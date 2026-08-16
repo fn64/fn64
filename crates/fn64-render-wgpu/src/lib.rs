@@ -69,19 +69,27 @@
 //! profile, Naga validation, and CPU oracle establish candidate mechanics.
 //! The component remains `NotQualified` and `NativeUnverified`; no complete
 //! RT64 shader-denominator row is promoted.
-//! Color combiner Slice 2 (characterization-first port of
-//! `/private/tmp/rt64-combiner-characterization-card.md`) adds typed
+//! The RT64 color combiner port (characterization-first, source: MIT RT64
+//! pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
+//! `docs/RT64-PORT-AUTHORITY.md`'s Rust-port source pin) adds typed
 //! `ColorInput`/`AlphaInput`/`CombineParams` selector decode, exact and
-//! complete for every wire-legal index (matching RT64 bit-for-bit), plus
-//! full one-cycle `(A-B)*C+D` arithmetic that now evaluates every selector
-//! either enum can hold — including KEY_CENTER/KEY_SCALE/K4/K5, NOISE,
+//! complete for every wire-legal index (matching RT64 bit-for-bit); full
+//! one-cycle `(A-B)*C+D` arithmetic evaluating every selector either enum
+//! can hold — including KEY_CENTER/KEY_SCALE/K4/K5, NOISE,
 //! LOD_FRACTION/PRIM_LOD_FRAC, and the `*_ALPHA`/COMBINED_ALPHA cross-reads
 //! — as caller-supplied typed [`CombinerInputs`] fields, not a PRNG or
-//! derivative computed here. An independently-derived Rust oracle
-//! ([`run_one_cycle`]) with a matching owned WGSL transcription
-//! (`shaders/color_combiner.wgsl`, Naga-validated). It adds no two-cycle
-//! mode, copy mode, shader-keying, `RdpState` wiring, draw-path
-//! integration, real NOISE/LOD generation, or native/GPU-verified behavior.
+//! derivative computed here; and full two-cycle mode
+//! ([`run_combiner`]/[`run_two_cycle`]) with cycle-0-then-cycle-1 ordering,
+//! `COMBINED`/`COMBINED_ALPHA` cross-cycle reads, the `TEXEL0`/`TEXEL1`
+//! cycle-1 swap, the `twoCycle`-conditioned pre-arithmetic
+//! `wrapInputC`/`wrapInputABD` cross-cycle-carry wrap (range chosen
+//! independently per channel by that channel's own slot-C selector), and
+//! `alphaCompareValue`'s cycle-0 capture timing. An independently-derived
+//! Rust oracle ([`run_one_cycle`], [`run_combiner`]) with a matching owned
+//! WGSL transcription (`shaders/color_combiner.wgsl`, Naga-validated). It
+//! adds no copy mode, shader-keying, `RdpState`/`SetCombine` wiring,
+//! draw-path integration, real NOISE/LOD generation, or native/GPU-verified
+//! behavior.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -339,8 +347,8 @@ pub use blend::{
     ResolvedBlendCycle, BLEND_ENTRY_POINT, BLEND_WGSL,
 };
 pub use combiner::{
-    run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams,
-    CombinerInputs, COLOR_COMBINER_WGSL,
+    run_combiner, run_one_cycle, run_two_cycle, AlphaInput, AlphaInputSlot, ColorInput,
+    ColorInputSlot, CombineParams, CombinerCycleMode, CombinerInputs, COLOR_COMBINER_WGSL,
 };
 pub use coverage::{
     apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,

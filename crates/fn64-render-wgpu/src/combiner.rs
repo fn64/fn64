@@ -1,10 +1,8 @@
-//! RT64 color combiner: selector decode and one-cycle arithmetic.
+//! RT64 color combiner: selector decode and one-cycle/two-cycle arithmetic.
 //!
-//! Characterization-first port, Slice 2 of
-//! `/private/tmp/rt64-combiner-characterization-card.md`
-//! (sha256 `e67751ff975eaf970b8179b2b62bd0093ccddac3d73c3dc0539b611006b345a`).
-//! Source: MIT RT64, pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
-//! `src/shared/rt64_color_combiner.h` (fn64's own
+//! Characterization-first port. Source: MIT RT64, pinned commit
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`'s
+//! Rust-port source pin), `src/shared/rt64_color_combiner.h` (fn64's own
 //! `docs/RT64-PORT-INVENTORY.md:291` records this file `unchanged` /
 //! `source-digests-verified` against the executable-comparison oracle, so
 //! unlike `rt64_state.cpp` there is no drift caveat here).
@@ -16,54 +14,67 @@
 //! pinned source) — this port never substitutes `Zero` for a selector RT64
 //! itself would decode to something else.
 //!
-//! Slice 2 adds full one-cycle arithmetic for every selector reachable in
-//! one-cycle mode: [`run_one_cycle`] (via `resolve_color_input`/
+//! Full one-cycle arithmetic: [`run_one_cycle`] (via `resolve_color_input`/
 //! `resolve_alpha_input`, transcribed directly from RT64's `fromColorInput`/
-//! `fromAlphaInput`, `rt64_color_combiner.h:468-540`) now evaluates
+//! `fromAlphaInput`, `rt64_color_combiner.h:468-540`) evaluates `COMBINED`,
+//! `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`, `ENVIRONMENT`, `KEY_CENTER`,
+//! `KEY_SCALE`, `COMBINED_ALPHA`, `TEXEL0_ALPHA`, `TEXEL1_ALPHA`,
+//! `PRIMITIVE_ALPHA`, `SHADE_ALPHA`, `ENV_ALPHA`, `LOD_FRACTION`,
+//! `PRIM_LOD_FRAC`, `NOISE`, `K4`, `K5`, `ONE`, `ZERO` for color, and
 //! `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`, `ENVIRONMENT`,
-//! `KEY_CENTER`, `KEY_SCALE`, `COMBINED_ALPHA`, `TEXEL0_ALPHA`,
-//! `TEXEL1_ALPHA`, `PRIMITIVE_ALPHA`, `SHADE_ALPHA`, `ENV_ALPHA`,
-//! `LOD_FRACTION`, `PRIM_LOD_FRAC`, `NOISE`, `K4`, `K5`, `ONE`, `ZERO` for
-//! color, and `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`,
-//! `ENVIRONMENT`, `LOD_FRACTION`, `PRIM_LOD_FRAC`, `ONE`, `ZERO` for alpha —
-//! every variant either enum can hold. There is therefore no longer a
-//! deferred-selector rejection path in one-cycle mode; [`CombinerInputs`]
-//! carries every field RT64's `Inputs` struct has that a one-cycle formula
-//! can reach (`keyCenter`, `keyScale`, `lodFraction`, `primLodFrac`,
-//! `noise`, `K4`, `K5`), all caller-supplied — NOISE and the LOD fractions
-//! are explicit typed inputs at this seam, not a PRNG or a derivative
-//! computed here (RT64's own `initRand`/`nextRand`/`computeLOD` remain
-//! uncharacterized per the port card's §13 nonclaims; this slice does not
-//! invent them).
+//! `LOD_FRACTION`, `PRIM_LOD_FRAC`, `ONE`, `ZERO` for alpha — every variant
+//! either enum can hold, so there is no deferred-selector rejection path.
+//! [`CombinerInputs`] carries every field RT64's `Inputs` struct has that a
+//! combine formula can reach (`keyCenter`, `keyScale`, `lodFraction`,
+//! `primLodFrac`, `noise`, `K4`, `K5`), all caller-supplied — NOISE and the
+//! LOD fractions are explicit typed inputs at this seam, not a PRNG or a
+//! derivative computed here (RT64's own `initRand`/`nextRand`/`computeLOD`
+//! remain uncharacterized; this port does not invent them).
 //!
-//! One-cycle mode only. Explicitly not in this slice: two-cycle mode and
-//! its wrap/carry arithmetic (Slice 3, `wrap`/`wrapInputC`/`wrapInputABD`
-//! as a *cross-cycle carry* mechanism — the always-on final `wrapClamp`
-//! below is unrelated and already implemented), copy mode, `SetCombine`
-//! decode/`RdpState` tracking (Slice 4), real NOISE/LOD generation (Slices
-//! 5-6), shader-keying, draw-path wiring, and any GPU execution.
+//! [`run_combiner`]/[`run_two_cycle`] add full two-cycle mode, transcribed
+//! from `runCycle`/`run` (`rt64_color_combiner.h:567-634`):
 //!
-//! The final `wrapClamp` (RT64 `rt64_color_combiner.h:562-565`, called
-//! unconditionally by `run` regardless of cycle count) still applies here:
-//! it is not part of the two-cycle carry mechanism, it is the ordinary
-//! `[0,1]` clamp on the finished color, preceded by the same `wrapInputABD`
-//! wrap used for cross-cycle carry. One-cycle mode never triggers the
-//! *carry* wrap (RT64's `secondCycle` flag is `twoCycle && secondCycleInputs`
-//! = `false && true` = `false`), but it still runs the final `wrapClamp`.
-//! `wrapClamp` is a per-scalar-channel clamp: extreme/out-of-range caller
-//! inputs (e.g. `NOISE`/`K4`/`K5` far outside `[0,1]`, or an intermediate
-//! `(A-B)*C+D` product that overshoots) still hit the same wrap-then-clamp
-//! boundary this module already tests at `WRAP_LOW`/`WRAP_HIGH`.
+//! - **Cycle-0-then-cycle-1 ordering and zero-initialization**: `run`
+//!   zero-initializes `combinerColor` once, then threads its single
+//!   `inout float4` accumulator through cycle 0's `runCycle` call and, for
+//!   two-cycle mode, cycle 1's — never the reverse, never independently.
+//! - **`COMBINED`/`COMBINED_ALPHA` cross-cycle reads**: cycle 1's
+//!   `C_COMBINED`/`A_COMBINED` selectors read cycle 0's real (not
+//!   zero-init) output, subject to the pre-arithmetic wrap below.
+//! - **`TEXEL0`/`TEXEL1` cycle swapping**: `fromColorInput`/
+//!   `fromAlphaInput`'s own `secondCycle` parameter (distinct from
+//!   `decodeColorInput`'s bitfield-slice parameter of the same name) is
+//!   `twoCycle && secondCycleInputs` — `true` only for two-cycle mode's
+//!   second pass, where `C_TEXEL0` reads `texVal1` and `C_TEXEL1` reads
+//!   `texVal0` (and their `*_ALPHA` cross-reads).
+//! - **`twoCycle`-conditioned pre-arithmetic wrapping**: cycle 1 applies
+//!   [`wrap_input_c`]/[`wrap_input_abd`] to the *incoming* accumulator
+//!   before any `fromColorInput`/`fromAlphaInput` call reads it — never
+//!   after the `(A-B)*C+D` arithmetic — and the range choice
+//!   (`wrapInputC`'s `[-1-1/255,1+1/255]` vs. `wrapInputABD`'s
+//!   `[-0.5-1/255,1.5+1/255]`) is decided independently for color and
+//!   alpha, by whether *that channel's own slot-C selector* is
+//!   `COMBINED`/`COMBINED_ALPHA` this cycle — not by which slot is
+//!   currently being resolved. One-cycle mode never applies this wrap
+//!   (`twoCycle` is `false`, so RT64's `secondCycle` flag is always
+//!   `false` regardless of the bitfield slice used).
+//! - **`alphaCompareValue` capture timing**: `run` snapshots
+//!   `alphaCompareValue = combinerColor.a` immediately after the first (and,
+//!   in one-cycle mode, only) `runCycle` call — i.e. cycle 0's alpha output
+//!   in two-cycle mode, never overwritten by cycle 1.
+//! - **Final `wrapClamp`**: `wrapInputABD` then `clamp(0,1)`, applied
+//!   unconditionally to the finished color and to `alphaCompareValue`,
+//!   regardless of cycle count — this is a separate mechanism from the
+//!   cross-cycle carry wrap above (see [`wrap_clamp`]'s doc).
 //!
-//! `fromColorInput`/`fromAlphaInput` take a `secondCycle` bool distinct from
-//! `runCycle`'s `secondCycleInputs` (which selects the bitfield slice):
-//! `secondCycle = twoCycle && secondCycleInputs` (`rt64_color_combiner.h:577`).
-//! One-cycle mode always has `twoCycle = false`, so `secondCycle` is always
-//! `false` here — RT64's `TEXEL0`/`TEXEL1` swap-on-`secondCycle` branch
-//! (`fromColorInput`/`fromAlphaInput`'s `secondCycle ? texVal1 : texVal0`)
-//! never triggers in this slice, matching Slice 1's behavior exactly; this
-//! is verified directly against the pinned source for this task, not only
-//! inferred from the port card.
+//! Explicitly not in this port: copy mode, `SetCombine` decode/`RdpState`
+//! tracking, real NOISE/LOD generation, shader-keying, draw-path wiring,
+//! and any GPU execution. RT64's `!inputs.alphaOnly` gate around the RGB
+//! combine (`runCycle` line 589) is transcribed as [`run_cycle`]'s
+//! `alpha_only` parameter for structural fidelity, but this port's
+//! [`CombinerInputs`] has no `alphaOnly` field to set it from — RT64's own
+//! only observed call site (`RasterPS.hlsl:171`) always sets it `false` —
+//! so every public entry point always passes `false`.
 
 /// Owned WGSL transcription of this module's decode tables and one-cycle
 /// arithmetic (`shaders/color_combiner.wgsl`). Naga-validated in this
@@ -382,30 +393,44 @@ pub struct CombinerInputs {
 /// `combinerColor.rgb` accumulator — in one-cycle mode this is always
 /// `[0.0, 0.0, 0.0]` (RT64 `run`'s zero-init, never written before the
 /// single `runCycle` call), so [`run_one_cycle`] passes that fixed value
-/// rather than exposing a caller-settable carry (which only exists for
-/// two-cycle mode, Slice 3).
+/// rather than exposing a caller-settable carry. Slice 3's [`run_cycle`]
+/// passes cycle 0's real output when evaluating cycle 1.
 ///
-/// `secondCycle` here is `fromColorInput`'s own parameter, distinct from
+/// `second_cycle` here is `fromColorInput`'s own parameter, distinct from
 /// `decodeColorInput`'s bitfield-slice `secondCycle` — RT64 calls it as
 /// `secondCycle = twoCycle && secondCycleInputs` (`runCycle`,
-/// `rt64_color_combiner.h:577`), always `false` in one-cycle mode
-/// (`twoCycle` is `false`), so the TEXEL0/TEXEL1 swap-on-`secondCycle`
-/// branch never triggers here — this always reads the un-swapped texel,
-/// matching RT64 exactly for one-cycle mode specifically (see module docs).
+/// `rt64_color_combiner.h:577`). It is `false` for one-cycle mode's single
+/// pass (`twoCycle` is `false`) and for two-cycle mode's cycle 0
+/// (`secondCycleInputs` is `false` for `cycle == 0`), but exactly `true`
+/// for two-cycle mode's cycle 1 — that is the *only* condition under which
+/// the `TEXEL0`/`TEXEL1` swap below fires: `C_TEXEL0` reads `texVal1` and
+/// `C_TEXEL1` reads `texVal0`, and likewise for their `*_ALPHA` cross-reads.
 /// `C_COMBINED_ALPHA`/`*_ALPHA` selectors read the *alpha* channel of the
-/// same named input, replicated into all three RGB lanes — exactly RT64's
-/// `return combinerColor.a;` / `return inputs.texVal0.a;` etc., an HLSL
-/// scalar-to-`float3` return that implicitly broadcasts.
+/// same (possibly swapped) named input, replicated into all three RGB
+/// lanes — exactly RT64's `return combinerColor.a;` / `return
+/// inputs.texVal0.a;` etc., an HLSL scalar-to-`float3` return that
+/// implicitly broadcasts.
 fn resolve_color_input(
     inputs: CombinerInputs,
+    second_cycle: bool,
     combiner_color: [f32; 3],
     combiner_alpha: f32,
     selector: ColorInput,
 ) -> [f32; 3] {
+    let texel0 = if second_cycle {
+        inputs.tex_val1
+    } else {
+        inputs.tex_val0
+    };
+    let texel1 = if second_cycle {
+        inputs.tex_val0
+    } else {
+        inputs.tex_val1
+    };
     match selector {
         ColorInput::Combined => combiner_color,
-        ColorInput::Texel0 => [inputs.tex_val0[0], inputs.tex_val0[1], inputs.tex_val0[2]],
-        ColorInput::Texel1 => [inputs.tex_val1[0], inputs.tex_val1[1], inputs.tex_val1[2]],
+        ColorInput::Texel0 => [texel0[0], texel0[1], texel0[2]],
+        ColorInput::Texel1 => [texel1[0], texel1[1], texel1[2]],
         ColorInput::Primitive => [
             inputs.prim_color[0],
             inputs.prim_color[1],
@@ -424,8 +449,8 @@ fn resolve_color_input(
         ColorInput::KeyCenter => inputs.key_center,
         ColorInput::KeyScale => inputs.key_scale,
         ColorInput::CombinedAlpha => [combiner_alpha; 3],
-        ColorInput::Texel0Alpha => [inputs.tex_val0[3]; 3],
-        ColorInput::Texel1Alpha => [inputs.tex_val1[3]; 3],
+        ColorInput::Texel0Alpha => [texel0[3]; 3],
+        ColorInput::Texel1Alpha => [texel1[3]; 3],
         ColorInput::PrimitiveAlpha => [inputs.prim_color[3]; 3],
         ColorInput::ShadeAlpha => [inputs.shade_color[3]; 3],
         ColorInput::EnvAlpha => [inputs.env_color[3]; 3],
@@ -441,14 +466,28 @@ fn resolve_color_input(
 
 /// Resolves one alpha selector, per `fromAlphaInput`
 /// (`rt64_color_combiner.h:516-540`). `combiner_alpha` stands in for RT64's
-/// `combinerColor.a` accumulator — see [`resolve_color_input`]'s doc for why
-/// one-cycle mode fixes it at `0.0`, and for the `secondCycle` TEXEL0/TEXEL1
-/// swap note (identical here: always `false` in one-cycle mode).
-fn resolve_alpha_input(inputs: CombinerInputs, combiner_alpha: f32, selector: AlphaInput) -> f32 {
+/// `combinerColor.a` accumulator — see [`resolve_color_input`]'s doc for the
+/// `second_cycle` TEXEL0/TEXEL1 swap note (identical shape here).
+fn resolve_alpha_input(
+    inputs: CombinerInputs,
+    second_cycle: bool,
+    combiner_alpha: f32,
+    selector: AlphaInput,
+) -> f32 {
+    let texel0 = if second_cycle {
+        inputs.tex_val1
+    } else {
+        inputs.tex_val0
+    };
+    let texel1 = if second_cycle {
+        inputs.tex_val0
+    } else {
+        inputs.tex_val1
+    };
     match selector {
         AlphaInput::Combined => combiner_alpha,
-        AlphaInput::Texel0 => inputs.tex_val0[3],
-        AlphaInput::Texel1 => inputs.tex_val1[3],
+        AlphaInput::Texel0 => texel0[3],
+        AlphaInput::Texel1 => texel1[3],
         AlphaInput::Primitive => inputs.prim_color[3],
         AlphaInput::Shade => inputs.shade_color[3],
         AlphaInput::Environment => inputs.env_color[3],
@@ -526,24 +565,27 @@ pub fn run_one_cycle(params: CombineParams, inputs: CombinerInputs) -> ([f32; 4]
     let ad = params.decode_alpha(AlphaInputSlot::D, SECOND_CYCLE);
 
     // RT64 `run`'s zero-init, unwritten before this one-and-only `runCycle`
-    // call (see `resolve_color_input`/`resolve_alpha_input` docs).
+    // call (see `resolve_color_input`/`resolve_alpha_input` docs). This
+    // call's own `fromColorInput`/`fromAlphaInput` `secondCycle` parameter
+    // (the TEXEL0/TEXEL1-swap flag) is `false` here, matching one-cycle
+    // mode's `twoCycle = false` exactly (see module docs).
     let combiner_color_in = [0.0f32; 3];
     let combiner_alpha_in = 0.0f32;
 
-    let a = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, ca);
-    let b = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cb);
-    let c = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cc);
-    let d = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cd);
+    let a = resolve_color_input(inputs, false, combiner_color_in, combiner_alpha_in, ca);
+    let b = resolve_color_input(inputs, false, combiner_color_in, combiner_alpha_in, cb);
+    let c = resolve_color_input(inputs, false, combiner_color_in, combiner_alpha_in, cc);
+    let d = resolve_color_input(inputs, false, combiner_color_in, combiner_alpha_in, cd);
     let rgb = [
         (a[0] - b[0]) * c[0] + d[0],
         (a[1] - b[1]) * c[1] + d[1],
         (a[2] - b[2]) * c[2] + d[2],
     ];
 
-    let aa_v = resolve_alpha_input(inputs, combiner_alpha_in, aa);
-    let ab_v = resolve_alpha_input(inputs, combiner_alpha_in, ab);
-    let ac_v = resolve_alpha_input(inputs, combiner_alpha_in, ac);
-    let ad_v = resolve_alpha_input(inputs, combiner_alpha_in, ad);
+    let aa_v = resolve_alpha_input(inputs, false, combiner_alpha_in, aa);
+    let ab_v = resolve_alpha_input(inputs, false, combiner_alpha_in, ab);
+    let ac_v = resolve_alpha_input(inputs, false, combiner_alpha_in, ac);
+    let ad_v = resolve_alpha_input(inputs, false, combiner_alpha_in, ad);
     let alpha = (aa_v - ab_v) * ac_v + ad_v;
 
     // RT64 `run`: `alphaCompareValue = combinerColor.a` snapshotted right
@@ -558,6 +600,283 @@ pub fn run_one_cycle(params: CombineParams, inputs: CombinerInputs) -> ([f32; 4]
     ];
 
     (combiner_color, alpha_compare_value)
+}
+
+/// `wrap`'s cross-cycle-carry range when the *consuming* selector is
+/// specifically `C_COMBINED`/`A_COMBINED` read by input slot **C**
+/// (`wrapInputC`, `rt64_color_combiner.h:548-553`): `[-1 - 1/255, 1 +
+/// 1/255]`. Distinct from [`wrap_input_abd`]'s range — RT64 chooses between
+/// the two based solely on whether the *C slot's own selector* is
+/// `COMBINED`/`COMBINED_ALPHA` for this cycle (`runCycle` lines 581, 591),
+/// not on which slot is being evaluated at any given call to
+/// `resolve_color_input`/`resolve_alpha_input`.
+fn wrap_input_c(i: f32) -> f32 {
+    const ROUNDING: f32 = 1.0 / 255.0;
+    const LOW: f32 = -1.0 - ROUNDING;
+    const HIGH: f32 = 1.0 + ROUNDING;
+    const RANGE: f32 = HIGH - LOW;
+    let mut wrapped = i;
+    if wrapped <= LOW {
+        wrapped += RANGE;
+    }
+    if HIGH <= wrapped {
+        wrapped -= RANGE;
+    }
+    wrapped
+}
+
+/// `wrap`'s cross-cycle-carry range for every other consuming case (slots
+/// A, B, or D reading `COMBINED`, or slot C reading it but not being the
+/// only reader — i.e. RT64's `else` branch at `runCycle` lines 584, 596/599)
+/// (`wrapInputABD`, `rt64_color_combiner.h:555-560`): `[-0.5 - 1/255, 1.5 +
+/// 1/255]`. This is the same range [`wrap_clamp`] applies as its own
+/// pre-clamp wrap step — that is RT64's `wrapClamp = wrapInputABD then
+/// clamp(0,1)`, an intentional reuse, not a coincidence.
+fn wrap_input_abd(i: f32) -> f32 {
+    const ROUNDING: f32 = 1.0 / 255.0;
+    const LOW: f32 = -0.5 - ROUNDING;
+    const HIGH: f32 = 1.5 + ROUNDING;
+    const RANGE: f32 = HIGH - LOW;
+    let mut wrapped = i;
+    if wrapped <= LOW {
+        wrapped += RANGE;
+    }
+    if HIGH <= wrapped {
+        wrapped -= RANGE;
+    }
+    wrapped
+}
+
+/// Which pass of a (possibly two-cycle) combiner evaluation this is. Mirrors
+/// RT64's `runCycle(inputs, cycle, twoCycle, combinerColor)` parameters
+/// (`cycle`, `twoCycle`) as one typed value instead of two raw booleans/a
+/// raw `uint cycle`, per this port's own convention of using
+/// [`state::CycleType`](crate::state::CycleType)-shaped enums rather than
+/// bare bools at public seams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CyclePass {
+    /// The only pass of one-cycle mode. RT64 still calls this `cycle = 1`
+    /// (`run`: `runCycle(inputs, twoCycle ? 0 : 1, twoCycle, ...)`), i.e. it
+    /// reads the *second*-cycle bitfield slice, but `twoCycle = false` means
+    /// `secondCycle` (the cross-cycle-carry flag) is always `false` — no
+    /// wrap ever applies, and `C_COMBINED`/`A_COMBINED` reads the
+    /// zero-initialized accumulator. See module docs.
+    OnlyCycleOfOneCycleMode,
+    /// Two-cycle mode's first pass (`cycle = 0`): reads the cycle-0
+    /// bitfield slice, no cross-cycle wrap (`secondCycleInputs` is `false`).
+    FirstOfTwoCycles,
+    /// Two-cycle mode's second pass (`cycle = 1`): reads the cycle-1
+    /// bitfield slice, and *does* apply the cross-cycle-carry wrap to
+    /// whatever cycle 0 just wrote into the accumulator before using it as
+    /// an input (`secondCycle = twoCycle && secondCycleInputs = true`).
+    SecondOfTwoCycles,
+}
+
+impl CyclePass {
+    /// `decodeColorInput`/`decodeAlphaInput`'s own `secondCycleInputs`
+    /// bitfield-slice selector: `true` for both the only one-cycle pass
+    /// (RT64's `cycle == 1` for that call) and two-cycle mode's second pass.
+    const fn bitfield_second_cycle(self) -> bool {
+        !matches!(self, CyclePass::FirstOfTwoCycles)
+    }
+
+    /// `runCycle`'s `secondCycle` cross-cycle-carry flag: `twoCycle &&
+    /// secondCycleInputs`. Only `true` for two-cycle mode's second pass.
+    const fn carries_wrap(self) -> bool {
+        matches!(self, CyclePass::SecondOfTwoCycles)
+    }
+}
+
+/// One `runCycle` call (`rt64_color_combiner.h:567-609`): decodes this
+/// pass's eight selectors from the right bitfield slice, applies the
+/// cross-cycle-carry wrap to the incoming accumulator when `pass` requires
+/// it, then evaluates `(A-B)*C+D` for color and alpha, writing the result
+/// back into the accumulator RT64 threads through both calls as one
+/// `inout float4 combinerColor`.
+///
+/// The wrap-range choice (`wrap_input_c` vs. `wrap_input_abd`) is decided
+/// **independently for color and alpha**, each by its own slot-C selector
+/// for *this* pass — exactly RT64's two separate `if (AC == A_COMBINED)` /
+/// `if (CC == C_COMBINED)` checks (`runCycle` lines 581, 591), not a single
+/// shared decision. The color-side wrap additionally applies to all three
+/// RGB channels independently (RT64 lines 592-594/597-599 call
+/// `wrapInputC`/`wrapInputABD` three times, once per channel — the
+/// per-channel repetition matters only in that each channel's value can
+/// legitimately differ, not in the wrap arithmetic itself, which is
+/// scalar).
+///
+/// `alpha_only` mirrors RT64's `!inputs.alphaOnly` gate around the RGB
+/// combine (`runCycle` line 589): this port's [`CombinerInputs`] has no
+/// `alphaOnly` field (RT64's own only observed call site,
+/// `RasterPS.hlsl:171`, always sets it `false` — see module docs), so this
+/// function's only caller always passes `false`. It is threaded through
+/// (rather than hard-coded away) so `run_cycle` stays a faithful
+/// transcription of `runCycle`'s exact branch structure, not an
+/// RT64-diverging simplification. The WGSL twin (`color_combiner.wgsl`'s
+/// `run_cycle`) elides this parameter entirely rather than threading an
+/// always-`false` value through a shader function signature, documenting
+/// the gate as unconditionally taken instead — a deliberate, documented
+/// structural difference between the two, not a semantic one (both always
+/// execute the RGB combine).
+fn run_cycle(
+    params: CombineParams,
+    inputs: CombinerInputs,
+    pass: CyclePass,
+    alpha_only: bool,
+    combiner_color_in: [f32; 4],
+) -> [f32; 4] {
+    let bitfield_second_cycle = pass.bitfield_second_cycle();
+    let carries_wrap = pass.carries_wrap();
+
+    let ca = params.decode_color(ColorInputSlot::A, bitfield_second_cycle);
+    let cb = params.decode_color(ColorInputSlot::B, bitfield_second_cycle);
+    let cc = params.decode_color(ColorInputSlot::C, bitfield_second_cycle);
+    let cd = params.decode_color(ColorInputSlot::D, bitfield_second_cycle);
+    let aa = params.decode_alpha(AlphaInputSlot::A, bitfield_second_cycle);
+    let ab = params.decode_alpha(AlphaInputSlot::B, bitfield_second_cycle);
+    let ac = params.decode_alpha(AlphaInputSlot::C, bitfield_second_cycle);
+    let ad = params.decode_alpha(AlphaInputSlot::D, bitfield_second_cycle);
+
+    let [mut r, mut g, mut b_ch, mut a_ch] = combiner_color_in;
+
+    // "Simulate the wrap on the inputs of the second cycle" (RT64's own
+    // comment, `runCycle` line 579) — applied to the *incoming* accumulator
+    // before it is read by this pass's `fromColorInput`/`fromAlphaInput`
+    // calls, not after this pass computes its own output.
+    if carries_wrap {
+        a_ch = if ac == AlphaInput::Combined {
+            wrap_input_c(a_ch)
+        } else {
+            wrap_input_abd(a_ch)
+        };
+    }
+
+    if !alpha_only {
+        if carries_wrap {
+            if cc == ColorInput::Combined {
+                r = wrap_input_c(r);
+                g = wrap_input_c(g);
+                b_ch = wrap_input_c(b_ch);
+            } else {
+                r = wrap_input_abd(r);
+                g = wrap_input_abd(g);
+                b_ch = wrap_input_abd(b_ch);
+            }
+        }
+
+        let combiner_color = [r, g, b_ch];
+        let a = resolve_color_input(inputs, carries_wrap, combiner_color, a_ch, ca);
+        let b = resolve_color_input(inputs, carries_wrap, combiner_color, a_ch, cb);
+        let c = resolve_color_input(inputs, carries_wrap, combiner_color, a_ch, cc);
+        let d = resolve_color_input(inputs, carries_wrap, combiner_color, a_ch, cd);
+        r = (a[0] - b[0]) * c[0] + d[0];
+        g = (a[1] - b[1]) * c[1] + d[1];
+        b_ch = (a[2] - b[2]) * c[2] + d[2];
+    }
+
+    let aa_v = resolve_alpha_input(inputs, carries_wrap, a_ch, aa);
+    let ab_v = resolve_alpha_input(inputs, carries_wrap, a_ch, ab);
+    let ac_v = resolve_alpha_input(inputs, carries_wrap, a_ch, ac);
+    let ad_v = resolve_alpha_input(inputs, carries_wrap, a_ch, ad);
+    a_ch = (aa_v - ab_v) * ac_v + ad_v;
+
+    [r, g, b_ch, a_ch]
+}
+
+/// Cycle-mode dispatch, mirroring RT64's `run`
+/// (`rt64_color_combiner.h:611-634`) minus its copy-mode branch (`run`'s
+/// `cycleType == G_CYC_COPY` case, out of this slice's scope — see module
+/// docs). Callers distinguish one-cycle from two-cycle execution through
+/// this typed enum rather than a raw `twoCycle: bool`, per the task's API
+/// requirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombinerCycleMode {
+    OneCycle,
+    TwoCycle,
+}
+
+/// Runs the combiner for either cycle mode and returns `(combinerColor,
+/// alphaCompareValue)`, exactly RT64's `run` out-parameters (minus copy
+/// mode). [`run_one_cycle`] remains the Slice 2 one-cycle-only entry point
+/// (unchanged signature, still independently tested); this function is the
+/// Slice 3 addition that also covers two-cycle mode and is the one
+/// `run_one_cycle`'s regression-equivalence test compares itself against.
+///
+/// **Cycle-0-then-cycle-1 ordering**: for [`CombinerCycleMode::TwoCycle`],
+/// `run_cycle` is called first with [`CyclePass::FirstOfTwoCycles`], then
+/// its full `[f32; 4]` output (not just the alpha or just the RGB channels)
+/// is threaded as the *next* call's `combiner_color_in` — this is RT64's
+/// single `inout float4 combinerColor` shared across both `runCycle` calls
+/// in `run` (`rt64_color_combiner.h:620,626`), not two independent
+/// evaluations. **`alphaCompareValue` capture timing**: RT64 snapshots
+/// `alphaCompareValue = combinerColor.a` (line 623) *between* the two
+/// `runCycle` calls in two-cycle mode — i.e. it is cycle 0's alpha output,
+/// pre-wrap-and-clamp at capture time (the shared final `wrapClamp` pass
+/// applies to it afterward, same as the finished color), and is **not**
+/// overwritten by cycle 1. For one-cycle mode there is only one `runCycle`
+/// call, so `alphaCompareValue` is trivially that (only) cycle's alpha
+/// output — see [`run_one_cycle`]'s doc, which this function reproduces via
+/// [`CyclePass::OnlyCycleOfOneCycleMode`].
+pub fn run_combiner(
+    params: CombineParams,
+    inputs: CombinerInputs,
+    cycle_mode: CombinerCycleMode,
+) -> ([f32; 4], f32) {
+    // RT64 `run`'s zero-init (`combinerColor = float4(0,0,0,0)`), unwritten
+    // before the first `runCycle` call regardless of cycle mode.
+    let zero_init = [0.0f32; 4];
+
+    let after_first_cycle = match cycle_mode {
+        CombinerCycleMode::OneCycle => run_cycle(
+            params,
+            inputs,
+            CyclePass::OnlyCycleOfOneCycleMode,
+            false,
+            zero_init,
+        ),
+        CombinerCycleMode::TwoCycle => run_cycle(
+            params,
+            inputs,
+            CyclePass::FirstOfTwoCycles,
+            false,
+            zero_init,
+        ),
+    };
+
+    // RT64 `run`: `alphaCompareValue = combinerColor.a`, snapshotted right
+    // after the first (and, in one-cycle mode, only) `runCycle` call, before
+    // any second cycle can overwrite it.
+    let alpha_compare_raw = after_first_cycle[3];
+
+    let final_color = match cycle_mode {
+        CombinerCycleMode::OneCycle => after_first_cycle,
+        CombinerCycleMode::TwoCycle => run_cycle(
+            params,
+            inputs,
+            CyclePass::SecondOfTwoCycles,
+            false,
+            after_first_cycle,
+        ),
+    };
+
+    let alpha_compare_value = wrap_clamp(alpha_compare_raw);
+    let combiner_color = [
+        wrap_clamp(final_color[0]),
+        wrap_clamp(final_color[1]),
+        wrap_clamp(final_color[2]),
+        wrap_clamp(final_color[3]),
+    ];
+
+    (combiner_color, alpha_compare_value)
+}
+
+/// Runs two-cycle combiner arithmetic. Thin, explicitly-named wrapper over
+/// [`run_combiner`] with [`CombinerCycleMode::TwoCycle`] — kept alongside
+/// [`run_one_cycle`] so both cycle modes have an equally discoverable named
+/// entry point, matching this crate's existing per-mode function naming
+/// convention rather than forcing every caller through the enum-taking form.
+pub fn run_two_cycle(params: CombineParams, inputs: CombinerInputs) -> ([f32; 4], f32) {
+    run_combiner(params, inputs, CombinerCycleMode::TwoCycle)
 }
 
 #[cfg(test)]
@@ -834,9 +1153,9 @@ mod tests {
     #[test]
     fn identity_passthrough() {
         let inputs = ALL_INPUTS;
-        let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0);
-        let zero = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Zero);
-        let one = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::One);
+        let a = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel0);
+        let zero = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Zero);
+        let one = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::One);
         let rgb = [
             (a[0] - zero[0]) * one[0] + zero[0],
             (a[1] - zero[1]) * one[1] + zero[1],
@@ -844,9 +1163,9 @@ mod tests {
         ];
         assert_eq!(rgb, inputs.tex_val0[..3]);
 
-        let alpha_a = resolve_alpha_input(inputs, 0.0, AlphaInput::Texel0);
-        let alpha_zero = resolve_alpha_input(inputs, 0.0, AlphaInput::Zero);
-        let alpha_one = resolve_alpha_input(inputs, 0.0, AlphaInput::One);
+        let alpha_a = resolve_alpha_input(inputs, false, 0.0, AlphaInput::Texel0);
+        let alpha_zero = resolve_alpha_input(inputs, false, 0.0, AlphaInput::Zero);
+        let alpha_one = resolve_alpha_input(inputs, false, 0.0, AlphaInput::One);
         let alpha = (alpha_a - alpha_zero) * alpha_one + alpha_zero;
         assert_eq!(alpha, inputs.tex_val0[3]);
     }
@@ -864,8 +1183,8 @@ mod tests {
             texel0[2] * shade[2],
         ];
         for (channel, expected) in expected.into_iter().enumerate() {
-            let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0)[channel];
-            let c = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Shade)[channel];
+            let a = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel0)[channel];
+            let c = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Shade)[channel];
             assert!((a * c - expected).abs() < f32::EPSILON);
         }
     }
@@ -909,7 +1228,7 @@ mod tests {
         wrapped.clamp(0.0, 1.0)
     }
 
-    /// Wrap-boundary sweep (card §9b): exercises both `step`-branches of
+    /// Wrap-boundary sweep (§9b): exercises both `step`-branches of
     /// RT64's `wrap()` that `wrap_clamp` translates to `if` statements —
     /// the card's own flag that this is "the single most error-prone part
     /// of this whole spec."
@@ -953,9 +1272,9 @@ mod tests {
     #[test]
     fn combined_reads_zero_init_in_one_cycle_mode() {
         let inputs = ALL_INPUTS;
-        let combined = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Combined);
+        let combined = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Combined);
         assert_eq!(combined, [0.0, 0.0, 0.0]);
-        let combined_alpha = resolve_alpha_input(inputs, 0.0, AlphaInput::Combined);
+        let combined_alpha = resolve_alpha_input(inputs, false, 0.0, AlphaInput::Combined);
         assert_eq!(combined_alpha, 0.0);
     }
 
@@ -1055,7 +1374,7 @@ mod tests {
             ..base
         };
         for inputs in [base, mutated] {
-            let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::KeyCenter);
+            let a = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::KeyCenter);
             assert_eq!(a, inputs.key_center);
         }
         assert_ne!(base.key_center, mutated.key_center);
@@ -1070,7 +1389,7 @@ mod tests {
             ..base
         };
         for inputs in [base, mutated] {
-            let c = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::KeyScale);
+            let c = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::KeyScale);
             assert_eq!(c, inputs.key_scale);
         }
         assert_ne!(base.key_scale, mutated.key_scale);
@@ -1089,11 +1408,11 @@ mod tests {
         };
         for inputs in [base, mutated] {
             assert_eq!(
-                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::K4),
+                resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::K4),
                 [inputs.k4; 3]
             );
             assert_eq!(
-                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::K5),
+                resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::K5),
                 [inputs.k5; 3]
             );
         }
@@ -1116,19 +1435,19 @@ mod tests {
         };
         for inputs in [base, mutated] {
             assert_eq!(
-                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::LodFraction),
+                resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::LodFraction),
                 [inputs.lod_fraction; 3]
             );
             assert_eq!(
-                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::PrimLodFrac),
+                resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::PrimLodFrac),
                 [inputs.prim_lod_frac; 3]
             );
             assert_eq!(
-                resolve_alpha_input(inputs, 0.0, AlphaInput::LodFraction),
+                resolve_alpha_input(inputs, false, 0.0, AlphaInput::LodFraction),
                 inputs.lod_fraction
             );
             assert_eq!(
-                resolve_alpha_input(inputs, 0.0, AlphaInput::PrimLodFrac),
+                resolve_alpha_input(inputs, false, 0.0, AlphaInput::PrimLodFrac),
                 inputs.prim_lod_frac
             );
         }
@@ -1148,7 +1467,7 @@ mod tests {
         };
         for inputs in [base, mutated] {
             assert_eq!(
-                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Noise),
+                resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Noise),
                 [inputs.noise; 3]
             );
         }
@@ -1164,35 +1483,41 @@ mod tests {
         let inputs = ALL_INPUTS;
         let combiner_alpha = 0.42;
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], combiner_alpha, ColorInput::CombinedAlpha),
+            resolve_color_input(
+                inputs,
+                false,
+                [0.0; 3],
+                combiner_alpha,
+                ColorInput::CombinedAlpha
+            ),
             [combiner_alpha; 3]
         );
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
             [inputs.tex_val0[3]; 3]
         );
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel1Alpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel1Alpha),
             [inputs.tex_val1[3]; 3]
         );
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::PrimitiveAlpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::PrimitiveAlpha),
             [inputs.prim_color[3]; 3]
         );
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::ShadeAlpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::ShadeAlpha),
             [inputs.shade_color[3]; 3]
         );
         assert_eq!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::EnvAlpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::EnvAlpha),
             [inputs.env_color[3]; 3]
         );
         // Distinct from the RGB-reading counterpart for the same named
         // input (proves this is genuinely a different read, not a typo
         // that happens to match by construction).
         assert_ne!(
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
-            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0)
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
+            resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Texel0)
         );
     }
 
@@ -1288,9 +1613,9 @@ mod tests {
         };
 
         // (NOISE - ZERO) * ONE + ZERO = NOISE, then wrap_clamp(NOISE).
-        let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Noise);
-        let zero = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Zero);
-        let one = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::One);
+        let a = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Noise);
+        let zero = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::Zero);
+        let one = resolve_color_input(inputs, false, [0.0; 3], 0.0, ColorInput::One);
         let rgb0 = (a[0] - zero[0]) * one[0] + zero[0];
         assert_eq!(rgb0, inputs.noise);
         assert_eq!(wrap_clamp(rgb0), wrap_clamp_reference(inputs.noise));
@@ -1341,9 +1666,9 @@ mod tests {
         assert_eq!(
             digest,
             [
-                0x5e, 0x96, 0x81, 0x82, 0x45, 0xff, 0xcf, 0xf9, 0x6e, 0x78, 0x55, 0xb4, 0xab,
-                0xa7, 0x4a, 0xc1, 0x8b, 0x91, 0x1d, 0x17, 0x88, 0x5f, 0x88, 0x6b, 0xf5, 0x73,
-                0xe1, 0x59, 0x55, 0xed, 0x21, 0x49,
+                0xec, 0xb8, 0xda, 0xe5, 0x4e, 0x77, 0xf7, 0x1f, 0x7e, 0x78, 0x6b, 0x1a, 0x08,
+                0xf3, 0xc2, 0x60, 0xcb, 0x5a, 0x10, 0xa8, 0xf2, 0x86, 0xfb, 0xdc, 0x9f, 0xa2,
+                0xc7, 0x77, 0xf6, 0xf5, 0x2d, 0xd2,
             ],
             "color_combiner.wgsl changed; recompute and update this frozen digest in the same commit"
         );
@@ -1410,8 +1735,8 @@ mod tests {
             "case COLOR_KEY_CENTER: { return inputs.key_center; }",
             "case COLOR_KEY_SCALE: { return inputs.key_scale; }",
             "case COLOR_COMBINED_ALPHA: { return vec3<f32>(combiner_alpha, combiner_alpha, combiner_alpha); }",
-            "case COLOR_TEXEL0_ALPHA: { return vec3<f32>(inputs.tex_val0.a, inputs.tex_val0.a, inputs.tex_val0.a); }",
-            "case COLOR_TEXEL1_ALPHA: { return vec3<f32>(inputs.tex_val1.a, inputs.tex_val1.a, inputs.tex_val1.a); }",
+            "case COLOR_TEXEL0_ALPHA: { return vec3<f32>(texel0.a, texel0.a, texel0.a); }",
+            "case COLOR_TEXEL1_ALPHA: { return vec3<f32>(texel1.a, texel1.a, texel1.a); }",
             "case COLOR_PRIMITIVE_ALPHA: { return vec3<f32>(inputs.prim_color.a, inputs.prim_color.a, inputs.prim_color.a); }",
             "case COLOR_SHADE_ALPHA: { return vec3<f32>(inputs.shade_color.a, inputs.shade_color.a, inputs.shade_color.a); }",
             "case COLOR_ENV_ALPHA: { return vec3<f32>(inputs.env_color.a, inputs.env_color.a, inputs.env_color.a); }",
@@ -1428,5 +1753,1250 @@ mod tests {
                 "color_combiner.wgsl is missing Slice 2 arithmetic case {needle:?}"
             );
         }
+    }
+
+    /// Slice 3 companion to the Slice 2 WGSL guards above: asserts
+    /// `color_combiner.wgsl` literally contains the two-cycle wiring's
+    /// load-bearing lines -- the wrap-range selection (per slot C's own
+    /// selector, independently for color and alpha), the TEXEL0/TEXEL1
+    /// swap, the wrap-before-not-after-arithmetic ordering, and the
+    /// alphaCompareValue cycle-0 capture. A future edit that regresses any
+    /// of these exact mechanisms (e.g. collapsing the two wrap ranges into
+    /// one, or applying the swap unconditionally) would delete one of these
+    /// lines and fail here, even though `wgsl_parses_and_validates_under_naga`
+    /// would still pass (the mutation is syntactically valid WGSL).
+    #[test]
+    fn wgsl_two_cycle_wiring_contains_every_load_bearing_line() {
+        let source = COLOR_COMBINER_WGSL;
+        for needle in [
+            // Cross-cycle-carry wrap-range selection, decided independently
+            // for alpha (ac == ALPHA_COMBINED) and color (cc == COLOR_COMBINED).
+            "if ac == ALPHA_COMBINED {",
+            "a_ch = wrap_input_c(a_ch);",
+            "a_ch = wrap_input_abd(a_ch);",
+            "if cc == COLOR_COMBINED {",
+            "r = wrap_input_c(r);",
+            "g = wrap_input_c(g);",
+            "b_ch = wrap_input_c(b_ch);",
+            "r = wrap_input_abd(r);",
+            "g = wrap_input_abd(g);",
+            "b_ch = wrap_input_abd(b_ch);",
+            // TEXEL0/TEXEL1 swap, present in both resolvers.
+            "if second_cycle {\n        texel0 = inputs.tex_val1;\n        texel1 = inputs.tex_val0;\n    }",
+            // Cycle-0-then-cycle-1 sequencing and cycle-0 alphaCompareValue capture.
+            "after_first_cycle = run_cycle(params, inputs, CYCLE_PASS_FIRST_OF_TWO_CYCLES, zero_init);",
+            "let alpha_compare_raw = after_first_cycle.a;",
+            "final_color = run_cycle(params, inputs, CYCLE_PASS_SECOND_OF_TWO_CYCLES, after_first_cycle);",
+            // wrapInputC/wrapInputABD's distinct ranges.
+            "let low: f32 = -1.0 - rounding;",
+            "let high: f32 = 1.0 + rounding;",
+            "let low: f32 = -0.5 - rounding;",
+            "let high: f32 = 1.5 + rounding;",
+        ] {
+            assert!(
+                source.contains(needle),
+                "color_combiner.wgsl is missing Slice 3 two-cycle wiring line {needle:?}"
+            );
+        }
+    }
+
+    /// Hostile: asserts the wrap-before-arithmetic ordering textually --
+    /// the wrap `if` blocks for color must appear in the WGSL source
+    /// *before* the `resolve_color_input`/`(a - b) * c + d` computation
+    /// inside `run_cycle`, not after. A regression that moved the wrap
+    /// calls after the arithmetic would still contain all the same lines
+    /// (defeating a pure line-presence check) but in the wrong relative
+    /// order -- this test catches that specifically.
+    #[test]
+    fn wgsl_wrap_before_arithmetic_ordering_is_textually_before_combine_formula() {
+        let source = COLOR_COMBINER_WGSL;
+        let run_cycle_start = source
+            .find("fn run_cycle(")
+            .expect("run_cycle must exist in color_combiner.wgsl");
+        let wrap_site = source[run_cycle_start..]
+            .find("r = wrap_input_abd(r);")
+            .map(|offset| run_cycle_start + offset)
+            .expect("run_cycle must wrap r via wrap_input_abd somewhere");
+        let combine_site = source[run_cycle_start..]
+            .find("let rgb = (a - b) * c + d;")
+            .map(|offset| run_cycle_start + offset)
+            .expect("run_cycle must compute (a - b) * c + d somewhere");
+        assert!(
+            wrap_site < combine_site,
+            "wrap_input_abd(r) must appear before the (a - b) * c + d combine formula in run_cycle"
+        );
+    }
+
+    // ======================================================================
+    // Slice 3: two-cycle cross-cycle wiring and wrap/carry semantics.
+    // ======================================================================
+
+    // Wire index constants for `pack_two_cycle_combine`'s literal fixtures.
+    // Every slot's table shares `color_input_common`/`alpha_input_abd` for
+    // indices 0-5, and index 0 is ALWAYS `Combined` there, never `Zero` --
+    // this trips up a hand-written `[0, 0]` meant to read as "zero both
+    // slots" (see `hostile_wrap_after_arithmetic_instead_of_before_is_detected`'s
+    // debugging history). `Zero`'s own wire index differs per slot/table
+    // (only reachable via each table's own out-of-range collapse), so name
+    // it explicitly per slot rather than repeating a bare literal whose
+    // correctness depends on which slot it's used in.
+    const IDX_COMBINED: u32 = 0; // every slot's common table, index 0.
+    const IDX_COLOR_ZERO_A: u32 = 8; // color A: 8..15 collapse (out of the 6=ONE/7=NOISE range).
+    const IDX_COLOR_ZERO_B: u32 = 8; // color B: 8..15 collapse (out of the 6=KEY_CENTER/7=K4 range).
+    const IDX_COLOR_ZERO_C: u32 = 16; // color C: 16..31 collapse (out of the 6..15 extended range).
+    const IDX_COLOR_ZERO_D: u32 = 7; // color D: only 7 is out of its 3-bit table's 0..6 range.
+    const IDX_ALPHA_ZERO_ABD: u32 = 7; // alpha A/B/D: only 7 is out of its 0..6 range.
+    const IDX_ALPHA_ZERO_C: u32 = 7; // alpha C: only 7 is out of its distinct 0..6 range.
+
+    /// Packs a `SetCombine` word from all 16 selector indices (8 slots x 2
+    /// cycles) independently, per the exact bit positions verified against
+    /// the pinned source in `CombineParams`'s `parse_*` methods. Lets a
+    /// two-cycle fixture set cycle 0's and cycle 1's selectors to different
+    /// values in one call, rather than only being able to test one cycle's
+    /// bitfield slice at a time (as `cycle_bitfield_slice_selection` does).
+    #[allow(clippy::too_many_arguments)]
+    fn pack_two_cycle_combine(
+        color_a: [u32; 2],
+        color_b: [u32; 2],
+        color_c: [u32; 2],
+        color_d: [u32; 2],
+        alpha_a: [u32; 2],
+        alpha_b: [u32; 2],
+        alpha_c: [u32; 2],
+        alpha_d: [u32; 2],
+    ) -> CombineParams {
+        let low = (color_a[0] << 20)
+            | (color_a[1] << 5)
+            | (color_c[0] << 15)
+            | color_c[1]
+            | (alpha_a[0] << 12)
+            | (alpha_c[0] << 9);
+        let high = (color_b[0] << 28)
+            | (color_b[1] << 24)
+            | (color_d[0] << 15)
+            | (color_d[1] << 6)
+            | (alpha_a[1] << 21)
+            | (alpha_b[0] << 12)
+            | (alpha_b[1] << 3)
+            | (alpha_c[1] << 18)
+            | (alpha_d[0] << 9)
+            | alpha_d[1];
+        CombineParams::from_wire(low, high)
+    }
+
+    /// Self-check for `pack_two_cycle_combine`: every packed index must
+    /// decode back to exactly the selector requested, independently for
+    /// cycle 0 and cycle 1, proving the packer's bit positions are correct
+    /// before any fixture below relies on it. Uses TEXEL0(1)/TEXEL1(2)/
+    /// PRIMITIVE(3)/SHADE(4) as distinct per-slot markers.
+    #[test]
+    fn pack_two_cycle_combine_round_trips_through_decode() {
+        let params = pack_two_cycle_combine(
+            [1, 2], // color A: cycle0=TEXEL0, cycle1=TEXEL1
+            [3, 4], // color B: cycle0=PRIMITIVE, cycle1=SHADE
+            [2, 1], // color C: cycle0=TEXEL1, cycle1=TEXEL0
+            [4, 3], // color D: cycle0=SHADE, cycle1=PRIMITIVE
+            [1, 2], // alpha A: cycle0=TEXEL0, cycle1=TEXEL1
+            [3, 4], // alpha B: cycle0=PRIMITIVE, cycle1=SHADE
+            [4, 3], // alpha C: cycle0=SHADE, cycle1=PRIMITIVE
+            [2, 1], // alpha D: cycle0=TEXEL1, cycle1=TEXEL0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, false),
+            ColorInput::Texel0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, true),
+            ColorInput::Texel1
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, false),
+            ColorInput::Primitive
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, true),
+            ColorInput::Shade
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, false),
+            ColorInput::Texel1
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::Texel0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, false),
+            ColorInput::Shade
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, true),
+            ColorInput::Primitive
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::A, false),
+            AlphaInput::Texel0
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::A, true),
+            AlphaInput::Texel1
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::B, false),
+            AlphaInput::Primitive
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::B, true),
+            AlphaInput::Shade
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::C, false),
+            AlphaInput::Shade
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::C, true),
+            AlphaInput::Primitive
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::D, false),
+            AlphaInput::Texel1
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::D, true),
+            AlphaInput::Texel0
+        );
+    }
+
+    // -- Regression: one-cycle mode is unaffected by the Slice 3 addition.
+
+    /// `run_combiner(..., OneCycle)` must equal `run_one_cycle` bit-for-bit
+    /// across a representative sweep of `SetCombine` words and inputs — the
+    /// Slice 3 dispatch must not perturb the already-shipped Slice 2 path.
+    #[test]
+    fn run_combiner_one_cycle_matches_run_one_cycle_regression() {
+        let words: &[(u32, u32)] = &[
+            (0, 0),
+            (u32::MAX, u32::MAX),
+            (0x0012_3456, 0x789A_BCDE),
+            ((1u32 << 5) | 4, (3u32 << 24) | (5u32 << 6)),
+        ];
+        for &(low, high) in words {
+            let params = CombineParams::from_wire(low, high);
+            let expected = run_one_cycle(params, ALL_INPUTS);
+            let actual = run_combiner(params, ALL_INPUTS, CombinerCycleMode::OneCycle);
+            assert_eq!(actual, expected, "low={low:#010x} high={high:#010x}");
+        }
+    }
+
+    // -- §9c: cycle-mode wiring sweep.
+
+    /// One-cycle mode: `C_COMBINED`/`A_COMBINED` in any slot reads the
+    /// zero-initialized accumulator, with no wrap applied — the
+    /// `run_combiner`-level counterpart of the existing unit-level
+    /// `combined_reads_zero_init_in_one_cycle_mode` test, exercised through
+    /// every one of the four color slots and all four alpha slots
+    /// independently, end to end.
+    #[test]
+    fn one_cycle_combined_reads_zero_init_not_wrap_every_slot() {
+        // color: A=COMBINED, B=ZERO, C=KEY_SCALE (overridden to [1,1,1],
+        // standing in for ONE -- color-C has no true ONE entry), D=ZERO.
+        // One-cycle mode always evaluates the cycle-1 bitfield slice
+        // (second element of each pair below), per module docs.
+        let inputs = CombinerInputs {
+            key_scale: [1.0, 1.0, 1.0],
+            ..ALL_INPUTS
+        };
+        let params_a = pack_two_cycle_combine(
+            [IDX_COMBINED, IDX_COMBINED],
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [IDX_COLOR_ZERO_C, 6],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [IDX_COMBINED, IDX_COMBINED],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+            [IDX_ALPHA_ZERO_C, 6],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        let inputs_alpha_one = CombinerInputs {
+            prim_lod_frac: 1.0,
+            ..inputs
+        };
+        let (color, alpha_compare) =
+            run_combiner(params_a, inputs_alpha_one, CombinerCycleMode::OneCycle);
+        // (COMBINED(=0) - ZERO) * KEY_SCALE/PRIM_LOD_FRAC(=1.0) + ZERO = 0,
+        // for every channel.
+        assert_eq!(color, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(alpha_compare, 0.0);
+    }
+
+    /// Two-cycle cross-feed (§9c): cycle 0 produces a known non-trivial
+    /// color; cycle 1's slot A reads it back via `C_COMBINED`/`A_COMBINED`.
+    /// Confirms the wrap-range selected is `wrapInputABD`'s (slot A is not
+    /// slot C), and that the value flowing into cycle 1 is cycle 0's real
+    /// (unclamped, pre-final-wrapClamp) output, wrapped once by
+    /// `wrap_input_abd` — not the raw value, and not additionally clamped
+    /// to `[0,1]` before cycle 1 reads it (that only happens at the very
+    /// end, in `run_combiner`'s trailing `wrap_clamp` calls).
+    #[test]
+    fn two_cycle_cross_feed_combined_via_non_c_slot_uses_abd_wrap() {
+        // cycle 0 color: A=TEXEL0(1), B=ZERO(covered by common table's 8..
+        // collapse via index 8 on a slot that doesn't reach it -- use
+        // explicit ZERO-shaped selectors instead), C=ONE, D=ZERO. This
+        // yields TEXEL0 verbatim for cycle 0's RGB, which for ALL_INPUTS is
+        // within [0,1] so wrap_input_abd is a no-op on it, isolating the
+        // cross-feed wrap-selection itself as the property under test.
+        // cycle 1 color: A=COMBINED(0), B=ZERO, C=ONE, D=ZERO -> passes
+        // cycle 0's (wrapped) color straight through.
+        // Color's C slot has NO `ONE` entry (index 6 there is `KeyScale`,
+        // not `ONE` -- `ONE` is only reachable from slots A/B/D). Use
+        // `KeyScale` with its value overridden to [1,1,1] as an effective
+        // ONE. Alpha's C slot has a *distinct* table with no ONE entry
+        // either (alpha_input_c has only LOD_FRACTION/TEXEL0/TEXEL1/
+        // PRIMITIVE/SHADE/ENVIRONMENT/PRIM_LOD_FRAC), so alpha uses
+        // ENVIRONMENT (index 5) as its multiplier instead, and the expected
+        // math accounts for that factor explicitly.
+        let inputs = CombinerInputs {
+            key_scale: [1.0, 1.0, 1.0],
+            ..ALL_INPUTS
+        };
+        let params = pack_two_cycle_combine(
+            [1, IDX_COMBINED],                        // color A: cycle0=TEXEL0, cycle1=COMBINED
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],     // color B: ZERO both cycles
+            [6, 6], // color C: KEY_SCALE both cycles (overridden to [1,1,1] above)
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D], // color D: ZERO both cycles
+            [1, IDX_COMBINED], // alpha A: cycle0=TEXEL0, cycle1=COMBINED
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha B: ZERO both cycles
+            [5, 5], // alpha C: ENVIRONMENT both cycles
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+        let (color, _alpha_compare) = run_combiner(params, inputs, CombinerCycleMode::TwoCycle);
+
+        // Independently derived: cycle 0 color is exactly inputs' tex_val0
+        // (in range, so wrap_input_abd is a no-op), which cycle 1 then
+        // passes through verbatim (COMBINED * KEY_SCALE(=1) + ZERO); the
+        // final wrap_clamp is a no-op for in-range values too.
+        let expected_rgb = [inputs.tex_val0[0], inputs.tex_val0[1], inputs.tex_val0[2]];
+        for (observed, expected) in color[..3].iter().zip(expected_rgb) {
+            assert!((observed - expected).abs() < 1e-6);
+        }
+
+        // cycle 0 alpha: (TEXEL0.a - 0) * env.a + 0 = tex_val0.a * env.a.
+        let cycle0_alpha = ALL_INPUTS.tex_val0[3] * ALL_INPUTS.env_color[3];
+        // cycle 1 alpha: (COMBINED - 0) * env.a + 0, where COMBINED is
+        // cycle 0's alpha wrapped by wrap_input_abd (alpha slot A, not C).
+        let expected_alpha = wrap_input_abd(cycle0_alpha) * ALL_INPUTS.env_color[3];
+        assert!((color[3] - expected_alpha.clamp(0.0, 1.0)).abs() < 1e-6);
+    }
+
+    /// Two-cycle cross-feed via slot **C** specifically: confirms the
+    /// `wrapInputC`-vs-`wrapInputABD` range choice really is keyed off
+    /// which slot's selector is `COMBINED` for the *consuming* cycle, by
+    /// driving cycle 0's output to a value that the two wrap ranges treat
+    /// differently, then reading it back through slot C in cycle 1.
+    /// `wrapInputC`'s range is `[-1-1/255, 1+1/255]`; `wrapInputABD`'s is
+    /// `[-0.5-1/255, 1.5+1/255]` — a cycle-0 output of `-0.75` sits inside
+    /// the C range (no wrap) but at-or-below the ABD range's `LOW` bound
+    /// (wraps). This test drives cycle 0 to produce exactly `-0.75` on
+    /// every channel via `(ZERO - PRIMITIVE) * ONE + ZERO` with a crafted
+    /// `prim_color`, then reads it back through slot **C** in cycle 1
+    /// (`(TEXEL0 - ZERO) * COMBINED + ZERO`) and confirms the result
+    /// matches the *unwrapped* `-0.75`, not `wrap_input_abd(-0.75)`.
+    #[test]
+    fn two_cycle_cross_feed_via_slot_c_uses_c_wrap_not_abd_wrap() {
+        // Color's C slot has NO `ONE` entry (index 6 there is `KeyScale`) --
+        // override key_scale to [1,1,1] as an effective ONE for cycle 0.
+        let inputs = CombinerInputs {
+            prim_color: [0.75, 0.75, 0.75, 0.75],
+            key_scale: [1.0, 1.0, 1.0],
+            ..ALL_INPUTS
+        };
+        // cycle 0 color: A=ZERO(8, the 8..15 collapse), B=PRIMITIVE(3),
+        // C=KEY_SCALE(6, overridden to 1.0), D=ZERO -> (0 - 0.75) * 1 + 0 =
+        // -0.75 on every RGB channel. cycle 1 color: A=TEXEL0(1), B=ZERO,
+        // C=COMBINED(0), D=ZERO -> reads the carried value back through
+        // slot C specifically.
+        // Alpha's slots are only decoded/evaluated here as a side effect of
+        // running the shared combine formula (`run_cycle` always evaluates
+        // both channels) -- this test only asserts on the RGB channels, so
+        // alpha's own C-slot selector value is not load-bearing; it is set
+        // to ENVIRONMENT (alpha-C has no ONE entry at all, unlike color-C's
+        // KEY_SCALE workaround) purely so the alpha computation stays
+        // well-defined.
+        let params = pack_two_cycle_combine(
+            [8, 1],                                   // color A: cycle0=ZERO, cycle1=TEXEL0
+            [3, IDX_COLOR_ZERO_B],                    // color B: cycle0=PRIMITIVE, cycle1=ZERO
+            [6, IDX_COMBINED], // color C: cycle0=KEY_SCALE(=1.0), cycle1=COMBINED
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D], // color D: ZERO both cycles
+            [IDX_ALPHA_ZERO_ABD, 1], // alpha A: cycle0=ZERO, cycle1=TEXEL0
+            [3, IDX_ALPHA_ZERO_ABD], // alpha B: cycle0=PRIMITIVE, cycle1=ZERO
+            [5, IDX_COMBINED], // alpha C: cycle0=ENVIRONMENT, cycle1=COMBINED
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::Combined
+        );
+
+        let (color, _alpha_compare) = run_combiner(params, inputs, CombinerCycleMode::TwoCycle);
+
+        // cycle 0: (ZERO - PRIMITIVE) * ONE + ZERO = -0.75 on every channel.
+        // cross-feed into cycle 1 slot C specifically: wrap_input_c(-0.75)
+        // == -0.75 (inside [-1-1/255, 1+1/255], no wrap), so cycle 1's
+        // COMBINED read (via slot C) yields exactly -0.75 as the "C" factor
+        // in (TEXEL0 - ZERO) * (-0.75) + ZERO.
+        let unwrapped_carry = -0.75f32;
+        assert!(
+            (wrap_input_c(unwrapped_carry) - unwrapped_carry).abs() < 1e-6,
+            "fixture premise: -0.75 must be a no-op under wrap_input_c"
+        );
+        assert!(
+            (wrap_input_abd(unwrapped_carry) - unwrapped_carry).abs() > 1e-3,
+            "fixture premise: -0.75 must NOT be a no-op under wrap_input_abd"
+        );
+
+        // Cycle 1 is the swapped pass (see
+        // `texel_swap_is_cycle_specific_not_selector_specific`), so its
+        // `TEXEL0` selector reads `tex_val1`, not `tex_val0`.
+        let expected_rgb = [
+            inputs.tex_val1[0] * unwrapped_carry,
+            inputs.tex_val1[1] * unwrapped_carry,
+            inputs.tex_val1[2] * unwrapped_carry,
+        ];
+        // Compare against the real `wrap_clamp` (wrapInputABD then
+        // clamp(0,1)), not a bare `.clamp(0.0, 1.0)` — these expected
+        // products are outside [0,1] but inside wrapInputABD's wider
+        // range, so a bare clamp would flatten both the correct and an
+        // incorrect (e.g. tex_val0-based) expectation to the same value
+        // and the assertion would lose its discriminating power.
+        for (observed, expected) in color[..3].iter().zip(expected_rgb) {
+            assert!(
+                (observed - wrap_clamp(expected)).abs() < 1e-5,
+                "observed={observed} expected={expected} wrap_clamp(expected)={}",
+                wrap_clamp(expected)
+            );
+        }
+    }
+
+    /// `alphaCompareValue` cycle-0 snapshot timing (§9c, §4): crafts a
+    /// two-cycle combine where cycle 0's alpha output differs from the
+    /// final (cycle-1) alpha output, and confirms `alphaCompareValue`
+    /// equals cycle 0's alpha, not the final `combinerColor.a`.
+    #[test]
+    fn alpha_compare_value_captures_cycle_zero_not_final_alpha() {
+        // alpha-C's table has no ONE entry (unlike color-C) -- use
+        // PRIM_LOD_FRAC(6) as the multiplier slot with its value overridden
+        // to 1.0, so it behaves as an effective ONE for this fixture.
+        let inputs = CombinerInputs {
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // cycle 0 alpha: A=SHADE(4 in alphaInputABD), B=ZERO, C=PRIM_LOD_FRAC(6, =1.0), D=ZERO
+        // -> shade_color.a.
+        // cycle 1 alpha: A=ENVIRONMENT(5), B=ZERO, C=PRIM_LOD_FRAC(6, =1.0), D=ZERO
+        // -> env_color.a (unrelated value, distinct from shade_color.a in ALL_INPUTS).
+        let params = pack_two_cycle_combine(
+            [IDX_COLOR_ZERO_A, IDX_COLOR_ZERO_A],
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [IDX_COLOR_ZERO_C, IDX_COLOR_ZERO_C],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [4, 5], // alpha A: cycle0=SHADE, cycle1=ENVIRONMENT
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha B: ZERO both cycles
+            [6, 6], // alpha C: PRIM_LOD_FRAC both cycles (overridden to 1.0 above)
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+        assert_ne!(inputs.shade_color[3], inputs.env_color[3]);
+
+        let (color, alpha_compare) = run_combiner(params, inputs, CombinerCycleMode::TwoCycle);
+
+        assert!((alpha_compare - inputs.shade_color[3]).abs() < 1e-6);
+        assert!((color[3] - inputs.env_color[3]).abs() < 1e-6);
+        assert_ne!(alpha_compare, color[3]);
+    }
+
+    /// Cycle-specific TEXEL0/TEXEL1 swap (§4, `fromColorInput`/
+    /// `fromAlphaInput`'s `secondCycle ? texVal1 : texVal0` branch):
+    /// cycle 0 must read the un-swapped texel; cycle 1 must read the
+    /// swapped texel. Constructs a combine mode that is *only* TEXEL0 in
+    /// both cycles at the selector level, and confirms cycle 0's output
+    /// tracks `tex_val0` while cycle 1's tracks `tex_val1` — proving the
+    /// swap is driven by which pass is executing, not by the selector
+    /// value itself (which is identically `C_TEXEL0`/`A_TEXEL0` both
+    /// times).
+    #[test]
+    fn texel_swap_is_cycle_specific_not_selector_specific() {
+        // Neither color-C (index 6 there is KeyScale) nor alpha-C (index 6
+        // there is PrimLodFrac) has an ONE entry -- override both to an
+        // effective 1.0/[1,1,1] so both channels stay a clean passthrough.
+        let inputs = CombinerInputs {
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // Both cycles: A=TEXEL0(1), B=ZERO, C=KEY_SCALE(6)/PRIM_LOD_FRAC(6)
+        // overridden to 1.0, D=ZERO -- selector-identical across cycles, so
+        // any output difference must come from the pass-specific
+        // secondCycle swap flag, not decode. Index 0 (a natural typo target
+        // for "zero") decodes to COMBINED in every slot's common table, so
+        // ZERO-intended slots use their own explicit zero-collapse index.
+        let params = pack_two_cycle_combine(
+            [1, 1],
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [6, 6],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [1, 1],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+            [6, 6],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        assert_ne!(inputs.tex_val0, inputs.tex_val1);
+
+        // Isolate cycle 0's raw (pre-final-wrapClamp) output via run_cycle
+        // directly, to check the swap without the two-cycle cross-feed's
+        // own wrap potentially masking a swap bug through a coincidental
+        // match after wrapping.
+        let cycle0 = run_cycle(params, inputs, CyclePass::FirstOfTwoCycles, false, [0.0; 4]);
+        let cycle1 = run_cycle(params, inputs, CyclePass::SecondOfTwoCycles, false, cycle0);
+
+        for (observed, expected) in cycle0[..3].iter().zip(inputs.tex_val0) {
+            assert!(
+                (observed - expected).abs() < 1e-6,
+                "cycle 0 must read tex_val0 un-swapped"
+            );
+        }
+        assert!((cycle0[3] - inputs.tex_val0[3]).abs() < 1e-6);
+
+        for (observed, expected) in cycle1[..3].iter().zip(inputs.tex_val1) {
+            assert!(
+                (observed - expected).abs() < 1e-6,
+                "cycle 1 must read tex_val1 (swapped)"
+            );
+        }
+        assert!((cycle1[3] - inputs.tex_val1[3]).abs() < 1e-6);
+    }
+
+    /// Selectors across both cycles: a combine mode using a *different*,
+    /// non-TEXEL0/TEXEL1 selector set per cycle end to end through
+    /// `run_combiner`, hand-derived against `(A-B)*C+D` independently for
+    /// each cycle, confirming both the correct per-cycle bitfield decode
+    /// and the correct threading of cycle 0's output into cycle 1's
+    /// `COMBINED` read.
+    #[test]
+    fn run_combiner_two_cycle_end_to_end_distinct_selectors_per_cycle() {
+        // Color-C has no `ONE` (index 6 there is `KeyScale`); alpha-C has no
+        // `ONE` either (index 6 there is `PrimLodFrac`). Override both
+        // fields to 1.0/[1,1,1] so cycle 1's multiplier slot behaves as an
+        // effective ONE.
+        let inputs = CombinerInputs {
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // cycle 0 color: (SHADE - PRIMITIVE) * ENVIRONMENT + ZERO.
+        // cycle 1 color: (COMBINED - TEXEL0) * KEY_SCALE(=1.0) + ZERO --
+        // reads cycle 0's wrapped output back via slot A.
+        let params = pack_two_cycle_combine(
+            [4, IDX_COMBINED],                        // color A: cycle0=SHADE, cycle1=COMBINED
+            [3, 1],                                   // color B: cycle0=PRIMITIVE, cycle1=TEXEL0
+            [5, 6], // color C: cycle0=ENVIRONMENT, cycle1=KEY_SCALE(=1.0)
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D], // color D: ZERO both cycles
+            [4, IDX_COMBINED], // alpha A: cycle0=SHADE, cycle1=COMBINED
+            [3, 1], // alpha B: cycle0=PRIMITIVE, cycle1=TEXEL0
+            [5, 6], // alpha C: cycle0=ENVIRONMENT, cycle1=PRIM_LOD_FRAC(=1.0)
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+
+        let (color, _alpha_compare) = run_combiner(params, inputs, CombinerCycleMode::TwoCycle);
+
+        let cycle0_rgb = [
+            (inputs.shade_color[0] - inputs.prim_color[0]) * inputs.env_color[0],
+            (inputs.shade_color[1] - inputs.prim_color[1]) * inputs.env_color[1],
+            (inputs.shade_color[2] - inputs.prim_color[2]) * inputs.env_color[2],
+        ];
+        let cycle0_alpha = (inputs.shade_color[3] - inputs.prim_color[3]) * inputs.env_color[3];
+
+        // Cycle 1 reads cycle 0's output back through slot A as COMBINED,
+        // wrapped by wrap_input_abd (slot A, not slot C) before use; slot B
+        // reads TEXEL0 -- but cycle 1 is the *swapped* pass, so "TEXEL0"
+        // here actually reads inputs.tex_val1 (see
+        // texel_swap_is_cycle_specific_not_selector_specific).
+        let carried_rgb = [
+            wrap_input_abd(cycle0_rgb[0]),
+            wrap_input_abd(cycle0_rgb[1]),
+            wrap_input_abd(cycle0_rgb[2]),
+        ];
+        let carried_alpha = wrap_input_abd(cycle0_alpha);
+        let expected_rgb = [
+            (carried_rgb[0] - inputs.tex_val1[0]) * 1.0,
+            (carried_rgb[1] - inputs.tex_val1[1]) * 1.0,
+            (carried_rgb[2] - inputs.tex_val1[2]) * 1.0,
+        ];
+        let expected_alpha = (carried_alpha - inputs.tex_val1[3]) * 1.0;
+
+        // The final, always-on wrapClamp (RT64 `run`'s trailing pass) is
+        // itself wrapInputABD-then-clamp -- NOT a bare [0,1] clamp -- so an
+        // expected value below wrapInputABD's LOW bound (as happens here)
+        // must go through the real wrap_clamp function, not a plain
+        // `.clamp(0.0, 1.0)`, to match RT64 exactly.
+        for (observed, expected) in color[..3].iter().zip(expected_rgb) {
+            assert!(
+                (observed - wrap_clamp(expected)).abs() < 1e-5,
+                "observed={observed} expected={expected} wrap_clamp(expected)={}",
+                wrap_clamp(expected)
+            );
+        }
+        assert!((color[3] - wrap_clamp(expected_alpha)).abs() < 1e-5);
+    }
+
+    // -- §9b: wrap boundary partition, extended to the cross-cycle
+    // carry wrap functions (`wrap_input_c`/`wrap_input_abd`), independent
+    // of `wrap_clamp`'s existing boundary tests. Values immediately below,
+    // on, and above every boundary, both signs, mirroring
+    // `wrap_clamp_reference`'s independent-oracle discipline (a boundary
+    // value can retrigger the opposite branch after the first wrap, so each
+    // reference below duplicates the two-`if` structure rather than
+    // reasoning about one branch alone).
+
+    const C_ROUNDING: f32 = 1.0 / 255.0;
+    const C_LOW: f32 = -1.0 - C_ROUNDING;
+    const C_HIGH: f32 = 1.0 + C_ROUNDING;
+    const C_RANGE: f32 = C_HIGH - C_LOW;
+
+    fn wrap_input_c_reference(i: f32) -> f32 {
+        let mut wrapped = i;
+        if wrapped <= C_LOW {
+            wrapped += C_RANGE;
+        }
+        if C_HIGH <= wrapped {
+            wrapped -= C_RANGE;
+        }
+        wrapped
+    }
+
+    const ABD_ROUNDING: f32 = 1.0 / 255.0;
+    const ABD_LOW: f32 = -0.5 - ABD_ROUNDING;
+    const ABD_HIGH: f32 = 1.5 + ABD_ROUNDING;
+    const ABD_RANGE: f32 = ABD_HIGH - ABD_LOW;
+
+    fn wrap_input_abd_reference(i: f32) -> f32 {
+        let mut wrapped = i;
+        if wrapped <= ABD_LOW {
+            wrapped += ABD_RANGE;
+        }
+        if ABD_HIGH <= wrapped {
+            wrapped -= ABD_RANGE;
+        }
+        wrapped
+    }
+
+    /// `wrap_input_c` boundary partition: immediately below/on/above
+    /// `C_LOW`/`C_HIGH`, both signs (the low boundary is itself negative,
+    /// the high boundary positive, so "both signs" is inherent to the two
+    /// boundaries; this also covers a strictly-interior negative and
+    /// positive value for contrast).
+    #[test]
+    fn wrap_input_c_boundary_partition() {
+        let cases = [
+            C_LOW - 0.01,
+            C_LOW,
+            C_LOW + 0.01,
+            C_HIGH - 0.01,
+            C_HIGH,
+            C_HIGH + 0.01,
+            -0.9, // interior, negative
+            0.9,  // interior, positive
+        ];
+        for value in cases {
+            assert!(
+                (wrap_input_c(value) - wrap_input_c_reference(value)).abs() < 1e-6,
+                "value={value}"
+            );
+        }
+    }
+
+    /// `wrap_input_abd` boundary partition, same shape as
+    /// `wrap_input_c_boundary_partition` but over `ABD_LOW`/`ABD_HIGH`.
+    #[test]
+    fn wrap_input_abd_boundary_partition() {
+        let cases = [
+            ABD_LOW - 0.01,
+            ABD_LOW,
+            ABD_LOW + 0.01,
+            ABD_HIGH - 0.01,
+            ABD_HIGH,
+            ABD_HIGH + 0.01,
+            -0.4, // interior, negative
+            1.4,  // interior, positive
+        ];
+        for value in cases {
+            assert!(
+                (wrap_input_abd(value) - wrap_input_abd_reference(value)).abs() < 1e-6,
+                "value={value}"
+            );
+        }
+    }
+
+    /// Per-RGBA-component wrap boundary sweep (§9b): drives each of R, G,
+    /// B, A independently to a value that straddles `wrap_input_abd`'s low
+    /// boundary while the other three channels stay comfortably in-range,
+    /// via a two-cycle fixture whose cycle-0 output differs per channel
+    /// (distinct per-channel `prim_color`/`shade_color` values), then
+    /// confirms cycle 1's `COMBINED` read wraps each channel independently
+    /// — catching a bug that wraps only channel 0 or applies one wrap
+    /// decision uniformly across all four channels.
+    #[test]
+    fn wrap_applies_independently_per_rgba_component() {
+        // cycle 0: (ZERO - PRIMITIVE) * ONE + ZERO, with prim_color chosen
+        // so each channel lands at a different point relative to
+        // ABD_LOW: R exactly on it (after negation), G just below, B just
+        // above, A comfortably interior.
+        let prim = [
+            -ABD_LOW, // R: (0 - (-ABD_LOW)) = ABD_LOW... see below, negated by formula.
+            -(ABD_LOW - 0.01),
+            -(ABD_LOW + 0.01),
+            0.3,
+        ];
+        // The combine formula computes (ZERO - PRIMITIVE) = -PRIMITIVE, so
+        // to land cycle-0 output exactly on ABD_LOW we need
+        // -PRIMITIVE[r] == ABD_LOW, i.e. PRIMITIVE[r] == -ABD_LOW. The
+        // array above already encodes that relationship per channel.
+        // Neither color-C (index 6 there is `KeyScale`) nor alpha-C (index
+        // 6 there is `PrimLodFrac`) has an `ONE` entry -- override both
+        // fields to an effective 1.0 so both channels' arithmetic matches
+        // the shape described above exactly.
+        let inputs = CombinerInputs {
+            prim_color: prim,
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+
+        // Index 0 (a natural typo target for "zero") decodes to COMBINED in
+        // every slot's common table, so ZERO-intended slots use their own
+        // explicit zero-collapse index throughout.
+        let params = pack_two_cycle_combine(
+            [IDX_COLOR_ZERO_A, IDX_COMBINED], // color A: cycle0=ZERO, cycle1=COMBINED
+            [3, IDX_COLOR_ZERO_B],            // color B: cycle0=PRIMITIVE, cycle1=ZERO
+            [6, 6], // color C: KEY_SCALE both cycles (overridden to [1,1,1] above)
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D], // color D: ZERO both cycles
+            [IDX_ALPHA_ZERO_ABD, IDX_COMBINED], // alpha A: cycle0=ZERO, cycle1=COMBINED
+            [3, IDX_ALPHA_ZERO_ABD], // alpha B: cycle0=PRIMITIVE, cycle1=ZERO
+            [6, 6], // alpha C: PRIM_LOD_FRAC both cycles (overridden to 1.0 above)
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+
+        let cycle0 = run_cycle(params, inputs, CyclePass::FirstOfTwoCycles, false, [0.0; 4]);
+        let expected_cycle0 = [-prim[0], -prim[1], -prim[2], -prim[3]];
+        for (observed, expected) in cycle0.iter().zip(expected_cycle0) {
+            assert!((observed - expected).abs() < 1e-6);
+        }
+
+        let cycle1 = run_cycle(params, inputs, CyclePass::SecondOfTwoCycles, false, cycle0);
+        // cycle 1: (COMBINED - ZERO) * ONE + ZERO = wrap_input_abd(cycle0[channel]),
+        // independently per channel.
+        for channel in 0..4 {
+            let expected = wrap_input_abd(expected_cycle0[channel]);
+            assert!(
+                (cycle1[channel] - expected).abs() < 1e-6,
+                "channel {channel}: observed={} expected={}",
+                cycle1[channel],
+                expected
+            );
+        }
+        // Confirm the channels genuinely differ in wrap outcome (R sits on
+        // the boundary and wraps, D/A stays interior and does not) --
+        // proving this test exercises per-channel independence rather than
+        // a uniform decision.
+        assert_ne!(cycle1[0], expected_cycle0[0]); // R wrapped.
+        assert!((cycle1[3] - expected_cycle0[3]).abs() < 1e-6); // A did not.
+    }
+
+    // -- Hostile mutations: each test below independently re-derives the
+    // expected value from the pinned source's exact formulas/branch
+    // structure (not by calling `run_combiner`/`run_cycle` and trusting
+    // them), then asserts the real implementation matches that oracle and
+    // a plausible *wrong* implementation would not.
+
+    /// Hostile: swapped cycle order (running cycle 1 before cycle 0) would
+    /// still type-check and produce *some* two-cycle-shaped output, but
+    /// would feed cycle 1's own zero-init accumulator into what should be
+    /// cycle 0, and cycle 0's decode into what should be cycle 1's
+    /// bitfield slice. Catches this by using distinct, order-sensitive
+    /// selectors per cycle and confirming the *correct* cycle-0-then-1
+    /// order (already `run_combiner`'s only code path) matches an
+    /// independently-ordered-by-hand oracle, while the swapped order would
+    /// not.
+    #[test]
+    fn hostile_swapped_cycle_order_is_detected() {
+        // Color's C slot has no ONE entry (index 6 there is KeyScale) --
+        // override key_scale to [1,1,1] as an effective ONE. prim_color is
+        // pushed out of wrapInputABD's no-op range so cycle 0's real output
+        // (-2.0) provably changes under the cross-cycle-carry wrap, giving
+        // the correct and swapped orderings genuinely different final
+        // values instead of accidentally converging.
+        let inputs = CombinerInputs {
+            prim_color: [2.0, 2.0, 2.0, 2.0],
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // cycle 0: (ZERO - PRIMITIVE) * KEY_SCALE(=1.0) + ZERO = -2.0 on
+        // every channel. cycle 1: (COMBINED - ZERO) * KEY_SCALE(=1.0) +
+        // ZERO -- reads cycle 0's real output back via slot A's COMBINED
+        // selector, wrapped by wrap_input_abd (slot A, not slot C) before
+        // use.
+        let params = pack_two_cycle_combine(
+            [IDX_COLOR_ZERO_A, IDX_COMBINED], // color A: cycle0=ZERO, cycle1=COMBINED
+            [3, IDX_COLOR_ZERO_B],            // color B: cycle0=PRIMITIVE, cycle1=ZERO
+            [6, 6],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [IDX_ALPHA_ZERO_ABD, IDX_COMBINED],
+            [3, IDX_ALPHA_ZERO_ABD],
+            [6, 6],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+
+        // Correct order (this is run_combiner's only code path): cycle 0
+        // first, then cycle 1 fed cycle 0's real output.
+        let (color, _alpha_compare) = run_combiner(params, inputs, CombinerCycleMode::TwoCycle);
+        let correct_cycle0 =
+            run_cycle(params, inputs, CyclePass::FirstOfTwoCycles, false, [0.0; 4]);
+        let correct_cycle1 = run_cycle(
+            params,
+            inputs,
+            CyclePass::SecondOfTwoCycles,
+            false,
+            correct_cycle0,
+        );
+        for (observed, expected) in color.iter().zip(correct_cycle1) {
+            assert!((observed - expected).abs() < 1e-6);
+        }
+        // Sanity: cycle 0's real output is both non-zero and provably
+        // altered by wrap_input_abd -- otherwise this fixture would not
+        // discriminate order at either the intermediate or final level.
+        assert_eq!(correct_cycle0, [-2.0, -2.0, -2.0, -2.0]);
+        assert_ne!(
+            wrap_input_abd(correct_cycle0[0]),
+            correct_cycle0[0],
+            "fixture premise: wrap_input_abd must not be a no-op on cycle 0's real output"
+        );
+
+        // Hostile: a swapped-order bug that literally exchanges which
+        // `CyclePass` each call site passes -- the "first" call now uses
+        // `SecondOfTwoCycles` (cycle 1's bitfield slice + wrap semantics)
+        // against the zero-init accumulator, and the "second" call uses
+        // `FirstOfTwoCycles` (cycle 0's bitfield slice) fed that wrong
+        // intermediate result. This reproduces exactly what a transposed
+        // `run_combiner` body would compute as its final output.
+        let swapped_first = run_cycle(
+            params,
+            inputs,
+            CyclePass::SecondOfTwoCycles,
+            false,
+            [0.0; 4],
+        );
+        let swapped_final = run_cycle(
+            params,
+            inputs,
+            CyclePass::FirstOfTwoCycles,
+            false,
+            swapped_first,
+        );
+
+        // The swapped order's first call reads COMBINED against zero-init:
+        // (0 - 0) * key_scale + 0 = 0, distinguishably different from the
+        // correct order's cycle 0 (-2.0, non-zero).
+        assert_eq!(swapped_first, [0.0; 4]);
+        assert_ne!(swapped_first, correct_cycle0);
+        // The swapped order's "second" call uses cycle 0's own selectors
+        // (ZERO - PRIMITIVE) * KEY_SCALE + ZERO = -2.0 unconditionally --
+        // it does not read COMBINED at all, so it is invariant to the
+        // (wrong) accumulator it was fed, landing on plain -2.0. The real,
+        // correctly-ordered `run_combiner` output instead reads -2.0 back
+        // through COMBINED in its real cycle 1, wrapped by wrap_input_abd
+        // first -- a materially different number by the premise assertion
+        // above. This is the load-bearing check: it compares FINAL outputs,
+        // not intermediates, so a swap that happened to cancel out in some
+        // other fixture cannot hide here.
+        assert_eq!(swapped_final, [-2.0, -2.0, -2.0, -2.0]);
+        assert_ne!(
+            color, swapped_final,
+            "a swapped cycle order must not reproduce run_combiner's real final output"
+        );
+    }
+
+    /// Hostile: using the ABD wrap range for a slot-C `COMBINED` read (or
+    /// vice versa) is exactly what
+    /// `two_cycle_cross_feed_via_slot_c_uses_c_wrap_not_abd_wrap` and
+    /// `two_cycle_cross_feed_combined_via_non_c_slot_uses_abd_wrap` above
+    /// individually catch; this test adds a single fixture where the two
+    /// ranges disagree in *sign of the resulting wrap* (one range wraps,
+    /// the other doesn't) for the same carried value, driven through
+    /// `run_cycle` directly so no other code path can mask the mix-up.
+    #[test]
+    fn hostile_abd_wrap_for_c_slot_or_vice_versa_is_detected() {
+        // -0.75 is inside wrapInputC's range (no wrap) but outside
+        // wrapInputABD's range (wraps) -- see
+        // two_cycle_cross_feed_via_slot_c_uses_c_wrap_not_abd_wrap's own
+        // fixture-premise assertions for the numeric proof.
+        let carried = -0.75f32;
+        let via_c = wrap_input_c(carried);
+        let via_abd = wrap_input_abd(carried);
+        assert_ne!(
+            via_c, via_abd,
+            "fixture premise: the two wrap ranges must disagree for this value"
+        );
+
+        // params: color A=TEXEL0, B=ZERO, C=COMBINED, D=ZERO -- cycle 1's
+        // slot C is the discriminator. Index 0 (a natural typo target for
+        // "zero") decodes to COMBINED in every slot's common table, so
+        // ZERO-intended slots use their own explicit zero-collapse index.
+        let params = pack_two_cycle_combine(
+            [1, 1], // color A: TEXEL0 both cycles
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [IDX_COMBINED, IDX_COMBINED], // color C: cycle1=COMBINED (the discriminator)
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [1, 1],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+            [IDX_ALPHA_ZERO_C, IDX_ALPHA_ZERO_C],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        // Cycle 1's slot C selector really is COMBINED here (index 0 in
+        // both the common table and this packing), so run_cycle must use
+        // wrap_input_c, not wrap_input_abd, on the incoming accumulator.
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::Combined
+        );
+
+        let cycle1 = run_cycle(
+            params,
+            ALL_INPUTS,
+            CyclePass::SecondOfTwoCycles,
+            false,
+            [carried, carried, carried, carried],
+        );
+        // (TEXEL0 - ZERO) * COMBINED + ZERO, where the COMBINED read used as
+        // the C factor is NOT wrapped a second time by fromColorInput
+        // itself -- the pre-arithmetic wrap that primes the accumulator
+        // before any fromColorInput call must have used wrap_input_c, not
+        // wrap_input_abd, since slot C's own selector is COMBINED this
+        // cycle. Cycle 1 is the swapped pass, so "TEXEL0" here reads
+        // ALL_INPUTS.tex_val1 (see
+        // texel_swap_is_cycle_specific_not_selector_specific).
+        let expected_r = ALL_INPUTS.tex_val1[0] * via_c;
+        assert!(
+            (cycle1[0] - expected_r).abs() < 1e-5,
+            "observed={} expected={} (would differ if wrap_input_abd were used instead)",
+            cycle1[0],
+            expected_r
+        );
+        let wrong_r = ALL_INPUTS.tex_val1[0] * via_abd;
+        assert!(
+            (cycle1[0] - wrong_r).abs() > 1e-3,
+            "must NOT match the wrapInputABD-for-slot-C mistake"
+        );
+    }
+
+    /// Hostile: wrapping in one-cycle mode. RT64's `secondCycle` flag is
+    /// `twoCycle && secondCycleInputs`, always `false` in one-cycle mode —
+    /// so even though one-cycle mode's single pass uses the *cycle-1*
+    /// bitfield slice (`CyclePass::OnlyCycleOfOneCycleMode`, which is
+    /// `bitfield_second_cycle() == true`), it must NOT apply the
+    /// cross-cycle-carry wrap. Confirms this by feeding a non-zero,
+    /// out-of-both-wrap-ranges `combiner_color_in` directly into
+    /// `run_cycle` under `OnlyCycleOfOneCycleMode` with a `COMBINED`
+    /// selector and checking the accumulator passes through un-wrapped
+    /// (only the final `wrap_clamp`, which this call bypasses by using
+    /// `run_cycle` directly rather than `run_combiner`, would ever touch
+    /// it).
+    #[test]
+    fn hostile_wrap_in_one_cycle_mode_is_detected() {
+        // (COMBINED - ZERO) * ONE-via-KEY_SCALE/PRIM_LOD_FRAC(overridden) +
+        // ZERO, so the result tracks the un-wrapped accumulator exactly,
+        // not a coincidental cancellation.
+        let inputs = CombinerInputs {
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        let params = pack_two_cycle_combine(
+            [1, IDX_COMBINED], // color A: cycle1=COMBINED (this fixture only evaluates the cycle-1 slice)
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [6, 6], // color C: KEY_SCALE both cycles (overridden to [1,1,1] above)
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [1, IDX_COMBINED],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+            [6, 6],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, true),
+            ColorInput::Combined
+        );
+
+        let out_of_range_carry = [5.0f32, 5.0, 5.0, 5.0];
+        let result = run_cycle(
+            params,
+            inputs,
+            CyclePass::OnlyCycleOfOneCycleMode,
+            false,
+            out_of_range_carry,
+        );
+        // (COMBINED - ZERO) * ONE + ZERO, with COMBINED read UN-wrapped:
+        // must equal exactly 5.0, not wrap_input_c(5.0)/wrap_input_abd(5.0)
+        // (both of which would reduce it toward [0,1]-ish ranges).
+        for observed in result {
+            assert!(
+                (observed - 5.0).abs() < 1e-6,
+                "one-cycle mode must not wrap the accumulator, observed={observed}"
+            );
+        }
+        assert_ne!(result[0], wrap_input_c(5.0));
+        assert_ne!(result[0], wrap_input_abd(5.0));
+    }
+
+    /// Hostile: wrapping after rather than before arithmetic. RT64 wraps
+    /// the *incoming* accumulator before any `fromColorInput`/
+    /// `fromAlphaInput` call reads it (`runCycle` lines 579-601, all before
+    /// line 603's combine-formula assignment). A buggy implementation that
+    /// instead wrapped the pass's *output* after computing `(A-B)*C+D`
+    /// would produce a different number whenever the selectors are
+    /// anything other than a bare `COMBINED` passthrough. Uses a
+    /// `COMBINED`-as-C-factor mode where wrap-before-arithmetic and
+    /// wrap-after-arithmetic provably diverge.
+    #[test]
+    fn hostile_wrap_after_arithmetic_instead_of_before_is_detected() {
+        // cycle 1: (TEXEL0 - ZERO) * COMBINED + ZERO. Feed an out-of-range
+        // carry so wrap actually changes the value. Every "ZERO" slot below
+        // uses its slot-specific zero-collapse index -- index 0 (a natural
+        // typo target) decodes to COMBINED in every slot's common table,
+        // not ZERO.
+        let params = pack_two_cycle_combine(
+            [1, 1], // color A: TEXEL0 both cycles
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [IDX_COMBINED, IDX_COMBINED], // color C: cycle1=COMBINED
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [1, 1],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+            [IDX_COMBINED, IDX_COMBINED],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        let carry_in = [2.0f32, 2.0, 2.0, 2.0]; // outside wrapInputABD's range; slot C == COMBINED -> wrapInputC.
+
+        let actual = run_cycle(
+            params,
+            ALL_INPUTS,
+            CyclePass::SecondOfTwoCycles,
+            false,
+            carry_in,
+        );
+
+        // Correct (wrap-before-arithmetic): factor_c = wrap_input_c(2.0),
+        // then (TEXEL0 - ZERO) * factor_c.
+        let correct_factor_c = wrap_input_c(2.0);
+        let correct_r = ALL_INPUTS.tex_val1[0] * correct_factor_c; // cycle 1 reads swapped TEXEL0 -> tex_val1.
+
+        // Wrong (wrap-after-arithmetic): raw_r = TEXEL0 * 2.0 (unwrapped C
+        // factor), then wrap_input_c(raw_r) as if the wrap applied to the
+        // finished product instead of the input.
+        let wrong_raw_r = ALL_INPUTS.tex_val1[0] * 2.0;
+        let wrong_r = wrap_input_c(wrong_raw_r);
+
+        assert!(
+            (actual[0] - correct_r).abs() < 1e-5,
+            "observed={} expected(before-arithmetic)={}",
+            actual[0],
+            correct_r
+        );
+        assert!(
+            (correct_r - wrong_r).abs() > 1e-3,
+            "fixture premise: before- and after-arithmetic wrapping must diverge numerically"
+        );
+        assert!(
+            (actual[0] - wrong_r).abs() > 1e-3,
+            "must not match the after-arithmetic mistake"
+        );
+    }
+
+    /// Hostile: missing per-component wrap (applying the wrap decision or
+    /// value to only one RGB channel, or sharing one scalar wrap result
+    /// across all three, instead of three independent scalar wraps).
+    /// Reuses `wrap_applies_independently_per_rgba_component`'s fixture
+    /// shape but asserts the specific failure mode: if channel 0's wrapped
+    /// value were incorrectly broadcast to channels 1/2 (a plausible
+    /// "wrap once, reuse for RGB" bug), they would not match their own
+    /// independently-derived expectations.
+    #[test]
+    fn hostile_missing_per_component_wrap_is_detected() {
+        let prim = [-ABD_LOW, -(ABD_LOW - 0.01), -(ABD_LOW + 0.01), 0.3];
+        // Neither color-C nor alpha-C has an ONE entry at index 6; override
+        // both to an effective 1.0/[1,1,1] (same shape as
+        // `wrap_applies_independently_per_rgba_component`).
+        let inputs = CombinerInputs {
+            prim_color: prim,
+            key_scale: [1.0, 1.0, 1.0],
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // Index 0 (a natural typo target for "zero") decodes to COMBINED in
+        // every slot's common table, so ZERO-intended slots use their own
+        // explicit zero-collapse index.
+        let params = pack_two_cycle_combine(
+            [IDX_COLOR_ZERO_A, IDX_COMBINED],
+            [3, IDX_COLOR_ZERO_B],
+            [6, 6],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [IDX_ALPHA_ZERO_ABD, IDX_COMBINED],
+            [3, IDX_ALPHA_ZERO_ABD],
+            [6, 6],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+
+        let cycle0 = run_cycle(params, inputs, CyclePass::FirstOfTwoCycles, false, [0.0; 4]);
+        let cycle1 = run_cycle(params, inputs, CyclePass::SecondOfTwoCycles, false, cycle0);
+
+        let expected_r = wrap_input_abd(cycle0[0]);
+        let expected_g = wrap_input_abd(cycle0[1]);
+        let expected_b = wrap_input_abd(cycle0[2]);
+        assert!((cycle1[0] - expected_r).abs() < 1e-6);
+        assert!((cycle1[1] - expected_g).abs() < 1e-6);
+        assert!((cycle1[2] - expected_b).abs() < 1e-6);
+        // A "wrap once, broadcast channel 0's result" bug would make
+        // channel 1 equal channel 0's wrapped value; the real
+        // per-component computation must not, since cycle0[0] != cycle0[1]
+        // by fixture construction (R sits on the boundary and wraps, G is
+        // just below and also wraps but to a different magnitude, so their
+        // wrapped outputs remain numerically distinct).
+        assert_ne!(cycle1[0], cycle1[1]);
+    }
+
+    /// Hostile: premature clamp. If `wrap_input_abd`/`wrap_input_c`
+    /// additionally hard-clamped to `[0,1]` (instead of only wrapping,
+    /// leaving the final `[0,1]` clamp to `run_combiner`'s trailing
+    /// `wrap_clamp` pass alone), a cross-cycle carry value that wraps to
+    /// something still outside `[0,1]` would be silently forced into range
+    /// one cycle early, changing cycle 1's arithmetic. This test picks
+    /// inputs whose wrapped *output* is itself still outside `[0,1]` (per
+    /// each function's own wrap range, wider than `[0,1]`) and pins that
+    /// `wrap_input_c`/`wrap_input_abd` never additionally clamp to `[0,1]`.
+    #[test]
+    fn hostile_premature_zero_one_clamp_in_carry_wrap_is_detected() {
+        // Values chosen so the wrapped result is provably outside [0,1],
+        // which a premature-clamp bug would silently force into range.
+        let c_wrapped = wrap_input_c(C_HIGH + 0.3);
+        assert!(
+            !(0.0..=1.0).contains(&c_wrapped),
+            "fixture premise: wrap_input_c's own output must land outside [0,1] here, got {c_wrapped}"
+        );
+        let abd_wrapped = wrap_input_abd(ABD_HIGH + 0.3);
+        assert!(
+            !(0.0..=1.0).contains(&abd_wrapped),
+            "fixture premise: wrap_input_abd's own output must land outside [0,1] here, got {abd_wrapped}"
+        );
+    }
+
+    /// Hostile: lost cross-cycle alpha. A bug that threads only the RGB
+    /// channels from cycle 0 into cycle 1 (dropping or zeroing the alpha
+    /// channel of the carried accumulator) would break any cycle-1 alpha
+    /// formula that reads `A_COMBINED`. Constructs exactly that case and
+    /// confirms cycle 1's alpha equals `wrap_input_abd` of cycle 0's real
+    /// alpha output, not zero and not cycle 0's RGB reused as alpha.
+    #[test]
+    fn hostile_lost_cross_cycle_alpha_is_detected() {
+        // Alpha-C's table has no ONE entry (index 6 there is PrimLodFrac) --
+        // override its value to 1.0 as an effective ONE.
+        let inputs = CombinerInputs {
+            prim_lod_frac: 1.0,
+            ..ALL_INPUTS
+        };
+        // cycle 0 alpha: (SHADE - ZERO) * PRIM_LOD_FRAC(=1.0) + ZERO =
+        // shade_color.a (a value distinct from 0.0 and from any RGB channel
+        // by construction, since ALL_INPUTS.shade_color's channels are all
+        // distinct).
+        let params = pack_two_cycle_combine(
+            [IDX_COLOR_ZERO_A, IDX_COLOR_ZERO_A],
+            [IDX_COLOR_ZERO_B, IDX_COLOR_ZERO_B],
+            [IDX_COLOR_ZERO_C, IDX_COLOR_ZERO_C],
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D],
+            [4, IDX_COMBINED], // alpha A: cycle0=SHADE, cycle1=COMBINED
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha B: ZERO both cycles
+            [6, 6],            // alpha C: PRIM_LOD_FRAC both cycles (overridden to 1.0 above)
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD], // alpha D: ZERO both cycles
+        );
+        let cycle0 = run_cycle(params, inputs, CyclePass::FirstOfTwoCycles, false, [0.0; 4]);
+        assert!((cycle0[3] - inputs.shade_color[3]).abs() < 1e-6);
+        assert_ne!(cycle0[3], 0.0);
+
+        let cycle1 = run_cycle(params, inputs, CyclePass::SecondOfTwoCycles, false, cycle0);
+        let expected_alpha = wrap_input_abd(cycle0[3]);
+        assert!(
+            (cycle1[3] - expected_alpha).abs() < 1e-6,
+            "observed={} expected={} (a lost-carry bug would instead read 0.0 here)",
+            cycle1[3],
+            expected_alpha
+        );
+        assert_ne!(cycle1[3], 0.0);
+    }
+
+    /// Hostile: algebraic reordering. `(A-B)*C+D` must be evaluated in
+    /// exactly that grouping and order — not `(A-B)*(C+D)`, not
+    /// `A*C - B*C + D` reassociated in a way that changes floating-point
+    /// rounding, not `D + (A-B)*C`. Uses f32 values specifically chosen so
+    /// that `(A-B)*C+D` and a plausible reassociation
+    /// (`A*C - B*C + D`) round differently at the bit level — floating
+    /// point multiplication does not distribute exactly over subtraction —
+    /// confirming `run_cycle`'s output matches the exact grouping RT64
+    /// uses, not merely a mathematically-equivalent-in-the-reals one.
+    #[test]
+    fn hostile_algebraic_reordering_is_detected() {
+        // Values chosen to have many significant bits so that
+        // (A-B)*C and A*C-B*C differ in their last ULPs.
+        let a = 0.1f32;
+        let b = 0.100_000_02_f32; // one ULP-ish away from a.
+        let c = 123_456.79_f32;
+        let d = 0.0f32;
+
+        let grouped = (a - b) * c + d;
+        let reassociated = a * c - b * c + d;
+        assert_ne!(
+            grouped, reassociated,
+            "fixture premise: the two groupings must round differently at f32 precision"
+        );
+
+        let inputs = CombinerInputs {
+            prim_color: [a, a, a, a],
+            shade_color: [b, b, b, b],
+            env_color: [c, c, c, c],
+            ..ALL_INPUTS
+        };
+        // (PRIMITIVE - SHADE) * ENVIRONMENT + ZERO, one-cycle mode (no wrap
+        // interference), values chosen to stay within wrap_clamp's no-op
+        // range... actually c is far outside [0,1]-adjacent ranges, so use
+        // run_cycle directly (no final wrap_clamp) to observe the raw
+        // grouped arithmetic.
+        let params = pack_two_cycle_combine(
+            [3, 3],                               // color A: PRIMITIVE
+            [4, 4],                               // color B: SHADE
+            [5, 5],                               // color C: ENVIRONMENT
+            [IDX_COLOR_ZERO_D, IDX_COLOR_ZERO_D], // color D: ZERO
+            [3, 3],
+            [4, 4],
+            [5, 5],
+            [IDX_ALPHA_ZERO_ABD, IDX_ALPHA_ZERO_ABD],
+        );
+        let result = run_cycle(
+            params,
+            inputs,
+            CyclePass::OnlyCycleOfOneCycleMode,
+            false,
+            [0.0; 4],
+        );
+        assert_eq!(
+            result[0], grouped,
+            "run_cycle must compute (A-B)*C+D in exactly that grouping"
+        );
+        assert_ne!(
+            result[0], reassociated,
+            "run_cycle must NOT match an algebraically-reassociated grouping"
+        );
     }
 }

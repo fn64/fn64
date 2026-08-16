@@ -647,27 +647,43 @@ parity, or performance claim. Combiner evaluation, coverage accumulation
 own `blend_fragment` signature), alpha compare, depth test, and dither are
 upstream/sibling concerns this module does not implement.
 
-## Color combiner: one-cycle selector arithmetic
+## Color combiner: one-cycle/two-cycle selector arithmetic
 
 `combiner` is a characterization-first port of RT64's color combiner,
 sourced from the MIT `src/shared/rt64_color_combiner.h`'s selector decode
 tables (`colorInputA/B/C/D`, `alphaInputABD/C`, `decodeColorInput`,
 `decodeAlphaInput`), `Inputs` struct, `fromColorInput`/`fromAlphaInput`, and
-`wrap`/`wrapInputABD`/`wrapClamp`/`runCycle`/`run` — the pinned commit
-`5473732a822a4423b5696e7cb18fecc425a59875` recorded as this crate's
+`wrap`/`wrapInputC`/`wrapInputABD`/`wrapClamp`/`runCycle`/`run` — the pinned
+commit `5473732a822a4423b5696e7cb18fecc425a59875` recorded as this crate's
 Rust-port source authority in `docs/RT64-PORT-AUTHORITY.md`. It provides
 typed `ColorInput`/`AlphaInput`/`CombineParams` selector decode — exact and
 complete for every wire-legal `(slot, index, second_cycle)` triple, matching
 RT64's `decodeColorInput`/`decodeAlphaInput` bit-for-bit — plus full
-one-cycle `(A-B)*C+D` arithmetic (`run_one_cycle`) that evaluates every
-selector either enum can hold: `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`,
-`SHADE`, `ENVIRONMENT`, `KEY_CENTER`, `KEY_SCALE`, `COMBINED_ALPHA` and the
-other `*_ALPHA` cross-reads, `LOD_FRACTION`, `PRIM_LOD_FRAC`, `NOISE`, `K4`,
-`K5`, `ONE`, and `ZERO`. An independently-derived Rust oracle
-(`combiner.rs`) is matched by an owned, Naga-validated WGSL transcription
-(`shaders/color_combiner.wgsl`, `COLOR_COMBINER_WGSL`) that implements
-identical arithmetic — neither is compiled into any pipeline or wired to a
-draw path.
+one-cycle and two-cycle `(A-B)*C+D` arithmetic (`run_one_cycle`,
+`run_combiner`/`run_two_cycle` taking a typed `CombinerCycleMode` rather than
+a raw boolean) that evaluates every selector either enum can hold:
+`COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`, `ENVIRONMENT`,
+`KEY_CENTER`, `KEY_SCALE`, `COMBINED_ALPHA` and the other `*_ALPHA`
+cross-reads, `LOD_FRACTION`, `PRIM_LOD_FRAC`, `NOISE`, `K4`, `K5`, `ONE`, and
+`ZERO`. An independently-derived Rust oracle (`combiner.rs`) is matched by an
+owned, Naga-validated WGSL transcription (`shaders/color_combiner.wgsl`,
+`COLOR_COMBINER_WGSL`) that implements identical arithmetic — neither is
+compiled into any pipeline or wired to a draw path.
+
+Two-cycle mode reproduces `runCycle`/`run`'s exact wiring: cycle 0 runs
+before cycle 1, threaded through one shared accumulator (RT64's single
+`inout float4 combinerColor`, never two independent evaluations); cycle 1's
+`COMBINED`/`COMBINED_ALPHA` selectors read cycle 0's real output, not the
+zero-init accumulator one-cycle mode always sees; `TEXEL0`/`TEXEL1` swap on
+cycle 1 specifically (`fromColorInput`/`fromAlphaInput`'s own `secondCycle`
+parameter, distinct from the bitfield-slice selector of the same name); the
+cross-cycle carry is wrapped by `wrapInputC`
+(`[-1-1/255,1+1/255]`)/`wrapInputABD` (`[-0.5-1/255,1.5+1/255]`) *before*
+any arithmetic reads it, with the range chosen independently for color and
+alpha by whether that channel's own slot-C selector is
+`COMBINED`/`COMBINED_ALPHA` this cycle, not by which slot is being resolved;
+and `alphaCompareValue` is captured immediately after cycle 0, never
+overwritten by cycle 1.
 
 `NOISE`, `LOD_FRACTION`, and `PRIM_LOD_FRAC` are caller-supplied typed
 fields on `CombinerInputs`, not generated here: RT64's own PRNG
@@ -678,18 +694,18 @@ module ports, so this module proves only that the formula correctly
 consumes whatever value it is given, mutating each field
 independently to confirm it actually participates rather than merely
 type-checking. The final `wrapClamp` (`wrapInputABD` then `clamp(0,1)`)
-applies unconditionally to every output channel; extreme/out-of-range
-caller-supplied scalars are exercised against the real wrap step boundary,
-not only the plain-clamp reduction that in-range texel/prim/shade/env
-inputs always hit.
+applies unconditionally to every output channel regardless of cycle count;
+extreme/out-of-range caller-supplied scalars are exercised against the real
+wrap step boundary, not only the plain-clamp reduction that in-range
+texel/prim/shade/env inputs always hit.
 
-**Nonclaims.** No two-cycle mode or its cross-cycle wrap/carry arithmetic,
-no copy mode, no `SetCombine` decode or `RdpState`/combiner-stack tracking,
-no real NOISE/LOD generation, no shader-keying or pipeline-variant
-selection, no texture/rasterizer integration (the crate's texel-fetch and
-three-nearest-filter machinery — see "M4.3.3f" above — is not wired to this
-module), no draw-path or production-DPC integration, no target/framebuffer
-write, and no RT64 pixel/visual/silicon parity or performance claim.
+**Nonclaims.** No copy mode, no `SetCombine` decode or `RdpState`/
+combiner-stack tracking, no real NOISE/LOD generation, no shader-keying or
+pipeline-variant selection, no texture/rasterizer integration (the crate's
+texel-fetch and three-nearest-filter machinery — see "M4.3.3f" above — is
+not wired to this module), no draw-path or production-DPC integration, no
+target/framebuffer write, and no RT64 pixel/visual/silicon parity or
+performance claim.
 
 ## Depth: strict-less compare/update (port-card slice 1)
 

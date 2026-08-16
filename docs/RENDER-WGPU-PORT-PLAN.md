@@ -1027,9 +1027,10 @@ The accelerated wave keeps dependency-safe work active in parallel:
     same-repo Rust-to-Rust differential drives the arithmetic against the
     reference lane's literal 262,144-case sweep plus a TMEM-address-grounded
     fixture at the `sf + tf == 32` boundary. It does not select which filter
-    mode applies, wire the filtered texel into a combiner (none exists in
-    this crate), drive per-pixel UV/gather from a rasterizer, or claim RT64
-    pixel/visual/silicon parity or performance.
+    mode applies, wire the filtered texel into the crate's pure one-cycle/
+    two-cycle color combiner (that seam is not connected to this decoder's
+    texel output), drive per-pixel UV/gather from a rasterizer, or claim
+    RT64 pixel/visual/silicon parity or performance.
     M2.5.3b adds a second owned WGSL component, `three_nearest_filter`,
     differentially gated directly against
     `fn64-render-reference::filter_three_nearest_s10_5` over a duplicated
@@ -1237,9 +1238,9 @@ The accelerated wave keeps dependency-safe work active in parallel:
     single fill-cycle rectangle write.
     Scope is exactly `CycleType::Fill` x RGBA16/RGBA32, matching what
     `plan_fill` already validates; `Copy`/`OneCycle`/`TwoCycle` fill and
-    `Index8` stay unimplemented (need the combiner, which does not exist in
-    this crate, or are out of the reference lane's own guaranteed-result
-    contract).
+    `Index8` stay unimplemented (need the crate's pure combiner wired into
+    this draw path, which it is not, or are out of the reference lane's own
+    guaranteed-result contract).
     **Coordinate provenance.** `raw_dpc::plan_fill`'s `>>2` and
     `fn64-render-reference`'s `draw_fill_rectangle` `.ceil()/.floor()` are
     reconciled, not chosen-over: both extract the identical wire field
