@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T10:46:00Z",
+    "updated_utc": "2026-08-16T11:03:34Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -681,13 +681,22 @@
       "findings": [
         "This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.",
         "Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.",
-        "Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap."
+        "Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.",
+        "Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.",
+        "The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        }
+      ],
       "blocker": null,
-      "next_action": "Finish the additive mechanism, obtain independent adversarial review, pass its deterministic bar, then execute and independently review all 56 rows.",
+      "next_action": "Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.",
       "started_utc": "2026-08-16T09:54:30Z",
-      "updated_utc": "2026-08-16T09:54:30Z"
+      "updated_utc": "2026-08-16T11:03:34Z"
     },
     {
       "id": "M2.5.2",

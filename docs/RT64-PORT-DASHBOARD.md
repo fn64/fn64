@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T10:46:00Z` |
+| updated | `2026-08-16T11:03:34Z` |
 
 ## Milestones
 
@@ -454,16 +454,24 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `m2-5a-reference-corpus` -> `main` |
 | dependencies | `M2.5` |
 | writable paths | `tools/rt64_reference_shader_artifacts.py`, `tools/test_rt64_reference_shader_artifacts.py`, `docs/rt64-reference-shader-artifact-schema.json`, `docs/RT64-REFERENCE-SHADER-ARTIFACTS.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T11:03:34Z` (elapsed 1h9m) |
+| verification runs meeting bar | 1/1 |
 
 **Findings:**
 
 - This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.
 - Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.
 - Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.
+- Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.
+- The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.
 
-**Next action:** Finish the additive mechanism, obtain independent adversarial review, pass its deterministic bar, then execute and independently review all 56 rows.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose` | 10 | 10 | deterministic |
+
+**Next action:** Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.
 
 ### `M2.5.2` -- Assess every reference-valid shader through the exact Naga/wgpu ingestion boundary with typed ingestible or blocked-known outcomes and a separate fail-closed runtime-ready gate.
 
