@@ -213,14 +213,14 @@ instance. It loudly rejects (typed `RawTexelError`, never masked or
 truncated) a `value` that does not fit `size`'s defined bit width — 4, 8, 16,
 or 32 bits — and multi-byte values combine big-endian, matching the rest of
 this crate's `to_be_bytes`/`from_be_bytes` convention. `RawTexel` takes no
-position on which `(format, size)` pairs are meaningful, so later CI/TLUT and
-YUV decode layers can reuse the same carrier for their own raw values ahead
-of a palette lookup or chroma conversion.
+position on which `(format, size)` pairs are meaningful, so M4.3.3b's CI/TLUT
+functions below and a future YUV layer can reuse the same carrier instead of
+inventing format-specific raw wrappers.
 `decode_direct_texel(format, raw)` then classifies `format` against an
 already-width-valid `RawTexel` and maps it to one `DecodedTexel` RGBA8888
 color, or a typed `DirectTexelDecodeError` naming why the pair is not one of
 the seven direct pairs: `IndexedDecodeIsSeparate` for `ColorIndex` (decoded
-through a separate, TLUT-aware indexed path this module never runs),
+through M4.3.3b's separate, TLUT-aware `resolve_indexed_texel` path),
 `YuvConversionDeferred` for `Yuv` (per M4.3's scope), and `UnsupportedPair`
 for every other combination (for example 4-bit or 8-bit direct RGBA, which
 the console does not define as real formats). All three types and both
@@ -247,22 +247,38 @@ transcription rather than re-deriving selector values. Exact source line
 ranges are cited at each decode function in `tmem/texel.rs`. RT64's
 TMEM-address and four-bit RGBA/I aliasing ("not a real format, replicated by
 observing hardware behavior") are read for citation only and are out of this
-slice's scope. RT64's CI dispatch is read for citation only, not asserted
-here: per the pinned source's `sampleTMEM` (TextureDecoder.hlsli:149-208),
-`ColorIndex` resolves against a TLUT only while a TLUT is active, and
-otherwise (`CI8`/`CI16`/`CI32`) decodes identically to the corresponding
-`Intensity` pair — CI does not unconditionally mean a palette lookup, and
-this slice takes no position on which side applies. No RT64 code is copied;
-only the numeric decode formula is transcribed, matching this crate's
+slice's scope. The pinned source's `sampleTMEM`
+(TextureDecoder.hlsli:149-208) supplies M4.3.3b's observed CI branch: a TLUT
+lookup occurs only while a table is active, while disabled CI aliases to
+intensity. M4.3.3b implements that branch only for CI4/CI8. Although RT64 also
+exhibits disabled CI16/CI32 intensity aliases, this slice deliberately rejects
+CI16/CI32 rather than silently widening the admitted pair set. No RT64 code is
+copied; only the numeric behavior is transcribed, matching this crate's
 existing `raster.rs` and `state.rs` provenance convention.
 
-This slice makes none of the following claims: TMEM addressing, storage, or
-byte validity; RDRAM or physical-source correctness; CI palette resolution or
-TLUT contents; YUV/chroma conversion; bilinear or box filtering; GPU upload
-or dispatch; or RT64 pixel-for-pixel parity. It does not consume M4.2's
-physical TMEM state or M4.0's guest-read plans; it is a standalone pure
-function pending a later slice that reads an already-resolved texel value out
-of physical TMEM and calls it.
+M4.3.3b extends that pure-value layer without crossing into physical TMEM.
+`OtherMode::texture_lut_mode()` decodes high bits 15:14 into the typed
+`TextureLutMode::{Disabled,Rgba16,Ia16}` set and rejects reserved encoding 1.
+`unpack_ci4_texel` extracts the high nibble for even columns and low nibble
+for odd columns from an already-isolated eight-bit packed value.
+`resolve_indexed_texel` admits only CI4/CI8, combines CI4's typed four-bit
+palette selector with its nibble, and ignores the selector for CI8. Disabled
+TLUT mode aliases the normalized eight-bit index to I8, including CI4's
+composite palette/index value. Enabled modes return a `TlutLookup` containing
+the index, RGBA16/IA16 entry interpretation, and canonical quadricated entry
+address `0x800 + index * 8`; they never fall back to direct decode.
+`decode_tlut_entry` accepts that lookup plus exactly one caller-supplied
+big-endian 16-bit `RawTexel` and reuses the existing RGBA16/IA16 conversion.
+Private fields and distinct `ResolvedIndexedTexel::{Direct,Tlut}` variants
+prevent a disabled result from consuming an entry or an enabled result from
+masquerading as a direct color.
+
+M4.3.3b makes no physical TMEM address/read, validity, epoch, generation,
+snapshot, first-row, odd-row, footprint, sampling, filtering, bilerp, LOD,
+cache, WGSL/GPU/upload, production-dispatch, YUV, non-CI TLUT-mode, parity, or
+performance claim. A later reader must bind the index and palette entry to one
+immutable `(PhysicalTmemStateIdentity, generation)` snapshot and resolve the
+still-open quadricated validity footprint before calling these pure functions.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,

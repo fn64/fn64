@@ -942,7 +942,8 @@ The accelerated wave keeps dependency-safe work active in parallel:
     reads, receipts every device-local effect, and publishes durable state only
     after guest commit. Public hardware authority overrides RT64's known
     source-size, starting-row, invalid-command, and host-layout shortcuts.
-19. **M4.3 -- load TLUT and decode committed textures (BLOCKED ON M4.2).**
+19. **M4.3 -- load TLUT and decode committed textures (RUNNING; M4.3.2 and
+    M4.3.3a INTEGRATED, `aec0ae1b`/`1f0a3213`; M4.3.3b THIS CHANGE).**
     Keep load semantics, physical TMEM, packed texture decode, sampling, and
     cache identity separate. `LoadTLUT` writes quadricated 16-bit entries into
     high-half TMEM; the CPU oracle and owned WGSL then cover RGBA16/32,
@@ -950,6 +951,17 @@ The accelerated wave keeps dependency-safe work active in parallel:
     validity-footprint checks. YUV remains blocked on its distinct
     `SetConvert`/filter/combiner contract, and cache publication keeps old
     generations isolated across overlapping TMEM/TLUT writes.
+    M4.3.3b is deliberately pure-value only: it decodes OtherMode high bits
+    15:14 into disabled/RGBA16/IA16 modes with reserved encoding 1 rejected,
+    extracts high-nibble-first CI4 values, normalizes CI4 palette+nibble and
+    CI8 byte indices, aliases disabled CI to I8, and returns typed enabled-TLUT
+    lookups at `0x800 + index * 8`. A caller-supplied big-endian 16-bit entry
+    reuses M4.3.3a's RGBA16/IA16 conversion. This slice does not read physical
+    TMEM or claim validity/epoch/generation/snapshot, footprint, addressing,
+    sampling/filtering, cache, GPU, production, parity, or performance. The
+    later physical reader must bind index and entry to one immutable state
+    identity/generation; the exact quadricated validity footprint remains an
+    authority blocker.
 
 ### M0 evidence ledger
 

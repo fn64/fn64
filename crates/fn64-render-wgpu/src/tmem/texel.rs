@@ -1,11 +1,11 @@
-//! M4.3.3a: allocation-free direct-format texel decode.
+//! M4.3.3: allocation-free direct and indexed-value texel decode.
 //!
 //! [`RawTexel`] is a format-neutral raw-value carrier: it validates only that
 //! a numeric value fits its `size`'s bit width (4/8/16/32), independent of
 //! `format`. It is deliberately not scoped to the seven direct pairs below —
-//! later CI/TLUT (M4.3.4/M4.3.5) and YUV layers reuse the same carrier for
-//! their own raw texel values before running a palette lookup or chroma
-//! conversion instead of a direct decode.
+//! M4.3.3b's CI/TLUT functions below and a future YUV layer reuse the same
+//! carrier for their own raw values instead of inventing format-specific raw
+//! wrappers.
 //!
 //! [`decode_direct_texel`] is the layer that is scoped to exactly the seven
 //! console "direct" `(format, size)` pairs that read one texel's color
@@ -19,18 +19,15 @@
 //! transcribed at [`crate::ImageFormat`]/[`crate::PixelSize`]
 //! (`wire.rs::image_format`/`wire.rs::pixel_size`) — this module reuses that
 //! prior transcription rather than re-deriving selector values. `ColorIndex`
-//! and `Yuv` pairs are rejected here as typed, named scope exclusions, not
-//! silent fallthroughs: `ColorIndex` decodes through a separate, TLUT-mode-
-//! aware indexed path this module never runs, and `Yuv` requires chroma
-//! conversion. That separate path's behavior is not unconditionally "a
-//! palette lookup" — the pinned RT64 source's own dispatch (`sampleTMEM`,
-//! TextureDecoder.hlsli:149-208) branches first on whether a TLUT is active
-//! at all (`usesTlut`, line 153/174), and only then, when TLUT is *not*
-//! active, falls through to `sampleTMEM8b`/`16b`/`32b`, which alias
-//! `G_IM_FMT_CI` to the same intensity decode as `G_IM_FMT_I` (line 74: "CI
-//! behaves like I when a TLUT is not active"). This module does not resolve
-//! that TLUT-mode branch and makes no claim about which side of it applies;
-//! it only names `ColorIndex` as out of its own direct-decode scope.
+//! and `Yuv` pairs are rejected by `decode_direct_texel` as typed, named scope
+//! exclusions, not silent fallthroughs: `ColorIndex` instead enters
+//! M4.3.3b's TLUT-mode-aware [`resolve_indexed_texel`] path below, while `Yuv`
+//! still requires deferred chroma conversion. The pinned RT64 `sampleTMEM`
+//! dispatch (TextureDecoder.hlsli:149-208) first tests whether a TLUT is
+//! active and, when disabled, aliases CI to intensity. M4.3.3b implements
+//! that branch only for the admitted CI4/CI8 pairs; despite RT64 also
+//! exhibiting disabled CI16/CI32 aliases, this slice rejects CI16/CI32
+//! explicitly rather than broadening its contract.
 //!
 //! Decode formulas are transcribed from the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
@@ -50,15 +47,28 @@
 //! of the same RDP field widths lives in
 //! [`crate::tmem::wire`] (`docs/RENDER-WGPU-PORT-PLAN.md` M4.1/M4.2).
 //!
-//! This module claims none of: TMEM addressing or storage, RDRAM/physical
-//! source validity, CI palette lookup, TLUT contents, YUV/chroma conversion,
-//! bilinear or box filtering, GPU upload, or RT64 pixel-for-pixel parity. It
-//! is a pure function from one already-isolated raw texel value plus its
-//! `(format, size)` pair to one RGBA8888 color.
+//! M4.3.3b adds the pure value boundary on the other side of that typed
+//! refusal. It extracts an already-isolated CI4 packed byte, normalizes CI4
+//! palette plus nibble or a CI8 byte into an eight-bit index, and either
+//! aliases the normalized index to I8 while the TLUT is disabled or returns
+//! a typed lookup naming the canonical quadricated high-bank entry address
+//! and RGBA16/IA16 interpretation. A separately supplied big-endian 16-bit
+//! entry is decoded through the existing direct conversion. The selector and
+//! CI behavior follow the permitted MIT RT64 source pinned at
+//! `5473732a822a4423b5696e7cb18fecc425a59875`: `shared/rt64_f3d_defines.h`,
+//! `shared/rt64_other_mode.h`, and `src/shaders/TextureDecoder.hlsli`.
+//!
+//! This module claims none of: physical TMEM addressing or reads, validity,
+//! epoch or generation binding, snapshot identity, tile-coordinate mapping,
+//! sub-16-entry footprints, sampling, filtering, bilerp, LOD, cache identity,
+//! RDRAM, GPU upload, production dispatch, YUV conversion, non-CI TLUT-mode
+//! behavior, RT64 pixel-for-pixel parity, or performance. Its indexed API is
+//! pure over already-isolated index and entry values; a later physical reader
+//! must bind both values to one immutable physical-state identity/generation.
 
 use core::fmt;
 
-use crate::{ImageFormat, PixelSize};
+use crate::{ImageFormat, PixelSize, TextureLutMode};
 
 /// One raw texel value, validated only against its `size`'s bit width.
 ///
@@ -176,6 +186,237 @@ impl DecodedTexel {
     }
 }
 
+/// A checked four-bit CI palette selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ci4Palette(u8);
+
+impl Ci4Palette {
+    pub const fn try_new(value: u8) -> Result<Self, Ci4PaletteError> {
+        if value <= 0x0f {
+            Ok(Self(value))
+        } else {
+            Err(Ci4PaletteError { value })
+        }
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// Why a raw palette selector could not become a [`Ci4Palette`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ci4PaletteError {
+    value: u8,
+}
+
+impl Ci4PaletteError {
+    pub const fn value(self) -> u8 {
+        self.value
+    }
+}
+
+impl fmt::Display for Ci4PaletteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "CI4 palette selector {} exceeds its four-bit field",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for Ci4PaletteError {}
+
+/// Which texel in a high-nibble-first CI4 packed byte is requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexelColumnParity {
+    Even,
+    Odd,
+}
+
+/// Why a packed CI4 byte could not be unpacked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci4UnpackError {
+    PackedByteMustBeBits8 { size: PixelSize },
+}
+
+impl fmt::Display for Ci4UnpackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PackedByteMustBeBits8 { size } => write!(
+                formatter,
+                "CI4 packed source must be an eight-bit byte, not {size:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Ci4UnpackError {}
+
+/// Extracts one CI4 texel from an already-isolated packed byte.
+///
+/// The even-column texel occupies bits 7:4 and the odd-column texel bits 3:0,
+/// following the permitted pinned RT64 `TextureDecoder.hlsli` CI4 path. No
+/// physical TMEM address or tile-coordinate mapping is performed here.
+pub fn unpack_ci4_texel(
+    packed_byte: RawTexel,
+    parity: TexelColumnParity,
+) -> Result<RawTexel, Ci4UnpackError> {
+    if packed_byte.size() != PixelSize::Bits8 {
+        return Err(Ci4UnpackError::PackedByteMustBeBits8 {
+            size: packed_byte.size(),
+        });
+    }
+    let value = match parity {
+        TexelColumnParity::Even => packed_byte.value() >> 4,
+        TexelColumnParity::Odd => packed_byte.value() & 0x0f,
+    };
+    Ok(RawTexel {
+        size: PixelSize::Bits4,
+        value,
+    })
+}
+
+/// One enabled-TLUT lookup requested by a normalized CI index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlutLookup {
+    index: u8,
+    entry_format: ImageFormat,
+    byte_address: u16,
+}
+
+impl TlutLookup {
+    pub const fn index(self) -> u8 {
+        self.index
+    }
+
+    pub const fn entry_format(self) -> ImageFormat {
+        self.entry_format
+    }
+
+    /// Canonical physical byte address of the quadricated entry's first
+    /// 16-bit lane: `0x800 + index * 8`.
+    pub const fn byte_address(self) -> u16 {
+        self.byte_address
+    }
+}
+
+/// The only two legal outcomes of resolving one CI texel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedIndexedTexel {
+    /// TLUT-disabled CI aliases the normalized eight-bit index to I8.
+    Direct(DecodedTexel),
+    /// TLUT-enabled CI requires exactly one separately supplied 16-bit entry.
+    Tlut(TlutLookup),
+}
+
+/// Why an index value could not be resolved as CI4 or CI8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexedTexelResolveError {
+    FormatMustBeColorIndex { format: ImageFormat },
+    UnsupportedIndexSize { size: PixelSize },
+}
+
+impl fmt::Display for IndexedTexelResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FormatMustBeColorIndex { format } => {
+                write!(
+                    formatter,
+                    "indexed decode requires ColorIndex, not {format:?}"
+                )
+            }
+            Self::UnsupportedIndexSize { size } => {
+                write!(
+                    formatter,
+                    "indexed decode supports only CI4 and CI8, not {size:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for IndexedTexelResolveError {}
+
+/// Resolves one already-isolated CI4 nibble or CI8 byte.
+///
+/// CI4 combines its four-bit palette selector with the nibble. CI8 ignores
+/// the palette selector and uses the byte unchanged. With no TLUT, both paths
+/// decode that normalized eight-bit index as I8. With a TLUT, the result is a
+/// lookup authority and cannot be mistaken for a direct color.
+pub fn resolve_indexed_texel(
+    format: ImageFormat,
+    raw_index: RawTexel,
+    palette: Ci4Palette,
+    lut_mode: TextureLutMode,
+) -> Result<ResolvedIndexedTexel, IndexedTexelResolveError> {
+    if format != ImageFormat::ColorIndex {
+        return Err(IndexedTexelResolveError::FormatMustBeColorIndex { format });
+    }
+    let index = match raw_index.size() {
+        PixelSize::Bits4 => (palette.value() << 4) | raw_index.value() as u8,
+        PixelSize::Bits8 => raw_index.value() as u8,
+        size => return Err(IndexedTexelResolveError::UnsupportedIndexSize { size }),
+    };
+    match lut_mode {
+        TextureLutMode::Disabled => Ok(ResolvedIndexedTexel::Direct(decode_i8(u32::from(index)))),
+        TextureLutMode::Rgba16 => Ok(ResolvedIndexedTexel::Tlut(TlutLookup {
+            index,
+            entry_format: ImageFormat::Rgba,
+            byte_address: 0x0800 + u16::from(index) * 8,
+        })),
+        TextureLutMode::Ia16 => Ok(ResolvedIndexedTexel::Tlut(TlutLookup {
+            index,
+            entry_format: ImageFormat::IntensityAlpha,
+            byte_address: 0x0800 + u16::from(index) * 8,
+        })),
+    }
+}
+
+/// Why a supplied TLUT entry could not be decoded for its typed lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlutEntryDecodeError {
+    EntryMustBeBits16 { size: PixelSize },
+    Direct(DirectTexelDecodeError),
+}
+
+impl fmt::Display for TlutEntryDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EntryMustBeBits16 { size } => {
+                write!(
+                    formatter,
+                    "TLUT entry must be a big-endian 16-bit value, not {size:?}"
+                )
+            }
+            Self::Direct(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for TlutEntryDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EntryMustBeBits16 { .. } => None,
+            Self::Direct(error) => Some(error),
+        }
+    }
+}
+
+/// Decodes one caller-supplied, big-endian 16-bit entry for an enabled-TLUT
+/// lookup. A disabled-mode result has no [`TlutLookup`] and therefore cannot
+/// be passed here without fabricating a value whose fields are private.
+pub fn decode_tlut_entry(
+    lookup: TlutLookup,
+    entry: RawTexel,
+) -> Result<DecodedTexel, TlutEntryDecodeError> {
+    if entry.size() != PixelSize::Bits16 {
+        return Err(TlutEntryDecodeError::EntryMustBeBits16 { size: entry.size() });
+    }
+    decode_direct_texel(lookup.entry_format, entry).map_err(TlutEntryDecodeError::Direct)
+}
+
 /// Why a `(format, size)` pair could not be decoded as a direct texel.
 ///
 /// Variants separate the three reasons a pair is out of this module's scope,
@@ -188,11 +429,12 @@ impl DecodedTexel {
 pub enum DirectTexelDecodeError {
     /// `ColorIndex` pairs are decoded through a separate, TLUT-mode-aware
     /// indexed path, not through this module's direct decode. That separate
-    /// path is not unconditionally a palette lookup: per the pinned RT64
-    /// source, it resolves against the TLUT only while a TLUT is active, and
-    /// otherwise (`CI8`/`CI16`/`CI32`) decodes identically to the
-    /// corresponding `Intensity` pair. This module takes no position on
-    /// which side applies; it only declares `ColorIndex` out of scope here.
+    /// path is not unconditionally a palette lookup: M4.3.3b resolves CI4/CI8
+    /// against the TLUT only while it is active and aliases the normalized
+    /// index to I8 otherwise. The pinned RT64 source also exhibits disabled
+    /// CI16/CI32 intensity aliases, but M4.3.3b deliberately rejects those
+    /// sizes; this direct decoder declares every `ColorIndex` size out of its
+    /// own scope.
     IndexedDecodeIsSeparate { size: PixelSize },
     /// `Yuv` pairs require chroma conversion, deferred per
     /// `docs/RENDER-WGPU-PORT-PLAN.md` M4.3.
@@ -641,5 +883,320 @@ mod tests {
         let texel = RawTexel::try_new(PixelSize::Bits16, 0xffff).unwrap();
         assert_eq!(texel.size(), PixelSize::Bits16);
         assert_eq!(texel.value(), 0xffff);
+    }
+
+    fn raw(size: PixelSize, value: u32) -> RawTexel {
+        RawTexel::try_new(size, value).unwrap()
+    }
+
+    fn palette(value: u8) -> Ci4Palette {
+        Ci4Palette::try_new(value).unwrap()
+    }
+
+    fn resolve(
+        size: PixelSize,
+        value: u32,
+        palette_value: u8,
+        mode: TextureLutMode,
+    ) -> ResolvedIndexedTexel {
+        resolve_indexed_texel(
+            ImageFormat::ColorIndex,
+            raw(size, value),
+            palette(palette_value),
+            mode,
+        )
+        .unwrap()
+    }
+
+    fn lookup(size: PixelSize, value: u32, palette_value: u8, mode: TextureLutMode) -> TlutLookup {
+        match resolve(size, value, palette_value, mode) {
+            ResolvedIndexedTexel::Tlut(lookup) => lookup,
+            ResolvedIndexedTexel::Direct(_) => panic!("enabled TLUT resolved directly"),
+        }
+    }
+
+    #[test]
+    fn ci4_unpack_is_high_nibble_first() {
+        let packed = raw(PixelSize::Bits8, 0x1f);
+        assert_eq!(
+            unpack_ci4_texel(packed, TexelColumnParity::Even)
+                .unwrap()
+                .value(),
+            0x1
+        );
+        assert_eq!(
+            unpack_ci4_texel(packed, TexelColumnParity::Odd)
+                .unwrap()
+                .value(),
+            0xf
+        );
+    }
+
+    #[test]
+    fn ci4_unpack_rejects_every_non_byte_width() {
+        for size in [PixelSize::Bits4, PixelSize::Bits16, PixelSize::Bits32] {
+            assert_eq!(
+                unpack_ci4_texel(raw(size, 0), TexelColumnParity::Even),
+                Err(Ci4UnpackError::PackedByteMustBeBits8 { size })
+            );
+        }
+    }
+
+    #[test]
+    fn ci4_palette_is_exactly_four_bits() {
+        for value in 0..=0x0f {
+            assert_eq!(palette(value).value(), value);
+        }
+        let error = Ci4Palette::try_new(0x10).unwrap_err();
+        assert_eq!(error.value(), 0x10);
+        assert!(!error.to_string().is_empty());
+        let _: &dyn std::error::Error = &error;
+    }
+
+    #[test]
+    fn disabled_ci4_decodes_composite_palette_index_as_i8() {
+        let ResolvedIndexedTexel::Direct(decoded) =
+            resolve(PixelSize::Bits4, 0x1, 0x2, TextureLutMode::Disabled)
+        else {
+            panic!("disabled CI4 requested a TLUT entry");
+        };
+        assert_eq!(decoded.rgba8888(), [0x21; 4]);
+
+        let ResolvedIndexedTexel::Direct(decoded) =
+            resolve(PixelSize::Bits4, 0xf, 0xf, TextureLutMode::Disabled)
+        else {
+            panic!("disabled CI4 requested a TLUT entry");
+        };
+        assert_eq!(decoded.rgba8888(), [0xff; 4]);
+    }
+
+    #[test]
+    fn disabled_ci8_ignores_palette_and_decodes_as_i8() {
+        let mut first = None;
+        for palette_value in [0x0, 0xf] {
+            let ResolvedIndexedTexel::Direct(value) = resolve(
+                PixelSize::Bits8,
+                0x42,
+                palette_value,
+                TextureLutMode::Disabled,
+            ) else {
+                panic!("disabled CI8 requested a TLUT entry");
+            };
+            assert_eq!(value.rgba8888(), [0x42; 4]);
+            if let Some(first) = first {
+                assert_eq!(value, first);
+            } else {
+                first = Some(value);
+            }
+        }
+    }
+
+    #[test]
+    fn enabled_ci_literal_lookups_and_entries_decode_exactly() {
+        let cases = [
+            (
+                PixelSize::Bits4,
+                0x1,
+                0x2,
+                TextureLutMode::Rgba16,
+                0x21,
+                0x0908,
+                0xf801,
+                [0xff, 0x00, 0x00, 0xff],
+            ),
+            (
+                PixelSize::Bits8,
+                0xff,
+                0xf,
+                TextureLutMode::Rgba16,
+                0xff,
+                0x0ff8,
+                0x003f,
+                [0x00, 0x00, 0xff, 0xff],
+            ),
+            (
+                PixelSize::Bits4,
+                0x5,
+                0xa,
+                TextureLutMode::Ia16,
+                0xa5,
+                0x0d28,
+                0x8040,
+                [0x80, 0x80, 0x80, 0x40],
+            ),
+            (
+                PixelSize::Bits8,
+                0x7f,
+                0,
+                TextureLutMode::Ia16,
+                0x7f,
+                0x0bf8,
+                0x00ff,
+                [0x00, 0x00, 0x00, 0xff],
+            ),
+        ];
+        for (size, value, palette_value, mode, index, address, entry, expected) in cases {
+            let lookup = lookup(size, value, palette_value, mode);
+            assert_eq!(lookup.index(), index);
+            assert_eq!(lookup.byte_address(), address);
+            assert_eq!(
+                decode_tlut_entry(lookup, raw(PixelSize::Bits16, entry))
+                    .unwrap()
+                    .rgba8888(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_modes_cover_both_boundary_indices_for_ci4_and_ci8() {
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            for (size, value, palette_value, expected_index, expected_address) in [
+                (PixelSize::Bits4, 0x0, 0x0, 0x00, 0x0800),
+                (PixelSize::Bits4, 0xf, 0xf, 0xff, 0x0ff8),
+                (PixelSize::Bits8, 0x00, 0xf, 0x00, 0x0800),
+                (PixelSize::Bits8, 0xff, 0x0, 0xff, 0x0ff8),
+            ] {
+                let lookup = lookup(size, value, palette_value, mode);
+                assert_eq!(lookup.index(), expected_index);
+                assert_eq!(lookup.byte_address(), expected_address);
+            }
+        }
+    }
+
+    #[test]
+    fn identical_entry_bits_have_distinct_rgba16_and_ia16_meanings() {
+        let rgba = lookup(PixelSize::Bits8, 0, 0, TextureLutMode::Rgba16);
+        let ia = lookup(PixelSize::Bits8, 0, 0, TextureLutMode::Ia16);
+        assert_eq!(rgba.entry_format(), ImageFormat::Rgba);
+        assert_eq!(ia.entry_format(), ImageFormat::IntensityAlpha);
+        let entry = raw(PixelSize::Bits16, 0xf801);
+        let rgba = decode_tlut_entry(rgba, entry).unwrap();
+        let ia = decode_tlut_entry(ia, entry).unwrap();
+        assert_eq!(rgba.rgba8888(), [0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(ia.rgba8888(), [0xf8, 0xf8, 0xf8, 0x01]);
+        assert_ne!(rgba, ia);
+    }
+
+    #[test]
+    fn big_endian_entry_mutation_changes_the_decoded_color() {
+        let lookup = lookup(PixelSize::Bits8, 0, 0, TextureLutMode::Rgba16);
+        let big_endian = decode_tlut_entry(lookup, raw(PixelSize::Bits16, 0xf801)).unwrap();
+        let byte_swapped = decode_tlut_entry(lookup, raw(PixelSize::Bits16, 0x01f8)).unwrap();
+        assert_eq!(big_endian.rgba8888(), [0xff, 0x00, 0x00, 0xff]);
+        assert_ne!(byte_swapped, big_endian);
+    }
+
+    #[test]
+    fn tlut_entry_rejects_every_non_16_bit_width() {
+        let lookup = lookup(PixelSize::Bits8, 0, 0, TextureLutMode::Rgba16);
+        for size in [PixelSize::Bits4, PixelSize::Bits8, PixelSize::Bits32] {
+            assert_eq!(
+                decode_tlut_entry(lookup, raw(size, 0)),
+                Err(TlutEntryDecodeError::EntryMustBeBits16 { size })
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_mode_cannot_resolve_directly_and_disabled_mode_cannot_request_entry() {
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            assert!(matches!(
+                resolve(PixelSize::Bits8, 0, 0, mode),
+                ResolvedIndexedTexel::Tlut(_)
+            ));
+        }
+        assert!(matches!(
+            resolve(PixelSize::Bits8, 0, 0, TextureLutMode::Disabled),
+            ResolvedIndexedTexel::Direct(_)
+        ));
+    }
+
+    #[test]
+    fn ci8_palette_mutation_cannot_change_lookup() {
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            assert_eq!(
+                lookup(PixelSize::Bits8, 0x42, 0, mode),
+                lookup(PixelSize::Bits8, 0x42, 0xf, mode)
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_resolution_rejects_ci16_ci32_and_every_non_ci_format() {
+        for size in [PixelSize::Bits16, PixelSize::Bits32] {
+            assert_eq!(
+                resolve_indexed_texel(
+                    ImageFormat::ColorIndex,
+                    raw(size, 0),
+                    palette(0),
+                    TextureLutMode::Disabled,
+                ),
+                Err(IndexedTexelResolveError::UnsupportedIndexSize { size })
+            );
+        }
+        for format in [
+            ImageFormat::Rgba,
+            ImageFormat::Yuv,
+            ImageFormat::IntensityAlpha,
+            ImageFormat::Intensity,
+        ] {
+            assert_eq!(
+                resolve_indexed_texel(
+                    format,
+                    raw(PixelSize::Bits8, 0),
+                    palette(0),
+                    TextureLutMode::Disabled,
+                ),
+                Err(IndexedTexelResolveError::FormatMustBeColorIndex { format })
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_format_size_mode_matrix_has_only_six_legal_cells() {
+        let modes = [
+            TextureLutMode::Disabled,
+            TextureLutMode::Rgba16,
+            TextureLutMode::Ia16,
+        ];
+        for format in ALL_FORMATS {
+            for size in ALL_SIZES {
+                for mode in modes {
+                    let result = resolve_indexed_texel(format, raw(size, 0), palette(0), mode);
+                    match (format, size) {
+                        (ImageFormat::ColorIndex, PixelSize::Bits4 | PixelSize::Bits8) => {
+                            assert!(result.is_ok(), "{format:?}/{size:?}/{mode:?}: {result:?}");
+                        }
+                        (ImageFormat::ColorIndex, _) => assert_eq!(
+                            result,
+                            Err(IndexedTexelResolveError::UnsupportedIndexSize { size })
+                        ),
+                        _ => assert_eq!(
+                            result,
+                            Err(IndexedTexelResolveError::FormatMustBeColorIndex { format })
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_error_types_render_and_implement_error() {
+        let errors: [&dyn std::error::Error; 3] = [
+            &Ci4UnpackError::PackedByteMustBeBits8 {
+                size: PixelSize::Bits16,
+            },
+            &IndexedTexelResolveError::UnsupportedIndexSize {
+                size: PixelSize::Bits32,
+            },
+            &TlutEntryDecodeError::EntryMustBeBits16 {
+                size: PixelSize::Bits8,
+            },
+        ];
+        for error in errors {
+            assert!(!error.to_string().is_empty());
+        }
     }
 }
