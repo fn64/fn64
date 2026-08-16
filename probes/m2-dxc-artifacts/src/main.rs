@@ -4,9 +4,104 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const VERSION_JSON: &str = concat!(
-    r#"{"schema":"fn64.wgpu-shader-validator.v1","wgpu_major":30,"wgpu_version":"30.0.0","naga_version":"30.0.0","backend":"noop","validation":"wgpu-30-baseline-naga-validation-plus-checked-api"}"#,
+    r#"{"schema":"fn64.wgpu-shader-validator.v2","wgpu_major":30,"wgpu_version":"30.0.0","naga_version":"30.0.0","backend":"noop","validation":"wgpu-30-closed-profile-naga-validation-plus-checked-api","profiles":[{"name":"baseline","required_features":[],"required_limits":{"max_immediate_size":0}},{"name":"immediates-4","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":4}},{"name":"immediates-8","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":8}},{"name":"immediates-16","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":16}},{"name":"immediates-20","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":20}},{"name":"immediates-24","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":24}},{"name":"immediates-32","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":32}},{"name":"immediates-40","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":40}},{"name":"immediates-56","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":56}}]}"#,
     "\n"
 );
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationProfile {
+    Baseline,
+    Immediates4,
+    Immediates8,
+    Immediates16,
+    Immediates20,
+    Immediates24,
+    Immediates32,
+    Immediates40,
+    Immediates56,
+}
+
+impl ValidationProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "immediates-4" => Ok(Self::Immediates4),
+            "immediates-8" => Ok(Self::Immediates8),
+            "immediates-16" => Ok(Self::Immediates16),
+            "immediates-20" => Ok(Self::Immediates20),
+            "immediates-24" => Ok(Self::Immediates24),
+            "immediates-32" => Ok(Self::Immediates32),
+            "immediates-40" => Ok(Self::Immediates40),
+            "immediates-56" => Ok(Self::Immediates56),
+            _ => Err(format!("unsupported validation profile {value:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Immediates4 => "immediates-4",
+            Self::Immediates8 => "immediates-8",
+            Self::Immediates16 => "immediates-16",
+            Self::Immediates20 => "immediates-20",
+            Self::Immediates24 => "immediates-24",
+            Self::Immediates32 => "immediates-32",
+            Self::Immediates40 => "immediates-40",
+            Self::Immediates56 => "immediates-56",
+        }
+    }
+
+    fn max_immediate_size(self) -> u32 {
+        match self {
+            Self::Baseline => 0,
+            Self::Immediates4 => 4,
+            Self::Immediates8 => 8,
+            Self::Immediates16 => 16,
+            Self::Immediates20 => 20,
+            Self::Immediates24 => 24,
+            Self::Immediates32 => 32,
+            Self::Immediates40 => 40,
+            Self::Immediates56 => 56,
+        }
+    }
+
+    fn required_features(self) -> wgpu::Features {
+        if self == Self::Baseline {
+            wgpu::Features::empty()
+        } else {
+            wgpu::Features::IMMEDIATES
+        }
+    }
+
+    fn for_immediate_size(size: u32) -> Result<Self, String> {
+        match size {
+            0 => Ok(Self::Baseline),
+            4 => Ok(Self::Immediates4),
+            8 => Ok(Self::Immediates8),
+            16 => Ok(Self::Immediates16),
+            20 => Ok(Self::Immediates20),
+            24 => Ok(Self::Immediates24),
+            32 => Ok(Self::Immediates32),
+            40 => Ok(Self::Immediates40),
+            56 => Ok(Self::Immediates56),
+            _ => Err(format!("SPIR-V requires unreviewed immediate size {size}")),
+        }
+    }
+
+    fn contract_json(self) -> String {
+        let features = if self == Self::Baseline {
+            "[]"
+        } else {
+            r#"["IMMEDIATES"]"#
+        };
+        format!(
+            r#"{{"name":"{}","required_features":{},"required_limits":{{"max_immediate_size":{}}}}}"#,
+            self.name(),
+            features,
+            self.max_immediate_size()
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
@@ -51,6 +146,7 @@ impl Stage {
 }
 
 struct Request {
+    profile: ValidationProfile,
     shader: PathBuf,
     stage: Stage,
     entry: String,
@@ -66,8 +162,16 @@ fn parse_request(mut arguments: impl Iterator<Item = String>) -> Result<Option<R
         }
         return Ok(None);
     }
-    if first != "--shader" {
+    if first != "--profile" {
         return Err(format!("unexpected argument {first:?}"));
+    }
+    let profile = ValidationProfile::parse(
+        &arguments
+            .next()
+            .ok_or_else(|| "--profile requires a value".to_owned())?,
+    )?;
+    if arguments.next().as_deref() != Some("--shader") {
+        return Err("expected --shader after validation profile".to_owned());
     }
     let shader = PathBuf::from(
         arguments
@@ -99,6 +203,7 @@ fn parse_request(mut arguments: impl Iterator<Item = String>) -> Result<Option<R
         );
     }
     Ok(Some(Request {
+        profile,
         shader,
         stage,
         entry,
@@ -206,7 +311,26 @@ fn validate(request: &Request) -> Result<usize, String> {
     {
         return Err("wgpu 30 parser did not retain the requested entry point".to_owned());
     }
-    let limits = wgpu::Limits::default();
+    let immediate_count = module
+        .global_variables
+        .iter()
+        .filter(|(_, variable)| variable.space == naga::AddressSpace::Immediate)
+        .count();
+    if immediate_count > 1 {
+        return Err("SPIR-V declares more than one immediate global".to_owned());
+    }
+    let required_profile = ValidationProfile::for_immediate_size(
+        naga::valid::ImmediateSlots::size_for_module(&module),
+    )?;
+    if request.profile != required_profile {
+        return Err(format!(
+            "validation profile {:?} does not equal derived minimum {:?}",
+            request.profile.name(),
+            required_profile.name()
+        ));
+    }
+    let mut limits = wgpu::Limits::default();
+    limits.max_immediate_size = request.profile.max_immediate_size();
     for (_, variable) in module.global_variables.iter() {
         if let Some(binding) = variable.binding {
             if binding.group >= limits.max_bind_groups {
@@ -218,7 +342,7 @@ fn validate(request: &Request) -> Result<usize, String> {
         }
     }
     let mut validator = wgpu_naga_bridge::create_validator(
-        wgpu::Features::empty(),
+        request.profile.required_features(),
         wgpu::DownlevelCapabilities::default().flags,
         naga::valid::ValidationFlags::all(),
     );
@@ -226,7 +350,17 @@ fn validate(request: &Request) -> Result<usize, String> {
         .validate(&module)
         .map_err(|error| format!("wgpu 30 naga validation failed: {error}"))?;
 
-    let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+    let device_descriptor = wgpu::DeviceDescriptor {
+        required_features: request.profile.required_features(),
+        required_limits: limits,
+        ..Default::default()
+    };
+    let (device, _queue) = wgpu::Device::noop(&device_descriptor);
+    if device.features() != request.profile.required_features()
+        || device.limits().max_immediate_size != request.profile.max_immediate_size()
+    {
+        return Err("noop device did not retain the exact validation profile".to_owned());
+    }
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("fn64-m2-dxc-artifact"),
@@ -253,7 +387,8 @@ fn main() -> ExitCode {
     match validate(&request) {
         Ok(module_bytes) => {
             println!(
-                r#"{{"schema":"fn64.wgpu-shader-validation.v1","status":"passed","wgpu_major":30,"stage":"{}","entry":"{}","module_bytes":{}}}"#,
+                r#"{{"schema":"fn64.wgpu-shader-validation.v2","status":"passed","wgpu_major":30,"profile":{},"stage":"{}","entry":"{}","module_bytes":{}}}"#,
+                request.profile.contract_json(),
                 request.stage.name(),
                 request.entry,
                 module_bytes
@@ -269,7 +404,233 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Stage, decode_name, has_entry, validate, words};
+    use super::{
+        Request, Stage, ValidationProfile, decode_name, has_entry, parse_request, validate, words,
+    };
+
+    fn request(profile: ValidationProfile, shader: std::path::PathBuf) -> Request {
+        Request {
+            profile,
+            shader,
+            stage: Stage::Compute,
+            entry: "CSMain".to_owned(),
+        }
+    }
+
+    fn push_constant_span(member_types: &[u32], offsets: &[u32]) -> u32 {
+        assert_eq!(member_types.len(), offsets.len());
+        fn instruction(words: &mut Vec<u32>, opcode: u32, operands: &[u32]) {
+            words.push(((operands.len() as u32 + 1) << 16) | opcode);
+            words.extend_from_slice(operands);
+        }
+        let mut module_words = vec![0x0723_0203, 0x0001_0000, 0, 14, 0];
+        instruction(&mut module_words, 17, &[1]);
+        instruction(&mut module_words, 14, &[0, 1]);
+        instruction(
+            &mut module_words,
+            15,
+            &[
+                5,
+                3,
+                u32::from_le_bytes(*b"CSMa"),
+                u32::from_le_bytes(*b"in\0\0"),
+            ],
+        );
+        instruction(&mut module_words, 16, &[3, 17, 1, 1, 1]);
+        instruction(&mut module_words, 71, &[11, 2]);
+        for (index, offset) in offsets.iter().copied().enumerate() {
+            instruction(&mut module_words, 72, &[11, index as u32, 35, offset]);
+        }
+        instruction(&mut module_words, 19, &[1]);
+        instruction(&mut module_words, 33, &[2, 1]);
+        instruction(&mut module_words, 22, &[5, 32]);
+        instruction(&mut module_words, 21, &[6, 32, 0]);
+        instruction(&mut module_words, 23, &[7, 5, 2]);
+        instruction(&mut module_words, 23, &[8, 6, 2]);
+        instruction(&mut module_words, 23, &[9, 5, 3]);
+        instruction(&mut module_words, 23, &[10, 5, 4]);
+        let mut struct_operands = vec![11];
+        struct_operands.extend_from_slice(member_types);
+        instruction(&mut module_words, 30, &struct_operands);
+        instruction(&mut module_words, 32, &[12, 9, 11]);
+        instruction(&mut module_words, 59, &[12, 13, 9]);
+        instruction(&mut module_words, 54, &[1, 3, 0, 2]);
+        instruction(&mut module_words, 248, &[4]);
+        instruction(&mut module_words, 253, &[]);
+        instruction(&mut module_words, 56, &[]);
+        let options = naga::front::spv::Options {
+            adjust_coordinate_space: false,
+            strict_capabilities: true,
+            block_ctx_dump_prefix: None,
+        };
+        let module = naga::front::spv::Frontend::new(module_words.into_iter(), &options)
+            .parse()
+            .expect("mixed-alignment SPIR-V fixture parses");
+        naga::valid::ImmediateSlots::size_for_module(&module)
+    }
+
+    #[test]
+    fn parses_only_closed_ordered_profile_commands() {
+        for (token, expected) in [
+            ("baseline", ValidationProfile::Baseline),
+            ("immediates-4", ValidationProfile::Immediates4),
+            ("immediates-8", ValidationProfile::Immediates8),
+            ("immediates-16", ValidationProfile::Immediates16),
+            ("immediates-20", ValidationProfile::Immediates20),
+            ("immediates-24", ValidationProfile::Immediates24),
+            ("immediates-32", ValidationProfile::Immediates32),
+            ("immediates-40", ValidationProfile::Immediates40),
+            ("immediates-56", ValidationProfile::Immediates56),
+        ] {
+            let parsed = parse_request(
+                [
+                    "--profile",
+                    token,
+                    "--shader",
+                    "input.spv",
+                    "--stage",
+                    "compute",
+                    "--entry",
+                    "CSMain",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("closed profile command")
+            .expect("validation request");
+            assert_eq!(parsed.profile, expected);
+        }
+        for arguments in [
+            vec![
+                "--shader",
+                "input.spv",
+                "--stage",
+                "compute",
+                "--entry",
+                "CSMain",
+            ],
+            vec![
+                "--profile",
+                "immediates-12",
+                "--shader",
+                "input.spv",
+                "--stage",
+                "compute",
+                "--entry",
+                "CSMain",
+            ],
+            vec![
+                "--profile",
+                "baseline",
+                "--feature",
+                "IMMEDIATES",
+                "--shader",
+                "input.spv",
+                "--stage",
+                "compute",
+                "--entry",
+                "CSMain",
+            ],
+            vec![
+                "--profile",
+                "baseline",
+                "--shader",
+                "input.spv",
+                "--entry",
+                "CSMain",
+                "--stage",
+                "compute",
+            ],
+            vec![
+                "--profile",
+                "baseline",
+                "--profile",
+                "immediates-8",
+                "--shader",
+                "input.spv",
+                "--stage",
+                "compute",
+                "--entry",
+                "CSMain",
+            ],
+            vec![
+                "--profile",
+                "baseline",
+                "--shader",
+                "input.spv",
+                "--stage",
+                "compute",
+                "--entry",
+                "CSMain",
+                "--limit",
+                "8",
+            ],
+            vec!["--fn64-version", "--profile", "baseline"],
+        ] {
+            assert!(parse_request(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_contracts_are_exact() {
+        assert_eq!(
+            ValidationProfile::Baseline.required_features(),
+            wgpu::Features::empty()
+        );
+        assert_eq!(ValidationProfile::Baseline.max_immediate_size(), 0);
+        assert_eq!(
+            ValidationProfile::Immediates56.required_features(),
+            wgpu::Features::IMMEDIATES
+        );
+        assert_eq!(ValidationProfile::Immediates56.max_immediate_size(), 56);
+        assert_eq!(
+            ValidationProfile::Immediates8.contract_json(),
+            r#"{"name":"immediates-8","required_features":["IMMEDIATES"],"required_limits":{"max_immediate_size":8}}"#
+        );
+        for (size, expected) in [
+            (0, ValidationProfile::Baseline),
+            (4, ValidationProfile::Immediates4),
+            (8, ValidationProfile::Immediates8),
+            (16, ValidationProfile::Immediates16),
+            (20, ValidationProfile::Immediates20),
+            (24, ValidationProfile::Immediates24),
+            (32, ValidationProfile::Immediates32),
+            (40, ValidationProfile::Immediates40),
+            (56, ValidationProfile::Immediates56),
+        ] {
+            assert_eq!(ValidationProfile::for_immediate_size(size), Ok(expected));
+        }
+        assert!(ValidationProfile::for_immediate_size(12).is_err());
+        assert!(ValidationProfile::for_immediate_size(36).is_err());
+        assert!(ValidationProfile::for_immediate_size(52).is_err());
+    }
+
+    #[test]
+    fn naga_mixed_alignment_spans_select_only_closed_profiles() {
+        let video_interface = push_constant_span(&[7, 7, 5], &[0, 8, 16]);
+        assert_eq!(video_interface, 24);
+        assert_eq!(
+            ValidationProfile::for_immediate_size(video_interface),
+            Ok(ValidationProfile::Immediates24)
+        );
+
+        let fb_common =
+            push_constant_span(&[8, 6, 6, 6, 6, 6, 6, 6], &[0, 8, 12, 16, 20, 24, 28, 32]);
+        assert_eq!(fb_common, 40);
+        assert_eq!(
+            ValidationProfile::for_immediate_size(fb_common),
+            Ok(ValidationProfile::Immediates40)
+        );
+
+        assert_eq!(push_constant_span(&[9, 5, 5], &[0, 12, 16]), 32);
+        assert_eq!(push_constant_span(&[10, 5], &[0, 16]), 32);
+        let unreviewed = push_constant_span(
+            &[8, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+            &[0, 8, 12, 16, 20, 24, 28, 32, 36, 40],
+        );
+        assert_eq!(unreviewed, 48);
+        assert!(ValidationProfile::for_immediate_size(unreviewed).is_err());
+    }
 
     #[test]
     fn rejects_bad_magic() {
@@ -311,11 +672,7 @@ mod tests {
         ]);
         let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         std::fs::write(&path, bytes).expect("write invalid SPIR-V fixture");
-        let result = validate(&Request {
-            shader: path.clone(),
-            stage: Stage::Compute,
-            entry: "CSMain".to_owned(),
-        });
+        let result = validate(&request(ValidationProfile::Baseline, path.clone()));
         std::fs::remove_file(path).expect("remove invalid SPIR-V fixture");
         assert!(result.is_err());
     }
@@ -365,11 +722,7 @@ mod tests {
         ];
         let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         std::fs::write(&path, bytes).expect("write valid SPIR-V fixture");
-        let result = validate(&Request {
-            shader: path.clone(),
-            stage: Stage::Compute,
-            entry: "CSMain".to_owned(),
-        });
+        let result = validate(&request(ValidationProfile::Baseline, path.clone()));
         std::fs::remove_file(path).expect("remove valid SPIR-V fixture");
         assert!(result.is_ok(), "{result:?}");
     }

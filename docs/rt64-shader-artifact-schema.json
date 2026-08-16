@@ -1,8 +1,17 @@
 {
-  "schema": "fn64.rt64-shader-artifact-policy.v1",
-  "receipt_schema": "fn64.rt64-shader-artifact-receipt.v2",
+  "schema": "fn64.rt64-shader-artifact-policy.v2",
+  "direct_consumers": [
+    "tools/rt64_shader_artifacts.py",
+    "tools/test_rt64_shader_artifacts.py",
+    "tools/rt64_reference_shader_artifacts.py",
+    "tools/test_rt64_reference_shader_artifacts.py",
+    "tools/rt64_wgpu_shader_assessment.py",
+    "tools/test_rt64_wgpu_shader_assessment.py"
+  ],
+  "receipt_schema": "fn64.rt64-shader-artifact-receipt.v3",
   "source_denominator_schema": "fn64.rt64-shader-source-denominator.v1",
   "build_receipt_schema": "fn64.dxc-source-build.v2",
+  "validator_build_receipt_schema": "fn64.wgpu-shader-validator-build.v2",
   "git_checkout_maximum_file_bytes": 268435456,
   "rt64": {
     "repository": "https://github.com/rt64/rt64",
@@ -164,7 +173,56 @@
     "wgpu_version": "30.0.0",
     "naga_version": "30.0.0",
     "backend": "noop",
-    "validation": "wgpu-30-baseline-naga-validation-plus-checked-api",
+    "protocol_schema": "fn64.wgpu-shader-validator.v2",
+    "result_schema": "fn64.wgpu-shader-validation.v2",
+    "validation": "wgpu-30-closed-profile-naga-validation-plus-checked-api",
+    "profiles": [
+      {
+        "name": "baseline",
+        "required_features": [],
+        "required_limits": {"max_immediate_size": 0}
+      },
+      {
+        "name": "immediates-4",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 4}
+      },
+      {
+        "name": "immediates-8",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 8}
+      },
+      {
+        "name": "immediates-16",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 16}
+      },
+      {
+        "name": "immediates-20",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 20}
+      },
+      {
+        "name": "immediates-24",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 24}
+      },
+      {
+        "name": "immediates-32",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 32}
+      },
+      {
+        "name": "immediates-40",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 40}
+      },
+      {
+        "name": "immediates-56",
+        "required_features": ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": 56}
+      }
+    ],
     "build_profile": "release",
     "cargo_lock_sha256": "733fa211c5dd777a3be2e264de61716d319aa65d5b0ebf38a0a316e380e5610c",
     "dependency_package_count": 82,
