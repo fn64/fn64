@@ -325,7 +325,7 @@ HASH = re.compile(r"\b[0-9a-f]{40,64}\b")
 
 def check_doc_hashes_are_tested() -> None:
     src = subprocess.run(
-        ["git", "grep", "-hoE", r"[0-9a-f]{40,64}", "--", "*.rs", "*.sh", "*.py"],
+        ["git", "grep", "-hoE", r"[0-9a-f]{40,64}", "--", "*.rs", "*.sh", "*.py", "*/CMakeLists.txt"],
         cwd=ROOT, capture_output=True, text=True,
     ).stdout
     tested = set(src.split())
@@ -406,6 +406,53 @@ def check_rt64_feature_inventory() -> None:
         fail("RT64-PUBLIC-FEATURE-INVENTORY.md", detail)
     elif VERBOSE:
         print("  RT64 public feature manifest and generated inventory agree")
+
+
+# --- 4ba. RT64 port source/license/overlay authority must remain closed ------
+def check_rt64_port_authority() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_rt64_port_authority.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PORT-AUTHORITY.md", detail)
+    elif VERBOSE:
+        print("  RT64 port source, license, and overlay authority agree")
+
+
+# --- 4bab. RT64 port work inventory must remain a reproducible denominator -
+def check_rt64_port_inventory() -> None:
+    tool = str(ROOT / "tools/rt64_port_inventory.py")
+    mutation = subprocess.run(
+        [sys.executable, tool, "--self-test"], cwd=ROOT,
+        capture_output=True, text=True,
+    )
+    if mutation.returncode != 0:
+        detail = mutation.stderr.strip() or mutation.stdout.strip() or "mutation checker failed silently"
+        fail("RT64-PORT-INVENTORY.md", detail)
+        return
+
+    oracle_dir = os.environ.get("FN64_RT64_ORACLE_DIR")
+    port_dir = os.environ.get("FN64_RT64_PORT_DIR")
+    if bool(oracle_dir) != bool(port_dir):
+        fail(
+            "RT64-PORT-INVENTORY.md",
+            "FN64_RT64_ORACLE_DIR and FN64_RT64_PORT_DIR must be set together",
+        )
+        return
+    command = [sys.executable, tool, "--check"]
+    if oracle_dir and port_dir:
+        command.extend(["--oracle-dir", oracle_dir, "--port-dir", port_dir])
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PORT-INVENTORY.md", detail)
+    elif VERBOSE:
+        suffix = "including dual-pin source rederivation" if oracle_dir else "structural; source dirs not configured"
+        print(f"  RT64 port inventory schema, mutations, and generated report agree ({suffix})")
 
 
 # --- 4bb. cross-platform RT64 case/blocker matrix must not shrink ----------
@@ -520,6 +567,7 @@ def main() -> int:
     for fn in (check_refs, check_readme_crates, check_env_vars,
                check_closed_roadmap_items, check_doc_hashes_are_tested,
                check_completeness_recipe, check_rt64_feature_inventory,
+               check_rt64_port_authority, check_rt64_port_inventory,
                check_rt64_platform_certification,
                check_private_input_admission,
                check_base_renderer_matrix,
