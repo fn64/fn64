@@ -1377,3 +1377,72 @@ claim (the RDP's real noise generator remains unpublished, per
 `docs/RDP-SILICON-VECTORS.md`), and no parity or performance claim. This
 module does not modify `state.rs`, `combiner.rs`, `alpha_compare.rs`,
 `rgb_dither.rs`, or any other existing file.
+
+## Texture-coordinate generation (`texture_gen`)
+
+`texture_gen` is a characterization-first literal port of the permitted MIT
+RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`src/shaders/TextureGen.hlsli`: `normalizeSafe` (lines 9-17) and
+`computeTextureGen` (lines 19-34). Like `depth_strict_less`, `alpha_compare`,
+and `rgb_dither`, `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`, so this is a self-contained literal re-expression
+citing RT64's source directly.
+
+**`normalize_safe`.** Returns `v / length(v)` when `length(v) > 0`, and `v`
+unchanged otherwise -- covering both the zero vector (`length == 0`) and any
+vector whose length is `NaN`: IEEE-754 `NaN > 0` is `false`, so HLSL's
+`if (l > 0)` and this port's plain `f32` `>` both fall through to the
+unchanged branch identically, with no special-case added for `NaN`.
+
+**`compute_texture_gen`: the `mul(vector, matrix)` operand order.** RT64's
+own pinned source tree calls `mul` two different ways: `RSPWorldCS.hlsl`
+calls it matrix-first (`mul(worldMats[i], float4(pos, 1.0))`, the
+column-vector convention), while `TextureGen.hlsli` calls it vector-first
+(`mul(float4(lookAt.x, 0.0f), worldMatrix)`, the row-vector convention).
+HLSL's `mul(x, y)` overload resolves structurally on argument shape, not a
+project-wide convention, so both calls are individually well-defined but
+compute the transpose of each other. This module ports `TextureGen.hlsli`'s
+own literal row-vector form exactly as written (`result[c] = sum_r x[r] *
+y[r][c]`) rather than reconciling it with the other file's opposite
+convention -- reconciling the two would be silently changing the ported
+arithmetic, not preserving it.
+
+**Arithmetic, in RT64's exact operation order.** Each `RSPLookAt` axis is
+transformed by the caller-supplied row-major `WorldMatrix`, `normalize_safe`d
+on its `.xyz`, then `dot`ted against `inputNormal` to produce `texgenUV.x`/
+`texgenUV.y`. Both scalars are `clamp`ed to `[-1, 1]` **unconditionally,
+before** branching on `texture_gen_linear` -- the clamp is not
+mode-conditional. Linear mode: `acos(-texgenUV) * 325.94932` (RT64's own
+comment: `1024 / PI`, kept as the pinned source's literal digit sequence
+rather than a runtime-computed `1024.0 / PI`, since both spellings round to
+the same `f32` value and this port preserves RT64's cited literal text).
+Non-linear mode: `texgenUV += (1, 1)` then `texgenUV *= 512.0`, reproduced as
+the same two separate ops rather than a fused single expression. Finally,
+regardless of mode: `(inputUV / 65536.0) * texgenUV`.
+
+An independently-derived Rust oracle (`compute_texture_gen`) is matched by an
+owned, Naga-validated WGSL transcription (`shaders/texture_gen.wgsl`,
+`TEXTURE_GEN_WGSL`, entry point `TEXTURE_GEN_ENTRY_POINT`); neither is
+compiled into any pipeline or wired to a draw path, matching
+`alpha_compare.wgsl`/`rgb_dither.wgsl`'s precedent.
+
+**Tests.** Independent hand-derivation of `normalize_safe` across zero,
+unit-axis, arbitrary, and negative-component vectors; a `NaN`-length case
+distinguishing the IEEE-754 comparison from a special-cased guard; identity-
+and rotation-matrix `compute_texture_gen` cases with independently computed
+expected values; both linear-mode boundary dot products (`-1`, `0`, `+1`)
+matching `acos`'s known values at those points; non-linear-mode positive,
+negative, and zero dot products; a structural test that a non-symmetric
+matrix distinguishes row-vector from column-vector `mul` (so a silently
+transposed operand order fails loudly); signed and zero UV-scale cases; and
+the same naga parse/validation/structural-guard/hostile-mutation WGSL
+pattern used by `rgb_dither.wgsl`.
+
+**Scope.** No RSP lookat-matrix derivation (`RSPLookAt` is caller-supplied,
+matching this module's pure value-in/value-out convention), no world-matrix
+upload/storage-buffer plumbing, no vertex-shader integration, no
+combiner/texture-sample consumption of the returned UV, no draw-path or
+production-DPC wiring, and no RT64 visual/pixel/silicon parity or
+performance claim. This module does not modify `state.rs` or any other
+existing file besides `lib.rs`'s module registration and re-exports.
