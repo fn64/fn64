@@ -1,0 +1,19 @@
+[package]
+name = "fn64-m2-dxc-artifact-validator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Isolated wgpu 30 SPIR-V validator for fn64's RT64 artifact qualification"
+
+[workspace]
+
+[[bin]]
+name = "fn64-wgpu-shader-validator"
+path = "src/main.rs"
+
+[dependencies]
+naga = { version = "=30.0.0", features = ["spv-in"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["noop", "spirv", "std"] }
+wgpu-naga-bridge = "=30.0.0"

@@ -1,0 +1,3459 @@
+{
+  "authority": {
+    "cmake_shader_options": {
+      "DXC_COMMON_OPTS": [
+        "-I${PROJECT_SOURCE_DIR}/src"
+      ],
+      "DXC_CS_OPTS": [
+        "${DXC_COMMON_OPTS}",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "DXC_PS_OPTS": [
+        "${DXC_COMMON_OPTS}",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "DXC_SPV_OPTS": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout"
+      ],
+      "DXC_VS_OPTS": [
+        "${DXC_COMMON_OPTS}",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y"
+      ]
+    },
+    "dual_pin_source_set_verified": true,
+    "oracle_cmake_sha256": "80b43e1ad5b70c624556fa7f61756a5ad85350cb05024cd26c3ad2c93b4556d9",
+    "oracle_commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "oracle_source_set_sha256": "446b5f27ef2df359abf083267cc51449db4da46cb6725aaaca07c8d89153e9bd",
+    "port_cmake_sha256": "4d6cb49be103302c019405794995aac6b526b759f257f4786a7a2a00d4de3fa2",
+    "port_commit": "5473732a822a4423b5696e7cb18fecc425a59875",
+    "port_inventory_sha256": "4b89565f591c4e2255a23ba6b9c5d31979e7a797c7a845d0229e09b135d54c66",
+    "port_source_set_sha256": "446b5f27ef2df359abf083267cc51449db4da46cb6725aaaca07c8d89153e9bd",
+    "repository": "https://github.com/rt64/rt64",
+    "shader_sources_identical": true
+  },
+  "counts": {
+    "dependency_files": 86,
+    "hlsl_sources": 36,
+    "hlsli_sources": 20,
+    "include_edges": 137,
+    "non_spirv_entries": 3,
+    "preprocess_only": 1,
+    "spirv_entries": 56
+  },
+  "denominator_sha256": "cae8956fff3258bf5c21bb5cea7ffb550ab726118840a16db69764d3507d3ebe",
+  "entries": [
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSDynamic.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "DYNAMIC_RENDER_PARAMS"
+      ],
+      "id": "src-shaders-rasterpsdynamic",
+      "oracle_cmake_line": 498,
+      "output_name": "src/shaders/RasterPSDynamic.hlsl",
+      "port_cmake_line": 501,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSDynamic.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSDynamic.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSDynamicMS.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "DYNAMIC_RENDER_PARAMS",
+        "-D",
+        "MULTISAMPLING"
+      ],
+      "id": "src-shaders-rasterpsdynamicms",
+      "oracle_cmake_line": 499,
+      "output_name": "src/shaders/RasterPSDynamicMS.hlsl",
+      "port_cmake_line": 502,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSDynamicMS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSDynamicMS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSSpecConstant.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS"
+      ],
+      "id": "src-shaders-rasterpsspecconstant",
+      "oracle_cmake_line": 500,
+      "output_name": "src/shaders/RasterPSSpecConstant.hlsl",
+      "port_cmake_line": 503,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSSpecConstant.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSSpecConstant.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSSpecConstantMS.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS",
+        "-D",
+        "MULTISAMPLING"
+      ],
+      "id": "src-shaders-rasterpsspecconstantms",
+      "oracle_cmake_line": 501,
+      "output_name": "src/shaders/RasterPSSpecConstantMS.hlsl",
+      "port_cmake_line": 504,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSSpecConstantMS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSSpecConstantMS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSSpecConstantFlat.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS",
+        "-D",
+        "VERTEX_FLAT_COLOR"
+      ],
+      "id": "src-shaders-rasterpsspecconstantflat",
+      "oracle_cmake_line": 502,
+      "output_name": "src/shaders/RasterPSSpecConstantFlat.hlsl",
+      "port_cmake_line": 505,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSSpecConstantFlat.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSSpecConstantFlat.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/RasterPS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shaders/TextureSampler.hlsli",
+        "src/shared/rt64_blender.h",
+        "src/shared/rt64_color_combiner.h",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterPSSpecConstantFlatMS.hlsl.json",
+      "dependency_set_sha256": "8278635ed4c4468e0e3c20a55778c27f98ffd2e6b9ad14a5b86c771dc7e63b99",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS",
+        "-D",
+        "VERTEX_FLAT_COLOR",
+        "-D",
+        "MULTISAMPLING"
+      ],
+      "id": "src-shaders-rasterpsspecconstantflatms",
+      "oracle_cmake_line": 503,
+      "output_name": "src/shaders/RasterPSSpecConstantFlatMS.hlsl",
+      "port_cmake_line": 506,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterPSSpecConstantFlatMS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RasterPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterPSSpecConstantFlatMS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_vertex_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/RasterVS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterVSDynamic.hlsl.json",
+      "dependency_set_sha256": "eec096ee06de68dfce1e3bf5694be30cc55e03767a1e85c24401c1229e170507",
+      "entry": "VSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y",
+        "-D",
+        "DYNAMIC_RENDER_PARAMS"
+      ],
+      "id": "src-shaders-rastervsdynamic",
+      "oracle_cmake_line": 504,
+      "output_name": "src/shaders/RasterVSDynamic.hlsl",
+      "port_cmake_line": 507,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterVSDynamic.hlsl.pp.hlsl",
+      "profile": "vs_6_3",
+      "source": "src/shaders/RasterVS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterVSDynamic.hlsl.spv",
+      "stage": "vertex"
+    },
+    {
+      "cmake_function": "build_vertex_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/RasterVS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterVSSpecConstant.hlsl.json",
+      "dependency_set_sha256": "eec096ee06de68dfce1e3bf5694be30cc55e03767a1e85c24401c1229e170507",
+      "entry": "VSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS"
+      ],
+      "id": "src-shaders-rastervsspecconstant",
+      "oracle_cmake_line": 505,
+      "output_name": "src/shaders/RasterVSSpecConstant.hlsl",
+      "port_cmake_line": 508,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterVSSpecConstant.hlsl.pp.hlsl",
+      "profile": "vs_6_3",
+      "source": "src/shaders/RasterVS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterVSSpecConstant.hlsl.spv",
+      "stage": "vertex"
+    },
+    {
+      "cmake_function": "build_vertex_shader_spec_constants",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/Library.hlsli",
+        "src/shaders/RasterVS.hlsl",
+        "src/shaders/RenderParamsSpecConstants.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_other_mode.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RasterVSSpecConstantFlat.hlsl.json",
+      "dependency_set_sha256": "eec096ee06de68dfce1e3bf5694be30cc55e03767a1e85c24401c1229e170507",
+      "entry": "VSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y",
+        "-D",
+        "SPEC_CONSTANT_RENDER_PARAMS",
+        "-D",
+        "VERTEX_FLAT_COLOR"
+      ],
+      "id": "src-shaders-rastervsspecconstantflat",
+      "oracle_cmake_line": 506,
+      "output_name": "src/shaders/RasterVSSpecConstantFlat.hlsl",
+      "port_cmake_line": 509,
+      "preprocessed_artifact": "preprocessed/src/shaders/RasterVSSpecConstantFlat.hlsl.pp.hlsl",
+      "profile": "vs_6_3",
+      "source": "src/shaders/RasterVS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RasterVSSpecConstantFlat.hlsl.spv",
+      "stage": "vertex"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/FbChangesClearCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbChangesClearCS.hlsl.json",
+      "dependency_set_sha256": "e142c4726a4055d5f242cb4a39532cd7b53e0b73c052816dbd8d52ebc55f8521",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-fbchangesclearcs",
+      "oracle_cmake_line": 507,
+      "output_name": "src/shaders/FbChangesClearCS.hlsl",
+      "port_cmake_line": 510,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbChangesClearCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbChangesClearCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbChangesClearCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/shaders/FbChangesDrawColorPS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbChangesDrawColorPS.hlsl.json",
+      "dependency_set_sha256": "b41ec3b4d31ed0dda772e9c6e01cb0402aaf5be1bb2af719a748aeee137cb209",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-fbchangesdrawcolorps",
+      "oracle_cmake_line": 508,
+      "output_name": "src/shaders/FbChangesDrawColorPS.hlsl",
+      "port_cmake_line": 511,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbChangesDrawColorPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/FbChangesDrawColorPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbChangesDrawColorPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/shaders/FbChangesDrawDepthPS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbChangesDrawDepthPS.hlsl.json",
+      "dependency_set_sha256": "146f3bd5596635e9aafe90569269c6ecdbdf9c99a77b9fc40fb1ecd5db849ad0",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-fbchangesdrawdepthps",
+      "oracle_cmake_line": 509,
+      "output_name": "src/shaders/FbChangesDrawDepthPS.hlsl",
+      "port_cmake_line": 512,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbChangesDrawDepthPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/FbChangesDrawDepthPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbChangesDrawDepthPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbCommon.hlsli",
+        "src/shaders/FbReadAnyChangesCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbReadAnyChangesCS.hlsl.json",
+      "dependency_set_sha256": "a1aad7f38daec7faa66889c7fdb8d832260268038c7d92aa9bc906a41c70fdab",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-O0"
+      ],
+      "id": "src-shaders-fbreadanychangescs",
+      "oracle_cmake_line": 510,
+      "output_name": "src/shaders/FbReadAnyChangesCS.hlsl",
+      "port_cmake_line": 513,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbReadAnyChangesCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbReadAnyChangesCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbReadAnyChangesCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbReinterpretCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_fb_reinterpret.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbReinterpretCS.hlsl.json",
+      "dependency_set_sha256": "c5681024391844931ae8f06587910af10c943bb46cd361a4308188fd33558c66",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-O0"
+      ],
+      "id": "src-shaders-fbreinterpretcs",
+      "oracle_cmake_line": 511,
+      "output_name": "src/shaders/FbReinterpretCS.hlsl",
+      "port_cmake_line": 514,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbReinterpretCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbReinterpretCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbReinterpretCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbCommon.hlsli",
+        "src/shaders/FbReadAnyFullCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbReadAnyFullCS.hlsl.json",
+      "dependency_set_sha256": "ffa11898f3b92231cc41c0fad175a370d11c822e29c40dd78ae12df6c7676d28",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-O0"
+      ],
+      "id": "src-shaders-fbreadanyfullcs",
+      "oracle_cmake_line": 512,
+      "output_name": "src/shaders/FbReadAnyFullCS.hlsl",
+      "port_cmake_line": 515,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbReadAnyFullCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbReadAnyFullCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbReadAnyFullCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbCommon.hlsli",
+        "src/shaders/FbWriteColorCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbWriteColorCS.hlsl.json",
+      "dependency_set_sha256": "cf24e3cb1caa4e0dcef0a857fc1380b4ece57c3f722073d10cb189efb255e384",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-O0"
+      ],
+      "id": "src-shaders-fbwritecolorcs",
+      "oracle_cmake_line": 513,
+      "output_name": "src/shaders/FbWriteColorCS.hlsl",
+      "port_cmake_line": 516,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbWriteColorCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbWriteColorCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbWriteColorCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbCommon.hlsli",
+        "src/shaders/FbWriteDepthCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbWriteDepthCS.hlsl.json",
+      "dependency_set_sha256": "d8ff1688c5c18bb178c839956e3f9350b9fe654769d0812b4ea594e421b90e45",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-fbwritedepthcs",
+      "oracle_cmake_line": 514,
+      "output_name": "src/shaders/FbWriteDepthCS.hlsl",
+      "port_cmake_line": 517,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbWriteDepthCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbWriteDepthCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbWriteDepthCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/FbCommon.hlsli",
+        "src/shaders/FbWriteDepthCS.hlsl",
+        "src/shaders/Formats.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FbWriteDepthCSMS.hlsl.json",
+      "dependency_set_sha256": "d8ff1688c5c18bb178c839956e3f9350b9fe654769d0812b4ea594e421b90e45",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-D",
+        "MULTISAMPLING"
+      ],
+      "id": "src-shaders-fbwritedepthcsms",
+      "oracle_cmake_line": 515,
+      "output_name": "src/shaders/FbWriteDepthCSMS.hlsl",
+      "port_cmake_line": 518,
+      "preprocessed_artifact": "preprocessed/src/shaders/FbWriteDepthCSMS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/FbWriteDepthCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FbWriteDepthCSMS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/GaussianFilterRGB3x3CS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/GaussianFilterRGB3x3CS.hlsl.json",
+      "dependency_set_sha256": "665978f86f843e354ddbafecdc39ac21c34176483b62a1a638ac69202a1a0925",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-gaussianfilterrgb3x3cs",
+      "oracle_cmake_line": 516,
+      "output_name": "src/shaders/GaussianFilterRGB3x3CS.hlsl",
+      "port_cmake_line": 519,
+      "preprocessed_artifact": "preprocessed/src/shaders/GaussianFilterRGB3x3CS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/GaussianFilterRGB3x3CS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/GaussianFilterRGB3x3CS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/BoxFilterCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/BoxFilterCS.hlsl.json",
+      "dependency_set_sha256": "2c1154edb5638b06dec2f4a294a665eaaa06db69a103b0706950da8fd095bfb5",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-boxfiltercs",
+      "oracle_cmake_line": 517,
+      "output_name": "src/shaders/BoxFilterCS.hlsl",
+      "port_cmake_line": 520,
+      "preprocessed_artifact": "preprocessed/src/shaders/BoxFilterCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/BoxFilterCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/BoxFilterCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/BicubicScalingCS.hlsl",
+        "src/shaders/Color.hlsli"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/BicubicScalingCS.hlsl.json",
+      "dependency_set_sha256": "de26293903c8d307749b35e5258e849b19c9b1cc991bc2999f7bad5bd6cb2091",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-bicubicscalingcs",
+      "oracle_cmake_line": 518,
+      "output_name": "src/shaders/BicubicScalingCS.hlsl",
+      "port_cmake_line": 521,
+      "preprocessed_artifact": "preprocessed/src/shaders/BicubicScalingCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/BicubicScalingCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/BicubicScalingCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/Constants.hlsli",
+        "src/shaders/HistogramAverageCS.hlsl",
+        "src/shaders/Math.hlsli"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/HistogramAverageCS.hlsl.json",
+      "dependency_set_sha256": "87db6dc843c915cff6b412438a5fd34144cc7b398b3c2652bae1665bdb6a40bc",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-histogramaveragecs",
+      "oracle_cmake_line": 519,
+      "output_name": "src/shaders/HistogramAverageCS.hlsl",
+      "port_cmake_line": 522,
+      "preprocessed_artifact": "preprocessed/src/shaders/HistogramAverageCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/HistogramAverageCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/HistogramAverageCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/HistogramClearCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/HistogramClearCS.hlsl.json",
+      "dependency_set_sha256": "67cf62ecc697a0e1bc84a2afb12a9ab962e627a7a50d86b033236204811409da",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-histogramclearcs",
+      "oracle_cmake_line": 520,
+      "output_name": "src/shaders/HistogramClearCS.hlsl",
+      "port_cmake_line": 523,
+      "preprocessed_artifact": "preprocessed/src/shaders/HistogramClearCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/HistogramClearCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/HistogramClearCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/Constants.hlsli",
+        "src/shaders/HistogramSetCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/HistogramSetCS.hlsl.json",
+      "dependency_set_sha256": "0e610b1b3b7f0278bd695eb6ef99b0b731d84880521668d277039d09bbbe4f29",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-histogramsetcs",
+      "oracle_cmake_line": 521,
+      "output_name": "src/shaders/HistogramSetCS.hlsl",
+      "port_cmake_line": 524,
+      "preprocessed_artifact": "preprocessed/src/shaders/HistogramSetCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/HistogramSetCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/HistogramSetCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/IdleCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/IdleCS.hlsl.json",
+      "dependency_set_sha256": "98b29cfe1fa3068a3b1441beb6c0645ea19e4a9f9886e67364eeaa57ba6ff37c",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-idlecs",
+      "oracle_cmake_line": 522,
+      "output_name": "src/shaders/IdleCS.hlsl",
+      "port_cmake_line": 525,
+      "preprocessed_artifact": "preprocessed/src/shaders/IdleCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/IdleCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/IdleCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/Color.hlsli",
+        "src/shaders/LuminanceHistogramCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/LuminanceHistogramCS.hlsl.json",
+      "dependency_set_sha256": "37359310c09d886aaac50cf82980c2ac0e8c48fe2bf6d2a488888efaa0449ead",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-luminancehistogramcs",
+      "oracle_cmake_line": 523,
+      "output_name": "src/shaders/LuminanceHistogramCS.hlsl",
+      "port_cmake_line": 526,
+      "preprocessed_artifact": "preprocessed/src/shaders/LuminanceHistogramCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/LuminanceHistogramCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/LuminanceHistogramCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/PostBlendDitherNoisePS.hlsl",
+        "src/shaders/Random.hlsli",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/PostBlendDitherNoiseAddPS.hlsl.json",
+      "dependency_set_sha256": "eb2fd3e75383a4be078385fa02652c2f9593da9f02356b4e6ef4f3e02168b9f9",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "ADD_MODE"
+      ],
+      "id": "src-shaders-postblenddithernoiseaddps",
+      "oracle_cmake_line": 524,
+      "output_name": "src/shaders/PostBlendDitherNoiseAddPS.hlsl",
+      "port_cmake_line": 527,
+      "preprocessed_artifact": "preprocessed/src/shaders/PostBlendDitherNoiseAddPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/PostBlendDitherNoiseAddPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/PostBlendDitherNoisePS.hlsl",
+        "src/shaders/Random.hlsli",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/PostBlendDitherNoiseSubPS.hlsl.json",
+      "dependency_set_sha256": "eb2fd3e75383a4be078385fa02652c2f9593da9f02356b4e6ef4f3e02168b9f9",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SUB_MODE"
+      ],
+      "id": "src-shaders-postblenddithernoisesubps",
+      "oracle_cmake_line": 525,
+      "output_name": "src/shaders/PostBlendDitherNoiseSubPS.hlsl",
+      "port_cmake_line": 528,
+      "preprocessed_artifact": "preprocessed/src/shaders/PostBlendDitherNoiseSubPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/PostBlendDitherNoiseSubPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/PostBlendDitherNoisePS.hlsl",
+        "src/shaders/Random.hlsli",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_raster_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/PostBlendDitherNoiseSubNegativePS.hlsl.json",
+      "dependency_set_sha256": "eb2fd3e75383a4be078385fa02652c2f9593da9f02356b4e6ef4f3e02168b9f9",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SUB_MODE",
+        "-D",
+        "NEGATIVE_MODE"
+      ],
+      "id": "src-shaders-postblenddithernoisesubnegativeps",
+      "oracle_cmake_line": 526,
+      "output_name": "src/shaders/PostBlendDitherNoiseSubNegativePS.hlsl",
+      "port_cmake_line": 529,
+      "preprocessed_artifact": "preprocessed/src/shaders/PostBlendDitherNoiseSubNegativePS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/PostBlendDitherNoiseSubNegativePS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/RSPModifyCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPModifyCS.hlsl.json",
+      "dependency_set_sha256": "9d9d016adacbb5b8d817147ded82953373bb6e41378aaa1c743bc5428453f344",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-rspmodifycs",
+      "oracle_cmake_line": 527,
+      "output_name": "src/shaders/RSPModifyCS.hlsl",
+      "port_cmake_line": 530,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPModifyCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPModifyCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPModifyCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_common.h",
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/RSPProcessCS.hlsl",
+        "src/shaders/TextureGen.hlsli",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_rsp_fog.h",
+        "src/shared/rt64_rsp_light.h",
+        "src/shared/rt64_rsp_lookat.h",
+        "src/shared/rt64_rsp_viewport.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPProcessCS.hlsl.json",
+      "dependency_set_sha256": "2c327631b26a99de78c78763da898447f28946c9a035bfb156774230bc24ae04",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-rspprocesscs",
+      "oracle_cmake_line": 528,
+      "output_name": "src/shaders/RSPProcessCS.hlsl",
+      "port_cmake_line": 531,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPProcessCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPProcessCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPProcessCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/RSPWorldCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPWorldCS.hlsl.json",
+      "dependency_set_sha256": "e23999973015a26684b6adc871a267b4385485eb26b9451599fb4cb36efb708e",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-rspworldcs",
+      "oracle_cmake_line": 529,
+      "output_name": "src/shaders/RSPWorldCS.hlsl",
+      "port_cmake_line": 532,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPWorldCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPWorldCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPWorldCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/shaders/RSPSmoothNormalCS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPSmoothNormalCS.hlsl.json",
+      "dependency_set_sha256": "a9e8eaebed9dd5f1d70fb12a2adb637ec6d4b5badeccd4847c4819e3891d6790",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-rspsmoothnormalcs",
+      "oracle_cmake_line": 530,
+      "output_name": "src/shaders/RSPSmoothNormalCS.hlsl",
+      "port_cmake_line": 533,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPSmoothNormalCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPSmoothNormalCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPSmoothNormalCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/RSPVertexTestZCS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_rsp_vertex_test_z.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPVertexTestZCS.hlsl.json",
+      "dependency_set_sha256": "7edc392488580540be307f64683d3bab872dc6e05b6832d94e7bde0bc56d0162",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-rspvertextestzcs",
+      "oracle_cmake_line": 531,
+      "output_name": "src/shaders/RSPVertexTestZCS.hlsl",
+      "port_cmake_line": 534,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPVertexTestZCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPVertexTestZCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPVertexTestZCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/RSPVertexTestZCS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_rsp_vertex_test_z.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RSPVertexTestZCSMS.hlsl.json",
+      "dependency_set_sha256": "7edc392488580540be307f64683d3bab872dc6e05b6832d94e7bde0bc56d0162",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3",
+        "-D",
+        "MULTISAMPLING"
+      ],
+      "id": "src-shaders-rspvertextestzcsms",
+      "oracle_cmake_line": 532,
+      "output_name": "src/shaders/RSPVertexTestZCSMS.hlsl",
+      "port_cmake_line": 535,
+      "preprocessed_artifact": "preprocessed/src/shaders/RSPVertexTestZCSMS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/RSPVertexTestZCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RSPVertexTestZCSMS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyColorToDepthPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyColorToDepthPS.hlsl.json",
+      "dependency_set_sha256": "9b1f658e73442e26370011ab4a19d4a5acc9afb87ff8b955c527bc2bfa8c7143",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-rtcopycolortodepthps",
+      "oracle_cmake_line": 533,
+      "output_name": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "port_cmake_line": 536,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyColorToDepthPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyColorToDepthPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyColorToDepthPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyColorToDepth2XPS.hlsl.json",
+      "dependency_set_sha256": "9b1f658e73442e26370011ab4a19d4a5acc9afb87ff8b955c527bc2bfa8c7143",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_2X"
+      ],
+      "id": "src-shaders-rtcopycolortodepth2xps",
+      "oracle_cmake_line": 534,
+      "output_name": "src/shaders/RtCopyColorToDepth2XPS.hlsl",
+      "port_cmake_line": 537,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyColorToDepth2XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyColorToDepth2XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyColorToDepthPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyColorToDepth4XPS.hlsl.json",
+      "dependency_set_sha256": "9b1f658e73442e26370011ab4a19d4a5acc9afb87ff8b955c527bc2bfa8c7143",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_4X"
+      ],
+      "id": "src-shaders-rtcopycolortodepth4xps",
+      "oracle_cmake_line": 535,
+      "output_name": "src/shaders/RtCopyColorToDepth4XPS.hlsl",
+      "port_cmake_line": 538,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyColorToDepth4XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyColorToDepth4XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyColorToDepthPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyColorToDepth8XPS.hlsl.json",
+      "dependency_set_sha256": "9b1f658e73442e26370011ab4a19d4a5acc9afb87ff8b955c527bc2bfa8c7143",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_8X"
+      ],
+      "id": "src-shaders-rtcopycolortodepth8xps",
+      "oracle_cmake_line": 536,
+      "output_name": "src/shaders/RtCopyColorToDepth8XPS.hlsl",
+      "port_cmake_line": 539,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyColorToDepth8XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyColorToDepth8XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyDepthToColorPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyDepthToColorPS.hlsl.json",
+      "dependency_set_sha256": "0b2b3139e3ab4b3b3126c817f25223929e869cfe2b29746f61d708905805f24a",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-rtcopydepthtocolorps",
+      "oracle_cmake_line": 537,
+      "output_name": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "port_cmake_line": 540,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyDepthToColorPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyDepthToColorPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyDepthToColorPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyDepthToColor2XPS.hlsl.json",
+      "dependency_set_sha256": "0b2b3139e3ab4b3b3126c817f25223929e869cfe2b29746f61d708905805f24a",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_2X"
+      ],
+      "id": "src-shaders-rtcopydepthtocolor2xps",
+      "oracle_cmake_line": 538,
+      "output_name": "src/shaders/RtCopyDepthToColor2XPS.hlsl",
+      "port_cmake_line": 541,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyDepthToColor2XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyDepthToColor2XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyDepthToColorPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyDepthToColor4XPS.hlsl.json",
+      "dependency_set_sha256": "0b2b3139e3ab4b3b3126c817f25223929e869cfe2b29746f61d708905805f24a",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_4X"
+      ],
+      "id": "src-shaders-rtcopydepthtocolor4xps",
+      "oracle_cmake_line": 539,
+      "output_name": "src/shaders/RtCopyDepthToColor4XPS.hlsl",
+      "port_cmake_line": 542,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyDepthToColor4XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyDepthToColor4XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Depth.hlsli",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/RtCopyDepthToColorPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_render_target_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/RtCopyDepthToColor8XPS.hlsl.json",
+      "dependency_set_sha256": "0b2b3139e3ab4b3b3126c817f25223929e869cfe2b29746f61d708905805f24a",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_8X"
+      ],
+      "id": "src-shaders-rtcopydepthtocolor8xps",
+      "oracle_cmake_line": 540,
+      "output_name": "src/shaders/RtCopyDepthToColor8XPS.hlsl",
+      "port_cmake_line": 543,
+      "preprocessed_artifact": "preprocessed/src/shaders/RtCopyDepthToColor8XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/RtCopyDepthToColor8XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/TextureCopyPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_texture_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/TextureCopyPS.hlsl.json",
+      "dependency_set_sha256": "680ea6baeae0ce6f35cb78df041bb8cd343b03df4910a3052523ec5cbd13a3cf",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-texturecopyps",
+      "oracle_cmake_line": 541,
+      "output_name": "src/shaders/TextureCopyPS.hlsl",
+      "port_cmake_line": 544,
+      "preprocessed_artifact": "preprocessed/src/shaders/TextureCopyPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/TextureCopyPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/TextureCopyPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_compute_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Formats.hlsli",
+        "src/shaders/TextureDecodeCS.hlsl",
+        "src/shaders/TextureDecoder.hlsli",
+        "src/shared/rt64_f3d_defines.h",
+        "src/shared/rt64_hlsl.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/TextureDecodeCS.hlsl.json",
+      "dependency_set_sha256": "d8fb3ef88ddfb3df0b4da2c5d36d86a3afa2ecb2e5dbf374825602f9403fb2d6",
+      "entry": "CSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "CSMain",
+        "-T",
+        "cs_6_3"
+      ],
+      "id": "src-shaders-texturedecodecs",
+      "oracle_cmake_line": 542,
+      "output_name": "src/shaders/TextureDecodeCS.hlsl",
+      "port_cmake_line": 545,
+      "preprocessed_artifact": "preprocessed/src/shaders/TextureDecodeCS.hlsl.pp.hlsl",
+      "profile": "cs_6_3",
+      "source": "src/shaders/TextureDecodeCS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/TextureDecodeCS.hlsl.spv",
+      "stage": "compute"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/TextureResolvePS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_texture_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/TextureResolveSamples2XPS.hlsl.json",
+      "dependency_set_sha256": "edaa58f790391b64af2aa7d4db24eb33f2497dedd3b424b003835f2ea51361cb",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_2X"
+      ],
+      "id": "src-shaders-textureresolvesamples2xps",
+      "oracle_cmake_line": 543,
+      "output_name": "src/shaders/TextureResolveSamples2XPS.hlsl",
+      "port_cmake_line": 546,
+      "preprocessed_artifact": "preprocessed/src/shaders/TextureResolveSamples2XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/TextureResolvePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/TextureResolveSamples2XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/TextureResolvePS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_texture_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/TextureResolveSamples4XPS.hlsl.json",
+      "dependency_set_sha256": "edaa58f790391b64af2aa7d4db24eb33f2497dedd3b424b003835f2ea51361cb",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_4X"
+      ],
+      "id": "src-shaders-textureresolvesamples4xps",
+      "oracle_cmake_line": 544,
+      "output_name": "src/shaders/TextureResolveSamples4XPS.hlsl",
+      "port_cmake_line": 547,
+      "preprocessed_artifact": "preprocessed/src/shaders/TextureResolveSamples4XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/TextureResolvePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/TextureResolveSamples4XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/TextureResolvePS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_texture_copy.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/TextureResolveSamples8XPS.hlsl.json",
+      "dependency_set_sha256": "edaa58f790391b64af2aa7d4db24eb33f2497dedd3b424b003835f2ea51361cb",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "SAMPLES_8X"
+      ],
+      "id": "src-shaders-textureresolvesamples8xps",
+      "oracle_cmake_line": 545,
+      "output_name": "src/shaders/TextureResolveSamples8XPS.hlsl",
+      "port_cmake_line": 548,
+      "preprocessed_artifact": "preprocessed/src/shaders/TextureResolveSamples8XPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/TextureResolvePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/TextureResolveSamples8XPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/VideoInterfacePS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_video_interface.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/VideoInterfacePSRegular.hlsl.json",
+      "dependency_set_sha256": "ce16c0487603392310a911f51a9ab2572d15e32314defbf53f21041c7fef5058",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-videointerfacepsregular",
+      "oracle_cmake_line": 546,
+      "output_name": "src/shaders/VideoInterfacePSRegular.hlsl",
+      "port_cmake_line": 549,
+      "preprocessed_artifact": "preprocessed/src/shaders/VideoInterfacePSRegular.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/VideoInterfacePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/VideoInterfacePSRegular.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/VideoInterfacePS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_video_interface.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/VideoInterfacePSPixel.hlsl.json",
+      "dependency_set_sha256": "ce16c0487603392310a911f51a9ab2572d15e32314defbf53f21041c7fef5058",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3",
+        "-D",
+        "PIXEL_ANTIALIASING"
+      ],
+      "id": "src-shaders-videointerfacepspixel",
+      "oracle_cmake_line": 547,
+      "output_name": "src/shaders/VideoInterfacePSPixel.hlsl",
+      "port_cmake_line": 550,
+      "preprocessed_artifact": "preprocessed/src/shaders/VideoInterfacePSPixel.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/VideoInterfacePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/VideoInterfacePSPixel.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_vertex_shader",
+      "dependency_files": [
+        "src/shaders/FullScreenVS.hlsl"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/FullScreenVS.hlsl.json",
+      "dependency_set_sha256": "b570a77fdbca89c81bb2cda0e66ea04a4efb552faac2c3820546dfbd6f2dadd7",
+      "entry": "VSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y"
+      ],
+      "id": "src-shaders-fullscreenvs",
+      "oracle_cmake_line": 548,
+      "output_name": "src/shaders/FullScreenVS.hlsl",
+      "port_cmake_line": 551,
+      "preprocessed_artifact": "preprocessed/src/shaders/FullScreenVS.hlsl.pp.hlsl",
+      "profile": "vs_6_3",
+      "source": "src/shaders/FullScreenVS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/FullScreenVS.hlsl.spv",
+      "stage": "vertex"
+    },
+    {
+      "cmake_function": "build_vertex_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererRT.hlsli",
+        "src/shaders/Im3DCommon.hlsli",
+        "src/shaders/Im3DVS.hlsl",
+        "src/shared/rt64_extra_params.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_interleaved_raster.h",
+        "src/shared/rt64_point_light.h",
+        "src/shared/rt64_raytracing_params.h",
+        "src/shared/rt64_rsp_fog.h",
+        "src/shared/rt64_rsp_light.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/Im3DVS.hlsl.json",
+      "dependency_set_sha256": "a35a38e7beb3192276c7f6dca8795117d0d56f7c584a5f5fbfc752af9ccc2458",
+      "entry": "VSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "VSMain",
+        "-T",
+        "vs_6_3",
+        "-fvk-invert-y"
+      ],
+      "id": "src-shaders-im3dvs",
+      "oracle_cmake_line": 549,
+      "output_name": "src/shaders/Im3DVS.hlsl",
+      "port_cmake_line": 552,
+      "preprocessed_artifact": "preprocessed/src/shaders/Im3DVS.hlsl.pp.hlsl",
+      "profile": "vs_6_3",
+      "source": "src/shaders/Im3DVS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/Im3DVS.hlsl.spv",
+      "stage": "vertex"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/shaders/Color.hlsli",
+        "src/shaders/ComposePS.hlsl",
+        "src/shaders/Constants.hlsli",
+        "src/shaders/Math.hlsli"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/ComposePS.hlsl.json",
+      "dependency_set_sha256": "48dbc0b4c4e2c782cc5212e2bd79eba08714ebe77ce596421efb39b922c25d86",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-composeps",
+      "oracle_cmake_line": 550,
+      "output_name": "src/shaders/ComposePS.hlsl",
+      "port_cmake_line": 553,
+      "preprocessed_artifact": "preprocessed/src/shaders/ComposePS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/ComposePS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/ComposePS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Color.hlsli",
+        "src/shaders/DebugPS.hlsl",
+        "src/shaders/FbRendererCommon.hlsli",
+        "src/shaders/FbRendererRT.hlsli",
+        "src/shaders/Random.hlsli",
+        "src/shared/rt64_extra_params.h",
+        "src/shared/rt64_fb_common.h",
+        "src/shared/rt64_frame_params.h",
+        "src/shared/rt64_framebuffer_params.h",
+        "src/shared/rt64_gpu_tile.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_interleaved_raster.h",
+        "src/shared/rt64_point_light.h",
+        "src/shared/rt64_raytracing_params.h",
+        "src/shared/rt64_rdp_params.h",
+        "src/shared/rt64_rdp_tile.h",
+        "src/shared/rt64_render_flags.h",
+        "src/shared/rt64_render_indices.h",
+        "src/shared/rt64_render_params.h",
+        "src/shared/rt64_rsp_fog.h",
+        "src/shared/rt64_rsp_light.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/DebugPS.hlsl.json",
+      "dependency_set_sha256": "f9dc45b72240b08d3b140f140a020637255aac156c0c907b949530dddefcba04",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-debugps",
+      "oracle_cmake_line": 551,
+      "output_name": "src/shaders/DebugPS.hlsl",
+      "port_cmake_line": 554,
+      "preprocessed_artifact": "preprocessed/src/shaders/DebugPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/DebugPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/DebugPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/FbRendererRT.hlsli",
+        "src/shaders/Im3DCommon.hlsli",
+        "src/shaders/Im3DPS.hlsl",
+        "src/shared/rt64_extra_params.h",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_interleaved_raster.h",
+        "src/shared/rt64_point_light.h",
+        "src/shared/rt64_raytracing_params.h",
+        "src/shared/rt64_rsp_fog.h",
+        "src/shared/rt64_rsp_light.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/Im3DPS.hlsl.json",
+      "dependency_set_sha256": "40669ccc7c0af686127ca7cccbbaa869cb376d1fe0e6d600d275448d8f12e203",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-im3dps",
+      "oracle_cmake_line": 552,
+      "output_name": "src/shaders/Im3DPS.hlsl",
+      "port_cmake_line": 555,
+      "preprocessed_artifact": "preprocessed/src/shaders/Im3DPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/Im3DPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/Im3DPS.hlsl.spv",
+      "stage": "fragment"
+    },
+    {
+      "cmake_function": "build_pixel_shader",
+      "dependency_files": [
+        "src/common/rt64_hlslpp.h",
+        "src/shaders/Color.hlsli",
+        "src/shaders/Constants.hlsli",
+        "src/shaders/Math.hlsli",
+        "src/shaders/PostProcessPS.hlsl",
+        "src/shared/rt64_hlsl.h",
+        "src/shared/rt64_raytracing_params.h"
+      ],
+      "dependency_manifest_artifact": "dependencies/src/shaders/PostProcessPS.hlsl.json",
+      "dependency_set_sha256": "3b2f4da6f60c37732550df016fdb2eb8571401b51f3a08f47ca631dff6599a67",
+      "entry": "PSMain",
+      "flags": [
+        "-spirv",
+        "-fspv-target-env=vulkan1.0",
+        "-fvk-use-dx-layout",
+        "-I",
+        "src",
+        "-E",
+        "PSMain",
+        "-T",
+        "ps_6_3"
+      ],
+      "id": "src-shaders-postprocessps",
+      "oracle_cmake_line": 553,
+      "output_name": "src/shaders/PostProcessPS.hlsl",
+      "port_cmake_line": 556,
+      "preprocessed_artifact": "preprocessed/src/shaders/PostProcessPS.hlsl.pp.hlsl",
+      "profile": "ps_6_3",
+      "source": "src/shaders/PostProcessPS.hlsl",
+      "spirv_artifact": "spirv/src/shaders/PostProcessPS.hlsl.spv",
+      "stage": "fragment"
+    }
+  ],
+  "generated_by": "tools/rt64_shader_artifacts.py",
+  "include_edges": [
+    {
+      "include": "rt64_hlslpp.h",
+      "resolved": "src/common/rt64_hlslpp.h",
+      "source": "src/common/rt64_common.h"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/Background.hlsli"
+    },
+    {
+      "include": "Color.hlsli",
+      "resolved": "src/shaders/Color.hlsli",
+      "source": "src/shaders/BicubicScalingCS.hlsl"
+    },
+    {
+      "include": "Constants.hlsli",
+      "resolved": "src/shaders/Constants.hlsli",
+      "source": "src/shaders/BlueNoise.hlsli"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/BlueNoise.hlsli"
+    },
+    {
+      "include": "Color.hlsli",
+      "resolved": "src/shaders/Color.hlsli",
+      "source": "src/shaders/ComposePS.hlsl"
+    },
+    {
+      "include": "Constants.hlsli",
+      "resolved": "src/shaders/Constants.hlsli",
+      "source": "src/shaders/ComposePS.hlsl"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/ComposePS.hlsl"
+    },
+    {
+      "include": "Color.hlsli",
+      "resolved": "src/shaders/Color.hlsli",
+      "source": "src/shaders/DebugPS.hlsl"
+    },
+    {
+      "include": "FbRendererCommon.hlsli",
+      "resolved": "src/shaders/FbRendererCommon.hlsli",
+      "source": "src/shaders/DebugPS.hlsl"
+    },
+    {
+      "include": "FbRendererRT.hlsli",
+      "resolved": "src/shaders/FbRendererRT.hlsli",
+      "source": "src/shaders/DebugPS.hlsl"
+    },
+    {
+      "include": "Random.hlsli",
+      "resolved": "src/shaders/Random.hlsli",
+      "source": "src/shaders/DebugPS.hlsl"
+    },
+    {
+      "include": "Formats.hlsli",
+      "resolved": "src/shaders/Formats.hlsli",
+      "source": "src/shaders/FbCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_f3d_defines.h",
+      "resolved": "src/shared/rt64_f3d_defines.h",
+      "source": "src/shaders/FbCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_fb_common.h",
+      "resolved": "src/shared/rt64_fb_common.h",
+      "source": "src/shaders/FbCommon.hlsli"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/FbReadAnyChangesCS.hlsl"
+    },
+    {
+      "include": "FbCommon.hlsli",
+      "resolved": "src/shaders/FbCommon.hlsli",
+      "source": "src/shaders/FbReadAnyChangesCS.hlsl"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/FbReadAnyFullCS.hlsl"
+    },
+    {
+      "include": "FbCommon.hlsli",
+      "resolved": "src/shaders/FbCommon.hlsli",
+      "source": "src/shaders/FbReadAnyFullCS.hlsl"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "Random.hlsli",
+      "resolved": "src/shaders/Random.hlsli",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "TextureDecoder.hlsli",
+      "resolved": "src/shaders/TextureDecoder.hlsli",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_f3d_defines.h",
+      "resolved": "src/shared/rt64_f3d_defines.h",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_fb_common.h",
+      "resolved": "src/shared/rt64_fb_common.h",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_fb_reinterpret.h",
+      "resolved": "src/shared/rt64_fb_reinterpret.h",
+      "source": "src/shaders/FbReinterpretCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_fb_common.h",
+      "resolved": "src/shared/rt64_fb_common.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_frame_params.h",
+      "resolved": "src/shared/rt64_frame_params.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_framebuffer_params.h",
+      "resolved": "src/shared/rt64_framebuffer_params.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_gpu_tile.h",
+      "resolved": "src/shared/rt64_gpu_tile.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_rdp_params.h",
+      "resolved": "src/shared/rt64_rdp_params.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_rdp_tile.h",
+      "resolved": "src/shared/rt64_rdp_tile.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_render_indices.h",
+      "resolved": "src/shared/rt64_render_indices.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_render_params.h",
+      "resolved": "src/shared/rt64_render_params.h",
+      "source": "src/shaders/FbRendererCommon.hlsli"
+    },
+    {
+      "include": "shared/rt64_extra_params.h",
+      "resolved": "src/shared/rt64_extra_params.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "shared/rt64_interleaved_raster.h",
+      "resolved": "src/shared/rt64_interleaved_raster.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "shared/rt64_point_light.h",
+      "resolved": "src/shared/rt64_point_light.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "shared/rt64_raytracing_params.h",
+      "resolved": "src/shared/rt64_raytracing_params.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "shared/rt64_rsp_fog.h",
+      "resolved": "src/shared/rt64_rsp_fog.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "shared/rt64_rsp_light.h",
+      "resolved": "src/shared/rt64_rsp_light.h",
+      "source": "src/shaders/FbRendererRT.hlsli"
+    },
+    {
+      "include": "FbCommon.hlsli",
+      "resolved": "src/shaders/FbCommon.hlsli",
+      "source": "src/shaders/FbWriteColorCS.hlsl"
+    },
+    {
+      "include": "Random.hlsli",
+      "resolved": "src/shaders/Random.hlsli",
+      "source": "src/shaders/FbWriteColorCS.hlsl"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/FbWriteDepthCS.hlsl"
+    },
+    {
+      "include": "FbCommon.hlsli",
+      "resolved": "src/shaders/FbCommon.hlsli",
+      "source": "src/shaders/FbWriteDepthCS.hlsl"
+    },
+    {
+      "include": "Constants.hlsli",
+      "resolved": "src/shaders/Constants.hlsli",
+      "source": "src/shaders/HistogramAverageCS.hlsl"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/HistogramAverageCS.hlsl"
+    },
+    {
+      "include": "Constants.hlsli",
+      "resolved": "src/shaders/Constants.hlsli",
+      "source": "src/shaders/HistogramSetCS.hlsl"
+    },
+    {
+      "include": "FbRendererRT.hlsli",
+      "resolved": "src/shaders/FbRendererRT.hlsli",
+      "source": "src/shaders/Im3DPS.hlsl"
+    },
+    {
+      "include": "Im3DCommon.hlsli",
+      "resolved": "src/shaders/Im3DCommon.hlsli",
+      "source": "src/shaders/Im3DPS.hlsl"
+    },
+    {
+      "include": "FbRendererRT.hlsli",
+      "resolved": "src/shaders/FbRendererRT.hlsli",
+      "source": "src/shaders/Im3DVS.hlsl"
+    },
+    {
+      "include": "Im3DCommon.hlsli",
+      "resolved": "src/shaders/Im3DCommon.hlsli",
+      "source": "src/shaders/Im3DVS.hlsl"
+    },
+    {
+      "include": "BlueNoise.hlsli",
+      "resolved": "src/shaders/BlueNoise.hlsli",
+      "source": "src/shaders/Lights.hlsli"
+    },
+    {
+      "include": "shared/rt64_extra_params.h",
+      "resolved": "src/shared/rt64_extra_params.h",
+      "source": "src/shaders/Lights.hlsli"
+    },
+    {
+      "include": "shared/rt64_point_light.h",
+      "resolved": "src/shared/rt64_point_light.h",
+      "source": "src/shaders/Lights.hlsli"
+    },
+    {
+      "include": "Color.hlsli",
+      "resolved": "src/shaders/Color.hlsli",
+      "source": "src/shaders/LuminanceHistogramCS.hlsl"
+    },
+    {
+      "include": "FbRendererCommon.hlsli",
+      "resolved": "src/shaders/FbRendererCommon.hlsli",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl"
+    },
+    {
+      "include": "Random.hlsli",
+      "resolved": "src/shaders/Random.hlsli",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl"
+    },
+    {
+      "include": "shared/rt64_raster_params.h",
+      "resolved": "src/shared/rt64_raster_params.h",
+      "source": "src/shaders/PostBlendDitherNoisePS.hlsl"
+    },
+    {
+      "include": "Color.hlsli",
+      "resolved": "src/shaders/Color.hlsli",
+      "source": "src/shaders/PostProcessPS.hlsl"
+    },
+    {
+      "include": "Constants.hlsli",
+      "resolved": "src/shaders/Constants.hlsli",
+      "source": "src/shaders/PostProcessPS.hlsl"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/PostProcessPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_raytracing_params.h",
+      "resolved": "src/shared/rt64_raytracing_params.h",
+      "source": "src/shaders/PostProcessPS.hlsl"
+    },
+    {
+      "include": "TextureGen.hlsli",
+      "resolved": "src/shaders/TextureGen.hlsli",
+      "source": "src/shaders/RSPProcessCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_rsp_fog.h",
+      "resolved": "src/shared/rt64_rsp_fog.h",
+      "source": "src/shaders/RSPProcessCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_rsp_light.h",
+      "resolved": "src/shared/rt64_rsp_light.h",
+      "source": "src/shaders/RSPProcessCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_rsp_lookat.h",
+      "resolved": "src/shared/rt64_rsp_lookat.h",
+      "source": "src/shaders/RSPProcessCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_rsp_viewport.h",
+      "resolved": "src/shared/rt64_rsp_viewport.h",
+      "source": "src/shaders/RSPProcessCS.hlsl"
+    },
+    {
+      "include": "shared/rt64_rsp_vertex_test_z.h",
+      "resolved": "src/shared/rt64_rsp_vertex_test_z.h",
+      "source": "src/shaders/RSPVertexTestZCS.hlsl"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "FbRendererCommon.hlsli",
+      "resolved": "src/shaders/FbRendererCommon.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "Library.hlsli",
+      "resolved": "src/shaders/Library.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "Random.hlsli",
+      "resolved": "src/shaders/Random.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "RenderParamsSpecConstants.hlsli",
+      "resolved": "src/shaders/RenderParamsSpecConstants.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "TextureSampler.hlsli",
+      "resolved": "src/shaders/TextureSampler.hlsli",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_blender.h",
+      "resolved": "src/shared/rt64_blender.h",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_color_combiner.h",
+      "resolved": "src/shared/rt64_color_combiner.h",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_raster_params.h",
+      "resolved": "src/shared/rt64_raster_params.h",
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "include": "FbRendererCommon.hlsli",
+      "resolved": "src/shaders/FbRendererCommon.hlsli",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "Library.hlsli",
+      "resolved": "src/shaders/Library.hlsli",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "RenderParamsSpecConstants.hlsli",
+      "resolved": "src/shaders/RenderParamsSpecConstants.hlsli",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "shared/rt64_other_mode.h",
+      "resolved": "src/shared/rt64_other_mode.h",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "shared/rt64_raster_params.h",
+      "resolved": "src/shared/rt64_raster_params.h",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "shared/rt64_render_flags.h",
+      "resolved": "src/shared/rt64_render_flags.h",
+      "source": "src/shaders/RasterVS.hlsl"
+    },
+    {
+      "include": "shared/rt64_render_params.h",
+      "resolved": "src/shared/rt64_render_params.h",
+      "source": "src/shaders/RenderParams.hlsli"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl"
+    },
+    {
+      "include": "Formats.hlsli",
+      "resolved": "src/shaders/Formats.hlsli",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_render_target_copy.h",
+      "resolved": "src/shared/rt64_render_target_copy.h",
+      "source": "src/shaders/RtCopyColorToDepthPS.hlsl"
+    },
+    {
+      "include": "Depth.hlsli",
+      "resolved": "src/shaders/Depth.hlsli",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl"
+    },
+    {
+      "include": "Formats.hlsli",
+      "resolved": "src/shaders/Formats.hlsli",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_render_target_copy.h",
+      "resolved": "src/shared/rt64_render_target_copy.h",
+      "source": "src/shaders/RtCopyDepthToColorPS.hlsl"
+    },
+    {
+      "include": "shared/rt64_texture_copy.h",
+      "resolved": "src/shared/rt64_texture_copy.h",
+      "source": "src/shaders/TextureCopyPS.hlsl"
+    },
+    {
+      "include": "TextureDecoder.hlsli",
+      "resolved": "src/shaders/TextureDecoder.hlsli",
+      "source": "src/shaders/TextureDecodeCS.hlsl"
+    },
+    {
+      "include": "Formats.hlsli",
+      "resolved": "src/shaders/Formats.hlsli",
+      "source": "src/shaders/TextureDecoder.hlsli"
+    },
+    {
+      "include": "shared/rt64_f3d_defines.h",
+      "resolved": "src/shared/rt64_f3d_defines.h",
+      "source": "src/shaders/TextureDecoder.hlsli"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shaders/TextureDecoder.hlsli"
+    },
+    {
+      "include": "shared/rt64_rsp_lookat.h",
+      "resolved": "src/shared/rt64_rsp_lookat.h",
+      "source": "src/shaders/TextureGen.hlsli"
+    },
+    {
+      "include": "shared/rt64_texture_copy.h",
+      "resolved": "src/shared/rt64_texture_copy.h",
+      "source": "src/shaders/TextureResolvePS.hlsl"
+    },
+    {
+      "include": "FbRendererCommon.hlsli",
+      "resolved": "src/shaders/FbRendererCommon.hlsli",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "Math.hlsli",
+      "resolved": "src/shaders/Math.hlsli",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "TextureDecoder.hlsli",
+      "resolved": "src/shaders/TextureDecoder.hlsli",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "shared/rt64_other_mode.h",
+      "resolved": "src/shared/rt64_other_mode.h",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "shared/rt64_render_flags.h",
+      "resolved": "src/shared/rt64_render_flags.h",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "shared/rt64_render_params.h",
+      "resolved": "src/shared/rt64_render_params.h",
+      "source": "src/shaders/TextureSampler.hlsli"
+    },
+    {
+      "include": "shared/rt64_video_interface.h",
+      "resolved": "src/shared/rt64_video_interface.h",
+      "source": "src/shaders/VideoInterfacePS.hlsl"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_blender.h"
+    },
+    {
+      "include": "shared/rt64_other_mode.h",
+      "resolved": "src/shared/rt64_other_mode.h",
+      "source": "src/shared/rt64_blender.h"
+    },
+    {
+      "include": "shared/rt64_render_flags.h",
+      "resolved": "src/shared/rt64_render_flags.h",
+      "source": "src/shared/rt64_blender.h"
+    },
+    {
+      "include": "shared/rt64_render_params.h",
+      "resolved": "src/shared/rt64_render_params.h",
+      "source": "src/shared/rt64_blender.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_color_combiner.h"
+    },
+    {
+      "include": "shared/rt64_other_mode.h",
+      "resolved": "src/shared/rt64_other_mode.h",
+      "source": "src/shared/rt64_color_combiner.h"
+    },
+    {
+      "include": "rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_extra_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_fb_common.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_fb_reinterpret.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_frame_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_framebuffer_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_gpu_tile.h"
+    },
+    {
+      "include": "common/rt64_hlslpp.h",
+      "resolved": "src/common/rt64_hlslpp.h",
+      "source": "src/shared/rt64_hlsl.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_interleaved_raster.h"
+    },
+    {
+      "include": "rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_other_mode.h"
+    },
+    {
+      "include": "shared/rt64_f3d_defines.h",
+      "resolved": "src/shared/rt64_f3d_defines.h",
+      "source": "src/shared/rt64_other_mode.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_point_light.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_raster_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_raytracing_params.h"
+    },
+    {
+      "include": "rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rdp_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rdp_tile.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_render_flags.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_render_indices.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_render_params.h"
+    },
+    {
+      "include": "shared/rt64_render_flags.h",
+      "resolved": "src/shared/rt64_render_flags.h",
+      "source": "src/shared/rt64_render_params.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_render_target_copy.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rsp_fog.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rsp_light.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rsp_lookat.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rsp_vertex_test_z.h"
+    },
+    {
+      "include": "common/rt64_common.h",
+      "resolved": "src/common/rt64_common.h",
+      "source": "src/shared/rt64_rsp_viewport.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_rsp_viewport.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_texture_copy.h"
+    },
+    {
+      "include": "shared/rt64_hlsl.h",
+      "resolved": "src/shared/rt64_hlsl.h",
+      "source": "src/shared/rt64_video_interface.h"
+    }
+  ],
+  "non_spirv_entries": [
+    {
+      "classification": "windows-dxil-library-only",
+      "oracle_cmake_line": 493,
+      "output_name": "src/shaders/RasterPSLibrary.hlsl",
+      "port_cmake_line": 496,
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "classification": "windows-dxil-library-only",
+      "oracle_cmake_line": 494,
+      "output_name": "src/shaders/RasterPSLibraryMS.hlsl",
+      "port_cmake_line": 497,
+      "source": "src/shaders/RasterPS.hlsl"
+    },
+    {
+      "classification": "windows-dxil-library-only",
+      "oracle_cmake_line": 495,
+      "output_name": "src/shaders/RasterVSLibrary.hlsl",
+      "port_cmake_line": 498,
+      "source": "src/shaders/RasterVS.hlsl"
+    }
+  ],
+  "preprocess_only": [
+    {
+      "classification": "runtime-generated-raster-parameter-text",
+      "oracle_cmake_line": 490,
+      "port_cmake_line": 493,
+      "source": "src/shaders/RenderParams.hlsli"
+    }
+  ],
+  "schema": "fn64.rt64-shader-source-denominator.v1",
+  "source_files": [
+    {
+      "oracle_sha256": "fd20ae43ea5cad0bcb3510a3fc6419b255455f12fa4cdbfc8d91f868925739b2",
+      "path": "src/common/rt64_common.h",
+      "port_delta": "unchanged",
+      "port_sha256": "fd20ae43ea5cad0bcb3510a3fc6419b255455f12fa4cdbfc8d91f868925739b2"
+    },
+    {
+      "oracle_sha256": "77103a2ef297ef942ebffe33ca93b9bed54f320bf3cb58937f0e294946a22379",
+      "path": "src/common/rt64_hlslpp.h",
+      "port_delta": "unchanged",
+      "port_sha256": "77103a2ef297ef942ebffe33ca93b9bed54f320bf3cb58937f0e294946a22379"
+    },
+    {
+      "oracle_sha256": "95a691d194f2f498a0b53b92a3b9aa1223ab04577f753cd847a28297965fae2f",
+      "path": "src/shaders/Background.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "95a691d194f2f498a0b53b92a3b9aa1223ab04577f753cd847a28297965fae2f"
+    },
+    {
+      "oracle_sha256": "58f35aa68c30042b31e530c6770b69309ad3e297e142d9cee0d13762b50a4ce4",
+      "path": "src/shaders/BicubicScalingCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "58f35aa68c30042b31e530c6770b69309ad3e297e142d9cee0d13762b50a4ce4"
+    },
+    {
+      "oracle_sha256": "4550c5a3bd38497f47e6c51351b09ba39b095745702037f3982f3e670de2f051",
+      "path": "src/shaders/BlueNoise.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "4550c5a3bd38497f47e6c51351b09ba39b095745702037f3982f3e670de2f051"
+    },
+    {
+      "oracle_sha256": "6983fdb48c3331d19041dd309d5f0e870b36c2e3c62eab72a305f8604b04f560",
+      "path": "src/shaders/BoxFilterCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "6983fdb48c3331d19041dd309d5f0e870b36c2e3c62eab72a305f8604b04f560"
+    },
+    {
+      "oracle_sha256": "41b0be36513eb829c215da6ca6e94a1b113fa550fcf87c443ff0f141010c3b48",
+      "path": "src/shaders/Color.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "41b0be36513eb829c215da6ca6e94a1b113fa550fcf87c443ff0f141010c3b48"
+    },
+    {
+      "oracle_sha256": "85a1aef1db2f21de09b4bc6de552fbd86a501bdc8e0b78c0aa6a483f61af9889",
+      "path": "src/shaders/ComposePS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "85a1aef1db2f21de09b4bc6de552fbd86a501bdc8e0b78c0aa6a483f61af9889"
+    },
+    {
+      "oracle_sha256": "551bcc54ec095634bbce77b9e3c7f629449835fc1443f12cbc47c7591523878b",
+      "path": "src/shaders/Constants.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "551bcc54ec095634bbce77b9e3c7f629449835fc1443f12cbc47c7591523878b"
+    },
+    {
+      "oracle_sha256": "7309ae1af2590ed758b7098bf9d27d4b534cc5564ce6bcb54c97854fa4f8c2e8",
+      "path": "src/shaders/DebugPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "7309ae1af2590ed758b7098bf9d27d4b534cc5564ce6bcb54c97854fa4f8c2e8"
+    },
+    {
+      "oracle_sha256": "7b66c5e78ce9e6d2118d4541bb6d92fd49a65875cbfe947794cf8e1080ed3a11",
+      "path": "src/shaders/Depth.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "7b66c5e78ce9e6d2118d4541bb6d92fd49a65875cbfe947794cf8e1080ed3a11"
+    },
+    {
+      "oracle_sha256": "41ecfa6e6c22d21154c57a9f62353dd64eb4ae56ab7c6f9e26ec72f8863d5095",
+      "path": "src/shaders/FbChangesClearCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "41ecfa6e6c22d21154c57a9f62353dd64eb4ae56ab7c6f9e26ec72f8863d5095"
+    },
+    {
+      "oracle_sha256": "5eb0c750c8d82056a6908713eaabc6095d60594e2f2c25b90e5f1a0bb1258fbd",
+      "path": "src/shaders/FbChangesDrawColorPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "5eb0c750c8d82056a6908713eaabc6095d60594e2f2c25b90e5f1a0bb1258fbd"
+    },
+    {
+      "oracle_sha256": "37e02f5c961c6102f7bdc829e5fd5868d847c18f23222a9c3471a803c7b30ac8",
+      "path": "src/shaders/FbChangesDrawDepthPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "37e02f5c961c6102f7bdc829e5fd5868d847c18f23222a9c3471a803c7b30ac8"
+    },
+    {
+      "oracle_sha256": "6ffa6f2d3e2cbb9ce92943ef9965ddefff0e5f4a4c936130308fbed646fc3591",
+      "path": "src/shaders/FbCommon.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "6ffa6f2d3e2cbb9ce92943ef9965ddefff0e5f4a4c936130308fbed646fc3591"
+    },
+    {
+      "oracle_sha256": "28757a072be4a15021d050d4e7f2c93267ce225adef8afbeb8676badffee64bd",
+      "path": "src/shaders/FbReadAnyChangesCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "28757a072be4a15021d050d4e7f2c93267ce225adef8afbeb8676badffee64bd"
+    },
+    {
+      "oracle_sha256": "36e11183307d15be68f2ba465a5842462692ec872065676bcc82b0eaf7ca55a4",
+      "path": "src/shaders/FbReadAnyFullCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "36e11183307d15be68f2ba465a5842462692ec872065676bcc82b0eaf7ca55a4"
+    },
+    {
+      "oracle_sha256": "603310262d0b0baa038f459835571c0d3e24552866004ebc84fc96b47297bf62",
+      "path": "src/shaders/FbReinterpretCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "603310262d0b0baa038f459835571c0d3e24552866004ebc84fc96b47297bf62"
+    },
+    {
+      "oracle_sha256": "aabd51229493d8cf15d42e1ce39d22e7a74353754bc31486188bc3e994aa127d",
+      "path": "src/shaders/FbRendererCommon.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "aabd51229493d8cf15d42e1ce39d22e7a74353754bc31486188bc3e994aa127d"
+    },
+    {
+      "oracle_sha256": "b9e2e76c7363e834c6ae2f0220cb2c3e45dc9a232e1e75ef91f31283757a9729",
+      "path": "src/shaders/FbRendererRT.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "b9e2e76c7363e834c6ae2f0220cb2c3e45dc9a232e1e75ef91f31283757a9729"
+    },
+    {
+      "oracle_sha256": "c589dfa305f3aaa791e05966b16cb9aba3a4661988a7a122ae8dd9806ebfa317",
+      "path": "src/shaders/FbWriteColorCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "c589dfa305f3aaa791e05966b16cb9aba3a4661988a7a122ae8dd9806ebfa317"
+    },
+    {
+      "oracle_sha256": "2a170828ab61d215848e1a4cd8999d6cc037beba22dde7c78e283b510d6469ef",
+      "path": "src/shaders/FbWriteDepthCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "2a170828ab61d215848e1a4cd8999d6cc037beba22dde7c78e283b510d6469ef"
+    },
+    {
+      "oracle_sha256": "9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b",
+      "path": "src/shaders/Formats.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b"
+    },
+    {
+      "oracle_sha256": "e03453509bbb8271f687861068190528e0a0f5a82b08e3ffaee062dcde1683dc",
+      "path": "src/shaders/FullScreenVS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "e03453509bbb8271f687861068190528e0a0f5a82b08e3ffaee062dcde1683dc"
+    },
+    {
+      "oracle_sha256": "523f3e2ea3a92c452267d3843a3901a1a9b07c57d9d17b880e96171b6755f2f1",
+      "path": "src/shaders/GaussianFilterRGB3x3CS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "523f3e2ea3a92c452267d3843a3901a1a9b07c57d9d17b880e96171b6755f2f1"
+    },
+    {
+      "oracle_sha256": "02498d46e883ef47c5977c26002cdd08f989ac7b7dee74dd272557a3f977c9d4",
+      "path": "src/shaders/GlobalHitBuffers.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "02498d46e883ef47c5977c26002cdd08f989ac7b7dee74dd272557a3f977c9d4"
+    },
+    {
+      "oracle_sha256": "e39a45adab1258f32569c6edc23fb609aedb71f3d4728f15598e9fb581041f26",
+      "path": "src/shaders/HistogramAverageCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "e39a45adab1258f32569c6edc23fb609aedb71f3d4728f15598e9fb581041f26"
+    },
+    {
+      "oracle_sha256": "8a47faa063c2dbe5e99b6c133c709f399578ced632896ca472042d162cdc4369",
+      "path": "src/shaders/HistogramClearCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "8a47faa063c2dbe5e99b6c133c709f399578ced632896ca472042d162cdc4369"
+    },
+    {
+      "oracle_sha256": "1f4f372edff0d21a29534b48e3955a1355e8810b2e1cc965e0eb4ecaf26e98a3",
+      "path": "src/shaders/HistogramSetCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "1f4f372edff0d21a29534b48e3955a1355e8810b2e1cc965e0eb4ecaf26e98a3"
+    },
+    {
+      "oracle_sha256": "ceeb9cbce742a77e7ea4c70819d4e3e258d0e94127f5921b9cda73d072e2458d",
+      "path": "src/shaders/IdleCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "ceeb9cbce742a77e7ea4c70819d4e3e258d0e94127f5921b9cda73d072e2458d"
+    },
+    {
+      "oracle_sha256": "3ce335b2f41f040b7d1c506a50bab82d4131b441d2c64fad16dd072dbff232b7",
+      "path": "src/shaders/Im3DCommon.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "3ce335b2f41f040b7d1c506a50bab82d4131b441d2c64fad16dd072dbff232b7"
+    },
+    {
+      "oracle_sha256": "44675d859f5902f73c70374a9410d53ff16b2df93409fa554a77898c7ea7ee0b",
+      "path": "src/shaders/Im3DPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "44675d859f5902f73c70374a9410d53ff16b2df93409fa554a77898c7ea7ee0b"
+    },
+    {
+      "oracle_sha256": "59ab294c3d779d94fbcd3e7fb4d53e35b9fc89ff22e8b37d46889e655f8837b4",
+      "path": "src/shaders/Im3DVS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "59ab294c3d779d94fbcd3e7fb4d53e35b9fc89ff22e8b37d46889e655f8837b4"
+    },
+    {
+      "oracle_sha256": "dd115f76ae192462eda8cfd6f464a2399d20cc2615adeebdb1fb5e44a91131ef",
+      "path": "src/shaders/Library.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "dd115f76ae192462eda8cfd6f464a2399d20cc2615adeebdb1fb5e44a91131ef"
+    },
+    {
+      "oracle_sha256": "6d1fe05edada003b2ad0b081774a6009fc16aca597a0d9044fb6d675332b2177",
+      "path": "src/shaders/Lights.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "6d1fe05edada003b2ad0b081774a6009fc16aca597a0d9044fb6d675332b2177"
+    },
+    {
+      "oracle_sha256": "dd4c6fa7637d2c1bfdcde71bcf2210b5e76f71dda2795282a0ce3ef690307ef1",
+      "path": "src/shaders/LuminanceHistogramCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "dd4c6fa7637d2c1bfdcde71bcf2210b5e76f71dda2795282a0ce3ef690307ef1"
+    },
+    {
+      "oracle_sha256": "0fe67a59e93992183adb76e3cc46b2100f2f6e9344746849606b063e1f9de0f0",
+      "path": "src/shaders/Math.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "0fe67a59e93992183adb76e3cc46b2100f2f6e9344746849606b063e1f9de0f0"
+    },
+    {
+      "oracle_sha256": "73eb5b96fd19be76ae243c3821c44211250156b778657e54fdf1ab30d04af0a5",
+      "path": "src/shaders/PostBlendDitherNoisePS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "73eb5b96fd19be76ae243c3821c44211250156b778657e54fdf1ab30d04af0a5"
+    },
+    {
+      "oracle_sha256": "a3560cb7336fcb8f4963359944818cc0fedd6540cae58802b94b45eb8d6f0848",
+      "path": "src/shaders/PostProcessPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "a3560cb7336fcb8f4963359944818cc0fedd6540cae58802b94b45eb8d6f0848"
+    },
+    {
+      "oracle_sha256": "761633642c76b3e5a09f8e9077d646150291bd4d831fc21aa952d8eb6339fb6c",
+      "path": "src/shaders/RSPModifyCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "761633642c76b3e5a09f8e9077d646150291bd4d831fc21aa952d8eb6339fb6c"
+    },
+    {
+      "oracle_sha256": "4455dad690da65c0e5d5ddc21fc3df04c4e0bcdad6137ee22e6a9eaa0a3816ec",
+      "path": "src/shaders/RSPProcessCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "4455dad690da65c0e5d5ddc21fc3df04c4e0bcdad6137ee22e6a9eaa0a3816ec"
+    },
+    {
+      "oracle_sha256": "d2ebad1d920cbab555171f9c95e25780777900c1c703e604730fbc28dfb3869e",
+      "path": "src/shaders/RSPSmoothNormalCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "d2ebad1d920cbab555171f9c95e25780777900c1c703e604730fbc28dfb3869e"
+    },
+    {
+      "oracle_sha256": "767f216cb1bdd893b8d05181c6dc78922d0a4ebff17a9d1d712cc03c05751a1e",
+      "path": "src/shaders/RSPVertexTestZCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "767f216cb1bdd893b8d05181c6dc78922d0a4ebff17a9d1d712cc03c05751a1e"
+    },
+    {
+      "oracle_sha256": "e696b0bc2924f31e0636f07cf437bcf805957064ce6a1dcefa643d9f7f71bd54",
+      "path": "src/shaders/RSPWorldCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "e696b0bc2924f31e0636f07cf437bcf805957064ce6a1dcefa643d9f7f71bd54"
+    },
+    {
+      "oracle_sha256": "6ce04cebcd02f7269464684f60c1448e8fb2d0d172d93b8860ff1cca5a114fb9",
+      "path": "src/shaders/Random.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "6ce04cebcd02f7269464684f60c1448e8fb2d0d172d93b8860ff1cca5a114fb9"
+    },
+    {
+      "oracle_sha256": "957b283411550457573421015580f84ca750c68a050981dbc1a4fe2634507820",
+      "path": "src/shaders/RasterPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "957b283411550457573421015580f84ca750c68a050981dbc1a4fe2634507820"
+    },
+    {
+      "oracle_sha256": "cc31c8d4c6ed11ea7f9370725365722916f0eae8ef17dedaa1c80fb7f4af6265",
+      "path": "src/shaders/RasterVS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "cc31c8d4c6ed11ea7f9370725365722916f0eae8ef17dedaa1c80fb7f4af6265"
+    },
+    {
+      "oracle_sha256": "d5f88b220b8aac84b541185cf18c8761701a7a6eb9fb81adfe1d421b7c1bdf58",
+      "path": "src/shaders/RenderParams.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "d5f88b220b8aac84b541185cf18c8761701a7a6eb9fb81adfe1d421b7c1bdf58"
+    },
+    {
+      "oracle_sha256": "805719635740868e7868839d8ccc152bf521ccd10930a7e23f5356b8d3e06ff3",
+      "path": "src/shaders/RenderParamsSpecConstants.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "805719635740868e7868839d8ccc152bf521ccd10930a7e23f5356b8d3e06ff3"
+    },
+    {
+      "oracle_sha256": "03390c3a6fb27a1bd1080df269fb7ac28a89f2f7457df59f24e51d407cf70d69",
+      "path": "src/shaders/RtCopyColorToDepthPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "03390c3a6fb27a1bd1080df269fb7ac28a89f2f7457df59f24e51d407cf70d69"
+    },
+    {
+      "oracle_sha256": "c7b08c62c192faa79bc7d9e07aed28c2fd5d69b49cb16d526c0689ab77102511",
+      "path": "src/shaders/RtCopyDepthToColorPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "c7b08c62c192faa79bc7d9e07aed28c2fd5d69b49cb16d526c0689ab77102511"
+    },
+    {
+      "oracle_sha256": "df997b74cd347dfe2eff1c1166a7acc47f71657483ccf0fea1ed1a2f85649e98",
+      "path": "src/shaders/TextureCopyPS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "df997b74cd347dfe2eff1c1166a7acc47f71657483ccf0fea1ed1a2f85649e98"
+    },
+    {
+      "oracle_sha256": "794a516a6fdaf702d25c97d90aaac3b1ed8c3f42389a43049414d1a69b5c61d4",
+      "path": "src/shaders/TextureDecodeCS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "794a516a6fdaf702d25c97d90aaac3b1ed8c3f42389a43049414d1a69b5c61d4"
+    },
+    {
+      "oracle_sha256": "63b2c1ce683e7e7880c9508d3232d90e90236157ac86ae91947c62ae1d359f07",
+      "path": "src/shaders/TextureDecoder.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "63b2c1ce683e7e7880c9508d3232d90e90236157ac86ae91947c62ae1d359f07"
+    },
+    {
+      "oracle_sha256": "e0fa4269a52e1927ffaf32b84df8e399926e124d21eea6236eb8355fa2e49841",
+      "path": "src/shaders/TextureGen.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "e0fa4269a52e1927ffaf32b84df8e399926e124d21eea6236eb8355fa2e49841"
+    },
+    {
+      "oracle_sha256": "141e8f74af1a9228d1b45879b74826b83e6f1cd0988d6bf1a9095d6ad69a34d4",
+      "path": "src/shaders/TextureResolvePS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "141e8f74af1a9228d1b45879b74826b83e6f1cd0988d6bf1a9095d6ad69a34d4"
+    },
+    {
+      "oracle_sha256": "927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a",
+      "path": "src/shaders/TextureSampler.hlsli",
+      "port_delta": "unchanged",
+      "port_sha256": "927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a"
+    },
+    {
+      "oracle_sha256": "f4990ef5edfbdece9c89938a0c4951b3a285f99be9e6d92a415433c0e227f961",
+      "path": "src/shaders/VideoInterfacePS.hlsl",
+      "port_delta": "unchanged",
+      "port_sha256": "f4990ef5edfbdece9c89938a0c4951b3a285f99be9e6d92a415433c0e227f961"
+    },
+    {
+      "oracle_sha256": "0520bbe032eea7f8791833c25a8b61c03b184174a97bfc77e52e45e1ce28d4b6",
+      "path": "src/shared/rt64_blender.h",
+      "port_delta": "unchanged",
+      "port_sha256": "0520bbe032eea7f8791833c25a8b61c03b184174a97bfc77e52e45e1ce28d4b6"
+    },
+    {
+      "oracle_sha256": "bc116cd9d8a86ca74ebb8f3294fa48bc9e605c0eec53bcac5e07503dfd668b02",
+      "path": "src/shared/rt64_color_combiner.h",
+      "port_delta": "unchanged",
+      "port_sha256": "bc116cd9d8a86ca74ebb8f3294fa48bc9e605c0eec53bcac5e07503dfd668b02"
+    },
+    {
+      "oracle_sha256": "4dbd323ad05fbf6cf8fdab6cb6bdb62f10a460981e91f0f31c9708b91291a90f",
+      "path": "src/shared/rt64_extra_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "4dbd323ad05fbf6cf8fdab6cb6bdb62f10a460981e91f0f31c9708b91291a90f"
+    },
+    {
+      "oracle_sha256": "1c0f2dbdafeaf4329c45961b33d232eafe62c775f59245a75e3a1acd6febcd93",
+      "path": "src/shared/rt64_f3d_defines.h",
+      "port_delta": "unchanged",
+      "port_sha256": "1c0f2dbdafeaf4329c45961b33d232eafe62c775f59245a75e3a1acd6febcd93"
+    },
+    {
+      "oracle_sha256": "5039d84369c04407eb37cb8c149946fe6bf23734e3352dff1a28830318c209fb",
+      "path": "src/shared/rt64_fb_common.h",
+      "port_delta": "unchanged",
+      "port_sha256": "5039d84369c04407eb37cb8c149946fe6bf23734e3352dff1a28830318c209fb"
+    },
+    {
+      "oracle_sha256": "f517eeb5ec505033747a9e18926c0732d17d362d1a69ee39432d36a2d106828c",
+      "path": "src/shared/rt64_fb_reinterpret.h",
+      "port_delta": "unchanged",
+      "port_sha256": "f517eeb5ec505033747a9e18926c0732d17d362d1a69ee39432d36a2d106828c"
+    },
+    {
+      "oracle_sha256": "dee91d3ff78177821d02d4a27cc43606a58f9a54d7896c5d17b7762a9b29ff3c",
+      "path": "src/shared/rt64_frame_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "dee91d3ff78177821d02d4a27cc43606a58f9a54d7896c5d17b7762a9b29ff3c"
+    },
+    {
+      "oracle_sha256": "ac4e6a7548ef28e9cbc36badbe357209cbe84e89b91038ec426d2430a788a268",
+      "path": "src/shared/rt64_framebuffer_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "ac4e6a7548ef28e9cbc36badbe357209cbe84e89b91038ec426d2430a788a268"
+    },
+    {
+      "oracle_sha256": "4d7aff6f3191007a094f3556fbe47ffcf30f387cdc70c03bb84c3b93b303c6c3",
+      "path": "src/shared/rt64_gpu_tile.h",
+      "port_delta": "unchanged",
+      "port_sha256": "4d7aff6f3191007a094f3556fbe47ffcf30f387cdc70c03bb84c3b93b303c6c3"
+    },
+    {
+      "oracle_sha256": "952897e1758cd07c911c136fd49b38b3ca3d2c7576e9b8001de2abf2f483bed7",
+      "path": "src/shared/rt64_hlsl.h",
+      "port_delta": "unchanged",
+      "port_sha256": "952897e1758cd07c911c136fd49b38b3ca3d2c7576e9b8001de2abf2f483bed7"
+    },
+    {
+      "oracle_sha256": "59e364d36e609ab0e31e237d8939ab6e2eaed85f03ce6f4306988551ddf0cfae",
+      "path": "src/shared/rt64_interleaved_raster.h",
+      "port_delta": "unchanged",
+      "port_sha256": "59e364d36e609ab0e31e237d8939ab6e2eaed85f03ce6f4306988551ddf0cfae"
+    },
+    {
+      "oracle_sha256": "01096cbd3ff147bba9bdc334d0112e3a1dfa0f09a87b858bac9965bdcf38ca67",
+      "path": "src/shared/rt64_other_mode.h",
+      "port_delta": "unchanged",
+      "port_sha256": "01096cbd3ff147bba9bdc334d0112e3a1dfa0f09a87b858bac9965bdcf38ca67"
+    },
+    {
+      "oracle_sha256": "cbca87e56011efca4c2f5eb4f110ffce59c7ba205cf29ae8daf3a9706797662e",
+      "path": "src/shared/rt64_point_light.h",
+      "port_delta": "unchanged",
+      "port_sha256": "cbca87e56011efca4c2f5eb4f110ffce59c7ba205cf29ae8daf3a9706797662e"
+    },
+    {
+      "oracle_sha256": "80a53c9d393ecef8793fde68afe552c781be922bb99a0e6d807f544e96e23db4",
+      "path": "src/shared/rt64_raster_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "80a53c9d393ecef8793fde68afe552c781be922bb99a0e6d807f544e96e23db4"
+    },
+    {
+      "oracle_sha256": "b5ce75be484daaa3732af5bc4cb1a0929799ceb620843788b66ebd680e962048",
+      "path": "src/shared/rt64_raytracing_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "b5ce75be484daaa3732af5bc4cb1a0929799ceb620843788b66ebd680e962048"
+    },
+    {
+      "oracle_sha256": "0b76128508f312e89377f20eb72c18cdccc73576d54f2e5d8ede003610143532",
+      "path": "src/shared/rt64_rdp_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "0b76128508f312e89377f20eb72c18cdccc73576d54f2e5d8ede003610143532"
+    },
+    {
+      "oracle_sha256": "b06d1c6f2ab976ee6a2b9ba1bcdc79655eec136080dce31ed4d17d61ce8eff9d",
+      "path": "src/shared/rt64_rdp_tile.h",
+      "port_delta": "unchanged",
+      "port_sha256": "b06d1c6f2ab976ee6a2b9ba1bcdc79655eec136080dce31ed4d17d61ce8eff9d"
+    },
+    {
+      "oracle_sha256": "f4e6a5a7704c7f315ba03054027bd4ccf218c9005c7b370f8a883e21cdc68a5d",
+      "path": "src/shared/rt64_render_flags.h",
+      "port_delta": "unchanged",
+      "port_sha256": "f4e6a5a7704c7f315ba03054027bd4ccf218c9005c7b370f8a883e21cdc68a5d"
+    },
+    {
+      "oracle_sha256": "102543e25d07bff02033abe584c7d2b340da345c1f902ba41f3de2c18df45b7b",
+      "path": "src/shared/rt64_render_indices.h",
+      "port_delta": "unchanged",
+      "port_sha256": "102543e25d07bff02033abe584c7d2b340da345c1f902ba41f3de2c18df45b7b"
+    },
+    {
+      "oracle_sha256": "d3a4af28af08a04433cf0dfbf766e954e168555e5fced07f2ff9e3dc56c1bc7a",
+      "path": "src/shared/rt64_render_params.h",
+      "port_delta": "unchanged",
+      "port_sha256": "d3a4af28af08a04433cf0dfbf766e954e168555e5fced07f2ff9e3dc56c1bc7a"
+    },
+    {
+      "oracle_sha256": "0cc648d54cb6e96a3084528f281809756e11826c4bc2c70dd1d601fa87d44829",
+      "path": "src/shared/rt64_render_target_copy.h",
+      "port_delta": "unchanged",
+      "port_sha256": "0cc648d54cb6e96a3084528f281809756e11826c4bc2c70dd1d601fa87d44829"
+    },
+    {
+      "oracle_sha256": "011898d7d1b91e53fa845161931ab2e5312fb1e8fc1c369766957baf4c2fe445",
+      "path": "src/shared/rt64_rsp_fog.h",
+      "port_delta": "unchanged",
+      "port_sha256": "011898d7d1b91e53fa845161931ab2e5312fb1e8fc1c369766957baf4c2fe445"
+    },
+    {
+      "oracle_sha256": "9aca26bd4195c609ccc9ee36da31e9c6ec70969ee58698cd75f1f1493872109a",
+      "path": "src/shared/rt64_rsp_light.h",
+      "port_delta": "unchanged",
+      "port_sha256": "9aca26bd4195c609ccc9ee36da31e9c6ec70969ee58698cd75f1f1493872109a"
+    },
+    {
+      "oracle_sha256": "c6415c5cdfac3da7be8716a8996dec42d52af7e799b9fce72b6ce2f1af49f762",
+      "path": "src/shared/rt64_rsp_lookat.h",
+      "port_delta": "unchanged",
+      "port_sha256": "c6415c5cdfac3da7be8716a8996dec42d52af7e799b9fce72b6ce2f1af49f762"
+    },
+    {
+      "oracle_sha256": "e5204de75da748da32ef0c9b3c23f7b71dd0b8dbdb5dcf79dada88e0b425ec00",
+      "path": "src/shared/rt64_rsp_vertex_test_z.h",
+      "port_delta": "unchanged",
+      "port_sha256": "e5204de75da748da32ef0c9b3c23f7b71dd0b8dbdb5dcf79dada88e0b425ec00"
+    },
+    {
+      "oracle_sha256": "0914b36810dc8ffe9d6dd8f1ffcd05b4bb229272cf61d8e8413ec313dabc06fb",
+      "path": "src/shared/rt64_rsp_viewport.h",
+      "port_delta": "unchanged",
+      "port_sha256": "0914b36810dc8ffe9d6dd8f1ffcd05b4bb229272cf61d8e8413ec313dabc06fb"
+    },
+    {
+      "oracle_sha256": "121a219ca6a514fdcb04d77b127e221c1f0407e27f5df719d6453b1c6cf5edc0",
+      "path": "src/shared/rt64_texture_copy.h",
+      "port_delta": "unchanged",
+      "port_sha256": "121a219ca6a514fdcb04d77b127e221c1f0407e27f5df719d6453b1c6cf5edc0"
+    },
+    {
+      "oracle_sha256": "5d97c854e5d4d0f1f40c5cf06815265baf9218982bcdf698d2b9b9fcf48fdb68",
+      "path": "src/shared/rt64_video_interface.h",
+      "port_delta": "unchanged",
+      "port_sha256": "5d97c854e5d4d0f1f40c5cf06815265baf9218982bcdf698d2b9b9fcf48fdb68"
+    }
+  ],
+  "unresolved_includes": [
+    {
+      "classification": "system-or-cpp-only",
+      "include": "fstream",
+      "source": "src/common/rt64_common.h"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "sstream",
+      "source": "src/common/rt64_common.h"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "string",
+      "source": "src/common/rt64_common.h"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "vector",
+      "source": "src/common/rt64_common.h"
+    },
+    {
+      "classification": "reviewed-unresolved",
+      "include": "hlsl++.h",
+      "reason": "This include is inside the C++-only branch of a shared header; the DXC preprocessed-input digest proves it is not consumed by an HLSL artifact.",
+      "source": "src/common/rt64_hlslpp.h"
+    },
+    {
+      "classification": "reviewed-unresolved",
+      "include": "Ray.hlsli",
+      "reason": "The admitted M12 source is not reachable from any pinned CMake shader entry or preprocess-only target; its absent public companion remains explicit and cannot produce an artifact.",
+      "source": "src/shaders/Lights.hlsli"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "string",
+      "source": "src/shared/rt64_blender.h"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "string",
+      "source": "src/shared/rt64_color_combiner.h"
+    },
+    {
+      "classification": "system-or-cpp-only",
+      "include": "stdint.h",
+      "source": "src/shared/rt64_hlsl.h"
+    }
+  ]
+}

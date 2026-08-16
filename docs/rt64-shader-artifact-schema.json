@@ -1,0 +1,224 @@
+{
+  "schema": "fn64.rt64-shader-artifact-policy.v1",
+  "receipt_schema": "fn64.rt64-shader-artifact-receipt.v1",
+  "source_denominator_schema": "fn64.rt64-shader-source-denominator.v1",
+  "build_receipt_schema": "fn64.dxc-source-build.v1",
+  "git_checkout_maximum_file_bytes": 268435456,
+  "rt64": {
+    "repository": "https://github.com/rt64/rt64",
+    "oracle_commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "port_commit": "5473732a822a4423b5696e7cb18fecc425a59875",
+    "inventory": "docs/rt64-port-inventory.json"
+  },
+  "dxc": {
+    "repository": "https://github.com/microsoft/DirectXShaderCompiler.git",
+    "tag": "v1.9.2607",
+    "commit": "0d3ee6b551b8fa768fbf825300ebab81047ef6a8",
+    "license_expression": "NCSA",
+    "license_files": [
+      {
+        "path": "LICENSE.TXT",
+        "sha256": "27a49e35d1da96eba18fba54bc882667ff0ff8c0254f16f2b6e165d605ba7df8"
+      },
+      {
+        "path": "ThirdPartyNotices.txt",
+        "sha256": "19512a5d0a015ef16d167272c164da49a604614a786206212a80ad486ed0be6d"
+      },
+      {
+        "path": ".gitmodules",
+        "sha256": "71c5659c24c004ac37b7eaa92d5d3aa143ced1572c9ce4e4129d906fdf664065"
+      }
+    ],
+    "bundled_license_files": [
+      {
+        "path": "lib/DxilCompression/LICENSE.TXT",
+        "license_expression": "MIT",
+        "sha256": "6f20fa7672b00e2e975c291df737cf227addf3ad32e36fef3fe0f416e4664d3d",
+        "classification": "retained; build manifest records whether DxilCompression translation units enter dxc"
+      },
+      {
+        "path": "lib/Support/COPYRIGHT.regex",
+        "license_expression": "LicenseRef-Henry-Spencer-OpenBSD AND BSD-3-Clause",
+        "sha256": "0424e57d4303164dc59a8509c20dae0518b853692e5c2b0e98b11816fdbc97c7",
+        "classification": "retained; also reproduced in ThirdPartyNotices.txt"
+      },
+      {
+        "path": "tools/clang/lib/Headers/hlsl/LICENSE.txt",
+        "license_expression": "Apache-2.0 WITH LLVM-exception",
+        "sha256": "eb425408dc2905e3506310bfdc33fdf00c1dfc2f2f01de95fb01809b29765be2",
+        "classification": "retained compiler-resource header notice"
+      },
+      {
+        "path": "test/YAMLParser/LICENSE.txt",
+        "license_expression": "MIT",
+        "sha256": "d0d8b09800a45cd982e9568fc7669d9c1a4c330e275a821bbe24d54366d16fe9",
+        "classification": "excluded because every test family is disabled"
+      },
+      {
+        "path": "utils/unittest/googlemock/LICENSE.txt",
+        "license_expression": "BSD-3-Clause",
+        "sha256": "9702de7e4117a8e2b20dafab11ffda58c198aede066406496bef670d40a22138",
+        "classification": "excluded because every test family is disabled"
+      },
+      {
+        "path": "utils/unittest/googletest/LICENSE.TXT",
+        "license_expression": "BSD-3-Clause",
+        "sha256": "9702de7e4117a8e2b20dafab11ffda58c198aede066406496bef670d40a22138",
+        "classification": "excluded because every test family is disabled"
+      }
+    ],
+    "source_dependencies": [
+      {
+        "path": "external/DirectX-Headers",
+        "repository": "https://github.com/microsoft/DirectX-Headers.git",
+        "commit": "980971e835876dc0cde415e8f9bc646e64667bf7",
+        "license_expression": "MIT",
+        "license_files": [
+          {
+            "path": "LICENSE",
+            "sha256": "903df5512f7d02609fed0c780a9b704f5a3eeb6e4d84ebe42a29845c81899a3c"
+          }
+        ]
+      },
+      {
+        "path": "external/SPIRV-Headers",
+        "repository": "https://github.com/KhronosGroup/SPIRV-Headers",
+        "commit": "29981f65241605e08b0ede4cfeb999fe3b723c6a",
+        "license_expression": "MIT AND CC-BY-4.0 AND (Unlicense OR MIT)",
+        "license_files": [
+          {
+            "path": "LICENSE",
+            "sha256": "ea43b1de38a6f90c488800d66dec1ed671e68cda530266bc96951fb5b6307613"
+          },
+          {
+            "path": "LICENSES/CC-BY-4.0.txt",
+            "sha256": "d557539df68e771cc1eedcc91d13f70fca930e508d11eedcafa4b15db49e3744"
+          },
+          {
+            "path": "LICENSES/MIT.txt",
+            "sha256": "6d7c9e9d7d12c8d3753bdb24417b84819ba4d6c2f025c37948113d86dc81eef9"
+          }
+        ]
+      },
+      {
+        "path": "external/SPIRV-Tools",
+        "repository": "https://github.com/KhronosGroup/SPIRV-Tools",
+        "commit": "b707790a898e44038547df54580022fc1cf89c3d",
+        "license_expression": "Apache-2.0",
+        "license_files": [
+          {
+            "path": "LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+          },
+          {
+            "path": "utils/vscode/src/lsp/LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+          }
+        ]
+      }
+    ],
+    "excluded_declarations": [
+      {
+        "path": "external/googletest",
+        "reason": "The tag's .gitmodules declares this path but the tag has no gitlink; all DXC, HLSL, LLVM, and SPIR-V tests are disabled for the producer build."
+      }
+    ],
+    "cmake_cache": "cmake/caches/PredefinedParams.cmake",
+    "cmake_flags": [
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+      "-DENABLE_SPIRV_CODEGEN=ON",
+      "-DSPIRV_BUILD_TESTS=OFF",
+      "-DHLSL_INCLUDE_TESTS=OFF",
+      "-DLLVM_INCLUDE_TESTS=OFF",
+      "-DLLVM_INCLUDE_EXAMPLES=OFF",
+      "-DLLVM_INCLUDE_DOCS=OFF",
+      "-DLLVM_TARGETS_TO_BUILD=None"
+    ],
+    "build_target": "dxc",
+    "maximum_compiled_source_manifest_bytes": 33554432
+  },
+  "validator": {
+    "source": "probes/m2-dxc-artifacts",
+    "package": "fn64-m2-dxc-artifact-validator",
+    "binary": "fn64-wgpu-shader-validator",
+    "wgpu_version": "30.0.0",
+    "naga_version": "30.0.0",
+    "backend": "noop",
+    "validation": "wgpu-30-baseline-naga-validation-plus-checked-api",
+    "build_profile": "release",
+    "cargo_lock_sha256": "733fa211c5dd777a3be2e264de61716d319aa65d5b0ebf38a0a316e380e5610c",
+    "dependency_package_count": 82,
+    "dependency_set_sha256": "7f68906e37340e8e9a5091f7d4d6d5c8055ee973fb6a24cc1e83866476320141",
+    "allowed_license_expressions": [
+      "Apache-2.0",
+      "Apache-2.0 OR MIT",
+      "Apache-2.0/MIT",
+      "BSD-2-Clause OR Apache-2.0 OR MIT",
+      "ISC",
+      "MIT",
+      "MIT OR Apache-2.0",
+      "MIT OR Apache-2.0 OR Zlib",
+      "Unlicense OR MIT",
+      "Zlib",
+      "Zlib OR Apache-2.0 OR MIT",
+      "(MIT OR Apache-2.0) AND Unicode-3.0"
+    ],
+    "source_files": [
+      ".gitignore",
+      "Cargo.toml",
+      "Cargo.lock",
+      "README.md",
+      "src/main.rs"
+    ]
+  },
+  "spirv": {
+    "common_flags": [
+      "-spirv",
+      "-fspv-target-env=vulkan1.0",
+      "-fvk-use-dx-layout",
+      "-I",
+      "src"
+    ],
+    "profiles": {
+      "compute": {
+        "entry": "CSMain",
+        "profile": "cs_6_3",
+        "extra_flags": []
+      },
+      "fragment": {
+        "entry": "PSMain",
+        "profile": "ps_6_3",
+        "extra_flags": []
+      },
+      "vertex": {
+        "entry": "VSMain",
+        "profile": "vs_6_3",
+        "extra_flags": [
+          "-fvk-invert-y"
+        ]
+      }
+    },
+    "required_validation": [
+      "dxc-built-in-spirv-validation",
+      "wgpu-30-shader-module-validation"
+    ],
+    "maximum_source_bytes": 1048576,
+    "maximum_preprocessed_bytes": 8388608,
+    "maximum_dependency_manifest_bytes": 1048576,
+    "maximum_artifact_bytes": 4194304,
+    "maximum_receipt_bytes": 4194304
+  },
+  "unresolved_include_allowlist": [
+    {
+      "source": "src/shaders/Lights.hlsli",
+      "include": "Ray.hlsli",
+      "reason": "The admitted M12 source is not reachable from any pinned CMake shader entry or preprocess-only target; its absent public companion remains explicit and cannot produce an artifact."
+    },
+    {
+      "source": "src/common/rt64_hlslpp.h",
+      "include": "hlsl++.h",
+      "reason": "This include is inside the C++-only branch of a shared header; the DXC preprocessed-input digest proves it is not consumed by an HLSL artifact."
+    }
+  ]
+}

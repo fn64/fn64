@@ -108,7 +108,12 @@ def check_refs() -> None:
             # README/AGENTS/docs -- naming them is the comparison's whole
             # point, and they can never exist here (aki-recomp is GPL-3.0 and
             # deliberately absent).
-            if "aki-recomp" in line or "~/Code/" in line:
+            # RT64-SHADER-ARTIFACTS.md cites files inside the separately pinned
+            # DirectXShaderCompiler source tree.  Its exact source audit owns
+            # those paths; treating `docs/...` there as fn64-local would make
+            # the ordinary documentation gate reject an honest upstream
+            # citation after the generated report becomes tracked.
+            if "aki-recomp" in line or "~/Code/" in line or "DirectXShaderCompiler" in line:
                 continue
             for raw in REF.findall(line):
                 ref = raw.rstrip(TRAIL)
