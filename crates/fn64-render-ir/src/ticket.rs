@@ -86,17 +86,67 @@ impl SubmissionQueue {
                 queue: self.queue.0,
             },
         )?;
-        let mut hash = Sha256::new();
-        hash.update(b"fn64.render-ir.submission.v2\0");
-        hash.update(decoded.packet.identity().as_bytes());
-        hash.update(self.queue.0.to_be_bytes());
-        hash.update(ordinal.to_be_bytes());
-        Ok(SubmittedTicket {
-            packet: decoded.packet,
-            queue: self.queue,
-            ordinal,
-            identity: SubmissionIdentity(ContentDigest::from_bytes(hash.finalize().into())),
-        })
+        Ok(issue_submitted_ticket(decoded, self.queue, ordinal))
+    }
+
+    /// Fallibly prove ordinal capacity while exclusively borrowing the queue,
+    /// without issuing or reserving an ordinal. The returned typestate is the
+    /// only route to a later infallible issuance; a capacity failure here
+    /// leaves `self` completely unchanged.
+    pub fn try_ready_submission(&mut self) -> Result<ReadySubmissionQueue<'_>, ValidationError> {
+        if self.next_ordinal.checked_add(1).is_none() {
+            return Err(ValidationError::SubmissionOrdinalExhausted {
+                queue: self.queue.0,
+            });
+        }
+        Ok(ReadySubmissionQueue { queue: self })
+    }
+}
+
+/// Nonmutating proof that one more ordinal fits, exclusively borrowing its
+/// [`SubmissionQueue`]. Holding this value reserves no ordinal by itself;
+/// only [`Self::issue`] advances the queue, and it cannot fail because
+/// capacity was already proven at construction and the borrow forbids any
+/// intervening mutation.
+#[derive(Debug)]
+pub struct ReadySubmissionQueue<'queue> {
+    queue: &'queue mut SubmissionQueue,
+}
+
+impl<'queue> ReadySubmissionQueue<'queue> {
+    pub const fn identity(&self) -> QueueIdentity {
+        self.queue.queue
+    }
+
+    /// Infallibly issue the next ordinal and publish `decoded`. Capacity was
+    /// already proven by [`SubmissionQueue::try_ready_submission`]; the
+    /// exclusive borrow held since then makes this call the queue's next
+    /// state deterministically, so there is no `Result` and no way to
+    /// produce a half-bound value.
+    pub fn issue(self, decoded: DecodedTicket) -> SubmittedTicket {
+        let ordinal = self.queue.next_ordinal;
+        self.queue.next_ordinal = ordinal
+            .checked_add(1)
+            .expect("try_ready_submission proved capacity for this exact ordinal");
+        issue_submitted_ticket(decoded, self.queue.queue, ordinal)
+    }
+}
+
+fn issue_submitted_ticket(
+    decoded: DecodedTicket,
+    queue: QueueIdentity,
+    ordinal: u64,
+) -> SubmittedTicket {
+    let mut hash = Sha256::new();
+    hash.update(b"fn64.render-ir.submission.v2\0");
+    hash.update(decoded.packet.identity().as_bytes());
+    hash.update(queue.0.to_be_bytes());
+    hash.update(ordinal.to_be_bytes());
+    SubmittedTicket {
+        packet: decoded.packet,
+        queue,
+        ordinal,
+        identity: SubmissionIdentity(ContentDigest::from_bytes(hash.finalize().into())),
     }
 }
 
@@ -320,6 +370,14 @@ pub struct BackendCompletionAuthority {
 }
 
 impl BackendCompletionAuthority {
+    /// Queue identity this role is authorized to complete.
+    ///
+    /// Exposes an identity for exact pairing checks at a sealed unseal
+    /// boundary, not receipt-issuing authority.
+    pub const fn queue_identity(&self) -> QueueIdentity {
+        self.queue
+    }
+
     pub fn issue(
         &mut self,
         submitted: &SubmittedTicket,
@@ -705,6 +763,43 @@ mod tests {
         assert_ne!(
             committed.backend_effect_identity(),
             committed.guest_effect_identity()
+        );
+    }
+
+    #[test]
+    fn ready_submission_queue_checks_capacity_without_mutating_and_then_issues_infallibly() {
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let identity_before = queue.identity();
+        let ready = queue.try_ready_submission().unwrap();
+        assert_eq!(ready.identity(), identity_before);
+        // Holding the ready check does not advance the queue's own ordinal.
+        let submitted = ready.issue(DecodedTicket::new(packet(0xe9, 1)));
+        assert_eq!(submitted.ordinal(), 0);
+        assert_eq!(submitted.queue(), identity_before);
+
+        let ready = queue.try_ready_submission().unwrap();
+        let submitted = ready.issue(DecodedTicket::new(packet(0xe9, 1)));
+        assert_eq!(submitted.ordinal(), 1);
+    }
+
+    #[test]
+    fn ready_submission_queue_exhaustion_is_reported_before_any_ordinal_is_reserved() {
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        // Drive the queue to the last valid ordinal without exhausting it.
+        queue.next_ordinal = u64::MAX;
+        assert_eq!(
+            queue.try_ready_submission().unwrap_err(),
+            ValidationError::SubmissionOrdinalExhausted {
+                queue: queue.identity().get(),
+            }
+        );
+        // The failed capacity check did not mutate the queue: it can still
+        // report the identical exhaustion on a later, independent call.
+        assert_eq!(
+            queue.try_ready_submission().unwrap_err(),
+            ValidationError::SubmissionOrdinalExhausted {
+                queue: queue.identity().get(),
+            }
         );
     }
 

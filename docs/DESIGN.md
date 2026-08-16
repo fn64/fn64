@@ -134,6 +134,251 @@ Provenance: fn64's resource-journal contract above and the N64Recomp-generated
 `MEM_*` storage mapping documented in this file's RDRAM section; no reference
 runtime implementation was consulted.
 
+**Production raw-DPC seam (T0, `fn64-render`/`fn64-render-ir`).** The
+production-dispatch migration card (`docs/RENDER-WGPU-PORT-PLAN.md`) freezes
+one transactional, TMEM-only, no-FullSync, no-guest-write vertical slice
+driven through the real ABI raw-DPC ingress, as a minimal sealed/session
+design (v11 interface freeze, superseding an earlier broader
+public-constructor sketch and a generic-capsule sketch, both rejected for
+widening the public forge surface).
+
+Two role objects split one lifecycle: `new_raw_dpc_roles() -> (RawDpcAbiSession,
+RawDpcBackendAuthority)`. `RawDpcAbiSession` (ABI-owned) holds the submission
+queue, the guest-commit authority, and a diagnostic retirement ledger.
+`RawDpcBackendAuthority` (backend-owned) holds the paired completion
+authority; it enters the registered backend at concrete construction, not
+through an object-safe `RenderBackend` method -- pairing is a one-time,
+backend-concrete construction fact, not a per-call production operation. The
+session stamps one `OwnedRawDpcCapture` with its own queue identity into a
+`RawDpcPlanRequest`; the backend's sole route to a plan-writing capability is
+`RawDpcBackendAuthority::begin_plan(request)`, which *consumes* the request
+by value (one stamped request cannot mint two writers or two plans) and
+traps immediately -- before any plan field can be written -- if the request
+was not stamped by the paired queue.
+
+The returned `ExactRawDpcPlanWriter` is a private-field, push-only handle
+(`push_tmem_load`, `push_state`, `push_command_decode_access`). Its sole
+`finish(journal)` first proves the writer's own accumulated access list
+equals `journal`'s ordered access list exactly -- same count, same order,
+same `ResourceAccess` identity -- rejecting a missing, extra, reordered, or
+mutated access with a named `ValidationError` before any plan exists; it
+then derives both the source identity and journal identity from the
+writer's own request capture and that same journal (never from a
+caller-supplied identity parameter that could disagree with what was
+actually pushed), builds the matching preflight internally, and returns the
+sealed `PlannedRawDpcSubmission`. There is no public constructor for
+`PlannedRawDpcSubmission`, `ExactValidatedRawDpcPlan`, an owned
+semantic-command builder enum, or any bare ticket type; the only route onward
+is `RawDpcAbiSession::finalize_and_submit`, which owns queue readiness and
+ticket issuance entirely inside the session so a bare `DecodedTicket`/
+`SubmittedTicket` never escapes to a caller, returning only the sealed
+`BoundSubmittedRawDpc` -- the session still records a diagnostic
+`RawDpcRetirementHandle` into its own ledger for this ordinal, but does not
+hand a second copy of it back to the caller; same-module test code inspects
+the ledger directly instead. Neither `PlannedRawDpcSubmission` nor
+`BoundSubmittedRawDpc` exposes a plan-visiting method to a generic caller:
+`BoundSubmittedRawDpc::execution_view` is the sole route, and it is
+paired-authority-checked, nonextracting, and statically dispatched (a
+generic `<V: RawDpcExecutionView<PV>>` parameter, never `&mut dyn Visitor`)
+rather than a getter -- ABI never gets a plan-extraction surface it can hold
+onto past the call.
+
+`BoundSubmittedRawDpc::into_backend_prepared(&mut RawDpcBackendAuthority,
+BackendEffectReport)` is the sole unseal route: it validates the exact paired
+authority queue identity before moving any field (a mismatch loudly traps;
+the still-sealed value then drops normally, recording exactly one `Rejected`
+and exposing no parts), then consumes the submitted ticket internally via the
+paired authority's own `issue`, so the resulting `GpuCompleteTicket` can only
+ever be the one this exact submission produced. It carries no physical-state
+field or identity of any kind -- the backend's own physical candidate lives
+entirely in `RawDpcCoordinator`'s double-buffered slots (below), never in a
+value this method returns. The result, `BackendPreparedRawDpc`, retains the
+GPU-completion ticket and exposes only `stage()`/`submission()` facts -- no
+plan-visiting method, no `complete()` getter.
+
+**`RawDpcCoordinator<P>` -- the physical-state ownership fix.** An earlier
+draft threaded a `RawDpcReadyPhysicalIdentity` (a bare, publicly constructible
+content-digest value) through every typestate and had the terminal publish
+step compare a caller-supplied copy against it. Independent review correctly
+rejected that shape: identity equality alone is not proof that a physical
+mutation happened, so any caller could echo a matching digest back without
+ever performing it. The fix moves physical-state *ownership*, not just its
+identity, into `fn64-render`: `RawDpcBackendAuthority::into_coordinator<P>(self,
+initial: P) -> RawDpcCoordinator<P>` consumes the paired authority into a
+coordinator generic over the backend's own physical state type `P` (a plain
+owned value -- for a real backend, its concrete `wgpu`-side TMEM/texture
+state -- never a callback or trait object). The coordinator owns `P` in two
+slots (`[Option<P>; 2]`) plus an `active: u8` index; `physical()` always
+returns the currently-published slot.
+
+**Why two slots, not `mem::replace`.** `P` is an arbitrary backend type whose
+`Drop` this module does not control. Replacing the *active* slot in place
+would run the old active `P`'s destructor at the exact instant a new
+candidate becomes current -- precisely the moment
+`ReadyPublication::commit`'s straight-line body must be Drop-free. With two
+slots, `RawDpcCoordinator::complete_execution(&mut self, BoundSubmittedRawDpc,
+BackendEffectReport, next_physical: P) -> Result<BackendPreparedRawDpc,
+ValidationError>` -- the coordinator's own wrapper around
+`into_backend_prepared` -- overwrites the currently-*inactive* slot with
+`next_physical`, dropping whatever `P` used to occupy it right there, inside
+this ordinary fallible method, before any publication exists. `commit` later
+only ever flips the `active` index, an integer write; a colocated test
+(`old_inactive_slot_physical_state_drops_during_complete_execution_not_during_commit`)
+proves this by tracking exactly when a droppable `P`'s destructor runs across
+two successive `complete_execution` calls on the same never-flipped
+coordinator. `complete_execution` also records private `(queue, submission,
+inactive slot index)` metadata for this ordinal, consumed exactly once by the
+matching `prepare_publication` call.
+
+`RawDpcAbiSession::commit_zero_guest_writes` is unchanged in shape from
+before this fix (card v10 section 1 point 2): it *consumes*
+`BackendPreparedRawDpc` and returns the sealed `GuestCommittedRawDpc`, moving
+plan and retirement together (no physical-state field to carry, since none
+ever entered `BackendPreparedRawDpc`). Before issuing the guest-commit
+receipt it hands `GuestCommitEffectReport::try_new` an empty write list
+against the prepared ticket's own packet, which re-derives that packet's
+actual `guest_write_accesses()` and requires an exact-length match -- a
+defensive re-check independent of what this method is named, proven by a
+colocated test that hand-builds a ticket with a real guest-visible write
+(bypassing the normal writer path, which can never produce one) and confirms
+this re-check rejects it.
+
+`RawDpcAbiSession::seal_publication(GuestCommittedRawDpc,
+fn64_runtime::device::ReadyDpcFabricCommit<'a>) ->
+Result<ReadyRawDpcCommitCapsule<'a>, ValidationError>` -- v11's exact
+signature -- seals a guest-committed submission against the concrete,
+backend-retained T2 fabric-ready value and advances retirement to
+`FabricPrepare`, the boundary where a real fabric commit is in hand but no
+physical mutation has happened yet. It validates only what this session alone
+owns (`committed`'s queue against the session's own); full
+authority/submission/ready-slot validation is deliberately deferred to
+`RawDpcCoordinator::prepare_publication`, the one place backend-owned
+physical state is actually available.
+
+`RawDpcCoordinator::prepare_publication(&mut self, ReadyRawDpcCommitCapsule<'a>)
+-> ReadyPublication<'_, 'a, P>` is where v11's "validate authority, queue,
+submission, proposal, and ready-slot identity while durable state is
+unchanged" actually happens: it looks up (and consumes) the private ready-slot
+metadata `complete_execution` recorded for this exact submission -- queue,
+submission, and (the strongest of the three) a private `Rc::clone` of the
+exact retirement slot `complete_execution` observed, checked via
+`Rc::ptr_eq` against the capsule's own retirement -- and traps if any
+disagree (no legitimate `complete_execution` call preceded this
+`prepare_publication` call, the queue disagrees, or this capsule is not the
+one the ready slot was actually prepared for). Only then does it advance
+retirement to `PhysicalPrepare` and construct a `ReadyPublication` borrowing
+the coordinator, holding the matched slot index and the capsule together.
+The `PhysicalPrepare` advance happens here, inside `prepare_publication`,
+*before* a `ReadyPublication` is ever returned -- not inside `commit` --
+so that stage is observable the instant a caller holds one, whether or not
+`commit` is ever called. That private retirement-slot clone (kept on the
+coordinator's own ready-slot record, never on the capsule) is also what
+lets a coordinator notice and reap an abandoned/rejected candidate's slot
+without a public capsule-side observation accessor a caller could otherwise
+reach the same state through -- an earlier draft exposed a public
+`ReadyRawDpcCommitCapsule::retirement_handle()` for exactly that purpose;
+it is removed, since nothing outside this module needs it once the
+coordinator holds its own private clone. By the time a `ReadyPublication`
+exists, every check has already passed -- there is nothing left to
+validate.
+
+`ReadyPublication::commit(self) -> CommittedRawDpcOutcome` is the sole
+terminal step, and the only method anywhere that can produce
+`CommittedRawDpcOutcome`: it flips `coordinator.active` to the already-checked
+slot index (the first, and only, durable physical move), commits the inner
+fabric transition infallibly, and unconditionally disarms retirement as
+`Published`. `commit` performs no stage advance of its own -- retirement is
+already at `PhysicalPrepare` by the time `commit` runs, set by
+`prepare_publication` before this value existed -- so no callback, trait
+object, allocation, lookup, `assert`, `Result`, `stage` write, or `Drop` of
+`P` runs after the flip. `ReadyRawDpcCommitCapsule`
+itself exposes **no bare public route to `Published`** -- no `commit`, no
+other `CommittedRawDpcOutcome`-returning method -- closing the exact
+fabric-only-terminal-route hazard the digest-based design had; a colocated
+source-shape test asserts by name that the capsule's own `impl` block has
+zero methods returning `CommittedRawDpcOutcome` and that
+`ReadyPublication::commit` is the sole one anywhere in the module. Dropping
+an unconsumed `ReadyPublication` (or the capsule it wraps, before
+`prepare_publication`) cancels: `ReadyPublication` itself borrows rather than
+owns the coordinator, so its `Drop` runs no code of its own and `active`
+stays untouched; the capsule's own `Drop` -- inherited from every earlier
+typestate -- rolls back the inner fabric commit and records exactly one
+`Rejected` at `FabricPrepare`.
+
+Every issued ordinal owns a `SubmittedRawDpcRetirement`: a pre-created shared
+`Rc<Cell<Option<RawDpcTerminalOutcome>>>` slot, also retained by the
+diagnostic `RawDpcRetirementHandle`. This type has no `Clone` impl and this
+module's own source-shape sweep forbids `mem::forget`/`ManuallyDrop`, so the
+*same* retirement -- and therefore the same shared slot -- moves by value
+from `BoundSubmittedRawDpc` through `BackendPreparedRawDpc` into
+`GuestCommittedRawDpc` and on into `ReadyRawDpcCommitCapsule`; a colocated
+test proves the slot is the exact same `Rc` allocation (`Rc::ptr_eq`) across
+that whole chain. Drop performs only "if empty, set `Rejected {stage,
+submission}`"; it allocates nothing, takes no `RefCell` borrow, and cannot
+panic during unwind. This exact-once guarantee is scoped to submissions that
+entered through `RawDpcAbiSession`: `fn64-render-ir`'s public,
+admission-agnostic `DecodedTicket::new` and
+`TicketAuthoritySet::submit`/`SubmissionQueue::submit` remain callable
+outside the session (v11 explicitly keeps them public), and a raw-DPC ticket
+minted that way is intentionally outside this ledger, exactly as under v10.
+
+No `Any`/`TypeId`/downcast/`FnOnce` callback exists anywhere in this seam --
+in particular, no generic trait stands in for a concrete backend authority,
+fabric-commit, or physical-state type (`RawDpcCoordinator<P>`/
+`ReadyPublication<P>` are generic over a plain owned `P`, never a `dyn`
+anything); the colocated source-shape sweep enforces this too. `RenderBackend`
+has exactly four object-safe raw-DPC methods: `raw_dpc_ir_capability`,
+`plan_raw_dpc(RawDpcPlanRequest) -> Result<PlannedRawDpcSubmission,
+RenderError>`, `execute_raw_dpc(BoundSubmittedRawDpc) ->
+Result<BackendPreparedRawDpc, RenderError>`, and
+`publish_raw_dpc(ReadyRawDpcCommitCapsule<'_>) -> CommittedRawDpcOutcome` --
+the last with no `Result` in its signature, matching v11 exactly, and its
+own object-safe shape unchanged from earlier drafts (only what a conforming
+backend does *inside* it changed). The first three have loud, named-error
+defaults; `publish_raw_dpc`'s default instead drops the capsule (cancelling
+its fabric commit and recording `Rejected`, never `Published`) and panics,
+since there is no `Result` arm available to report "unsupported" and this
+default is architecturally unreachable in practice -- a capsule cannot exist
+unless `execute_raw_dpc` already succeeded against a real, capable backend.
+This keeps every existing `RenderBackend` implementor across the workspace
+unrelated to raw-DPC production (test mocks, other backends) compiling
+without adding a fourth required method to each of them. A real
+raw-DPC-capable backend instead stores a `RawDpcCoordinator<P>` (`P` = its own
+physical state type) and implements `publish_raw_dpc` as exactly
+`self.coordinator.prepare_publication(publication).commit()`. There is
+deliberately no `install_raw_dpc_backend_authority` object-safe method, since
+v11 moves that pairing to concrete backend construction (now: the same
+construction site that calls `into_coordinator`). The call into any of these
+four methods through `dyn RenderBackend` is the sole dynamic dispatch in the
+raw-DPC production path; everything from validating authority/queue/
+submission/ready-slot identity through the terminal state transition,
+including `ReadyPublication::commit`'s fixed consuming body, is monomorphic
+Rust with no further vtable call. This holds only because `fn64-render`/
+`fn64-render-wgpu` do not, and must never, depend on `fn64-abi` -- a
+load-bearing reentrancy guarantee (not a hygiene preference) against
+`fn64-abi`'s `with_host`/`with_executor` gateway, which has already produced
+a real nested-reentry panic through an analogous path.
+
+This T0 slice defines the neutral vocabulary, sealed session/writer/typestate
+seam, the generic physical-state coordinator, and the real terminal
+capsule/publish transition, sealed against the concrete
+`fn64_runtime::device::ReadyDpcFabricCommit` T2 landed. That capsule's
+readiness check binds to the plan's *captured* source identity, never live
+device state: a public STATUS-mode command may legitimately change XBUS
+selection while an already-admitted DPC transaction is still in flight, and
+`fn64-runtime`'s `commit_dpc_submission` deliberately preserves the pending
+submission's captured source rather than re-reading live XBUS -- a
+live-XBUS-equality gate at publish time would be a correctness bug, not a
+stricter check; neither `seal_publication` nor `prepare_publication`/`commit`
+reads any live DPC/XBUS register as a validation gate. T0 does not implement
+`fn64-render-wgpu`'s decoder (T1) or instantiate a real backend's
+`RawDpcCoordinator<P>` with `P` = concrete `wgpu` physical state (T3, which
+also owns `PendingTmemTransaction::into_physical_successor` and proposed
+logical RDP state/durable before-after identity -- T0 provides only the
+generic coordinator mechanism, not a backend state payload or its own
+generation-tracking logic); see the migration card's ticket DAG and T0's
+freeze report for the exact scoped boundary.
+
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer
 ownership, and the diagnostic/watch hooks. It has no knowledge that it is

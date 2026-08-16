@@ -62,15 +62,24 @@ pub use microcode_identity::{
     F3DZEX2_RAW_WINDOW_SIZE,
 };
 pub use raw_dpc_batch::{
-    OwnedRawDpcSubmission, PreflightedRawDpcBatch, RawDpcBatch, RawDpcBatchCapability,
-    RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource, RawDpcStreamGroup,
-    RawDpcSubmissionError, RawDpcSubmissionIdentity,
+    OwnedRawDpcCapture, OwnedRawDpcSubmission, PreflightedRawDpcBatch, RawDpcBatch,
+    RawDpcBatchCapability, RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource,
+    RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use render_ir::{
-    decode_raw_dpc_capture, ir_effect_content_digest, preflight_raw_dpc_capture,
-    CommittedSemanticWorkloadRecord, IrGuestMemoryPreimage, IrGuestMemorySnapshot,
-    IrRawDpcBackendCompletion, IrRawDpcPacketPreflight, StagedIrRdramWrite,
+    decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
+    BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
+    CommittedSemanticWorkloadRecord, ExactRawDpcPlanVisitor, ExactValidatedRawDpcPlan,
+    GuestCommittedRawDpc, IrGuestMemoryPreimage, IrGuestMemorySnapshot, IrRawDpcBackendCompletion,
+    IrRawDpcPacketPreflight, NeutralImageFormat, NeutralPixelSize, NeutralTextureImage,
+    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
+    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, PlannedRawDpcSubmission,
+    RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator,
+    RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle,
+    RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome, ReadyPublication,
+    ReadyRawDpcCommitCapsule, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
+    TmemLoadShape, TmemStateCommand, TmemTransferLayout,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
@@ -675,7 +684,9 @@ pub enum ReleaseCapturePixelsError {
 impl std::fmt::Display for ReleaseCapturePixelsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ZeroDimension => formatter.write_str("release capture dimensions must be nonzero"),
+            Self::ZeroDimension => {
+                formatter.write_str("release capture dimensions must be nonzero")
+            }
             Self::ZeroVisibleHeight => {
                 formatter.write_str("release capture visible height must be nonzero")
             }
@@ -1794,6 +1805,147 @@ pub trait RenderBackend {
     /// callers are expected to consult this before dispatch too, but
     /// `process_task` is the enforced boundary, not this advisory list.
     fn supported_ucodes(&self) -> &[UcodeId];
+
+    // --- Production raw-DPC seam (v11 interface freeze) -------------------
+    //
+    // `raw_dpc_ir_capability`, `plan_raw_dpc`, `execute_raw_dpc`, and
+    // `publish_raw_dpc` are the four object-safe raw-DPC methods this trait
+    // exposes (v11 §134-153). `publish_raw_dpc`'s signature has no `Result`
+    // (`-> CommittedRawDpcOutcome`, not `Result<_, RenderError>`), unlike its
+    // three siblings, so its default body cannot report "unsupported" the
+    // way theirs do. It panics instead -- deliberately, not as a workaround:
+    // by the time any caller holds a `ReadyRawDpcCommitCapsule` to hand this
+    // method, `raw_dpc_ir_capability`/`plan_raw_dpc`/`execute_raw_dpc` have
+    // already had to succeed against a real, capable backend (only a capable
+    // backend's `execute_raw_dpc` can produce the `BackendPreparedRawDpc` a
+    // capsule is eventually sealed from), so this default is unreachable in
+    // practice for a correctly gated caller and exists only so the many
+    // existing `RenderBackend` implementors across the workspace unrelated
+    // to raw-DPC production (test mocks, other backends) do not have to
+    // implement a fourth production method just to keep compiling. A
+    // conforming raw-DPC-capable backend instead stores a
+    // `render_ir::RawDpcCoordinator<P>` (over its own physical state type
+    // `P`) and overrides this as exactly
+    // `self.coordinator.prepare_publication(publication).commit()` -- see
+    // `RawDpcCoordinator::prepare_publication` and `ReadyPublication::commit`
+    // for the exact validate-then-consume contract; there is no bare
+    // `ReadyRawDpcCommitCapsule` method that reaches `Published` on its own.
+    //
+    // **Dispatch boundary (B3).** The call *into* `plan_raw_dpc`/
+    // `execute_raw_dpc`/`publish_raw_dpc` through `dyn RenderBackend` is
+    // itself one dynamic dispatch -- unavoidably, since these are
+    // trait-object methods. That entry call is the *only* dynamic dispatch
+    // in the raw-DPC production path. Nothing on the `fn64-render` side of
+    // the boundary -- `RawDpcAbiSession`'s methods (including
+    // `seal_publication`), `RawDpcBackendAuthority::begin_plan`,
+    // `ExactRawDpcPlanWriter::finish`,
+    // `BoundSubmittedRawDpc::into_backend_prepared`,
+    // `RawDpcCoordinator::prepare_publication`, or `ReadyPublication::commit`'s
+    // fixed consuming publish body -- performs a further vtable call,
+    // `Box<dyn _>` invocation, or trait-object method resolution. A
+    // conforming backend's own `execute_raw_dpc`/`publish_raw_dpc` bodies are
+    // expected to hold the same property: exactly one dispatch to enter,
+    // then monomorphic Rust from there through the terminal state
+    // transition.
+    //
+    // **Dependency-direction reentrancy guarantee.** `fn64-render` and
+    // `fn64-render-wgpu` do not, and per this seam's design must never,
+    // depend on `fn64-abi`. `fn64-abi`'s live-host access (`with_host`,
+    // `with_executor`) is reached only through a `thread_local!`
+    // `RefCell`-backed gateway private to `fn64-abi`; that crate has already
+    // hit a real "already borrowed" panic from nested reentry through an
+    // analogous gateway (`with_executor`'s own doc comment), so this is a
+    // proven hazard class, not a theoretical one. Backend code on this side
+    // of the boundary cannot name `with_host` even if it wanted to, because
+    // no crate-graph edge exists from `fn64-render`/`fn64-render-wgpu` to
+    // `fn64-abi`. This is a **load-bearing invariant of this design**, not a
+    // hygiene preference: if that dependency direction were ever reversed or
+    // an edge added, backend code lent a `ReadyDpcFabricCommit<'_>` "inside
+    // the existing `with_host` borrow" (T2 §43-45) could transitively
+    // re-enter `with_host` and panic. Any future change that adds
+    // `fn64-abi` as a dependency of `fn64-render`/`fn64-render-wgpu` must
+    // re-verify this reentrancy property explicitly; it does not hold for
+    // free once that edge exists.
+
+    /// What this backend can honestly claim about the production raw-DPC
+    /// seam (`docs/RENDER-WGPU-PORT-PLAN.md`'s TMEM-only vertical slice). The
+    /// default reports `Unsupported`; only a real transactional backend may
+    /// report a wider capability, and only after landing the typestates that
+    /// back it.
+    fn raw_dpc_ir_capability(&self) -> RawDpcIrCapability {
+        RawDpcIrCapability::Unsupported
+    }
+
+    /// Finish one [`RawDpcPlanRequest`] into the neutral, sealed
+    /// [`PlannedRawDpcSubmission`] described by card v10 section 3: decode every
+    /// command through the one real decoder into
+    /// [`ExactRawDpcPlanWriter`](ir::ExactRawDpcPlanWriter)-pushed neutral
+    /// semantics, reject FullSync, guest-visible writes, and
+    /// unsupported/raster/YUV/TLUT commands, and construct the exact
+    /// resource journal and deferred guest-read plan.
+    ///
+    /// The default is a loud, named rejection -- never a silent `NeedsLle` or
+    /// a dropped command. A conforming backend overrides this once its
+    /// private provisional decoder can push into an `ExactRawDpcPlanWriter`
+    /// obtained from `RawDpcBackendAuthority::begin_plan`, using the
+    /// backend's own paired authority -- received at concrete construction/
+    /// registration time (per v11 §"non-negotiable shape"), not through this
+    /// trait. `fn64-render` intentionally exposes no object-safe method to
+    /// install that authority: the pairing is a one-time, backend-concrete
+    /// construction fact, not a per-call production operation.
+    fn plan_raw_dpc(
+        &mut self,
+        request: RawDpcPlanRequest,
+    ) -> Result<PlannedRawDpcSubmission, RenderError> {
+        let _ = request;
+        Err(RenderError::Backend {
+            backend: "render/raw-dpc-plan",
+            reason: "registered backend does not implement production raw-DPC planning".to_string(),
+        })
+    }
+
+    /// Execute one sealed, bound raw-DPC submission's declared TMEM loads and
+    /// advance it into [`BackendPreparedRawDpc`], retaining every GPU/
+    /// physical readiness fact backend-side. The default is a loud rejection
+    /// that leaves `bound` unusable to the caller (it is consumed either way,
+    /// so its armed retirement still records exactly one `Rejected` on this
+    /// path's implicit drop).
+    fn execute_raw_dpc(
+        &mut self,
+        bound: BoundSubmittedRawDpc,
+    ) -> Result<BackendPreparedRawDpc, RenderError> {
+        let _ = bound;
+        Err(RenderError::Backend {
+            backend: "render/raw-dpc-execute",
+            reason: "registered backend does not implement raw-DPC execution".to_string(),
+        })
+    }
+
+    /// Jointly publish `publication`'s fabric commit, this backend's own
+    /// already-prepared physical state, and the `Published` terminal
+    /// outcome. The default panics -- see the module-level comment above for
+    /// why that is the deliberate, unreachable-in-practice backstop for
+    /// backends that never override this. A conforming raw-DPC-capable
+    /// backend stores a [`render_ir::RawDpcCoordinator`] (parameterized over
+    /// its own physical state type) and implements this as exactly
+    /// `self.coordinator.prepare_publication(publication).commit()` --
+    /// `prepare_publication` performs every queue/submission/ready-slot
+    /// check `publication` needs (see its own doc comment), and the returned
+    /// [`render_ir::ReadyPublication`]'s `commit` is the fixed, straight-line,
+    /// no-`Result`, no-callback body that actually flips the coordinator's
+    /// active physical slot, commits the fabric transition, and writes
+    /// `Published`.
+    fn publish_raw_dpc(
+        &mut self,
+        publication: render_ir::ReadyRawDpcCommitCapsule<'_>,
+    ) -> render_ir::CommittedRawDpcOutcome {
+        drop(publication);
+        panic!(
+            "registered backend does not implement raw-DPC publication -- \
+             this method should be unreachable unless execute_raw_dpc \
+             already (incorrectly) succeeded for a non-raw-DPC-capable backend"
+        );
+    }
 }
 
 /// One post-commit, non-RDP 16-bit write at a canonical physical RDRAM
@@ -2246,7 +2398,10 @@ mod tests {
             scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
             ..ViPresentation::default()
         };
-        assert_eq!(interlaced_resampled.active_output_height(), progressive.active_output_height());
+        assert_eq!(
+            interlaced_resampled.active_output_height(),
+            progressive.active_output_height()
+        );
         assert_eq!(ViPresentation::default().active_output_height(), None);
     }
 
