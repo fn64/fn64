@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T09:00:00Z` |
+| updated | `2026-08-16T09:09:51Z` |
 
 ## Milestones
 
@@ -20,7 +20,7 @@
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:2 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:5, RUNNING:1 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -508,6 +508,125 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Prevention: Future lifecycle task cards must list every capability mint, exact successor relation, and frozen predecessor fixture before a writer begins.
 - Estimated minutes saved: 20
 
+### `M3.3.1` -- M3.3a — Freeze rollback-safe ownership and byte-domain contracts for one exact synthetic 4x2 RGBA16 native fill before target, raster, or VI implementation.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `INTEGRATED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | native fill contract writer |
+| branch | `port/m3-native-contract` -> `main` |
+| dependencies | `M3.2` |
+| writable paths | `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/raw_dpc/mod.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T08:00:00Z` / `2026-08-16T08:35:41Z` (elapsed 35m) |
+| verification runs meeting bar | 1/1 |
+
+**Findings:**
+
+- Commit 06eb68db freezes the exact 4x2 RGBA16 fill and separates logical/device bytes from N64Recomp backing-storage bytes.
+- The rollback-safe typestate retains exclusive durable state through preparation, backend completion, and guest-owned commit; every precommit failure leaves the prior state unchanged.
+- The 10-run bar closed with 43 unit tests and seven compile-fail doctests per run.
+- This is a synthetic CPU ownership contract, not target allocation, raster execution, guest writeback implementation, VI, surface, RT64 parity, or performance evidence.
+
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --lib && cargo test -p fn64-render-wgpu --doc` | 10 | 10 | deterministic |
+
+**Next action:** Use the frozen ownership contract as M3.3c's exact raster-completion boundary without widening guest-memory or publication authority.
+
+### `M3.3.2` -- M3.3b — Add typed native color-target keys, exact row plans, device-byte domains, and rollback-safe resident generations without claiming GPU allocation or raster completion.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `INTEGRATED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | /root/m3_3b_targets_impl |
+| branch | `port/m3-3b-targets` -> `main` |
+| dependencies | `M3.3.1` |
+| writable paths | `crates/fn64-render-wgpu/src/targets`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T08:35:41Z` / `2026-08-16T09:04:42Z` (elapsed 29m) |
+| verification runs meeting bar | 2/2 |
+
+**Findings:**
+
+- Commit b5ffe53e binds target layout, physical range, extent, RGBA16/32 format, generation, full initialization range, device-byte domain, and exact byte count.
+- Independent review rejected direct promotion from a structural row plan because it could fabricate initialized residency without completed-write authority.
+- The accepted repair makes CompletedColorTargetWrite move-only and leaves it without a production constructor until M3.3c can supply real raster completion.
+- The 10-run bar closed with the complete 65-test crate suite plus compile-fail coverage; no GPU allocation, raster execution, VI, surface, parity, or performance claim advanced.
+
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --lib` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-wgpu --doc` | 10 | 10 | deterministic |
+
+**Next action:** Let M3.3c construct the completed-write capability only after exact real wgpu submission, completion, and byte validation.
+
+### `M3.3.3` -- M3.3c — Execute the exact synthetic native fill through a bounded real wgpu raster path and produce the typed completion required by M3.3b.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `RUNNING` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | /root/m3_3c_raster_impl |
+| branch | `port/m3-3c-native-raster` -> `main` |
+| dependencies | `M3.3.1`, `M3.3.2` |
+| writable paths | `crates/fn64-render-wgpu/src/raster`, `crates/fn64-render-wgpu/src/device`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T09:04:42Z` / `2026-08-16T09:09:51Z` (elapsed 5m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- The implementation lane is active on the exact bounded fill; no accepted implementation, review verdict, verification receipt, or GPU evidence exists yet.
+- The slice must consume M3.3b's target/completion contract rather than fabricating residency, and it must not broaden into live VI, surface presentation, parity, or performance claims.
+
+**Next action:** Implement and independently review the exact wgpu raster submission, completion, readback, and typed target-write transition, then run the required deterministic and host-GPU bars.
+
+### `M3.3.4` -- M3.3d — Add one exact progressive/replicate VI CPU oracle, separate VI/capture plans, padded BGRA8 extraction, and a validated repository WGSL mechanism.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `INTEGRATED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | /root/m3_3d_vi_impl |
+| branch | `port/m3-3d-vi-capture` -> `main` |
+| dependencies | `M3.3.1` |
+| writable paths | `crates/fn64-render-wgpu/src/vi`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T08:35:41Z` / `2026-08-16T09:08:08Z` (elapsed 32m) |
+| verification runs meeting bar | 3/3 |
+
+**Findings:**
+
+- Commit bed6c241 admits the exact 4x2 RGBA16 origin, stride, extent, pixel type, U2.10 scale, replicate filters, progressive field, and presentation/capture identity.
+- The CPU oracle consumes only M3.3a's typed DeviceRgba16Bytes; N64Recomp storage-order bytes cannot cross the API. Capture strips exact 256-byte padded rows into tightly packed BGRA8.
+- Independent review rejected the raw byte-slice oracle and missing provenance; the accepted repair uses the typed device domain and cites public VI, RGBA5551, scale, and wgpu padding authorities.
+- The final actual-crate bar passed 12 VI tests 10/10, the combined 77-test suite, eight doctests, strict scoped clippy, docs lint, and Naga validation.
+- This proves a fixed CPU/WGSL mechanism only: no live ViPresentation adapter, GPU VI execution, ordinary capture, surface, RT64 parity, or performance evidence.
+
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --lib 'vi::tests'` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-wgpu --lib` | 1 | 1 | single |
+| `cargo test -p fn64-render-wgpu --doc` | 1 | 1 | single |
+
+**Next action:** Keep this mechanism private until a later slice supplies the complete live ViPresentation adapter and real GPU VI/capture execution with separately reviewed evidence.
+
+**Retrospective:**
+
+- Friction: The isolated target/VI slices initially relied on scratch harnesses while their new modules were untracked and not declared by the actual crate; an ordinary filtered Cargo command therefore ran zero new tests.
+- Cause: Exclusive-path isolation deferred crate-root wiring, and the reliability loop began before checking that Cargo compiled tracked source and reported the expected test count.
+- Prevention: Before any 10-run bar, wire the module in an actual crate worktree, stage or otherwise prove the source is tracked, and require the exact expected test count; scratch harnesses may supplement but never replace that check.
+- Estimated minutes saved: 20
+
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 
 | field | value |
@@ -543,8 +662,8 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | command | clean runs | required | kind |
 |---|---|---|---|
 | `cargo test -p fn64-render-conformance --features conformance-test-runner --all-targets && python3 -m unittest tools/test_check_rt64_port_parity.py` | 1 | 1 | single |
-| `FN64_RT64_DIR=/Users/jer/Code/no-mercy-recompiled/third_party/rt64 cargo test -p fn64-render-conformance --features rt64-deferred-history-runner --bin fn64-render-conformance-rt64-deferred-history-runner` | 1 | 1 | single |
-| `env -i target/debug/fn64-render-conformance-rt64-deferred-history-runner run < /private/tmp/fn64-a0-4-request-final.json > /private/tmp/fn64-a0-4-result-final.json 2> /private/tmp/fn64-a0-4-native-final.stderr (approved WindowServer access; pre-registration diagnostic)` | 1 | 1 | single |
+| `cargo test -p fn64-render-conformance --features rt64-deferred-history-runner --bin fn64-render-conformance-rt64-deferred-history-runner (FN64_RT64_DIR set to the clean pinned RT64 checkout)` | 1 | 1 | single |
+| `env -i target/debug/fn64-render-conformance-rt64-deferred-history-runner run with retained request/result/stderr artifacts (approved WindowServer access; pre-registration diagnostic)` | 1 | 1 | single |
 | `python3 tools/check_rt64_port_parity.py --qualification-output evidence/rt64-port/artifacts/deferred-frame-history/qualification-report.json (approved WindowServer access)` | 10 | 10 | deterministic |
 
 **Next action:** Use the retained deferred-history oracle to close its Rust-port counterpart, then add subsequent RT64 rows only through separately reviewed runner/build/effect authority without promoting unrelated pending rows.
