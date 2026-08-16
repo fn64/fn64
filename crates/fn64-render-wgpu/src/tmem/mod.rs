@@ -9,13 +9,23 @@
 //! M4.1 scope. M4.2.0's transfer-word/effect-union split follows public
 //! Programming Manual section 13.9; undefined word padding is never promoted
 //! to defined texture content. YUV and TLUT retain source-only deferred
-//! contracts until their destination rules are frozen. RT64 is not hardware
-//! authority for this module.
+//! contracts until their destination rules are frozen. M4.2a consumes those
+//! exact plans into one packet-local physical-state transaction, retaining
+//! intermediate load effects across overlaps and publishing durable state only
+//! after exact GPU and guest lifecycle evidence. RT64 is not hardware authority
+//! for this module.
 
+mod physical;
 mod state;
 mod types;
 mod wire;
 
+pub use physical::{
+    CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
+    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
+    PhysicalTmemTransactionIdentity, StagedTmemTransaction,
+};
 pub use state::{TileState, TmemState};
 pub use types::{
     TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize,
