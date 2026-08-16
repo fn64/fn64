@@ -59,7 +59,7 @@
 <p>
   <span class="badge state-running">IN PROGRESS</span>
   <code>main</code> &rarr; <code>origin/main</code>
-  &middot; updated <code>2026-08-16T10:46:00Z</code>
+  &middot; updated <code>2026-08-16T11:03:34Z</code>
 </p>
 
 <h2>Milestones</h2>
@@ -346,14 +346,14 @@
     <dt>Branch</dt><dd><code>m2-5a-reference-corpus</code> &rarr; <code>main</code></dd>
     <dt>Dependencies</dt><dd><code>M2.5</code></dd>
     <dt>Writable paths</dt><dd><code>tools/rt64_reference_shader_artifacts.py</code>, <code>tools/test_rt64_reference_shader_artifacts.py</code>, <code>docs/rt64-reference-shader-artifact-schema.json</code>, <code>docs/RT64-REFERENCE-SHADER-ARTIFACTS.md</code></dd>
-    <dt>Elapsed</dt><dd>0m (started 2026-08-16T09:54:30Z, updated 2026-08-16T09:54:30Z)</dd>
-    <dt>Verification bar met</dt><dd>0/0 runs</dd>
+    <dt>Elapsed</dt><dd>1h9m (started 2026-08-16T09:54:30Z, updated 2026-08-16T11:03:34Z)</dd>
+    <dt>Verification bar met</dt><dd>1/1 runs</dd>
   </dl>
-  <p><strong>Next action:</strong> Finish the additive mechanism, obtain independent adversarial review, pass its deterministic bar, then execute and independently review all 56 rows.</p>
-  <details open><summary>Findings</summary><ul><li>This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.</li><li>Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.</li><li>Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.</li></ul></details>
+  <p><strong>Next action:</strong> Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.</p>
+  <details open><summary>Findings</summary><ul><li>This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.</li><li>Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.</li><li>Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.</li><li>Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.</li><li>The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.</li></ul></details>
   <details><summary>Verification runs</summary>
     <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
-    <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>
+    <tbody><tr><td><code>python3 -m unittest tools/test_rt64_reference_shader_artifacts.py &amp;&amp; python3 tools/rt64_reference_shader_artifacts.py selftest &amp;&amp; python3 scripts/lint-docs.py --verbose</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
   </details>
 </article>
 <article class="ticket" data-state="READY" data-milestone="M2">

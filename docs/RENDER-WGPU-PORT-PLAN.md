@@ -946,7 +946,9 @@ The accelerated wave keeps dependency-safe work active in parallel:
     typed wgpu-ingestion assessment; M2.5.3 owns the separately checked
     runtime corpus, using owned WGSL/Naga IR and bounded feature fallbacks
     where reference SPIR-V is not ingestible. None of these claims substitutes
-    for another.
+    for another. M2.5.1's additive receipt/validator mechanism is integrated
+    at `8765d9b0` after independent review and a 10/10 hostile gate; the exact
+    external `spirv-val` source build and 56-row corpus remain open.
 16. **M4.0 -- own deferred guest reads (INTEGRATED, `d8c0d4b1`; 10/10 VALIDATED).** The
     renderer preflights an exact ordered plan from RDRAM `TmemLoadSource`
     journal operations; the ABI captures only those ranges in N64 logical byte
