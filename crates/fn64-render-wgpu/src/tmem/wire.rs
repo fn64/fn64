@@ -8,15 +8,18 @@
 
 use fn64_render_ir::{
     AccessMode, AccessPurpose, OperationId, PhysicalMemoryLayout, PhysicalRange, RdramResource,
-    ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion, MAX_RESOURCE_ACCESSES,
+    ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion, TmemRange,
+    MAX_RESOURCE_ACCESSES,
 };
 
 use crate::{ImageFormat, PixelSize};
 
+use super::types::project_tmem_transfer_word;
 use super::{
     TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize,
-    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan,
-    TmemState, TmemWordAddress,
+    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadDestinationPlan, TmemLoadKind,
+    TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemState, TmemTransferLayout,
+    TmemTransferPhysicalWord, TmemTransferPlan, TmemWordAddress,
 };
 
 pub(crate) const LOAD_SYNC: u8 = 0x26;
@@ -213,7 +216,7 @@ fn decode_load_block(
             "LoadBlock source texel offset overflows",
         ))?;
     let range = source_range(layout, image, start_texel, texels, "LoadBlock source range")?;
-    let (source_plan, accesses) = source_accesses(
+    let (source_plan, mut accesses) = source_accesses(
         source_identity,
         first_access_index,
         first_operation,
@@ -225,19 +228,32 @@ fn decode_load_block(
         high_s,
         coordinate(u32::from(dxt.get()))?,
     );
-    let load = TmemLoad::new(
-        epoch,
-        tile,
-        image,
-        descriptor,
-        TmemLoadKind::Block {
-            source_s,
-            source_t,
-            high_s,
-            dxt,
-        },
-        source_plan,
-    );
+    let kind = TmemLoadKind::Block {
+        source_s,
+        source_t,
+        high_s,
+        dxt,
+    };
+    // M4.1 retains the exact source plan, but M4.2.0 does not guess at YUV
+    // pairing or descriptor constraints without a frozen public contract.
+    let load = if image.format() == ImageFormat::Yuv {
+        TmemLoad::new_deferred_yuv(epoch, tile, image, descriptor, kind, source_plan)
+    } else {
+        let transfer_plan = transfer_plan(
+            source_plan,
+            TransferInputs {
+                epoch,
+                tile,
+                image,
+                descriptor,
+                kind,
+            },
+            first_access_index,
+            first_operation,
+            &mut accesses,
+        )?;
+        TmemLoad::new(epoch, tile, image, descriptor, kind, transfer_plan)
+    };
     state.commit_load(load, size);
     Ok((TmemCommand::LoadBlock(load), accesses))
 }
@@ -302,16 +318,29 @@ fn decode_load_tile(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    let (source_plan, accesses) =
+    let (source_plan, mut accesses) =
         source_accesses(source_identity, first_access_index, first_operation, ranges)?;
-    let load = TmemLoad::new(
-        epoch,
-        tile,
-        image,
-        descriptor,
-        TmemLoadKind::Tile { bounds },
-        source_plan,
-    );
+    let kind = TmemLoadKind::Tile { bounds };
+    // M4.1 retains the exact source plan, but M4.2.0 does not guess at YUV
+    // pairing or descriptor constraints without a frozen public contract.
+    let load = if image.format() == ImageFormat::Yuv {
+        TmemLoad::new_deferred_yuv(epoch, tile, image, descriptor, kind, source_plan)
+    } else {
+        let transfer_plan = transfer_plan(
+            source_plan,
+            TransferInputs {
+                epoch,
+                tile,
+                image,
+                descriptor,
+                kind,
+            },
+            first_access_index,
+            first_operation,
+            &mut accesses,
+        )?;
+        TmemLoad::new(epoch, tile, image, descriptor, kind, transfer_plan)
+    };
     state.commit_load(load, bounds);
     Ok((TmemCommand::LoadTile(load), accesses))
 }
@@ -377,14 +406,11 @@ fn decode_load_tlut(
         first_operation,
         vec![range],
     )?;
-    let load = TmemLoad::new(
-        epoch,
-        tile,
-        image,
-        descriptor,
-        TmemLoadKind::Tlut { bounds, entries },
-        source_plan,
-    );
+    let kind = TmemLoadKind::Tlut { bounds, entries };
+    // M4.2 owns physical LoadTile/LoadBlock effects. LoadTLUT keeps its exact
+    // owned source but acquires no destination or quadrication claim until
+    // M4.3 freezes the still-open high-bank authority contract.
+    let load = TmemLoad::new_deferred_tlut(epoch, tile, image, descriptor, kind, source_plan);
     state.commit_load(load, bounds);
     Ok((TmemCommand::LoadTlut(load), accesses))
 }
@@ -449,6 +475,259 @@ fn source_accesses(
     ))
 }
 
+#[derive(Clone, Copy)]
+struct TransferShape {
+    layout: TmemTransferLayout,
+    logical_source_bytes: u32,
+    transfer_words: u16,
+    undefined_padding_bytes: u32,
+    words_per_row: u16,
+    row_count: u16,
+}
+
+#[derive(Clone, Copy)]
+struct TransferInputs {
+    epoch: super::TmemLoadEpoch,
+    tile: TileIndex,
+    image: TextureImage,
+    descriptor: TileDescriptor,
+    kind: TmemLoadKind,
+}
+
+fn transfer_plan(
+    source: TmemLoadSourcePlan,
+    inputs: TransferInputs,
+    first_access_index: u32,
+    first_operation: OperationId,
+    accesses: &mut Vec<ResourceAccess>,
+) -> Result<TmemTransferPlan, TmemWireError> {
+    let shape = transfer_shape(source, inputs.image, inputs.descriptor, inputs.kind)?;
+    let destination_ranges = destination_ranges(inputs.descriptor, inputs.kind, shape)?;
+    let first_destination_access = first_access_index
+        .checked_add(u32::from(source.access_count()))
+        .ok_or(TmemWireError::new(
+            "TMEM destination access identity overflows",
+        ))?;
+    let first_destination_operation = first_operation
+        .get()
+        .checked_add(u32::from(source.access_count()))
+        .ok_or(TmemWireError::new(
+            "TMEM destination operation identity overflows",
+        ))?;
+    if accesses
+        .len()
+        .checked_add(destination_ranges.len())
+        .is_none_or(|count| count > MAX_RESOURCE_ACCESSES)
+    {
+        return Err(TmemWireError::new(
+            "TMEM transfer exceeds the bounded resource-plan access count",
+        ));
+    }
+    let total_bytes = destination_ranges.iter().try_fold(0_u32, |total, range| {
+        total
+            .checked_add(range.len())
+            .ok_or(TmemWireError::new("TMEM destination byte count overflows"))
+    })?;
+    let mut destination_accesses = Vec::with_capacity(destination_ranges.len());
+    for (offset, range) in destination_ranges.into_iter().enumerate() {
+        let offset = u32::try_from(offset)
+            .map_err(|_| TmemWireError::new("TMEM destination operation offset overflows"))?;
+        let operation =
+            first_destination_operation
+                .checked_add(offset)
+                .ok_or(TmemWireError::new(
+                    "TMEM destination operation identity overflows",
+                ))?;
+        destination_accesses.push(
+            ResourceAccess::try_new(
+                OperationId::new(operation),
+                AccessMode::Write,
+                AccessPurpose::TmemLoadDestination,
+                ResourceRegion::Tmem(range),
+            )
+            .expect("TMEM destination uses the IR-admitted mode and resource"),
+        );
+    }
+    let access_count = u16::try_from(destination_accesses.len())
+        .map_err(|_| TmemWireError::new("TMEM destination access count exceeds u16"))?;
+    let destination_access_identity = ResourceJournal::try_new(
+        ResourceJournalLimits::try_new(destination_accesses.len(), total_bytes)
+            .expect("TMEM destination plan is nonempty and bounded"),
+        destination_accesses.clone(),
+    )
+    .expect("TMEM destination accesses satisfy the IR journal contract")
+    .identity();
+    accesses.extend(destination_accesses);
+    let destination = TmemLoadDestinationPlan::new(
+        source.identity(),
+        source.source_access_identity(),
+        destination_access_identity,
+        first_destination_access,
+        OperationId::new(first_destination_operation),
+        access_count,
+        total_bytes,
+    );
+    Ok(TmemTransferPlan::new(
+        source,
+        destination,
+        shape.logical_source_bytes,
+        shape.transfer_words,
+        shape.undefined_padding_bytes,
+        shape.words_per_row,
+        shape.row_count,
+        shape.layout,
+        inputs.kind,
+        inputs.epoch,
+        inputs.tile,
+        inputs.image,
+        inputs.descriptor,
+    ))
+}
+
+fn transfer_shape(
+    source: TmemLoadSourcePlan,
+    image: TextureImage,
+    descriptor: TileDescriptor,
+    kind: TmemLoadKind,
+) -> Result<TransferShape, TmemWireError> {
+    if image.format() == ImageFormat::Yuv {
+        return Err(TmemWireError::new(
+            "YUV destination execution is deferred pending a public pairing contract",
+        ));
+    }
+    let layout = if image.size() == PixelSize::Bits32 {
+        if descriptor.tmem().get() >= 256 {
+            return Err(TmemWireError::new(
+                "split-bank TMEM load base is outside low TMEM",
+            ));
+        }
+        TmemTransferLayout::SplitBanks64
+    } else {
+        TmemTransferLayout::Linear64
+    };
+    let (logical_source_bytes, transfer_words, undefined_padding_bytes, words_per_row, row_count) =
+        match kind {
+            TmemLoadKind::Block { .. } => {
+                let logical = source.total_bytes();
+                let words = logical.div_ceil(8);
+                let written = words.checked_mul(8).ok_or(TmemWireError::new(
+                    "LoadBlock transfer byte count overflows",
+                ))?;
+                let padding = written.checked_sub(logical).ok_or(TmemWireError::new(
+                    "LoadBlock padding byte count underflows",
+                ))?;
+                (logical, words, padding, words, 1)
+            }
+            TmemLoadKind::Tile { bounds } => {
+                let width = u32::from(bounds.high_s().integer())
+                    .checked_sub(u32::from(bounds.low_s().integer()))
+                    .and_then(|span| span.checked_add(1))
+                    .ok_or(TmemWireError::new("LoadTile transfer width underflows"))?;
+                let rows = u32::from(bounds.high_t().integer())
+                    .checked_sub(u32::from(bounds.low_t().integer()))
+                    .and_then(|span| span.checked_add(1))
+                    .ok_or(TmemWireError::new("LoadTile transfer height underflows"))?;
+                let row_bytes = texel_bytes(image.size(), width)?;
+                let words_per_row = row_bytes.div_ceil(8);
+                let words = words_per_row
+                    .checked_mul(rows)
+                    .ok_or(TmemWireError::new("LoadTile transfer word count overflows"))?;
+                let logical = row_bytes
+                    .checked_mul(rows)
+                    .ok_or(TmemWireError::new("LoadTile logical byte count overflows"))?;
+                let written = words
+                    .checked_mul(8)
+                    .ok_or(TmemWireError::new("LoadTile transfer byte count overflows"))?;
+                let padding = written
+                    .checked_sub(logical)
+                    .ok_or(TmemWireError::new("LoadTile padding byte count underflows"))?;
+                (logical, words, padding, words_per_row, rows)
+            }
+            TmemLoadKind::Tlut { .. } => {
+                return Err(TmemWireError::new(
+                    "LoadTLUT destination execution is deferred to M4.3",
+                ));
+            }
+        };
+    if logical_source_bytes != source.total_bytes() {
+        return Err(TmemWireError::new(
+            "TMEM logical transfer bytes differ from the exact source plan",
+        ));
+    }
+    let transfer_words = u16::try_from(transfer_words)
+        .map_err(|_| TmemWireError::new("TMEM transfer word count exceeds u16"))?;
+    let words_per_row = u16::try_from(words_per_row)
+        .map_err(|_| TmemWireError::new("TMEM transfer row word count exceeds u16"))?;
+    let row_count = u16::try_from(row_count)
+        .map_err(|_| TmemWireError::new("TMEM transfer row count exceeds u16"))?;
+    Ok(TransferShape {
+        layout,
+        logical_source_bytes,
+        transfer_words,
+        undefined_padding_bytes,
+        words_per_row,
+        row_count,
+    })
+}
+
+fn destination_ranges(
+    descriptor: TileDescriptor,
+    kind: TmemLoadKind,
+    shape: TransferShape,
+) -> Result<Vec<TmemRange>, TmemWireError> {
+    let mut ranges = Vec::new();
+    for word in 0..shape.transfer_words {
+        let geometry = project_tmem_transfer_word(
+            descriptor,
+            kind,
+            shape.layout,
+            shape.transfer_words,
+            shape.words_per_row,
+            word,
+        )
+        .map_err(TmemWireError::new)?;
+        match geometry.physical() {
+            TmemTransferPhysicalWord::Linear(range) => ranges.push(range),
+            TmemTransferPhysicalWord::SplitBanks { low, high } => {
+                ranges.push(low);
+                ranges.push(high);
+            }
+        }
+    }
+    canonical_destination_union(ranges)
+}
+
+fn canonical_destination_union(
+    mut ranges: Vec<TmemRange>,
+) -> Result<Vec<TmemRange>, TmemWireError> {
+    ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+    let mut union: Vec<TmemRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = union.last_mut() {
+            if range.start() <= last.end() {
+                let end = last.end().max(range.end());
+                *last = TmemRange::try_new(last.start(), end).map_err(|_| {
+                    TmemWireError::new("canonical TMEM destination union is outside TMEM")
+                })?;
+                continue;
+            }
+        }
+        union.push(range);
+    }
+    Ok(union)
+}
+
+fn texel_bytes(size: PixelSize, texels: u32) -> Result<u32, TmemWireError> {
+    match size {
+        PixelSize::Bits4 => Err(TmemWireError::new(
+            "direct four-bit TMEM loads are unsupported; load through a public 16-bit form",
+        )),
+        size => texels
+            .checked_mul(size.bytes_per_pixel().expect("non-four-bit size has bytes"))
+            .ok_or(TmemWireError::new("TMEM logical byte count overflows")),
+    }
+}
+
 fn source_range(
     layout: PhysicalMemoryLayout,
     image: TextureImage,
@@ -458,11 +737,9 @@ fn source_range(
 ) -> Result<PhysicalRange, TmemWireError> {
     let (first_byte, end_byte) = match image.size() {
         PixelSize::Bits4 => {
-            let last_texel = first_texel
-                .checked_add(texel_count)
-                .and_then(|value| value.checked_sub(1))
-                .ok_or(TmemWireError::new("TMEM load source texel span overflows"))?;
-            (first_texel / 2, last_texel / 2 + 1)
+            return Err(TmemWireError::new(
+                "direct four-bit TMEM loads are unsupported; load through a public 16-bit form",
+            ));
         }
         size => {
             let bytes_per_texel = size

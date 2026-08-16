@@ -15,9 +15,10 @@ use crate::state::{
     StagedRdpState,
 };
 use crate::tmem::{
-    decode_tmem_command, TmemCommand, TmemLoad, TmemLoadEpoch, TmemLoadSourceIdentity,
-    TmemLoadSourcePlan, TmemSourcePlanStart, LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT,
-    SET_TEXTURE_IMAGE, SET_TILE, SET_TILE_SIZE,
+    decode_tmem_command, TmemCommand, TmemLoad, TmemLoadContract, TmemLoadEpoch,
+    TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemSourcePlanStart, TmemTransferPlan,
+    TmemTransferWord, LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE,
+    SET_TILE_SIZE,
 };
 
 const SET_OTHER_MODE: u8 = 0x2f;
@@ -154,6 +155,42 @@ impl DecodedRawDpcCommand {
 pub struct RawDpcResourcePlan {
     tmem_source_identity: TmemLoadSourceIdentity,
     accesses: Box<[ResourceAccess]>,
+    tmem_transfers: Box<[TmemTransferRecord]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TmemTransferRecord {
+    plan: TmemTransferPlan,
+    words: Box<[TmemTransferWord]>,
+}
+
+#[derive(Debug)]
+/// An immutable view whose load, ordered words, and exact journal slices have
+/// been checked against one decoded resource plan. This is not a consuming
+/// execution capability and may be reconstructed while that plan is borrowed.
+pub struct BoundTmemTransfer<'a> {
+    load: TmemLoad,
+    source_accesses: &'a [ResourceAccess],
+    destination_accesses: &'a [ResourceAccess],
+    words: &'a [TmemTransferWord],
+}
+
+impl BoundTmemTransfer<'_> {
+    pub const fn load(&self) -> TmemLoad {
+        self.load
+    }
+
+    pub const fn source_accesses(&self) -> &[ResourceAccess] {
+        self.source_accesses
+    }
+
+    pub const fn destination_accesses(&self) -> &[ResourceAccess] {
+        self.destination_accesses
+    }
+
+    pub const fn words(&self) -> &[TmemTransferWord] {
+        self.words
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +198,12 @@ pub enum TmemLoadSourcePlanError {
     DecodeIdentityMismatch,
     AccessSliceOutOfBounds,
     AccessDescriptorsDiffer,
+    TransferNotDeclared,
+    DestinationDecodeIdentityMismatch,
+    DestinationAccessSliceOutOfBounds,
+    DestinationAccessDescriptorsDiffer,
+    YuvExecutionDeferred,
+    TlutExecutionDeferred,
 }
 
 impl fmt::Display for TmemLoadSourcePlanError {
@@ -174,6 +217,23 @@ impl fmt::Display for TmemLoadSourcePlanError {
             }
             Self::AccessDescriptorsDiffer => formatter
                 .write_str("TMEM source plan differs from the exact ordered source descriptors"),
+            Self::TransferNotDeclared => {
+                formatter.write_str("TMEM transfer plan is not declared by this decode")
+            }
+            Self::DestinationDecodeIdentityMismatch => formatter
+                .write_str("TMEM destination plan belongs to a different source/decode identity"),
+            Self::DestinationAccessSliceOutOfBounds => {
+                formatter.write_str("TMEM destination plan access slice is out of bounds")
+            }
+            Self::DestinationAccessDescriptorsDiffer => formatter.write_str(
+                "TMEM destination plan differs from the canonical sorted destination union",
+            ),
+            Self::YuvExecutionDeferred => formatter.write_str(
+                "YUV destination execution is deferred pending a public pairing contract",
+            ),
+            Self::TlutExecutionDeferred => {
+                formatter.write_str("LoadTLUT destination execution is deferred to M4.3")
+            }
         }
     }
 }
@@ -215,15 +275,77 @@ impl RawDpcResourcePlan {
         }) && accesses.iter().try_fold(0_u32, |total, access| {
             total.checked_add(access.region().declared_bytes())
         }) == Some(plan.total_bytes())
-            && source_access_identity(accesses) == plan.source_access_identity();
+            && access_identity(accesses) == plan.source_access_identity();
         if !exact_descriptors {
             return Err(TmemLoadSourcePlanError::AccessDescriptorsDiffer);
         }
         Ok(accesses)
     }
+
+    pub fn bind_tmem_transfer(
+        &self,
+        load: TmemLoad,
+    ) -> Result<BoundTmemTransfer<'_>, TmemLoadSourcePlanError> {
+        let plan = match load.contract() {
+            TmemLoadContract::Transfer(plan) => plan,
+            TmemLoadContract::DeferredYuv { .. } => {
+                return Err(TmemLoadSourcePlanError::YuvExecutionDeferred);
+            }
+            TmemLoadContract::DeferredTlut { .. } => {
+                return Err(TmemLoadSourcePlanError::TlutExecutionDeferred);
+            }
+        };
+        let record = self
+            .tmem_transfers
+            .iter()
+            .find(|record| record.plan == plan)
+            .ok_or(TmemLoadSourcePlanError::TransferNotDeclared)?;
+        let source_accesses = self.tmem_load_source_accesses(plan.source())?;
+        let destination = plan.destination();
+        if destination.identity() != self.tmem_source_identity
+            || destination.identity() != plan.source().identity()
+            || destination.source_access_identity() != plan.source().source_access_identity()
+        {
+            return Err(TmemLoadSourcePlanError::DestinationDecodeIdentityMismatch);
+        }
+        let start = usize::try_from(destination.first_access_index())
+            .map_err(|_| TmemLoadSourcePlanError::DestinationAccessSliceOutOfBounds)?;
+        let end = start
+            .checked_add(usize::from(destination.access_count()))
+            .ok_or(TmemLoadSourcePlanError::DestinationAccessSliceOutOfBounds)?;
+        let destination_accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(TmemLoadSourcePlanError::DestinationAccessSliceOutOfBounds)?;
+        let exact_descriptors = destination_accesses
+            .iter()
+            .enumerate()
+            .all(|(offset, access)| {
+                access.operation().get() == destination.first_operation().get() + offset as u32
+                    && access.mode() == AccessMode::Write
+                    && access.purpose() == AccessPurpose::TmemLoadDestination
+                    && matches!(access.region(), ResourceRegion::Tmem(_))
+            })
+            && destination_accesses
+                .iter()
+                .try_fold(0_u32, |total, access| {
+                    total.checked_add(access.region().declared_bytes())
+                })
+                == Some(destination.total_bytes())
+            && access_identity(destination_accesses) == destination.destination_access_identity();
+        if !exact_descriptors {
+            return Err(TmemLoadSourcePlanError::DestinationAccessDescriptorsDiffer);
+        }
+        Ok(BoundTmemTransfer {
+            load,
+            source_accesses,
+            destination_accesses,
+            words: &record.words,
+        })
+    }
 }
 
-fn source_access_identity(accesses: &[ResourceAccess]) -> fn64_render_ir::JournalIdentity {
+fn access_identity(accesses: &[ResourceAccess]) -> fn64_render_ir::JournalIdentity {
     let total_bytes = accesses
         .iter()
         .try_fold(0_u32, |total, access| {
@@ -237,6 +359,68 @@ fn source_access_identity(accesses: &[ResourceAccess]) -> fn64_render_ir::Journa
     )
     .expect("TMEM source slice came from an admitted resource journal")
     .identity()
+}
+
+fn transfer_record(
+    plan: TmemTransferPlan,
+    accesses: &[ResourceAccess],
+) -> Result<TmemTransferRecord, TmemLoadSourcePlanError> {
+    let source_start = usize::try_from(plan.source().first_access_index())
+        .map_err(|_| TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+    let source_end = source_start
+        .checked_add(usize::from(plan.source().access_count()))
+        .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+    let sources = accesses
+        .get(source_start..source_end)
+        .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+    let mut words = Vec::with_capacity(usize::from(plan.transfer_words()));
+    for index in 0..plan.transfer_words() {
+        let geometry = plan
+            .geometry_for_word(index)
+            .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
+        let logical_offset = plan
+            .logical_source_offset(index)
+            .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
+        let mut preceding = 0_u32;
+        let mut source_binding = None;
+        for (source_ordinal, access) in sources.iter().enumerate() {
+            let bytes = access.region().declared_bytes();
+            let end = preceding
+                .checked_add(bytes)
+                .ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
+            if logical_offset < end {
+                let ordinal = u32::try_from(source_ordinal)
+                    .map_err(|_| TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+                source_binding = Some((
+                    plan.source()
+                        .first_access_index()
+                        .checked_add(ordinal)
+                        .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?,
+                    logical_offset - preceding,
+                ));
+                break;
+            }
+            preceding = end;
+        }
+        let (source_access_index, source_access_byte_offset) =
+            source_binding.ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
+        words.push(TmemTransferWord::new(
+            index,
+            logical_offset,
+            source_access_index,
+            source_access_byte_offset,
+            plan.defined_source_byte_mask(index)
+                .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?,
+            geometry.destination_word(),
+            geometry.row_advance(),
+            geometry.odd_row_exchange(),
+            geometry.physical(),
+        ));
+    }
+    Ok(TmemTransferRecord {
+        plan,
+        words: words.into_boxed_slice(),
+    })
 }
 
 #[derive(Debug)]
@@ -348,10 +532,16 @@ impl fmt::Display for RawDpcDecodeError {
                 write!(formatter, "workload {workload} is not admitted as raw DPC")
             }
             Self::StagedStateMismatch { workload, reason } => {
-                write!(formatter, "workload {workload} cannot chain staged RDP state: {reason}")
+                write!(
+                    formatter,
+                    "workload {workload} cannot chain staged RDP state: {reason}"
+                )
             }
             Self::UnknownCommandWidth { location } => {
-                write!(formatter, "{location}: command has no admitted public width")
+                write!(
+                    formatter,
+                    "{location}: command has no admitted public width"
+                )
             }
             Self::TruncatedCommand {
                 location,
@@ -373,7 +563,10 @@ impl fmt::Display for RawDpcDecodeError {
                 write!(formatter, "{location}: state-invalid command: {reason}")
             }
             Self::ResourcePlanOverflow { workload } => {
-                write!(formatter, "workload {workload} resource-plan operation IDs overflow u32")
+                write!(
+                    formatter,
+                    "workload {workload} resource-plan operation IDs overflow u32"
+                )
             }
             Self::JournalMismatch {
                 workload,
@@ -513,6 +706,20 @@ fn decode_from_state(
         });
     }
     let resource_accesses = actual.to_vec().into_boxed_slice();
+    let tmem_transfers = commands
+        .iter()
+        .filter_map(|command| match command.kind {
+            RawDpcCommandKind::LoadBlock(load) | RawDpcCommandKind::LoadTile(load) => {
+                load.transfer_plan().ok()
+            }
+            _ => None,
+        })
+        .map(|plan| {
+            transfer_record(plan, &resource_accesses)
+                .expect("decoder-created TMEM transfer must bind its exact admitted journal")
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let staged_state =
         StagedRdpState::from_transaction(state, queue, submission_ordinal, transaction_sequence);
 
@@ -525,6 +732,7 @@ fn decode_from_state(
         resource_plan: RawDpcResourcePlan {
             tmem_source_identity,
             accesses: resource_accesses,
+            tmem_transfers,
         },
         origin,
     })
@@ -1157,8 +1365,104 @@ mod tests {
                     tmem_source_access(layout, index as u32 + 1, start, end)
                 }),
         );
+        let finalize = |accesses: Vec<ResourceAccess>| {
+            let declared = accesses
+                .iter()
+                .map(|access| access.region().declared_bytes())
+                .sum::<u32>();
+            let journal = ResourceJournal::try_new(
+                ResourceJournalLimits::try_new(MAX_RESOURCE_ACCESSES, declared.max(1)).unwrap(),
+                accesses,
+            )
+            .unwrap();
+            let preflight = WorkloadPacketPreflight::try_new(
+                layout,
+                WorkloadAdmission::RawDpc {
+                    transaction_sequence,
+                },
+                vec![stream.clone()],
+                journal,
+            )
+            .unwrap();
+            let capture = DeferredGuestReadCapture::new(
+                preflight
+                    .guest_read_plan()
+                    .reads()
+                    .iter()
+                    .map(|read| {
+                        CapturedGuestRead::try_new(
+                            *read,
+                            vec![read.operation().get() as u8; read.range().len() as usize],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            );
+            preflight.finalize(capture).unwrap()
+        };
+        let probe = finalize(accesses.clone());
+        let final_accesses = match decode_raw_dpc(submit(probe), &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            Ok(_) => accesses,
+            Err(error) => {
+                panic!("TMEM packet planning probe failed before journal comparison: {error}")
+            }
+        };
+        finalize(final_accesses)
+    }
+
+    fn packet_with_unplanned_tmem_accesses_in_layout(
+        layout_bytes: u32,
+        transaction_sequence: u64,
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+        destination_ranges: &[(u32, u32)],
+    ) -> WorkloadPacket {
+        let layout = PhysicalMemoryLayout::try_new(layout_bytes).unwrap();
+        let bytes = u32::try_from(words.len() * 4).unwrap();
+        let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
+        let stream = RawCommandStream::Dram(
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                command_range,
+                words,
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        );
+        let mut accesses = vec![command_access(layout, bytes, 0)];
+        accesses.extend(
+            source_ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
+                    tmem_source_access(layout, index as u32 + 1, start, end)
+                }),
+        );
+        let destination_operation = u32::try_from(accesses.len()).unwrap();
+        accesses.extend(
+            destination_ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
+                    ResourceAccess::try_new(
+                        OperationId::new(destination_operation + index as u32),
+                        AccessMode::Write,
+                        AccessPurpose::TmemLoadDestination,
+                        ResourceRegion::Tmem(
+                            fn64_render_ir::TmemRange::try_new(start, end).unwrap(),
+                        ),
+                    )
+                    .unwrap()
+                }),
+        );
+        let declared = accesses
+            .iter()
+            .map(|access| access.region().declared_bytes())
+            .sum::<u32>();
         let journal = ResourceJournal::try_new(
-            ResourceJournalLimits::try_new(64, layout_bytes).unwrap(),
+            ResourceJournalLimits::try_new(MAX_RESOURCE_ACCESSES, declared).unwrap(),
             accesses,
         )
         .unwrap();
@@ -1186,6 +1490,44 @@ mod tests {
                 .collect(),
         );
         preflight.finalize(capture).unwrap()
+    }
+
+    fn assert_transfer_geometry_matches_destination_union(decoded: &DecodedRawDpc, load: TmemLoad) {
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
+        let mut projected = transfer
+            .words()
+            .iter()
+            .flat_map(|word| match word.physical() {
+                crate::TmemTransferPhysicalWord::Linear(range) => vec![range],
+                crate::TmemTransferPhysicalWord::SplitBanks { low, high } => vec![low, high],
+            })
+            .collect::<Vec<_>>();
+        projected.sort_unstable_by_key(|range| (range.start(), range.end()));
+        let mut canonical: Vec<fn64_render_ir::TmemRange> = Vec::new();
+        for range in projected {
+            if let Some(last) = canonical.last_mut() {
+                if range.start() <= last.end() {
+                    *last = fn64_render_ir::TmemRange::try_new(
+                        last.start(),
+                        last.end().max(range.end()),
+                    )
+                    .unwrap();
+                    continue;
+                }
+            }
+            canonical.push(range);
+        }
+        assert_eq!(
+            canonical,
+            transfer
+                .destination_accesses()
+                .iter()
+                .map(|access| match access.region() {
+                    ResourceRegion::Tmem(range) => range,
+                    _ => panic!("TMEM destination access has a non-TMEM region"),
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     fn set_texture_image(prefix: u8, format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
@@ -1492,7 +1834,7 @@ mod tests {
                 "SetColorImage",
                 vec![
                     word(0, SET_OTHER_MODE, 3 << 20),
-                    0,
+                    256,
                     word(0, FILL_RECTANGLE, 0),
                     0,
                 ],
@@ -1953,11 +2295,15 @@ mod tests {
             .submit(DecodedTicket::new(packet(7, first_words, &[])))
             .unwrap();
         let second = queue
-            .submit(DecodedTicket::new(packet_with_tmem_sources(
-                8,
-                second_words,
-                &[(0x214, 0x224)],
-            )))
+            .submit(DecodedTicket::new(
+                packet_with_unplanned_tmem_accesses_in_layout(
+                    LAYOUT_BYTES,
+                    8,
+                    second_words,
+                    &[(0x214, 0x224)],
+                    &[(0, 8), (24, 32)],
+                ),
+            ))
             .unwrap();
 
         let staged = decode_raw_dpc(first, &RdpState::default())
@@ -1993,12 +2339,15 @@ mod tests {
             )))
             .unwrap();
         let second = queue
-            .submit(DecodedTicket::new(packet_with_tmem_sources_in_layout(
-                0x5000,
-                8,
-                load_words.clone(),
-                &[(0x214, 0x224)],
-            )))
+            .submit(DecodedTicket::new(
+                packet_with_unplanned_tmem_accesses_in_layout(
+                    0x5000,
+                    8,
+                    load_words.clone(),
+                    &[(0x214, 0x224)],
+                    &[(0, 16)],
+                ),
+            ))
             .unwrap();
         let staged = decode_raw_dpc(first, &RdpState::default())
             .unwrap()
@@ -2023,11 +2372,12 @@ mod tests {
         durable.apply(first.state_delta());
         assert!(matches!(
             decode_raw_dpc(
-                submit(packet_with_tmem_sources_in_layout(
+                submit(packet_with_unplanned_tmem_accesses_in_layout(
                     0x5000,
                     8,
                     load_words,
                     &[(0x214, 0x224)],
+                    &[(0, 16)],
                 )),
                 &durable,
             ),
@@ -2087,10 +2437,12 @@ mod tests {
         ]);
         assert!(matches!(
             decode_raw_dpc(
-                submit(packet_with_tmem_sources(
+                submit(packet_with_unplanned_tmem_accesses_in_layout(
+                    LAYOUT_BYTES,
                     8,
                     missing_second_sync,
                     &[(0x214, 0x224), (0x214, 0x224)],
+                    &[],
                 )),
                 &RdpState::default(),
             ),
@@ -2166,6 +2518,485 @@ mod tests {
     }
 
     #[test]
+    fn transfer_words_preserve_wrap_order_and_undefined_tail_separately_from_union() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        words.extend(set_tile(0, 7, 0, 511));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 4 << 12]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x210, 0x21a)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
+        assert_eq!(load.transfer_plan().unwrap().logical_source_bytes(), 10);
+        assert_eq!(load.transfer_plan().unwrap().written_bytes(), 16);
+        assert_eq!(load.transfer_plan().unwrap().undefined_padding_bytes(), 6);
+        assert_eq!(transfer.words().len(), 2);
+        assert_eq!(transfer.words()[0].destination_word(), 511);
+        assert_eq!(transfer.words()[1].destination_word(), 0);
+        assert_eq!(transfer.words()[0].defined_source_byte_mask(), 0xff);
+        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0x03);
+        assert!(transfer.words().iter().all(|word| word.odd_row_exchange()));
+        assert_eq!(
+            transfer
+                .destination_accesses()
+                .iter()
+                .map(|access| access.region())
+                .collect::<Vec<_>>(),
+            vec![
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4088, 4096).unwrap()),
+            ]
+        );
+        assert_transfer_geometry_matches_destination_union(&decoded, load);
+    }
+
+    #[test]
+    fn load_block_starting_tl_and_dxt_carry_select_each_word_row() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 16, 0x200));
+        words.extend(set_tile(0, 7, 2, 10));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 8 << 12 | 0x0400]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x220, 0x232)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
+        assert_eq!(
+            transfer
+                .words()
+                .iter()
+                .map(|word| (
+                    word.row_advance(),
+                    word.destination_word(),
+                    word.odd_row_exchange()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 10, true), (0, 11, true), (1, 14, false)]
+        );
+        assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0x03);
+        assert_transfer_geometry_matches_destination_union(&decoded, load);
+    }
+
+    #[test]
+    fn canonical_union_cannot_alias_distinct_transfer_order_or_detached_decode() {
+        let decode = |source_t: u32, line: u32, base: u32, dxt: u32| {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+            words.extend(set_tile(0, 7, line, base));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_BLOCK, source_t), 7 << 24 | 4 << 12 | dxt]);
+            let start = 0x200 + source_t * 16;
+            decode_raw_dpc(
+                submit(packet_with_tmem_sources(7, words, &[(start, start + 10)])),
+                &RdpState::default(),
+            )
+            .unwrap()
+        };
+        let forward = decode(0, 0, 0, 0);
+        let reverse = decode(1, 510, 1, 0x0800);
+        let RawDpcCommandKind::LoadBlock(forward_load) = forward.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let RawDpcCommandKind::LoadBlock(reverse_load) = reverse.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let forward_bound = forward
+            .resource_plan()
+            .bind_tmem_transfer(forward_load)
+            .unwrap();
+        let reverse_bound = reverse
+            .resource_plan()
+            .bind_tmem_transfer(reverse_load)
+            .unwrap();
+        assert_eq!(
+            forward_bound.destination_accesses(),
+            reverse_bound.destination_accesses()
+        );
+        assert_eq!(
+            forward_bound
+                .words()
+                .iter()
+                .map(|word| word.destination_word())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            reverse_bound
+                .words()
+                .iter()
+                .map(|word| word.destination_word())
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_ne!(forward_load.transfer_plan(), reverse_load.transfer_plan());
+
+        let mut repeated_words = Vec::new();
+        repeated_words.extend(set_texture_image(0, 0, 2, 16, 0x200));
+        repeated_words.extend(set_tile(0, 7, 511, 0));
+        repeated_words.extend(load_sync(0));
+        repeated_words.extend([word(0, LOAD_BLOCK, 0), 7 << 24 | 8 << 12 | 0x0800]);
+        let repeated = decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                7,
+                repeated_words,
+                &[(0x200, 0x212)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(repeated_load) = repeated.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let repeated_bound = repeated
+            .resource_plan()
+            .bind_tmem_transfer(repeated_load)
+            .unwrap();
+        assert_eq!(
+            repeated_bound
+                .words()
+                .iter()
+                .map(|word| word.destination_word())
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0]
+        );
+        assert_eq!(repeated_load.transfer_plan().unwrap().written_bytes(), 24);
+        assert_eq!(
+            repeated_load
+                .transfer_plan()
+                .unwrap()
+                .destination()
+                .total_bytes(),
+            8
+        );
+        assert_eq!(repeated_bound.destination_accesses().len(), 1);
+        for (decoded, load) in [
+            (&forward, forward_load),
+            (&reverse, reverse_load),
+            (&repeated, repeated_load),
+        ] {
+            assert_transfer_geometry_matches_destination_union(decoded, load);
+        }
+        assert_eq!(
+            reverse
+                .resource_plan()
+                .bind_tmem_transfer(forward_load)
+                .unwrap_err(),
+            TmemLoadSourcePlanError::TransferNotDeclared
+        );
+    }
+
+    #[test]
+    fn rgba32_uses_texture_image_size_and_split_banks_despite_tile_size() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 3, 2, 0x200));
+        words.extend(set_tile(0, 7, 0, 255));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 0), 7 << 24 | 1 << 12]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x200, 0x208)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        assert_eq!(load.source_image().size(), PixelSize::Bits32);
+        assert_eq!(load.tile_descriptor().size(), PixelSize::Bits16);
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
+        assert_eq!(
+            load.transfer_plan().unwrap().layout(),
+            crate::TmemTransferLayout::SplitBanks64
+        );
+        assert_eq!(
+            transfer.words()[0].physical(),
+            crate::TmemTransferPhysicalWord::SplitBanks {
+                low: fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap(),
+                high: fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap(),
+            }
+        );
+
+        let mut odd_wrapped = Vec::new();
+        odd_wrapped.extend(set_texture_image(0, 0, 3, 4, 0x200));
+        odd_wrapped.extend(set_tile(0, 7, 0, 255));
+        odd_wrapped.extend(load_sync(0));
+        odd_wrapped.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 3 << 12]);
+        let odd_wrapped = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, odd_wrapped, &[(0x210, 0x220)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(odd_load) = odd_wrapped.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let odd_transfer = odd_wrapped
+            .resource_plan()
+            .bind_tmem_transfer(odd_load)
+            .unwrap();
+        assert_eq!(
+            odd_transfer
+                .words()
+                .iter()
+                .map(|word| (word.destination_word(), word.physical()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    255,
+                    crate::TmemTransferPhysicalWord::SplitBanks {
+                        low: fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap(),
+                    },
+                ),
+                (
+                    0,
+                    crate::TmemTransferPhysicalWord::SplitBanks {
+                        low: fn64_render_ir::TmemRange::try_new(4, 8).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap(),
+                    },
+                ),
+            ]
+        );
+        assert_eq!(
+            odd_transfer
+                .destination_accesses()
+                .iter()
+                .map(|access| access.region())
+                .collect::<Vec<_>>(),
+            vec![
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4, 8).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap()),
+            ]
+        );
+        assert_transfer_geometry_matches_destination_union(&odd_wrapped, odd_load);
+
+        let mut rejected = Vec::new();
+        rejected.extend(set_texture_image(0, 0, 3, 2, 0x200));
+        rejected.extend(set_tile(0, 7, 0, 256));
+        rejected.extend(load_sync(0));
+        rejected.extend([word(0, LOAD_BLOCK, 0), 7 << 24 | 1 << 12]);
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet_with_unplanned_tmem_accesses_in_layout(
+                    LAYOUT_BYTES,
+                    7,
+                    rejected,
+                    &[(0x200, 0x208)],
+                    &[],
+                )),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("outside low TMEM")
+        ));
+    }
+
+    #[test]
+    fn load_tile_retains_row_local_defined_masks_and_source_row_parity() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 5, 0x200));
+        words.extend(set_tile(0, 7, 3, 0));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_TILE, 4), 7 << 24 | 16 << 12 | 8]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x20a, 0x21e)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTile(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTile");
+        };
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
+        assert_eq!(
+            transfer
+                .words()
+                .iter()
+                .map(|word| {
+                    (
+                        word.logical_source_offset(),
+                        word.defined_source_byte_mask(),
+                        word.destination_word(),
+                        word.odd_row_exchange(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0xff, 0, true),
+                (8, 0x03, 1, true),
+                (10, 0xff, 3, false),
+                (18, 0x03, 4, false)
+            ]
+        );
+        assert_transfer_geometry_matches_destination_union(&decoded, load);
+    }
+
+    #[test]
+    fn four_bit_yuv_and_tlut_destination_claims_stay_loudly_out_of_scope() {
+        let mut four_bit = Vec::new();
+        four_bit.extend(set_texture_image(0, 0, 0, 8, 0x200));
+        four_bit.extend(set_tile(0, 7, 1, 0));
+        four_bit.extend(load_sync(0));
+        four_bit.extend([word(0, LOAD_BLOCK, 0), 7 << 24 | 7 << 12]);
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet_with_unplanned_tmem_accesses_in_layout(
+                    LAYOUT_BYTES,
+                    7,
+                    four_bit,
+                    &[(0x200, 0x204)],
+                    &[],
+                )),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("direct four-bit")
+        ));
+
+        let mut four_bit_tile = Vec::new();
+        four_bit_tile.extend(set_texture_image(0, 0, 0, 8, 0x200));
+        four_bit_tile.extend(set_tile(0, 7, 1, 0));
+        four_bit_tile.extend(load_sync(0));
+        four_bit_tile.extend([word(0, LOAD_TILE, 0), 7 << 24 | 28 << 12]);
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet_with_unplanned_tmem_accesses_in_layout(
+                    LAYOUT_BYTES,
+                    7,
+                    four_bit_tile,
+                    &[(0x200, 0x204)],
+                    &[],
+                )),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("direct four-bit")
+        ));
+
+        let mut unpaired_yuv = Vec::new();
+        unpaired_yuv.extend(set_texture_image(0, 1, 2, 4, 0x200));
+        unpaired_yuv.extend(set_tile(0, 7, 1, 0));
+        unpaired_yuv.extend(load_sync(0));
+        unpaired_yuv.extend([word(0, LOAD_BLOCK, 1 << 12), 7 << 24 | 2 << 12]);
+        let yuv = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, unpaired_yuv, &[(0x202, 0x206)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(yuv_load) = yuv.commands()[3].kind() else {
+            panic!("expected YUV LoadBlock");
+        };
+        assert!(yuv_load.transfer_plan().is_err());
+        assert_eq!(
+            yuv.resource_plan()
+                .bind_tmem_transfer(yuv_load)
+                .unwrap_err(),
+            TmemLoadSourcePlanError::YuvExecutionDeferred
+        );
+        assert!(yuv
+            .resource_plan()
+            .accesses()
+            .iter()
+            .all(|access| access.purpose() != AccessPurpose::TmemLoadDestination));
+
+        let mut yuv_tile = Vec::new();
+        yuv_tile.extend(set_texture_image(0, 1, 2, 4, 0x200));
+        yuv_tile.extend(set_tile(0, 7, 1, 0));
+        yuv_tile.extend(load_sync(0));
+        yuv_tile.extend([word(0, LOAD_TILE, 4 << 12), 7 << 24 | 8 << 12 | 4]);
+        let yuv_tile = decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                7,
+                yuv_tile,
+                &[(0x202, 0x206), (0x20a, 0x20e)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTile(yuv_tile_load) = yuv_tile.commands()[3].kind() else {
+            panic!("expected YUV LoadTile");
+        };
+        let yuv_tile_sources = yuv_tile
+            .resource_plan()
+            .tmem_load_source_accesses(yuv_tile_load.source_plan())
+            .unwrap();
+        assert_eq!(yuv_tile_load.source_plan().access_count(), 2);
+        assert_eq!(yuv_tile_load.source_plan().total_bytes(), 8);
+        assert_eq!(
+            yuv_tile_sources
+                .iter()
+                .map(|access| access.region())
+                .collect::<Vec<_>>(),
+            vec![
+                ResourceRegion::Rdram {
+                    resource: RdramResource::Buffer,
+                    range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
+                        .unwrap()
+                        .range(0x202, 0x206)
+                        .unwrap(),
+                },
+                ResourceRegion::Rdram {
+                    resource: RdramResource::Buffer,
+                    range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
+                        .unwrap()
+                        .range(0x20a, 0x20e)
+                        .unwrap(),
+                },
+            ]
+        );
+        assert!(yuv_tile_load.transfer_plan().is_err());
+        assert_eq!(
+            yuv_tile
+                .resource_plan()
+                .bind_tmem_transfer(yuv_tile_load)
+                .unwrap_err(),
+            TmemLoadSourcePlanError::YuvExecutionDeferred
+        );
+        assert!(yuv_tile
+            .resource_plan()
+            .accesses()
+            .iter()
+            .all(|access| access.purpose() != AccessPurpose::TmemLoadDestination));
+
+        let mut tlut = Vec::new();
+        tlut.extend(set_texture_image(0, 0, 2, 1, 0x300));
+        tlut.extend(set_tile(0, 7, 0, 256));
+        tlut.extend(load_sync(0));
+        tlut.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 15 << 14]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, tlut, &[(0x300, 0x320)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTLUT");
+        };
+        assert!(load.transfer_plan().is_err());
+        assert_eq!(
+            decoded
+                .resource_plan()
+                .bind_tmem_transfer(load)
+                .unwrap_err(),
+            TmemLoadSourcePlanError::TlutExecutionDeferred
+        );
+        assert!(decoded
+            .resource_plan()
+            .accesses()
+            .iter()
+            .all(|access| { access.purpose() != AccessPurpose::TmemLoadDestination }));
+    }
+
+    #[test]
     fn tmem_source_plans_reject_cross_decode_range_and_layout_aliases() {
         let decode_block = |layout_bytes: u32, address: u32, range: (u32, u32)| {
             let mut words = Vec::new();
@@ -2227,7 +3058,7 @@ mod tests {
     #[test]
     fn load_tile_plans_exact_fractional_subrows_and_collapses_full_rows() {
         let mut subrows = Vec::new();
-        subrows.extend(set_texture_image(0, 2, 0, 9, 0x200));
+        subrows.extend(set_texture_image(0, 2, 1, 9, 0x200));
         subrows.extend(set_tile(0, 3, 1, 0));
         subrows.extend(load_sync(0));
         subrows.extend([word(0, LOAD_TILE, 5 << 12 | 8), 3 << 24 | 15 << 12 | 15]);
@@ -2235,7 +3066,7 @@ mod tests {
             submit(packet_with_tmem_sources(
                 7,
                 subrows,
-                &[(0x209, 0x20b), (0x20e, 0x210)],
+                &[(0x213, 0x216), (0x21c, 0x21f)],
             )),
             &RdpState::default(),
         )
@@ -2244,7 +3075,7 @@ mod tests {
             panic!("expected LoadTile");
         };
         assert_eq!(load.source_plan().access_count(), 2);
-        assert_eq!(load.source_plan().total_bytes(), 4);
+        assert_eq!(load.source_plan().total_bytes(), 6);
         let TmemLoadKind::Tile { bounds } = load.kind() else {
             panic!("expected tile bounds");
         };
@@ -2367,7 +3198,13 @@ mod tests {
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12]);
         let error = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x214, 0x222)])),
+            submit(packet_with_unplanned_tmem_accesses_in_layout(
+                LAYOUT_BYTES,
+                7,
+                words,
+                &[(0x214, 0x222)],
+                &[],
+            )),
             &durable,
         )
         .unwrap_err();
