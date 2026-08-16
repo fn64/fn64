@@ -1,10 +1,11 @@
 //! Pure-Rust wgpu renderer ownership for fn64.
 //!
 //! M3.3b adds CPU-only typed color-target planning and rollback-safe generation
-//! ownership to M3.3a's exact native 4x2 RGBA16 fill contract. It has no
-//! production target-completion constructor yet and does not allocate GPU
-//! resources, rasterize, write guest memory, run VI/capture, or establish RT64
-//! parity or performance.
+//! ownership to M3.3a's exact native 4x2 RGBA16 fill contract. M3.3d adds one
+//! CPU-only progressive, replicate-mode VI oracle and padded capture extractor
+//! for that exact fill. There is no production target-completion constructor,
+//! GPU allocation/raster/VI execution, guest write, live VI adapter, RT64
+//! parity, or performance claim.
 //!
 //! Submission and completion are type states. An in-flight operation has no
 //! early receipt conversion:
@@ -95,6 +96,7 @@ mod native_contract;
 mod raw_dpc;
 mod state;
 mod targets;
+mod vi;
 
 pub use device::{
     HeadlessBackend, HeadlessDeviceOutcome, InFlightFill, NoAdapter, PrewarmedRenderer,
