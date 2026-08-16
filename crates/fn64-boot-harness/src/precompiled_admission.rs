@@ -1,4 +1,4 @@
-use fn64_recomp_rs::{AotMiss, BankId, GuestPc, Rdram};
+use fn64_cpu_runtime::{AotMiss, BankId, GuestPc, Rdram};
 use sha2::{Digest, Sha256};
 
 /// Verify a short immutable executable image without hashing on the matching
@@ -67,7 +67,7 @@ pub fn verify_precompiled_words(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fn64_recomp_rs::verify_precompiled_image;
+    use fn64_cpu_runtime::verify_precompiled_image;
 
     #[test]
     fn word_admission_matches_full_image_miss_evidence() {

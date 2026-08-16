@@ -764,9 +764,9 @@ waiting for the commit boundary to notice the byte -- named it in one run:
 
 ```
 FN64DIAG store_backed_word vaddr=0xffffffff8009b0b0 phys=0x9b0b0 value=0x00000000
-  fn64_recomp_rs::runtime::host::Rdram::store_backed_word
-  fn64_recomp_rs::runtime::host::Rdram::try_store_w_translated
-  fn64_recomp_rs::execution::program::BlockProgram::run
+  fn64_cpu_runtime::runtime::host::Rdram::store_backed_word
+  fn64_cpu_runtime::runtime::host::Rdram::try_store_w_translated
+  fn64_cpu_runtime::execution::program::BlockProgram::run
   fn64_abi::recompiled::runners::run_catalog_block_program
 ```
 
@@ -1440,7 +1440,7 @@ Two generations share base `0x800e1b90`, one a strict PREFIX of the other:
 
 The guest loaded the LONGER image; activation hashed the SHORTER extent over
 those bytes and got a different digest, because the tail belongs to the other
-overlay. `verify_precompiled_image` (`fn64-recomp-rs/src/execution/mod.rs:193`)
+overlay. `verify_precompiled_image` (`fn64-cpu-runtime/src/execution/mod.rs:193`)
 is exact and documents "no fallback path", so the firewall is correct here --
 the observed image genuinely is not the compiled one.
 
@@ -1539,7 +1539,7 @@ I first read this as `(base, length)` failing to identify a generation when
 two overlays share a VRAM base, and proposed changing what identifies one.
 Reading the selector shows that diagnosis was wrong.
 
-`activate_for_fetch_with_digest` (`fn64-recomp-rs/src/generation/mod.rs:723`)
+`activate_for_fetch_with_digest` (`fn64-cpu-runtime/src/generation/mod.rs:723`)
 collects EVERY generation containing the PC, digests each against its own
 `expected_sha256`, and admits the one that matches -- reporting
 `AmbiguousLiveImage` only if several match. Overlapping overlays at one base
@@ -1565,7 +1565,7 @@ So what remains established is narrow and worth stating without embellishment:
 
 The next measurement is the one no current diagnostic provides: WHERE the live
 bytes first differ from the compiled image. `AotMiss`
-(`fn64-recomp-rs/src/execution/mod.rs:157`) carries only two digests, so it
+(`fn64-cpu-runtime/src/execution/mod.rs:157`) carries only two digests, so it
 cannot distinguish "the game wrote to a data field inside the image" from
 "this is a different overlay". Recording the first differing offset at the
 activation is the cheap next step, and it decides which fix is correct.
@@ -1964,7 +1964,7 @@ The fix is understood and the pack side works, but three constraints cannot be
 satisfied simultaneously for one overlay:
 
 1. the generation image must be shard-aligned -- shards tile it in whole
-   64 KiB blocks (`fn64-recomp-rs/src/generation/mod.rs:109-125`);
+   64 KiB blocks (`fn64-cpu-runtime/src/generation/mod.rs:109-125`);
 2. the image must sit inside the invalidation extent, i.e.
    `image_end <= bss_end`;
 3. the image must exclude the mutable data the guest writes, i.e. it should end
@@ -2031,7 +2031,7 @@ and the last thing between here and a run that gets past the activation.
 ### The catalog digest mismatch is overlay 1's prepared shard
 
 Located precisely. `canonical_definition_sha256` folds in every shard's start
-and end (`fn64-recomp-rs/src/generation/mod.rs:1104-1109`), so the runtime and
+and end (`fn64-cpu-runtime/src/generation/mod.rs:1104-1109`), so the runtime and
 build-time catalogs diverge whenever their shard geometry differs.
 
 The runtime reads `pack.rs`, and the pack's shard lists are:

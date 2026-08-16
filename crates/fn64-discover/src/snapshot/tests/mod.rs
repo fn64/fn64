@@ -890,14 +890,14 @@
         assert!(runner.contains("Sparse bank-qualified MIPS runner"));
         let code_bank = crate::block_pack::materialized_code_bank(&materialized[0]).unwrap();
         assert_eq!(code_bank.instruction_count(), 2);
-        let mut catalog = fn64_recomp_rs::CodeCatalog::new();
+        let mut catalog = fn64_cpu_runtime::CodeCatalog::new();
         let bank_id = code_bank.id();
         catalog.register(code_bank).unwrap();
         assert_eq!(
             catalog
-                .resolve(fn64_recomp_rs::ExecutionKey::new(
+                .resolve(fn64_cpu_runtime::ExecutionKey::new(
                     bank_id,
-                    fn64_recomp_rs::GuestPc::new(BASE),
+                    fn64_cpu_runtime::GuestPc::new(BASE),
                 ))
                 .unwrap()
                 .word,

@@ -1,5 +1,5 @@
     use super::*;
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         run_bank, BackedExecutableSpanV1, BlockRun, BootCicIdentity, BootCop0Context, BootRegion,
         CodeBank, CodeCatalog, CpuFaultKind, GeneratedBankRunner, GenerationId,
         PhysicalCodeBank, PrecompiledGeneration, PrecompiledGenerationBackingV1, PrecompiledShard,
@@ -432,7 +432,7 @@
 
 
     fn bootstrap_test_rdram_len() -> usize {
-        fn64_recomp_rs::RDRAM_LEN
+        fn64_cpu_runtime::RDRAM_LEN
     }
 
 
@@ -591,8 +591,8 @@
             EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow_mut().clear());
             CPU_INSTRUCTION_STORE_TRACE.with(|trace| *trace.borrow_mut() = None);
             RDP_RENDERER_WRITER_TRACE.with(|trace| *trace.borrow_mut() = None);
-            fn64_recomp_rs::set_write_observer(None);
-            fn64_recomp_rs::set_guest_write_boundary_observer(None);
+            fn64_cpu_runtime::set_write_observer(None);
+            fn64_cpu_runtime::set_guest_write_boundary_observer(None);
         }
     }
 
@@ -687,8 +687,8 @@
                     .map(|range| (range.physical_start, range.physical_end)),
             );
         });
-        fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
-        fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
+        fn64_cpu_runtime::set_write_observer(Some(record_executable_and_renderer_write));
+        fn64_cpu_runtime::set_guest_write_boundary_observer(Some(classify_live_executable_write));
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
         PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
         crate::load_rom(rom);
@@ -1481,7 +1481,7 @@
                 BlockExit::Fault(CpuFault {
                     at: ExecutionKey::new(BRK_BANK, BRK_ENTRY),
                     kind: CpuFaultKind::Exception {
-                        exception: fn64_recomp_rs::CpuException::Breakpoint,
+                        exception: fn64_cpu_runtime::CpuException::Breakpoint,
                         epc: BRK_ENTRY,
                         branch_delay: false,
                         instruction_code: 0,

@@ -30,7 +30,7 @@
 //! [`cfg::WordClass::merge`] or any proof rule.
 
 use crate::cfg::{BlockTerminator, Cfg, WordClass};
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A candidate classification for one previously-undecided word, with the

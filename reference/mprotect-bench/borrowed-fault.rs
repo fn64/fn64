@@ -21,7 +21,7 @@
 //!   1. a whole-region `&mut [u8]`, live across the faults;
 //!   2. stores issued as safe bounds-checked slice indexing (`mem[i] = v`),
 //!      exactly what `Rdram::store_b` compiles to
-//!      (`crates/fn64-recomp-rs/src/runtime/host.rs:938-948`);
+//!      (`crates/fn64-cpu-runtime/src/runtime/host.rs:938-948`);
 //!   3. reads back through the SAME borrow after the fault, which is where a
 //!      compiler that had cached the region's contents around the "impossible"
 //!      write would show it;

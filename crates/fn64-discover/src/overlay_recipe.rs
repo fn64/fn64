@@ -56,7 +56,7 @@ pub const DENSE_SHARD_BYTES: u32 = 64 * 1024;
 /// Rounding up to whole shards was the earlier rule, on the belief that a
 /// generation's image had to end on a shard boundary for the shard list to
 /// tile. It does not. `PrecompiledGeneration::new`
-/// (`fn64-recomp-rs/src/generation/mod.rs:109-126`) requires only that shards
+/// (`fn64-cpu-runtime/src/generation/mod.rs:109-126`) requires only that shards
 /// tile contiguously from `image_start` and COVER `image_end`; the final shard
 /// may legitimately overhang, because "the digest covers
 /// `[image_start, image_end)` only, which is precisely why a generation may end

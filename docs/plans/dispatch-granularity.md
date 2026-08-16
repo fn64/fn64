@@ -88,25 +88,25 @@ A guest store to RDRAM ends the block it is in, unconditionally, whenever the
 store lands anywhere inside the watched executable region.
 
 1. Every 4-byte CPU store to backed RDRAM calls `notify_cpu_instruction_store`
-   — `crates/fn64-recomp-rs/src/runtime/host.rs:730` (`store_backed_word`;
+   — `crates/fn64-cpu-runtime/src/runtime/host.rs:730` (`store_backed_word`;
    the 1-byte and 8-byte forms are at `:947` and `:1051`).
 2. That calls `request_guest_write_boundary`
-   (`crates/fn64-recomp-rs/src/runtime/host.rs:531`).
+   (`crates/fn64-cpu-runtime/src/runtime/host.rs:531`).
 3. Which consults the installed boundary observer. In the live ABI that is
    `classify_live_executable_write`
    (`crates/fn64-abi/src/recompiled/snapshots.rs:983`), which returns
    `GuestWriteBoundary::ExecutableChanged` iff the store's byte range
    intersects any entry of `EXECUTABLE_WRITE_RANGES`.
 4. On `ExecutableChanged`, `EXECUTABLE_WRITE_BOUNDARY` is set
-   (`crates/fn64-recomp-rs/src/runtime/host.rs:541`).
+   (`crates/fn64-cpu-runtime/src/runtime/host.rs:541`).
 5. The runner consumes it at the next architectural instruction boundary and
    converts the exit into `BlockExit::ExecutableWrite` — interpreter at
-   `crates/fn64-recomp-rs/src/semantic/mod.rs:619-627`, and generically via
+   `crates/fn64-cpu-runtime/src/semantic/mod.rs:619-627`, and generically via
    `finalize_executable_write_exit`
-   (`crates/fn64-recomp-rs/src/execution/mod.rs:804`).
+   (`crates/fn64-cpu-runtime/src/execution/mod.rs:804`).
 6. The chaining loop in `dispatch_with_exception_vectoring` explicitly refuses
    to chain past it and returns the slice
-   (`crates/fn64-recomp-rs/src/execution/program.rs:1511-1524`).
+   (`crates/fn64-cpu-runtime/src/execution/program.rs:1511-1524`).
 7. The outer runner then publishes a checkpoint and suspends the coroutine
    (`crates/fn64-abi/src/recompiled/runners.rs:1103-1114`).
 
@@ -134,7 +134,7 @@ slice ends this way.
 
 It never consults the budget. The slice ends at the first guest store into the
 watched megabyte, which for this workload is every ~3 instructions. The budget
-is checked at `crates/fn64-recomp-rs/src/execution/program.rs:1432-1439` and
+is checked at `crates/fn64-cpu-runtime/src/execution/program.rs:1432-1439` and
 that branch is never taken — consistent with the already-recorded negative
 result that 4096 vs 65536 produced byte-identical `sim_time` and wall time.
 
@@ -425,7 +425,7 @@ What this settles:
 
 That experiment is cheap. Because the census and the predicate both live in
 `fn64-abi`, the edit-measure loop is a single-crate rebuild: **19.7 seconds**,
-measured, versus the ~11 minutes a `fn64-recomp-rs` change costs by rebuilding
+measured, versus the ~11 minutes a `fn64-cpu-runtime` change costs by rebuilding
 all 32 shard crates. Option A above is a few lines and needs no new data
 source; Option B needs a conservative code map and is the one that must be
 proven.
@@ -463,15 +463,15 @@ Census implementation: `dispatch_census` in
 `crates/fn64-abi/src/recompiled/runners.rs`, recorded at the static runner's
 dispatch site. It is deliberately confined to `fn64-abi`. `DispatchRun`
 already carries `{ exit, instructions, blocks }`
-(`crates/fn64-recomp-rs/src/execution/mod.rs:1035-1039`), so the per-block mean
+(`crates/fn64-cpu-runtime/src/execution/mod.rs:1035-1039`), so the per-block mean
 is derivable from the slice census alone and no instrumentation inside
-`fn64-recomp-rs` is required.
+`fn64-cpu-runtime` is required.
 
-Two reasons that matters. `fn64-recomp-rs` is a dependency of all 32 generated
+Two reasons that matters. `fn64-cpu-runtime` is a dependency of all 32 generated
 shard crates, so editing it rebuilds all of them. More importantly,
 `src/lib.rs` and `src/execution/program.rs` are both members of
 `DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1`
-(`crates/fn64-recomp-rs/src/lib.rs:91-154`), which is hashed into the dynamic
+(`crates/fn64-cpu-runtime/src/lib.rs:91-154`), which is hashed into the dynamic
 mapped execution source identity — instrumenting them would have changed a
 certified identity value. An earlier draft of this census did exactly that and
 was reverted.
@@ -485,10 +485,10 @@ behind the non-default `dynamic-withheld` feature
 
 Worth recording for whoever touches that lane: its unit is far smaller still.
 `DynamicMappedUnitCatalogV1::activate_and_run_with_memory_port`
-(`crates/fn64-recomp-rs/src/fetch.rs:495-545`) snapshots **one instruction, or
+(`crates/fn64-cpu-runtime/src/fetch.rs:495-545`) snapshots **one instruction, or
 one branch/delay pair**, hashes it into a unit identity, admits a synthetic
 bank through a `BTreeMap`, and runs it — asserted at
-`crates/fn64-recomp-rs/src/semantic/mod.rs:481-484`. A straight instruction
+`crates/fn64-cpu-runtime/src/semantic/mod.rs:481-484`. A straight instruction
 then falls out of its own one-word unit and returns `ResolveTransfer`
 (`semantic/mod.rs:639-645`), so that lane re-snapshots and re-hashes per guest
 instruction. If it ever becomes the default, this analysis needs redoing
@@ -553,7 +553,7 @@ no live translation depends on still forced a scheduler round trip.
 
 It now also asks whether any **currently resident** generation is backed by
 those bytes, mirroring the scan `invalidate_physical_write` already performs
-(`fn64-recomp-rs` `generation/mod.rs:1292`): for each active segment, test the
+(`fn64-cpu-runtime` `generation/mod.rs:1292`): for each active segment, test the
 owning generation's physical backing spans. `active` holds segments rather than
 generations, so this is a handful of interval tests per store.
 

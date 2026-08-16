@@ -6,7 +6,7 @@
 //! interval to executable or claim that discovery recovered its boundaries.
 
 use fn64_discover::normalize;
-use fn64_recomp_rs::BankId;
+use fn64_cpu_runtime::BankId;
 use fn64_recomp_rs_codegen::{
     classify_bank_words, emit_bank_runner, BankInput, BankWordCatalog, BankWordKind,
 };
@@ -108,7 +108,7 @@ fn run() -> Result<(), String> {
     let runner_sha256 = format!("{:x}", Sha256::digest(runner.as_bytes()));
     let (source_path, metadata_path) = temporary_paths(&rom.sha256, rom_start, byte_len);
     let source = format!(
-        "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext}};\n\n{runner}"
+        "#![allow(clippy::all, unused)]\nuse fn64_cpu_runtime::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext}};\n\n{runner}"
     );
     std::fs::write(&source_path, source.as_bytes())
         .map_err(|error| format!("writing {}: {error}", source_path.display()))?;
@@ -121,7 +121,7 @@ fn run() -> Result<(), String> {
         .arg("--crate-type=lib")
         .arg(&source_path)
         .arg("--extern")
-        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg(format!("fn64_cpu_runtime={}", rlib.display()))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--emit=metadata")
@@ -216,7 +216,7 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
+                    name.starts_with("libfn64_cpu_runtime-") && name.ends_with(".rlib")
                 })
         })
         .max_by_key(|path| {
@@ -224,5 +224,5 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
                 .and_then(|metadata| metadata.modified())
                 .ok()
         })
-        .ok_or_else(|| "fn64_recomp_rs rlib is missing beside gate executable".into())
+        .ok_or_else(|| "fn64_cpu_runtime rlib is missing beside gate executable".into())
 }

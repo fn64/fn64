@@ -9,7 +9,7 @@
 //! The returned opaque value is not executable-image, placement, PI-event, or
 //! release authority, and its serializable certificate cannot recreate it.
 
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     decode, dynamic_mapped_execution_build_receipt_v1, BankId, BlockExit,
     DynamicMappedUnitCatalogV1, ExecutionKey, GuestPc, Instruction, InstructionBudget, MemoryPort,
     MmioOutcome, MmioPort, Rdram, RecompContext, RecompContextEvidenceSnapshotV1, RDRAM_LEN,
@@ -698,7 +698,7 @@ fn verify_instruction_identities(
     request: &MmioPollingStutterRequestV1<'_>,
     entry_pc: u32,
     expected_count: usize,
-    identities: &[fn64_recomp_rs::InstructionWordIdentity],
+    identities: &[fn64_cpu_runtime::InstructionWordIdentity],
 ) -> Result<(), MmioPollingStutterErrorV1> {
     if identities.len() != expected_count {
         return Err(MmioPollingStutterErrorV1::InstructionCountMismatch {

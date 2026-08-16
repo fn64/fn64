@@ -14,8 +14,8 @@ crate-type = ["lib", "staticlib"]
 
 [features]
 default = []
-recomp-rs = ["dep:fn64-recomp-rs"]
-dynamic-mapped-runtime = ["recomp-rs", "fn64-recomp-rs/dynamic-mapped-runtime"]
+recomp-rs = ["dep:fn64-cpu-runtime"]
+dynamic-mapped-runtime = ["recomp-rs", "fn64-cpu-runtime/dynamic-mapped-runtime"]
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
@@ -37,7 +37,7 @@ fn64-audio = { path = "../fn64-audio" }
 # fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
-fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true, default-features = false, features = ["aot-runtime"] }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime", optional = true, default-features = false, features = ["aot-runtime"] }
 # `asm` selects sha2's aarch64/x86 hardware backend. The canonical mutation
 # journal SHA-256s the whole watched region -- the 1 MiB boot bank on WM2000 --
 # at every dispatch boundary, and profiling the shell found ~42% of samples in
@@ -55,4 +55,4 @@ sha2 = { version = "0.10", features = ["asm"] }
 # dependency, keeping fn64-abi's real dependency graph backend-agnostic per
 # docs/DECOUPLING.md.
 fn64-render-reference = { path = "../fn64-render-reference" }
-fn64-recomp-rs = { path = "../fn64-recomp-rs", features = ["dev-interpreter"] }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime", features = ["dev-interpreter"] }

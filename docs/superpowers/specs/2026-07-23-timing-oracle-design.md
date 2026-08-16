@@ -30,7 +30,7 @@ Hence 0a is first.
   It's a PC tracer, not a timing tracer.
 - **Jer's native arm64 mupen dynarec** (PR #1184, `~/Code/mupen64plus-core`) —
   removes the Rosetta blocker the docs cited; a fast native reference core exists.
-- **fn64-recomp-rs oracle test scaffolding** — the differential-comparison
+- **fn64-cpu-runtime oracle test scaffolding** — the differential-comparison
   pattern (`cop0.rs`, `interp_differential.rs`, `fpu_oracle.rs`) to mirror.
 - **`crates/fn64-discover/src/trace/mod.rs`** — the existing trace schema to extend.
 

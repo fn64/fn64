@@ -12,7 +12,7 @@
 //! Discovery must not have a weaker decoder than recompilation: treating a
 //! reserved word as ordinary fallthrough would let data become `ProvenCode`
 //! and could unsafely satisfy exact-owner admission. [`classify_control`]
-//! therefore consumes [`fn64_recomp_rs::decode`]. Unknown instructions and
+//! therefore consumes [`fn64_cpu_runtime::decode`]. Unknown instructions and
 //! malformed delay slots terminate the CFG as typed blockers.
 //!
 //! # Determinism and monotonicity
@@ -23,7 +23,7 @@
 //! even if an earlier speculative decode called it `CandidateCode` or
 //! `Unknown` (see [`WordClass::merge`]).
 
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

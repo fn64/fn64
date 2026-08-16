@@ -49,7 +49,7 @@
 //! than pretend to know it.
 
 use crate::cfg::{build_cfg_fenced, BasicBlock, BlockTerminator, Cfg, WordClass};
-use fn64_recomp_rs::decoder::{decode, Instruction};
+use fn64_cpu_runtime::decoder::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

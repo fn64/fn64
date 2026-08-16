@@ -1085,12 +1085,12 @@ pub(super) fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvid
 #[cfg(feature = "recomp-rs")]
 pub(super) fn encode_program_identity(
     out: &mut Vec<u8>,
-    identity: fn64_recomp_rs::ProgramIdentityEvidenceSnapshot,
+    identity: fn64_cpu_runtime::ProgramIdentityEvidenceSnapshot,
 ) {
     out.extend_from_slice(&identity.identity.bytes());
     out.push(match identity.source {
-        fn64_recomp_rs::ProgramIdentitySource::CallerSupplied => 0,
-        fn64_recomp_rs::ProgramIdentitySource::CanonicalBlockProgramSha256 => 1,
+        fn64_cpu_runtime::ProgramIdentitySource::CallerSupplied => 0,
+        fn64_cpu_runtime::ProgramIdentitySource::CanonicalBlockProgramSha256 => 1,
     });
 }
 

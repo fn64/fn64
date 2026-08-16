@@ -42,7 +42,7 @@ pub fn set_entry_lookup_with_execution_observation(
 ) {
     set_entry_lookup_config(lookup, rdram_len, Some(identity));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(Some(schema)));
-    fn64_recomp_rs::set_function_entry_observer(Some(observe_function_entry));
+    fn64_cpu_runtime::set_function_entry_observer(Some(observe_function_entry));
 }
 
 fn set_entry_lookup_config(
@@ -59,10 +59,10 @@ fn set_entry_lookup_config(
     FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
     FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(identity));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
-    fn64_recomp_rs::set_function_entry_observer(None);
-    fn64_recomp_rs::set_write_observer(Some(observe_renderer_write));
-    fn64_recomp_rs::set_guest_write_boundary_observer(None);
-    fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
+    fn64_cpu_runtime::set_function_entry_observer(None);
+    fn64_cpu_runtime::set_write_observer(Some(observe_renderer_write));
+    fn64_cpu_runtime::set_guest_write_boundary_observer(None);
+    fn64_cpu_runtime::set_unsupported_observer(Some(record_recompiled_unsupported));
     with_host(|host| {
         host.recompiled_lookup = Some(lookup);
         host.recompiled_program = None;
@@ -83,9 +83,9 @@ pub(super) fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
     BLOCK_HOST_BOUNDARY_HISTORY_ENABLED.with(|enabled| enabled.set(true));
     FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(None));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
-    fn64_recomp_rs::set_function_entry_observer(None);
-    fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
-    fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
+    fn64_cpu_runtime::set_function_entry_observer(None);
+    fn64_cpu_runtime::set_unsupported_observer(Some(record_recompiled_unsupported));
+    fn64_cpu_runtime::set_guest_write_boundary_observer(Some(classify_live_executable_write));
     with_host(|host| {
         host.recompiled_lookup = None;
         host.recompiled_program = Some(program);
@@ -143,9 +143,9 @@ fn set_catalog_program_parts(
     BLOCK_HOST_BOUNDARY_HISTORY_ENABLED.with(|enabled| enabled.set(true));
     FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(None));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
-    fn64_recomp_rs::set_function_entry_observer(None);
-    fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
-    fn64_recomp_rs::set_host_lookup(None);
+    fn64_cpu_runtime::set_function_entry_observer(None);
+    fn64_cpu_runtime::set_unsupported_observer(Some(record_recompiled_unsupported));
+    fn64_cpu_runtime::set_host_lookup(None);
     let mutation_state = (!ranges.is_empty()).then(|| {
         let had_bootstrap = bootstrap.is_some();
         let state = bootstrap.map_or_else(
@@ -192,11 +192,11 @@ fn set_catalog_program_parts(
                 .borrow_mut()
                 .extend_from_slice(&state.borrow().watched_ranges());
         });
-        fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
-        fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
+        fn64_cpu_runtime::set_guest_write_boundary_observer(Some(classify_live_executable_write));
+        fn64_cpu_runtime::set_write_observer(Some(record_executable_and_renderer_write));
     } else {
-        fn64_recomp_rs::set_guest_write_boundary_observer(None);
-        fn64_recomp_rs::set_write_observer(Some(observe_renderer_write));
+        fn64_cpu_runtime::set_guest_write_boundary_observer(None);
+        fn64_cpu_runtime::set_write_observer(Some(observe_renderer_write));
     }
     let live = CanonicalLiveBlockProgramV1 {
         install: Rc::new(install),
@@ -508,13 +508,13 @@ fn process_live_executable_writes_from_host_inner() {
         catalog.invalidate_pending_physical_writes_from_view(&view, |physical| unsafe {
             storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
         });
-        fn64_recomp_rs::discard_executable_write_boundary();
+        fn64_cpu_runtime::discard_executable_write_boundary();
         return;
     }
     let Some(live) = live else {
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
         PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
-        fn64_recomp_rs::discard_executable_write_boundary();
+        fn64_cpu_runtime::discard_executable_write_boundary();
         return;
     };
     let (rdram, rdram_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
@@ -530,7 +530,7 @@ fn process_live_executable_writes_from_host_inner() {
     process_executable_writes(&live, |offset| unsafe {
         storage.read_u8(fn64_runtime::RdramAddr::from_offset(offset))
     });
-    fn64_recomp_rs::discard_executable_write_boundary();
+    fn64_cpu_runtime::discard_executable_write_boundary();
 }
 
 /// Commit the active catalog host transaction's current mutation prefix before
@@ -701,7 +701,7 @@ impl CatalogNestedWriterTransactionV1 {
                     live.invalidate_pending_physical_writes_with(&mut read_physical_byte);
                 }
             }
-            fn64_recomp_rs::discard_executable_write_boundary();
+            fn64_cpu_runtime::discard_executable_write_boundary();
             if let Some(transaction_id) = self.transaction_id {
                 live.mutation_state
                     .as_ref()
@@ -821,7 +821,7 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
         committed: false,
     };
     unsafe { storage.write_u32(origin.global, origin.handle) };
-    fn64_recomp_rs::notify_host_abi_write(physical_start, 4);
+    fn64_cpu_runtime::notify_host_abi_write(physical_start, 4);
     // Hand the view down. `commit_with` is `commit_with_optional_view(.., None)`,
     // and that `None` skipped the word-wise fast path at
     // `live_program.rs:2760` -- which requires `Some(view)` -- dropping the
@@ -1222,8 +1222,8 @@ unsafe fn boot_thread0_config(
         }
     }
     unsafe { crate::register_process_rdram(rdram, rdram_len) };
-    fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
-    fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+    fn64_cpu_runtime::set_host_pause(Some(pause_active_recompiled_thread));
+    fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
@@ -1629,8 +1629,8 @@ unsafe fn boot_thread0_catalog_live_v1(
     priority: Priority,
 ) {
     unsafe { crate::register_process_rdram(rdram, rdram_len) };
-    fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
-    fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+    fn64_cpu_runtime::set_host_pause(Some(pause_active_recompiled_thread));
+    fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
     let rdram_addr = rdram as usize;
     let boot_return_pc = boot_context.gprs[31] as u32;
@@ -1737,9 +1737,9 @@ unsafe fn boot_thread0_block_program_config(
     };
     set_block_program(live.clone(), rdram_len);
     unsafe { crate::register_process_rdram(rdram, rdram_len) };
-    fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
-    fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
-    fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
+    fn64_cpu_runtime::set_host_pause(Some(pause_active_recompiled_thread));
+    fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+    fn64_cpu_runtime::set_write_observer(Some(record_executable_and_renderer_write));
 
     let rdram_addr = rdram as usize;
     let boot_return_pc = boot_context.gprs[31] as u32;

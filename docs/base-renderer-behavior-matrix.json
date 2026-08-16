@@ -403,7 +403,7 @@
         { "kind": "test", "path": "crates/fn64-render-reference/src/backend/tests/group3.rs", "needle": "fn copy_ia8_preserves_packed_bytes_and_compares_expanded_alpha_nibble" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/backend/tests/group3.rs", "needle": "fn copy_ia8_preserves_odd_tmem_row_layout_without_alpha_compare" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/backend/tests/group2.rs", "needle": "fn known_same_value_non_rdp_write_replicates_the_visible_lsb" },
-        { "kind": "test", "path": "crates/fn64-recomp-rs/src/runtime/tests.rs", "needle": "fn rdram_write_observer_runs_after_committed_logical_ranges" },
+        { "kind": "test", "path": "crates/fn64-cpu-runtime/src/runtime/tests.rs", "needle": "fn rdram_write_observer_runs_after_committed_logical_ranges" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch/tests/dispatch_a.rs", "needle": "fn generated_c_kseg1_same_value_halfword_keeps_visible_bytes_and_renderer_sidecar_coherent" },
         { "kind": "test", "path": "crates/fn64-abi/tests/c_smoke.rs", "needle": "fn c_caller_links_and_runs_against_fn64_abi_staticlib" },
         { "kind": "doc", "path": "docs/RDP-SILICON-VECTORS.md", "needle": "Local framebuffer transition evidence" }

@@ -21,7 +21,7 @@ use crate::snapshot::{
     SnapshotError, ValidatedComposedSnapshotsV2,
 };
 use crate::NormalizedRom;
-use fn64_recomp_rs::BackedPrecompiledGenerationCatalogV1;
+use fn64_cpu_runtime::BackedPrecompiledGenerationCatalogV1;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -385,7 +385,7 @@ mod tests {
         build_generation_topology_v1, CatalogBoundExactTransferErrorV1,
     };
     use crate::overlay_recipe::{OverlayLoadRecipeV1, OVERLAY_RECIPE_SCHEMA_V1};
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         BackedExecutableSpanV1, BackedPrecompiledGenerationCatalogV1, BankId, GenerationId,
         GuestPc, PrecompiledGeneration, PrecompiledGenerationBackingV1,
         PrecompiledGenerationCatalog, PrecompiledShard,

@@ -71,7 +71,7 @@
 //! with its numbers (the aligned-pointer-run precedent), not tuned quietly.
 
 use crate::cfg::{classify_control, ControlOp};
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

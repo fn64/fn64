@@ -138,7 +138,7 @@ pub fn build_generated_runner_v1(
         shard_cargo_source_sha256(&package_root, prepared_source_mode)?;
     let expected_emitter_source_sha256 = emitter_source_sha256(&workspace)?;
     let expected_runtime_source_sha256 =
-        hex(&fn64_recomp_rs::generated_runner_runtime_source_receipt_v1().source_sha256());
+        hex(&fn64_cpu_runtime::generated_runner_runtime_source_receipt_v1().source_sha256());
     let prepared_claims = prepared_source_claims_v3(&workspace)?;
     let memory_guard = workspace.join("scripts/memory-guard.zsh");
     let memory_guard_sha256 = validate_memory_guard(&memory_guard)?;
@@ -484,7 +484,7 @@ pub(super) fn validate_identity(
     if identity.schema != GENERATED_RUNNER_BUILD_IDENTITY_SCHEMA_V3
         || identity.package != PACKAGE
         || identity.source_attestation_schema
-            != fn64_recomp_rs::GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2
+            != fn64_cpu_runtime::GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2
     {
         return Err(error(
             "generated-runner child reported an unsupported identity envelope",
@@ -684,7 +684,7 @@ pub(super) fn recompute_binding_sha256(
     identity: &GeneratedRunnerBuildIdentityV1,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let mut digest = Sha256::new();
-    digest.update(fn64_recomp_rs::GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2);
+    digest.update(fn64_cpu_runtime::GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2);
     for value in [
         &identity.program_identity_sha256,
         &identity.root_adapter_source_sha256,
@@ -1102,7 +1102,7 @@ pub(super) fn prepared_source_claims_v3(
         )?,
         emitter_source_sha256: emitter_source_sha256(workspace)?,
         runtime_source_sha256: hex(
-            &fn64_recomp_rs::generated_runner_runtime_source_receipt_v1().source_sha256(),
+            &fn64_cpu_runtime::generated_runner_runtime_source_receipt_v1().source_sha256(),
         ),
         materializer_source_sha256: sha256_file(
             &shard_root.join("materializer.rs"),

@@ -27,7 +27,7 @@
 //! live at that PC, or anything about the target bytes. The admitted base is a
 //! typed conclusion about the *program's* `$gp`, not about any one site.
 
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

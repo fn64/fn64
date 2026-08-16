@@ -56,9 +56,9 @@ pub(super) fn run_block_program(
             BlockExit::Fault(CpuFault {
                 at,
                 kind:
-                    fn64_recomp_rs::CpuFaultKind::UnknownBank
-                    | fn64_recomp_rs::CpuFaultKind::UnmappedPc { .. }
-                    | fn64_recomp_rs::CpuFaultKind::UnmappedPhysicalInstruction { .. },
+                    fn64_cpu_runtime::CpuFaultKind::UnknownBank
+                    | fn64_cpu_runtime::CpuFaultKind::UnmappedPc { .. }
+                    | fn64_cpu_runtime::CpuFaultKind::UnmappedPhysicalInstruction { .. },
             }) => live
                 .precompiled_generations
                 .borrow_mut()
@@ -166,7 +166,7 @@ pub(super) fn run_block_program(
                 match resolver.resolve_call(source_bank, target_pc, resume) {
                     Ok(CallResolution::Guest(next)) => entry = next,
                     Ok(CallResolution::Host) => {
-                        let host = fn64_recomp_rs::resolve_host_function(target_pc.get())
+                        let host = fn64_cpu_runtime::resolve_host_function(target_pc.get())
                             .unwrap_or_else(|| {
                                 recompiled_gap_panic(format!(
                                     "live BlockProgram requested unknown host call {:#010x}",
@@ -200,7 +200,7 @@ pub(super) fn run_block_program(
                 });
             }
             BlockExit::HostCall { vram, resume } => {
-                let host = fn64_recomp_rs::resolve_host_function(vram.get()).unwrap_or_else(|| {
+                let host = fn64_cpu_runtime::resolve_host_function(vram.get()).unwrap_or_else(|| {
                     recompiled_gap_panic(format!(
                         "live BlockProgram requested unknown host call {:#010x}",
                         vram.get()
@@ -493,7 +493,7 @@ pub(super) fn dispatch_unified_catalog_slice(
     budget: InstructionBudget,
     ctx: &mut RsContext,
     mem: &mut Rdram<'_>,
-) -> Result<fn64_recomp_rs::DispatchRun, String> {
+) -> Result<fn64_cpu_runtime::DispatchRun, String> {
     let mut instructions = 0u32;
     let mut blocks = 0u32;
     let census = dispatch_census::enabled();
@@ -521,7 +521,7 @@ pub(super) fn dispatch_unified_catalog_slice(
             .checked_sub(instructions)
             .ok_or_else(|| "unified catalog consumed more than its slice budget".to_string())?;
         if remaining < InstructionBudget::MIN {
-            finish_slice!(fn64_recomp_rs::DispatchRun {
+            finish_slice!(fn64_cpu_runtime::DispatchRun {
                 exit: BlockExit::Checkpoint(target.key()),
                 instructions,
                 blocks,
@@ -543,7 +543,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                     dispatched.instructions,
                     dispatched.blocks,
                 )?;
-                fn64_recomp_rs::BlockRun::new(dispatched.exit, dispatched.instructions)
+                fn64_cpu_runtime::BlockRun::new(dispatched.exit, dispatched.instructions)
             }
             UnifiedCatalogTargetV1::Dynamic {
                 source_bank,
@@ -581,14 +581,14 @@ pub(super) fn dispatch_unified_catalog_slice(
                                 .can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
                         {
                             if instructions > 0 {
-                                finish_slice!(fn64_recomp_rs::DispatchRun {
+                                finish_slice!(fn64_cpu_runtime::DispatchRun {
                                     exit: BlockExit::Checkpoint(attempted),
                                     instructions,
                                     blocks,
                                 });
                             }
                             return Err(
-                                fn64_recomp_rs::DispatchError::IndivisibleUnitExceedsBudget {
+                                fn64_cpu_runtime::DispatchError::IndivisibleUnitExceedsBudget {
                                     at: dynamic.entry,
                                     budget: turn_budget,
                                     required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
@@ -610,7 +610,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                         )?;
                         dynamic.run
                     }
-                    Err(fn64_recomp_rs::DynamicMappedErrorV1::Fetch {
+                    Err(fn64_cpu_runtime::DynamicMappedErrorV1::Fetch {
                         fault,
                         attempted_instructions,
                     }) => {
@@ -625,7 +625,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                             attempted_instructions,
                             0,
                         )?;
-                        finish_slice!(fn64_recomp_rs::DispatchRun {
+                        finish_slice!(fn64_cpu_runtime::DispatchRun {
                             exit: BlockExit::Fault(fault),
                             instructions,
                             blocks,
@@ -677,7 +677,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 resume,
             } => match resolve_unified_catalog_call(live, source_bank, target_pc, mem)? {
                 UnifiedCatalogCallV1::Host => {
-                    finish_slice!(fn64_recomp_rs::DispatchRun {
+                    finish_slice!(fn64_cpu_runtime::DispatchRun {
                         exit: BlockExit::HostCall {
                             vram: target_pc,
                             resume,
@@ -695,7 +695,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 // run, then the writer resumes and resolves the new image.
                 // Resolving here would collapse both sides of that scheduler
                 // boundary into one unified slice.
-                finish_slice!(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_cpu_runtime::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -715,7 +715,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 };
             }
             exit => {
-                finish_slice!(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_cpu_runtime::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -760,8 +760,8 @@ pub(super) mod dispatch_census {
         *ENABLED.get_or_init(|| std::env::var_os("FN64_DISPATCH_CENSUS").is_some())
     }
 
-    pub(super) fn exit_name(exit: &fn64_recomp_rs::BlockExit) -> &'static str {
-        use fn64_recomp_rs::BlockExit as E;
+    pub(super) fn exit_name(exit: &fn64_cpu_runtime::BlockExit) -> &'static str {
+        use fn64_cpu_runtime::BlockExit as E;
         match exit {
             E::Transfer(_) => "Transfer",
             E::ResolveTransfer { .. } => "ResolveTransfer",
@@ -780,8 +780,8 @@ pub(super) mod dispatch_census {
 
     /// The guest PC a slice's terminating exit names, so a hot exit can be
     /// attributed to the code that produced it.
-    fn exit_pc(exit: &fn64_recomp_rs::BlockExit) -> u32 {
-        use fn64_recomp_rs::BlockExit as E;
+    fn exit_pc(exit: &fn64_cpu_runtime::BlockExit) -> u32 {
+        use fn64_cpu_runtime::BlockExit as E;
         match exit {
             E::Transfer(key) | E::Checkpoint(key) | E::Yield(key) => key.pc.get(),
             E::ResolveTransfer { target_pc, .. }
@@ -796,7 +796,7 @@ pub(super) mod dispatch_census {
     }
 
     /// Record one completed slice (one scheduler round trip).
-    pub(super) fn record_slice(run: &fn64_recomp_rs::DispatchRun) {
+    pub(super) fn record_slice(run: &fn64_cpu_runtime::DispatchRun) {
         CENSUS.with(|census| {
             let mut census = census.borrow_mut();
             census.slices += 1;
@@ -1566,7 +1566,7 @@ pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static st
         "C shim {name} is not in the FR-stable adapter registry"
     );
     if shim_trace_enabled() {
-        eprintln!("[fn64-recomp-rs-shim] {name}");
+        eprintln!("[fn64-cpu-runtime-shim] {name}");
     }
     let mut c = c_from_recompiled(ctx);
     // `f_odd` aliases this stack-local context, so arm it only after the C
@@ -1672,7 +1672,7 @@ pub fn os_set_fpc_csr(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
     ctx.write_fcr(31, ctx.r_u32(4));
     ctx.set_r32(2, previous as i32);
     if ctx.fcsr_exception_pending() {
-        fn64_recomp_rs::trap_unsupported(
+        fn64_cpu_runtime::trap_unsupported(
             "__osSetFpcCsr wrote an enabled FCSR cause through a host-call boundary",
         );
     }

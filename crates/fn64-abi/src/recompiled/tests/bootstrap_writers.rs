@@ -1009,7 +1009,7 @@ use super::*;
         );
         record_executable_and_renderer_write(GuestWriteEvent::Range {
             channel: WriterChannel::CpuInstructionStore,
-            physical_offset: fn64_recomp_rs::RDRAM_LEN as u32,
+            physical_offset: fn64_cpu_runtime::RDRAM_LEN as u32,
             len: 4,
         });
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());

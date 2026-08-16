@@ -239,8 +239,8 @@ window.
 
 ## Working in this tree
 
-**8. Editing `fn64-recomp-rs` costs 32 crate rebuilds** — ~9-11 minutes, versus
-~25 s for `fn64-abi`. Every file in `crates/fn64-recomp-rs/src` is a certified
+**8. Editing `fn64-cpu-runtime` costs 32 crate rebuilds** — ~9-11 minutes, versus
+~25 s for `fn64-abi`. Every file in `crates/fn64-cpu-runtime/src` is a certified
 source, so an edit changes an identity digest. Prefer `fn64-abi`; when you must
 cross, say so in the commit.
 

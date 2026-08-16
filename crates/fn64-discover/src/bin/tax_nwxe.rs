@@ -284,8 +284,8 @@ fn main() {
                 || (0x10..=0x13).contains(&opcode)
                 || opcode == 0x08
                 || matches!(
-                    fn64_recomp_rs::decode(first),
-                    fn64_recomp_rs::Instruction::Unknown { .. }
+                    fn64_cpu_runtime::decode(first),
+                    fn64_cpu_runtime::Instruction::Unknown { .. }
                 )
             {
                 continue;

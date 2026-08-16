@@ -2,7 +2,7 @@
 //! propose region boundaries and content kinds; they never prove code or data
 //! by themselves.
 
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

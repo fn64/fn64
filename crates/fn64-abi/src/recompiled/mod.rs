@@ -1,7 +1,7 @@
 //! Typed-Rust recompiler adapters over the existing fn64 host ABI.
 //!
 //! The generated module stays `#![forbid(unsafe_code)]`: it calls ordinary
-//! safe [`fn64_recomp_rs::RecompFunc`]s. Raw-pointer reconstruction is
+//! safe [`fn64_cpu_runtime::RecompFunc`]s. Raw-pointer reconstruction is
 //! confined here, beside the C ABI seam that already owns the identical
 //! process-lifetime RDRAM and coroutine contracts.
 
@@ -13,7 +13,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     enter_pending_interrupt, AotMiss, BackedGenerationCatalogEvidenceV1,
     BackedPrecompiledGenerationCatalogV1, BankId, BlockExit, BlockProgram,
     BlockProgramEvidenceSnapshot, BootContext, BootTvStandard, CallResolution,
@@ -261,7 +261,7 @@ pub struct BlockHostBoundaryObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalThreadCheckpointEvidenceV1 {
     pub thread: ThreadId,
-    pub cpu: fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
+    pub cpu: fn64_cpu_runtime::RecompContextEvidenceSnapshotV1,
     pub charged_instructions: u32,
     pub canonical_charged_instructions_at_publication: u64,
     pub pending_exit: BlockExit,
@@ -298,13 +298,13 @@ pub enum CanonicalThreadPublicationV1 {
     /// non-comparable with [`Self::Exact`].
     ParkedFaultOpaque {
         thread: ThreadId,
-        post_exception_cpu: fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
+        post_exception_cpu: fn64_cpu_runtime::RecompContextEvidenceSnapshotV1,
         fault: CpuFault,
         canonical_charged_instructions_at_publication: u64,
     },
     Returned {
         thread: ThreadId,
-        cpu: fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
+        cpu: fn64_cpu_runtime::RecompContextEvidenceSnapshotV1,
     },
 }
 
@@ -323,9 +323,9 @@ pub struct DynamicMappedEntryCountV1 {
 #[cfg(feature = "dynamic-mapped-runtime")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DynamicMappedExecutionAggregateV1 {
-    pub identity: fn64_recomp_rs::DynamicMappedUnitIdentityV1,
+    pub identity: fn64_cpu_runtime::DynamicMappedUnitIdentityV1,
     pub admitted_entry: ExecutionKey,
-    pub instructions: Vec<fn64_recomp_rs::InstructionWordIdentity>,
+    pub instructions: Vec<fn64_cpu_runtime::InstructionWordIdentity>,
     pub attempted_entries: Vec<DynamicMappedEntryCountV1>,
     pub activations: u64,
     /// Instruction-budget units charged by this dynamic unit. Architectural
@@ -386,14 +386,14 @@ pub(super) struct LiveBlockProgram {
 pub(super) struct CanonicalLiveBlockProgramV1 {
     install: Rc<CatalogResolverInstallV1>,
     #[cfg(feature = "dynamic-mapped-runtime")]
-    dynamic_units: Rc<RefCell<Option<fn64_recomp_rs::DynamicMappedUnitCatalogV1>>>,
+    dynamic_units: Rc<RefCell<Option<fn64_cpu_runtime::DynamicMappedUnitCatalogV1>>>,
     #[cfg(feature = "dynamic-mapped-runtime")]
     dynamic_withheld_static_key: Rc<Cell<Option<ExecutionKey>>>,
     #[cfg(feature = "dynamic-mapped-runtime")]
     dynamic_execution_aggregates: Rc<
         RefCell<
             BTreeMap<
-                fn64_recomp_rs::DynamicMappedUnitIdentityV1,
+                fn64_cpu_runtime::DynamicMappedUnitIdentityV1,
                 DynamicMappedExecutionAggregateV1,
             >,
         >,
@@ -1751,7 +1751,7 @@ impl CatalogResolverInstallV1 {
         self.program.budget()
     }
 
-    pub fn run(&self, ctx: &mut RsContext, mem: &mut Rdram<'_>) -> fn64_recomp_rs::BlockRun {
+    pub fn run(&self, ctx: &mut RsContext, mem: &mut Rdram<'_>) -> fn64_cpu_runtime::BlockRun {
         self.program.run(ctx, mem)
     }
 
@@ -1762,7 +1762,7 @@ impl CatalogResolverInstallV1 {
         entry: ExecutionKey,
         ctx: &mut RsContext,
         mem: &mut Rdram<'_>,
-    ) -> Result<fn64_recomp_rs::DispatchRun, fn64_recomp_rs::DispatchError> {
+    ) -> Result<fn64_cpu_runtime::DispatchRun, fn64_cpu_runtime::DispatchError> {
         self.dispatch_exposing_exceptions_at_budget(entry, self.budget(), ctx, mem)
     }
 
@@ -1772,7 +1772,7 @@ impl CatalogResolverInstallV1 {
         budget: InstructionBudget,
         ctx: &mut RsContext,
         mem: &mut Rdram<'_>,
-    ) -> Result<fn64_recomp_rs::DispatchRun, fn64_recomp_rs::DispatchError> {
+    ) -> Result<fn64_cpu_runtime::DispatchRun, fn64_cpu_runtime::DispatchError> {
         self.program.dispatch_exposing_exceptions_at_budget(
             entry,
             &self.host_functions,
@@ -1830,7 +1830,7 @@ impl CatalogResolverInstallV1 {
         budget: InstructionBudget,
         ctx: &mut RsContext,
         mem: &mut Rdram<'_>,
-    ) -> Result<fn64_recomp_rs::DispatchRun, fn64_recomp_rs::DispatchError> {
+    ) -> Result<fn64_cpu_runtime::DispatchRun, fn64_cpu_runtime::DispatchError> {
         self.program
             .dispatch_exposing_exceptions_with_generations_at_budget(
                 entry,

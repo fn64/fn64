@@ -296,7 +296,7 @@ fn run() -> Result<(), String> {
                     // GNU `as` refuses `jalr` with identical source and
                     // destination registers; a word carrying that encoding
                     // inside a proven block is table data, retained raw.
-                    if let fn64_recomp_rs::Instruction::Jalr { rd, rs } = instruction {
+                    if let fn64_cpu_runtime::Instruction::Jalr { rd, rs } = instruction {
                         if rd == rs {
                             return AsmWord::raw(word);
                         }
@@ -306,12 +306,12 @@ fn run() -> Result<(), String> {
                     // retained numerically wherever they appear.
                     if matches!(
                         instruction,
-                        fn64_recomp_rs::Instruction::MovzS { .. }
-                            | fn64_recomp_rs::Instruction::MovnS { .. }
-                            | fn64_recomp_rs::Instruction::MovzD { .. }
-                            | fn64_recomp_rs::Instruction::MovnD { .. }
-                            | fn64_recomp_rs::Instruction::MovcfS { .. }
-                            | fn64_recomp_rs::Instruction::MovcfD { .. }
+                        fn64_cpu_runtime::Instruction::MovzS { .. }
+                            | fn64_cpu_runtime::Instruction::MovnS { .. }
+                            | fn64_cpu_runtime::Instruction::MovzD { .. }
+                            | fn64_cpu_runtime::Instruction::MovnD { .. }
+                            | fn64_cpu_runtime::Instruction::MovcfS { .. }
+                            | fn64_cpu_runtime::Instruction::MovcfD { .. }
                     ) {
                         return AsmWord::raw(word);
                     }
@@ -320,10 +320,10 @@ fn run() -> Result<(), String> {
                     // refuses the mnemonic outright.
                     if matches!(
                         instruction,
-                        fn64_recomp_rs::Instruction::Bltzal { rs: 31, .. }
-                            | fn64_recomp_rs::Instruction::Bgezal { rs: 31, .. }
-                            | fn64_recomp_rs::Instruction::Bltzall { rs: 31, .. }
-                            | fn64_recomp_rs::Instruction::Bgezall { rs: 31, .. }
+                        fn64_cpu_runtime::Instruction::Bltzal { rs: 31, .. }
+                            | fn64_cpu_runtime::Instruction::Bgezal { rs: 31, .. }
+                            | fn64_cpu_runtime::Instruction::Bltzall { rs: 31, .. }
+                            | fn64_cpu_runtime::Instruction::Bgezall { rs: 31, .. }
                     ) {
                         return AsmWord::raw(word);
                     }

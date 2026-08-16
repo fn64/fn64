@@ -905,7 +905,7 @@ impl<'a> BootstrapImportTransactionV1<'a> {
         // The 0x2900_0000-byte sparse mirror exists only for generated C,
         // whose pointer macros cannot be intercepted; carrying it into this
         // owned all-Rust lane would waste roughly 648 MiB per process.
-        let minimum = fn64_recomp_rs::RDRAM_LEN;
+        let minimum = fn64_cpu_runtime::RDRAM_LEN;
         if rdram_len < minimum {
             return Err(BootstrapImportErrorV1::RdramLength {
                 actual: rdram_len,
@@ -984,7 +984,7 @@ impl<'a> BootstrapImportTransactionV1<'a> {
                     start: physical_start,
                     end: u32::MAX,
                 })?;
-        if physical_end > fn64_recomp_rs::RDRAM_LEN as u32 {
+        if physical_end > fn64_cpu_runtime::RDRAM_LEN as u32 {
             return Err(BootstrapImportErrorV1::RdramRange {
                 start: physical_start,
                 end: physical_end,
@@ -1049,7 +1049,7 @@ impl<'a> BootstrapImportTransactionV1<'a> {
                 view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
             })
             .map_err(|error| match error {
-                fn64_recomp_rs::InitialGenerationImageErrorV1::UnrecognizedNonzeroByte {
+                fn64_cpu_runtime::InitialGenerationImageErrorV1::UnrecognizedNonzeroByte {
                     physical_address,
                     actual,
                 } => BootstrapImportErrorV1::UnrecognizedInitialGenerationImage {
@@ -1108,7 +1108,7 @@ impl<'a> BootstrapImportTransactionV1<'a> {
 
 fn direct_rdram_physical_address(address: u32) -> Option<u32> {
     let physical = address & 0x1fff_ffff;
-    ((0x8000_0000..0xc000_0000).contains(&address) && physical < fn64_recomp_rs::RDRAM_LEN as u32)
+    ((0x8000_0000..0xc000_0000).contains(&address) && physical < fn64_cpu_runtime::RDRAM_LEN as u32)
         .then_some(physical)
 }
 

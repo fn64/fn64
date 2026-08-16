@@ -48,7 +48,7 @@ voice-map-intervention-free gate, and the DPC STATUS counter-clear slice.
 - Full workspace: 2474/2474 tests pass across 98 suites, zero failures.
 - DPC determinism under `AGENTS.md`: cancellation tests 20/20 consecutive fresh
   runs; selective-clear and shim/raw-MMIO convergence 10/10.
-- Strict clippy clean on the composed gate — `fn64-recomp-rs` all-targets plus
+- Strict clippy clean on the composed gate — `fn64-cpu-runtime` all-targets plus
   `fn64-abi`, `fn64-runtime`, `fn64-boot-harness`, `fn64-render-rt64`, both
   featureless and with `--features recomp-rs`, `-D warnings`.
 - Base-renderer matrix, RT64 macOS/platform certification, and RT64 feature

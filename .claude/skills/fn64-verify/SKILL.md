@@ -6,7 +6,7 @@ description: Canonical full-workspace verification in a clean-target pinned work
 # fn64-verify
 
 The shared checkout's `target/` accumulates rlibs from feature-varying
-builds (parallel agents, feature experiments). The fn64-recomp-rs
+builds (parallel agents, feature experiments). The fn64-cpu-runtime
 differential tests (`interp_differential`, `mapped_fetch`) compile emitted
 code against an rlib found in `target/debug/deps` — in a polluted target
 dir they FAIL FALSELY and look exactly like a real regression. A two-hour

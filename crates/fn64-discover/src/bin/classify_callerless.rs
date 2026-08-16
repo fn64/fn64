@@ -61,7 +61,7 @@
 //! unmodified). Emits one JSON report to stdout: one [`ClassifiedFunctionV1`]
 //! per input entry, sorted into a ranked worklist.
 
-use fn64_recomp_rs::decoder::{decode, Instruction};
+use fn64_cpu_runtime::decoder::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsString;

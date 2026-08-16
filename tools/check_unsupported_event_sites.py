@@ -17,7 +17,7 @@ SOURCE_ROOTS = [
     ROOT / "crates/fn64-runtime/src",
     ROOT / "crates/fn64-abi/src",
     ROOT / "crates/fn64-audio/src",
-    ROOT / "crates/fn64-recomp-rs/src",
+    ROOT / "crates/fn64-cpu-runtime/src",
     ROOT / "crates/fn64-render/src",
     ROOT / "crates/fn64-render-reference/src",
     ROOT / "crates/fn64-render-rt64/src",

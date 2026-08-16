@@ -11,7 +11,7 @@
 //! ordered lexicographically by `(bank, vram)` and may not overlap within a
 //! bank.
 
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     static_micro_op_format_source_receipt_v1, static_micro_op_format_source_receipt_v2,
     AdmittedStaticMicroOpProgramV1, AdmittedStaticMicroOpProgramV2, BankId,
     StaticMicroOpPackErrorV1, StaticMicroOpRecordV1, STATIC_MICRO_OP_HEADER_V1_BYTES,
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 const HEADER_LEN: usize = STATIC_MICRO_OP_HEADER_V1_BYTES;
 const SPAN_HEADER_LEN: usize = STATIC_MICRO_OP_SPAN_HEADER_V1_BYTES;
 
-pub use fn64_recomp_rs::STATIC_MICRO_OP_PACK_SCHEMA_V1;
+pub use fn64_cpu_runtime::STATIC_MICRO_OP_PACK_SCHEMA_V1;
 pub const STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V1: &str = "fn64.static-micro-op-packer-source.v1";
 pub const STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V2: &str = "fn64.static-micro-op-packer-source.v2";
 pub const STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V3: &str = "fn64.static-micro-op-packer-source.v3";
@@ -186,7 +186,7 @@ pub struct StaticMicroOpPackV2 {
 
 impl StaticMicroOpPackV2 {
     pub const fn schema(&self) -> &'static str {
-        fn64_recomp_rs::STATIC_MICRO_OP_PACK_SCHEMA_V2
+        fn64_cpu_runtime::STATIC_MICRO_OP_PACK_SCHEMA_V2
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -585,7 +585,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             packed.schema(),
-            fn64_recomp_rs::STATIC_MICRO_OP_PACK_SCHEMA_V2
+            fn64_cpu_runtime::STATIC_MICRO_OP_PACK_SCHEMA_V2
         );
         assert_eq!(packed.instruction_count(), 1);
         assert_eq!(

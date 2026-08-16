@@ -7,9 +7,9 @@ pub(crate) fn notify_committed_dma_write(channel: fn64_runtime::DmaWriterChannel
     #[cfg(feature = "recomp-rs")]
     {
         let notify = match channel {
-            fn64_runtime::DmaWriterChannel::Pi => fn64_recomp_rs::notify_pi_dma_write,
-            fn64_runtime::DmaWriterChannel::Si => fn64_recomp_rs::notify_si_dma_write,
-            fn64_runtime::DmaWriterChannel::Sp => fn64_recomp_rs::notify_sp_dma_write,
+            fn64_runtime::DmaWriterChannel::Pi => fn64_cpu_runtime::notify_pi_dma_write,
+            fn64_runtime::DmaWriterChannel::Si => fn64_cpu_runtime::notify_si_dma_write,
+            fn64_runtime::DmaWriterChannel::Sp => fn64_cpu_runtime::notify_sp_dma_write,
         };
         notify(
             u32::try_from(offset).expect("DMA write offset exceeds u32"),
@@ -57,7 +57,7 @@ fn normalize_rom_to_big_endian(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Publish the normalized image to `fn64-recomp-rs` so generated shard crates
+/// Publish the normalized image to `fn64-cpu-runtime` so generated shard crates
 /// can recover their instruction words instead of embedding them.
 ///
 /// A no-op without the `recomp-rs` feature, and a no-op for the many tests
@@ -65,7 +65,7 @@ fn normalize_rom_to_big_endian(bytes: &[u8]) -> Option<Vec<u8>> {
 fn publish_normalized_rom_image_for_shards(bytes: &[u8]) {
     #[cfg(feature = "recomp-rs")]
     if let Some(normalized) = normalize_rom_to_big_endian(bytes) {
-        fn64_recomp_rs::publish_normalized_rom_image(normalized);
+        fn64_cpu_runtime::publish_normalized_rom_image(normalized);
     }
     #[cfg(not(feature = "recomp-rs"))]
     let _ = bytes;

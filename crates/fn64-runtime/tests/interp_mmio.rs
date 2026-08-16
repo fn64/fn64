@@ -1,8 +1,8 @@
 //! The device-fabric half of the interpreter→device seam, proven against the
 //! crate's REAL modeled device state (`fn64_runtime::DeviceFabric`).
 //!
-//! `fn64-recomp-rs`'s `MmioPort` trait (see its `interp` module) is the door the
-//! interpreter reaches a modeled hardware register through; `fn64-recomp-rs`
+//! `fn64-cpu-runtime`'s `MmioPort` trait (see its `interp` module) is the door the
+//! interpreter reaches a modeled hardware register through; `fn64-cpu-runtime`
 //! itself cannot depend on this crate (the dependency edge runs the other way —
 //! `docs/DESIGN.md` §1), so the *implementation* of that door over the real
 //! `DeviceFabric` lives here. This test proves the whole slice end to end:
@@ -23,12 +23,12 @@
 //! guest device time only when the test explicitly calls `advance_to` between
 //! turns, exactly the deterministic (deadline, sequence) model U2 describes.
 
-use fn64_recomp_rs::execution::{
+use fn64_cpu_runtime::execution::{
     BankId, BlockExit, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget,
 };
-use fn64_recomp_rs::interp::{run_bank_with_mmio, MmioOutcome, MmioPort};
-use fn64_recomp_rs::runtime::{Rdram, RecompContext, RDRAM_LEN};
-use fn64_recomp_rs::CodeCatalog;
+use fn64_cpu_runtime::interp::{run_bank_with_mmio, MmioOutcome, MmioPort};
+use fn64_cpu_runtime::runtime::{Rdram, RecompContext, RDRAM_LEN};
+use fn64_cpu_runtime::CodeCatalog;
 
 use fn64_runtime::device::{Cycles, DeviceFabric, PiDmaRequest, PiTimingModel};
 use fn64_runtime::rdram::Rdram as DeviceRdram;

@@ -91,7 +91,7 @@ fn main() {
 /// OoT's host-first rs-lane lookup table, shared verbatim with the headless
 /// harness (game-profile data beside the OoT harness, not duplicated here —
 /// see that file's module doc).
-#[cfg(fn64_recomp_rs)]
+#[cfg(fn64_cpu_runtime)]
 #[path = "../../../examples/oot-boot/src/host_lookup.rs"]
 mod host_lookup;
 
@@ -108,7 +108,7 @@ mod game {
     use crate::timing::{DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow};
     use std::sync::Arc;
 
-    #[cfg(fn64_recomp_rs)]
+    #[cfg(fn64_cpu_runtime)]
     use oot_recompiled as recompiled;
 
     use pixels::{Pixels, SurfaceTexture};
@@ -264,7 +264,7 @@ mod game {
             // (e.g. a read-only filesystem) rather than aborting boot.
             fn64_abi::set_save(save_storage_for_rom(&rom_path));
 
-            #[cfg(not(fn64_recomp_rs))]
+            #[cfg(not(fn64_cpu_runtime))]
             {
                 let registration = fn64_boot_harness::register_linked_sections();
                 println!(
@@ -300,7 +300,7 @@ mod game {
                     &resident_sections,
                 );
             }
-            #[cfg(fn64_recomp_rs)]
+            #[cfg(fn64_cpu_runtime)]
             {
                 let section_indices: Vec<_> = recompiled::RECOMPILED_SECTION_GEOMETRY
                     .iter()
@@ -393,9 +393,9 @@ mod game {
             configure_audio_tasks();
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
-            #[cfg(fn64_recomp_rs)]
+            #[cfg(fn64_cpu_runtime)]
             {
-                fn64_recomp_rs::set_host_lookup(Some(
+                fn64_cpu_runtime::set_host_lookup(Some(
                     crate::host_lookup::recompiled_or_host_lookup,
                 ));
                 println!(
@@ -416,7 +416,7 @@ mod game {
                     );
                 }
             }
-            #[cfg(not(fn64_recomp_rs))]
+            #[cfg(not(fn64_cpu_runtime))]
             unsafe {
                 fn64_abi::boot_thread0(
                     rdram_ptr,

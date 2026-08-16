@@ -6,7 +6,7 @@
 //! backing interval. It does not mint a ROM mapping or mutate the fact log.
 
 use crate::resolve::{ConstantTlbTransferAnalysisV1, TlbTransferBlockerV1, TlbWriteProofV1};
-use fn64_recomp_rs::runtime::{InstructionTranslationDiagnosticErrorV1, RecompContext};
+use fn64_cpu_runtime::runtime::{InstructionTranslationDiagnosticErrorV1, RecompContext};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 

@@ -15,17 +15,17 @@
 //!
 //! ## What this crate is now
 //!
-//! `fn64-recomp-rs` (the from-scratch, all-Rust VR4300 recompiler,
+//! `fn64-cpu-runtime` (the from-scratch, all-Rust VR4300 recompiler,
 //! `docs/DECOUPLING.md` step 5) implements the [`Recompiler`] trait for CPU
 //! code and is the whole-ROM recompile path in tree; see
-//! `docs/RECOMP-RS-COVERAGE.md`. This crate now provides only the shared
+//! `docs/CPU-RUNTIME-COVERAGE.md`. This crate now provides only the shared
 //! seam types (the [`Recompiler`] trait, [`RecompConfig`]/[`RspConfig`],
 //! [`AbiVersion`], [`RecompOutput`]) and the [`load`] reader those consumers
 //! share.
 //!
 //! The former `n64recomp` adapter — which serialized a `RecompConfig` to
 //! N64Recomp/RSPRecomp TOML and shelled out to the pinned fork's binaries —
-//! has been retired: it had no in-tree consumer once `fn64-recomp-rs` became
+//! has been retired: it had no in-tree consumer once `fn64-cpu-runtime` became
 //! the recompiler. The pre-generated-C CI oracle lane (compiled by
 //! `fn64-boot-harness`/`fn64-shell` build scripts) is unaffected.
 #![forbid(unsafe_code)]

@@ -31,7 +31,7 @@ Success = `gate_rom_recompile` on Clay Fighter completes, prints
   compile-strategy change and must not weaken any proof.
 - **No shared-library invariant changes.** Do not modify
   `generation_topology.rs`, `dense_aot_pack.rs`, `block_pack.rs`, or
-  anything under `crates/fn64-recomp-rs*`. Another agent (Codex) is active
+  anything under `crates/fn64-cpu-runtime*`. Another agent (Codex) is active
   in this tree; this work is confined to
   `crates/fn64-discover/src/bin/gate_rom_recompile.rs` plus its docs.
 - **Byte identity is the oracle.** The emitted code must remain the
@@ -59,7 +59,7 @@ Requirements:
   compile time is superlinear in single-unit size; 111 MB in one unit did
   not finish in 32 minutes).
 - Emit each unit as its own file in the temp directory, compiled with the
-  same `rustc --edition=2021 -O --extern fn64_recomp_rs=… -L deps` flags
+  same `rustc --edition=2021 -O --extern fn64_cpu_runtime=… -L deps` flags
   already used. Prefer compiling units as separate `--crate-type=rlib`
   artifacts linked by a small driver binary, OR use `mod` includes if that
   proves simpler — the deciding requirement is that no single `rustc`

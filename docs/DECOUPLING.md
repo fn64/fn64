@@ -58,7 +58,7 @@ only crate that knows N64Recomp exists.** It gets its own test suite: golden
 tests that a known `RecompConfig` → expected TOML, and a round-trip that a
 tiny fixture ROM recompiles + links against fn64-abi.
 
-### Our implementation later: `fn64-recomp-rs`
+### Our implementation later: `fn64-cpu-runtime`
 
 A Rust MIPS→Rust (or →C) emitter implementing the same trait. Built
 incrementally against the SAME golden/round-trip tests the adapter passes, so
@@ -224,7 +224,7 @@ before following it.
    split (DESIGN.md §1.1).
 2. ~~**Wrap the recompiler fork** as `fn64-recomp-n64recomp`~~ **NOT DONE, and
    not the plan any more.** No such crate exists or should be created. The
-   project went further than wrapping: `fn64-recomp`/`fn64-recomp-rs` are our
+   project went further than wrapping: `fn64-recomp`/`fn64-cpu-runtime` are our
    own Rust-emitting recompiler, and the fork is consumed as the `c` lane
    instead of being adapter-wrapped. `aki_profile` is legacy (ROADMAP Phase H).
 3. ~~**Rename `fn64-rt64` → `fn64-render-rt64`**~~ **DONE**, behind the
@@ -261,14 +261,14 @@ fn64-render-rt64 (RT64 adapter), fn64-shell.
    the RSPRecomp'd-ucode path behind it. Symmetric with fn64-render. Land the audio work AS this
    crate, not scattered into fn64-abi/runtime. (Refactor wave, on a green tree.)
 2. **fn64-recomp** — the Recompiler adapter trait (see top of this doc). Overdue: N64Recomp
-   shell-out still lives in aki-recomp/aki_profile. Home for fn64-recomp-rs later.
+   shell-out still lives in aki-recomp/aki_profile. Home for fn64-cpu-runtime later.
 3. **fn64-shell promotion** — NOT a new crate: move the common boot-host logic (load ROM → register
    sections → install rdram → run entrypoint → drive backends) out of examples/{wm2000,oot}-boot
    into fn64-shell so the examples become thin mains and the shell is a real product binary.
 4. **fn64-trace** — extract the differential-trace types (thread switch / queue op / DMA / task
    submit) from fn64-runtime WHEN the A/B comparator exists (a cross-tool shared type). Not before.
 5. **fn64-cpu / semantics spec** — the recomp_context + MEM/sign-extension/COP1 contract that
-   translated instructions target. Extract WHEN fn64-recomp-rs starts (it must emit against a
+   translated instructions target. Extract WHEN fn64-cpu-runtime starts (it must emit against a
    spec, not fn64-abi's incidental layout). Not before.
 
 **Deliberately NOT fn64 crates:** the game-profile toolchain (AKI-specific, stays in aki-recomp

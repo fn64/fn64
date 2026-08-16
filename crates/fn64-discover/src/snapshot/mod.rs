@@ -1174,7 +1174,7 @@ fn authority_delay_slots(
                             .try_into()
                             .ok()?,
                     );
-                    fn64_recomp_rs::decode(word)
+                    fn64_cpu_runtime::decode(word)
                         .has_delay_slot()
                         .then_some((block.end_va, control_pc))?
                 }

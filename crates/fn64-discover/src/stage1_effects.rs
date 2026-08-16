@@ -7,7 +7,7 @@
 //! physical target determines the region.
 
 use crate::cfg::{Cfg, WordClass};
-use fn64_recomp_rs::decoder::{decode, Instruction};
+use fn64_cpu_runtime::decoder::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

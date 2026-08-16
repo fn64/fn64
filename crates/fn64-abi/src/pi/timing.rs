@@ -460,7 +460,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                                 }
                             }
                             #[cfg(feature = "recomp-rs")]
-                            fn64_recomp_rs::notify_pi_dma_write(mirror.offset(), completion.len);
+                            fn64_cpu_runtime::notify_pi_dma_write(mirror.offset(), completion.len);
                         }
                         overlays.push((
                             rom_offset,

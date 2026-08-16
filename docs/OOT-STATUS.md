@@ -88,7 +88,7 @@ diverged around gfx task 232/framebuffer 234, but does not prove the missing
 bodies were irrelevant earlier. See `PARITY-METHOD.md`.
 
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
-- **CPU** `fn64-recomp-rs`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
+- **CPU** `fn64-cpu-runtime`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
   ELF/symbol front-end. Oracle-validated (differential vs N64Recomp C).
 - **CPU whole-ROM link gate:** OoT emits as one typed-Rust module with 13,190
   recompiled functions, a sorted safe `vram -> fn` table, and 43 trap bodies held
@@ -482,7 +482,7 @@ road, but the top half misprojects).
 ---
 
 ## ✅ Whole-ROM Rust recompile + rs boot (task #28)
-fn64-recomp-rs (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
+fn64-cpu-runtime (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
 the WHOLE OoT ROM. Driver `recompile_rom` + config loader (`fn64-recomp/src/load.rs`,
 loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
 `feat/native-whole-rom-driver`. Gap report over the full ROM:

@@ -48,7 +48,7 @@ shows whether the remaining `Vec`/`BTreeMap` rebuild cost is material.
 
 **FILES:** `crates/fn64-discover/src/{resolve.rs,boot_tlb_alias.rs}`;
 `crates/fn64-discover/src/bin/fn64_discover.rs`; the related module export in
-`crates/fn64-discover/src/lib.rs`; `crates/fn64-recomp-rs/src/{runtime.rs,lib.rs}`;
+`crates/fn64-discover/src/lib.rs`; `crates/fn64-cpu-runtime/src/{runtime.rs,lib.rs}`;
 `docs/DESIGN.md`; `tools/mupen-trace/README.md`.
 
 **STATE:** Done as a diagnostic-only mechanism. The analyzer carries COP0 TLB
@@ -63,13 +63,13 @@ traps for invalid PageMask encodings and undefined multiple matches.
   --test-threads=1`: 10 consecutive clean runs.
 - `cargo test -q -p fn64-discover --lib tlb -- --test-threads=1`: 10
   consecutive clean runs.
-- `cargo test -q -p fn64-recomp-rs --lib
+- `cargo test -q -p fn64-cpu-runtime --lib
   instruction_translation_diagnostic -- --test-threads=1`: 10 consecutive
   clean runs.
 - `cargo check -p fn64-discover --bin fn64-discover`: one clean run.
 - `cargo test -p fn64-discover --lib -- --test-threads=2`: one clean run;
   778 passed and two ignored.
-- `cargo test -p fn64-recomp-rs -- --test-threads=2`: one clean run; 372
+- `cargo test -p fn64-cpu-runtime -- --test-threads=2`: one clean run; 372
   passed and one ignored across unit, integration, and doc-test targets.
 - `cargo fmt --all -- --check`: clean.
 - `git diff --check`: clean.

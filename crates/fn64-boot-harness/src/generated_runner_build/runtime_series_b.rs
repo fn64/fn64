@@ -313,7 +313,7 @@ pub(super) fn validate_host_abi_runtime_prerequisite(
     let mut previous_end = None;
     for range in &prerequisite.watched_ranges {
         if range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
             || previous_end.is_some_and(|end| range.physical_start <= end)
         {
             return Err(error(
@@ -679,7 +679,7 @@ pub(super) fn validate_pi_runtime_prerequisite(
     let mut previous_end = None;
     for range in &prerequisite.watched_ranges {
         if range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
             || previous_end.is_some_and(|end| range.physical_start <= end)
         {
             return Err(error(
@@ -1073,7 +1073,7 @@ pub(super) fn validate_rdp_renderer_runtime_prerequisite(
     let mut previous_end = None;
     for range in &prerequisite.watched_ranges {
         if range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
             || previous_end.is_some_and(|end| range.physical_start <= end)
         {
             return Err(error(

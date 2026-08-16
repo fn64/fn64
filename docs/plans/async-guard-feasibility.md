@@ -86,7 +86,7 @@ the same bytes.
 
 ### Category A — the gate, synchronous by necessity
 
-`activate_for_fetch_with_digest` (`crates/fn64-recomp-rs/src/generation/mod.rs:771`)
+`activate_for_fetch_with_digest` (`crates/fn64-cpu-runtime/src/generation/mod.rs:771`)
 computes a digest from **live memory** via `live_sha256_with`
 (`generation/mod.rs:1453-1474`) and compares it to the generation's *own*
 `expected_sha256` — a constant baked into the generation record at compile

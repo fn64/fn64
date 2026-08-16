@@ -8,7 +8,7 @@ use crate::dense_aot_pack::{
 };
 use crate::overlay_recipe::{OverlayLoadRecipeV1, OVERLAY_RECIPE_SCHEMA_V1};
 use crate::NormalizedRom;
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     decode, BackedGenerationCatalogEvidenceV1, BackedPrecompiledGenerationCatalogV1, Instruction,
     BACKED_GENERATION_CATALOG_EVIDENCE_SCHEMA_V1,
 };

@@ -1501,10 +1501,10 @@ fn emit_block_program_command(mut args: impl Iterator<Item = OsString>) -> Resul
                     format!("--instruction-budget exceeds u32 or is malformed: {value:?}")
                 })?;
                 instruction_budget = Some(
-                    fn64_recomp_rs::InstructionBudget::new(value).ok_or_else(|| {
+                    fn64_cpu_runtime::InstructionBudget::new(value).ok_or_else(|| {
                         format!(
                             "--instruction-budget must be at least {}, got {value}",
-                            fn64_recomp_rs::InstructionBudget::MIN
+                            fn64_cpu_runtime::InstructionBudget::MIN
                         )
                     })?,
                 );
@@ -1548,9 +1548,9 @@ fn emit_block_program_command(mut args: impl Iterator<Item = OsString>) -> Resul
         &pack,
         &rom,
         BlockProgramSourceConfig {
-            entry: fn64_recomp_rs::ExecutionKey::new(
-                fn64_recomp_rs::BankId::new(entry_bank),
-                fn64_recomp_rs::GuestPc::new(entry_pc),
+            entry: fn64_cpu_runtime::ExecutionKey::new(
+                fn64_cpu_runtime::BankId::new(entry_bank),
+                fn64_cpu_runtime::GuestPc::new(entry_pc),
             ),
             instruction_budget,
         },

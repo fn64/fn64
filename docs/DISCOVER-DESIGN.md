@@ -458,7 +458,7 @@ understand:
 - Handwritten assembly without standard stack frames.
 
 > Implementation status (2026-07-18): `fn64-discover::cfg` consumes the same
-> `fn64-recomp-rs::decode` authority used by recompilation. A reserved or
+> `fn64-cpu-runtime::decode` authority used by recompilation. A reserved or
 > unsupported word is an `InvalidInstruction` terminator and is never marked
 > `proven_code`; every control transfer's delay word is decoded before it can
 > become code, with a separate `MissingDelaySlot` blocker at bank end.

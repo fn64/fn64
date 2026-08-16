@@ -43,7 +43,7 @@ fn main() {
     // Declared so a clean `#[cfg(fn64_game_linked)]` doesn't warn as an
     // unexpected cfg under `-Wunexpected_cfgs` (Rust 1.80+ lint).
     println!("cargo:rustc-check-cfg=cfg(fn64_game_linked)");
-    println!("cargo:rustc-check-cfg=cfg(fn64_recomp_rs)");
+    println!("cargo:rustc-check-cfg=cfg(fn64_cpu_runtime)");
 
     // FN64_RECOMP=rs (same contract as oot-boot/build.rs): the game comes
     // from the linked `oot-recompiled` typed-Rust crate (the rs manifest at
@@ -56,7 +56,7 @@ fn main() {
             "Point it at the decomp's OWN decompressed build-output z64 -- NOT the retail \
              compressed cartridge image.",
         );
-        println!("cargo:rustc-cfg=fn64_recomp_rs");
+        println!("cargo:rustc-cfg=fn64_cpu_runtime");
         println!("cargo:rustc-cfg=fn64_game_linked");
         return;
     }

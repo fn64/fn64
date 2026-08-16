@@ -464,7 +464,7 @@ use super::*;
     #[test]
     fn typed_raw_word_accesses_and_sp_shims_share_one_device_fabric_state() {
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
 
@@ -476,7 +476,7 @@ use super::*;
         unsafe { crate::__osSpSetStatus_recomp(std::ptr::null_mut(), &mut set) };
         assert_eq!(mem.load_w(0xFFFF_FFFF_A404_0010) as u32 & (1 << 7), 1 << 7);
 
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -500,7 +500,7 @@ use super::*;
             host.runtime_rdram = bytes.as_mut_ptr();
             host.runtime_rdram_len = bytes.len();
         });
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         {
             let mut mem = Rdram::new(&mut bytes);
             mem.store_w(0xFFFF_FFFF_A404_0000, 0x1000);
@@ -531,7 +531,7 @@ use super::*;
             with_host(|host| host.device_fabric.snapshot().sp_imem_generation),
             1
         );
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -545,7 +545,7 @@ use super::*;
             host.runtime_rdram = bytes.as_mut_ptr();
             host.runtime_rdram_len = bytes.len();
         });
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         {
             let mut mem = Rdram::new(&mut bytes);
             mem.store_w(0xFFFF_FFFF_A460_0000, 0x400);
@@ -572,7 +572,7 @@ use super::*;
             mem.load_w(0xFFFF_FFFF_A430_0008) as u32 & fn64_runtime::InterruptSource::Pi.bit(),
             0
         );
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -593,7 +593,7 @@ use super::*;
             }
         });
 
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
         mem.store_w(0xFFFF_FFFF_A404_0010, 1 << 3);
@@ -604,7 +604,7 @@ use super::*;
 
         let pending = with_host(|host| host.device_fabric.snapshot().mi_pending);
         assert_eq!(pending & 0x3F, 0);
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -613,7 +613,7 @@ use super::*;
         crate::test_support::install_complete_render_backend(
             fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
         );
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
         mem.store_w(0xFFFF_FFFF_A440_0018, 525);
@@ -635,7 +635,7 @@ use super::*;
             mem.load_w(0xFFFF_FFFF_A430_0008) as u32 & fn64_runtime::InterruptSource::Vi.bit(),
             0
         );
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -643,7 +643,7 @@ use super::*;
     fn typed_raw_ai_registers_schedule_the_live_guest_cycle_fifo() {
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
         crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
         mem.store_w(0xFFFF_FFFF_A450_0008, 1);
@@ -665,7 +665,7 @@ use super::*;
                 & fn64_runtime::InterruptSource::Ai.bit(),
             0
         );
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }
 
 
@@ -682,7 +682,7 @@ use super::*;
             host.runtime_rdram = bytes.as_mut_ptr();
             host.runtime_rdram_len = bytes.len();
         });
-        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let previous = fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         {
             let mut mem = Rdram::new(&mut bytes);
             mem.store_w(0xFFFF_FFFF_A480_0000, 0);
@@ -705,5 +705,5 @@ use super::*;
                 .collect::<Vec<_>>(),
             vec![0x05, 0, 0]
         );
-        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+        fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }

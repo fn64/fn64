@@ -36,12 +36,12 @@ pub enum InitialBootTvStandardV1 {
     Mpal,
 }
 
-impl From<fn64_recomp_rs::boot::BootTvStandard> for InitialBootTvStandardV1 {
-    fn from(standard: fn64_recomp_rs::boot::BootTvStandard) -> Self {
+impl From<fn64_cpu_runtime::boot::BootTvStandard> for InitialBootTvStandardV1 {
+    fn from(standard: fn64_cpu_runtime::boot::BootTvStandard) -> Self {
         match standard {
-            fn64_recomp_rs::boot::BootTvStandard::Ntsc => Self::Ntsc,
-            fn64_recomp_rs::boot::BootTvStandard::Pal => Self::Pal,
-            fn64_recomp_rs::boot::BootTvStandard::Mpal => Self::Mpal,
+            fn64_cpu_runtime::boot::BootTvStandard::Ntsc => Self::Ntsc,
+            fn64_cpu_runtime::boot::BootTvStandard::Pal => Self::Pal,
+            fn64_cpu_runtime::boot::BootTvStandard::Mpal => Self::Mpal,
         }
     }
 }
@@ -876,7 +876,7 @@ fn sort_dedup<T: Ord>(values: &mut Vec<T>) {
 }
 
 fn valid_cop0_status_site(site: &Cop0StatusWriteSiteV1) -> bool {
-    use fn64_recomp_rs::decoder::{decode, Instruction};
+    use fn64_cpu_runtime::decoder::{decode, Instruction};
     matches!(
         (decode(site.instruction_word), site.kind),
         (

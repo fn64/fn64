@@ -10,11 +10,11 @@ autobins = false
 [features]
 default = []
 writer-runtime-authority = ["dep:fn64-boot-harness"]
-transform-invocation-certificate = ["fn64-recomp-rs/dynamic-mapped-runtime"]
+transform-invocation-certificate = ["fn64-cpu-runtime/dynamic-mapped-runtime"]
 
 [dependencies]
 fn64-boot-harness = { path = "../fn64-boot-harness", optional = true, default-features = false, features = ["recomp-rs"] }
-fn64-recomp-rs = { path = "../fn64-recomp-rs", default-features = false, features = ["aot-runtime"] }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime", default-features = false, features = ["aot-runtime"] }
 fn64-recomp-rs-codegen = { path = "../fn64-recomp-rs-codegen" }
 fn64-runtime = { path = "../fn64-runtime" }
 csv = "1"

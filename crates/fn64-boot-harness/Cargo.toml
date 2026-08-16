@@ -9,13 +9,13 @@ description = "Shared generated-C registration and RDRAM boot seam for fn64 harn
 [features]
 default = ["c-bridge"]
 c-bridge = []
-recomp-rs = ["fn64-abi/recomp-rs", "dep:fn64-recomp-rs"]
+recomp-rs = ["fn64-abi/recomp-rs", "dep:fn64-cpu-runtime"]
 
 [dependencies]
 fn64-abi = { path = "../fn64-abi" }
 fn64-audio = { path = "../fn64-audio" }
 fn64-runtime = { path = "../fn64-runtime" }
-fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true, default-features = false, features = ["aot-runtime"] }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime", optional = true, default-features = false, features = ["aot-runtime"] }
 getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

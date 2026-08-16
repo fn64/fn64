@@ -212,7 +212,7 @@ that gap is six times the win it had just measured.
 
 **Cause: fifteen concurrent `rustc` processes at ~90% CPU each**, load average
 16.16. A second agent was rebuilding the 32 shard crates — an ~11 minute job
-triggered by any edit to `crates/fn64-recomp-rs`. The benchmark was competing
+triggered by any edit to `crates/fn64-cpu-runtime`. The benchmark was competing
 with a full shard rebuild.
 
 Reproduced: the same binary and invocation that measured 430 ms on an idle
@@ -229,6 +229,6 @@ trustworthy 54.9 ms delta *through* the contention, which is exactly what
 pairing is for. But the **ratio** to hardware does not survive, and that agent
 correctly declined to quote one.
 
-Practical consequence: **do not run a `fn64-recomp-rs`-editing agent concurrently
+Practical consequence: **do not run a `fn64-cpu-runtime`-editing agent concurrently
 with a benchmarking agent.** `fn64-abi` edits rebuild only the harness (~25 s);
-`fn64-recomp-rs` edits rebuild 32 crates and saturate the machine.
+`fn64-cpu-runtime` edits rebuild 32 crates and saturate the machine.

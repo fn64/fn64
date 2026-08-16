@@ -13,7 +13,7 @@ use crate::source_closure::{
     IndirectDispositionV1, IndirectTransferFrontierV1, TransferInventoryV1, TransferSummaryV1,
     MODELED_EXCEPTION_VECTOR_DESTINATIONS_V1,
 };
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     static_execution_build_receipt, CatalogResolverPolicyEvidenceV1,
     CATALOG_RESOLVER_POLICY_NAME_V1,
 };

@@ -378,7 +378,7 @@ pub struct CommittedViBoundary {
     function_execution_destinations:
         Vec<fn64_abi::recompiled::FunctionExecutionDestinationObservation>,
     #[cfg(feature = "recomp-rs")]
-    block_execution_destinations: Vec<fn64_recomp_rs::ExecutionDestinationObservation>,
+    block_execution_destinations: Vec<fn64_cpu_runtime::ExecutionDestinationObservation>,
     device_snapshot: fn64_runtime::DeviceEvidenceSnapshot,
     executor_snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
     host_snapshot: fn64_abi::AbiHostEvidenceSnapshot,
@@ -871,7 +871,7 @@ pub(crate) struct FrozenExecutionDestinations {
     #[cfg(feature = "recomp-rs")]
     pub(crate) function: Vec<fn64_abi::recompiled::FunctionExecutionDestinationObservation>,
     #[cfg(feature = "recomp-rs")]
-    pub(crate) block: Vec<fn64_recomp_rs::ExecutionDestinationObservation>,
+    pub(crate) block: Vec<fn64_cpu_runtime::ExecutionDestinationObservation>,
 }
 
 #[cfg(feature = "recomp-rs")]
