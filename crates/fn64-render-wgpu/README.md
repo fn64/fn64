@@ -699,13 +699,15 @@ extreme/out-of-range caller-supplied scalars are exercised against the real
 wrap step boundary, not only the plain-clamp reduction that in-range
 texel/prim/shade/env inputs always hit.
 
-**Nonclaims.** No copy mode, no `SetCombine` decode or `RdpState`/
-combiner-stack tracking, no real NOISE/LOD generation, no shader-keying or
-pipeline-variant selection, no texture/rasterizer integration (the crate's
+**Nonclaims.** No copy mode, no real NOISE/LOD generation, no shader-keying
+or pipeline-variant selection, no texture/rasterizer integration (the crate's
 texel-fetch and three-nearest-filter machinery — see "M4.3.3f" above — is
 not wired to this module), no draw-path or production-DPC integration, no
 target/framebuffer write, and no RT64 pixel/visual/silicon parity or
-performance claim.
+performance claim. `SetCombine`'s raw-DPC decode and durable `RdpState`
+retention are covered separately below ("SetCombine: raw-DPC decode and
+durable state retention"); this module still performs no decode of its own
+and constructs `CombineParams` only in its own tests.
 
 ## Depth: strict-less compare/update (port-card slice 1)
 
@@ -1675,3 +1677,67 @@ leaves the result identical. A final test exercises `PrimDepth::from_wire`
 directly (independent of this function, since it takes no `PrimDepth`
 parameter at all) to make the 15-bit-mask omission from this function's
 signature a documented, tested API fact rather than a silent gap.
+
+## SetCombine: raw-DPC decode and durable state retention
+
+`raw_dpc`'s decoder admits `SetCombine` (`G_SETCOMBINE` = `0xfc`, masked to
+this crate's low-six-bit command field as `0xfc & 0x3f = 0x3c`; public SGI
+*RDP Command Summary* "Set Combine Mode" / libultra `gDPSetCombineMode` /
+`gsDPSetCombineLERP`), a single 64-bit command word exactly like the other
+already-admitted fragment constant registers (`SetEnvColor`, `SetPrimColor`,
+`SetBlendColor`, `SetFogColor`, `SetPrimDepth`). `fn64_render::raw_rdp_command_width`
+already assigned opcode `0x3c` an 8-byte width before this slice; this slice
+adds the decode arm and typed `RawDpcCommandKind::SetCombine(CombineParams)`
+variant that consumes it.
+
+**Wire-fidelity property.** `RDP::setCombine` (pinned RT64 commit
+`5473732a822a4423b5696e7cb18fecc425a59875`, `src/hle/rt64_rdp.cpp:295-302`)
+stores `combineL` as the command's exact first wire word (`w0`) and
+`combineH` as the exact second wire word (`w1`) — RT64 never masks or strips
+`w0`'s top opcode byte before storing it. This decoder's `SET_COMBINE` arm
+reproduces that exactly: it calls `CombineParams::from_wire(w0, w1)` with the
+full, unmasked 32-bit `w0` this module already extracted before any opcode
+masking, not a "cleaned" value with its top byte removed. A dedicated test
+(`set_combine_w0_is_passed_through_completely_unmasked`) proves this with an
+exact captured-shaped fixture (`w0 = 0xfc8f_ff1f`, `w1 = 0x88fc_f279`),
+asserting `CombineParams::low()`/`high()` equal those words byte-for-byte,
+plus independently hand-derived (not self-asserted) `decode_color`/
+`decode_alpha` selector results for both cycles.
+
+`combiner.rs`'s `CombineParams::from_wire` — previously `pub(crate)` with an
+`#[allow(dead_code)]` marker and a comment stating no opcode handler existed
+yet — is now called from exactly this decode arm; its signature and
+arithmetic are unchanged, and the selector-decode tables/one-cycle/two-cycle
+arithmetic this crate already ported for `CombineParams` remain exactly as
+characterized in "Color combiner: one-cycle/two-cycle selector arithmetic"
+above. This slice does not add a combiner-evaluation consumer of the newly
+decoded state, does not wire `CombineParams` into
+`combiner_inputs_from_fragment_registers`, and does not touch
+`production_adapter.rs`'s admission logic beyond the strictly-additive match
+arms every new `RawDpcCommandKind` variant requires to keep that module's two
+exhaustive matches (`opcode_name`, the v11 TMEM-only admission dispatch)
+compiling — `SetCombine` is rejected there by the same "outside the admitted
+zero-guest-write TMEM/state subset" path every other non-TMEM command kind
+already takes, not newly admitted into production.
+
+**Durable state retention.** `RdpState`/`RdpStateDelta`/`StagedRdpState`
+each gain a `combine: Option<CombineParams>` field, following exactly the
+same "current value + tracked change" shape `env_color`/`prim_color`/etc.
+already use: `RdpState::fork_for_decode` copies it, `RdpState::apply` takes
+the delta's value when present (last-command-wins within one packet, proven
+by `set_combine_sequential_overwrite_last_command_wins_in_one_packet`), and
+`RdpStateDelta::set_combine` records only the decoded command
+(`set_combine_state_delta_records_only_the_decoded_command`). A dedicated
+cross-packet test
+(`set_combine_is_retained_as_durable_state_across_a_packet_boundary_with_no_intervening_set_combine`)
+proves the retention property the task required explicitly: a `SetCombine`
+decoded in packet N is still the active `staged_state().combine()` value read
+in packet N+1 after `decode_raw_dpc_after` chaining, with no intervening
+`SetCombine` in packet N+1 and packet N+1's own `state_delta().combine()`
+correctly reporting `None`.
+
+**Nonclaims.** No combiner-evaluation wiring of the newly decoded state (no
+`CombinerInputs`/`run_combiner` call site reads `RdpState::combine` in this
+slice), no `production_adapter.rs` admission of `SetCombine` into the v11
+TMEM-only production plan, no shader/pipeline/draw-path integration, and no
+RT64 pixel/visual/silicon parity or performance claim.

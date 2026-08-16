@@ -26,6 +26,7 @@ use fn64_render_ir::{
     MAX_RESOURCE_ACCESSES,
 };
 
+use crate::combiner::CombineParams;
 use crate::state::{
     Color4, ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor,
     PrimDepth, RdpState, RdpStateDelta, StagedRdpState,
@@ -58,6 +59,10 @@ const SET_PRIM_COLOR: u8 = 0xfa & 0x3f;
 /// `G_SETENVCOLOR` (`src/shared/rt64_f3d_defines.h:145`); public SGI *RDP
 /// Command Summary* "Set Environment Color".
 const SET_ENV_COLOR: u8 = 0xfb & 0x3f;
+/// `G_SETCOMBINE` (`src/shared/rt64_f3d_defines.h:144`); public SGI *RDP
+/// Command Summary* "Set Combine Mode" / libultra `gDPSetCombineMode` /
+/// `gsDPSetCombineLERP`.
+const SET_COMBINE: u8 = 0xfc & 0x3f;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawDpcCommandLocation {
@@ -170,6 +175,7 @@ pub enum RawDpcCommandKind {
     SetBlendColor(Color4),
     SetFogColor(Color4),
     SetPrimDepth(PrimDepth),
+    SetCombine(CombineParams),
     FillRectangle(FillRectangle),
     SetTextureImage(crate::TextureImage),
     SetTile {
@@ -982,6 +988,18 @@ fn decode_stream(
                 delta.set_prim_depth(value);
                 state.apply(delta);
                 RawDpcCommandKind::SetPrimDepth(value)
+            }
+            SET_COMBINE => {
+                // `RDP::setCombine` stores `combineL = combine & 0xFFFFFFFF`
+                // (exactly `w0`, unmasked -- RT64 never strips its top
+                // opcode byte) and `combineH = combine >> 32` (exactly
+                // `w1`). `w0` here is the full 32-bit wire word this
+                // decoder already extracted above, before the `& 0x3f`
+                // opcode mask below it was ever applied to `opcode`.
+                let value = CombineParams::from_wire(w0, w1);
+                delta.set_combine(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetCombine(value)
             }
             FILL_RECTANGLE => {
                 let rectangle = FillRectangle {
@@ -3858,5 +3876,205 @@ mod tests {
             assert_eq!(location.source_byte_offset(), COMMAND_START);
             assert_eq!(location.stream_byte_offset(), 0);
         }
+    }
+
+    // -- SetCombine (0xfc & 0x3f) ----------------------------------------
+
+    #[test]
+    fn set_combine_opcode_constant_matches_public_spelling_masked_to_six_bits() {
+        assert_eq!(SET_COMBINE, 0xfc & 0x3f);
+        assert_eq!(
+            raw_rdp_command_width(SET_COMBINE),
+            Some(8),
+            "SetCombine is exactly one 64-bit command word"
+        );
+    }
+
+    #[test]
+    fn set_combine_accepts_all_four_wire_prefixes() {
+        for prefix in [0x00, 0x40, 0x80, 0xc0] {
+            let words = vec![word(prefix, SET_COMBINE, 0x00ab_cdef), 0x1122_3344];
+            let decoded = decode(words).unwrap();
+            let RawDpcCommandKind::SetCombine(params) = decoded.commands()[0].kind() else {
+                panic!("expected SetCombine");
+            };
+            // `w0`'s top byte carries `prefix | SET_COMBINE` here (from the
+            // `word()` helper), not a hostile hand-built payload -- the
+            // full-word-passthrough property is proven separately below
+            // with an exact captured-style fixture.
+            assert_eq!(params.low(), word(prefix, SET_COMBINE, 0x00ab_cdef));
+            assert_eq!(params.high(), 0x1122_3344);
+        }
+    }
+
+    #[test]
+    fn set_combine_zero_and_max_high_word_boundaries() {
+        let prefix = 0x00;
+        let decoded_zero = decode(vec![word(prefix, SET_COMBINE, 0), 0]).unwrap();
+        let RawDpcCommandKind::SetCombine(zero) = decoded_zero.commands()[0].kind() else {
+            panic!("expected SetCombine");
+        };
+        assert_eq!(zero.low(), word(prefix, SET_COMBINE, 0));
+        assert_eq!(zero.high(), 0);
+
+        let decoded_max = decode(vec![word(prefix, SET_COMBINE, 0), u32::MAX]).unwrap();
+        let RawDpcCommandKind::SetCombine(max) = decoded_max.commands()[0].kind() else {
+            panic!("expected SetCombine");
+        };
+        assert_eq!(max.low(), word(prefix, SET_COMBINE, 0));
+        assert_eq!(max.high(), u32::MAX);
+    }
+
+    /// Proves the wire-fidelity property the task calls out explicitly:
+    /// `CombineParams::from_wire` receives `w0` completely unmasked, top
+    /// opcode byte included -- `low()` must report the command's actual
+    /// captured first wire word verbatim, not a decoder-"cleaned" value with
+    /// its top byte stripped. `w0 = 0xfc8f_ff1f` here is not built through
+    /// the `word()` helper (which would force the top byte to
+    /// `prefix | SET_COMBINE`); it is a standalone literal whose own top
+    /// byte (`0xfc`) already happens to mask to `SET_COMBINE` (`0xfc & 0x3f
+    /// == 0x3c == SET_COMBINE`), so it is simultaneously a wire-legal
+    /// `SetCombine` command word and an exact fixture for this assertion.
+    #[test]
+    fn set_combine_w0_is_passed_through_completely_unmasked() {
+        let w0: u32 = 0xfc8f_ff1f;
+        let w1: u32 = 0x88fc_f279;
+        assert_eq!(
+            w0 & 0x3f000000,
+            0x3c00_0000,
+            "fixture's top byte must mask to SET_COMBINE"
+        );
+        let decoded = decode(vec![w0, w1]).unwrap();
+        let RawDpcCommandKind::SetCombine(params) = decoded.commands()[0].kind() else {
+            panic!("expected SetCombine");
+        };
+        assert_eq!(
+            params.low(),
+            0xfc8f_ff1f,
+            "w0 must reach CombineParams::low() byte-for-byte"
+        );
+        assert_eq!(
+            params.high(),
+            0x88fc_f279,
+            "w1 must reach CombineParams::high() byte-for-byte"
+        );
+
+        // Independently hand-derived selector decode for this exact fixture
+        // (bit positions verified against `combiner.rs`'s cited
+        // `parseColorInputA/B/C/D`/`parseAlphaInputA/B/C/D` bit offsets, not
+        // against this crate's own `decode_color`/`decode_alpha` output):
+        //
+        // low  = 0xfc8fff1f, high = 0x88fcf279
+        // cycle 0 (second_cycle=false): colorA=(low>>20)&0xF=8, colorB=
+        //   (high>>28)&0xF=8, colorC=(low>>15)&0x1F=31, colorD=(high>>15)&0x7=1,
+        //   alphaA=(low>>12)&0x7=7, alphaB=(high>>12)&0x7=7,
+        //   alphaC=(low>>9)&0x7=7, alphaD=(high>>9)&0x7=1
+        // cycle 1 (second_cycle=true): colorA=(low>>5)&0xF=8, colorB=
+        //   (high>>24)&0xF=8, colorC=low&0x1F=31, colorD=(high>>6)&0x7=1,
+        //   alphaA=(high>>21)&0x7=7, alphaB=(high>>3)&0x7=7,
+        //   alphaC=(high>>18)&0x7=7, alphaD=high&0x7=1
+        //
+        // index 8 collapses to Zero in both color-A (table has 0-7) and
+        // color-B (table has 0-7); index 31 collapses to Zero in color-C
+        // (table has 0-15); index 1 is Texel0 in the common/ABD tables;
+        // index 7 collapses to Zero in alpha-ABD (table has 0-6) and in
+        // alpha-C (table has 0-6, distinct mapping).
+        use crate::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot};
+        for second_cycle in [false, true] {
+            assert_eq!(
+                params.decode_color(ColorInputSlot::A, second_cycle),
+                ColorInput::Zero
+            );
+            assert_eq!(
+                params.decode_color(ColorInputSlot::B, second_cycle),
+                ColorInput::Zero
+            );
+            assert_eq!(
+                params.decode_color(ColorInputSlot::C, second_cycle),
+                ColorInput::Zero
+            );
+            assert_eq!(
+                params.decode_color(ColorInputSlot::D, second_cycle),
+                ColorInput::Texel0
+            );
+            assert_eq!(
+                params.decode_alpha(AlphaInputSlot::A, second_cycle),
+                AlphaInput::Zero
+            );
+            assert_eq!(
+                params.decode_alpha(AlphaInputSlot::B, second_cycle),
+                AlphaInput::Zero
+            );
+            assert_eq!(
+                params.decode_alpha(AlphaInputSlot::C, second_cycle),
+                AlphaInput::Zero
+            );
+            assert_eq!(
+                params.decode_alpha(AlphaInputSlot::D, second_cycle),
+                AlphaInput::Texel0
+            );
+        }
+    }
+
+    #[test]
+    fn set_combine_state_delta_records_only_the_decoded_command() {
+        let words = vec![word(0, SET_COMBINE, 0), 0xDEAD_BEEF];
+        let decoded = decode(words).unwrap();
+        assert_eq!(decoded.state_delta().combine().unwrap().high(), 0xDEAD_BEEF);
+        assert!(decoded.state_delta().env_color().is_none());
+        assert!(decoded.state_delta().prim_color().is_none());
+    }
+
+    #[test]
+    fn set_combine_sequential_overwrite_last_command_wins_in_one_packet() {
+        let prefix = 0;
+        let words = vec![
+            word(prefix, SET_COMBINE, 0),
+            0x1111_1111,
+            word(prefix, SET_COMBINE, 0),
+            0x2222_2222,
+        ];
+        let decoded = decode(words).unwrap();
+        assert_eq!(decoded.commands().len(), 2);
+        assert_eq!(
+            decoded.staged_state().combine().unwrap().high(),
+            0x2222_2222,
+            "last SetCombine in the packet must win"
+        );
+    }
+
+    /// Retention across packet boundaries: a `SetCombine` decoded in packet
+    /// N must still be the active combine state read from `RdpState` in
+    /// packet N+1, with no intervening `SetCombine`, exactly matching
+    /// `fragment_register_decode_preserves_every_pre_existing_state_field`'s
+    /// cross-packet chaining shape for the other fragment registers.
+    #[test]
+    fn set_combine_is_retained_as_durable_state_across_a_packet_boundary_with_no_intervening_set_combine(
+    ) {
+        let prefix = 0;
+        let seed_packet = packet(7, vec![word(prefix, SET_COMBINE, 0), 0xAABB_CCDD], &[]);
+        let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+            .unwrap()
+            .into_roles();
+        let seed_submitted = queue.submit(DecodedTicket::new(seed_packet)).unwrap();
+        let seed = decode_raw_dpc(seed_submitted, &RdpState::default()).unwrap();
+        let expected_combine = seed.staged_state().combine();
+        assert!(expected_combine.is_some());
+
+        // Packet N+1 decodes an unrelated command (SetEnvColor) with no
+        // SetCombine of its own.
+        let next_packet = packet(8, vec![word(prefix, SET_ENV_COLOR, 0), 0x0102_0304], &[]);
+        let next_submitted = queue.submit(DecodedTicket::new(next_packet)).unwrap();
+        let decoded = decode_raw_dpc_after(next_submitted, seed.into_staged_state()).unwrap();
+        let staged = decoded.staged_state();
+        assert_eq!(
+            staged.combine(),
+            expected_combine,
+            "SetCombine from packet N must still be the active combine state in packet N+1"
+        );
+        assert!(
+            decoded.state_delta().combine().is_none(),
+            "packet N+1's own delta must not record a SetCombine it never decoded"
+        );
     }
 }
