@@ -724,3 +724,68 @@ is TMEM-only, no-FullSync, no-guest-write, headless: no ABI/T4 ingress, no
 visible presentation, no raster parity, no native GPU testing.
 `WgpuBackend::process_task`/`present` are honest named rejections. See
 `docs/DESIGN.md`'s "T3 Phase A/B" section for the full account.
+
+## Depth: full four-mode compare/update (`depth_mode`)
+
+`depth_mode` extends `depth_strict_less`'s smallest-slice foundation to the
+full RDP depth-mode dispatch the port card's §4 "Depth compare/update"
+describes: all four `ZMODE_*` variants (`state::DepthMode::{Opaque,
+Interpenetrating, Translucent, Decal}`, reused directly from this crate's
+existing `OtherMode` decode layer, not redefined) and their exact
+comparison/update semantics, plus the coverage-wrap tightening
+`depth_coverage_decision` layers on top of the plain per-mode test. It is a
+literal, self-contained re-expression of `fn64-render-reference`'s
+`depth::{relations, mode_passes}` (`crates/fn64-render-reference/src/depth.rs`)
+and `raster::coverage::depth_coverage_decision`
+(`crates/fn64-render-reference/src/raster/coverage.rs:39-59`), following
+`depth_strict_less`'s established convention: a typed CPU oracle
+(`DepthRelations`, `DepthModeDecision`, `relations`, `mode_passes`,
+`depth_mode_decision`) plus a matching WGSL compute-shader seam
+(`DEPTH_MODE_WGSL`, entry point `DEPTH_MODE_ENTRY_POINT`), citation comments
+in place of a cross-crate dependency (`fn64-render-wgpu` still has no
+dependency on `fn64-render-reference`).
+
+**Behavior.** `relations()` computes the four Programming Manual Chapter 15
+Equations 5-9 signals (`memory_is_max`, `farther`, `nearer`, `in_front`) from
+a fragment's already-decoded Z/DeltaZ and a memory sample's Z plus *stored*
+four-bit DeltaZ exponent — the reference's own asymmetric signature is
+preserved exactly: `pixel_delta_z` is a direct `u16` value, while
+`memory_encoded_delta_z` is the packed exponent decoded internally via
+`decode_delta_z` before the two deltas are compared, because the memory side
+is only ever available in its packed `EncodedDepth` form. `delta_z_max` is
+the larger of the two decoded deltas; `farther`/`nearer` use `u32`
+`saturating_add`/`saturating_sub` unconditionally (not just within the RDP's
+documented 18-bit convention — `pixel_z`/`memory_z` are plain `u32`, and the
+WGSL companion emulates true saturation, not a range-restricted
+approximation, so it cannot silently wrap on out-of-convention input).
+`mode_passes()` is Chapter 15 §15.7's exhaustive four-way dispatch — Opaque
+and Interpenetrating both accept `relations.nearer` (delta-tolerant
+correlation), Translucent requires the strict `relations.in_front`, and Decal
+requires `relations.farther && relations.nearer && !relations.memory_is_max`
+— with no default/fallthrough arm, so a hypothetical fifth mode fails to
+compile rather than silently reusing an existing arm.
+
+**Coverage-wrap tightening.** `depth_mode_decision()` layers
+`depth_coverage_decision`'s wrap-aware override on top of `mode_passes()`:
+Opaque combined with `coverage_wraps=true` tightens the delta-tolerant
+`nearer` test to the strict `in_front` test; Interpenetrating combined with
+`coverage_wraps=true` is the reference's own known, unresolved gap — the
+Programming Manual's "Blender Modes and Assumptions" section requires a
+coverage-adjustment path here but does not publish its arithmetic, so this
+port preserves it as a first-class typed
+`DepthModeDecision::UnsupportedInterpenetratingCoverageAdjustment` variant a
+caller must handle explicitly, never a silent pass, reject, or decode-time
+normalization (AGENTS.md "loud traps, no silent shrugs"). Translucent and
+Decal receive no wrap-specific override in the reference, so this port
+invents none for them either.
+
+**Scope.** This slice ports the four-mode dispatch and its coverage-wrap
+interaction only. Z encode/decode (`EncodedDepth`, `encode_z`/`decode_z`,
+DeltaZ *encoding*, as opposed to the already-ported `decode_delta_z`
+expansion this module needs for its memory-side argument) remains the
+distinct, not-yet-started slice `depth_strict_less`'s README section already
+names. Blend, coverage accumulation, alpha compare, dither, the
+framebuffer-read problem, draw-call integration, and native GPU execution are
+out of scope — this module only decides `Pass`/`Reject`/`Unsupported`, never
+a byte write. It consumes `crate::state::DepthMode` as its mode parameter
+without redefining or re-exporting it, and does not modify `state.rs`.
