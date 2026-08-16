@@ -162,6 +162,32 @@ destinations. Neither this slice nor its combination with M4.2a establishes
 visual parity or performance; no such claim is made anywhere in this
 document.
 
+`tmem::execute_ordered_tmem_loads` (`tmem/execute/packet.rs`) is the packet-level
+outer loop neither executor nor M4.2a itself owns: it validates a decoded
+raw-DPC command stream in one pass, then — only if every command in it clears
+validation — walks it again in order, dispatches each `LoadTile`/`LoadBlock`
+to its executor, and chains the resulting packet transactions into one sealed
+`PendingTmemTransaction` — the N-load generalization of each executor's
+single-load case. The validation pass first checks the caller-supplied
+`SubmittedTicket` is exactly the decoded packet's own ticket (queue,
+submission ordinal/identity, workload, journal, and memory-layout identity),
+rejecting a foreign or reordered ticket with a named `SubmissionMismatch`
+error before any other exit; it then rejects a `LoadTlut` command or a
+YUV-deferred Tile/Block contract before any load in the packet stages. Since
+M4.3.1, `bind_tmem_transfer` returns a valid, bindable transfer plan for TLUT
+loads (the destination transfer-plan is closed), but no physical executor
+(`prepare_load_tlut`, M4.3.2) exists yet to write TMEM from it, so this loop
+refuses it as an explicit scope boundary rather than executing a load it
+cannot back — the same treatment a YUV-deferred Tile/Block contract already
+receives. Because rejection is decided by a validation pass that runs to
+completion before the execution pass stages anything, a later TLUT/YUV
+command can never be preceded by an already-staged earlier Tile/Block load.
+Like the executors it chains, this function stops at `PendingTmemTransaction`:
+it holds neither `BackendCompletionAuthority` nor `GuestCommitAuthority`, so
+the caller assembles the packet-wide `BackendEffectReport` (TMEM proposals
+from `pending.proposed_effects()` plus any other declared writes from the
+same packet) and drives the remaining ticket/publication steps itself.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction

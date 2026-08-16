@@ -2,6 +2,7 @@
 
 mod load_block;
 mod load_tile;
+mod packet;
 
 pub use load_block::{
     prepare_load_block, ExecutedLoadBlock, LoadBlockExecutionError, PreparedLoadBlock,
@@ -9,3 +10,4 @@ pub use load_block::{
 pub use load_tile::{
     prepare_load_tile, ExecutedLoadTile, LoadTileExecutionError, PreparedLoadTile,
 };
+pub use packet::{execute_ordered_tmem_loads, TmemPacketExecutionError};

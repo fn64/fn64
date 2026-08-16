@@ -22,8 +22,9 @@ mod types;
 mod wire;
 
 pub use execute::{
-    prepare_load_block, prepare_load_tile, ExecutedLoadBlock, ExecutedLoadTile,
-    LoadBlockExecutionError, LoadTileExecutionError, PreparedLoadBlock, PreparedLoadTile,
+    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, ExecutedLoadBlock,
+    ExecutedLoadTile, LoadBlockExecutionError, LoadTileExecutionError, PreparedLoadBlock,
+    PreparedLoadTile, TmemPacketExecutionError,
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
