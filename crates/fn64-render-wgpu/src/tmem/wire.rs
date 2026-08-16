@@ -363,6 +363,22 @@ fn decode_load_tlut(
             "LoadTLUT destination tile is outside high TMEM",
         ));
     }
+    // Public libultra `gbi.h` `gDPLoadTLUTCmd`: the macro always programs a
+    // 16-bit-per-entry palette image, and this module's transfer-shape
+    // (`entries.get() * 2` source bytes) and destination projection are
+    // sized for exactly that. Reject any other `SetTextureImage` or tile
+    // descriptor size explicitly rather than silently mis-sizing the
+    // transfer -- see `AGENTS.md`'s "loud traps, no silent shrugs".
+    if image.size() != PixelSize::Bits16 {
+        return Err(TmemWireError::new(
+            "LoadTLUT public macro requires a 16-bit SetTextureImage source",
+        ));
+    }
+    if descriptor.size() != PixelSize::Bits16 {
+        return Err(TmemWireError::new(
+            "LoadTLUT public macro requires a 16-bit destination tile descriptor",
+        ));
+    }
     let low_s = (w0 >> 12) & 0x0fff;
     let low_t = w0 & 0x0fff;
     let count_fraction = (w1 >> 12) & 3;
@@ -400,17 +416,30 @@ fn decode_load_tlut(
     let range = layout
         .range(start, end)
         .map_err(|_| TmemWireError::new("LoadTLUT source range is outside installed RDRAM"))?;
-    let (source_plan, accesses) = source_accesses(
+    let (source_plan, mut accesses) = source_accesses(
         source_identity,
         first_access_index,
         first_operation,
         vec![range],
     )?;
     let kind = TmemLoadKind::Tlut { bounds, entries };
-    // M4.2 owns physical LoadTile/LoadBlock effects. LoadTLUT keeps its exact
-    // owned source but acquires no destination or quadrication claim until
-    // M4.3 freezes the still-open high-bank authority contract.
-    let load = TmemLoad::new_deferred_tlut(epoch, tile, image, descriptor, kind, source_plan);
+    // M4.3.1 closes LoadTLUT's destination/quadrication claim using the same
+    // M4.2.0 transfer-plan mechanism Block/Tile already use (see
+    // `transfer_shape`'s and `project_tmem_transfer_word`'s `Tlut` arms).
+    let transfer_plan = transfer_plan(
+        source_plan,
+        TransferInputs {
+            epoch,
+            tile,
+            image,
+            descriptor,
+            kind,
+        },
+        first_access_index,
+        first_operation,
+        &mut accesses,
+    )?;
+    let load = TmemLoad::new(epoch, tile, image, descriptor, kind, transfer_plan);
     state.commit_load(load, bounds);
     Ok((TmemCommand::LoadTlut(load), accesses))
 }
@@ -643,10 +672,26 @@ fn transfer_shape(
                     .ok_or(TmemWireError::new("LoadTile padding byte count underflows"))?;
                 (logical, words, padding, words_per_row, rows)
             }
-            TmemLoadKind::Tlut { .. } => {
-                return Err(TmemWireError::new(
-                    "LoadTLUT destination execution is deferred to M4.3",
-                ));
+            TmemLoadKind::Tlut { entries, .. } => {
+                // SGI RDP Command Summary Table 9 / libultra gbi.h
+                // gDPLoadTLUTCmd: the source is `entries` sequential 16-bit
+                // palette values (2 bytes/entry, already validated by
+                // `decode_load_tlut`'s `entries.get() * 2` source-byte
+                // computation). Each entry occupies exactly one 8-byte TMEM
+                // destination word (quadricated -- see
+                // `project_tmem_transfer_word`'s `Tlut` arm and this
+                // repository's own `write_tlut` precedent), so the transfer
+                // is one word per entry with no row grouping.
+                let logical = source.total_bytes();
+                let words = u32::from(entries.get());
+                // Every transfer-word byte is defined destination content
+                // (the entry's 2 real source bytes plus their 3 quadricated
+                // copies) -- none are `undefined_padding_bytes` in the sense
+                // that field documents (a value the logical source span does
+                // not define). `defined_source_byte_mask`'s `Tlut` arm
+                // reports only the 2 *captured* source bytes (`0x03`), a
+                // distinct, narrower fact from this padding count.
+                (logical, words, 0, words, 1)
             }
         };
     if logical_source_bytes != source.total_bytes() {
@@ -806,5 +851,534 @@ const fn pixel_size(raw: u32) -> PixelSize {
         1 => PixelSize::Bits8,
         2 => PixelSize::Bits16,
         _ => PixelSize::Bits32,
+    }
+}
+
+#[cfg(test)]
+mod tlut_transfer_plan_tests {
+    //! M4.3.1: LoadTLUT destination transfer-plan tests. These decode
+    //! through the crate's public `decode_raw_dpc` entry point (the same
+    //! depth `raw_dpc::tests` and `tmem::physical::tests` already exercise)
+    //! rather than hand-assembling `TmemSourcePlanStart`'s identity/journal
+    //! plumbing, which is production-wired only inside `raw_dpc/mod.rs`
+    //! (out of this task's writable scope). Only wire-layer geometry is
+    //! asserted here; palette-byte decode is M4.3.4/M4.3.5 and physical
+    //! execution is M4.3.2 -- neither is claimed by these tests.
+
+    use fn64_render_ir::{
+        AccessPurpose, CapturedGuestRead, DecodedTicket, DeferredGuestReadCapture,
+        DpInterruptState, DramCommandChunk, DramCommandStream, PhysicalMemoryLayout,
+        RawCommandStream, ResourceAccess, ResourceJournal, ResourceJournalLimits, SubmittedTicket,
+        TemporalBoundary, TicketAuthoritySet, WorkloadAdmission, WorkloadPacket,
+        WorkloadPacketPreflight, MAX_RESOURCE_ACCESSES,
+    };
+
+    use super::*;
+    use crate::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError, RdpState};
+
+    const LAYOUT_BYTES: u32 = 0x4000;
+    const COMMAND_START: u32 = 0x1000;
+
+    fn word(opcode: u8, payload: u32) -> u32 {
+        u32::from(opcode) << 24 | payload
+    }
+
+    /// RGBA16 SetTextureImage: TLUT sources are always a 16-bit-per-entry
+    /// palette image, which `decode_load_tlut` now explicitly requires (see
+    /// `source_size_is_rejected_unless_bits16` below); `transfer_shape`
+    /// always resolves `Linear64` for LoadTLUT as a result.
+    fn set_texture_image(width: u32, address: u32) -> [u32; 2] {
+        // format=RGBA (0), size=16-bit (2).
+        [word(SET_TEXTURE_IMAGE, 2 << 19 | (width - 1)), address]
+    }
+
+    /// Like `set_texture_image`, but with an explicit wire size field (0-3,
+    /// `pixel_size`'s raw encoding) for the Bits4/Bits8/Bits32 hostiles.
+    fn set_texture_image_sized(size: u32, width: u32, address: u32) -> [u32; 2] {
+        [word(SET_TEXTURE_IMAGE, size << 19 | (width - 1)), address]
+    }
+
+    /// Like `set_tile`, but with an explicit wire size field for the
+    /// Bits4/Bits8/Bits32 destination-descriptor hostiles.
+    fn set_tile_sized(size: u32, tile: u32, tmem: u32) -> [u32; 2] {
+        [word(SET_TILE, size << 19 | tmem), tile << 24]
+    }
+
+    fn set_tile(tile: u32, tmem: u32) -> [u32; 2] {
+        [word(SET_TILE, 2 << 19 | tmem), tile << 24]
+    }
+
+    fn load_sync() -> [u32; 2] {
+        [word(LOAD_SYNC, 0), 0]
+    }
+
+    fn load_tlut(tile: u32, entries_minus_one: u32) -> [u32; 2] {
+        [word(LOAD_TLUT, 0), tile << 24 | entries_minus_one << 14]
+    }
+
+    fn command_access(
+        layout: PhysicalMemoryLayout,
+        byte_count: u32,
+        operation: u32,
+    ) -> ResourceAccess {
+        ResourceAccess::try_new(
+            OperationId::new(operation),
+            AccessMode::Read,
+            AccessPurpose::CommandDecode,
+            ResourceRegion::Rdram {
+                resource: RdramResource::RawCommands,
+                range: layout
+                    .range(COMMAND_START, COMMAND_START + byte_count)
+                    .unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn tmem_source_access(
+        layout: PhysicalMemoryLayout,
+        operation: u32,
+        start: u32,
+        end: u32,
+    ) -> ResourceAccess {
+        ResourceAccess::try_new(
+            OperationId::new(operation),
+            AccessMode::Read,
+            AccessPurpose::TmemLoadSource,
+            ResourceRegion::Rdram {
+                resource: RdramResource::Buffer,
+                range: layout.range(start, end).unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn submit(packet: WorkloadPacket) -> SubmittedTicket {
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        queue.submit(DecodedTicket::new(packet)).unwrap()
+    }
+
+    /// A command-only packet with no declared TMEM source access, for
+    /// hostile fixtures whose decode is expected to reject the command
+    /// before it ever reaches source-range construction (mirrors
+    /// `raw_dpc::tests::packet`, used the same way there).
+    fn hostile_packet(words: Vec<u32>) -> WorkloadPacket {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let bytes = u32::try_from(words.len() * 4).unwrap();
+        let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
+        let stream = RawCommandStream::Dram(
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                command_range,
+                words,
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        );
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(MAX_RESOURCE_ACCESSES, LAYOUT_BYTES).unwrap(),
+            vec![command_access(layout, bytes, 0)],
+        )
+        .unwrap();
+        WorkloadPacket::try_new(
+            layout,
+            WorkloadAdmission::RawDpc {
+                transaction_sequence: 7,
+            },
+            vec![stream],
+            journal,
+        )
+        .unwrap()
+    }
+
+    /// Mirrors `raw_dpc::tests::packet_with_tmem_sources`: this task's
+    /// destination accesses are only known once decode runs, so the packet
+    /// is built with a source-only journal guess, probed once, and rebuilt
+    /// from the exact expected journal `decode_raw_dpc` reports back on
+    /// mismatch.
+    fn packet_with_tmem_sources(words: Vec<u32>, source_ranges: &[(u32, u32)]) -> WorkloadPacket {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let bytes = u32::try_from(words.len() * 4).unwrap();
+        let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
+        let stream = RawCommandStream::Dram(
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                command_range,
+                words,
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        );
+        let mut accesses = vec![command_access(layout, bytes, 0)];
+        accesses.extend(
+            source_ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
+                    tmem_source_access(layout, index as u32 + 1, start, end)
+                }),
+        );
+        let finalize = |accesses: Vec<ResourceAccess>| {
+            let declared = accesses
+                .iter()
+                .map(|access| access.region().declared_bytes())
+                .sum::<u32>();
+            let journal = ResourceJournal::try_new(
+                ResourceJournalLimits::try_new(MAX_RESOURCE_ACCESSES, declared.max(1)).unwrap(),
+                accesses,
+            )
+            .unwrap();
+            let preflight = WorkloadPacketPreflight::try_new(
+                layout,
+                WorkloadAdmission::RawDpc {
+                    transaction_sequence: 7,
+                },
+                vec![stream.clone()],
+                journal,
+            )
+            .unwrap();
+            let capture = DeferredGuestReadCapture::new(
+                preflight
+                    .guest_read_plan()
+                    .reads()
+                    .iter()
+                    .map(|read| {
+                        CapturedGuestRead::try_new(
+                            *read,
+                            vec![read.operation().get() as u8; read.range().len() as usize],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            );
+            preflight.finalize(capture).unwrap()
+        };
+        let probe = finalize(accesses.clone());
+        let final_accesses = match decode_raw_dpc(submit(probe), &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            Ok(_) => accesses,
+            Err(error) => {
+                panic!("TMEM packet planning probe failed before journal comparison: {error}")
+            }
+        };
+        finalize(final_accesses)
+    }
+
+    fn decode_tlut(
+        tmem_base: u32,
+        entries: u16,
+        source_range: (u32, u32),
+    ) -> Result<TmemLoad, RawDpcDecodeError> {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(1, 0x300));
+        words.extend(set_tile(7, tmem_base));
+        words.extend(load_sync());
+        words.extend(load_tlut(7, u32::from(entries) - 1));
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(words, &[source_range])),
+            &RdpState::default(),
+        )?;
+        let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTLUT");
+        };
+        Ok(load)
+    }
+
+    #[test]
+    fn minimum_single_entry_produces_one_destination_word() {
+        let load = decode_tlut(256, 1, (0x300, 0x302)).unwrap();
+        let plan = load
+            .transfer_plan()
+            .expect("M4.3.1 closes LoadTLUT's transfer plan");
+        assert_eq!(plan.transfer_words(), 1);
+        assert_eq!(plan.logical_source_bytes(), 2);
+        assert_eq!(plan.destination_word(0).unwrap(), 256);
+        assert_eq!(plan.undefined_padding_bytes(), 0);
+        // 8 destination bytes are defined content (quadrication), but only
+        // the entry's 2 real bytes are *captured* source bytes.
+        assert_eq!(plan.defined_source_byte_mask(0).unwrap(), 0x03);
+    }
+
+    #[test]
+    fn maximum_256_entries_fills_the_high_bank_without_overflow() {
+        let load = decode_tlut(256, 256, (0x300, 0x500)).unwrap();
+        let plan = load
+            .transfer_plan()
+            .expect("256-entry TLUT closes a transfer plan");
+        assert_eq!(plan.transfer_words(), 256);
+        assert_eq!(plan.logical_source_bytes(), 512);
+        assert_eq!(plan.destination_word(0).unwrap(), 256);
+        assert_eq!(plan.destination_word(255).unwrap(), 511);
+        for word in 0..256 {
+            assert_eq!(plan.defined_source_byte_mask(word).unwrap(), 0x03);
+        }
+    }
+
+    #[test]
+    fn destination_base_at_the_exact_256_boundary_is_accepted() {
+        let load = decode_tlut(256, 4, (0x300, 0x308)).unwrap();
+        assert!(load.transfer_plan().is_ok());
+    }
+
+    #[test]
+    fn destination_word_near_tmem_top_wraps_within_the_high_bank_only() {
+        // tmem=511, entries=2: 511 + 1 exceeds the 512-word space, but a
+        // TLUT destination must never wrap into low-half TMEM (words
+        // 0-255). It wraps through `project_tlut_high_bank_word`'s
+        // dedicated `0x100 | ((base + entry) & 0xff)` projection, landing
+        // back at word 256 -- not word 0, which the shared 512-word
+        // `& 0x01ff` linear mask Block/Tile use would (wrongly) produce.
+        let load = decode_tlut(511, 2, (0x300, 0x304)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.destination_word(0).unwrap(), 511);
+        assert_eq!(plan.destination_word(1).unwrap(), 256);
+    }
+
+    #[test]
+    fn destination_base_at_literal_256_stays_at_256() {
+        let load = decode_tlut(256, 1, (0x300, 0x302)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.destination_word(0).unwrap(), 256);
+    }
+
+    #[test]
+    fn destination_base_511_plus_one_entry_wraps_to_256_not_zero() {
+        let load = decode_tlut(511, 1, (0x300, 0x302)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.destination_word(0).unwrap(), 511);
+
+        let load = decode_tlut(511, 2, (0x300, 0x304)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.destination_word(1).unwrap(), 256);
+    }
+
+    #[test]
+    fn full_256_entry_high_bank_coverage_never_touches_low_half() {
+        let load = decode_tlut(256, 256, (0x300, 0x500)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        for word in 0..256u16 {
+            let destination = plan.destination_word(word).unwrap();
+            assert!(
+                (256..512).contains(&destination),
+                "TLUT destination word {destination} at entry {word} escaped the high bank"
+            );
+        }
+        // Base 256 with 256 entries exactly fills 256..512: entry 255 (the
+        // last real entry in this load) lands at word 511, the top of the
+        // high bank, with no wrap. A 256th entry beyond this load's declared
+        // count would be the one that wraps, back to word 256 -- not entry
+        // 255 itself.
+        assert_eq!(plan.destination_word(0).unwrap(), 256);
+        assert_eq!(plan.destination_word(255).unwrap(), 511);
+    }
+
+    #[test]
+    fn every_entry_of_a_511_base_load_stays_in_the_high_bank() {
+        // Regression for the exact bug this task repairs: a full 256-entry
+        // load based at the top of TMEM must still project every word into
+        // 256..512, never spilling into low-half TMEM at any entry index.
+        let load = decode_tlut(511, 256, (0x300, 0x500)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        for word in 0..256u16 {
+            let destination = plan.destination_word(word).unwrap();
+            assert!(
+                (256..512).contains(&destination),
+                "TLUT destination word {destination} at entry {word} escaped the high bank"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_ranges_are_disjoint_sorted_and_word_aligned() {
+        let load = decode_tlut(256, 16, (0x300, 0x320)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        for word in 0..16u16 {
+            match plan.physical_word(word).unwrap() {
+                TmemTransferPhysicalWord::Linear(range) => {
+                    let expected_start = (256 + u32::from(word)) * 8;
+                    assert_eq!(range.start(), expected_start);
+                    assert_eq!(range.end(), expected_start + 8);
+                }
+                TmemTransferPhysicalWord::SplitBanks { .. } => {
+                    panic!("LoadTLUT destination is always the linear high bank")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn destination_accesses_are_purpose_tagged_and_disjoint_from_source() {
+        let load = decode_tlut(256, 4, (0x300, 0x308)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.destination().access_count(), 1);
+        assert_eq!(plan.destination().total_bytes(), 32);
+    }
+
+    #[test]
+    fn source_plan_and_transfer_plan_agree_on_total_bytes() {
+        let load = decode_tlut(256, 16, (0x300, 0x320)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.source().total_bytes(), plan.logical_source_bytes());
+        assert_eq!(plan.source().total_bytes(), 32);
+    }
+
+    #[test]
+    fn no_source_tail_spill_every_destination_byte_is_defined_content() {
+        // Hostile per the task: a naive Block/Tile-style `div_ceil(8)`
+        // padding calculation would treat 6 of every 8 destination bytes as
+        // "undefined tail" since TLUT entries are 2 source bytes per 8-byte
+        // destination word. Quadrication means all 8 destination bytes are
+        // real, defined TMEM content -- `undefined_padding_bytes` regresses
+        // that. `defined_source_byte_mask` is a distinct, narrower fact: only
+        // the entry's 2 real *captured* source bytes (`0x03`), not the 6
+        // quadricated copies -- this regresses that distinction too, so a
+        // regression to either the old wrong padding count or a wrongly
+        // widened mask is caught here.
+        let load = decode_tlut(256, 3, (0x300, 0x306)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.transfer_words(), 3);
+        assert_eq!(plan.written_bytes(), 24);
+        assert_eq!(plan.logical_source_bytes(), 6);
+        assert_eq!(plan.undefined_padding_bytes(), 0);
+        for word in 0..3u16 {
+            assert_eq!(plan.defined_source_byte_mask(word).unwrap(), 0x03);
+        }
+    }
+
+    #[test]
+    fn logical_source_offset_is_sequential_two_bytes_per_entry() {
+        let load = decode_tlut(256, 4, (0x300, 0x308)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        assert_eq!(plan.logical_source_offset(0).unwrap(), 0);
+        assert_eq!(plan.logical_source_offset(1).unwrap(), 2);
+        assert_eq!(plan.logical_source_offset(2).unwrap(), 4);
+        assert_eq!(plan.logical_source_offset(3).unwrap(), 6);
+    }
+
+    #[test]
+    fn no_odd_row_bank_exchange_for_tlut() {
+        let load = decode_tlut(256, 4, (0x300, 0x308)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        for word in 0..4u16 {
+            assert!(!plan.word_uses_odd_row_exchange(word).unwrap());
+            assert_eq!(plan.row_advance_for_word(word).unwrap(), word);
+        }
+    }
+
+    #[test]
+    fn low_s_low_t_count_fraction_and_high_t_stay_rejected_before_this_tasks_code_runs() {
+        // Regression fixtures: M4.3.1 must not loosen the pre-existing
+        // public-macro-shape gate (`decode_load_tlut`, already present
+        // before this task). Each nonzero field is independently hostile.
+        let base = || {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(1, 0x300));
+            words.extend(set_tile(7, 256));
+            words.extend(load_sync());
+            words
+        };
+
+        let mut low_s = base();
+        low_s.extend([word(LOAD_TLUT, 1 << 12), 7 << 24]);
+        assert!(decode_raw_dpc(submit(hostile_packet(low_s)), &RdpState::default()).is_err());
+
+        let mut low_t = base();
+        low_t.extend([word(LOAD_TLUT, 1), 7 << 24]);
+        assert!(decode_raw_dpc(submit(hostile_packet(low_t)), &RdpState::default()).is_err());
+
+        let mut count_fraction = base();
+        count_fraction.extend([word(LOAD_TLUT, 0), 7 << 24 | 1 << 12]);
+        assert!(
+            decode_raw_dpc(submit(hostile_packet(count_fraction)), &RdpState::default()).is_err()
+        );
+
+        let mut high_t = base();
+        high_t.extend([word(LOAD_TLUT, 0), 7 << 24 | 1]);
+        assert!(decode_raw_dpc(submit(hostile_packet(high_t)), &RdpState::default()).is_err());
+    }
+
+    #[test]
+    fn destination_below_high_tmem_stays_rejected_before_this_tasks_code_runs() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(1, 0x300));
+        words.extend(set_tile(7, 255));
+        words.extend(load_sync());
+        words.extend(load_tlut(7, 0));
+        assert!(decode_raw_dpc(submit(hostile_packet(words)), &RdpState::default()).is_err());
+    }
+
+    #[test]
+    fn source_size_is_rejected_unless_bits16() {
+        // Public libultra `gbi.h` `gDPLoadTLUTCmd` always programs a 16-bit
+        // SetTextureImage; every other wire size (4/8/32-bit, encodings
+        // 0/1/3) must be rejected explicitly rather than silently mis-sized
+        // by `transfer_shape`'s `entries.get() * 2` byte math.
+        for size in [0_u32, 1, 3] {
+            let mut words = Vec::new();
+            words.extend(set_texture_image_sized(size, 1, 0x300));
+            words.extend(set_tile(7, 256));
+            words.extend(load_sync());
+            words.extend(load_tlut(7, 0));
+            assert!(
+                decode_raw_dpc(submit(hostile_packet(words)), &RdpState::default()).is_err(),
+                "SetTextureImage size encoding {size} must be rejected for LoadTLUT"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_size_is_rejected_unless_bits16() {
+        // The admitted TLUT load descriptor (`SetTile`'s size field) must
+        // independently match the public macro's 16-bit assumption -- a
+        // 16-bit source image paired with a differently sized destination
+        // tile descriptor is rejected too, not just a mismatched source.
+        for size in [0_u32, 1, 3] {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(1, 0x300));
+            words.extend(set_tile_sized(size, 7, 256));
+            words.extend(load_sync());
+            words.extend(load_tlut(7, 0));
+            assert!(
+                decode_raw_dpc(submit(hostile_packet(words)), &RdpState::default()).is_err(),
+                "SetTile size encoding {size} must be rejected for LoadTLUT"
+            );
+        }
+    }
+
+    #[test]
+    fn back_to_back_loads_to_overlapping_destinations_each_produce_independent_plans() {
+        // Two LoadTLUTs to overlapping destination word ranges in one
+        // packet: each command's own transfer plan is independently exact
+        // (physical-TMEM overlap resolution is M4.3.2's transaction
+        // machinery, not this task's).
+        let mut words = Vec::new();
+        words.extend(set_texture_image(1, 0x300));
+        words.extend(set_tile(7, 256));
+        words.extend(load_sync());
+        words.extend(load_tlut(7, 3));
+        words.extend(load_sync());
+        words.extend(load_tlut(7, 1));
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                words,
+                &[(0x300, 0x308), (0x300, 0x304)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTlut(first) = decoded.commands()[3].kind() else {
+            panic!("expected first LoadTLUT");
+        };
+        let RawDpcCommandKind::LoadTlut(second) = decoded.commands()[5].kind() else {
+            panic!("expected second LoadTLUT");
+        };
+        let first_plan = first.transfer_plan().unwrap();
+        let second_plan = second.transfer_plan().unwrap();
+        assert_eq!(first_plan.transfer_words(), 4);
+        assert_eq!(second_plan.transfer_words(), 2);
+        assert_eq!(first_plan.destination_word(0).unwrap(), 256);
+        assert_eq!(second_plan.destination_word(0).unwrap(), 256);
     }
 }
