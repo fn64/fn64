@@ -20,7 +20,7 @@
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY:1, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1, READY:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1, RUNNING:1 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -428,7 +428,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M3` |
-| state | `READY` |
+| state | `RUNNING` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | raw-DPC decoder/state writer |
 | branch | `port/m3-raw-dpc-decoder` -> `main` |
@@ -443,8 +443,10 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Admit only no-op variants, fill-cycle SetOtherMode, SetColorImage, SetFillColor, FillRectangle, and FullSync; unknown, truncated, unsupported, or state-invalid commands reject with workload/stream/chunk/source-offset/opcode context.
 - Use fn64-render's public raw-RDP command-width authority and accept all equivalent two-bit opcode-prefix spellings. RT64 remains candidate semantic evidence rather than parity authority.
 - The decoder and staged persistent state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets.
+- Independent review rejected borrowed-ticket decoding because one submission could mint duplicate move-only staged states; decoding needs a one-use authority.
+- The first candidate accepted raw transaction gaps, incorrectly rejected FullSync's unassigned payload bits, and changed M3.1's exact 8-word bridge into a different 10-word partially checked fixture.
 
-**Next action:** Implement the bounded decoder and transaction-local state delta with exact journal equality, hostile command tables, and two-packet staged-state tests; run the 10-process CPU bar before independent review.
+**Next action:** Add one-use decode authority, require exact transaction succession, restore general FullSync payload tolerance, preserve M3.1's exact 8-word wire fixture, and repeat independent review before the 10-process bar.
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 
