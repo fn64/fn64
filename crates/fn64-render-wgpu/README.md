@@ -76,15 +76,29 @@ planning cannot masquerade as raster completion. The RGBA5551/RGBA32 CPU
 pack/unpack oracles and the M3.3a `DeviceRgba16Bytes` narrowing seam are
 executable mechanism evidence only.
 
-This contract is deliberately not an implementation of GPU target allocation,
-raster execution, guest writes, VI filtering, headless capture, or
-presentation. It admits no depth image or depth write, no TMEM,
-textures, blending, coverage, multisampling, ray tracing, surface path, or
-performance/parity claim. Its byte-exact synthetic fixture is mechanism
-evidence, not the required real captured workload. It consumes no M2.5 shader
-artifact: a separately reviewed repository WGSL implementation may satisfy this
-one mechanism later, while any RT64 HLSL corpus claim must wait for M2.5's
-complete 56-artifact receipts.
+M3.3d adds one exact CPU-only VI/capture mechanism after that contract. It
+admits the complete fourteen-word register image for the synthetic 4x2 RGBA16
+target at origin `0x400`, stride four, a progressive field, 1:1 U2.10 scale,
+replicate mode, and every optional VI filter disabled. Its oracle consumes only
+M3.3a's typed `DeviceRgba16Bytes` domain and produces the frozen tightly packed
+BGRA8 bytes; N64Recomp backing-storage bytes cannot cross that API. VI and
+capture have separate typed resource plans. The capture extractor requires the
+exact presentation/capture identity and strips two 256-byte padded GPU-copy
+rows without admitting padding as visible pixels. Every fixed register,
+manager control, identity component, extent, pitch, and byte length has hostile
+mutation coverage. A repository-owned WGSL implementation parses and validates
+under Naga 30, but is not wired to a GPU pipeline or executed here.
+
+The combined contract is deliberately not an implementation of native target
+allocation, raster, RGBA16 packing, guest writes, a live `ViPresentation`
+adapter, GPU VI/filter execution, ordinary headless capture, or surface
+presentation. It admits no depth image or depth write, no TMEM, textures,
+blending, coverage, multisampling, ray tracing, interlacing, resampling,
+optional VI filters, surface path, or performance/parity claim. Its byte-exact
+synthetic fixture is mechanism evidence, not the required real captured
+workload. It consumes no M2.5 shader artifact: the M3.3d WGSL is a separately
+reviewed repository mechanism only, while any RT64 HLSL corpus claim must wait
+for M2.5's complete 56-artifact receipts.
 
 The retained GPU fixture is a lifecycle proof, not a broad RDP implementation.
 It continues to require the exact M3.1 eight-word DRAM stream: Set Color Image,
@@ -93,9 +107,9 @@ the fixture's selected fill-color value and one exact 16-byte RDRAM effect. Its
 FullSync remains at byte 24 and its observation timeline is exactly `CMD_END ->
 FullSync -> DP interrupt`. The fixed host evidence vector preserves RGBA byte
 order as `21 3c 4d 59` for each of four pixels. Effect bytes use render-IR's
-canonical digest, shared with the M1.2 guest-staging adapter. This slice does not claim
-TMEM, persistent framebuffer ownership, broad raster, VI, surface presentation,
-RT64 parity, or performance. Those remain later work in
+canonical digest, shared with the M1.2 guest-staging adapter. This slice does
+not claim TMEM, persistent framebuffer ownership, broad raster, live or GPU
+VI, surface presentation, RT64 parity, or performance. Those remain later work in
 [`../../docs/RENDER-WGPU-PORT-PLAN.md`](../../docs/RENDER-WGPU-PORT-PLAN.md).
 
 The lifecycle keeps the renderer's paired backend-completion authority private.
@@ -123,3 +137,6 @@ field interpretation follows the permitted MIT RT64 semantic source pinned by
 the port plan; no RT64 code is copied. The shader is a repository-owned
 mechanism fixture. No RT64 shader, C++, CMake, DXC artifact, GPL runtime
 implementation, texture hasher, game content, or excluded tool is used here.
+M3.3d's VI register/scale and RGBA5551 sources are recorded beside its code;
+its 256-byte row pitch is explicitly a wgpu mechanism rather than console
+behavior.
