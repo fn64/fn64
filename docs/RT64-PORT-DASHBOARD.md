@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T09:09:51Z` |
+| updated | `2026-08-16T09:32:45Z` |
 
 ## Milestones
 
@@ -20,7 +20,7 @@
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:5, RUNNING:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -572,21 +572,37 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M3` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m3_3c_raster_impl |
 | branch | `port/m3-3c-native-raster` -> `main` |
 | dependencies | `M3.3.1`, `M3.3.2` |
 | writable paths | `crates/fn64-render-wgpu/src/raster`, `crates/fn64-render-wgpu/src/device`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T09:04:42Z` / `2026-08-16T09:09:51Z` (elapsed 5m) |
-| verification runs meeting bar | 0/0 |
+| started / updated | `2026-08-16T09:04:42Z` / `2026-08-16T09:31:17Z` (elapsed 26m) |
+| verification runs meeting bar | 2/2 |
 
 **Findings:**
 
-- The implementation lane is active on the exact bounded fill; no accepted implementation, review verdict, verification receipt, or GPU evidence exists yet.
-- The slice must consume M3.3b's target/completion contract rather than fabricating residency, and it must not broaden into live VI, surface presentation, parity, or performance claims.
+- Commit 35116c76 executes the exact bounded raster fill, routes its typed RGBA16 output through M3.3d's fixed VI mechanism, validates bounded readback, commits the adjacent-byte-converted result to guest memory, and only then publishes the completed target through an infallible move-only capability.
+- The ordinary bar passed 10/10 with 81 unit tests and nine compile-fail doctests per run; the host-GPU bar passed 20/20 with 83 unit tests, including native GPU and cleanup/reuse coverage, plus nine compile-fail doctests per run.
+- A required host without a selected native adapter returns typed NoAdapter and fails closed; it is never counted as a skip or passing GPU result.
+- This proves only the exact 4x2 synthetic fill lifecycle: no general RDP or VI, live ViPresentation, surface, depth, TMEM, textures, blending, coverage, multisampling, ray tracing, interlacing, resampling, optional filters, RT64 parity, or performance result.
 
-**Next action:** Implement and independently review the exact wgpu raster submission, completion, readback, and typed target-write transition, then run the required deterministic and host-GPU bars.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --no-default-features` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-wgpu --features host-gpu-tests` | 20 | 20 | concurrency |
+
+**Next action:** Keep the exact mechanism bounded while later slices add separately reviewed real workloads and general RDP/VI behavior without weakening completion, guest-commit, or publication authority.
+
+**Retrospective:**
+
+- Friction: Independent review found that a failure after map_async could return without cancelling or unmapping the shared readback buffer, so operation N could poison the same resource's N+1 reuse.
+- Cause: Cleanup was distributed across completion branches instead of being owned by the mapped-resource lifetime.
+- Prevention: Use RAII cleanup for every mapped-range exit, name the exact N-to-N+1 reuse interleaving at the fix, and require failure at operation N followed by a successful same-resource operation N+1 in host-GPU tests.
+- Estimated minutes saved: 30
 
 ### `M3.3.4` -- M3.3d — Add one exact progressive/replicate VI CPU oracle, separate VI/capture plans, padded BGRA8 extraction, and a validated repository WGSL mechanism.
 

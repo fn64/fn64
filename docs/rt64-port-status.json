@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T09:09:51Z",
+    "updated_utc": "2026-08-16T09:32:45Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -855,16 +855,37 @@
         "crates/fn64-render-wgpu/README.md"
       ],
       "dependencies": ["M3.3.1", "M3.3.2"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
-        "The implementation lane is active on the exact bounded fill; no accepted implementation, review verdict, verification receipt, or GPU evidence exists yet.",
-        "The slice must consume M3.3b's target/completion contract rather than fabricating residency, and it must not broaden into live VI, surface presentation, parity, or performance claims."
+        "Commit 35116c76 executes the exact bounded raster fill, routes its typed RGBA16 output through M3.3d's fixed VI mechanism, validates bounded readback, commits the adjacent-byte-converted result to guest memory, and only then publishes the completed target through an infallible move-only capability.",
+        "The ordinary bar passed 10/10 with 81 unit tests and nine compile-fail doctests per run; the host-GPU bar passed 20/20 with 83 unit tests, including native GPU and cleanup/reuse coverage, plus nine compile-fail doctests per run.",
+        "A required host without a selected native adapter returns typed NoAdapter and fails closed; it is never counted as a skip or passing GPU result.",
+        "This proves only the exact 4x2 synthetic fill lifecycle: no general RDP or VI, live ViPresentation, surface, depth, TMEM, textures, blending, coverage, multisampling, ray tracing, interlacing, resampling, optional filters, RT64 parity, or performance result."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "cargo test -p fn64-render-wgpu --no-default-features",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "cargo test -p fn64-render-wgpu --features host-gpu-tests",
+          "clean_run_count": 20,
+          "required_run_count": 20,
+          "kind": "concurrency"
+        }
+      ],
       "blocker": null,
-      "next_action": "Implement and independently review the exact wgpu raster submission, completion, readback, and typed target-write transition, then run the required deterministic and host-GPU bars.",
+      "next_action": "Keep the exact mechanism bounded while later slices add separately reviewed real workloads and general RDP/VI behavior without weakening completion, guest-commit, or publication authority.",
       "started_utc": "2026-08-16T09:04:42Z",
-      "updated_utc": "2026-08-16T09:09:51Z"
+      "updated_utc": "2026-08-16T09:31:17Z",
+      "retrospective": {
+        "friction": "Independent review found that a failure after map_async could return without cancelling or unmapping the shared readback buffer, so operation N could poison the same resource's N+1 reuse.",
+        "cause": "Cleanup was distributed across completion branches instead of being owned by the mapped-resource lifetime.",
+        "prevention": "Use RAII cleanup for every mapped-range exit, name the exact N-to-N+1 reuse interleaving at the fix, and require failure at operation N followed by a successful same-resource operation N+1 in host-GPU tests.",
+        "estimated_minutes_saved": 30
+      }
     },
     {
       "id": "M3.3.4",
