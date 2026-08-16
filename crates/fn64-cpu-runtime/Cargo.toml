@@ -21,5 +21,5 @@ toml = "0.8"
 
 [dev-dependencies]
 fn64-recomp = { path = "../fn64-recomp" }
-fn64-recomp-rs-codegen = { path = "../fn64-recomp-rs-codegen" }
+fn64-cpu-runtime-codegen = { path = "../fn64-cpu-runtime-codegen" }
 serde_json = "1"

@@ -552,7 +552,7 @@ WM2000 inventory. Grepped only that crate.
 ## Correction: the "missing emit.rs" failure is a stale path, not a missing file
 
 `50d2c21` reported `generated_runner_build::tests::part1::independent_emitter_source_measurement_matches_the_linked_receipt`
-as failing because `fn64-recomp-rs-codegen/src/emit.rs` is "missing from disk
+as failing because `fn64-cpu-runtime-codegen/src/emit.rs` is "missing from disk
 entirely -- looks like a file-split in flight elsewhere."
 
 **Checked: the split is committed, not in flight.** `emit.rs` became the

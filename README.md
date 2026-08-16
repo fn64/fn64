@@ -106,7 +106,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); all C++ interop remains quarantined here |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-cpu-runtime` | Linked typed execution runtime for generated VR4300 Rust runners |
-| `fn64-recomp-rs-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |
+| `fn64-cpu-runtime-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |
 | `fn64-recomp` | N64Recomp adapter used by the comparison lane |
 | `fn64-audio` | RSP audio ucode execution |
 | `fn64-diff` | The first-divergence comparator (pure; no I/O) |

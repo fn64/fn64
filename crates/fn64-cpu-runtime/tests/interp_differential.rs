@@ -23,7 +23,7 @@ mod support;
 use support::dev_interpreter_rlib;
 
 use fn64_cpu_runtime::BankId;
-use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
+use fn64_cpu_runtime_codegen::{emit_bank_runner, BankInput};
 
 /// One synthetic bank plus the initial machine state to run it from. Every
 /// program's words decode to ordinary integer/control/memory ops (no FPU/COP0),

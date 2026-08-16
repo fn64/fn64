@@ -54,7 +54,7 @@ use fn64_discover::{
     FactDb, RecoveredOverlayInput, RomAddressSpace,
 };
 use fn64_cpu_runtime::execution::BankId;
-use fn64_recomp_rs_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
+use fn64_cpu_runtime_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1245,7 +1245,7 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
             continue;
         };
         // "libfn64_cpu_runtime" alone also matches
-        // "libfn64_recomp_rs_codegen-*.rlib" (a sibling crate in the same
+        // "libfn64_cpu_runtime_codegen-*.rlib" (a sibling crate in the same
         // deps directory); require the hyphen that starts the hash suffix
         // so the codegen crate's rlib is never mistaken for the runtime
         // crate's, which -- because both can share a build-batch mtime --

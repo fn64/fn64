@@ -213,7 +213,7 @@ Their fix: rewrite the backward `j` into a self-branch so N64Recomp emits
 mirrors "every sister's documented patch."
 
 **Does fn64 handle it? YES, and better — without a patch.**
-`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:1394-1400` detects a `j`/`b` to
+`crates/fn64-cpu-runtime-codegen/src/emit/mod.rs:1394-1400` detects a `j`/`b` to
 its own address and emits `pause_self()` directly. But note the crucial
 difference: **their fix requires an instruction patch because the loop is not
 already self-referential** — it is a two-instruction `jal`/`j` pair. Our
@@ -249,7 +249,7 @@ divide-by-zero asserts — are false positives, silently no-oping
 `Letterbox_Update`, `Interface_Draw`, `Camera_Normal1`, `KaleidoScope_Update`.
 
 **fn64 recovers automatically:** `compiler_div_guards_only()` at
-`crates/fn64-recomp-rs-codegen/src/bin/recompile_rom.rs:538` disassembles each
+`crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:538` disassembles each
 stub candidate and auto-un-stubs when its only traps are guarded div/overflow
 asserts (`auto_div_guards`, `:284-303`; tests `:974-997`). Jer's own
 `~/Code/aki-recomp` git log shows the same fight by hand — commits `9f06f81`
@@ -372,7 +372,7 @@ forever while the rest of the game keeps running — "gfx frozen, audio alive,"
 the hardest failure to diagnose because it looks like a rendering bug.
 
 **Do we handle it? NO — we have the same emission rule and no mitigation.**
-`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:1394-1400` emits `pause_self()`
+`crates/fn64-cpu-runtime-codegen/src/emit/mod.rs:1394-1400` emits `pause_self()`
 for any self-targeting `j`/`b`. We should distinguish *idle loops* (reached
 with other threads runnable) from *assert loops* (reached once, never exited),
 and at minimum make a thread that parks in `pause_self` and is never rescheduled

@@ -159,7 +159,7 @@ pub const GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V2: &str =
 /// runners.
 ///
 /// These files own typed RDRAM/MMIO routing, host-boundary exits, and
-/// block-program admission. `fn64-recomp-rs-codegen` issues the separate
+/// block-program admission. `fn64-cpu-runtime-codegen` issues the separate
 /// emitter-source receipt. Neither receipt says anything about a separately
 /// compiled callable; only the external build owner proves that relation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

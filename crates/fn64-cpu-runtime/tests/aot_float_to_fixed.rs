@@ -5,7 +5,7 @@
 //! exercised through the typed runtime tests in `isa_completeness.rs`.
 
 use fn64_cpu_runtime::BankId;
-use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
+use fn64_cpu_runtime_codegen::{emit_bank_runner, BankInput};
 
 #[derive(Clone, Copy)]
 struct Case {
