@@ -1,23 +1,22 @@
 //! Packet-level sequencing of every executable TMEM load in one decoded
 //! raw-DPC command stream.
 //!
-//! M4.2b's LoadTile ([`super::load_tile`]) and M4.2c's LoadBlock
-//! ([`super::load_block`]) executors each drive exactly one checked transfer
-//! through the M4.2a physical-TMEM typestate engine. Neither, nor
-//! [`crate::raw_dpc`], walks [`DecodedRawDpc::commands()`] and chains
-//! executors across every load declared by one packet. This module is that
-//! outer loop: it dispatches each ordered `LoadTile`/`LoadBlock` command to
-//! its executor, chains the resulting [`PhysicalTmemPacketTransaction`]
-//! across the whole packet, and seals it into one
-//! [`PendingTmemTransaction`]. `LoadTlut` has a valid, bindable transfer plan
-//! since M4.3.1 but no physical executor until M4.3.2, so it is refused
-//! loudly as a scope boundary before any load in the packet is staged; any
-//! YUV-deferred contract is refused the same way. Rejection is decided by a
-//! dedicated validation pass over every ordered command, run to completion
-//! before staging begins, so a later TLUT/YUV command can never be preceded
-//! by an already-staged earlier Tile/Block load — neither is silently
-//! omitted from the sealed transaction's destination coverage either way.
-//! RT64 is not hardware authority for this module.
+//! M4.2b's LoadTile ([`super::load_tile`]), M4.2c's LoadBlock
+//! ([`super::load_block`]), and M4.3.2's LoadTLUT ([`super::load_tlut`])
+//! executors each drive exactly one checked transfer through the M4.2a
+//! physical-TMEM typestate engine. None of them, nor [`crate::raw_dpc`],
+//! walks [`DecodedRawDpc::commands()`] and chains executors across every load
+//! declared by one packet. This module is that outer loop: it dispatches
+//! each ordered `LoadTile`/`LoadBlock`/`LoadTlut` command to its executor,
+//! chains the resulting [`PhysicalTmemPacketTransaction`] across the whole
+//! packet, and seals it into one [`PendingTmemTransaction`]. A YUV-deferred
+//! Tile/Block contract is refused loudly as a scope boundary before any load
+//! in the packet is staged. Rejection is decided by a dedicated validation
+//! pass over every ordered command, run to completion before staging begins,
+//! so a later YUV command can never be preceded by an already-staged earlier
+//! Tile/Block/TLUT load — neither is silently omitted from the sealed
+//! transaction's destination coverage either way. RT64 is not hardware
+//! authority for this module.
 
 use core::fmt;
 
@@ -31,7 +30,8 @@ use super::super::{
     PendingTmemTransaction, PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState,
 };
 use super::{
-    prepare_load_block, prepare_load_tile, LoadBlockExecutionError, LoadTileExecutionError,
+    prepare_load_block, prepare_load_tile, prepare_load_tlut, LoadBlockExecutionError,
+    LoadTileExecutionError, LoadTlutExecutionError,
 };
 
 /// Sequences every ordered executable TMEM load in `decoded.commands()` into
@@ -43,16 +43,16 @@ use super::{
 ///    (queue, submission ordinal/identity, workload, journal, and
 ///    memory-layout identity all typed-equal — see
 ///    [`validate_submitted_ticket`]), then every ordered command is scanned:
-///    a `LoadTlut` command or a `LoadTile`/`LoadBlock` command whose contract
-///    turns out to be YUV-deferred rejects the whole packet here. Nothing is
-///    staged and no [`PhysicalTmemPacketTransaction`] is constructed during
-///    this pass.
+///    a `LoadTile`/`LoadBlock` command whose contract turns out to be
+///    YUV-deferred rejects the whole packet here. Nothing is staged and no
+///    [`PhysicalTmemPacketTransaction`] is constructed during this pass.
 /// 2. **Execute.** Only once every command has cleared validation does this
-///    pass dispatch each `LoadTile`/`LoadBlock` to its M4.2b/M4.2c executor
-///    in decode order, chaining the result into one packet-local
-///    transaction. Because pass 1 already proved no TLUT/YUV command exists
-///    in this packet, pass 2 can never observe one; [`checked_load`] is the
-///    single helper both passes call so that can't drift apart.
+///    pass dispatch each `LoadTile`/`LoadBlock`/`LoadTlut` to its
+///    M4.2b/M4.2c/M4.3.2 executor in decode order, chaining the result into
+///    one packet-local transaction. Because pass 1 already proved no YUV
+///    command exists in this packet, pass 2 can never observe one;
+///    [`checked_load`] is the single helper both passes call so that can't
+///    drift apart.
 ///
 /// This function never silently omits a declared destination from the sealed
 /// transaction. Sealing (via [`PhysicalTmemPacketTransaction::into_pending`](
@@ -79,7 +79,7 @@ pub fn execute_ordered_tmem_loads(
 
     let mut packet: Option<PhysicalTmemPacketTransaction> = None;
     for command in decoded.commands() {
-        let Some((load, is_tile)) = checked_load(command.kind())? else {
+        let Some((load, load_kind)) = checked_load(command.kind())? else {
             continue;
         };
         let transfer = decoded
@@ -94,10 +94,10 @@ pub fn execute_ordered_tmem_loads(
             None => state.stage_transfer(submitted, &transfer),
         }
         .map_err(TmemPacketExecutionError::Physical)?;
-        packet = Some(if is_tile {
-            execute_tile(submitted, &transfer, staged)?
-        } else {
-            execute_block(submitted, &transfer, staged)?
+        packet = Some(match load_kind {
+            CheckedLoadKind::Tile => execute_tile(submitted, &transfer, staged)?,
+            CheckedLoadKind::Block => execute_block(submitted, &transfer, staged)?,
+            CheckedLoadKind::Tlut => execute_tlut(submitted, &transfer, staged)?,
         });
     }
     let packet = packet.ok_or(TmemPacketExecutionError::NoExecutableLoads)?;
@@ -106,36 +106,42 @@ pub fn execute_ordered_tmem_loads(
         .map_err(TmemPacketExecutionError::Physical)
 }
 
+/// Which executor one checked command's load dispatches to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckedLoadKind {
+    Tile,
+    Block,
+    Tlut,
+}
+
 /// Checked classification of one command's load, shared by both the
 /// validation pass and the execution pass so the two can never disagree
-/// about which commands are TLUT, YUV-deferred, or executable.
+/// about which commands are YUV-deferred or executable.
 ///
 /// Returns `Ok(None)` for a command that carries no TMEM load at all (it is
-/// simply skipped). Returns `Ok(Some((load, is_tile)))` for a `LoadTile`
-/// (`is_tile = true`) or `LoadBlock` (`is_tile = false`) command whose
-/// contract is not YUV-deferred. Returns `Err` for a `LoadTlut` command (in
-/// or out of scope, see [`TmemPacketExecutionError::TlutExecutorNotLanded`])
-/// or a Tile/Block command whose contract is YUV-deferred.
+/// simply skipped). Returns `Ok(Some((load, kind)))` for a `LoadTile`,
+/// `LoadBlock`, or `LoadTlut` command whose contract is not YUV-deferred.
+/// Returns `Err` for a Tile/Block command whose contract is YUV-deferred.
 ///
 /// This helper does not call [`crate::raw_dpc::RawDpcResourcePlan::bind_tmem_transfer`]
-/// itself for Tile/Block commands — the execution pass still needs the
+/// itself for Tile/Block/TLUT commands — the execution pass still needs the
 /// borrowed [`BoundTmemTransfer`] that call produces, and a second,
 /// independent lookup here would let the two passes see different contracts
 /// for the same command if the resource plan were ever position-dependent.
 /// Instead this helper inspects [`crate::TmemLoad::contract`] directly, the
 /// same source `bind_tmem_transfer` itself reads to decide the YUV-deferred
-/// case — so both passes reject on exactly the same fact.
+/// case — so both passes reject on exactly the same fact. TLUT loads are
+/// never YUV-deferred (`decode_load_tlut` requires a 16-bit RGBA source, and
+/// [`crate::TmemLoad::new`] always mints a `Transfer` contract, never a
+/// `DeferredYuv` one, for a `Tlut` kind), but this helper still checks the
+/// contract uniformly rather than special-casing TLUT around that check.
 fn checked_load(
     kind: RawDpcCommandKind,
-) -> Result<Option<(crate::TmemLoad, bool)>, TmemPacketExecutionError> {
-    let (load, is_tile) = match kind {
-        RawDpcCommandKind::LoadTlut(load) => {
-            return Err(TmemPacketExecutionError::TlutExecutorNotLanded {
-                epoch: load.epoch(),
-            });
-        }
-        RawDpcCommandKind::LoadTile(load) => (load, true),
-        RawDpcCommandKind::LoadBlock(load) => (load, false),
+) -> Result<Option<(crate::TmemLoad, CheckedLoadKind)>, TmemPacketExecutionError> {
+    let (load, load_kind) = match kind {
+        RawDpcCommandKind::LoadTlut(load) => (load, CheckedLoadKind::Tlut),
+        RawDpcCommandKind::LoadTile(load) => (load, CheckedLoadKind::Tile),
+        RawDpcCommandKind::LoadBlock(load) => (load, CheckedLoadKind::Block),
         _ => return Ok(None),
     };
     if let crate::TmemLoadContract::DeferredYuv { .. } = load.contract() {
@@ -144,7 +150,7 @@ fn checked_load(
             epoch: load.epoch(),
         });
     }
-    Ok(Some((load, is_tile)))
+    Ok(Some((load, load_kind)))
 }
 
 /// Validates that `submitted` is exactly `expected` (`decoded.submitted()`)
@@ -156,7 +162,6 @@ fn checked_load(
 /// analogous check elsewhere in this crate. A caller-supplied ticket that
 /// names a foreign queue or submission is rejected with this named identity
 /// error here, never surfacing as
-/// [`TmemPacketExecutionError::TlutExecutorNotLanded`] or
 /// [`TmemPacketExecutionError::NoExecutableLoads`].
 fn validate_submitted_ticket(
     submitted: &SubmittedTicket,
@@ -218,13 +223,25 @@ fn execute_block(
         .map_err(TmemPacketExecutionError::Block)
 }
 
+fn execute_tlut(
+    submitted: &SubmittedTicket,
+    transfer: &BoundTmemTransfer<'_>,
+    staged: super::super::StagedTmemTransaction,
+) -> Result<PhysicalTmemPacketTransaction, TmemPacketExecutionError> {
+    let prepared =
+        prepare_load_tlut(submitted, transfer).map_err(TmemPacketExecutionError::Tlut)?;
+    prepared
+        .execute(staged)
+        .map(super::ExecutedLoadTlut::into_packet)
+        .map_err(TmemPacketExecutionError::Tlut)
+}
+
 #[derive(Debug)]
 pub enum TmemPacketExecutionError {
     /// `submitted` is not exactly `decoded.submitted()` — queue, submission
     /// ordinal/identity, workload, journal, or memory-layout identity
     /// disagreed at the named `field`. Checked before any other exit, so a
-    /// foreign ticket can never surface as `TlutExecutorNotLanded` or
-    /// `NoExecutableLoads` instead.
+    /// foreign ticket can never surface as `NoExecutableLoads` instead.
     SubmissionMismatch {
         field: &'static str,
     },
@@ -236,21 +253,11 @@ pub enum TmemPacketExecutionError {
         error: TmemLoadSourcePlanError,
         epoch: crate::TmemLoadEpoch,
     },
-    /// A `LoadTlut` command appeared in the packet. Since M4.3.1,
-    /// `RawDpcResourcePlan::bind_tmem_transfer` produces a valid, bindable
-    /// `BoundTmemTransfer` for TLUT loads — the destination transfer-plan is
-    /// closed — but no physical executor (`prepare_load_tlut`, M4.3.2) exists
-    /// yet to actually write TMEM from it. This is a scope boundary, not a
-    /// bug and not a decode-time defer: the load is well-formed, this loop
-    /// simply refuses to execute it. The packet is rejected before any load
-    /// in it is staged.
-    TlutExecutorNotLanded {
-        epoch: crate::TmemLoadEpoch,
-    },
-    /// No `LoadTile`/`LoadBlock` command was present to execute.
+    /// No `LoadTile`/`LoadBlock`/`LoadTlut` command was present to execute.
     NoExecutableLoads,
     Tile(LoadTileExecutionError),
     Block(LoadBlockExecutionError),
+    Tlut(LoadTlutExecutionError),
     Physical(PhysicalTmemError),
 }
 
@@ -266,17 +273,11 @@ impl fmt::Display for TmemPacketExecutionError {
                 "TMEM packet load at epoch {} cannot execute physically yet: {error}",
                 epoch.get()
             ),
-            Self::TlutExecutorNotLanded { epoch } => write!(
-                formatter,
-                "TMEM packet LoadTLUT at epoch {} has a valid transfer plan but no physical \
-                 executor until M4.3.2",
-                epoch.get()
-            ),
-            Self::NoExecutableLoads => {
-                formatter.write_str("TMEM packet has no executable LoadTile/LoadBlock command")
-            }
+            Self::NoExecutableLoads => formatter
+                .write_str("TMEM packet has no executable LoadTile/LoadBlock/LoadTlut command"),
             Self::Tile(error) => error.fmt(formatter),
             Self::Block(error) => error.fmt(formatter),
+            Self::Tlut(error) => error.fmt(formatter),
             Self::Physical(error) => error.fmt(formatter),
         }
     }
@@ -586,10 +587,10 @@ mod tests {
         (words, ranges)
     }
 
-    // Genuine Tile -> TLUT -> Block: a valid LoadTile, then a LoadTLUT (no
-    // executor until M4.3.2), then a second valid load (LoadBlock). Proves
-    // TLUT rejects the whole packet regardless of position, including a
-    // still-valid executable load declared after it.
+    // Genuine Tile -> TLUT -> Block: a valid LoadTile, then a valid LoadTLUT
+    // (executable since M4.3.2), then a second valid load (LoadBlock). Used
+    // by `a_genuine_tile_tlut_block_packet_executes_all_three_in_decode_order`
+    // below to prove all three execute in decode order in one packet.
     fn tile_tlut_block_words(
         tile_address: u32,
         tlut_address: u32,
@@ -722,44 +723,157 @@ mod tests {
     }
 
     #[test]
-    fn a_load_tlut_command_is_rejected_loudly_before_any_load_stages() {
-        // Since M4.3.1, LoadTLUT decodes a real transfer plan with a
-        // journaled `TmemLoadDestination` claim in the high TMEM bank, so
-        // this fixture needs the same two-pass planning-probe round trip
-        // (`fixture`/`packet_from_words`) as the Tile/Block fixtures, not the
-        // single-pass, source-only construction the pre-M4.3.1 test used.
+    fn a_load_tlut_command_alone_dispatches_to_the_tlut_executor() {
+        // Since M4.3.2, a `LoadTlut` command is executed like any other
+        // executable load: it stages, dispatches to `execute_tlut`, and
+        // seals into a completed transaction.
         let (words, ranges) = tlut_words(0x300);
         let fixture = fixture(words, &ranges);
         let state = PhysicalTmemState::try_new().unwrap();
-        let result =
-            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded);
-        assert!(matches!(
-            result,
-            Err(TmemPacketExecutionError::TlutExecutorNotLanded { .. })
-        ));
-        // No load staged means the durable state must be untouched.
-        assert_eq!(state.generation(), 0);
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        assert_eq!(pending.completed_loads(), 1);
+        let mut state = state;
+        let committed = publish(&mut state, fixture, pending);
+        assert_eq!(committed.completed_loads(), 1);
+        assert_eq!(state.generation(), 1);
+        // Every byte of the high-bank destination word (tmem 256, byte
+        // address 0x800) must be valid and quadricated -- 2 real source
+        // bytes repeated across all four 16-bit lanes.
+        let base = 256 * 8;
+        for lane in 0..8_u16 {
+            assert!(state.byte_is_valid(base + lane));
+        }
+        let hi = state.valid_byte(base).unwrap();
+        let lo = state.valid_byte(base + 1).unwrap();
+        for lane in (0..8_u16).step_by(2) {
+            assert_eq!(state.valid_byte(base + lane), Some(hi));
+            assert_eq!(state.valid_byte(base + lane + 1), Some(lo));
+        }
     }
 
     #[test]
-    fn a_load_tlut_between_two_executable_loads_still_rejects_the_whole_packet() {
-        // Genuinely Tile -> TLUT -> Block: both the load before and the load
-        // after LoadTLUT are individually valid, executable commands. If the
-        // pre-stage validation pass (point 1) regressed back to staging
-        // while walking, the leading Tile load would already be staged by
-        // the time the loop reached LoadTLUT; this proves it never is.
+    fn a_genuine_tile_tlut_block_packet_executes_all_three_in_decode_order() {
+        // Genuinely Tile -> TLUT -> Block: proves the packet-level outer loop
+        // dispatches all three kinds, in decode order, into one chained
+        // transaction -- not just TLUT alone.
         let (words, ranges) = tile_tlut_block_words(0x200, 0x300, 0x400);
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        assert_eq!(pending.completed_loads(), 3);
+        let mut state = state;
+        let committed = publish(&mut state, fixture, pending);
+        assert_eq!(committed.completed_loads(), 3);
+        assert_eq!(state.generation(), 1);
+    }
+
+    // A single-word LoadTile targeting the SAME high-bank destination word
+    // (tmem 256) that `tlut_words` above also targets, so a Tile-then-TLUT
+    // packet exercises a genuine cross-kind overlap on one destination word.
+    fn tile_words_at_high_bank(image_address: u32) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let words = vec![
+            word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19 | 7),
+            image_address,
+            word(SET_TILE, 4 << 21 | 1 << 19 | 7 << 9 | 256),
+            7 << 24,
+            word(LOAD_SYNC, 0),
+            0,
+            word(LOAD_TILE, 0),
+            7 << 24 | 28 << 12,
+        ];
+        (words, vec![(image_address, image_address + 8)])
+    }
+
+    fn tile_then_tlut_same_word_words(
+        tile_address: u32,
+        tlut_address: u32,
+    ) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let (mut words, mut ranges) = tile_words_at_high_bank(tile_address);
+        let (tlut_words, tlut_ranges) = tlut_words(tlut_address);
+        words.extend(tlut_words);
+        ranges.extend(tlut_ranges);
+        (words, ranges)
+    }
+
+    #[test]
+    fn a_tlut_load_overwrites_an_earlier_tile_loads_same_destination_word_byte_for_byte() {
+        // Cross-kind overlap: LoadTile writes tmem word 256 first (8 real
+        // source bytes, one-for-one), then a LoadTLUT in the same packet
+        // targets the SAME word (tmem_base 256). Last-writer-wins must hold
+        // across kinds, not just within one kind (`overlapping_loads_publish_
+        // only_the_last_loads_defined_lanes` in `load_tlut.rs` already covers
+        // same-kind TLUT/TLUT overlap) -- every one of the 8 destination
+        // bytes must be the TLUT's quadricated `[hi, lo]` pair, not any of
+        // the Tile load's literal bytes.
+        // Distinct low bytes so the Tile load's literal content and the
+        // TLUT's quadricated content can never coincidentally match at any
+        // lane -- the byte-for-byte disproof below stays meaningful.
+        let tile_address = 0x210_u32;
+        let tlut_address = 0x340_u32;
+        let (words, ranges) = tile_then_tlut_same_word_words(tile_address, tlut_address);
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        assert_eq!(pending.completed_loads(), 2);
+        let mut state = state;
+        let committed = publish(&mut state, fixture, pending);
+        assert_eq!(committed.completed_loads(), 2);
+        assert_eq!(state.generation(), 1);
+
+        let base = 256 * 8;
+        // The fixture's capture fills every source byte with `address as
+        // u8`; the TLUT source is 2 bytes at `tlut_address`.
+        let hi = tlut_address as u8;
+        let lo = (tlut_address + 1) as u8;
+        let expected: [u8; 8] = [hi, lo, hi, lo, hi, lo, hi, lo];
+        for (lane, expected_byte) in expected.iter().copied().enumerate() {
+            let lane = lane as u16;
+            assert!(state.byte_is_valid(base + lane));
+            assert_eq!(state.valid_byte(base + lane), Some(expected_byte));
+            // None of the Tile load's own literal bytes (`tile_address +
+            // lane`) may remain -- the exact literal-byte disproof the
+            // review asked for.
+            assert_ne!(
+                state.valid_byte(base + lane),
+                Some((tile_address as u16 + lane) as u8),
+                "byte {lane} still shows the overwritten Tile load's literal content"
+            );
+            assert_eq!(state.last_touched_generation(base + lane), Some(1));
+        }
+    }
+
+    #[test]
+    fn a_tlut_load_before_a_later_yuv_deferred_block_rejects_the_whole_packet_unstaged() {
+        // TLUT is now executable, so this specifically proves the pre-stage
+        // validation pass still catches a LATER YUV-deferred command even
+        // when an earlier TLUT command in the same packet is itself
+        // perfectly valid and executable: if the loop staged the TLUT load
+        // while walking (regressing to pre-validation-pass behavior) before
+        // reaching the YUV-deferred load, durable state would already
+        // reflect a staged transaction by the time this call returns.
+        let (mut words, mut ranges) = tlut_words(0x300);
+        let (yuv_words, yuv_ranges) = yuv_block_words(0x500);
+        words.extend(yuv_words);
+        ranges.extend(yuv_ranges);
         let fixture = fixture(words, &ranges);
         let state = PhysicalTmemState::try_new().unwrap();
         let result =
             execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded);
         assert!(matches!(
             result,
-            Err(TmemPacketExecutionError::TlutExecutorNotLanded { .. })
+            Err(TmemPacketExecutionError::DeferredLoadKind {
+                error: TmemLoadSourcePlanError::YuvExecutionDeferred,
+                ..
+            })
         ));
         // No load staged means the durable state must be untouched, even
-        // though both the Tile load before and the Block load after LoadTLUT
-        // were themselves individually valid.
+        // though the TLUT load earlier in the packet was itself valid.
         assert_eq!(state.generation(), 0);
     }
 

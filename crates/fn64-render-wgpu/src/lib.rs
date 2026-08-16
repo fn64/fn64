@@ -28,8 +28,16 @@
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
 //! is not hardware authority for this slice. M4.2a does not execute guest
-//! reads, assemble backend reports, issue lifecycle receipts, run LoadTLUT,
-//! migrate production dispatch, or establish parity or performance.
+//! reads, assemble backend reports, issue lifecycle receipts, migrate
+//! production dispatch, or establish parity or performance.
+//! M4.3.2 adds a LoadTLUT executor (`tmem/execute/load_tlut.rs`) alongside
+//! M4.2b/M4.2c's LoadTile/LoadBlock executors: it consumes one checked
+//! LoadTLUT transfer and the submitted packet's owned guest reads, then
+//! quadricates each entry's 2 captured source bytes into all four 16-bit
+//! lanes of its high-bank destination word through the same M4.2a
+//! move-only staged-transaction API. Like its siblings it returns only
+//! transaction-local state; it does not publish durable bytes or issue a
+//! lifecycle receipt.
 //!
 //! Downstream callers cannot relabel logical source bytes as physical TMEM
 //! lanes; the bounded assertion constructor is crate-private:
@@ -230,12 +238,13 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, CommittedTmemTransaction,
-    DefinedPhysicalTmemWordBytes, ExecutedLoadBlock, ExecutedLoadTile, GpuBoundTmemTransaction,
-    LoadBlockExecutionError, LoadTileExecutionError, PendingTmemTransaction, PhysicalTmemBinding,
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority,
-    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
-    PreparedLoadBlock, PreparedLoadTile, StagedTmemTransaction, TextureImage, TileAddressMode,
+    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, prepare_load_tlut,
+    CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, ExecutedLoadBlock, ExecutedLoadTile,
+    ExecutedLoadTlut, GpuBoundTmemTransaction, LoadBlockExecutionError, LoadTileExecutionError,
+    LoadTlutExecutionError, PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
+    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PreparedLoadBlock,
+    PreparedLoadTile, PreparedLoadTlut, StagedTmemTransaction, TextureImage, TileAddressMode,
     TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt,
     TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind,
     TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
