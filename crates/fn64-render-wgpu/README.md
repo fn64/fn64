@@ -203,6 +203,67 @@ caller assembles the packet-wide `BackendEffectReport` (TMEM proposals from
 `pending.proposed_effects()` plus any other declared writes from the same
 packet) and drives the remaining ticket/publication steps itself.
 
+M4.3.3a adds `tmem::RawTexel`, a format-neutral raw-value carrier, and
+`tmem::decode_direct_texel`, a pure, allocation-free decoder for exactly the
+seven console "direct" `(format, size)` pairs that read one texel's color
+straight out of TMEM without a palette lookup: RGBA16, RGBA32, IA4, IA8,
+IA16, I4, and I8. `RawTexel::try_new(size, value)` is the sole constructor;
+its fields are private, so a caller cannot assemble an already-invalid
+instance. It loudly rejects (typed `RawTexelError`, never masked or
+truncated) a `value` that does not fit `size`'s defined bit width — 4, 8, 16,
+or 32 bits — and multi-byte values combine big-endian, matching the rest of
+this crate's `to_be_bytes`/`from_be_bytes` convention. `RawTexel` takes no
+position on which `(format, size)` pairs are meaningful, so later CI/TLUT and
+YUV decode layers can reuse the same carrier for their own raw values ahead
+of a palette lookup or chroma conversion.
+`decode_direct_texel(format, raw)` then classifies `format` against an
+already-width-valid `RawTexel` and maps it to one `DecodedTexel` RGBA8888
+color, or a typed `DirectTexelDecodeError` naming why the pair is not one of
+the seven direct pairs: `IndexedDecodeIsSeparate` for `ColorIndex` (decoded
+through a separate, TLUT-aware indexed path this module never runs),
+`YuvConversionDeferred` for `Yuv` (per M4.3's scope), and `UnsupportedPair`
+for every other combination (for example 4-bit or 8-bit direct RGBA, which
+the console does not define as real formats). All three types and both
+functions use no `Option`, no `unsafe`, and no allocation. Nothing here reads
+TMEM, RDRAM, a CI palette, a TLUT, or a GPU; this is a pure function of an
+already-isolated raw texel value.
+
+Decode formulas are transcribed from the permitted MIT RT64 Rust-port source
+pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
+(`docs/RT64-PORT-AUTHORITY.md`): `src/shaders/Formats.hlsli` (digest
+`9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b`) for
+`I4ToFloat4`, `IA4ToFloat4`, `I8ToFloat4`, `IA8ToFloat4`, `RGBA16ToFloat4`,
+`IA16ToFloat4`, and `RGBA32ToFloat4`; and `src/shaders/TextureDecoder.hlsli`
+(digest `63b2c1ce683e7e7880c9508d3232d90e90236157ac86ae91947c62ae1d359f07`),
+whose `sampleTMEM4b`/`sampleTMEM8b`/`sampleTMEM16b`/`sampleTMEM32b` select
+those functions. Which `(format, size)` pairs are legal at all is the public
+SGI *RDP Command Summary* Table 4 image-data-format legality matrix. The
+format and size selector encodings dispatched on here are not owned by this
+module: SetTextureImage (Table 3) and SetTile (Table 6) each define both the
+`G_IM_FMT_*` format field and the `G_IM_SIZ_*` size field on their own
+command word, and both are already transcribed in this crate at
+`ImageFormat`/`PixelSize` (`tmem/wire.rs`) — this module reuses that prior
+transcription rather than re-deriving selector values. Exact source line
+ranges are cited at each decode function in `tmem/texel.rs`. RT64's
+TMEM-address and four-bit RGBA/I aliasing ("not a real format, replicated by
+observing hardware behavior") are read for citation only and are out of this
+slice's scope. RT64's CI dispatch is read for citation only, not asserted
+here: per the pinned source's `sampleTMEM` (TextureDecoder.hlsli:149-208),
+`ColorIndex` resolves against a TLUT only while a TLUT is active, and
+otherwise (`CI8`/`CI16`/`CI32`) decodes identically to the corresponding
+`Intensity` pair — CI does not unconditionally mean a palette lookup, and
+this slice takes no position on which side applies. No RT64 code is copied;
+only the numeric decode formula is transcribed, matching this crate's
+existing `raster.rs` and `state.rs` provenance convention.
+
+This slice makes none of the following claims: TMEM addressing, storage, or
+byte validity; RDRAM or physical-source correctness; CI palette resolution or
+TLUT contents; YUV/chroma conversion; bilinear or box filtering; GPU upload
+or dispatch; or RT64 pixel-for-pixel parity. It does not consume M4.2's
+physical TMEM state or M4.0's guest-read plans; it is a standalone pure
+function pending a later slice that reads an already-resolved texel value out
+of physical TMEM and calls it.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction
