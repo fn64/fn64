@@ -307,9 +307,11 @@ mod tests {
     use crate::raw_dpc::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError};
     use crate::tmem::{LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE};
     use crate::{
-        decode_direct_texel, read_committed_texel, AddressedTmemTexel, ImageFormat,
-        PhysicalTexelReadError, PhysicalTmemState, PixelSize, RawTexel, RdpState, TextureLutMode,
-        TileAddressMode, TileDescriptor, TmemFirstRowParity, TmemWordAddress,
+        decode_direct_texel, read_committed_texel, sample_committed_point, AddressedTmemTexel,
+        ImageFormat, PhysicalTexelReadError, PhysicalTmemState, PixelSize, PointSampleCoordinates,
+        PointSampleRequest, RawTexel, RdpState, TextureCoordinateS10_5, TextureLutMode,
+        TileAddressMode, TileCoordinate, TileDescriptor, TileSize, TmemFirstRowParity,
+        TmemLoadEpoch, TmemWordAddress,
     };
 
     const LAYOUT_BYTES: u32 = 0x4000;
@@ -319,6 +321,34 @@ mod tests {
         decoded: crate::DecodedRawDpc,
         backend: BackendCompletionAuthority,
         guest: GuestCommitAuthority,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurableObservation {
+        valid_bytes: Vec<Option<u8>>,
+        validity: Vec<bool>,
+        touch_generations: Vec<Option<u64>>,
+        generation: u64,
+        epoch: Option<TmemLoadEpoch>,
+    }
+
+    fn observe_durable(state: &PhysicalTmemState) -> DurableObservation {
+        let addresses = 0_u16..4096;
+        DurableObservation {
+            valid_bytes: addresses
+                .clone()
+                .map(|address| state.valid_byte(address))
+                .collect(),
+            validity: addresses
+                .clone()
+                .map(|address| state.byte_is_valid(address))
+                .collect(),
+            touch_generations: addresses
+                .map(|address| state.last_touched_generation(address))
+                .collect(),
+            generation: state.generation(),
+            epoch: state.last_load_epoch(),
+        }
     }
 
     fn word(opcode: u8, payload: u32) -> u32 {
@@ -676,6 +706,15 @@ mod tests {
         )
     }
 
+    fn reader_size(low_s: u16, low_t: u16, high_s: u16, high_t: u16) -> TileSize {
+        TileSize::from_wire(
+            TileCoordinate::try_new(low_s).unwrap(),
+            TileCoordinate::try_new(low_t).unwrap(),
+            TileCoordinate::try_new(high_s).unwrap(),
+            TileCoordinate::try_new(high_t).unwrap(),
+        )
+    }
+
     fn direct_reader_words() -> (Vec<u32>, Vec<(u32, u32)>) {
         let linear_address = 0x201;
         let rgba32_address = 0x220;
@@ -928,6 +967,127 @@ mod tests {
     }
 
     #[test]
+    fn committed_point_sampler_preserves_snapshot_and_caller_selected_row_parity() {
+        let (words, ranges) = direct_reader_words();
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+
+        let tile = reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 511, 0);
+        let size = reader_size(0, 0, 28, 4);
+        let coordinates = PointSampleCoordinates::new(
+            TextureCoordinateS10_5::from_raw(0),
+            TextureCoordinateS10_5::from_raw(0),
+        );
+        let before = observe_durable(&state);
+
+        let even = sample_committed_point(
+            &state,
+            tile,
+            size,
+            PointSampleRequest::new(coordinates, TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        let odd = sample_committed_point(
+            &state,
+            tile,
+            size,
+            PointSampleRequest::new(coordinates, TmemFirstRowParity::Odd),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+
+        assert_eq!(even.texel().rgba8888(), [0x0c; 4]);
+        assert_eq!(odd.texel().rgba8888(), [0x08; 4]);
+        assert_eq!(even.snapshot(), odd.snapshot());
+        assert_eq!(even.snapshot().state(), state.identity());
+        assert_eq!(even.snapshot().generation(), before.generation);
+        assert_eq!(observe_durable(&state), before);
+    }
+
+    #[test]
+    fn committed_point_sampler_decodes_every_direct_format_with_exact_colors() {
+        let (words, ranges) = direct_reader_words();
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+
+        let coordinates = |column: u16| {
+            PointSampleRequest::new(
+                PointSampleCoordinates::new(
+                    TextureCoordinateS10_5::from_raw((column * 32) as i16),
+                    TextureCoordinateS10_5::from_raw(0),
+                ),
+                TmemFirstRowParity::Even,
+            )
+        };
+        let cases = [
+            (ImageFormat::Rgba, PixelSize::Bits16, 0, [0, 33, 8, 0]),
+            (
+                ImageFormat::IntensityAlpha,
+                PixelSize::Bits4,
+                1,
+                [0, 0, 0, 255],
+            ),
+            (
+                ImageFormat::IntensityAlpha,
+                PixelSize::Bits8,
+                1,
+                [0, 0, 0, 34],
+            ),
+            (
+                ImageFormat::IntensityAlpha,
+                PixelSize::Bits16,
+                1,
+                [3, 3, 3, 4],
+            ),
+            (
+                ImageFormat::Intensity,
+                PixelSize::Bits4,
+                1,
+                [17, 17, 17, 17],
+            ),
+            (ImageFormat::Intensity, PixelSize::Bits8, 4, [5, 5, 5, 5]),
+        ];
+        let before = observe_durable(&state);
+        for (format, size, column, expected) in cases {
+            let actual = sample_committed_point(
+                &state,
+                reader_tile(format, size, 1, 8, 0),
+                reader_size(0, 0, 28, 0),
+                coordinates(column),
+                TextureLutMode::Disabled,
+            )
+            .unwrap();
+            assert_eq!(actual.texel().rgba8888(), expected);
+            assert_eq!(actual.snapshot().state(), state.identity());
+            assert_eq!(actual.snapshot().generation(), before.generation);
+        }
+
+        let rgba32 = sample_committed_point(
+            &state,
+            reader_tile(ImageFormat::Rgba, PixelSize::Bits32, 1, 16, 0),
+            reader_size(0, 0, 4, 0),
+            coordinates(0),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(rgba32.texel().rgba8888(), [32, 33, 34, 35]);
+        assert_eq!(rgba32.snapshot().state(), state.identity());
+        assert_eq!(rgba32.snapshot().generation(), before.generation);
+        assert_eq!(observe_durable(&state), before);
+    }
+
+    #[test]
     fn committed_reader_resolves_absolute_offset_tlut_for_ci4_and_ci8() {
         // Programming Manual section 13.8's partial-CI8 pattern: palette
         // indices 40..=69 occupy absolute TMEM words 256+40 through 256+69.
@@ -1000,9 +1160,52 @@ mod tests {
     }
 
     #[test]
+    fn committed_point_sampler_resolves_ci4_rgba16_and_ci8_ia16_exactly() {
+        let (words, ranges) = ci_and_offset_tlut_reader_words();
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+        let before = observe_durable(&state);
+        let request = PointSampleRequest::new(
+            PointSampleCoordinates::new(
+                TextureCoordinateS10_5::from_raw(0),
+                TextureCoordinateS10_5::from_raw(0),
+            ),
+            TmemFirstRowParity::Even,
+        );
+
+        let ci4 = sample_committed_point(
+            &state,
+            reader_tile(ImageFormat::ColorIndex, PixelSize::Bits4, 1, 1, 2),
+            reader_size(0, 0, 4, 0),
+            request,
+            TextureLutMode::Rgba16,
+        )
+        .unwrap();
+        assert_eq!(ci4.texel().rgba8888(), [0, 0, 0, 255]);
+        assert_eq!(ci4.snapshot().state(), state.identity());
+        assert_eq!(ci4.snapshot().generation(), before.generation);
+
+        let ci8 = sample_committed_point(
+            &state,
+            reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 15),
+            reader_size(0, 0, 4, 0),
+            request,
+            TextureLutMode::Ia16,
+        )
+        .unwrap();
+        assert_eq!(ci8.texel().rgba8888(), [0, 0, 0, 1]);
+        assert_eq!(ci8.snapshot(), ci4.snapshot());
+        assert_eq!(observe_durable(&state), before);
+    }
+
+    #[test]
     fn committed_reader_rejects_partial_and_unequal_tlut_words() {
         let ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
-        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
 
         let (words, ranges) = ci_and_hostile_tlut_word_words(2);
         let partial_fixture = fixture(words, &ranges);
@@ -1015,13 +1218,25 @@ mod tests {
         .unwrap();
         let mut partial = state;
         publish(&mut partial, partial_fixture, pending);
-        assert_eq!(
-            read_committed_texel(&partial, ci8, addressed, TextureLutMode::Rgba16),
-            Err(PhysicalTexelReadError::IncompleteTlutEntry {
-                byte_address: 0x800,
-                valid_mask: 0x03,
-            })
+        let request = PointSampleRequest::new(
+            PointSampleCoordinates::new(
+                TextureCoordinateS10_5::from_raw(0),
+                TextureCoordinateS10_5::from_raw(0),
+            ),
+            TmemFirstRowParity::Even,
         );
+        let size = reader_size(0, 0, 0, 0);
+        let partial_before = observe_durable(&partial);
+        assert_eq!(
+            sample_committed_point(&partial, ci8, size, request, TextureLutMode::Rgba16,),
+            Err(crate::PointSampleError::Read(
+                PhysicalTexelReadError::IncompleteTlutEntry {
+                    byte_address: 0x800,
+                    valid_mask: 0x03,
+                }
+            ))
+        );
+        assert_eq!(observe_durable(&partial), partial_before);
 
         let (words, ranges) = ci_and_hostile_tlut_word_words(8);
         let fixture = fixture(words, &ranges);
@@ -1031,13 +1246,17 @@ mod tests {
                 .unwrap();
         let mut unequal = state;
         publish(&mut unequal, fixture, pending);
+        let unequal_before = observe_durable(&unequal);
         assert_eq!(
-            read_committed_texel(&unequal, ci8, addressed, TextureLutMode::Ia16),
-            Err(PhysicalTexelReadError::NonCanonicalTlutEntry {
-                byte_address: 0x800,
-                lanes: [0x0001, 0x0203, 0x0405, 0x0607],
-            })
+            sample_committed_point(&unequal, ci8, size, request, TextureLutMode::Ia16),
+            Err(crate::PointSampleError::Read(
+                PhysicalTexelReadError::NonCanonicalTlutEntry {
+                    byte_address: 0x800,
+                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
+                }
+            ))
         );
+        assert_eq!(observe_durable(&unequal), unequal_before);
     }
 
     #[test]
