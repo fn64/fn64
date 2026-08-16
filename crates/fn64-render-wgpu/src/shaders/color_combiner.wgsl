@@ -1,6 +1,6 @@
 // RT64 color combiner: selector decode and one-cycle arithmetic.
 //
-// Characterization-first port, Slice 1 of
+// Characterization-first port, Slice 2 of
 // /private/tmp/rt64-combiner-characterization-card.md
 // (sha256 e67751ff975eaf970b8179b2b62bd0093ccddac3d73c3dc0539b611006b345a).
 // Source: MIT RT64, pinned commit 5473732a822a4423b5696e7cb18fecc425a59875,
@@ -17,12 +17,12 @@
 // decodeColorInput/decodeAlphaInput bit-for-bit, including NOISE/
 // KEY_CENTER/KEY_SCALE/K4/K5/LOD_FRACTION/PRIM_LOD_FRAC/*_ALPHA — only
 // genuine RT64 out-of-range indices alias ZERO, matching the pinned
-// source's own `default:` arms). Scope narrowing happens one layer later,
-// in resolve_color_input/resolve_alpha_input (the arithmetic layer): only
-// COMBINED/TEXEL0/TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO are
-// evaluated there; any other selector returns the OUT_OF_SCOPE success
-// flag rather than a silently substituted ZERO. One-cycle mode only, no
-// two-cycle/copy mode/draw wiring.
+// source's own `default:` arms). Slice 2 extends resolve_color_input/
+// resolve_alpha_input (the arithmetic layer) to evaluate every selector
+// either table can produce — there is no remaining out-of-scope selector in
+// one-cycle mode. NOISE/LOD_FRACTION/PRIM_LOD_FRAC/K4/K5/KEY_CENTER/
+// KEY_SCALE are caller-supplied CombinerInputs fields, not generated here.
+// One-cycle mode only, no two-cycle/copy mode/draw wiring.
 //
 // Selector encoding below matches RT64's enum ordinal order exactly
 // (rt64_color_combiner.h ColorInput/AlphaInput), so a decode function's
@@ -67,12 +67,6 @@ const SLOT_A: u32 = 0u;
 const SLOT_B: u32 = 1u;
 const SLOT_C: u32 = 2u;
 const SLOT_D: u32 = 3u;
-
-// `Combiner selector is out of Slice 1 scope` — the sentinel this module's
-// functions return instead of silently substituting ZERO. Not one of the
-// encoded selector values above, so a caller can distinguish "decoded to
-// ZERO" from "decoded to something Slice 1 doesn't implement yet."
-const OUT_OF_SCOPE: u32 = 0xffffffffu;
 
 struct CombineParams {
     low: u32,
@@ -251,65 +245,90 @@ fn decode_alpha(params: CombineParams, slot: u32, second_cycle: bool) -> u32 {
     }
 }
 
+// Mirrors RT64's Inputs struct (rt64_color_combiner.h:451-466) restricted to
+// the fields a one-cycle formula can reach (otherMode/alphaOnly are
+// two-cycle/copy-mode-only concerns, Slice 3+). key_center/key_scale/
+// lod_fraction/prim_lod_frac/noise/k4/k5 are caller-supplied — this file has
+// no PRNG or derivative implementation and does not invent one; see
+// combiner.rs's matching struct doc for the full per-field provenance note.
 struct CombinerInputs {
     tex_val0: vec4<f32>,
     tex_val1: vec4<f32>,
     prim_color: vec4<f32>,
     shade_color: vec4<f32>,
     env_color: vec4<f32>,
+    key_center: vec3<f32>,
+    key_scale: vec3<f32>,
+    lod_fraction: f32,
+    prim_lod_frac: f32,
+    noise: f32,
+    k4: f32,
+    k5: f32,
 }
 
-// Resolves one color selector to RGB, per `fromColorInput`. `combiner_color`
-// stands in for RT64's `combinerColor.rgb` accumulator, always [0,0,0] in
-// one-cycle mode (RT64 `run`'s zero-init, unwritten before the single
-// `runCycle` call) — see combiner.rs's matching function for the full note,
-// including why the TEXEL0/TEXEL1 secondCycle swap never triggers here.
-// This is the ONLY place selector scope is narrowed in this file: `selector`
-// may legitimately be any value decode_color/decode_alpha can produce
-// (including NOISE, KEY_CENTER, etc. — decode above is exact), and every
-// value outside {COMBINED, TEXEL0, TEXEL1, PRIMITIVE, SHADE, ENVIRONMENT,
-// ONE, ZERO} falls to `default`, which reports OUT_OF_SCOPE via the success
-// flag rather than substituting a wrong value for it. Returns vec4(rgb, 1.0)
-// on success or vec4(_, _, _, 0.0) — the w component is a success flag,
-// since WGSL has no Result type (component xyz are then 0.0, not
-// meaningful, since the selector's real arithmetic was never evaluated).
-fn resolve_color_input(inputs: CombinerInputs, combiner_color: vec3<f32>, selector: u32) -> vec4<f32> {
+// Resolves one color selector to RGB, per `fromColorInput`
+// (rt64_color_combiner.h:468-514). `combiner_color` stands in for RT64's
+// `combinerColor.rgb` accumulator, always [0,0,0] in one-cycle mode (RT64
+// `run`'s zero-init, unwritten before the single `runCycle` call);
+// `combiner_alpha` stands in for `combinerColor.a`, read by the
+// COMBINED_ALPHA cross-read below — see combiner.rs's matching function for
+// the full note, including why the TEXEL0/TEXEL1 secondCycle swap never
+// triggers here. Every ColorInput value this file's decode tables can
+// produce is evaluated — no remaining out-of-scope selector in one-cycle
+// mode. `*_ALPHA`/COMBINED_ALPHA read the named input's alpha channel,
+// replicated into all three RGB lanes (RT64's `return combinerColor.a;`
+// etc., an HLSL scalar-to-float3 implicit broadcast).
+fn resolve_color_input(inputs: CombinerInputs, combiner_color: vec3<f32>, combiner_alpha: f32, selector: u32) -> vec3<f32> {
     switch selector {
-        case COLOR_COMBINED: { return vec4<f32>(combiner_color, 1.0); }
-        case COLOR_TEXEL0: { return vec4<f32>(inputs.tex_val0.rgb, 1.0); }
-        case COLOR_TEXEL1: { return vec4<f32>(inputs.tex_val1.rgb, 1.0); }
-        case COLOR_PRIMITIVE: { return vec4<f32>(inputs.prim_color.rgb, 1.0); }
-        case COLOR_SHADE: { return vec4<f32>(inputs.shade_color.rgb, 1.0); }
-        case COLOR_ENVIRONMENT: { return vec4<f32>(inputs.env_color.rgb, 1.0); }
-        case COLOR_ONE: { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
-        case COLOR_ZERO: { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
-        default: { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+        case COLOR_COMBINED: { return combiner_color; }
+        case COLOR_TEXEL0: { return inputs.tex_val0.rgb; }
+        case COLOR_TEXEL1: { return inputs.tex_val1.rgb; }
+        case COLOR_PRIMITIVE: { return inputs.prim_color.rgb; }
+        case COLOR_SHADE: { return inputs.shade_color.rgb; }
+        case COLOR_ENVIRONMENT: { return inputs.env_color.rgb; }
+        case COLOR_KEY_CENTER: { return inputs.key_center; }
+        case COLOR_KEY_SCALE: { return inputs.key_scale; }
+        case COLOR_COMBINED_ALPHA: { return vec3<f32>(combiner_alpha, combiner_alpha, combiner_alpha); }
+        case COLOR_TEXEL0_ALPHA: { return vec3<f32>(inputs.tex_val0.a, inputs.tex_val0.a, inputs.tex_val0.a); }
+        case COLOR_TEXEL1_ALPHA: { return vec3<f32>(inputs.tex_val1.a, inputs.tex_val1.a, inputs.tex_val1.a); }
+        case COLOR_PRIMITIVE_ALPHA: { return vec3<f32>(inputs.prim_color.a, inputs.prim_color.a, inputs.prim_color.a); }
+        case COLOR_SHADE_ALPHA: { return vec3<f32>(inputs.shade_color.a, inputs.shade_color.a, inputs.shade_color.a); }
+        case COLOR_ENV_ALPHA: { return vec3<f32>(inputs.env_color.a, inputs.env_color.a, inputs.env_color.a); }
+        case COLOR_LOD_FRACTION: { return vec3<f32>(inputs.lod_fraction, inputs.lod_fraction, inputs.lod_fraction); }
+        case COLOR_PRIM_LOD_FRAC: { return vec3<f32>(inputs.prim_lod_frac, inputs.prim_lod_frac, inputs.prim_lod_frac); }
+        case COLOR_NOISE: { return vec3<f32>(inputs.noise, inputs.noise, inputs.noise); }
+        case COLOR_K4: { return vec3<f32>(inputs.k4, inputs.k4, inputs.k4); }
+        case COLOR_K5: { return vec3<f32>(inputs.k5, inputs.k5, inputs.k5); }
+        case COLOR_ONE: { return vec3<f32>(1.0, 1.0, 1.0); }
+        default: { return vec3<f32>(0.0, 0.0, 0.0); } // COLOR_ZERO, and RT64's own default: fallthrough.
     }
 }
 
-// Resolves one alpha selector, per `fromAlphaInput`. Returns
-// vec2(value, success_flag) — see resolve_color_input's note on the
-// success-flag convention.
-fn resolve_alpha_input(inputs: CombinerInputs, combiner_alpha: f32, selector: u32) -> vec2<f32> {
+// Resolves one alpha selector, per `fromAlphaInput`
+// (rt64_color_combiner.h:516-540). Every AlphaInput value this file's
+// decode tables can produce is evaluated.
+fn resolve_alpha_input(inputs: CombinerInputs, combiner_alpha: f32, selector: u32) -> f32 {
     switch selector {
-        case ALPHA_COMBINED: { return vec2<f32>(combiner_alpha, 1.0); }
-        case ALPHA_TEXEL0: { return vec2<f32>(inputs.tex_val0.a, 1.0); }
-        case ALPHA_TEXEL1: { return vec2<f32>(inputs.tex_val1.a, 1.0); }
-        case ALPHA_PRIMITIVE: { return vec2<f32>(inputs.prim_color.a, 1.0); }
-        case ALPHA_SHADE: { return vec2<f32>(inputs.shade_color.a, 1.0); }
-        case ALPHA_ENVIRONMENT: { return vec2<f32>(inputs.env_color.a, 1.0); }
-        case ALPHA_ONE: { return vec2<f32>(1.0, 1.0); }
-        case ALPHA_ZERO: { return vec2<f32>(0.0, 1.0); }
-        default: { return vec2<f32>(0.0, 0.0); }
+        case ALPHA_COMBINED: { return combiner_alpha; }
+        case ALPHA_TEXEL0: { return inputs.tex_val0.a; }
+        case ALPHA_TEXEL1: { return inputs.tex_val1.a; }
+        case ALPHA_PRIMITIVE: { return inputs.prim_color.a; }
+        case ALPHA_SHADE: { return inputs.shade_color.a; }
+        case ALPHA_ENVIRONMENT: { return inputs.env_color.a; }
+        case ALPHA_LOD_FRACTION: { return inputs.lod_fraction; }
+        case ALPHA_PRIM_LOD_FRAC: { return inputs.prim_lod_frac; }
+        case ALPHA_ONE: { return 1.0; }
+        default: { return 0.0; } // ALPHA_ZERO, and RT64's own default: fallthrough.
     }
 }
 
 // The final wrapClamp RT64 always applies to the finished color and to
 // alphaCompareValue, regardless of cycle count (rt64_color_combiner.h's
 // wrapClamp = wrapInputABD then clamp(0,1)). See combiner.rs's wrap_clamp
-// for the exact reasoning on why this reduces to a plain clamp for every
-// input Slice 1 can produce, while still being implemented as the full
-// two-step formula.
+// for the exact reasoning on why this reduces to a plain clamp for
+// [0,1]-normalized inputs, while genuinely exercising the wrap step
+// branches for Slice 2's caller-supplied NOISE/K4/K5/LOD_FRACTION/
+// PRIM_LOD_FRAC scalars when those carry an out-of-range value.
 fn wrap_clamp(i: f32) -> f32 {
     let rounding: f32 = 1.0 / 255.0;
     let low: f32 = -0.5 - rounding;
@@ -327,22 +346,12 @@ fn wrap_clamp(i: f32) -> f32 {
 
 // Runs one-cycle combiner arithmetic and the final wrapClamp pass, mirroring
 // combiner.rs's run_one_cycle exactly. Decode (ca/cb/cc/cd/aa/ab/ac/ad
-// below) is always exact per RT64, regardless of scope — only
-// resolve_color_input/resolve_alpha_input narrow what gets evaluated.
-// Returns RunOneCycleResult: on success, rejected_selector is
-// OUT_OF_SCOPE (never a real selector's ordinal, since OUT_OF_SCOPE is
-// disjoint from every COLOR_*/ALPHA_* constant) and combiner_color/
-// alpha_compare_value hold the real result; on failure, rejected_selector
-// is the exact decoded ordinal (color or alpha, whichever's resolve call
-// hit `default` first — see the priority comment below) that this file's
-// arithmetic does not yet implement, and combiner_color/alpha_compare_value
-// are not meaningful. WGSL has no Result type, so this is the loud-
-// rejection mechanism's shader-side shape: a caller must check
-// rejected_selector != OUT_OF_SCOPE before trusting the rest of the struct.
+// below) is always exact per RT64; resolve_color_input/resolve_alpha_input
+// now evaluate every selector either enum can hold, so this is infallible —
+// no rejection-tracking struct remains.
 struct RunOneCycleResult {
     combiner_color: vec4<f32>,
     alpha_compare_value: f32,
-    rejected_selector: u32,
 }
 
 fn run_one_cycle(params: CombineParams, inputs: CombinerInputs) -> RunOneCycleResult {
@@ -360,33 +369,20 @@ fn run_one_cycle(params: CombineParams, inputs: CombinerInputs) -> RunOneCycleRe
     let combiner_color_in = vec3<f32>(0.0, 0.0, 0.0);
     let combiner_alpha_in = 0.0;
 
-    let a = resolve_color_input(inputs, combiner_color_in, ca);
-    let b = resolve_color_input(inputs, combiner_color_in, cb);
-    let c = resolve_color_input(inputs, combiner_color_in, cc);
-    let d = resolve_color_input(inputs, combiner_color_in, cd);
+    let a = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, ca);
+    let b = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cb);
+    let c = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cc);
+    let d = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cd);
 
     let aa_v = resolve_alpha_input(inputs, combiner_alpha_in, aa);
     let ab_v = resolve_alpha_input(inputs, combiner_alpha_in, ab);
     let ac_v = resolve_alpha_input(inputs, combiner_alpha_in, ac);
     let ad_v = resolve_alpha_input(inputs, combiner_alpha_in, ad);
 
-    // Priority order (first rejection wins) matches combiner.rs's `?`
-    // early-return order: color A, B, C, D, then alpha A, B, C, D.
-    var rejected_selector: u32 = OUT_OF_SCOPE;
-    if a.w == 0.0 { rejected_selector = ca; }
-    else if b.w == 0.0 { rejected_selector = cb; }
-    else if c.w == 0.0 { rejected_selector = cc; }
-    else if d.w == 0.0 { rejected_selector = cd; }
-    else if aa_v.y == 0.0 { rejected_selector = aa; }
-    else if ab_v.y == 0.0 { rejected_selector = ab; }
-    else if ac_v.y == 0.0 { rejected_selector = ac; }
-    else if ad_v.y == 0.0 { rejected_selector = ad; }
-
-    let rgb = (a.rgb - b.rgb) * c.rgb + d.rgb;
-    let alpha = (aa_v.x - ab_v.x) * ac_v.x + ad_v.x;
+    let rgb = (a - b) * c + d;
+    let alpha = (aa_v - ab_v) * ac_v + ad_v;
 
     var result: RunOneCycleResult;
-    result.rejected_selector = rejected_selector;
     result.alpha_compare_value = wrap_clamp(alpha);
     result.combiner_color = vec4<f32>(
         wrap_clamp(rgb.x),

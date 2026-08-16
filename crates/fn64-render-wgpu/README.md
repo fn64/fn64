@@ -378,9 +378,11 @@ lane's own literal 262,144-case sweep (all `sf, tf` in `0..32` across 256
 pseudo-random four-corner seeds), plus a TMEM-address-grounded fixture at the
 `sf + tf == 32` boundary reading real committed RGBA16 bytes. This slice does
 not select which filter mode applies (point vs. bilerp vs. box-average vs.
-copy), wire the filtered texel into a color combiner (none exists in this
-crate yet), drive per-pixel UV/gather from a triangle rasterizer, or claim
-RT64 pixel/visual/silicon parity or performance.
+copy), wire the filtered texel into the crate's pure one-cycle color
+combiner (see "Color combiner: one-cycle selector arithmetic" below —
+that seam is not connected to this decoder's texel output), drive
+per-pixel UV/gather from a triangle rasterizer, or claim RT64
+pixel/visual/silicon parity or performance.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
@@ -644,6 +646,50 @@ parity, or performance claim. Combiner evaluation, coverage accumulation
 (the `blend_enabled` derivation is caller-supplied, matching the reference's
 own `blend_fragment` signature), alpha compare, depth test, and dither are
 upstream/sibling concerns this module does not implement.
+
+## Color combiner: one-cycle selector arithmetic
+
+`combiner` is a characterization-first port of RT64's color combiner,
+sourced from the MIT `src/shared/rt64_color_combiner.h`'s selector decode
+tables (`colorInputA/B/C/D`, `alphaInputABD/C`, `decodeColorInput`,
+`decodeAlphaInput`), `Inputs` struct, `fromColorInput`/`fromAlphaInput`, and
+`wrap`/`wrapInputABD`/`wrapClamp`/`runCycle`/`run` — the pinned commit
+`5473732a822a4423b5696e7cb18fecc425a59875` recorded as this crate's
+Rust-port source authority in `docs/RT64-PORT-AUTHORITY.md`. It provides
+typed `ColorInput`/`AlphaInput`/`CombineParams` selector decode — exact and
+complete for every wire-legal `(slot, index, second_cycle)` triple, matching
+RT64's `decodeColorInput`/`decodeAlphaInput` bit-for-bit — plus full
+one-cycle `(A-B)*C+D` arithmetic (`run_one_cycle`) that evaluates every
+selector either enum can hold: `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`,
+`SHADE`, `ENVIRONMENT`, `KEY_CENTER`, `KEY_SCALE`, `COMBINED_ALPHA` and the
+other `*_ALPHA` cross-reads, `LOD_FRACTION`, `PRIM_LOD_FRAC`, `NOISE`, `K4`,
+`K5`, `ONE`, and `ZERO`. An independently-derived Rust oracle
+(`combiner.rs`) is matched by an owned, Naga-validated WGSL transcription
+(`shaders/color_combiner.wgsl`, `COLOR_COMBINER_WGSL`) that implements
+identical arithmetic — neither is compiled into any pipeline or wired to a
+draw path.
+
+`NOISE`, `LOD_FRACTION`, and `PRIM_LOD_FRAC` are caller-supplied typed
+fields on `CombinerInputs`, not generated here: RT64's own PRNG
+(`initRand`/`nextRand`, `src/shaders/Random.hlsli`) and per-pixel derivative
+computation (`computeLOD`) are not part of the pinned
+`rt64_color_combiner.h`/`RasterPS.hlsl` combiner-arithmetic surface this
+module ports, so this module proves only that the formula correctly
+consumes whatever value it is given, mutating each field
+independently to confirm it actually participates rather than merely
+type-checking. The final `wrapClamp` (`wrapInputABD` then `clamp(0,1)`)
+applies unconditionally to every output channel; extreme/out-of-range
+caller-supplied scalars are exercised against the real wrap step boundary,
+not only the plain-clamp reduction that in-range texel/prim/shade/env
+inputs always hit.
+
+**Nonclaims.** No two-cycle mode or its cross-cycle wrap/carry arithmetic,
+no copy mode, no `SetCombine` decode or `RdpState`/combiner-stack tracking,
+no real NOISE/LOD generation, no shader-keying or pipeline-variant
+selection, no texture/rasterizer integration (the crate's texel-fetch and
+three-nearest-filter machinery — see "M4.3.3f" above — is not wired to this
+module), no draw-path or production-DPC integration, no target/framebuffer
+write, and no RT64 pixel/visual/silicon parity or performance claim.
 
 ## Depth: strict-less compare/update (port-card slice 1)
 

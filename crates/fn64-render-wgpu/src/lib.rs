@@ -69,19 +69,19 @@
 //! profile, Naga validation, and CPU oracle establish candidate mechanics.
 //! The component remains `NotQualified` and `NativeUnverified`; no complete
 //! RT64 shader-denominator row is promoted.
-//! Color combiner Slice 1 (characterization-first port of
+//! Color combiner Slice 2 (characterization-first port of
 //! `/private/tmp/rt64-combiner-characterization-card.md`) adds typed
 //! `ColorInput`/`AlphaInput`/`CombineParams` selector decode, exact and
-//! complete for every wire-legal index (matching RT64 bit-for-bit,
-//! including selectors whose arithmetic is not yet implemented), plus
-//! one-cycle `(A-B)*C+D` arithmetic that evaluates only COMBINED/TEXEL0/
-//! TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO and loudly rejects any other
-//! decoded selector rather than substituting a silent default. An
-//! independently-derived Rust oracle ([`run_one_cycle`]) with a matching
-//! owned WGSL transcription (`shaders/color_combiner.wgsl`, Naga-validated).
-//! It adds no NOISE/KEY_CENTER/etc. arithmetic, two-cycle mode, copy mode,
-//! shader-keying, `RdpState` wiring, draw-path integration, or
-//! native/GPU-verified behavior.
+//! complete for every wire-legal index (matching RT64 bit-for-bit), plus
+//! full one-cycle `(A-B)*C+D` arithmetic that now evaluates every selector
+//! either enum can hold — including KEY_CENTER/KEY_SCALE/K4/K5, NOISE,
+//! LOD_FRACTION/PRIM_LOD_FRAC, and the `*_ALPHA`/COMBINED_ALPHA cross-reads
+//! — as caller-supplied typed [`CombinerInputs`] fields, not a PRNG or
+//! derivative computed here. An independently-derived Rust oracle
+//! ([`run_one_cycle`]) with a matching owned WGSL transcription
+//! (`shaders/color_combiner.wgsl`, Naga-validated). It adds no two-cycle
+//! mode, copy mode, shader-keying, `RdpState` wiring, draw-path
+//! integration, real NOISE/LOD generation, or native/GPU-verified behavior.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -319,7 +319,7 @@ pub use blend::{
 };
 pub use combiner::{
     run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams,
-    CombinerInputError, CombinerInputs, COLOR_COMBINER_WGSL,
+    CombinerInputs, COLOR_COMBINER_WGSL,
 };
 pub use coverage::{
     apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,
