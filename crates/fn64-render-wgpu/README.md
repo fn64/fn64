@@ -1205,3 +1205,103 @@ production-dispatch admission (the T3/T4 seam still rejects all five exactly
 like every other still-unadmitted command kind, so a real ABI-driven
 submission containing any of these five commands cannot reach a backend
 through the production path); and no RT64 parity or performance claim.
+
+## Raw RDP TextureRectangle decode and six-vertex conversion
+
+`raw_dpc::texture_rectangle` (re-exported as `RawTextureRectangle`/
+`RawTextureRectangleError`/`texture_rectangle_vertices`/
+`TextureRectangleVertex`/`TextureRectangleVertices`/
+`TEXTURE_RECTANGLE_COMMAND_BYTES`) is a literal, characterization-first Rust
+port of the raw RDP TextureRectangle/TextureRectangleFlip command decode
+(opcodes `0x24`/`0x25`) and RT64's deterministic rectangle-to-six-vertex
+setup. It is a standalone characterization module: it is not wired into
+`decode_stream`, `RawDpcCommandKind`, or `push_decoded_raw_dpc`, matching
+this crate's precedent of landing a pure conversion (see the triangle
+decode/vertex sections above) before its production dispatch integration.
+
+Source: the permitted MIT RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+Wire-field layout comes from `src/gbi/rt64_gbi_rdp.cpp`'s `texrectLLE`/
+`texrectFlipLLE` (the raw/LLE wire-decode variants a raw-DPC command stream
+actually carries, not the HLE `texrect`/`texrectFlip` that read from a live
+RSP `DisplayList**` cursor) and `DisplayList::p0`/`p1`
+(`src/gbi/rt64_gbi.cpp`: `((w0 >> pos) & ((0x01 << bits) - 1))` /
+`((w1 >> pos) & ((0x01 << bits) - 1))`). The vertex conversion comes from
+`src/hle/rt64_rdp.cpp`'s `RDP::drawTexRect` (the copy-mode `dsdx`/`lrx`/
+`lry` mutation) and `RDP::drawRect` (fill/copy UL rounding, `FixedRect`
+construction, `width`/`height`, `lrs`/`lrt`, `vFractionOffset`, and the six
+`triPosFloats`/`triColorFloats`/`triTcFloats` vertex writes), plus
+`src/common/rt64_common.cpp`'s `FixedRect::isEmpty`/`left`/`top`/`right`/
+`bottom`/`width`/`height` (the bounded default-alignment quarter-pixel
+rounding this module ports).
+
+**Decode.** `RawTextureRectangle::decode(opcode, command)` accepts opcode
+`0x24` or `0x25` and exactly `TEXTURE_RECTANGLE_COMMAND_BYTES` (16) bytes,
+rejecting a wrong opcode before the length is checked and a wrong length
+before any word is read. The wire shape is two 64-bit words: word 0's low
+half carries `lrx`/`lry` (matching this crate's existing `FillRectangle`
+decode of the same shape in `raw_dpc::mod`), word 0's high half carries
+`tile`/`ulx`/`uly`, and word 1's two halves carry signed 16-bit
+`uls`/`ult`/`dsdx`/`dtdy`. `flip` is not a wire bit: it is derived solely
+from which of the two opcodes was decoded (RT64 dispatches `texrectLLE`
+with `flip = false` and `texrectFlipLLE` with `flip = true`), exactly as
+the pinned source does.
+
+**Conversion.** `texture_rectangle_vertices(rectangle, cycle_type)` accepts
+a caller-supplied `state::CycleType` (RT64: `otherMode.cycleType()`,
+performing no OtherMode decode of its own) and reproduces, in order: copy
+mode's `dsdx >>= 2; lrx |= 3; lry |= 3;`; fill-or-copy mode's `ulx &= ~3;
+uly &= ~3;` UL rounding; `FixedRect`'s exact `isNull`/`isEmpty` check
+(`ulx > lrx || uly > lry`, then `lrx == ulx || lry == uly`) with no
+`movedFromOrigin`/`ExtendedAlignment` origin-stack offset applied (see
+Nonclaims); `left`/`top`/`right`/`bottom`'s `(coordinate + 3) >> 2`
+quarter-pixel rounding, both ends of both axes always using RT64's
+`width(true, true)`/`height(true, true)` ceiling variant; the UV
+width/height swap under `flip`; `lrs`/`lrt`'s exact `<<7`, multiply, `+`,
+`>>7` operation order; `vFractionOffset`'s `(uly & 0x3) ? (dtdy >> 5) /
+32.0f : 0.0f` (reading the *already* fill/copy-rounded `uly`, so
+`vFractionOffset` is always exactly `0.0` in fill or copy mode, matching
+the pinned source's own mutate-in-place `uly` parameter); and RT64's exact
+six `triPosFloats`/`triColorFloats`/`triTcFloats` push order (two
+triangles, always the same four clip-space corners and all-zero color,
+with `flip` swapping only the texcoord pairing). A reversed or
+zero-width/-height rectangle returns `None` -- the exact reproduction of
+RT64's `if (drawRect.isEmpty()) { return; }` early return, not a silently
+renormalized rectangle. IEEE f32 results (including infinities a
+degenerate perspective-adjacent shift/divide can produce) are preserved
+exactly as RT64's own arithmetic produces them; no defensive fallback is
+added anywhere RT64 does not have one.
+
+**Tests.** Independent oracle re-deriving every formula from the raw wire
+bytes and the RT64 source text (i64/f64 internally, narrowing to i32/f32
+only where RT64's own `int32_t`/`float` locals narrow) without calling any
+production helper; both opcodes; all-zero/max coordinate and tile fields;
+signed `uls`/`ult`/`dsdx`/`dtdy` boundaries including `i16::MIN`/`MAX`;
+every high wire-prefix combination decoding identically once masked;
+wrong-opcode and one-byte-short/oversized rejection; flip/nonflip and
+copy/noncopy/fill combinations; fractional UL Y and the exact
+`vFractionOffset` value including its always-zero fill/copy case; negative
+`dsdx`/`dtdy` arithmetic-right-shift semantics; reversed and
+zero-width/zero-height rectangles observed as `None`, not silently
+normalized (including a case where copy mode's `lrx |= 3`/`lry |= 3`
+mutation turns an otherwise-empty rectangle nonempty); exact six-vertex
+position/color/order; `<<7`/multiply/`>>7`/`/32.0` operation-order
+sensitivity checks; and a source-shape/mutation sweep (swapped word
+halves, unsigned-vs-signed field misinterpretation, a missing copy
+mutation, and a missing flip swap) each proven to disagree with the
+correctly-mutated oracle path.
+
+**Nonclaims.** No production raw-DPC admission or execution -- this module
+is not wired into `decode_stream`/`push_decoded_raw_dpc`, and
+`RawDpcCommandKind` does not gain a texture-rectangle variant in this
+slice. No scissor-rectangle intersection and no `movedFromOrigin`/
+`ExtendedAlignment` origin-stack offset (RT64's `drawRect` applies both
+before constructing its `FixedRect`; this module builds the `FixedRect`
+directly from the wire/copy-mutated coordinates -- the exact bounded
+default RT64's own `FixedRect` type performs, not an invented alignment or
+scissor correction). No texture sampling or TMEM read, no rasterizer, no
+combiner/blend/depth/coverage/render-target/VI integration, and no native
+GPU, parity, or performance claim of any kind. `RDP::updateCallTexcoords`'s
+tracked-tile texcoord bookkeeping and the scissor-intersected `intU1`/
+`intV1`/`intU2`/`intV2` branch are workload/tile-tracking side effects this
+pure conversion has no state to attach to and does not reproduce.

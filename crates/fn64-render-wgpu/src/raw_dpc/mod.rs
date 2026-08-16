@@ -1,10 +1,15 @@
 //! Bounded decoding for the first admitted raw-DPC command subset.
 
 mod production_adapter;
+mod texture_rectangle;
 mod triangle;
 mod triangle_vertices;
 
 pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
+pub use texture_rectangle::{
+    texture_rectangle_vertices, RawTextureRectangle, RawTextureRectangleError,
+    TextureRectangleVertex, TextureRectangleVertices, TEXTURE_RECTANGLE_COMMAND_BYTES,
+};
 pub use triangle::{
     triangle_word_count, CoefficientWords, DepthWords, RawTriangle, RawWord, TriangleDecodeError,
     TriangleFlags,
