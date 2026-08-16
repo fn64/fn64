@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T10:37:19Z` |
+| updated | `2026-08-16T10:46:00Z` |
 
 ## Milestones
 
@@ -21,7 +21,7 @@
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:1, RUNNING:1 |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:2, INTEGRATED:1, RUNNING:1 |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -805,6 +805,31 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 **Blocker:** M4.1 is not yet reviewed/integrated, and M4.2.0 has not frozen destination-journal fragments or the stronger-authority full-word and starting-row fixtures.
 
 **Next action:** After M4.1 integrates, land the M4.2.0 contract, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.
+
+### `M4.3` -- Execute TLUT loads and decode committed, validity-checked TMEM into exact CPU and owned-WGSL texture representations without conflating load, decode, sampling, or cache state.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `BLOCKED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | integration lead |
+| branch | `port/m4-texture-decode` -> `main` |
+| dependencies | `M4.2` |
+| writable paths | `crates/fn64-render-ir/src/tmem`, `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/texture`, `crates/fn64-render-wgpu/src/shaders/tmem_decode.wgsl`, `crates/fn64-render-reference/src/tmem_decode.rs` |
+| started / updated | `2026-08-16T10:46:00Z` / `2026-08-16T10:46:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- LoadTLUT uses a 16-bit source and high-half destination and quadricates each 16-bit entry into one 64-bit TMEM word; raw sub-16-entry loads remain bounded evidence rather than universal support.
+- CI4 combines the tile palette high nibble with the texel nibble; CI8 ignores tile palette. TLUT mode selects RGBA16 or IA16 interpretation.
+- Decode identity contains committed TMEM snapshot, render format/size, base/line, TLUT mode, normalized palette, window, and row parity. Source-image and sampler/filter state do not belong in that cache key.
+- YUV remains a separate SetConvert/filter/combiner prerequisite. RT64's black result and eager RGB approximation are not acceptable authority.
+
+**Blocker:** M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
+
+**Next action:** After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 

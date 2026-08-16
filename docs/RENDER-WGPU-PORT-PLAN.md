@@ -975,6 +975,14 @@ The accelerated wave keeps dependency-safe work active in parallel:
     reads, receipts every device-local effect, and publishes durable state only
     after guest commit. Public hardware authority overrides RT64's known
     source-size, starting-row, invalid-command, and host-layout shortcuts.
+19. **M4.3 -- load TLUT and decode committed textures (BLOCKED ON M4.2).**
+    Keep load semantics, physical TMEM, packed texture decode, sampling, and
+    cache identity separate. `LoadTLUT` writes quadricated 16-bit entries into
+    high-half TMEM; the CPU oracle and owned WGSL then cover RGBA16/32,
+    CI4/CI8 plus RGBA16/IA16 palettes, IA4/8/16, and I4/8 only after complete
+    validity-footprint checks. YUV remains blocked on its distinct
+    `SetConvert`/filter/combiner contract, and cache publication keeps old
+    generations isolated across overlapping TMEM/TLUT writes.
 
 ### M0 evidence ledger
 

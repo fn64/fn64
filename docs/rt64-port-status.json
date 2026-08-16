@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T10:37:19Z",
+    "updated_utc": "2026-08-16T10:46:00Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -1155,6 +1155,37 @@
       "next_action": "After M4.1 integrates, land the M4.2.0 contract, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.",
       "started_utc": "2026-08-16T10:37:19Z",
       "updated_utc": "2026-08-16T10:37:19Z"
+    },
+    {
+      "id": "M4.3",
+      "milestone": "M4",
+      "objective": "Execute TLUT loads and decode committed, validity-checked TMEM into exact CPU and owned-WGSL texture representations without conflating load, decode, sampling, or cache state.",
+      "profile": "F",
+      "model": "GPT-5.6 Sol",
+      "effort": "xhigh",
+      "owner": "integration lead",
+      "branch": "port/m4-texture-decode",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-ir/src/tmem",
+        "crates/fn64-render-wgpu/src/tmem",
+        "crates/fn64-render-wgpu/src/texture",
+        "crates/fn64-render-wgpu/src/shaders/tmem_decode.wgsl",
+        "crates/fn64-render-reference/src/tmem_decode.rs"
+      ],
+      "dependencies": ["M4.2"],
+      "state": "BLOCKED",
+      "findings": [
+        "LoadTLUT uses a 16-bit source and high-half destination and quadricates each 16-bit entry into one 64-bit TMEM word; raw sub-16-entry loads remain bounded evidence rather than universal support.",
+        "CI4 combines the tile palette high nibble with the texel nibble; CI8 ignores tile palette. TLUT mode selects RGBA16 or IA16 interpretation.",
+        "Decode identity contains committed TMEM snapshot, render format/size, base/line, TLUT mode, normalized palette, window, and row parity. Source-image and sampler/filter state do not belong in that cache key.",
+        "YUV remains a separate SetConvert/filter/combiner prerequisite. RT64's black result and eager RGB approximation are not acceptable authority."
+      ],
+      "verification_runs": [],
+      "blocker": "M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.",
+      "next_action": "After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.",
+      "started_utc": "2026-08-16T10:46:00Z",
+      "updated_utc": "2026-08-16T10:46:00Z"
     },
     {
       "id": "A0.4",
