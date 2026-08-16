@@ -42,12 +42,12 @@ reserving authority, parity, performance, and integration claims for the lead.
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
 | active milestones | **M0 authority/baseline, M2 shader/tool feasibility, M3 raw-DPC vertical slice, and M4 base RDP/TMEM correctness (all IN PROGRESS)** |
-| active slices | M2.5.2 typed wgpu-ingestion assessment; M4.2a transactional physical TMEM state; A0 workflow frontier maintenance |
+| active slices | M2.5.2 typed wgpu-ingestion assessment; M4.2a transactional physical TMEM state; T3 physical-successor follow-on; A0 workflow frontier maintenance |
 | active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.2 assessment owner; `F/xhigh` M4.2a physical-state owner; independent reviewers remain serialized from writers |
-| last completed result | the independently reviewed M2.5.1 corpus contains all 56 reference-valid rows; remote `main` contains M4.2.0 (`75e9025f`), the scalar-layout contract (`f967d32f`), and A0.5 (`05c7c88b`) |
-| next concrete decision | consume the frozen M2.5.1 inventories in a typed all-56 wgpu-ingestion assessment, and repair/review M4.2a before parallel LoadTile/LoadBlock execution |
-| evidence blockers | no matched private-game RT64 performance baseline exists; the original M2.5 gate is split because required ShaderNonUniform SPIR-V semantics are rejected by Naga 30; production DPC dispatch still does not consume the new owned-read path |
-| verification claim | M4.2.0 passed 10/10 full renderer suites and freezes plans only; M2.5.1 has an independently verified 56/56 conditional reference-valid corpus but no wgpu/runtime/parity claim; A0.5 passed its final-source 10/10 dashboard gate |
+| last completed result | M4.3.4 (this slice) executes fill-cycle `FillRectangle` against a real color target -- the first production consumer of that decoded command, previously validated-for-identity only; M4.3.3f ports the three-nearest filter as a pure fn (still no production caller); T0 lands the sealed raw-DPC coordinator; T1 integrates a TMEM-only raw-DPC production adapter (`push_decoded_raw_dpc`, still not called by any dispatcher); T3 adds `PendingTmemTransaction::into_physical_successor` |
+| next concrete decision | consume the frozen M2.5.1 inventories in a typed all-56 wgpu-ingestion assessment; repair/review M4.2a before parallel LoadTile/LoadBlock execution; wire a real command-stream dispatcher that calls T1's `push_decoded_raw_dpc` and M4.3.4's `execute_fill_rectangle` from the same walk, instead of each being reachable only from its own tests |
+| evidence blockers | no matched private-game RT64 performance baseline exists; the original M2.5 gate is split because required ShaderNonUniform SPIR-V semantics are rejected by Naga 30; no combiner exists in this crate, so texture-rectangle/one-cycle/two-cycle fill and every triangle opcode remain undecoded and unexecuted; production DPC dispatch still does not consume the new owned-read path or call either M4.3.4's or T1's production entry points from a shared per-command walk |
+| verification claim | M4.3.4 passed `cargo test -p fn64-render-wgpu` 10/10 consecutive clean (308 unit + 13 doctests) after this slice's changes, plus scoped clippy/rustfmt/lint-docs; M4.2.0 passed 10/10 full renderer suites and freezes plans only; M2.5.1 has an independently verified 56/56 conditional reference-valid corpus but no wgpu/runtime/parity claim; A0.5 passed its final-source 10/10 dashboard gate |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -1223,6 +1223,88 @@ The accelerated wave keeps dependency-safe work active in parallel:
     passed together; see the T0 freeze report for the exact command lines,
     the per-item audit
     disposition, and the scoped blocker.
+
+21. **M4.3.4 -- execute fill-cycle `FillRectangle` against a color target
+    (INTEGRATED).** Closes the exact gap the M4.3.3f/T1 audit named: decoded
+    RDP `FillRectangle` (opcode `0x36`) was validated by `raw_dpc::plan_fill`
+    into a resource-journal entry but never executed against a target, and
+    neither raw-DPC production seam (T1's `push_decoded_raw_dpc`, TMEM-only
+    by frozen v11 scope) admits it. New `targets/fill.rs` adds a CPU-side
+    executor -- not a GPU/wgpu compute pipeline, deliberately: it produces
+    the identical `CompletedColorTargetWrite`/`DeviceColorBytes` domain the
+    M3.3c GPU raster path also produces, and the two compose at that seam by
+    construction, so this slice adds no new pipeline/shader surface for a
+    single fill-cycle rectangle write.
+    Scope is exactly `CycleType::Fill` x RGBA16/RGBA32, matching what
+    `plan_fill` already validates; `Copy`/`OneCycle`/`TwoCycle` fill and
+    `Index8` stay unimplemented (need the combiner, which does not exist in
+    this crate, or are out of the reference lane's own guaranteed-result
+    contract).
+    **Coordinate provenance.** `raw_dpc::plan_fill`'s `>>2` and
+    `fn64-render-reference`'s `draw_fill_rectangle` `.ceil()/.floor()` are
+    reconciled, not chosen-over: both extract the identical wire field
+    (`(word >> 12) & 0x0fff`, confirmed at `raw_dpc/mod.rs:909-912` and
+    `fn64-render-reference/src/gbi/stream.rs:1087,1313,1337`) and the same
+    `/4` scale to a whole-integer-or-fractional quarter-pixel coordinate.
+    `plan_fill` rejects any nonzero low two bits before its `>>2` runs, so
+    that shift is exact integer division with nothing left to round;
+    `.ceil()/.floor()` is the reference lane's *general* rule for the
+    fractional case this slice does not admit. In the domain both lanes
+    share (already-whole-pixel edges), they compute the same integer pixel
+    range -- see `targets/fill.rs`'s module doc for the full derivation.
+    This rests on the two in-repo sources agreeing on one identical bit
+    extraction, not on a freshly re-read Programming Manual page: the exact
+    section number is not independently reconfirmed here, named as a loud
+    nonclaim in the module doc rather than a silent shrug.
+    **Z/framebuffer bypass hazard.** `docs/BASE-RENDERER-BEHAVIOR-MATRIX.md`'s
+    `rdp-command-state-order` row grades fill-cycle `G_FILLRECT`'s
+    Z_CMP/Z_UPD/IM_RD bypass-hazard rejection `exact_public` -- this slice
+    adds the check (`targets/fill.rs`'s `require_safe_fill_cycle_bypass`)
+    rather than deferring it, porting `fn64-render-reference/src/raster/
+    blend.rs:13-21`'s check (itself citing *Nintendo 64 Functions Reference*
+    `gDPFillRectangle`/`gDPSetCycleType`) onto `OtherMode`'s existing wire
+    words at the same bit positions.
+    **Resident sub-rectangle admission.** `targets::CandidateColorTarget::
+    admit_completed_initialization` previously rejected every non-full-extent
+    completion outright, for both brand-new and already-resident targets
+    (`TargetError::PartialResidentUpdateUnsupported`, now removed as
+    unreachable). The type machinery already distinguished the two cases
+    (`predecessor: Option<TargetGeneration>` on `CandidateColorTarget`); this
+    slice only changes the resident branch's behavior, keeping the identical
+    full-extent requirement for a brand-new target (nothing else could prove
+    every byte of a target with no prior generation). A resident sub-
+    rectangle write is admitted once its `DeviceColorBytes` buffer still
+    covers the target's full extent -- the pre-existing byte-length check
+    already enforced that shape; `execute_fill_rectangle` is the real
+    producer, read-modify-writing the prior generation's full buffer with
+    only the claimed rectangle's rows patched. An independent adversarial
+    review caught the resulting caller-discipline gap directly: nothing
+    stopped a caller from omitting the prior generation's bytes for an
+    already-resident candidate, which would have silently zero-filled every
+    untouched row instead of preserving it. `execute_fill_rectangle` now
+    rejects `resident_bytes: None` for a `predecessor.is_some()` candidate
+    with `FillExecutionError::MissingResidentBytes` rather than assuming
+    zero content -- a loud trap, not the silent shrug AGENTS.md forbids.
+    Fixtures: an exhaustive 65,536 x 5-seed RGBA16 differential and a full
+    256-case RGBA32 differential against an inline-duplicated,
+    independently-written oracle of `draw_fill_rectangle`'s fill-cycle
+    branch; hand-computed unit fixtures for the 5-bit expansion and
+    RGBA32 alpha/coverage-byte unpack; a real end-to-end test decoding
+    genuine raw-DPC command words through `decode_raw_dpc` and executing the
+    resulting `FillRectangle` against a real `CandidateColorTarget`, byte-
+    exact; targeted characterization for literal single-pixel/degenerate
+    rectangles, fractional-edge and reversed-coordinate rejection,
+    out-of-bounds rejection, resident-byte-length mismatch rejection, and
+    nonmutation on every rejection path (the resident target's bytes and
+    generation are asserted unchanged after an out-of-bounds attempt).
+    It does not implement Copy/OneCycle/TwoCycle fill, texture rectangles,
+    triangles, a combiner, blend, coverage, or depth; it writes no GPU
+    buffer and drives no wgpu pipeline (CPU-side `DeviceColorBytes` write
+    only); it establishes no VI, presentation, or full-frame path; it claims
+    no visual/silicon parity or performance. `targets/raster.rs`'s M3.3c
+    fixture demo, T0's sealed coordinator, T1's TMEM-only production
+    adapter, T3's `PendingTmemTransaction::into_physical_successor`, and the
+    M4.3.3f three-nearest filter are all unchanged.
 
 ### M0 evidence ledger
 

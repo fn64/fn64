@@ -19,9 +19,14 @@ use fn64_render_ir::{PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, Valid
 
 use crate::{ColorImage, ImageFormat, PixelSize};
 
+mod fill;
 mod oracle;
 mod raster;
 
+pub use fill::{
+    decode_fill_cycle_pixel, execute_fill_rectangle, resolve_fill_pixel_rectangle,
+    FillCoordinateError, FillCycleBypassHazards, FillExecutionError, FillPixelRectangle,
+};
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
@@ -358,7 +363,6 @@ impl CandidateColorTarget {
 
     /// Validates a move-only completion capability issued by the future raster
     /// owner. Row planning alone cannot construct `CompletedColorTargetWrite`.
-    #[allow(dead_code)] // No production caller exists until raster owns completion authority.
     pub(crate) fn admit_completed_initialization(
         self,
         completed: CompletedColorTargetWrite,
@@ -398,16 +402,19 @@ impl CandidateColorTarget {
                 actual: completed.device_bytes.bytes.len(),
             });
         }
-        if !completed.rectangle.is_full(self.key.extent) {
-            if self.predecessor.is_none() {
-                return Err(TargetError::PartialNewTargetInitialization {
-                    key: self.key,
-                    rectangle: completed.rectangle,
-                });
-            }
-            return Err(TargetError::PartialResidentUpdateUnsupported {
+        if !completed.rectangle.is_full(self.key.extent) && self.predecessor.is_none() {
+            // A brand-new target has no prior device-byte content to patch a
+            // sub-rectangle into: every byte must come from this write, so
+            // only a full-extent completion can prove the whole target is
+            // initialized. A resident target (self.predecessor.is_some())
+            // already has a full-extent byte buffer from its prior
+            // generation; a sub-rectangle write patches into that buffer
+            // (see fill::execute_fill_rectangle) and is admitted below --
+            // the full-extent byte-length check just above already proves
+            // completed.device_bytes still covers the whole target, so no
+            // separate resident-partial rejection is needed.
+            return Err(TargetError::PartialNewTargetInitialization {
                 key: self.key,
-                generation: self.generation,
                 rectangle: completed.rectangle,
             });
         }
@@ -445,6 +452,26 @@ pub struct CompletedColorTargetWrite {
 }
 
 impl CompletedColorTargetWrite {
+    /// The M4.3.4 fill executor's own production constructor. `device_bytes`
+    /// must already be the target's full-extent byte content (enforced by
+    /// [`DeviceColorBytes::new_for_fill`]); `rectangle` records the actual
+    /// sub-region the executor wrote, for [`InitializedRegionProof`].
+    pub(crate) const fn new_for_fill(
+        key: ColorTargetKey,
+        generation: TargetGeneration,
+        range: PhysicalRange,
+        rectangle: TargetRectangle,
+        device_bytes: DeviceColorBytes,
+    ) -> Self {
+        Self {
+            key,
+            generation,
+            range,
+            rectangle,
+            device_bytes,
+        }
+    }
+
     pub const fn key(&self) -> ColorTargetKey {
         self.key
     }
@@ -784,11 +811,6 @@ pub enum TargetError {
         key: ColorTargetKey,
         rectangle: TargetRectangle,
     },
-    PartialResidentUpdateUnsupported {
-        key: ColorTargetKey,
-        generation: TargetGeneration,
-        rectangle: TargetRectangle,
-    },
     StaleCandidateGeneration {
         key: ColorTargetKey,
         expected_predecessor: Option<TargetGeneration>,
@@ -896,11 +918,6 @@ impl fmt::Display for TargetError {
             Self::PartialNewTargetInitialization { key, rectangle } => write!(
                 formatter,
                 "new color target {key:?} cannot become resident from partial initialization {rectangle:?}"
-            ),
-            Self::PartialResidentUpdateUnsupported { key, generation, rectangle } => write!(
-                formatter,
-                "color-target generation {} for {key:?} cannot become resident from unsupported partial update {rectangle:?}",
-                generation.get()
             ),
             Self::StaleCandidateGeneration { key, expected_predecessor, actual_resident } => write!(
                 formatter,
