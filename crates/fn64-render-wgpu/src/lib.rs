@@ -338,6 +338,7 @@ mod rgb_dither;
 mod rt64_blender_analysis;
 mod rt64_common;
 mod rt64_extended_gbi;
+mod rt64_fb_reinterpret;
 mod rt64_float4_quantize;
 mod rt64_frame_compatibility;
 mod rt64_framebuffer_geometry;
