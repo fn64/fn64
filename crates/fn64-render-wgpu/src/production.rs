@@ -22,8 +22,9 @@
 use fn64_render::{
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome, ExactRawDpcPlanVisitor,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcCoordinator, RawDpcExecutionView,
-    RawDpcIrCapability, RawDpcPlanRequest, RawDpcSemanticCommandRef, ReadyRawDpcCommitCapsule,
-    RenderBackend, RenderConfig, RenderError, TmemLoadSemantics, TmemLoadShape,
+    RawDpcIrCapability, RawDpcPlanRequest, RawDpcSemanticCommandRef, RdpStateCommand,
+    RdpTriangleCommand, ReadyRawDpcCommitCapsule, RenderBackend, RenderConfig, RenderError,
+    TmemLoadSemantics, TmemLoadShape,
 };
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CapturedGuestRead, CompletedWrite,
@@ -33,10 +34,10 @@ use fn64_render_ir::{
 
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::{
-    HeadlessBackend, PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState,
-    RawDpcDecodeError, RdpState, TmemLoadSourceIdentity, TmemTransferWord,
-    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
-    UninitializedTrianglePipeline,
+    CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError, RdpState,
+    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TrianglePipelineDeviceOutcome,
+    TrianglePipelineError, TrianglePipelineRenderer, UninitializedTrianglePipeline,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -130,14 +131,20 @@ impl WgpuBackend {
 
     /// `RenderBackend::create`'s body: block once, synchronously, on
     /// `UninitializedTrianglePipeline::request()`, storing the resulting
-    /// renderer or reporting a richly-typed failure. Public and callable
-    /// directly (unlike `execute_raw_dpc_inner`, which is a private free
-    /// function) so a test can assert on the exact `WgpuCreateError`
-    /// variant -- specifically distinguishing a genuine `NoAdapter` from
-    /// any other failure -- which `RenderBackend::create`'s own
-    /// `Result<(), RenderError>` signature cannot preserve once converted
-    /// (`RenderError::Backend`'s `reason` is a plain `String`).
-    pub fn create_inner(&mut self, _cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
+    /// renderer or reporting a richly-typed failure. `pub(crate)`, not
+    /// fully `pub` (unlike `WgpuRawDpcExecutionError`, which is public
+    /// because external callers reach it through
+    /// `RenderBackend::execute_raw_dpc`'s conversion path): nothing
+    /// outside this crate has a reason to call `create_inner` instead of
+    /// the trait's `create`, so there is no reason to widen this crate's
+    /// public API surface for it. It exists, distinct from `create`
+    /// itself, only so this module's own `#[cfg(test)]` code can assert
+    /// on the exact `WgpuCreateError` variant -- specifically
+    /// distinguishing a genuine `NoAdapter` from any other failure --
+    /// which `RenderBackend::create`'s own `Result<(), RenderError>`
+    /// signature cannot preserve once converted (`RenderError::Backend`'s
+    /// `reason` is a plain `String`).
+    pub(crate) fn create_inner(&mut self, _cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
         let outcome = pollster::block_on(
             UninitializedTrianglePipeline::new(HeadlessBackend::default()).request(),
         )
@@ -154,15 +161,18 @@ impl WgpuBackend {
     }
 }
 
-/// Named, loud rejection for one `RenderBackend::create` call -- kept
-/// distinct from `WgpuRawDpcExecutionError`/`WgpuBackendConstructionError`
-/// because this is specifically the triangle-pipeline device-request
-/// failure surface. Public so a caller/test can distinguish `NoAdapter`
-/// (no exotic device failure, just no matching adapter on this host) from
-/// `Request` (a genuine `TrianglePipelineError` -- adapter/device request
-/// rejected, or the pipeline prewarm itself reported a device error).
+/// Named, loud rejection for one `create_inner` call -- kept distinct
+/// from `WgpuRawDpcExecutionError`/`WgpuBackendConstructionError` because
+/// this is specifically the triangle-pipeline device-request failure
+/// surface. `pub(crate)`, matching `create_inner`'s own visibility (see
+/// its doc comment): this exists so this crate's own tests can
+/// distinguish `NoAdapter` (no exotic device failure, just no matching
+/// adapter on this host) from `Request` (a genuine `TrianglePipelineError`
+/// -- adapter/device request rejected, or the pipeline prewarm itself
+/// reported a device error) before either is collapsed into
+/// `RenderError::Backend`'s plain `String` reason at the trait boundary.
 #[derive(Debug)]
-pub enum WgpuCreateError {
+pub(crate) enum WgpuCreateError {
     NoAdapter(crate::NoAdapter),
     Request(TrianglePipelineError),
 }
@@ -198,22 +208,70 @@ impl From<WgpuCreateError> for RenderError {
 /// Collects every TMEM load in the complete neutral plan, in plan order
 /// (`command_index` records each load's position among *every* plan
 /// command, matching T1's own `push_decoded_raw_dpc` numbering, even though
-/// `State` commands are not retained here), plus every access, exactly as
+/// `State` commands are not retained here), plus every access, plus every
+/// admitted `Triangle` command's own vertices/command-time `OtherMode`/
+/// `CombineParams` snapshot, exactly as
 /// [`fn64_render::ExactValidatedRawDpcPlan::visit`] lends them through
 /// [`BoundSubmittedRawDpc::execution_view`]/
 /// [`RawDpcCoordinator::execution_view`] -- nonextracting, borrowed for the
 /// duration of one `execution_view` call only. This is the sole route
 /// `execute_raw_dpc` uses to reach plan contents; it never widens access to
-/// a bare ticket. `State` commands (`SetTile`/`SetTileSize`/
-/// `SetTextureImage`/`SyncLoad`) carry no resource access of their own and
-/// no field this executor reads -- `TmemLoadSemantics` already carries its
-/// own staged `source_image`/`tile_descriptor`/`epoch` directly -- so they
-/// are counted for `command_index` continuity but not stored.
-#[derive(Default)]
+/// a bare ticket. `State` commands other than `SetOtherMode`/`SetCombine`
+/// (`SetTile`/`SetTileSize`/`SetTextureImage`/`SyncLoad`, etc.) carry no
+/// resource access of their own and no field this executor reads --
+/// `TmemLoadSemantics` already carries its own staged
+/// `source_image`/`tile_descriptor`/`epoch` directly -- so they are counted
+/// for `command_index` continuity but not stored.
+///
+/// The `Triangle`/`SetOtherMode`/`SetCombine` handling below deliberately
+/// duplicates `raw_dpc::triangle_draw_data::TriangleDrawStateCollector`'s
+/// exact per-command logic (walk-local `current_other_mode`/
+/// `current_combine`, snapshotted onto each triangle at its own stream
+/// position, never a single whole-plan-final value) rather than reusing
+/// that type directly: `RawDpcExecutionView::plan_visited` is generic over
+/// exactly one visitor type, fixed at this file's own `execute_raw_dpc_
+/// inner` call site, so there is no route to lend one sealed plan to two
+/// independent visitors in the same `execution_view` call. This is a
+/// duplication of behavior, not of trust -- if `TriangleDrawStateCollector`
+/// changes, this file's own copy must be updated to match.
 struct PlanCollector {
     loads: Vec<(u32, TmemLoadSemantics)>,
     accesses: Vec<ResourceAccess>,
     next_command_index: u32,
+    /// `OtherMode`/`CombineParams` current at the walk's current stream
+    /// position -- seeded from `WgpuBackend.rdp_state`'s durable value at
+    /// construction time (`Self::seeded`), then updated on every
+    /// `SetOtherMode`/`SetCombine` command in plan order.
+    current_other_mode: Option<OtherMode>,
+    current_combine: Option<CombineParams>,
+    /// One entry per admitted `Triangle` command, in plan order. `Err`
+    /// names exactly which state (`OtherMode` or `CombineParams`) was
+    /// still unset at that triangle's own stream position -- never a
+    /// silent default, matching `TriangleDrawStateCollector`'s own
+    /// documented absence handling.
+    triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+}
+
+impl PlanCollector {
+    /// Seeds `current_other_mode`/`current_combine` from `WgpuBackend`'s
+    /// own durable `rdp_state` instead of `None` -- a real constructor
+    /// parameter, never a synthetic plan-stream entry. This is the
+    /// draw-state-*retrieval* half of durable cross-submission carry-in;
+    /// the admission-time half (`push_decoded_raw_dpc`'s own
+    /// `TriangleBeforeAnyOtherMode` gate) already seeds identically from
+    /// the same `rdp_state`, via `decode_raw_dpc`'s existing
+    /// `durable_state` parameter -- see this card's own design notes for
+    /// why neither half needed a signature change to close this gap.
+    fn seeded(other_mode: Option<OtherMode>, combine: Option<CombineParams>) -> Self {
+        Self {
+            loads: Vec::new(),
+            accesses: Vec::new(),
+            next_command_index: 0,
+            current_other_mode: other_mode,
+            current_combine: combine,
+            triangles: Vec::new(),
+        }
+    }
 }
 
 impl ExactRawDpcPlanVisitor for PlanCollector {
@@ -224,7 +282,34 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
             RawDpcSemanticCommandRef::TmemLoad(load) => {
                 self.loads.push((command_index, load.clone()));
             }
-            RawDpcSemanticCommandRef::State(_) => {}
+            RawDpcSemanticCommandRef::State(state) => match state {
+                RdpStateCommand::SetOtherMode { other_mode, .. } => {
+                    self.current_other_mode =
+                        Some(OtherMode::from_wire(other_mode.high, other_mode.low));
+                }
+                RdpStateCommand::SetCombine { combine, .. } => {
+                    self.current_combine =
+                        Some(CombineParams::from_wire(combine.low, combine.high));
+                }
+                _ => {}
+            },
+            RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand { vertices, .. }) => {
+                let triangle_index = self.triangles.len();
+                let snapshot = (|| {
+                    let other_mode = self
+                        .current_other_mode
+                        .ok_or(MissingTriangleDrawState::NoOtherMode { triangle_index })?;
+                    let combine_params = self
+                        .current_combine
+                        .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
+                    Ok(RetrievedTriangleDraw {
+                        vertices: *vertices,
+                        other_mode,
+                        combine_params,
+                    })
+                })();
+                self.triangles.push(snapshot);
+            }
             other => unreachable!(
                 "RawDpcSemanticCommandRef gained a variant WgpuBackend does not know about: \
                  {other:?}"
@@ -261,7 +346,12 @@ struct ExecutionCollector<'coord> {
 
 impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
     fn plan_visited(&mut self, plan_visitor: &mut PlanCollector) {
-        self.plan = core::mem::take(plan_visitor);
+        // `PlanCollector` has no `Default` (its real construction always
+        // takes an explicit durable-state seed, `Self::seeded`) -- the
+        // placeholder left behind here is discarded immediately by the
+        // caller (`execute_raw_dpc_inner`'s `let _ = plan_visitor;`), so
+        // its exact seed values are irrelevant.
+        self.plan = core::mem::replace(plan_visitor, PlanCollector::seeded(None, None));
     }
 
     fn captured_reads(&mut self, reads: &[CapturedGuestRead]) {
@@ -497,7 +587,13 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        execute_raw_dpc_inner(&mut self.coordinator, bound).map_err(RenderError::from)
+        execute_raw_dpc_inner(
+            &mut self.coordinator,
+            bound,
+            self.rdp_state.other_mode(),
+            self.rdp_state.combine(),
+        )
+        .map_err(RenderError::from)
     }
 
     fn publish_raw_dpc(
@@ -750,17 +846,27 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// comment for why), then hand the resulting `BackendEffectReport` and
 /// `into_physical_successor` (T3 Phase A) result to
 /// `RawDpcCoordinator::complete_execution`.
+///
+/// `durable_other_mode`/`durable_combine` are `WgpuBackend.rdp_state`'s
+/// own current values, passed in by the trait method (which has `self`)
+/// since this is a free function taking only `coordinator` -- they seed
+/// `PlanCollector`'s walk (`PlanCollector::seeded`) so a triangle in this
+/// submission with no `SetOtherMode`/`SetCombine` of its own still
+/// resolves its draw state from durable cross-submission carry-in, not
+/// `None`.
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
     bound: BoundSubmittedRawDpc,
+    durable_other_mode: Option<OtherMode>,
+    durable_combine: Option<CombineParams>,
 ) -> Result<BackendPreparedRawDpc, WgpuRawDpcExecutionError> {
-    let mut plan_visitor = PlanCollector::default();
+    let mut plan_visitor = PlanCollector::seeded(durable_other_mode, durable_combine);
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
         queue: bound.queue(),
         ordinal: bound.ordinal(),
         submission: bound.submission(),
-        plan: PlanCollector::default(),
+        plan: PlanCollector::seeded(durable_other_mode, durable_combine),
         reads: Vec::new(),
         outcome: None,
     };
@@ -1509,6 +1615,188 @@ mod tests {
         );
     }
 
+    fn fixture_location(command_index: u32) -> fn64_render::RawDpcCommandLocation {
+        fn64_render::RawDpcCommandLocation {
+            command_index,
+            stream_index: 0,
+            chunk_index: 0,
+            source_address: fn64_render_ir::PhysicalAddress::try_new(0x1000)
+                .expect("fixture address is in-bounds"),
+            source_byte_offset: 0,
+            source_byte_len: 8,
+            wire_opcode: 0x08,
+        }
+    }
+
+    fn fixture_vertex(seed: f32) -> fn64_render::NeutralTriangleVertex {
+        fn64_render::NeutralTriangleVertex {
+            x: seed,
+            y: seed + 1.0,
+            z: seed + 2.0,
+            w: 1.0,
+            color: [seed, seed, seed, 1.0],
+            texcoord: [0.0, 0.0],
+        }
+    }
+
+    fn fixture_triangle(seed: f32) -> RdpTriangleCommand {
+        RdpTriangleCommand {
+            location: fixture_location(0),
+            raw_words: Box::new([]),
+            vertices: core::array::from_fn(|index| fixture_vertex(seed + index as f32)),
+        }
+    }
+
+    fn fixture_set_other_mode(high: u32, low: u32) -> RdpStateCommand {
+        RdpStateCommand::SetOtherMode {
+            location: fixture_location(0),
+            raw_words: Box::new([0, 0]),
+            other_mode: fn64_render::NeutralOtherMode { high, low },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_other_mode(fn64_render::NeutralOtherMode {
+                high,
+                low,
+            }),
+        }
+    }
+
+    fn fixture_set_combine(low: u32, high: u32) -> RdpStateCommand {
+        RdpStateCommand::SetCombine {
+            location: fixture_location(0),
+            raw_words: Box::new([0, 0]),
+            combine: fn64_render::NeutralCombineParams { low, high },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_combine(fn64_render::NeutralCombineParams {
+                low,
+                high,
+            }),
+        }
+    }
+
+    /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
+    /// neither seeded nor in-plan -- must be a loud, named rejection, not
+    /// a silent default. Proves `PlanCollector::seeded(None, None)`
+    /// (unseeded) genuinely leaves `current_other_mode`/`current_combine`
+    /// at `None` rather than defaulting them.
+    #[test]
+    fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
+        let mut collector = PlanCollector::seeded(None, None);
+        let triangle = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+        assert_eq!(collector.triangles.len(), 1);
+        assert!(
+            matches!(
+                collector.triangles[0],
+                Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 0 })
+            ),
+            "expected NoOtherMode at triangle_index 0, got {:?}",
+            collector.triangles[0]
+        );
+    }
+
+    /// `PlanCollector::seeded` with a real durable value closes the
+    /// cross-submission carry-in gap: a triangle with no in-plan
+    /// `SetOtherMode`/`SetCombine` of its own still resolves cleanly when
+    /// seeded from a durable value, mirroring
+    /// `production_adapter.rs`'s own
+    /// `raw_triangle_is_admitted_using_durable_other_mode_carried_from_a_prior_submission`
+    /// at the retrieval layer instead of the admission layer.
+    #[test]
+    fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine));
+        let triangle = fixture_triangle(1.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+        assert_eq!(collector.triangles.len(), 1);
+        let retrieved = collector.triangles[0]
+            .as_ref()
+            .expect("a triangle with durably-seeded state must resolve, not reject");
+        assert_eq!(retrieved.vertices, triangle.vertices);
+        assert_eq!(retrieved.other_mode, seed_other_mode);
+        assert_eq!(retrieved.combine_params, seed_combine);
+    }
+
+    /// Two triangles separated by an intervening `SetCombine` change must
+    /// collect **two different** snapshots, not one collapsed
+    /// whole-plan-final value -- the exact regression this design avoids
+    /// (see `production_adapter.rs`'s own `TriangleDrawStateCollector`
+    /// module doc, which independent review found and fixed this same
+    /// defect for). The first triangle sees the seeded value; the second
+    /// sees the value after the intervening `SetCombine`.
+    #[test]
+    fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine));
+
+        let first_triangle = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&first_triangle));
+
+        let changed_combine = fixture_set_combine(0, 1);
+        collector.command(RawDpcSemanticCommandRef::State(&changed_combine));
+
+        let second_triangle = fixture_triangle(10.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&second_triangle));
+
+        assert_eq!(collector.triangles.len(), 2);
+        let first_retrieved = collector.triangles[0]
+            .as_ref()
+            .expect("first triangle resolves against the seeded value");
+        let second_retrieved = collector.triangles[1]
+            .as_ref()
+            .expect("second triangle resolves against the post-SetCombine value");
+        assert_eq!(
+            first_retrieved.combine_params, seed_combine,
+            "the first triangle must NOT be retroactively affected by a SetCombine that comes \
+             after it in plan order"
+        );
+        assert_ne!(
+            second_retrieved.combine_params, first_retrieved.combine_params,
+            "the second triangle must see the changed combine, proving per-triangle snapshots \
+             are not collapsed onto one shared value"
+        );
+    }
+
+    /// A real `SetOtherMode` visited before a triangle overrides the seed
+    /// -- the seed is only a starting value, never a fixed override, per
+    /// this design's own documented ordering semantics.
+    #[test]
+    fn plan_collector_lets_an_in_plan_set_other_mode_override_the_seed() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let mut collector =
+            PlanCollector::seeded(Some(seed_other_mode), Some(CombineParams::from_wire(0, 0)));
+
+        let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
+        collector.command(RawDpcSemanticCommandRef::State(&changed_other_mode));
+
+        let triangle = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let retrieved = collector.triangles[0].as_ref().unwrap();
+        assert_ne!(
+            retrieved.other_mode, seed_other_mode,
+            "an in-plan SetOtherMode must override the seed, not be shadowed by it"
+        );
+        assert_eq!(retrieved.other_mode, OtherMode::from_wire(1 << 19, 0));
+    }
+
+    /// A plan with a triangle and no TMEM load must walk cleanly (no
+    /// panic) -- `PlanCollector` is now exhaustive over
+    /// `RawDpcSemanticCommandRef`'s real variant set instead of treating
+    /// `Triangle` as `unreachable!()`.
+    #[test]
+    fn plan_collector_walks_a_triangle_only_plan_without_panicking() {
+        let mut collector = PlanCollector::seeded(
+            Some(OtherMode::from_wire(0, 0)),
+            Some(CombineParams::from_wire(0, 0)),
+        );
+        let triangle = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+        assert!(collector.loads.is_empty());
+        assert_eq!(collector.triangles.len(), 1);
+    }
+
     fn test_render_config() -> fn64_render::RenderConfig {
         fn64_render::RenderConfig {
             width: 8,
@@ -1545,19 +1833,36 @@ mod tests {
         use super::*;
 
         /// Required host evidence: a real adapter request succeeds and
-        /// `WgpuBackend::create` stores a real `TrianglePipelineRenderer`.
-        /// `create_inner` (not `create`) is called directly so a
-        /// `NoAdapter` outcome on a genuinely headless CI host is
-        /// reportable as a named, non-panicking skip rather than an
-        /// opaque `RenderError::Backend` string match.
+        /// `WgpuBackend::create` stores a real `TrianglePipelineRenderer`,
+        /// specifically a Metal adapter (asserted below via
+        /// `adapter_info().backend`, not merely "some adapter, whatever
+        /// it is" -- `host-gpu-tests` is this crate's real-Metal
+        /// qualification gate). `create_inner` (not `create`) is called
+        /// directly so a `NoAdapter` outcome is distinguishable, by type,
+        /// from any other failure -- not to make it non-panicking: a
+        /// `NoAdapter` here is still a loud, named panic (`required host
+        /// GPU evidence unavailable`), matching this crate's own existing
+        /// convention for required host-GPU test evidence
+        /// (`device/mod.rs`'s `host_gpu_tests` module panics identically
+        /// on its own `HeadlessDeviceOutcome::NoAdapter`). The value of
+        /// the typed `WgpuCreateError` here is that this panic message
+        /// names exactly which failure occurred, instead of an opaque
+        /// `RenderError::Backend` string a caller would have to parse.
         #[test]
-        fn create_requests_a_real_adapter_and_stores_the_triangle_pipeline() {
+        fn create_requests_a_real_metal_adapter_and_stores_the_triangle_pipeline() {
             let (mut backend, _session) = WgpuBackend::try_new().unwrap();
             match backend.create_inner(&test_render_config()) {
                 Ok(()) => {
-                    assert!(
-                        backend.triangle_pipeline.is_some(),
-                        "a successful create() must store a real TrianglePipelineRenderer"
+                    let renderer = backend
+                        .triangle_pipeline
+                        .as_ref()
+                        .expect("a successful create() must store a real TrianglePipelineRenderer");
+                    assert_eq!(
+                        renderer.adapter_info().backend,
+                        wgpu::Backend::Metal,
+                        "this test qualifies real Metal execution specifically, not merely \
+                         some adapter -- got {:?}",
+                        renderer.adapter_info()
                     );
                 }
                 Err(WgpuCreateError::NoAdapter(no_adapter)) => {
