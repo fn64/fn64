@@ -36,8 +36,9 @@ use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::{
     CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode, PhysicalTmemError,
     PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError, RdpState,
-    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TrianglePipelineDeviceOutcome,
-    TrianglePipelineError, TrianglePipelineRenderer, UninitializedTrianglePipeline,
+    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
+    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
+    TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -57,15 +58,20 @@ pub struct WgpuBackend {
     /// prior submission set (e.g. a `SetTile` from submission N read by a
     /// `LoadBlock` in submission N+1).
     rdp_state: RdpState,
-    /// The real GPU triangle-draw pipeline, populated only by a successful
-    /// `RenderBackend::create` call -- never by `try_new`, never lazily on
-    /// first draw (`WgpuBackend` production triangle-draw integration card
-    /// §1a: eager, synchronous initialization is the owner's explicit
-    /// decision, superseding an earlier lazy-init draft). `None` until
-    /// `create` succeeds; a caller that never calls `create` never pays
-    /// GPU-adapter-negotiation cost, since every existing TMEM-only
-    /// caller/test already never calls it.
+    /// `Some` only after a successful `RenderBackend::create`; `try_new`
+    /// never populates it. Always `Some` together with
+    /// `triangle_target_extent`, never one without the other.
     triangle_pipeline: Option<Box<TrianglePipelineRenderer>>,
+    /// The render-target extent for triangle draws, sized from `create`'s
+    /// own `RenderConfig`. Always `Some` together with `triangle_pipeline`,
+    /// never one without the other; replaced atomically with it on every
+    /// `create()` call.
+    triangle_target_extent: Option<TriangleTargetExtent>,
+    /// The most recent successful triangle draw's GPU-observed output.
+    /// Replaced only when every triangle in a draw call succeeds; a
+    /// failed draw leaves the prior value untouched. Never an accumulated
+    /// history, never a persistent framebuffer.
+    triangle_draw_output: Option<TriangleDrawOutput>,
 }
 
 /// Failure constructing a fresh [`WgpuBackend`]. Both sources are the T0
@@ -111,6 +117,8 @@ impl WgpuBackend {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
                 triangle_pipeline: None,
+                triangle_target_extent: None,
+                triangle_draw_output: None,
             },
             session,
         ))
@@ -144,7 +152,14 @@ impl WgpuBackend {
     /// which `RenderBackend::create`'s own `Result<(), RenderError>`
     /// signature cannot preserve once converted (`RenderError::Backend`'s
     /// `reason` is a plain `String`).
-    pub(crate) fn create_inner(&mut self, _cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
+    ///
+    /// Also derives and stores `triangle_target_extent` from `cfg`
+    /// (§1e: `TriangleTargetExtent { width: cfg.width, height:
+    /// cfg.height }`, an identity mapping -- no RDP viewport/scissor
+    /// concept exists to derive anything narrower from), so a later
+    /// triangle draw knows what render-target size to use without `cfg`
+    /// being threaded through every call.
+    pub(crate) fn create_inner(&mut self, cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
         let outcome = pollster::block_on(
             UninitializedTrianglePipeline::new(HeadlessBackend::default()).request(),
         )
@@ -152,12 +167,77 @@ impl WgpuBackend {
         match outcome {
             TrianglePipelineDeviceOutcome::Ready(renderer) => {
                 self.triangle_pipeline = Some(renderer);
+                self.triangle_target_extent = Some(TriangleTargetExtent {
+                    width: cfg.width,
+                    height: cfg.height,
+                });
                 Ok(())
             }
             TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => {
                 Err(WgpuCreateError::NoAdapter(no_adapter))
             }
         }
+    }
+
+    /// The most recent triangle draw's real GPU-observed color/depth
+    /// output (§1e), or `None` if no triangle-bearing `execute_raw_dpc`
+    /// call has succeeded yet. Exposed for diagnostics and tests, mirroring
+    /// `physical_tmem()`/`rdp_state()`'s own diagnostic-accessor
+    /// convention on this struct -- never an accumulated history, never a
+    /// persistent framebuffer.
+    pub fn last_triangle_draw(&self) -> Option<&TriangleDrawOutput> {
+        self.triangle_draw_output.as_ref()
+    }
+
+    /// Draws every collected triangle, in stream order, through
+    /// `TrianglePipelineRenderer::submit_admitted_triangle`, using the
+    /// identity `TriangleRasterParams` derived once from the stored
+    /// `triangle_target_extent` (never recomputed per triangle, never
+    /// defaulted). `last_triangle_draw()` updates only after every
+    /// triangle in this call draws successfully -- a failure partway
+    /// through leaves the prior successful value in place, unchanged,
+    /// never cleared: an old-but-real result outlives a failed attempt to
+    /// replace it, matching this file's own "never a silent partial
+    /// state" convention elsewhere.
+    fn draw_admitted_triangles(
+        &mut self,
+        triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+    ) -> Result<(), WgpuRawDpcExecutionError> {
+        let pipeline = self
+            .triangle_pipeline
+            .as_mut()
+            .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
+        let extent = self
+            .triangle_target_extent
+            .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
+        let raster_params = TriangleRasterParams {
+            resolution: [extent.width as f32, extent.height as f32],
+            screen_scale: [1.0, 1.0],
+            screen_offset: [0.0, 0.0],
+        };
+
+        let mut last_output = None;
+        for draw in triangles {
+            let draw = draw.map_err(WgpuRawDpcExecutionError::MissingTriangleDrawState)?;
+            let in_flight = pipeline
+                .submit_admitted_triangle(
+                    draw.vertices,
+                    draw.other_mode,
+                    draw.combine_params,
+                    raster_params,
+                    extent,
+                )
+                .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+            let output = in_flight
+                .complete()
+                .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+            last_output = Some(output);
+        }
+
+        if let Some(output) = last_output {
+            self.triangle_draw_output = Some(output);
+        }
+        Ok(())
     }
 }
 
@@ -341,7 +421,24 @@ struct ExecutionCollector<'coord> {
     submission: fn64_render_ir::SubmissionIdentity,
     plan: PlanCollector,
     reads: Vec<(u32, Vec<u8>)>,
-    outcome: Option<Result<(BackendEffectReport, PhysicalTmemState), WgpuRawDpcExecutionError>>,
+    outcome: Option<Result<StagedOutcome, WgpuRawDpcExecutionError>>,
+}
+
+/// What `stage_and_report` found for one sealed plan, structurally
+/// distinguishing "this plan has TMEM loads to stage" from "this plan has
+/// no TMEM loads, only triangles" (`WgpuBackend` production triangle-draw
+/// integration card §1c) -- the caller (`execute_raw_dpc_inner`) uses this
+/// to choose which `RawDpcCoordinator` completion method is even
+/// reachable, never by re-deriving "is this plan write-bearing" itself.
+/// Mechanical, not a judgment call: a plan reaches `TriangleOnly` only
+/// when `collector.plan.loads` is empty and `collector.plan.triangles` is
+/// not (checked once, here, at the one place both facts are already
+/// gathered) -- never inferred from the *presence* of triangles alone,
+/// since a plan could in principle carry both (mixed plans stay on the
+/// `TmemLoads` path unconditionally, per the `is_empty()` check).
+enum StagedOutcome {
+    TmemLoads(BackendEffectReport, PhysicalTmemState),
+    TriangleOnly,
 }
 
 impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
@@ -385,14 +482,24 @@ pub enum WgpuRawDpcExecutionError {
     MissingCapturedSource {
         command_index: u32,
     },
-    /// A plan with zero TMEM loads reached execution -- v11's admitted
-    /// TMEM/state subset always requires at least one, exactly like
-    /// `PhysicalTmemPacketTransaction::into_pending`'s own
-    /// `NoCompletedLoads` rejection.
+    /// A plan with zero TMEM loads AND zero admitted triangles reached
+    /// execution -- there is nothing for this backend to do with it.
     NoCompletedLoads,
     Physical(PhysicalTmemError),
     Effect(ValidationError),
     Coordinator(ValidationError),
+    /// A triangle's own command-time `OtherMode`/`CombineParams` snapshot
+    /// was never established (`PlanCollector`'s own `MissingTriangleDrawState`)
+    /// -- never silently skipped.
+    MissingTriangleDrawState(MissingTriangleDrawState),
+    /// The real GPU triangle-draw pipeline rejected a draw (device
+    /// poisoned, submission/readback failure) -- never silently skipped.
+    TriangleDraw(TrianglePipelineError),
+    /// A triangle-bearing plan reached execution with no successful prior
+    /// `RenderBackend::create` call -- `triangle_pipeline`/
+    /// `triangle_target_extent` are always `Some` together (§1a/§1e) or
+    /// both `None`; this is the caller-contract violation of the latter.
+    TriangleDrawBeforeCreate,
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -413,6 +520,14 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::Physical(error) => write!(formatter, "physical TMEM staging failed: {error}"),
             Self::Effect(error) => write!(formatter, "backend effect report failed: {error}"),
             Self::Coordinator(error) => write!(formatter, "coordinator execution failed: {error}"),
+            Self::MissingTriangleDrawState(error) => {
+                write!(formatter, "triangle draw state missing: {error}")
+            }
+            Self::TriangleDraw(error) => write!(formatter, "triangle draw failed: {error}"),
+            Self::TriangleDrawBeforeCreate => formatter.write_str(
+                "a triangle-bearing plan reached execution with no successful prior \
+                 RenderBackend::create call",
+            ),
         }
     }
 }
@@ -508,23 +623,16 @@ fn map_physical_lanes(
 }
 
 impl RenderBackend for WgpuBackend {
-    /// Eagerly, synchronously requests the real GPU triangle-draw pipeline
-    /// (`WgpuBackend` production triangle-draw integration card §1a): blocks
-    /// once on `UninitializedTrianglePipeline::request()` via
-    /// `pollster::block_on`. A repeated call is an explicit full reset, not
-    /// a no-op and not an error -- it re-requests a device from scratch and
-    /// replaces `triangle_pipeline`, dropping the previous renderer's
-    /// device/queue/pipeline. `_cfg` is accepted (matching the trait
-    /// signature every other backend implements) but unused here: this
-    /// backend's fixed-fixture triangle pipeline does not size itself off
-    /// `RenderConfig`'s `width`/`height`/`tv_type` (per-draw extent is
-    /// supplied per call to `submit_admitted_triangle`, not fixed at
-    /// `create` time). Thin wrapper over `Self::create_inner`, mirroring
-    /// `execute_raw_dpc`/`execute_raw_dpc_inner`'s existing split in this
-    /// file -- `create_inner` returns the richly-typed `WgpuCreateError` a
-    /// test can assert on specifically (e.g. distinguishing a genuine
-    /// `NoAdapter` from any other failure), which `RenderError::Backend`'s
-    /// plain `String` reason cannot preserve once converted.
+    /// Requests a real GPU device and derives this backend's triangle
+    /// render-target extent from `cfg`, both eagerly and synchronously
+    /// (blocks on `UninitializedTrianglePipeline::request()`). A repeated
+    /// call is a full reset: `triangle_pipeline`/`triangle_target_extent`
+    /// are always replaced together, from a fresh device request, never
+    /// partially. Thin wrapper over `Self::create_inner`, which returns
+    /// the richly-typed `WgpuCreateError` this crate's own tests need to
+    /// distinguish a genuine `NoAdapter` from any other failure --
+    /// `RenderError::Backend`'s plain `String` reason cannot preserve
+    /// that distinction once converted.
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
         self.create_inner(cfg).map_err(RenderError::from)
     }
@@ -587,13 +695,20 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        execute_raw_dpc_inner(
+        let (prepared, triangles) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
             self.rdp_state.other_mode(),
             self.rdp_state.combine(),
         )
-        .map_err(RenderError::from)
+        .map_err(RenderError::from)?;
+
+        if !triangles.is_empty() {
+            self.draw_admitted_triangles(triangles)
+                .map_err(RenderError::from)?;
+        }
+
+        Ok(prepared)
     }
 
     fn publish_raw_dpc(
@@ -859,7 +974,13 @@ fn execute_raw_dpc_inner(
     bound: BoundSubmittedRawDpc,
     durable_other_mode: Option<OtherMode>,
     durable_combine: Option<CombineParams>,
-) -> Result<BackendPreparedRawDpc, WgpuRawDpcExecutionError> {
+) -> Result<
+    (
+        BackendPreparedRawDpc,
+        Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+    ),
+    WgpuRawDpcExecutionError,
+> {
     let mut plan_visitor = PlanCollector::seeded(durable_other_mode, durable_combine);
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
@@ -873,13 +994,33 @@ fn execute_raw_dpc_inner(
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
 
-    let (effects, next_physical) = view
+    let outcome = view
         .outcome
         .expect("execution_view always calls submitted_packet exactly once")?;
+    let triangles = view.plan.triangles;
 
-    coordinator
-        .complete_execution(bound, effects, next_physical)
-        .map_err(WgpuRawDpcExecutionError::Coordinator)
+    let prepared = match outcome {
+        StagedOutcome::TmemLoads(effects, next_physical) => coordinator
+            .complete_execution(bound, effects, next_physical)
+            .map_err(WgpuRawDpcExecutionError::Coordinator)?,
+        // Mechanical, not inferred: `StagedOutcome::TriangleOnly` is only
+        // ever produced when `stage_and_report` observed zero completed
+        // TMEM loads AND at least one admitted triangle (§1c) -- a mixed
+        // plan (loads + triangles) always takes the `TmemLoads` arm above,
+        // never this one. `complete_execution_preserving_physical` itself
+        // additionally, structurally rejects any packet whose journal
+        // declares write accesses (its own internal
+        // `BackendEffectReport::try_new(packet, Vec::new())` call fails
+        // `validate_effects`'s access-count check if the journal expects
+        // any writes) -- this branch selection and that internal
+        // validation are two independent enforcements of the same
+        // invariant, not one relying on the other.
+        StagedOutcome::TriangleOnly => coordinator
+            .complete_execution_preserving_physical(bound)
+            .map_err(WgpuRawDpcExecutionError::Coordinator)?,
+    };
+
+    Ok((prepared, triangles))
 }
 
 /// The pipeline `submitted_packet` runs once `&WorkloadPacket` is in scope:
@@ -888,11 +1029,14 @@ fn execute_raw_dpc_inner(
 /// counterpart to the decoder-typed `stage_transfer`), seal it into a
 /// `PendingTmemTransaction`, compute the exact `BackendEffectReport` from
 /// its own proposed effects, and derive this transaction's
-/// `into_physical_successor` (T3 Phase A) candidate.
+/// `into_physical_successor` (T3 Phase A) candidate. Returns
+/// `StagedOutcome::TriangleOnly` instead of staging anything when the
+/// plan has zero TMEM loads but at least one admitted triangle (§1c) --
+/// still `NoCompletedLoads` when the plan has neither.
 fn stage_and_report(
     collector: &ExecutionCollector<'_>,
     packet: &WorkloadPacket,
-) -> Result<(BackendEffectReport, PhysicalTmemState), WgpuRawDpcExecutionError> {
+) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
     let source = TmemLoadSourceIdentity::new(
         packet.identity(),
         packet.journal().identity(),
@@ -953,8 +1097,22 @@ fn stage_and_report(
         );
     }
 
-    let packet_transaction =
-        packet_transaction.ok_or(WgpuRawDpcExecutionError::NoCompletedLoads)?;
+    let packet_transaction = match packet_transaction {
+        Some(packet_transaction) => packet_transaction,
+        None => {
+            // No TMEM load completed a transaction -- mechanically
+            // distinguish "this plan has triangles instead" (§1c: route
+            // to the coordinator's preserving-physical completion, never
+            // to `complete_execution`, which has no successor to offer
+            // for an empty transaction) from "this plan has nothing at
+            // all" (still `NoCompletedLoads`, unchanged).
+            return if collector.plan.triangles.is_empty() {
+                Err(WgpuRawDpcExecutionError::NoCompletedLoads)
+            } else {
+                Ok(StagedOutcome::TriangleOnly)
+            };
+        }
+    };
     let pending = packet_transaction
         .into_pending()
         .map_err(WgpuRawDpcExecutionError::Physical)?;
@@ -967,7 +1125,7 @@ fn stage_and_report(
         .into_physical_successor(collector.physical, &effects)
         .map_err(WgpuRawDpcExecutionError::Physical)?;
 
-    Ok((effects, next_physical))
+    Ok(StagedOutcome::TmemLoads(effects, next_physical))
 }
 
 #[cfg(test)]
@@ -987,9 +1145,42 @@ mod tests {
     const LOAD_SYNC: u8 = 0x26;
     const LOAD_BLOCK: u8 = 0x33;
     const FULL_SYNC: u8 = 0x29;
+    const SET_OTHER_MODE: u8 = 0x2f;
+    const SET_COMBINE: u8 = 0x3c;
+    const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     fn word(opcode: u8, payload: u32) -> u32 {
         u32::from(opcode) << 24 | payload
+    }
+
+    fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
+        [word(SET_OTHER_MODE, cycle_type << 20), low]
+    }
+
+    fn set_combine(payload: u32, high: u32) -> [u32; 2] {
+        [word(SET_COMBINE, payload & 0x00ff_ffff), high]
+    }
+
+    /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
+    /// eight raw wire words -- mirrors
+    /// `raw_dpc::production_adapter::tests::triangle_base_edge_words`
+    /// exactly (that helper is private to its own module's tests, so this
+    /// is a local, identical copy, not a shared import).
+    fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
+        let w0 = word(
+            RAW_TRIANGLE_BASE_EDGE,
+            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
+        );
+        [
+            w0,
+            0,
+            0x0010_0000,
+            0,
+            0x0020_0000,
+            0x0000_8000,
+            0x0005_0000,
+            0,
+        ]
     }
 
     fn set_texture_image(format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
@@ -1017,6 +1208,66 @@ mod tests {
         words.extend(set_tile(7, 2, 0));
         words.extend(load_sync());
         words.extend([word(LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+        words
+    }
+
+    /// A mixed plan: one admitted `TmemLoad` (identical shape to
+    /// `one_load_block_words`) PLUS `SetOtherMode`/`SetCombine`/one
+    /// admitted `RawTriangle` -- proves the loads+triangle branch-selection
+    /// rule (§1c): a plan with at least one TMEM load must always take the
+    /// real successor route (`complete_execution`), never the
+    /// preserving-physical route, regardless of the triangle's presence.
+    fn mixed_load_and_triangle_words() -> Vec<u32> {
+        let mut words = one_load_block_words();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(triangle_base_edge_words(7, 2, 0));
+        words
+    }
+
+    /// A triangle-only plan: `SetOtherMode`/`SetCombine`/one admitted
+    /// `RawTriangle`, zero TMEM loads -- exercises `stage_and_report`'s
+    /// `StagedOutcome::TriangleOnly` arm and
+    /// `RawDpcCoordinator::complete_execution_preserving_physical`.
+    fn triangle_only_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(triangle_base_edge_words(7, 2, 0));
+        words
+    }
+
+    const RAW_TRIANGLE_SHADED: u8 = 0x0c;
+
+    /// A shaded (0x0c), non-textured, non-Z triangle covering the whole
+    /// 8x8 target with a FLAT uniform shade color -- mirrors
+    /// `targets::triangle_pipeline::tests::host_gpu_tests::
+    /// shaded_covering_triangle_words` exactly (see that function's own
+    /// doc for the full field-by-field derivation); duplicated here, not
+    /// imported, since that helper is private to its own module's tests.
+    fn shaded_covering_triangle_words(color_255: [u32; 4]) -> Vec<u32> {
+        let mut words = vec![
+            word(RAW_TRIANGLE_SHADED, 32u32),
+            0,
+            (8i32 << 16) as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let base_w0 = (color_255[0] << 16) | (color_255[1] & 0xffff);
+        let base_w1 = (color_255[2] << 16) | (color_255[3] & 0xffff);
+        words.extend([
+            base_w0, base_w1, // shade[0]
+            0, 0, // shade[1] (dx)
+            0, 0, // shade[2] (base low half, zero)
+            0, 0, // shade[3] (dx low half)
+            0, 0, // shade[4] (de)
+            0, 0, // shade[5] (unused by decode_shade)
+            0, 0, // shade[6] (de low half)
+            0, 0, // shade[7] (unused)
+        ]);
         words
     }
 
@@ -1091,6 +1342,27 @@ mod tests {
             .map(|index| index as u8)
             .collect();
         (planned, source_bytes)
+    }
+
+    /// Same as `plan_with_deterministic_reads`, but for a fixture that
+    /// declares zero `TmemLoadSource` reads (a triangle-only plan) --
+    /// `plan_with_deterministic_reads`'s own `reads()[0]` indexing would
+    /// panic on an empty guest-read plan, so this asserts the expectation
+    /// explicitly instead of assuming it.
+    fn plan_with_no_reads(
+        backend: &mut WgpuBackend,
+        session: &RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> PlannedRawDpcSubmission {
+        let request = session.plan_request(capture(words));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("fixture plans cleanly");
+        assert!(
+            planned.guest_read_plan().reads().is_empty(),
+            "a triangle-only plan must declare zero TmemLoadSource reads"
+        );
+        planned
     }
 
     /// Plans a multi-load fixture and fills *every* read the resulting
@@ -1199,6 +1471,317 @@ mod tests {
             "publish must flip the coordinator's active slot to the executed candidate"
         );
         assert_eq!(fabric.rsp_execution_state().dpc_current, 0x108);
+    }
+
+    /// End-to-end, real Metal execution: a mixed plan (TMEM load +
+    /// triangle) must plan/execute/publish and flip the coordinator's
+    /// active physical slot exactly like a TMEM-only plan does (mirrors
+    /// `plan_execute_publish_completes_and_flips_active_physical_slot`'s
+    /// own full sequence) -- proving the real successor route
+    /// (`complete_execution`), not the preserving-physical route, was
+    /// actually used for a mixed plan. If the preserving-physical route
+    /// had been used instead, `complete_execution_preserving_physical`'s
+    /// own internal `BackendEffectReport::try_new(packet, Vec::new())`
+    /// call would have failed outright (the load's own journal entry
+    /// declares a real write access, `Vec::new()` declares zero, and
+    /// `validate_effects` rejects any count mismatch) -- so this test's
+    /// mere success, not just the slot flip, is itself evidence the
+    /// correct route was taken.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn mixed_load_and_triangle_plan_uses_the_real_successor_route_not_preserving() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        let initial_identity = backend.physical_tmem().identity();
+
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, mixed_load_and_triangle_words());
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("a mixed load+triangle plan must execute successfully");
+        assert!(
+            backend.last_triangle_draw().is_some(),
+            "the mixed plan's triangle must still be drawn during execute_raw_dpc"
+        );
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+        assert_ne!(
+            backend.physical_tmem().identity(),
+            initial_identity,
+            "a mixed plan's TMEM load must still flip the active physical slot on publish, via \
+             the real complete_execution successor route"
+        );
+    }
+
+    /// End-to-end, real Metal execution: a triangle-only plan (zero TMEM
+    /// loads) completes via `complete_execution_preserving_physical` and
+    /// its publish must leave the active physical slot's identity
+    /// UNCHANGED (the opposite assertion direction from every TMEM-load
+    /// test in this module) -- there is no successor state to flip to,
+    /// by design (§1c).
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn triangle_only_plan_completes_via_preserving_physical_and_never_flips_the_slot() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        let initial_identity = backend.physical_tmem().identity();
+
+        let planned = plan_with_no_reads(&mut backend, &session, triangle_only_words());
+        let guest_capture = guest_read_capture(&planned, &[]);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("a triangle-only plan must execute successfully via preserving_physical");
+        assert!(
+            backend.last_triangle_draw().is_some(),
+            "the triangle-only plan's triangle must still be drawn"
+        );
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+        assert_eq!(
+            backend.physical_tmem().identity(),
+            initial_identity,
+            "a triangle-only plan has no TMEM successor to flip to -- the active physical slot's \
+             identity must remain exactly what it was before, proving complete_execution (the \
+             route that WOULD flip it) was never used"
+        );
+    }
+
+    /// The real end-to-end test (§2): a real decoded capture containing
+    /// `SetOtherMode`/`SetCombine`/one `RawTriangle`, pushed through the
+    /// actual production entry points
+    /// (`WgpuBackend::create`/`plan_raw_dpc`/`execute_raw_dpc`), asserted
+    /// against real GPU-observed pixel output -- matching the rigor
+    /// `targets::triangle_pipeline::tests`'s own
+    /// `required_host_draws_a_real_admitted_triangle_matching_the_combiner_oracle`
+    /// already established for its own standalone (non-`WgpuBackend`)
+    /// proof, but through the actual `RenderBackend` seam this card
+    /// closes, not a bare coordinator.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn wgpu_backend_draws_a_real_admitted_triangle_matching_the_combiner_oracle() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+
+        // SHADE-passthrough SetCombine: (A-B)*C+D collapses to D=SHADE.
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 4;
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 4;
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(low, high));
+        let triangle_color_255 = [64u32, 128, 192, 255];
+        words.extend(shaded_covering_triangle_words(triangle_color_255));
+
+        // `set_combine(payload, high)` masks `payload` to the low 24 bits
+        // and bakes the `SET_COMBINE` opcode byte into the top 8 bits of
+        // the wire word -- `CombineParams::from_wire(w0, w1)` stores `w0`
+        // unmasked (`combiner.rs`'s own module doc), so the expected value
+        // is derived from the exact same wire word this fixture pushed,
+        // not read back from the sealed plan (which exposes no such
+        // accessor -- this mirrors how the standalone parallel-lane test
+        // cross-checks against its own raw decoded ticket, not the plan).
+        let combine_params = CombineParams::from_wire(word(SET_COMBINE, low & 0x00ff_ffff), high);
+        let planned = plan_with_no_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &[]);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+
+        backend
+            .execute_raw_dpc(bound)
+            .expect("the fixture stays inside the admitted state+triangle subset");
+
+        let output = backend.last_triangle_draw().expect(
+            "a successful triangle-bearing execute_raw_dpc must populate last_triangle_draw",
+        );
+
+        // Known-covered pixel, flat shade -> every covered pixel has the
+        // same combiner output, no barycentric interpolation needed.
+        let shade_color = [
+            triangle_color_255[0] as f32 / 255.0,
+            triangle_color_255[1] as f32 / 255.0,
+            triangle_color_255[2] as f32 / 255.0,
+            triangle_color_255[3] as f32 / 255.0,
+        ];
+        let inputs = crate::combiner::CombinerInputs {
+            tex_val0: [0.0; 4],
+            tex_val1: [0.0; 4],
+            prim_color: [0.0; 4],
+            shade_color,
+            env_color: [0.0; 4],
+            key_center: [0.0; 3],
+            key_scale: [0.0; 3],
+            lod_fraction: 0.0,
+            prim_lod_frac: 0.0,
+            noise: 0.0,
+            k4: 0.0,
+            k5: 0.0,
+        };
+        let (expected_color, _alpha_compare) =
+            crate::combiner::run_one_cycle(combine_params, inputs);
+        let expected_u8 = expected_color.map(|component| (component * 255.0).round() as u8);
+
+        let pixel_index = (output.extent.width + 1) as usize * 4;
+        let observed = [
+            output.color_rgba8[pixel_index],
+            output.color_rgba8[pixel_index + 1],
+            output.color_rgba8[pixel_index + 2],
+            output.color_rgba8[pixel_index + 3],
+        ];
+        for channel in 0..4 {
+            assert!(
+                observed[channel].abs_diff(expected_u8[channel]) <= 2,
+                "pixel (1,1) channel {channel}: observed {observed:?} vs expected {expected_u8:?} \
+                 (real decoded CombineParams via the real WgpuBackend production seam)"
+            );
+        }
+        assert_eq!(expected_u8, triangle_color_255.map(|c| c as u8));
+    }
+
+    /// `create()`'s success stores `triangle_pipeline`/`triangle_target_extent`
+    /// atomically, together -- a repeated `create()` call with a changed
+    /// `RenderConfig` extent updates both, never one without the other.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn repeated_create_with_a_changed_extent_updates_pipeline_and_extent_together() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("first create() must succeed on a real adapter");
+        assert_eq!(
+            backend.triangle_target_extent,
+            Some(TriangleTargetExtent {
+                width: 8,
+                height: 8
+            })
+        );
+
+        let changed_config = fn64_render::RenderConfig {
+            width: 16,
+            height: 16,
+            tv_type: fn64_runtime::TvType::default(),
+        };
+        backend
+            .create_inner(&changed_config)
+            .expect("a second create() call with a different extent must also succeed");
+        assert!(backend.triangle_pipeline.is_some());
+        assert_eq!(
+            backend.triangle_target_extent,
+            Some(TriangleTargetExtent {
+                width: 16,
+                height: 16
+            }),
+            "a repeated create() call must update the stored extent to match its own \
+             RenderConfig, not retain the first call's value"
+        );
+    }
+
+    /// `last_triangle_draw()` update timing (§1e): a failed
+    /// `draw_admitted_triangles` call leaves whatever prior successful
+    /// output was already stored completely untouched -- never cleared,
+    /// never partially overwritten. Calls `draw_admitted_triangles`
+    /// directly with a deliberately failing second triangle so the
+    /// failure is deterministic, rather than relying on a real pipeline
+    /// error.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn a_failed_triangle_draw_leaves_the_prior_successful_output_untouched() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("create() must succeed on a real adapter");
+
+        let good_triangle = RetrievedTriangleDraw {
+            vertices: [
+                fixture_vertex(0.0),
+                fixture_vertex(1.0),
+                fixture_vertex(2.0),
+            ],
+            other_mode: OtherMode::from_wire(0, 0),
+            combine_params: CombineParams::from_wire(0, 0),
+        };
+        backend
+            .draw_admitted_triangles(vec![Ok(good_triangle)])
+            .expect("a single valid triangle must draw successfully");
+        let first_output_extent = backend
+            .last_triangle_draw()
+            .expect("the first successful draw must populate last_triangle_draw")
+            .extent;
+
+        let failing_triangles = vec![
+            Ok(good_triangle),
+            Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 1 }),
+        ];
+        let result = backend.draw_admitted_triangles(failing_triangles);
+        assert!(
+            result.is_err(),
+            "a batch containing a MissingTriangleDrawState entry must fail, not silently skip it"
+        );
+
+        let output_after_failure = backend
+            .last_triangle_draw()
+            .expect("the prior successful output must still be present after a later failure");
+        assert_eq!(
+            output_after_failure.extent, first_output_extent,
+            "a failed draw_admitted_triangles call must leave the prior successful \
+             last_triangle_draw() value completely untouched, never cleared"
+        );
     }
 
     /// Positive: `raw_dpc_ir_capability` reports the real v11 TMEM-only
