@@ -46,8 +46,8 @@ reserving authority, parity, performance, and integration claims for the lead.
 | active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.2 assessment owner; `F/xhigh` M4.2a physical-state owner; independent reviewers remain serialized from writers |
 | last completed result | Production blend wiring Slice 1 is complete for the non-framebuffer selector subset: the real triangle fragment path now evaluates the characterized blender cycles, preserves Copy/Fill and no-blend bypasses, and rejects any `Framebuffer`/`FramebufferAlpha` dependency before GPU submission with `BlendRequiresFramebuffer`. The retained WGSL is differentially checked against `blend_fragment(..., memory: None, ...)`; a corrected host-shareable fixture layout uses offsets 48/80/96 and stride 112. Final-source evidence is 1091/1091 default tests, 1122/1122 Metal tests (3 ignored freeze printers), and 10 consecutive Apple M5 Pro ordinals of the exact WGSL differential, general-divide draw, and pre-submit rejection tests (30/30 fresh processes). This remains a bounded execution/readback result, not framebuffer-dependent blending, presentation, parity, performance, or full-ROM evidence. |
 | last completed result (prior) | `Math.hlsli` literal CPU dispatch port (`crates/fn64-render-wgpu/src/math_hlsli.rs`) completed both `modulo` and `get_perpendicular_vector`, with its public re-exports, 10/10 focused reliability evidence, full default/host-GPU suites, explicit formatting, and unchanged five-error docs-lint baseline. It remains an unwired CPU-only literal port with no GPU, production-path, or parity claim. |
-| next concrete decision | Implement the separately reviewed plain-color framebuffer fallback (manual snapshot/pass-splitting Slice B); `FramebufferAlpha` remains blocked on a real coverage-count destination, and native dual-source remains separate because wgpu 30 rejects dual-source blending with the current second `R32Uint` status target. Continue the remaining raw-DPC admission gaps (`NoOp`, `FillRectangle`, `FullSync`) and the typed all-56 wgpu-ingestion assessment in parallel. |
-| evidence blockers | no matched private-game RT64 performance baseline exists; ShaderNonUniform SPIR-V remains blocked by Naga 30; no presentation/VI/swapchain claim; framebuffer-alpha blending lacks a GPU-visible prior coverage count; native dual-source conflicts with the current two-color-target pipeline; `FillRectangle`/`NoOp`/`FullSync` remain outside admitted production dispatch. |
+| next concrete decision | Implement the separately reviewed plain-color framebuffer fallback (manual snapshot/pass-splitting Slice B); `FramebufferAlpha` remains blocked on a real coverage-count destination, and native dual-source remains separate because wgpu 30 rejects dual-source blending with the current second `R32Uint` status target. Continue the remaining raw-DPC admission gaps (`FillRectangle`, `FullSync`) and the typed all-56 wgpu-ingestion assessment in parallel. |
+| evidence blockers | no matched private-game RT64 performance baseline exists; ShaderNonUniform SPIR-V remains blocked by Naga 30; no presentation/VI/swapchain claim; framebuffer-alpha blending lacks a GPU-visible prior coverage count; native dual-source conflicts with the current two-color-target pipeline; `FillRectangle`/`FullSync` remain outside admitted production dispatch. |
 | verification claim | Full `WgpuBackend` production triangle-draw integration passed `cargo test -p fn64-render-wgpu --lib` clean under both default and `--features host-gpu-tests` (945/945, 0 failures), scoped clippy (`--no-deps --all-targets`, both feature sets) clean, explicit-file `rustfmt --check --edition 2021` clean on every touched file, `lint-docs.py` clean against the pre-existing 5-error `origin/main` baseline (0 new errors). 10 new tests in `production.rs`: five `PlanCollector` unit tests (unseeded-triangle rejection, durable-seed resolution, per-triangle-not-collapsed snapshotting, seed-override by real in-plan state, triangle-only walk without panicking); a real-Metal mixed-plan test proving the real successor route (not preserving) is used and the triangle still draws; a real-Metal triangle-only test proving `complete_execution_preserving_physical` is used and the physical slot never flips; a real-Metal atomic pipeline+extent replacement test; a failed-draw test proving `last_triangle_draw()` retains its prior value on failure; and the real end-to-end test (`create` -> `plan_raw_dpc` -> `execute_raw_dpc` -> `last_triangle_draw()`) asserting real GPU-observed pixel output at a known-covered pixel matches `combiner.rs`'s `run_one_cycle` oracle called with the real decoded `CombineParams`, through the actual production `RenderBackend` path -- all confirmed 10 consecutive clean runs against a real Metal adapter. `RawDpcCoordinator::complete_execution_preserving_physical` (`d41fac44`) and `RawTriangle` sealed-plan admission (`2b3ed203`), the two dependencies this integration consumed, each separately passed their own recorded final-source gates. M2.5.1 has an independently verified 56/56 conditional reference-valid corpus but no runtime/parity claim. |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
@@ -1308,7 +1308,52 @@ The accelerated wave keeps dependency-safe work active in parallel:
     adapter, T3's `PendingTmemTransaction::into_physical_successor`, and the
     M4.3.3f three-nearest filter are all unchanged.
 
-22. **T4 -- real ABI raw-DPC ingress (INTEGRATED).** Wires all three concrete
+22. **T1 -- admit `NoOp` into the production raw-DPC seam.**
+    Closes one of the three still-open raw-DPC admission gaps the M4.3.4
+    entry above names (`NoOp`, `FillRectangle`, `FullSync`). Scope: opcode
+    range `0x00..=0x07` under `command = opcode & 0x3f` masking (all four
+    `0x00`/`0x40`/`0x80`/`0xc0` high-bit prefixes), admission-and-discard
+    only -- `push_decoded_raw_dpc`'s three-way rejection arm splits so a
+    decoded `NoOp` matches its own arm (`{}`, do nothing, loop continues)
+    while `FillRectangle`/`FullSync` keep their existing loud
+    `UnadmittedRawDpcCommand` rejection unchanged. Design rationale: `NoOp`
+    is decode-time proven state-inert and resource-inert
+    (`all_low_noop_variants_and_four_prefixes_are_admitted`,
+    `raw_dpc/mod.rs:1970-1988`, asserts `decoded.state_delta() ==
+    &RdpStateDelta::default()`) -- it has no address, format, or length, so
+    it can construct no `ResourceAccess` and therefore cannot become a
+    guest write for `commit_zero_guest_writes`'s hardcoded empty write list
+    to either honestly reject or dishonestly hide. This is categorically
+    different from `FillRectangle`, whose color-target write is
+    structurally guest-visible by construction and stays deferred pending a
+    new guest-commit mechanism. "Admit and discard" needed no new type:
+    no new `RawDpcSemanticCommandRef`/`OwnedSemanticCommand` variant, no new
+    `ExactRawDpcPlanWriter` method, no new `RawDpcIrCapability` value, no
+    `WgpuBackend`/`PlanCollector` field -- `NoOp` carries no semantic
+    payload to represent. Fixtures: all 32 prefix x variant wire encodings
+    pushed through `push_decoded_raw_dpc` and `writer.finish` produce an
+    empty plan (`command_count() == 0`); a mixed stream interleaving `NoOp`
+    before/between/after real admitted commands (`SetTextureImage`,
+    `SetTile`, `LoadSync`, `LoadBlock`) proves the finished plan's semantic
+    command sequence matches the identical stream with every `NoOp`
+    physically deleted; a stream with `NoOp`s present and a trailing
+    `FullSync` proves rejection still fires with the correct `opcode_name`
+    (never `"NoOp"`) and `command_index` (still counting every `NoOp` as an
+    ordinary indexed command); `opcode_name(&RawDpcCommandKind::NoOp {
+    .. })` still returns `"NoOp"` after the match-arm split, since its arm
+    was kept intentionally live (not folded into the `unreachable!()`
+    catch-all, whose "admitted kinds are pushed, never rejected" message
+    would be false for the now-admitted-but-never-pushed `NoOp` case).
+    Nonclaims: does not admit `FillRectangle` or `FullSync` (both remain
+    exactly as blocked/deferred as before); does not widen the accepted
+    `NoOp` range beyond `0x00..=0x07` (`0x10..=0x23`'s documented-but-
+    rejected No Operation opcodes stay rejected at the decoder layer,
+    untouched); does not touch `raw_dpc/mod.rs`'s decoder, `rdp_completion.
+    rs`'s width table, `production.rs`'s `PlanCollector`/`WgpuBackend`, or
+    any `targets/*` executor; does not change `Rt64Backend`'s legacy path;
+    establishes no VI, presentation, parity, or performance claim.
+
+23. **T4 -- real ABI raw-DPC ingress (INTEGRATED).** Wires all three concrete
     production raw-DPC producers in `fn64-abi` -- sp_dp DRAM (`sp_dp.rs`),
     MMIO DRAM/XBUS (`pi/mmio.rs`, both sources, via the shared
     `dispatch_dpc_submission` seam), and RSP XBUS (the coalesced

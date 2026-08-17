@@ -12,10 +12,11 @@
 //! `SetCombine`), `RawTriangle`, and `TextureRectangle`/
 //! `TextureRectangleFlip` (admitted as two `RdpTriangleCommand` pushes each,
 //! reusing the same triangle draw path -- see `push_decoded_raw_dpc`'s
-//! `TextureRectangle` arm); every other decoded command kind (`NoOp`,
-//! `FillRectangle`, `FullSync`) remains outside the admitted zero-guest-write
-//! subset and is rejected loudly -- never silently dropped -- the instant
-//! one is encountered.
+//! `TextureRectangle` arm). `NoOp` is admitted and discarded: it carries no
+//! resource identity or state delta, so it is pushed nowhere and simply
+//! skipped. Every other decoded command kind (`FillRectangle`, `FullSync`)
+//! remains outside the admitted zero-guest-write subset and is rejected
+//! loudly -- never silently dropped -- the instant one is encountered.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
@@ -44,8 +45,9 @@ use crate::{
 /// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`, and
 /// `TextureRectangle` is rejected here, loudly, at the exact command
 /// index/location it was decoded at -- never silently dropped or aliased to
-/// a no-op push. Remaining rejected kinds: `NoOp`, `FillRectangle`,
-/// `FullSync`.
+/// a no-op push. Remaining rejected kinds: `FillRectangle`, `FullSync`.
+/// `NoOp` is not rejected: it is admitted and discarded (see
+/// `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -646,8 +648,8 @@ pub fn push_decoded_raw_dpc(
         // both must go through `width_keyed_command_raw_words`'s
         // `raw_rdp_command_width`-keyed reader (see its own doc), never the
         // fixed-2-word slicer, or a texture rectangle's payload would be
-        // silently truncated from 4 words to 2. The three rejected kinds
-        // below (`NoOp`/`FillRectangle`/`FullSync`) never reach a
+        // silently truncated from 4 words to 2. `NoOp` and the two rejected
+        // kinds below (`FillRectangle`/`FullSync`) never reach a
         // `push_state`/`push_triangle` call, so slicing them with the
         // fixed-2-word reader (their own wire shape) is harmless -- their
         // `raw_words`/`location` values are computed but discarded.
@@ -929,9 +931,8 @@ pub fn push_decoded_raw_dpc(
                     viewport: Some(vertices.viewport),
                 });
             }
-            other @ (RawDpcCommandKind::NoOp { .. }
-            | RawDpcCommandKind::FillRectangle(_)
-            | RawDpcCommandKind::FullSync(_)) => {
+            RawDpcCommandKind::NoOp { .. } => {}
+            other @ (RawDpcCommandKind::FillRectangle(_) | RawDpcCommandKind::FullSync(_)) => {
                 return Err(UnadmittedRawDpcCommand {
                     command_index,
                     location: old_location,
@@ -2147,6 +2148,101 @@ mod tests {
         assert_eq!(rejection.opcode_name, "FullSync");
         assert_eq!(rejection.command_index, 4);
         let _ = (session, journal);
+    }
+
+    /// All 32 `NoOp` wire encodings (four `0x00`/`0x40`/`0x80`/`0xc0`
+    /// high-bit prefixes x eight `0x00..=0x07` variants -- the same
+    /// coverage `raw_dpc::mod::tests::
+    /// all_low_noop_variants_and_four_prefixes_are_admitted` exercises at
+    /// the decode layer) are admitted and discarded here, not merely
+    /// decoded: the finished plan is empty.
+    #[test]
+    fn no_op_is_admitted_and_produces_an_empty_plan() {
+        let mut words = Vec::new();
+        for prefix in [0x00, 0x40, 0x80, 0xc0] {
+            for variant in 0..=7u8 {
+                words.extend([word(prefix | variant, 0x005a_5a5a), 0xa5a5_a5a5]);
+            }
+        }
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x200, 0x208));
+        assert_eq!(decoded.commands().len(), 32);
+
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 0);
+        assert_eq!(plan.loads.len(), 0);
+        assert_eq!(plan.triangles.len(), 0);
+    }
+
+    /// `NoOp`s interleaved before, between, and after real admitted
+    /// commands are dropped, not double-counted or miscounted: the
+    /// finished plan's semantic command sequence matches the identical
+    /// stream with every `NoOp` physically deleted.
+    #[test]
+    fn no_op_interleaved_with_admitted_commands_is_invisible_downstream() {
+        let no_op = || [word(0x00, 0), 0];
+        let mut words = Vec::new();
+        words.extend(no_op());
+        words.extend(set_texture_image(0, 2, 8, 0x200));
+        words.extend(no_op());
+        words.extend(set_tile(7, 2, 0));
+        words.extend(no_op());
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+        words.extend(no_op());
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        assert_eq!(decoded.commands().len(), 8, "4 admitted + 4 NoOp");
+
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 3, "SetTextureImage, SetTile, LoadSync");
+        assert_eq!(plan.loads.len(), 1, "LoadBlock");
+        assert_eq!(plan.triangles.len(), 0);
+    }
+
+    /// `NoOp`s present in a stream that also contains a trailing rejected
+    /// command must not weaken or widen rejection: the rejection still
+    /// fires, names the actual offending opcode (never `"NoOp"`), and
+    /// `command_index` still counts every `NoOp` as an ordinary indexed
+    /// command.
+    #[test]
+    fn no_op_does_not_widen_admission_past_a_trailing_rejected_command() {
+        let mut words = Vec::new();
+        words.extend([word(0x00, 0), 0]); // NoOp, index 0
+        words.extend(set_texture_image(0, 2, 8, 0x200)); // index 1
+        words.extend([word(0x01, 0), 0]); // NoOp, index 2
+        words.extend(set_tile(7, 2, 0)); // index 3
+        words.extend([word(0x02, 0), 0]); // NoOp, index 4
+        words.extend([word(0x29, 0), 0]); // FULL_SYNC, index 5
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+
+        let layout = capture.memory_layout();
+        let submission_start = capture.submission().start();
+        let capture_words = capture.submission().command_words();
+        let (session, authority) = new_raw_dpc_roles().unwrap();
+        let request = session.plan_request(capture);
+        let mut writer = authority.begin_plan(request);
+        let outcome = push_decoded_raw_dpc(
+            &mut writer,
+            &decoded,
+            &capture_words,
+            layout,
+            submission_start,
+        );
+        let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
+            panic!(
+                "FullSync must still be rejected via UnadmittedRawDpcCommand even with NoOps \
+                 present in the stream: {outcome:?}"
+            );
+        };
+        assert_eq!(rejection.opcode_name, "FullSync");
+        assert_eq!(rejection.command_index, 5);
+        let _ = (session, journal);
+    }
+
+    #[test]
+    fn opcode_name_still_names_no_op_after_the_match_arm_split() {
+        for variant in 0..=7u8 {
+            assert_eq!(opcode_name(&RawDpcCommandKind::NoOp { variant }), "NoOp");
+        }
     }
 
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
