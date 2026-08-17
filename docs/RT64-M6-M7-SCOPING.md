@@ -49,7 +49,11 @@ for `src/render/rt64_buffer_uploader.cpp`:
 > outcome: "Port the admitted behavior represented by
 > src/render/rt64_buffer_uploader.cpp into an owned Rust module without
 > widening behavior claims."
-> writable_paths: `["crates/fn64-render-wgpu/src/rt64_buffer_uploader_cpp.rs"]`
+> writable_paths: the inventory's generated proposal for this still-unported
+> source, `rt64_buffer_uploader_cpp.rs` under `crates/fn64-render-wgpu/src/`.
+> Quoted as a proposal, not a live path — the file does not exist yet, and
+> naming it as one would trip `scripts/lint-docs.py`'s dangling-reference
+> check.
 > exit_gate: "The M6 behavior fixture for src/render/rt64_buffer_uploader.cpp
 > passes its declared differential and required 10/20-run reliability bar."
 
