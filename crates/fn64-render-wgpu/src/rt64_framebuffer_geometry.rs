@@ -284,12 +284,26 @@
 //!   `rt64_common.rs`'s public surface; nothing here needed reaching into a
 //!   private helper or silently re-deriving one.
 //!
+//! ## Scope status
+//!
+//! **Complete for its stated scope.** Every function in this ticket's named
+//! cluster is ported and tested: `imageRowBytes`, `contains`/`overlaps`,
+//! `discardLastWrite`, `isLastWriteDifferent`, `clearChanged`,
+//! `addDitherPatterns`, `bestDitherPattern`, `FramebufferTile::valid`,
+//! `NativeTarget::getNativeSize`, and both of `copyNativeToRAM`'s byte-swap
+//! branches including the `i ^ 3` sub-word tail. This module is not waiting
+//! on any other card; the list below is what the card declined, all of it
+//! RHI/RenderWorker plumbing or out-of-cluster helpers.
+//!
 //! ## Nonclaims
 //!
 //! No GPU, WGSL, or production wiring (this module is not called from
 //! anywhere yet; dead-code warnings on the unused public surface are
 //! expected and correct), and no RT64 visual/pixel/silicon parity or
-//! performance claim. Deliberately not ported from this cluster:
+//! performance claim. "Complete for its stated scope" claims the cluster
+//! and its tests, not runtime correctness against RT64 and not admission to
+//! any production path. Deliberately not ported from this cluster (scope
+//! decisions, not pending prerequisites):
 //!
 //! - `Framebuffer::copyRAMToNativeAndChanges`'s *other* word-swap loop (the
 //!   `src -> nativeSwappedRAM` direction, `_byteswap_ulong(*srcWords)` over

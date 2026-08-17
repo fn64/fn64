@@ -275,18 +275,31 @@
 //!   `updateResources`/`threadUpload`/`commandListCopyResources` with no
 //!   named private helper hiding behind class-private access.
 //!
+//! ## Scope status
+//!
+//! **Complete for its stated scope.** Every pure arithmetic fragment named
+//! above is ported and tested: `roundUp`, `Upload::valid`, `threadUpload`'s
+//! offset/size computation (shared with `commandListCopyResources`), and
+//! `updateResources`'s growth policy. The two `rt64_shader_compiler` files
+//! were read in full and genuinely contain no arithmetic to port -- that is
+//! a finished reading, not an outstanding one. This module is not waiting
+//! on any other card; the list below is what the card declined.
+//!
 //! ## Nonclaims
 //!
 //! No GPU, RHI, or production wiring (this module is not called from
 //! anywhere yet and is not registered on any public crate surface beyond its
 //! own `mod` declaration; dead-code warnings on its unused public surface are
 //! expected and correct), and no RT64 visual/pixel/silicon parity or
-//! performance claim. `assert(upload.dstPair != nullptr)` in `threadUpload`
+//! performance claim. "Complete for its stated scope" claims the arithmetic
+//! and its tests, not runtime correctness against RT64 and not admission to
+//! any production path. `assert(upload.dstPair != nullptr)` in `threadUpload`
 //! is a release-mode-stripped (`NDEBUG`) precondition on RHI object
 //! lifetime, not exercised here since this module carries no `dstPair`-like
 //! type at all.
 //!
-//! Deliberately left in the RHI/thread/GPU bulk, not ported:
+//! Deliberately left in the RHI/thread/GPU bulk, not ported (scope
+//! decisions, not pending prerequisites):
 //!
 //! - **All of `rt64_shader_compiler.cpp`/`.h` (127 + 41 lines, whole file in
 //!   both cases).** Every function (`ShaderCompiler::ShaderCompiler`,
