@@ -359,6 +359,7 @@ mod rt64_math;
 mod rt64_math_decompose;
 mod rt64_math_matrix;
 mod rt64_postprocess;
+mod rt64_preset_draw_call_match;
 mod rt64_replacement_resolve;
 mod rt64_resample;
 mod rt64_rigid_body;
