@@ -2292,3 +2292,129 @@ silicon pixel-for-pixel — WGSL `discard` is the standard GPU mechanism for
 "this fragment contributes nothing," matching alpha-test semantics RT64
 itself implements via `clip()`/discard in `RasterPS.hlsl`, but this slice
 does not cite RT64's exact discard line.
+
+## 2026-08-17: Production coverage node 1 — `cvg_dst`/coverage-alpha in the triangle fragment path
+
+Wires the existing, already-GPU-differentially-validated `coverage_fragment_fn`
+("Coverage, fragment-callable WGSL seam" above) into the real triangle
+fragment path (`shaders/triangle_pipeline_fragment.wgsl`'s `fs_main`), the
+`Full`/no-image-read subset only. This is node 1 of a three-node production
+coverage plan (`.claude-handoffs/production-coverage-node1-card-v2.md`);
+node 2 (`memory: Coverage` read/write-back — the framebuffer-read problem
+both this file's own coverage sections and the alpha-compare section above
+name and defer) and node 3 (`CoverageMask`/geometric sub-pixel coverage
+machinery) remain separate, unresolved, out of scope here.
+
+**Two authorities this section keeps explicitly distinct, by design.**
+
+> `CoverageDestination::Full => Coverage::FULL` (count 8) is ported from
+> `fn64-render-reference/src/raster/coverage.rs:89` under Programming Manual
+> authority — the RDP's real 8-sample full-coverage value. RT64's own
+> `CVG_DST_FULL` arm (`RasterPS.hlsl:249-250`, pin
+> `f0728a2520d5aa735886240de3fee75cc805f6d6`) writes `7.0f/cvgRange`, one
+> coverage unit below this port's value — a known, deliberate RT64
+> approximation this port does not reproduce. This slice is
+> **hardware-faithful, with RT64 cited only as structural precedent** (the
+> alpha-channel-as-coverage-storage *resource choice*, and the fact that RT64
+> independently also has no geometric 8-sample source to draw from for this
+> mode) — **never as arithmetic authority, and never as a byte-for-byte
+> match**. This matches this repo's standing policy of citing RT64 for
+> structural/ordering inspiration only, per `RT64-GAP-REGISTER.md`'s existing
+> convention.
+
+RT64's real per-fragment order, re-read directly from `RasterPS.hlsl`: alpha
+compare (`G_AC_DITHER`/`G_AC_THRESHOLD` discard, lines 204-213) runs first,
+its `resultCvg` coverage estimate (lines 215-224, with its own
+coverage-threshold discard) is computed second, and the `cvgDst`/
+output-alpha composition switch (lines 241-255) runs last, once a fragment
+has survived both. This slice's own `fs_main` sequencing — call
+`coverage_fragment_fn` *after* `alpha_compare_fragment_fn`'s discard — is
+consistent with that real RT64 order, not a divergence from it:
+
+> Coverage/`alpha_coverage_select` composition does not depend on
+> alpha-compare's outcome for a fragment that survives it — it only reads the
+> already-computed combiner alpha. Sequencing coverage **after**
+> `alpha_compare_fragment_fn`'s discard (i.e., call `coverage_fragment_fn`
+> last in `fs_main`) avoids computing coverage arithmetic for a fragment about
+> to be discarded — a dead-work/performance ordering choice, not a
+> correctness-driven one, and this repo's own data-flow argument is
+> sufficient on its own to justify the placement independent of any RT64
+> citation. RT64's own real order (alpha compare first, coverage estimate
+> second, `cvgDst` composition last) is cited here only as contextual
+> precedent: this repo's placement (coverage after alpha-compare's discard)
+> happens to be consistent with that real order, not a legitimate divergence
+> from it.
+
+**WGSL wiring.** `coverage_fragment_fn.wgsl`'s existing `Full`/`Save`
+branches (the only independently GPU-differentially-validated ones —
+`Clamp`/`Wrap` stay transcribed-but-unvalidated per that file's own boundary
+doc) are reused verbatim, concatenated into the combined fragment source
+(`shader_manifest.rs`'s `triangle_pipeline_fragment_wgsl`) after
+`alpha_compare_fragment_fn.wgsl` and before `triangle_pipeline_fragment.wgsl`'s
+own `@fragment` wrapper. New binding 6, `FragmentCoverageParams` (32-byte
+uniform: `coverage_destination`, `image_read_enabled`, `force_blend`,
+`antialias_enabled`, `coverage_times_alpha`, `alpha_coverage_select`, two
+reserved words), the six already-decoded `OtherMode` coverage fields
+verbatim, matching this crate's pad-to-16-byte-multiple convention. `fs_main`
+calls the callable with `pixel_count = COVERAGE_FULL` (8u) and
+`memory_count = 0u` always — this slice's rasterizer produces only
+whole-pixel coverage (no `CoverageMask` sub-pixel geometry, node 3) and no
+framebuffer-read mechanism exists to supply a real `memory` value (node 2) —
+and, when `alpha_coverage_select` is set, overwrites `output.color.a` with
+the callable's `adjusted_alpha`; otherwise `output.color.a` stays the
+combiner's own alpha unmodified, exactly as before this slice.
+
+**Loud rejection, not silent substitution.** `CoverageDestination::Save`
+always, and `Clamp`/`Wrap` whenever `image_read_enabled` is set, panic in
+`targets/triangle_pipeline.rs`'s `fragment_coverage_params_bytes` before GPU
+submission — this pipeline has no framebuffer-read mechanism to supply the
+real `memory: Coverage` value those paths need, so a value can never be
+honestly synthesized. This is the pipeline's own submission-boundary
+enforcement point (mirroring the `AlphaCompareMode::Reserved`/`Dither`
+retrieval-time-panic precedent's shape), not a retrieval-time collector
+change — `raw_dpc`/`production.rs` are out of this node's scope and are
+untouched. With `image_read_enabled` clear, `Clamp`/`Wrap` degenerate to
+`pixel` (== `Coverage::FULL`, this slice's only supplied `pixel` value) and
+pass through unrejected.
+
+**`TriangleFixture`/`submit_admitted_triangle`.** Six new `TriangleFixture`
+fields (`coverage_destination`, `image_read_enabled`, `force_blend`,
+`antialias_enabled`, `coverage_times_alpha`, `alpha_coverage_select`),
+populated in `submit_admitted_triangle` from `other_mode`'s existing
+decoded accessors verbatim — no new admission mechanism, matching this
+node's "reuse already-landed, already-admitted state" scope exactly the way
+the alpha-compare production section above reused `OtherMode`/`SetBlendColor`.
+
+**Host GPU evidence.** A new required host-GPU differential
+(`targets/triangle_pipeline/tests.rs`,
+`required_host_ordinary_vs_alpha_coverage_select_writes_distinct_alpha`)
+submits two single-triangle draws at the same low combiner alpha (0.2, byte
+51) — one with `alpha_coverage_select` clear (must write alpha 51
+unmodified) and one with it set against `Full`/`coverage_times_alpha=false`
+(must write alpha 255, `coverage_alpha_fn(8)`) — mirroring the alpha-compare
+precedent's "real GPU-observed... not the CPU oracle called in isolation"
+shape. The required differential test has been added; it has not been run
+on a certified Metal adapter in this sandbox (`host-gpu-tests` tests are
+`NoAdapter`-unsupported here, identical to every other host-GPU test in this
+crate), so native evidence and the 10-consecutive-clean-run bar remain
+unrecorded pending the final Metal gate. No passing or skipped GPU claim is
+made here.
+
+**Nonclaims.** No `memory: Coverage` source of any kind (node 2, the
+framebuffer-read problem, named and deferred here exactly as the
+characterization-only coverage section above already deferred it — this
+slice does not narrow that frontier, it only routes around it by staying in
+the `Full`/no-image-read subset). No `CoverageMask`/geometric sub-pixel
+coverage (node 3). No `Clamp`/`Wrap` GPU validation — inherited unchanged
+from `coverage_fragment_fn.wgsl`'s own boundary; this slice adds no new GPU
+evidence for either mode, only a host-side rejection when they would need
+`memory`. No RT64 arithmetic-parity claim for `Coverage::FULL` (see the
+7-vs-8 authority statement above) and no RT64 textual-order-replication claim
+(see the ordering statement above) — both are structural/contextual
+citations only. No blend-equation wiring — `blend: None` still holds at both
+`ColorTargetState` sites, so no fixed-function GPU blend consumes
+`output.color.a` today; a future blend-wiring slice must be told `.a` may
+already carry `alpha_coverage_select`-derived coverage for such triangles,
+not raw combiner alpha (the same forward-compatibility note the alpha-compare
+section above's coverage precedent already flagged). No RT64 pixel/visual
+parity claim, no performance claim.

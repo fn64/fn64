@@ -99,7 +99,7 @@ use crate::shader_manifest::{
     triangle_pipeline_fragment_wgsl, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
-use crate::state::{AlphaCompare, Color4, OtherMode};
+use crate::state::{AlphaCompare, Color4, CoverageDestination, OtherMode};
 use crate::tmem::{
     TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES, TMEM_BYTE_WORDS,
     TMEM_VALIDITY_WORDS,
@@ -116,6 +116,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const RASTER_PARAMS_BYTES: u64 = 32;
 const COMBINE_PARAMS_BYTES: u64 = 16;
 const ALPHA_COMPARE_PARAMS_BYTES: u64 = 16;
+const COVERAGE_PARAMS_BYTES: u64 = 32;
 const TMEM_BYTES_BUFFER_SIZE: u64 = TMEM_BYTE_WORDS as u64 * 4;
 const TMEM_VALIDITY_BUFFER_SIZE: u64 = TMEM_VALIDITY_WORDS as u64 * 4;
 
@@ -232,6 +233,67 @@ fn fragment_alpha_compare_params_bytes(
     bytes
 }
 
+/// Serializes the fragment shader's `FragmentCoverageParams` uniform
+/// (`shaders/triangle_pipeline_fragment.wgsl`, production coverage node 1):
+/// all six already-decoded `OtherMode` coverage fields, one `u32` each (bool
+/// fields 0/1), matching this file's existing pad-to-16-byte-multiple
+/// convention (here padded to 32 bytes: six real fields plus two reserved
+/// words).
+///
+/// This slice is the `Full`/no-image-read subset only (production coverage
+/// node 1 card §3, "retained mechanics"). `Save`
+/// (`CoverageDestination::Save`) always retrieval-time-panics: this pipeline
+/// has no framebuffer-read mechanism to supply a real `memory: Coverage`
+/// value (node 2, a separate unresolved architectural decision), so `Save`'s
+/// pass-through-memory semantics cannot be honored at all -- a silent
+/// substitute would be exactly the "silent no-op that hides corruption"
+/// AGENTS.md forbids. `Clamp`/`Wrap` retrieval-time-panic only when
+/// `image_read_enabled` is set, mirroring `Save`'s reasoning exactly: both
+/// modes' accumulation math (`coverage_result`, `coverage.rs:149-166`) reads
+/// `memory` whenever `image_read_enabled` is true, and this pipeline cannot
+/// supply that value honestly either. With `image_read_enabled` clear,
+/// `Clamp`/`Wrap` degenerate to `pixel` (== `Coverage::FULL`, this slice's
+/// only supplied `pixel` value) and pass through this function -- the exact
+/// boundary `coverage_fragment_fn.wgsl`'s own header already documents.
+/// Loud panic, not a fallback: mirrors the `AlphaCompareMode::Reserved`/
+/// `Dither` precedent's "reject before rasterization" shape exactly, applied
+/// here at the pipeline's own submission boundary since no upstream
+/// retrieval-time collector exists for coverage yet (this card's scope is
+/// this crate's pipeline/shader files only, not `raw_dpc`/`production.rs`).
+fn fragment_coverage_params_bytes(
+    coverage_destination: CoverageDestination,
+    image_read_enabled: bool,
+    force_blend: bool,
+    antialias_enabled: bool,
+    coverage_times_alpha: bool,
+    alpha_coverage_select: bool,
+) -> [u8; COVERAGE_PARAMS_BYTES as usize] {
+    let coverage_destination_wire: u32 = match coverage_destination {
+        CoverageDestination::Clamp | CoverageDestination::Wrap if image_read_enabled => panic!(
+            "submit_admitted_triangle received coverage_destination={coverage_destination:?} \
+             with image_read_enabled=true: this pipeline has no framebuffer-read mechanism to \
+             supply a real memory coverage value (node 2, out of scope) -- must be rejected \
+             before GPU submission, not silently substituted"
+        ),
+        CoverageDestination::Save => panic!(
+            "submit_admitted_triangle received coverage_destination=Save: this pipeline has no \
+             framebuffer-read mechanism to supply a real memory coverage value (node 2, out of \
+             scope) -- must be rejected before GPU submission, not silently substituted"
+        ),
+        CoverageDestination::Clamp => 0,
+        CoverageDestination::Wrap => 1,
+        CoverageDestination::Full => 2,
+    };
+    let mut bytes = [0u8; COVERAGE_PARAMS_BYTES as usize];
+    bytes[0..4].copy_from_slice(&coverage_destination_wire.to_le_bytes());
+    bytes[4..8].copy_from_slice(&u32::from(image_read_enabled).to_le_bytes());
+    bytes[8..12].copy_from_slice(&u32::from(force_blend).to_le_bytes());
+    bytes[12..16].copy_from_slice(&u32::from(antialias_enabled).to_le_bytes());
+    bytes[16..20].copy_from_slice(&u32::from(coverage_times_alpha).to_le_bytes());
+    bytes[20..24].copy_from_slice(&u32::from(alpha_coverage_select).to_le_bytes());
+    bytes
+}
+
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
 /// vertex shader's `RasterParams` uniform (`shaders/triangle_pipeline_vertex.wgsl`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -282,6 +344,13 @@ pub struct TriangleTargetExtent {
 /// `TrianglePipelineRenderer::pipelines` variants (see
 /// [`depth_pipeline_index`]), not new arithmetic. `(true, true)` reduces to
 /// the pipeline's prior sole `Less`/write-always state.
+/// `coverage_destination`/`image_read_enabled`/`force_blend`/
+/// `antialias_enabled`/`coverage_times_alpha`/`alpha_coverage_select`
+/// (production coverage node 1) are `OtherMode`'s six coverage-related bits
+/// verbatim -- `Save`, and `Clamp`/`Wrap` with `image_read_enabled` set,
+/// retrieval-time-panic before this fixture ever reaches the GPU (see
+/// [`fragment_coverage_params_bytes`]); this pipeline's `Full`/no-image-read
+/// subset otherwise passes through unmodified.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TriangleFixture {
     pub vertices: [RasterVertex; 3],
@@ -294,6 +363,12 @@ pub struct TriangleFixture {
     pub blend_color: Option<Color4>,
     pub depth_compare_enabled: bool,
     pub depth_update_enabled: bool,
+    pub coverage_destination: CoverageDestination,
+    pub image_read_enabled: bool,
+    pub force_blend: bool,
+    pub antialias_enabled: bool,
+    pub coverage_times_alpha: bool,
+    pub alpha_coverage_select: bool,
 }
 
 /// Maps a draw's `(Z_CMP, Z_UPD)` enable bits
@@ -435,6 +510,12 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let coverage_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-coverage-params"),
+            size: COVERAGE_PARAMS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -508,6 +589,18 @@ impl UninitializedTrianglePipeline {
                     },
                     count: None,
                 },
+                // Production coverage node 1: `FragmentCoverageParams`, the
+                // real per-fragment `cvg_dst`/coverage-alpha uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // Prewarm-only bind group: exercised once here so a bind-group-layout
@@ -543,6 +636,10 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: alpha_compare_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: coverage_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -754,6 +851,13 @@ impl TrianglePipelineRenderer {
     /// read here or anywhere in this module: every `DepthMode` value gets
     /// exactly the plain hardware `Less`/write-toggle behavior this slice
     /// implements, no mode-specific dispatch (nonclaims, module doc).
+    ///
+    /// `other_mode`'s six coverage bits (production coverage node 1) feed
+    /// the real fragment-stage `cvg_dst`/coverage-alpha uniform verbatim --
+    /// `Save`, and `Clamp`/`Wrap` with `image_read_enabled` set, panic here
+    /// (via [`fragment_coverage_params_bytes`] in `submit_triangles`) rather
+    /// than reach the GPU with a memory-coverage value this pipeline cannot
+    /// honestly supply.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_admitted_triangle(
         &mut self,
@@ -784,6 +888,12 @@ impl TrianglePipelineRenderer {
             blend_color,
             depth_compare_enabled: other_mode.depth_compare_enabled(),
             depth_update_enabled: other_mode.depth_update_enabled(),
+            coverage_destination: other_mode.coverage_destination(),
+            image_read_enabled: other_mode.image_read_enabled(),
+            force_blend: other_mode.force_blend(),
+            antialias_enabled: other_mode.antialias_enabled(),
+            coverage_times_alpha: other_mode.coverage_times_alpha(),
+            alpha_coverage_select: other_mode.alpha_coverage_select(),
         };
         self.submit_triangle(fixture)
     }
@@ -862,6 +972,7 @@ impl TrianglePipelineRenderer {
             _tmem_validity_buffer: wgpu::Buffer,
             _tile_binding_buffer: wgpu::Buffer,
             _alpha_compare_params_buffer: wgpu::Buffer,
+            _coverage_params_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -936,6 +1047,23 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&alpha_compare_params_buffer, 0, &alpha_compare_bytes);
 
+            let coverage_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-coverage-params"),
+                size: COVERAGE_PARAMS_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let coverage_bytes = fragment_coverage_params_bytes(
+                fixture.coverage_destination,
+                fixture.image_read_enabled,
+                fixture.force_blend,
+                fixture.antialias_enabled,
+                fixture.coverage_times_alpha,
+                fixture.alpha_coverage_select,
+            );
+            self.queue
+                .write_buffer(&coverage_params_buffer, 0, &coverage_bytes);
+
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fn64-triangle-pipeline-bind-group"),
                 layout: &self.bind_group_layout,
@@ -964,6 +1092,10 @@ impl TrianglePipelineRenderer {
                         binding: 5,
                         resource: alpha_compare_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: coverage_params_buffer.as_entire_binding(),
+                    },
                 ],
             });
             draws.push(DrawResources {
@@ -979,6 +1111,7 @@ impl TrianglePipelineRenderer {
                 _tmem_validity_buffer: tmem_validity_buffer,
                 _tile_binding_buffer: tile_binding_buffer,
                 _alpha_compare_params_buffer: alpha_compare_params_buffer,
+                _coverage_params_buffer: coverage_params_buffer,
             });
         }
 

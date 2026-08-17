@@ -92,6 +92,18 @@ fn covering_triangle_fixture() -> TriangleFixture {
         // existing depth test reuses unmodified.
         depth_compare_enabled: true,
         depth_update_enabled: true,
+        // Production coverage node 1's no-op default: `Full`/no-image-read
+        // (`coverage_destination` `Full` reads no `memory`, matching this
+        // pipeline's `Full`/no-image-read-only scope), no coverage-alpha
+        // interaction -- `output.color.a` stays the combiner's own alpha
+        // unmodified (`alpha_coverage_select == false`), the regression-
+        // guard default every existing test in this file reuses unmodified.
+        coverage_destination: crate::state::CoverageDestination::Full,
+        image_read_enabled: false,
+        force_blend: false,
+        antialias_enabled: false,
+        coverage_times_alpha: false,
+        alpha_coverage_select: false,
     }
 }
 
@@ -550,6 +562,114 @@ fn fragment_alpha_compare_params_bytes_rejects_dither_mode_defensively() {
     let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Dither, None);
 }
 
+/// Byte-offset proof for `FragmentCoverageParams` (production coverage node
+/// 1): all six fields at their own 4-byte slot, bytes 24..32 always zero.
+/// Covers the `Full`/no-image-read default (this file's regression-guard
+/// fixture shape) and every bool field independently set.
+#[test]
+fn fragment_coverage_params_byte_layout_is_32_bytes_with_all_six_fields() {
+    let default_bytes = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Full,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(default_bytes.len(), COVERAGE_PARAMS_BYTES as usize);
+    assert_eq!(&default_bytes[0..4], &2u32.to_le_bytes());
+    assert_eq!(&default_bytes[4..8], &0u32.to_le_bytes());
+    assert_eq!(&default_bytes[8..12], &0u32.to_le_bytes());
+    assert_eq!(&default_bytes[12..16], &0u32.to_le_bytes());
+    assert_eq!(&default_bytes[16..20], &0u32.to_le_bytes());
+    assert_eq!(&default_bytes[20..24], &0u32.to_le_bytes());
+    assert_eq!(&default_bytes[24..32], &[0u8; 8]);
+
+    let clamp_bytes = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Clamp,
+        false,
+        true,
+        true,
+        true,
+        true,
+    );
+    assert_eq!(&clamp_bytes[0..4], &0u32.to_le_bytes());
+    assert_eq!(&clamp_bytes[4..8], &0u32.to_le_bytes());
+    assert_eq!(&clamp_bytes[8..12], &1u32.to_le_bytes());
+    assert_eq!(&clamp_bytes[12..16], &1u32.to_le_bytes());
+    assert_eq!(&clamp_bytes[16..20], &1u32.to_le_bytes());
+    assert_eq!(&clamp_bytes[20..24], &1u32.to_le_bytes());
+
+    let wrap_bytes = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Wrap,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(&wrap_bytes[0..4], &1u32.to_le_bytes());
+}
+
+#[test]
+#[should_panic(expected = "must be rejected before GPU submission")]
+fn fragment_coverage_params_bytes_rejects_save_destination() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Save,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be rejected before GPU submission")]
+fn fragment_coverage_params_bytes_rejects_clamp_with_image_read_enabled() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Clamp,
+        true,
+        false,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be rejected before GPU submission")]
+fn fragment_coverage_params_bytes_rejects_wrap_with_image_read_enabled() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Wrap,
+        true,
+        false,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn fragment_coverage_params_bytes_allows_clamp_and_wrap_without_image_read_enabled() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Clamp,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Wrap,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+}
+
 /// Device-unavailable degradation path (port card §7): a real GPU adapter
 /// cannot be forced absent deterministically in this test harness (no unit
 /// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
@@ -608,6 +728,12 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         blend_color: None,
         depth_compare_enabled: true,
         depth_update_enabled: true,
+        coverage_destination: crate::state::CoverageDestination::Full,
+        image_read_enabled: false,
+        force_blend: false,
+        antialias_enabled: false,
+        coverage_times_alpha: false,
+        alpha_coverage_select: false,
     };
     assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
     assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
@@ -1210,6 +1336,75 @@ mod host_gpu_tests {
                 1.0,
                 "a discarded fragment must not write depth either -- the whole fragment is \
                  discarded before either color-attachment write executes (card §3c)"
+            );
+        }
+    }
+
+    /// Required host GPU evidence (production coverage node 1): a real draw
+    /// with `alpha_coverage_select` set must write the GPU-observed alpha
+    /// channel exactly as `coverage_fragment_fn`/`apply_coverage_alpha`
+    /// predicts, differing from the same draw with the bit clear -- not the
+    /// CPU `coverage_fragment_fn`/`coverage.rs` oracle called in isolation.
+    /// This slice's `pixel_count` is always `COVERAGE_FULL` (8u,
+    /// `Full`/no-image-read scope, WGSL wiring doc), so with
+    /// `coverage_destination = Full` the `cvg_dst` accumulation always
+    /// yields `destination = 8`; with `coverage_times_alpha` clear,
+    /// `adjusted_coverage` stays `8`, so `alpha_coverage_select` set writes
+    /// `coverage_alpha_fn(8) = (8*255+4)/8 = 255` into the output alpha
+    /// channel regardless of the combiner's own low input alpha -- a
+    /// maximally distinguishable signal from the unmodified low input alpha
+    /// the `alpha_coverage_select`-clear draw must still show.
+    #[test]
+    fn required_host_ordinary_vs_alpha_coverage_select_writes_distinct_alpha() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        // Ordinary: alpha_coverage_select clear -- output alpha must stay
+        // the combiner's own low input alpha unmodified (0.2 -> u32(0.2 *
+        // 255.0 + 0.5) = 51).
+        let mut ordinary_fixture = covering_triangle_fixture();
+        for vertex in &mut ordinary_fixture.vertices {
+            vertex.color = [1.0, 1.0, 1.0, 0.2];
+        }
+        let ordinary_output = renderer
+            .submit_triangle(ordinary_fixture)
+            .unwrap()
+            .complete()
+            .unwrap();
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            assert_close_rgba8(rgba8_at(&ordinary_output, x, y), [255, 255, 255, 51], 2);
+        }
+
+        // alpha_coverage_select set, Full destination, coverage_times_alpha
+        // clear -- output alpha must become 255 (coverage_alpha_fn(8)),
+        // provably different from the ordinary draw's 51 above, proving the
+        // GPU actually executed `coverage_fragment_fn`'s composition rather
+        // than passing the combiner alpha through unmodified.
+        let mut select_fixture = covering_triangle_fixture();
+        for vertex in &mut select_fixture.vertices {
+            vertex.color = [1.0, 1.0, 1.0, 0.2];
+        }
+        select_fixture.alpha_coverage_select = true;
+        let select_output = renderer
+            .submit_triangle(select_fixture)
+            .unwrap()
+            .complete()
+            .unwrap();
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            assert_close_rgba8(rgba8_at(&select_output, x, y), [255, 255, 255, 255], 2);
+            assert_ne!(
+                rgba8_at(&select_output, x, y)[3],
+                rgba8_at(&ordinary_output, x, y)[3],
+                "alpha_coverage_select=true at ({x},{y}) must write a different alpha than the \
+                 same draw with alpha_coverage_select=false"
             );
         }
     }
