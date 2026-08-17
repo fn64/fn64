@@ -36,11 +36,11 @@ use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
     AlphaCompare, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode,
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError,
-    RdpState, RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
-    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
-    TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
-    TMEM_SAMPLE_STATUS_OK,
+    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, PrimColor,
+    RawDpcDecodeError, RdpState, RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord,
+    TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
+    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -385,6 +385,15 @@ struct PlanCollector {
     /// exactly, a third instance of the same seed-then-track pattern (card
     /// §4d).
     current_blend_color: Option<Color4>,
+    /// `G_SETENVCOLOR` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
+    /// time (`Self::seeded`), then updated on every `SetEnvColor` command
+    /// in plan order. Mirrors `current_blend_color`, but unconditionally
+    /// tracked -- no `AlphaCompare` gate.
+    current_env_color: Option<Color4>,
+    /// `G_SETPRIMCOLOR` current at the walk's current stream position --
+    /// mirrors `current_env_color` exactly.
+    current_prim_color: Option<PrimColor>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -407,6 +416,8 @@ impl PlanCollector {
         other_mode: Option<OtherMode>,
         combine: Option<CombineParams>,
         blend_color: Option<Color4>,
+        env_color: Option<Color4>,
+        prim_color: Option<PrimColor>,
     ) -> Self {
         Self {
             loads: Vec::new(),
@@ -417,6 +428,8 @@ impl PlanCollector {
             current_tile0_descriptor: None,
             current_tile0_size: None,
             current_blend_color: blend_color,
+            current_env_color: env_color,
+            current_prim_color: prim_color,
             triangles: Vec::new(),
         }
     }
@@ -441,6 +454,15 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 }
                 RdpStateCommand::SetBlendColor { color, .. } => {
                     self.current_blend_color = Some(Color4::from_wire(color.value));
+                }
+                RdpStateCommand::SetEnvColor { color, .. } => {
+                    self.current_env_color = Some(Color4::from_wire(color.value));
+                }
+                RdpStateCommand::SetPrimColor { color, .. } => {
+                    self.current_prim_color = Some(PrimColor::from_wire(
+                        u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
+                        color.color,
+                    ));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -499,6 +521,8 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         combine_params,
                         tile_binding,
                         blend_color,
+                        env_color: self.current_env_color,
+                        prim_color: self.current_prim_color,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -561,7 +585,10 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // placeholder left behind here is discarded immediately by the
         // caller (`execute_raw_dpc_inner`'s `let _ = plan_visitor;`), so
         // its exact seed values are irrelevant.
-        self.plan = core::mem::replace(plan_visitor, PlanCollector::seeded(None, None, None));
+        self.plan = core::mem::replace(
+            plan_visitor,
+            PlanCollector::seeded(None, None, None, None, None),
+        );
     }
 
     fn captured_reads(&mut self, reads: &[CapturedGuestRead]) {
@@ -830,6 +857,8 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.other_mode(),
             self.rdp_state.combine(),
             self.rdp_state.blend_color(),
+            self.rdp_state.env_color(),
+            self.rdp_state.prim_color(),
         )
         .map_err(RenderError::from)?;
 
@@ -1092,19 +1121,22 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// `into_physical_successor` (T3 Phase A) result to
 /// `RawDpcCoordinator::complete_execution`.
 ///
-/// `durable_other_mode`/`durable_combine`/`durable_blend_color` are
-/// `WgpuBackend.rdp_state`'s own current values, passed in by the trait
-/// method (which has `self`) since this is a free function taking only
-/// `coordinator` -- they seed `PlanCollector`'s walk (`PlanCollector::seeded`)
-/// so a triangle in this submission with no `SetOtherMode`/`SetCombine`/
-/// `SetBlendColor` of its own still resolves its draw state from durable
-/// cross-submission carry-in, not `None`.
+/// `durable_other_mode`/`durable_combine`/`durable_blend_color`/
+/// `durable_env_color`/`durable_prim_color` are `WgpuBackend.rdp_state`'s
+/// own current values, passed in by the trait method (which has `self`)
+/// since this is a free function taking only `coordinator` -- they seed
+/// `PlanCollector`'s walk (`PlanCollector::seeded`) so a triangle in this
+/// submission with no `SetOtherMode`/`SetCombine`/`SetBlendColor`/
+/// `SetEnvColor`/`SetPrimColor` of its own still resolves its draw state
+/// from durable cross-submission carry-in, not `None`.
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
     bound: BoundSubmittedRawDpc,
     durable_other_mode: Option<OtherMode>,
     durable_combine: Option<CombineParams>,
     durable_blend_color: Option<Color4>,
+    durable_env_color: Option<Color4>,
+    durable_prim_color: Option<PrimColor>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -1112,14 +1144,25 @@ fn execute_raw_dpc_inner(
     ),
     WgpuRawDpcExecutionError,
 > {
-    let mut plan_visitor =
-        PlanCollector::seeded(durable_other_mode, durable_combine, durable_blend_color);
+    let mut plan_visitor = PlanCollector::seeded(
+        durable_other_mode,
+        durable_combine,
+        durable_blend_color,
+        durable_env_color,
+        durable_prim_color,
+    );
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
         queue: bound.queue(),
         ordinal: bound.ordinal(),
         submission: bound.submission(),
-        plan: PlanCollector::seeded(durable_other_mode, durable_combine, durable_blend_color),
+        plan: PlanCollector::seeded(
+            durable_other_mode,
+            durable_combine,
+            durable_blend_color,
+            durable_env_color,
+            durable_prim_color,
+        ),
         reads: Vec::new(),
         outcome: None,
     };
@@ -2669,6 +2712,8 @@ mod tests {
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
             blend_color: None,
+            env_color: None,
+            prim_color: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)])
@@ -3170,6 +3215,114 @@ mod tests {
         }
     }
 
+    fn fixture_set_env_color(value: u32) -> RdpStateCommand {
+        RdpStateCommand::SetEnvColor {
+            location: fixture_location(0),
+            raw_words: Box::new([0]),
+            color: fn64_render::NeutralColor4 { value },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_env_color(fn64_render::NeutralColor4 {
+                value,
+            }),
+        }
+    }
+
+    fn fixture_set_prim_color(lod_frac: u8, lod_min: u8, color: u32) -> RdpStateCommand {
+        let neutral = fn64_render::NeutralPrimColor {
+            lod_frac,
+            lod_min,
+            color,
+        };
+        RdpStateCommand::SetPrimColor {
+            location: fixture_location(0),
+            raw_words: Box::new([0, 0]),
+            color: neutral,
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_prim_color(neutral),
+        }
+    }
+
+    /// Command-time capture seam (card): `SetEnvColor(A)`/`SetPrimColor(A)`
+    /// -> triangle A -> `SetEnvColor(B)`/`SetPrimColor(B)` -> triangle B
+    /// must collect two distinct snapshots through `PlanCollector`,
+    /// mirroring `plan_collector_snapshots_each_triangle_at_its_own_
+    /// stream_position_not_the_final_value` above and
+    /// `triangle_draw_data.rs`'s identical `TriangleDrawStateCollector`
+    /// characterization test for the same new fields.
+    #[test]
+    fn plan_collector_snapshots_distinct_env_and_prim_colors_through_a_and_b_triangles() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let mut collector =
+            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
+
+        let env_a = fixture_set_env_color(0x1111_1111);
+        let prim_a = fixture_set_prim_color(10, 5, 0x2222_2222);
+        collector.command(RawDpcSemanticCommandRef::State(&env_a));
+        collector.command(RawDpcSemanticCommandRef::State(&prim_a));
+        let triangle_a = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_a));
+
+        let env_b = fixture_set_env_color(0x3333_3333);
+        let prim_b = fixture_set_prim_color(20, 10, 0x4444_4444);
+        collector.command(RawDpcSemanticCommandRef::State(&env_b));
+        collector.command(RawDpcSemanticCommandRef::State(&prim_b));
+        let triangle_b = fixture_triangle(10.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
+
+        assert_eq!(collector.triangles.len(), 2);
+        let first = collector.triangles[0].as_ref().unwrap();
+        let second = collector.triangles[1].as_ref().unwrap();
+        assert_eq!(first.env_color, Some(Color4::from_wire(0x1111_1111)));
+        assert_eq!(
+            first.prim_color,
+            Some(PrimColor::from_wire(10 | (5 << 8), 0x2222_2222))
+        );
+        assert_eq!(second.env_color, Some(Color4::from_wire(0x3333_3333)));
+        assert_eq!(
+            second.prim_color,
+            Some(PrimColor::from_wire(20 | (10 << 8), 0x4444_4444))
+        );
+        assert_ne!(
+            first.env_color, second.env_color,
+            "triangle A must NOT be retroactively affected by a SetEnvColor after it in plan \
+             order"
+        );
+        assert_ne!(
+            first.prim_color, second.prim_color,
+            "triangle A must NOT be retroactively affected by a SetPrimColor after it in plan \
+             order"
+        );
+    }
+
+    /// Durable cross-submission seed behavior for `env_color`/`prim_color`:
+    /// a triangle with no in-plan `SetEnvColor`/`SetPrimColor` of its own
+    /// still resolves those fields from `PlanCollector::seeded`'s durable
+    /// value, exactly mirroring `plan_collector_seeded_resolves_a_triangle_
+    /// with_no_in_plan_state_of_its_own` above for `other_mode`/`combine`.
+    #[test]
+    fn plan_collector_seeded_env_and_prim_color_resolve_a_triangle_with_no_in_plan_state() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let seed_env_color = Color4::from_wire(0x5555_5555);
+        let seed_prim_color = PrimColor::from_wire(15 | (7 << 8), 0x6666_6666);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            None,
+            Some(seed_env_color),
+            Some(seed_prim_color),
+        );
+        let triangle = fixture_triangle(1.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+        assert_eq!(collector.triangles.len(), 1);
+        let retrieved = collector.triangles[0]
+            .as_ref()
+            .expect("a triangle with durably-seeded state must resolve, not reject");
+        assert_eq!(retrieved.env_color, Some(seed_env_color));
+        assert_eq!(retrieved.prim_color, Some(seed_prim_color));
+    }
+
     /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
     /// neither seeded nor in-plan -- must be a loud, named rejection, not
     /// a silent default. Proves `PlanCollector::seeded(None, None)`
@@ -3177,7 +3330,7 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(None, None, None);
+        let mut collector = PlanCollector::seeded(None, None, None, None, None);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3202,7 +3355,8 @@ mod tests {
     fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None);
+        let mut collector =
+            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3225,7 +3379,8 @@ mod tests {
     fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None);
+        let mut collector =
+            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
 
         let first_triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&first_triangle));
@@ -3265,6 +3420,8 @@ mod tests {
             Some(seed_other_mode),
             Some(CombineParams::from_wire(0, 0)),
             None,
+            None,
+            None,
         );
 
         let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
@@ -3290,6 +3447,8 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
+            None,
+            None,
             None,
         );
         let triangle = fixture_triangle(0.0);

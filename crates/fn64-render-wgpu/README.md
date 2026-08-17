@@ -2418,3 +2418,85 @@ already carry `alpha_coverage_select`-derived coverage for such triangles,
 not raw combiner alpha (the same forward-compatibility note the alpha-compare
 section above's coverage precedent already flagged). No RT64 pixel/visual
 parity claim, no performance claim.
+
+## 2026-08-17: Production combiner state capture — EnvColor/PrimColor command-time seam
+
+Slice A, sub-step 5a (corrected per independent review): threads
+`SetEnvColor`/`SetPrimColor` through the same command-time-snapshot seam
+`blend_color` already uses, so a triangle's real `ENVIRONMENT`/`PRIMITIVE`
+combiner inputs are typed, captured, and tested — but not yet reaching WGSL.
+This slice is `production.rs`/`raw_dpc/triangle_draw_data.rs`-only: no
+uniform, no `fs_main` change, no binding slot. It deliberately does not
+change any rendered pixel; it only builds the typed seam the WGSL half
+(serialized after Coverage Node 1, per the corrected slice plan) will read
+from.
+
+**EnvColor/PrimColor snapshot, a fifth and sixth instance of an existing
+pattern.** `raw_dpc::triangle_draw_data::TriangleDrawStateCollector` and
+`production.rs`'s `PlanCollector` each gain `current_env_color:
+Option<Color4>` and `current_prim_color: Option<PrimColor>` fields, tracked
+on `RdpStateCommand::SetEnvColor`/`SetPrimColor` exactly like the existing
+`current_other_mode`/`current_combine`/`current_blend_color` tracking —
+command-time snapshot at each triangle's own stream position, never a
+whole-plan-final value. `PlanCollector::seeded` gains two more parameters
+(`env_color: Option<Color4>`, `prim_color: Option<PrimColor>`), seeded from
+`WgpuBackend.rdp_state().env_color()`/`.prim_color()` in `execute_raw_dpc`
+exactly as `other_mode`/`combine`/`blend_color` already are — durable
+cross-submission carry-in, not a synthetic plan-stream entry. Both
+collectors are mirrored in the same slice (independent review's Correction
+B): `TriangleDrawStateCollector` has no live production caller today, but
+the module's own doc already states it deliberately duplicates
+`PlanCollector`'s behavior, and leaving one collector behind would silently
+break that stated invariant.
+
+**Unconditional, unlike `blend_color`.** `blend_color` is `Some` only for
+`AlphaCompare::Threshold` triangles, gated by a retrieval-time match on
+`other_mode.alpha_compare()`. `env_color`/`prim_color` have no such gate:
+every triangle's one-cycle/two-cycle combiner arithmetic can reference
+`ENVIRONMENT`/`PRIMITIVE` regardless of alpha-compare mode (`combiner.rs`'s
+`ColorInput`/`AlphaInput` selector tables), so `RetrievedTriangleDraw` simply
+carries whatever `current_env_color`/`current_prim_color` held at that
+triangle's own stream position — `None` when neither the plan nor the
+durable seed ever set one, never a hard-error `MissingTriangleDrawState`
+variant the way absent `OtherMode`/`CombineParams`/`Threshold`-mode
+`blend_color` are.
+
+**Wire conversion.** `RdpStateCommand::SetEnvColor { color: NeutralColor4,
+.. }` converts via the existing `Color4::from_wire(color.value)`, identical
+to `SetBlendColor`'s own conversion. `RdpStateCommand::SetPrimColor { color:
+NeutralPrimColor { lod_frac, lod_min, color }, .. }` converts via the
+existing `PrimColor::from_wire(w0, w1)`, reconstructing `w0` as `lod_frac as
+u32 | (lod_min as u32) << 8` and passing `color` as `w1` directly —
+`NeutralPrimColor.lod_min` is already `PrimLod::from_wire`'s masked 5-bit
+value (`raw_dpc::production_adapter`'s own `neutral_prim_color` produces it
+that way), so shifting it back into wire bit position 8:12 and letting
+`PrimColor::from_wire`'s own `& 0x1f` mask apply is idempotent, not a
+re-derivation of new masking logic.
+
+**Characterization tests.** Both collectors gain an
+`a_and_b`/`snapshots_distinct`-shaped test proving the exact seam this slice
+exists for: `SetEnvColor(A)`/`SetPrimColor(A)` → triangle A →
+`SetEnvColor(B)`/`SetPrimColor(B)` → triangle B collects two distinct
+snapshots, with an explicit `assert_ne!` proving triangle A is not
+retroactively affected by state that arrives after it in plan order — the
+same regression shape the crate's existing `OtherMode`/`CombineParams`/
+`BlendColor` tests already guard against. `PlanCollector` additionally gains
+a durable-seed test (`plan_collector_seeded_env_and_prim_color_resolve_a_
+triangle_with_no_in_plan_state`) proving a triangle with no in-plan
+`SetEnvColor`/`SetPrimColor` of its own still resolves both fields from
+`PlanCollector::seeded`'s durable value, mirroring the existing
+`other_mode`/`combine` durable-seed test. `TriangleDrawStateCollector`
+additionally gains a no-gate test proving a triangle before any
+`SetEnvColor`/`SetPrimColor` resolves cleanly with `None`, not an error —
+the unconditional/gated distinction from `blend_color` stated above, made
+executable.
+
+**Nonclaims.** No WGSL, no `shader_manifest.rs`, no `targets/
+triangle_pipeline.rs`, no new uniform buffer or binding slot — this slice's
+own explicit non-scope, matching the independently-reviewed corrected card.
+No rendered-pixel claim: `combiner_inputs_from_fragment_registers` still has
+zero production callers after this slice: it wires the *retrieval* side and
+does not yet call into it. `TriangleDrawStateCollector`'s general
+non-production-caller status is unchanged by this slice — mirroring it here
+is about keeping its own documented invariant honest for the next reader,
+not about giving it a new caller.
