@@ -336,6 +336,7 @@ mod raster_vs;
 mod raw_dpc;
 mod rgb_dither;
 mod rt64_common;
+mod rt64_gbi_f3dex;
 mod rt64_math;
 mod rt64_tmem_hasher;
 mod shader_manifest;
