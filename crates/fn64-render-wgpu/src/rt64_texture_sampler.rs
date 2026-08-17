@@ -398,6 +398,71 @@ pub struct RdpTileAddressing {
     pub lrt: f32,
 }
 
+impl RdpTileAddressing {
+    /// Builds a [`RdpTileAddressing`] from **positional** arguments in the
+    /// relative source declaration order of the eight `RDPTile` members this
+    /// type owns (`rt64_rdp_tile.h` lines 18, 19, 22, 23, 24, 25, 26, 27).
+    ///
+    /// This transcribes the source's member order into an argument order that
+    /// a reviewer can read against `rt64_rdp_tile.h` directly, and gives
+    /// callers a form that does not restate fourteen field names.
+    ///
+    /// **It does not detect a declaration reorder, and no test here claims it
+    /// does.** The body uses field-init shorthand, which binds by identifier,
+    /// not by position; so does every accessor below. Swapping two field
+    /// declarations of the same type leaves this constructor, those
+    /// accessors, and every test compiling and passing unchanged. That was
+    /// verified by mutation (`cms`/`cmt` swapped; all tests still green).
+    /// In safe Rust there is no construction or access form for a named-field
+    /// struct that binds positionally, so a reorder can only be caught by
+    /// generating the declaration and an order witness from one source -- a
+    /// change to the port's source text, not an added test.
+    ///
+    /// The sibling half of the same `RDPTile` split,
+    /// [`crate::rt64_shared_params::RdpTileImageDescriptor`], carries an
+    /// identically-shaped constructor with the identical limitation.
+    ///
+    /// Note the field order here is the struct's own declaration order
+    /// (`cms`, `cmt`, `masks`, `maskt`, ...), which groups by role rather than
+    /// following the header's line order; the argument names make the mapping
+    /// explicit. This claims declaration order as a source-text fact only --
+    /// no memory layout, size, or offset claim is made or implied.
+    #[must_use]
+    pub const fn in_source_order(
+        cms: i32,
+        cmt: i32,
+        masks: i32,
+        maskt: i32,
+        uls: f32,
+        ult: f32,
+        lrs: f32,
+        lrt: f32,
+    ) -> RdpTileAddressing {
+        RdpTileAddressing {
+            cms,
+            cmt,
+            masks,
+            maskt,
+            uls,
+            ult,
+            lrs,
+            lrt,
+        }
+    }
+
+    /// The four `int` members in declaration order.
+    #[must_use]
+    pub const fn signed_members_in_source_order(self) -> [i32; 4] {
+        [self.cms, self.cmt, self.masks, self.maskt]
+    }
+
+    /// The four `float` bound members in declaration order.
+    #[must_use]
+    pub const fn float_members_in_source_order(self) -> [f32; 4] {
+        [self.uls, self.ult, self.lrs, self.lrt]
+    }
+}
+
 /// `G_TX_MIRROR` (`rt64_f3d_defines.h:66`).
 pub const G_TX_MIRROR: i32 = 1;
 /// `G_TX_CLAMP` (`rt64_f3d_defines.h:67`).
@@ -574,6 +639,32 @@ mod tests {
             texel_mask: (u32::MAX, u32::MAX),
             texel_shift: (0, 0),
         }
+    }
+
+    // --- RdpTileAddressing: declaration order ---
+
+    #[test]
+    fn rdp_tile_addressing_in_source_order_maps_arguments_to_named_fields() {
+        // This checks that `in_source_order`'s argument list maps to the
+        // fields its parameter names promise, and that the two accessors
+        // agree with it. It is NOT a reorder detector: see the constructor's
+        // own docs. Swapping two same-typed field declarations keeps this
+        // test green (verified by mutation), because field-init shorthand and
+        // field access both bind by name, never by position.
+        //
+        // Nothing here claims anything about memory layout, size, or offsets.
+        let t = RdpTileAddressing::in_source_order(1, 2, 3, 4, 5.0, 6.0, 7.0, 8.0);
+        assert_eq!(t.cms, 1);
+        assert_eq!(t.cmt, 2);
+        assert_eq!(t.masks, 3);
+        assert_eq!(t.maskt, 4);
+        assert_eq!(t.uls, 5.0);
+        assert_eq!(t.ult, 6.0);
+        assert_eq!(t.lrs, 7.0);
+        assert_eq!(t.lrt, 8.0);
+        // Second, independent derivation of the same order, per run of types.
+        assert_eq!(t.signed_members_in_source_order(), [1, 2, 3, 4]);
+        assert_eq!(t.float_members_in_source_order(), [5.0, 6.0, 7.0, 8.0]);
     }
 
     // --- clamp_wrap_mirror_address: no flags at all ---
