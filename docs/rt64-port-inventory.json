@@ -10500,8 +10500,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-draw-call-cpp",
@@ -10514,7 +10516,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_draw_call_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -10633,8 +10635,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-draw-call-h",
@@ -10647,7 +10651,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_draw_call_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -11028,8 +11032,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-hle-rt64-framebuffer-changes-cpp",
@@ -11042,7 +11048,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_framebuffer_changes_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -11720,8 +11726,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-hle-rt64-framebuffer-pair-cpp",
@@ -11734,7 +11742,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_framebuffer_pair_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -13274,8 +13282,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-projection-cpp",
@@ -13288,7 +13298,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_projection_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -14138,8 +14148,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-hle-rt64-rdp-tmem-cpp",
@@ -14152,7 +14164,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_rdp_tmem_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
