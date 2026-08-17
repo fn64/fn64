@@ -2,6 +2,20 @@
 //! a literal port of the permitted MIT RT64 source pinned at commit
 //! `f0728a2520d5aa735886240de3fee75cc805f6d6` (`docs/RT64-PORT-AUTHORITY.md`),
 //! `src/hle/rt64_color_converter.h` + `src/hle/rt64_color_converter.cpp`
+//! (SHA-256 of the whole files,
+//! `0e774419ca842b7d085a9fdbbcdb9cd2394d061c18b4969d11afc8eec1c05bef` /
+//! `b40f82b3534380171489183a7240ea5a82c3d464f346e45538ad13e25f44b939`; this
+//! module's inventory-authoritative port input is actually the *port*
+//! commit `5473732a822a4423b5696e7cb18fecc425a59875`
+//! (`docs/rt64-port-authority.json`'s `port_source`), cited above by the
+//! oracle commit instead because that is the commit this module's prose was
+//! originally reviewed against; both commits' versions of these two files
+//! are byte-identical -- the port commit is 9 commits ahead of the oracle
+//! commit overall, but carries no diff to `rt64_color_converter.{h,cpp}`, so
+//! the two SHA-256 digests above are simultaneously each file's oracle *and*
+//! port digest per `docs/rt64-port-inventory.json`'s `sources.oracle.sha256`
+//! / `sources.port.sha256`, confirmed independently here by `shasum -a 256`
+//! against the pinned port-commit checkout)
 //! (code, comments elided for brevity -- see the pinned checkout for the full
 //! files with their header and section comments; the two `D16::toF`
 //! explanatory comments are carried forward below verbatim):
