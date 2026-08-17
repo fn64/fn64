@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 72 `ported`, 193 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 73 `ported`, 192 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -290,7 +290,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/shaders/TextureResolvePS.hlsl` | `unchanged` | `not-started` | -- | 39 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shaders-textureresolveps-hlsl` |
 | `src/shaders/TextureSampler.hlsli` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_texture_sampler.rs`, `crates/fn64-render-wgpu/src/texture_lod.rs` | 359 | 5 | 6 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shaders-texturesampler-hlsli` |
 | `src/shaders/VideoInterfacePS.hlsl` | `unchanged` | `not-started` | -- | 41 | 3 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shaders-videointerfaceps-hlsl` |
-| `src/shared/rt64_blender.h` | `unchanged` | `not-started` | -- | 510 | 27 | 4 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-blender-h` |
+| `src/shared/rt64_blender.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_blender_analysis.rs` | 510 | 27 | 4 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-blender-h` |
 | `src/shared/rt64_color_combiner.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/combiner.rs` | 639 | 16 | 2 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-color-combiner-h` |
 | `src/shared/rt64_extra_params.h` | `unchanged` | `not-started` | -- | 132 | 2 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-extra-params-h` |
 | `src/shared/rt64_f3d_defines.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_rsp_segment.rs` | 169 | 0 | 0 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-f3d-defines-h` |
