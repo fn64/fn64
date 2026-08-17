@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 40 `ported`, 225 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 42 `ported`, 223 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -94,8 +94,8 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/gbi/rt64_gbi_f3d.h` | `unchanged` | `not-started` | -- | 88 | 0 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3d-h` |
 | `src/gbi/rt64_gbi_f3dex.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_f3dex.rs` | 100 | 9 | 5 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex-cpp` |
 | `src/gbi/rt64_gbi_f3dex.h` | `unchanged` | `not-started` | -- | 27 | 0 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex-h` |
-| `src/gbi/rt64_gbi_f3dex2.cpp` | `unchanged` | `not-started` | -- | 212 | 18 | 6 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex2-cpp` |
-| `src/gbi/rt64_gbi_f3dex2.h` | `unchanged` | `not-started` | -- | 87 | 0 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex2-h` |
+| `src/gbi/rt64_gbi_f3dex2.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_f3dex2.rs` | 212 | 18 | 6 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex2-cpp` |
+| `src/gbi/rt64_gbi_f3dex2.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_f3dex2.rs` | 87 | 0 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dex2-h` |
 | `src/gbi/rt64_gbi_f3dgolden.cpp` | `unchanged` | `not-started` | -- | 37 | 2 | 3 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dgolden-cpp` |
 | `src/gbi/rt64_gbi_f3dgolden.h` | `unchanged` | `not-started` | -- | 17 | 0 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dgolden-h` |
 | `src/gbi/rt64_gbi_f3dpd.cpp` | `unchanged` | `not-started` | -- | 30 | 3 | 4 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-f3dpd-cpp` |
