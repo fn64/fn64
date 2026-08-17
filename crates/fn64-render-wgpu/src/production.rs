@@ -1224,7 +1224,77 @@ impl RenderBackend for WgpuBackend {
         })
     }
 
-    fn resize(&mut self, _w: u32, _h: u32) {}
+    /// **Shape (a): a real reconfiguration, not a refusal.** This replaces a
+    /// silent no-op stub, which AGENTS.md forbids outright.
+    ///
+    /// A resize here is exactly and only a change of *target geometry*.
+    /// That is the whole of it, because this backend owns no device
+    /// resource whose size is fixed at `create` time:
+    /// `TrianglePipelineRenderer` holds an instance, a device, a queue,
+    /// four extent-independent `RenderPipeline`s, a bind-group layout and
+    /// one fixed-size dummy buffer -- no swapchain, no persistent color or
+    /// depth attachment. Its color+depth textures are created fresh per
+    /// submission from the extent handed to `submit_triangles`
+    /// (`targets::triangle_pipeline`'s own "fresh per-submission color+depth
+    /// texture pair ... not a persistent swapchain"). So there is nothing to
+    /// reallocate and no device to re-request: recording the new extent *is*
+    /// the recovery, and the next submission builds its attachments at the
+    /// new size. Reusing `create_inner` would be actively wrong, not merely
+    /// redundant -- it would blow away a live `triangle_pipeline` and
+    /// re-request an adapter to reach the identical state.
+    ///
+    /// Both extents are written, and the pairing invariant
+    /// `triangle_pipeline.is_some() == triangle_target_extent.is_some()`
+    /// (§1a/§1e) is preserved by construction: `triangle_target_extent` is
+    /// updated through `Option::as_mut`, so a resize before any successful
+    /// `create` leaves it `None` rather than populating an extent with no
+    /// pipeline behind it. `configured_target_extent` is written
+    /// unconditionally for the same reason `create_inner` records it before
+    /// the device request -- it is the CPU-side fill path's only color-image
+    /// height, and an adapterless host must still be able to resize the
+    /// target a `FillRectangle` executes into.
+    ///
+    /// **Zero dimensions are recorded, not clamped and not dropped.** The
+    /// trait contract makes `resize` infallible and directs a backend that
+    /// cannot honor one to surface it at the next call; both consumers of
+    /// these extents already do exactly that, by name --
+    /// `ColorTargetExtent::try_new` returns `TargetError::ZeroExtent` and
+    /// `validate_triangle_extent` returns `TrianglePipelineError::ZeroExtent`.
+    /// Clamping to 1 would fabricate a target geometry the host never asked
+    /// for and silently publish a resident of the wrong byte range; ignoring
+    /// the call would be the silent no-op this replaces. Recording it routes
+    /// a minimized window to a named rejection at the point of use.
+    ///
+    /// **A pending fill token survives a resize, deliberately.** A staged
+    /// `PendingFillPublication` carries an `InitializedCandidateColorTarget`
+    /// whose `ColorTargetKey` -- address, extent and byte range -- was
+    /// sealed inside the token when the fill executed, and
+    /// `ColorTargetRegistry::prepare_publication` reads only that captured
+    /// key; it never consults the backend's current
+    /// `configured_target_extent`. The invariant is therefore already in the
+    /// type system rather than in this method: a resize *cannot* retarget an
+    /// executed fill, so there is nothing for this method to guard. Dropping
+    /// the token instead would discard the guest-write report of a
+    /// submission that completed correctly, and the next
+    /// `staged_guest_render_target_writes` would return an empty list --
+    /// failing that submission loudly with `EffectCountMismatch` for a
+    /// window resize it had nothing to do with. A resize is a statement
+    /// about the geometry of *future* targets, never a retroactive
+    /// invalidation of a fill that already ran.
+    ///
+    /// Guest-write nonclaim (module doc): nothing here touches guest RDRAM.
+    /// These are host-side extent fields; a resize writes no memory the
+    /// guest can observe.
+    fn resize(&mut self, w: u32, h: u32) {
+        let extent = TriangleTargetExtent {
+            width: w,
+            height: h,
+        };
+        self.configured_target_extent = Some(extent);
+        if let Some(triangle_target_extent) = self.triangle_target_extent.as_mut() {
+            *triangle_target_extent = extent;
+        }
+    }
 
     fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
         &[]
@@ -6048,6 +6118,347 @@ mod tests {
         backend
             .execute_raw_dpc(bound)
             .expect("TMEM-only execution must succeed without ever calling create()");
+    }
+
+    /// A resize BEFORE any `create` records the host-configured extent and
+    /// leaves `triangle_target_extent` `None`.
+    ///
+    /// The pairing invariant (§1a/§1e) is that `triangle_pipeline` and
+    /// `triangle_target_extent` are `Some` together or `None` together. A
+    /// resize that populated `triangle_target_extent` on a backend with no
+    /// pipeline would break it, and `draw_admitted_triangles` reads the two
+    /// through separate `ok_or`s -- so the broken state would not be caught
+    /// there, it would just draw at an extent no device was ever requested
+    /// for. `configured_target_extent` is a different field with a different
+    /// rule: it is deliberately adapter-independent (see `create_inner`), so
+    /// it IS written here.
+    #[test]
+    fn resize_before_create_records_only_the_adapter_independent_extent() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        assert_eq!(backend.configured_target_extent, None);
+        assert_eq!(backend.triangle_target_extent, None);
+
+        backend.resize(320, 240);
+
+        assert_eq!(
+            backend.configured_target_extent,
+            Some(TriangleTargetExtent {
+                width: 320,
+                height: 240,
+            }),
+            "the CPU-side fill path's color-image height must follow a resize even with no adapter"
+        );
+        assert_eq!(
+            backend.triangle_target_extent, None,
+            "a resize must never populate a triangle extent with no pipeline behind it"
+        );
+        assert!(
+            backend.triangle_pipeline.is_none(),
+            "a resize must not request a device -- that is create()'s job, not this one's"
+        );
+    }
+
+    /// A resize AFTER a successful create updates both extents together and
+    /// keeps the live pipeline.
+    ///
+    /// `create_inner` here is allowed to report `NoAdapter` (this test must
+    /// run on the default, adapterless configuration too), so the pipeline
+    /// half is asserted conditionally on whether one was actually obtained
+    /// -- what is unconditional is the pairing: whichever way create went,
+    /// `triangle_target_extent.is_some()` still equals
+    /// `triangle_pipeline.is_some()` after the resize, and the extent that
+    /// exists is the new one, never the create-time one.
+    #[test]
+    fn resize_after_create_updates_both_extents_and_keeps_the_pipeline() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let had_pipeline = backend.triangle_pipeline.is_some();
+        assert_eq!(
+            backend.triangle_target_extent.is_some(),
+            had_pipeline,
+            "create_inner's own pairing invariant must hold before the resize is judged"
+        );
+
+        backend.resize(640, 480);
+
+        let resized = TriangleTargetExtent {
+            width: 640,
+            height: 480,
+        };
+        assert_eq!(
+            backend.configured_target_extent,
+            Some(resized),
+            "the fill path's extent must be the resized one, not create()'s"
+        );
+        assert_eq!(
+            backend.triangle_pipeline.is_some(),
+            had_pipeline,
+            "a resize must not drop or re-request the device -- nothing this backend owns is \
+             sized at create time"
+        );
+        assert_eq!(
+            backend.triangle_target_extent.is_some(),
+            had_pipeline,
+            "the pipeline/extent pairing must survive a resize in both directions"
+        );
+        if had_pipeline {
+            assert_eq!(
+                backend.triangle_target_extent,
+                Some(resized),
+                "a live pipeline's raster extent must follow the resize; the per-submission \
+                 attachments are built from it"
+            );
+        }
+    }
+
+    /// A resize to the SAME dimensions is a real write of the same value,
+    /// not a special-cased early return.
+    ///
+    /// There is deliberately no `if new == old { return }` guard: this
+    /// method allocates nothing and touches no device, so an equality check
+    /// would only add a branch whose "skip" arm is indistinguishable from
+    /// the silent no-op this whole change removes. The observable
+    /// requirement is idempotence, which is what this asserts.
+    ///
+    /// A same-dimensions resize is trivially satisfied by a no-op, so this
+    /// deliberately resizes AWAY first and then back: that makes the return
+    /// leg a real write whose result a no-op cannot produce, and only then
+    /// is repeating it asserted to be a fixed point.
+    #[test]
+    fn resize_to_the_same_dimensions_is_idempotent() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let after_create = backend.configured_target_extent;
+        let pipeline_extent_after_create = backend.triangle_target_extent;
+
+        // Away, so the return leg below cannot be satisfied by doing nothing.
+        backend.resize(FILL_TARGET_WIDTH * 3, FILL_TARGET_HEIGHT * 3);
+        assert_ne!(
+            backend.configured_target_extent, after_create,
+            "the intermediate resize must genuinely move the extent"
+        );
+
+        backend.resize(FILL_TARGET_WIDTH, FILL_TARGET_HEIGHT);
+        assert_eq!(
+            backend.configured_target_extent, after_create,
+            "resizing back to create()'s own dimensions must restore exactly that extent"
+        );
+        assert_eq!(
+            backend.triangle_target_extent, pipeline_extent_after_create,
+            "same for the triangle extent"
+        );
+
+        backend.resize(FILL_TARGET_WIDTH, FILL_TARGET_HEIGHT);
+        assert_eq!(
+            backend.configured_target_extent, after_create,
+            "and a repeated identical resize must still be a fixed point"
+        );
+        assert_eq!(
+            backend.triangle_target_extent, pipeline_extent_after_create,
+            "the triangle extent must be a fixed point under repetition too"
+        );
+    }
+
+    /// A resize to zero is RECORDED, not clamped and not ignored, and the
+    /// zero then surfaces as a named rejection at the point of use.
+    ///
+    /// This is the honest reading of the trait's own contract ("a backend
+    /// that cannot honor a resize should surface that at the next
+    /// `process_task`/`present` call ... not here"): `resize` is infallible,
+    /// so the refusal has to live downstream, and it already does --
+    /// `ColorTargetExtent::try_new` rejects a zero height with
+    /// `TargetError::ZeroExtent`. Clamping to 1 would invent a target
+    /// geometry the host never asked for and publish a resident whose byte
+    /// range is wrong; ignoring the call would be the silent no-op this
+    /// change exists to delete. Asserting the *named* error, not merely
+    /// "some error", is the point.
+    #[test]
+    fn resize_to_zero_is_recorded_and_rejected_by_name_at_the_fill() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        backend.resize(FILL_TARGET_WIDTH, 0);
+        assert_eq!(
+            backend.configured_target_extent,
+            Some(TriangleTargetExtent {
+                width: FILL_TARGET_WIDTH,
+                height: 0,
+            }),
+            "a zero extent must be recorded verbatim -- never clamped to 1, never dropped"
+        );
+
+        let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let error = backend
+            .execute_raw_dpc(bound)
+            .expect_err("a fill against a zero-height target must not execute");
+        let RenderError::Backend { reason, .. } = error else {
+            panic!("expected a backend-scoped rejection, got {error:?}");
+        };
+        assert_eq!(
+            reason,
+            WgpuRawDpcExecutionError::Target(TargetError::ZeroExtent {
+                width: FILL_TARGET_WIDTH,
+                height: 0,
+            })
+            .to_string(),
+            "the zero must surface as the color target's own named ZeroExtent, not as a generic \
+             failure and not as a successful fill of a fabricated one-row target"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a rejected fill must stage no redeemable token"
+        );
+    }
+
+    /// A resize between `execute_raw_dpc` and `publish_raw_dpc` must NOT
+    /// disturb the outstanding fill token, and the fill must still publish
+    /// at the extent it actually executed against.
+    ///
+    /// Why keeping it is correct rather than merely convenient: the token's
+    /// `InitializedCandidateColorTarget` sealed its own `ColorTargetKey`
+    /// (address, extent, byte range) when the fill ran, and
+    /// `ColorTargetRegistry::prepare_publication` reads only that captured
+    /// key -- it never re-derives one from the backend's current
+    /// `configured_target_extent`. So a resize structurally cannot retarget
+    /// an already-executed fill; the invariant is in the type, not in a
+    /// guard inside `resize`. Dropping the token would instead throw away a
+    /// completed submission's guest-write report and fail it with
+    /// `EffectCountMismatch` for a window resize it had nothing to do with.
+    ///
+    /// The resize here is deliberately to a DIFFERENT height than the fill
+    /// executed at, so a hypothetical re-derivation would produce a
+    /// different key and be caught.
+    #[test]
+    fn a_resize_between_execute_and_publish_leaves_the_fill_token_redeemable() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let request = session.plan_request(capture(whole_target_fill_words()));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("fixture plans cleanly");
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture executes cleanly");
+        assert!(
+            backend.has_pending_fill_publication(),
+            "this fixture must actually stage a token, or the claim below is vacuous"
+        );
+
+        // The window changes size in the middle of the staged-then-publish
+        // window -- a different height, so a re-derived key would differ.
+        backend.resize(FILL_TARGET_WIDTH, FILL_TARGET_HEIGHT * 2);
+        assert_eq!(
+            backend.configured_target_extent,
+            Some(TriangleTargetExtent {
+                width: FILL_TARGET_WIDTH,
+                height: FILL_TARGET_HEIGHT * 2,
+            }),
+            "the resize must genuinely have landed, or this test proves nothing about surviving \
+             one"
+        );
+        assert!(
+            backend.has_pending_fill_publication(),
+            "a resize must not drop an outstanding fill token"
+        );
+
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert!(
+            !staged.is_empty(),
+            "the staged guest writes must still bind to their own submission after a resize -- \
+             an empty list here would drive the caller into the zero-write commit branch and \
+             fail a submission that completed correctly"
+        );
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged.clone())
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "the token must be redeemed by the publish, not left behind"
+        );
+        let residents = backend
+            .color_targets()
+            .expect("an executed fill builds the registry")
+            .residents();
+        assert_eq!(residents.len(), 1, "exactly one resident target was filled");
+        assert_eq!(
+            residents[0].key().extent().height(),
+            FILL_TARGET_HEIGHT,
+            "the published resident must carry the extent the fill EXECUTED at, never the \
+             post-resize one -- the key is sealed in the token, not re-derived at publish"
+        );
+    }
+
+    /// The adapterless CPU-side fill path still works after a resize, at the
+    /// new geometry.
+    ///
+    /// `configured_target_extent` exists precisely so an admitted
+    /// `FillRectangle` executes with no adapter (see its own doc), and this
+    /// change writes that field -- so the hazard is that a resize breaks the
+    /// one path the field was created for. This drives a full
+    /// plan/execute/commit/seal/publish cycle at a resized height and proves
+    /// the resident lands at the NEW extent, which also proves the resize
+    /// actually reached the fill path rather than being cosmetic.
+    ///
+    /// Deliberately not `#[cfg(feature = "host-gpu-tests")]`: the whole
+    /// point is the no-adapter case, and this host having a real Metal
+    /// adapter must not be what makes it pass. The fill executor is CPU-side
+    /// on either host.
+    #[test]
+    fn the_adapterless_fill_path_still_works_after_a_resize() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        // Half the height create() configured: a real geometry change the
+        // fill's own ColorTargetKey must pick up.
+        let resized_height = FILL_TARGET_HEIGHT / 2;
+        backend.resize(FILL_TARGET_WIDTH, resized_height);
+
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x0842_1085));
+        words.extend(fill_rectangle(
+            0,
+            0,
+            FILL_TARGET_WIDTH - 1,
+            resized_height - 1,
+        ));
+        let staged = publish_one_fill(&mut backend, &mut session, words);
+        assert!(
+            !staged.is_empty(),
+            "an admitted fill must still declare guest writes after a resize"
+        );
+
+        let registry = backend
+            .color_targets()
+            .expect("an executed fill builds the registry");
+        let residents = registry.residents();
+        assert_eq!(residents.len(), 1, "exactly one resident target was filled");
+        assert_eq!(
+            residents[0].key().extent().height(),
+            resized_height,
+            "the fill must have executed against the RESIZED height -- equal to \
+             FILL_TARGET_HEIGHT here would mean the resize never reached the fill path"
+        );
+        assert_eq!(
+            residents[0].key().extent().width(),
+            FILL_TARGET_WIDTH,
+            "width comes from SetColorImage's own wire field, not from the resize"
+        );
     }
 
     #[cfg(feature = "host-gpu-tests")]
