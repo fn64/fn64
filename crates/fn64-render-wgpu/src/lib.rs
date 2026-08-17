@@ -376,6 +376,7 @@ mod rt64_resample;
 mod rt64_rigid_body;
 mod rt64_rsp_matrix_stack;
 mod rt64_rsp_patch;
+mod rt64_rsp_process;
 mod rt64_rsp_segment;
 mod rt64_rsp_smooth_normal;
 mod rt64_rsp_world_modify;
