@@ -363,6 +363,7 @@ mod rt64_rsp_patch;
 mod rt64_rsp_segment;
 mod rt64_rsp_smooth_normal;
 mod rt64_rsp_world_modify;
+mod rt64_texture_map_lru;
 mod rt64_texture_sampler;
 mod rt64_tmem_hasher;
 mod rt64_user_configuration;
