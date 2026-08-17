@@ -2,7 +2,14 @@
 //!
 //! Characterization-first literal port of the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureGen.hlsli`:
+//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureGen.hlsli` (SHA-256
+//! of the whole file,
+//! `e0fa4269a52e1927ffaf32b84df8e399926e124d21eea6236eb8355fa2e49841`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! path -- which for this file is identical to its `sources.oracle.sha256`,
+//! so the digest is simultaneously the oracle and port digest, confirmed
+//! independently here by `shasum -a 256` against the pinned port-commit
+//! checkout). Both of the file's two functions are ported below:
 //!
 //! ```text
 //! float3 normalizeSafe(float3 v) {

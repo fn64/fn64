@@ -4,7 +4,13 @@
 //! Characterization-first literal port of RT64's `RasterVS`
 //! (`src/shaders/RasterVS.hlsl:14-36`, pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875` per
-//! `docs/RT64-PORT-AUTHORITY.md`). Two independent behaviors, each gated by
+//! `docs/RT64-PORT-AUTHORITY.md`; SHA-256 of the whole file,
+//! `cc31c8d4c6ed11ea7f9370725365722916f0eae8ef17dedaa1c80fb7f4af6265`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for
+//! `src/shaders/RasterVS.hlsl` -- which for this file is identical to its
+//! `sources.oracle.sha256`, so the digest is simultaneously the oracle and
+//! port digest, confirmed independently here by `shasum -a 256` against the
+//! pinned port-commit checkout). Two independent behaviors, each gated by
 //! its own condition:
 //!
 //! 1. **Screen scale/offset**: unless the draw is a rectangle
