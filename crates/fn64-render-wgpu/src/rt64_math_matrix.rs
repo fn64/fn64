@@ -178,6 +178,14 @@
 //! `rt64_math_matrix` stays reachable only via `crate::rt64_math_matrix::*`,
 //! same as every other unwired characterization module in this crate.
 //!
+//! The scalar `hlslpp::lerp` is **not** redefined here: it is
+//! [`crate::rt64_math_decompose::lerp_f32`], widened to `pub(crate)` and
+//! shared. Both modules port halves of the same `rt64_math.cpp` at the same
+//! pinned commit and the same file SHA-256, so they cite one authority for
+//! one formula (`a + t*(b-a)`, not `a*(1-t)+b*t` -- see "Admitted domain").
+//! This module previously carried a character-identical private copy; the
+//! duplicate was retired rather than left to drift apart.
+//!
 //! ## Admitted domain / unpinned HLSL semantics (bound, not invented)
 //!
 //! - **`hlslpp::normalize` in `rotation_from_3x3`**: `hlslpp` is an
@@ -364,6 +372,7 @@
 //! consolidation pass, not an oversight.
 
 use crate::rt64_math::Mat3;
+use crate::rt64_math_decompose::lerp_f32;
 use fn64_render_ir::Vec3;
 
 /// `extract3x3`: copies the upper-left 3x3 of a row-major `float4x4`,
@@ -490,13 +499,6 @@ pub fn lerp_matrix_components(
     }
 
     ret
-}
-
-/// `hlslpp::lerp(a, b, t)` for a single scalar component: `a + t*(b-a)`
-/// (see module doc "Admitted domain" for why this exact formula, not
-/// `a*(1-t)+b*t`, was chosen).
-fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
-    a + t * (b - a)
 }
 
 /// `hlslpp::lerp(a, b, t)` applied component-wise to a `float4`.
