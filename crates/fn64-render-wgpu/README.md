@@ -2723,3 +2723,106 @@ repair moved those three fields to their WGSL-correct offsets 48, 80, and 96
 processes passed with no retry or source change. This satisfies AGENTS.md's
 deterministic 10x bar for this bounded slice; it is not a broader parity,
 performance, or full-ROM claim.
+
+## RDP LOD-fraction / tile-index selection (`computeLOD`, `texture_lod`)
+
+`texture_lod` is a characterization-first literal port of the permitted MIT
+RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`src/shaders/TextureSampler.hlsli:27-72` (`computeLOD`, whole-file SHA-256
+`927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a`). Like
+`texture_gen`/`math_hlsli`/`color_hlsli`, `fn64-render-wgpu` has no crate
+dependency on `fn64-render-reference`, so this is a self-contained literal
+re-expression citing RT64's source directly. `TextureSampler.hlsli`'s other
+functions (`clampWrapMirrorSample`, `sampleTextureNative`,
+`sampleTextureLevel`, `sampleTexture`) all bind `Texture2D`/`GPUTile`/
+`RDPTile`/TMEM resources and are out of scope for this literal-CPU-port
+slice; only `computeLOD`, the file's one pure scalar/vector formula, is
+ported here.
+
+**Reused accessors, no `state.rs` edit.** RT64's `otherMode.textLOD()`/
+`textDetail()` map onto this crate's existing `OtherMode::texture_lod() ->
+bool` and `OtherMode::texture_detail() -> u8` (`state.rs`), already landed
+and unit-tested before this slice. `texture_lod()` reads other-mode high bit
+16 (`G_MDSFT_TEXTLOD`) as a bare bit test, which is already
+`textLOD() == G_TL_LOD` collapsed to a `bool` (`G_TL_LOD = 1 << 16`,
+`G_TL_TILE = 0 << 16` are the field's only two values), so this port's
+`uses_lod` is `other_mode.texture_lod()` directly. `texture_detail()` reads
+high bits 17:18 (`G_MDSFT_TEXTDETAIL`) already right-shifted to a plain
+`0..3` ordinal, so `lodSharpen` is `texture_detail() & 1 != 0`
+(`G_TD_SHARPEN = 1 << 17`, ordinal bit 0) and `lodDetail` is
+`texture_detail() & 2 != 0` (`G_TD_DETAIL = 2 << 17`, ordinal bit 1). This
+slice adds no new `OtherMode` accessors and makes no edit to `state.rs`.
+
+**`inout`/`out` params as an owned return value.** `tileIndex0`/`tileIndex1`
+are HLSL `inout` parameters and `lodFraction` is an `out` parameter. This
+port follows this crate's established conversion of HLSL out-params to owned
+return values: [`LodTileIndices`] carries the caller-supplied
+`tile_index0`/`tile_index1` *input*, and [`LodSelection`] is the owned
+result. This input/output split matters because RT64's `!usesLOD` branch
+writes only `lodFraction = 1.0f` and leaves `tileIndex0`/`tileIndex1`
+untouched -- a naive port that defaults them to `0` instead of threading the
+caller's prior value through would silently change behavior. `compute_lod`
+preserves the pass-through literally.
+
+**Arithmetic, in RT64's exact operation order.** `maxDdUV = max(|ddxUV|,
+|ddyUV|)` per component; `maxDst = max(maxDdUV.x, maxDdUV.y) * resLodScale`;
+when `lodDetail || lodSharpen`, `maxDst` is further maxed against
+`primLOD.y` (and *only* then -- a dedicated fixture proves `primLOD.y` is
+inert when neither flag is set, even when it would otherwise dominate).
+`tileBase = floor(log2(maxDst))`, `lodFraction = maxDst / 2^max(tileBase, 0)
+- 1.0`. Sharpen then may override `lodFraction` to `maxDst - 1.0` (strictly
+`maxDst < 1.0`); detail then may replace a still-negative `lodFraction` with
+`maxDst` and always advances `tileBase` by one; otherwise (`!lodDetail`) a
+`tileBase >= tileMax` clamps `lodFraction` to `1.0`. A final gate --
+`lodDetail || lodSharpen` clamps `tileBase` to `>= 0`, else `lodFraction` is
+clamped to `>= 0` -- determines which of the two values receives the
+non-negative floor. Both tile indices are `clamp(tileBase [+1], 0, tileMax)`.
+
+**No defensive guards the source doesn't have.** `log2(x)` for `x <= 0` is
+undefined in the HLSL source; this port lets plain IEEE-754 `f32::log2`
+propagate (`0.0 -> -inf`, negative -> `NaN`, `inf -> inf`) rather than
+special-casing it, matching `depth_strict_less`'s precedent.
+`int(rdpTileCount) - 1` has no guard against `rdpTileCount == 0`, so
+`tileMax` can go negative -- preserved rather than clamped away. Two extra
+consequences follow directly from admitting these unguarded values, and this
+port makes an explicit, literal choice for each:
+
+- HLSL's `clamp(x, lo, hi)` is `min(max(x, lo), hi)` and never panics when
+  `lo > hi` (it resolves to `hi`). Rust's `i32::clamp` instead panics on
+  `lo > hi`, which `rdpTileCount == 0` (`tileMax == -1`) reaches directly.
+  This port defines a small `hlsl_clamp_i32` helper reproducing the
+  `min(max(...))` composition instead of calling `i32::clamp`.
+- HLSL 32-bit `int` addition has no trap-on-overflow semantics. The extreme-
+  `maxDst` fixtures this slice's sweep requires (`1e30`, `+inf`) drive
+  `tileBase` to `i32::MAX`/`i32::MIN` via the `as i32` float-to-int cast, and
+  `tileBase + 1` would then panic in a debug build under Rust's default
+  overflow checking. This port uses `i32::wrapping_add` at both increment
+  sites so the result is the same 32-bit two's-complement wrap in every
+  build profile, not a build-profile-dependent panic.
+
+**Tests.** `usesLOD == false` pass-through across several arbitrary
+(including zero and negative) prior tile-index pairs, always producing
+`lodFraction == 1.0`; the full sharpen/detail 2x2 cross product exercised at
+representative `maxDst` values (a moderate in-range case, at-or-past-`tileMax`
+clamping, the sharpen sub-`1.0` override boundary and its non-triggering
+sibling just at `1.0`, the detail negative-fraction-replacement path and its
+non-triggering sibling); `primLOD.y` proven inert when neither flag is set
+and dominant when either is; `rdpTileCount == 0` proving the unguarded
+negative-`tileMax` path does not panic; `ddxUV`/`ddyUV` sign and per-axis
+dominance combinations; `maxDst` at `0.0`, exactly `1.0`, an exact power of
+two, `1e30`, and `+inf` (the last two exercising the `wrapping_add` and
+`hlsl_clamp_i32` decisions directly); and a mutation sweep pinning each `<`/
+`<=`/`>=` boundary direction and each `||`/`&&` logical gate the formula
+depends on, so a flipped comparison or connective fails a fixture rather
+than passing silently.
+
+**Scope.** No GPU, WGSL, texture sampling, TMEM wiring, mip-level selection
+at a real draw call, combiner integration (`combiner_inputs_from_fragment_
+registers` does not gain a `lod_fraction` producer here -- `combiner.rs`'s
+`ColorInput::LodFraction`/`PrimLodFrac` selectors remain caller-supplied
+typed fields), triangle/rasterizer integration, or RT64 visual/pixel/silicon
+parity or performance claim. This module does not modify `state.rs` or any
+other existing file besides `lib.rs`'s module registration. No WGSL
+companion: `computeLOD` is not called from any of this crate's existing WGSL
+fixtures.

@@ -1422,3 +1422,62 @@ Next exact action:
 Worktree:
   Relevant changes plus unrelated pre-existing changes that must be preserved.
 ```
+
+## Implementation-slice capsule: `computeLOD` (`texture_lod.rs`)
+
+Self-contained addendum, landed from an isolated worktree disjoint from the
+live status capsule's active Color/blend lanes (see
+`.claude-handoffs/next-disjoint-after-color-blend-card.md` and its review
+chain). Root folds this into the live status capsule's rotation at merge
+time; this entry does not itself edit that table, to stay merge-safe against
+a concurrent isolated slice touching the same rows.
+
+- **Slice.** `computeLOD` (`src/shaders/TextureSampler.hlsli:27-72`, pinned
+  commit `5473732a822a4423b5696e7cb18fecc425a59875`), a pure RDP LOD-fraction
+  / tile-index-selection formula: `OtherMode` + tile count + `primLOD` +
+  UV-derivative inputs in, two `i32` tile indices and one `f32` LOD fraction
+  out. New module `crates/fn64-render-wgpu/src/texture_lod.rs`
+  (`compute_lod`, `LodTileIndices`, `LodSelection`); one `mod texture_lod;`
+  line added to `lib.rs`'s alphabetically-ordered module block. No other
+  file touched.
+- **Reuse, not new surface.** `OtherMode::texture_lod()`/`texture_detail()`
+  (`state.rs`) already existed and needed no change; this slice's own
+  earlier card draft incorrectly claimed they were missing, was independently
+  reviewed, corrected, and re-reviewed before implementation began (see the
+  card's own repair/rereview handoffs). Zero `state.rs` edits in the
+  implemented candidate.
+- **Literal-port decisions worth flagging for a future reader.** HLSL's
+  `clamp(x, lo, hi) = min(max(x, lo), hi)` never panics when `lo > hi`
+  (reachable here via `rdpTileCount == 0` making `tileMax == -1`); Rust's
+  `i32::clamp` does, so this port defines a small non-panicking
+  `hlsl_clamp_i32` helper instead of calling it. HLSL 32-bit `int` addition
+  has no trap-on-overflow semantics, and the extreme-`maxDst` fixtures this
+  slice's own required sweep (`1e30`, `+inf`) drive `tileBase` to
+  `i32::MAX`/`i32::MIN`; this port uses `i32::wrapping_add` at both increment
+  sites so the result is build-profile-independent (no debug-only overflow
+  panic). Both decisions were found and fixed by the fixture sweep itself,
+  not anticipated in advance -- the sweep is load-bearing, not decorative.
+- **Evidence.** `cargo test -p fn64-render-wgpu --lib texture_lod::`:
+  24/24 passed, 10/10 consecutive fresh-process runs. Full crate suite under
+  default features: 1152/1152 passed, 3 ignored, 0 failed (no regression).
+  `--features host-gpu-tests` full suite: pre-existing failures only, all in
+  `production`/`device`/`targets`/`blend`/`alpha_compare`/`coverage` GPU-
+  adapter-bound tests unrelated to this slice, root-caused to "no-adapter for
+  AnyNative" (no real GPU device reachable in this isolated worktree's
+  sandbox) -- not a regression this slice introduced; `texture_lod::` has no
+  GPU dependency and is absent from that failure list entirely. Scoped
+  clippy (`--no-deps --all-targets`, both default and `--features
+  host-gpu-tests`) clean for this module (only the expected unwired-`pub`
+  dead-code warnings, matching `fbcommon.rs`'s own unwired precedent).
+  Explicit-file `rustfmt --check --edition 2021` clean on both touched files.
+- **Scope held.** No GPU, WGSL, texture sampling, TMEM wiring, mip-level
+  selection at a real draw call, combiner integration
+  (`combiner_inputs_from_fragment_registers` does not gain a `lod_fraction`
+  producer -- `combiner.rs`'s `ColorInput::LodFraction`/`PrimLodFrac`
+  selectors remain caller-supplied typed fields, unchanged by this slice),
+  triangle/rasterizer integration, or RT64 visual/pixel/silicon parity or
+  performance claim. `docs/rt64-port-inventory.json`'s
+  `src/shaders/TextureSampler.hlsli` row is intentionally left
+  `port_state: "not-started"` by this slice -- only `computeLOD` lands;
+  `clampWrapMirrorSample`/`sampleTextureNative`/`sampleTextureLevel`/
+  `sampleTexture` remain GPU-bound and unported.
