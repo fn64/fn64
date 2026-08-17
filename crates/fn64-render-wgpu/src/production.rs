@@ -988,6 +988,18 @@ pub enum WgpuRawDpcExecutionError {
     /// ship an untested merge, this slice rejects the combination loudly.
     /// Admitting it is a follow-on slice, not a silent reorder.
     MixedFillAndTmemLoadPacket,
+    /// This packet declared both an admitted `FillRectangle` and at least
+    /// one admitted triangle. The two run entirely disjoint render paths:
+    /// the fill is executed CPU-side into an owned buffer staged behind
+    /// `PendingFillPublication`, while `draw_admitted_triangles` clears and
+    /// rasterizes into a GPU color attachment that never composes back into
+    /// that buffer. Executing both would publish a resident generation
+    /// carrying only the fill while the triangles landed somewhere the
+    /// guest can never observe -- with no defined ordering between them.
+    /// Composing the two sources is a follow-on slice; this is the loud
+    /// refusal in the meantime, exactly as with
+    /// [`Self::MixedFillAndTmemLoadPacket`].
+    MixedFillAndTrianglePacket,
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -1053,6 +1065,12 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "this packet declares both TMEM loads and an admitted FillRectangle; merging \
                  both write sources into the plan's own journal order is a follow-on slice, \
                  rejected loudly here rather than reordered silently",
+            ),
+            Self::MixedFillAndTrianglePacket => formatter.write_str(
+                "this packet declares both an admitted FillRectangle and at least one admitted \
+                 triangle; the CPU-side fill and the GPU triangle raster target are disjoint \
+                 with no defined composition or ordering between them, so the combination is \
+                 rejected loudly here rather than half-executed silently",
             ),
         }
     }
@@ -1259,18 +1277,29 @@ impl RenderBackend for WgpuBackend {
         )
         .map_err(RenderError::from)?;
 
-        // Replaced, not merged: a token still held from an earlier
-        // submission was never redeemed, and carrying it forward would let
-        // a later `publish_raw_dpc` publish a fill that belongs to a
-        // submission that already retired. Dropping it leaves the registry
-        // at its prior generation, which is the correct "nothing published"
-        // outcome.
-        self.pending_fill_publication = pending;
-
         if !triangles.is_empty() {
             self.draw_admitted_triangles(triangles)
                 .map_err(RenderError::from)?;
         }
+
+        // Stored only after every fallible step of THIS submission has
+        // succeeded, and replaced rather than merged.
+        //
+        // Ordering: a triangle draw that fails (`TriangleDrawBeforeCreate`
+        // on an adapterless host, for one) makes this call return `Err`,
+        // and a submission that failed must leave no redeemable token
+        // behind -- so the store happens after the draw, never before it.
+        //
+        // Replacement: a token still held from an earlier submission was
+        // never redeemed, and carrying it forward would let a later
+        // `publish_raw_dpc` publish a fill that belongs to a submission
+        // that already retired. Dropping it leaves the registry at its
+        // prior generation, which is the correct "nothing published"
+        // outcome. On the error path above, the stale token is likewise
+        // left untouched rather than replaced -- it was already
+        // unredeemable by submission identity, and this submission
+        // produced nothing to put in its place.
+        self.pending_fill_publication = pending;
 
         Ok(prepared)
     }
@@ -1719,6 +1748,17 @@ fn stage_and_report(
     // shipping an untested merge would be worse than a loud, named refusal.
     if !collector.plan.fills.is_empty() && !collector.plan.loads.is_empty() {
         return Err(WgpuRawDpcExecutionError::MixedFillAndTmemLoadPacket);
+    }
+    // Mixed fill-plus-triangle packets are refused at the same point, in
+    // the same shape, and for the same reason. `stage_fills_and_report`
+    // never inspects `plan.triangles`, and `execute_raw_dpc` draws them
+    // afterwards into a color attachment `draw_admitted_triangles` clears
+    // itself -- disjoint from the CPU-side fill buffer this packet staged.
+    // Admitting the pair would silently drop one of two render results
+    // with no ordering defined between them. Composing them is a follow-on
+    // slice; refusing by name is the honest answer until then.
+    if !collector.plan.fills.is_empty() && !collector.plan.triangles.is_empty() {
+        return Err(WgpuRawDpcExecutionError::MixedFillAndTrianglePacket);
     }
     if !collector.plan.fills.is_empty() {
         return stage_fills_and_report(collector, packet);
@@ -5631,6 +5671,246 @@ mod tests {
         assert!(
             backend.plan_raw_dpc(request).is_err(),
             "a fractional edge must be rejected, never truncated to whole pixels"
+        );
+    }
+
+    /// A `FillRectangle` followed by a `RawTriangle` in one packet: the
+    /// ordinary N64 idiom of clearing a framebuffer and then drawing into
+    /// it. Both halves plan cleanly on their own, so nothing upstream
+    /// refuses this; the refusal has to live at execution.
+    ///
+    /// `set_combine` is required before the triangle -- `PlanCollector`
+    /// rejects a triangle visited with no combiner state established
+    /// (see `plan_collector_rejects_a_triangle_visited_with_no_state_
+    /// established_at_all`). `set_other_mode` is deliberately NOT re-issued
+    /// after the fill: reverting to a non-Fill cycle would be a second,
+    /// unrelated reason for the packet to be interesting, and the fill's
+    /// own Fill-cycle `OtherMode` is what `plan_fill` admitted against.
+    fn fill_then_triangle_words() -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        words.extend(set_combine(0, 0));
+        words.extend(triangle_base_edge_words(7, 2, 0));
+        words
+    }
+
+    /// Hostile, and the reason this refusal exists: a packet carrying both
+    /// an admitted fill and an admitted triangle is rejected by name.
+    ///
+    /// Before this check, `stage_and_report` routed straight into
+    /// `stage_fills_and_report` -- which never inspects `plan.triangles` --
+    /// and `execute_raw_dpc` then drew those triangles into a color
+    /// attachment `draw_admitted_triangles` clears itself, disjoint from
+    /// the CPU-side fill buffer the same packet had just staged. The
+    /// renderer reported success while one of the two render results went
+    /// nowhere the guest could observe, with no ordering between them.
+    ///
+    /// The assertion is against the named variant's own `Display` text, not
+    /// a substring: `RenderBackend::execute_raw_dpc` converts the typed
+    /// `WgpuRawDpcExecutionError` into `RenderError::Backend`'s string, so
+    /// comparing to `MixedFillAndTrianglePacket.to_string()` is how this
+    /// module pins the *specific* refusal rather than merely "some error".
+    ///
+    /// The whole-target fill runs first for the same reason every other
+    /// first-fill fixture here does: a partial rectangle cannot honestly
+    /// initialize a fresh target.
+    #[test]
+    fn execute_raw_dpc_rejects_a_mixed_fill_and_triangle_packet() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let planned = plan_with_no_reads(&mut backend, &session, fill_then_triangle_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        let error = backend
+            .execute_raw_dpc(bound)
+            .expect_err("a fill+triangle packet must be refused, never half-executed");
+        match error {
+            RenderError::Backend { reason, .. } => assert_eq!(
+                reason,
+                WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string(),
+                "the refusal must be the named MixedFillAndTrianglePacket variant, not some \
+                 other error that happens to also reject this packet"
+            ),
+            other => panic!("expected a backend rejection, got {other:?}"),
+        }
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused fill+triangle packet must stage no redeemable fill token"
+        );
+    }
+
+    /// The new refusal did not over-reject: a fill with no triangle beside
+    /// it still executes and still stages its token. Without this, the
+    /// check above could have been written as "any packet with a fill" and
+    /// nothing in this module would have noticed.
+    #[test]
+    fn a_fill_only_packet_still_executes_after_the_triangle_refusal() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let (_, result) =
+            plan_and_execute_fill(&mut backend, &mut session, whole_target_fill_words());
+        result.expect("a fill-only packet must still execute -- the new check is fill+triangle");
+        assert!(
+            backend.has_pending_fill_publication(),
+            "a fill-only packet must still stage its deferred publication token"
+        );
+    }
+
+    /// The mirror of the test above, from the triangle side: a triangle
+    /// with no fill beside it still reaches `draw_admitted_triangles`
+    /// rather than being caught by the new check.
+    ///
+    /// The draw itself needs a real adapter, so on an adapterless host the
+    /// packet's execution ends in `TriangleDrawBeforeCreate`. That is the
+    /// *evidence* this test wants, not a limitation of it: reaching that
+    /// error proves `stage_and_report` admitted the plan and
+    /// `execute_raw_dpc` went on to attempt the draw. Being caught by
+    /// `MixedFillAndTrianglePacket` instead would mean the new check fires
+    /// on triangles alone. (The full real-GPU success path for a
+    /// triangle-only plan is covered under `host-gpu-tests` by
+    /// `triangle_only_plan_completes_via_preserving_physical_and_never_
+    /// flips_the_slot`.)
+    #[test]
+    fn a_triangle_only_packet_still_reaches_the_draw_after_the_fill_refusal() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+
+        let planned = plan_with_no_reads(&mut backend, &session, triangle_only_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+        match backend.execute_raw_dpc(bound) {
+            // A host that DOES have an adapter AND has had create() called
+            // on it draws the triangle and succeeds; this test calls no
+            // create(), so on every host today it takes the Err arm below.
+            // The arm is kept rather than made `unreachable!()` because the
+            // claim under test is "not caught by the fill+triangle refusal",
+            // which a success satisfies just as well as the draw's own error.
+            Ok(_) => {}
+            Err(RenderError::Backend { reason, .. }) => {
+                assert_ne!(
+                    reason, refused,
+                    "a triangle with no fill beside it must never hit the fill+triangle refusal"
+                );
+                assert_eq!(
+                    reason,
+                    WgpuRawDpcExecutionError::TriangleDrawBeforeCreate.to_string(),
+                    "on an adapterless host the only expected outcome is the draw's own \
+                     TriangleDrawBeforeCreate, reached by going PAST stage_and_report"
+                );
+            }
+            Err(other) => panic!("expected either success or the draw's own error, got {other:?}"),
+        }
+    }
+
+    /// Ordering: a submission whose triangle draw FAILS must leave no
+    /// redeemable fill token behind.
+    ///
+    /// `execute_raw_dpc` used to store `pending_fill_publication` before
+    /// calling `draw_admitted_triangles`, so a draw failure returned `Err`
+    /// with the token already on the backend -- a later `publish_raw_dpc`
+    /// could then redeem a fill from a submission that never completed.
+    ///
+    /// Inducing the failure needs a submission that carries BOTH a fill (to
+    /// produce a token) and a triangle draw that fails -- and the new
+    /// refusal above now rejects exactly that packet before either happens.
+    /// So this drives the two halves of `execute_raw_dpc` directly, in its
+    /// own order: `execute_raw_dpc_inner` on a fill-only packet yields a
+    /// real token, then `draw_admitted_triangles` is called with a triangle
+    /// whose plan state never resolved. Both halves are the production
+    /// functions, not stand-ins; only their sequencing is reproduced here.
+    ///
+    /// The chosen failure is `MissingTriangleDrawState::NoCombine`, not the
+    /// review's `TriangleDrawBeforeCreate`: this host has a real Metal
+    /// adapter, so `configure_fill_target_height`'s `create_inner` succeeds
+    /// and the pipeline IS present. `NoCombine` fails inside the same
+    /// function on any host, adapter or not, and is the same
+    /// `execute_raw_dpc` error path -- it is `draw_admitted_triangles`
+    /// returning `Err` that this test is about, not which `Err`.
+    #[test]
+    fn a_failed_triangle_draw_leaves_no_redeemable_fill_token() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        let (_prepared, _triangles, pending) = execute_raw_dpc_inner(
+            &mut backend.coordinator,
+            bound,
+            backend.rdp_state.other_mode(),
+            backend.rdp_state.combine(),
+            backend.rdp_state.blend_color(),
+            backend.rdp_state.env_color(),
+            backend.rdp_state.prim_color(),
+            backend.rdp_state.fog_color(),
+            &mut backend.color_targets,
+            backend.configured_target_extent,
+        )
+        .expect("the fill half must stage a real token");
+        assert!(
+            pending.is_some(),
+            "this fixture must actually produce a token, or the ordering claim is vacuous"
+        );
+
+        // The draw half, on the same backend the fill just staged against.
+        let draw =
+            backend.draw_admitted_triangles(vec![Err(MissingTriangleDrawState::NoCombine {
+                triangle_index: 0,
+            })]);
+        assert!(
+            matches!(
+                draw,
+                Err(WgpuRawDpcExecutionError::MissingTriangleDrawState(_))
+            ),
+            "expected the draw to fail, got {draw:?}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "the token must not be on the backend when the triangle draw fails -- the store \
+             belongs AFTER the draw, not before it"
+        );
+
+        // The runtime half above proves the two production functions
+        // compose correctly in this order, but it calls them itself -- it
+        // cannot notice `execute_raw_dpc` reverting to the OLD order. So
+        // the ordering `execute_raw_dpc` actually uses is pinned at the
+        // source level too, the same way
+        // `publish_raw_dpc_source_is_exactly_prepare_publication_then_commit`
+        // pins its own body's shape.
+        let source = include_str!("production.rs");
+        let body_start = source
+            .find("fn execute_raw_dpc(")
+            .expect("execute_raw_dpc must exist in this file");
+        let body_end = source[body_start..]
+            .find("\n    }\n")
+            .expect("execute_raw_dpc must have a closing brace")
+            + body_start;
+        let body = &source[body_start..body_end];
+
+        let draw_at = body
+            .find("self.draw_admitted_triangles(triangles)")
+            .expect("execute_raw_dpc must still call draw_admitted_triangles");
+        let store_at = body
+            .find("self.pending_fill_publication = pending;")
+            .expect("execute_raw_dpc must still store the pending token");
+        assert!(
+            draw_at < store_at,
+            "execute_raw_dpc must call draw_admitted_triangles BEFORE storing \
+             pending_fill_publication -- storing first leaves a redeemable token on the backend \
+             when the draw fails and the call returns Err"
+        );
+        assert_eq!(
+            body.matches("self.pending_fill_publication = pending;")
+                .count(),
+            1,
+            "exactly one store site, or the ordering above says nothing about the other"
         );
     }
 
