@@ -362,6 +362,7 @@ mod rt64_math_decompose;
 mod rt64_math_matrix;
 mod rt64_postprocess;
 mod rt64_preset_draw_call_match;
+mod rt64_preset_light;
 mod rt64_preset_material;
 mod rt64_profiling_timer;
 mod rt64_render_target_geometry;
