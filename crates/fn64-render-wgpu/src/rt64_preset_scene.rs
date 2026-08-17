@@ -458,6 +458,102 @@ pub struct PresetScene {
 }
 
 impl PresetScene {
+    /// Builds a [`PresetScene`] from **positional** arguments in the source's
+    /// declaration order (`rt64_preset_scene.h` lines 11-30), with the
+    /// inherited `PresetBase` sub-object first.
+    ///
+    /// This transcribes the header's member order into an argument order a
+    /// reviewer can read against `rt64_preset_scene.h` directly, and spares
+    /// callers fifteen repeated field names.
+    ///
+    /// **It does not detect a declaration reorder, and no test here claims it
+    /// does.** The body uses field-init shorthand, which binds by identifier
+    /// rather than position, as do the accessors below.
+    ///
+    /// This struct is nonetheless worth flagging as genuinely unpinned. Two
+    /// runs admit a completely silent swap: the four adjacent `Vec3` colours
+    /// (`ambientBaseColor`, `ambientNoGIColor`, `eyeLightDiffuseColor`,
+    /// `eyeLightSpecularColor`) and the eight adjacent trailing scalar
+    /// `float`s. The default constructor makes it worse rather than better --
+    /// `ambientBaseColor` and `ambientNoGIColor` default to the *identical*
+    /// `(0.03, 0.03, 0.03)` triple, so even a field-by-field default
+    /// comparison cannot tell those two apart. Nor does [`scene_write_json`]
+    /// close the gap: it reads each field *by name* into a fixed list
+    /// position, so swapping two declarations leaves its emitted key/value
+    /// pairs byte-identical.
+    ///
+    /// Closing it would mean generating the declaration and an order witness
+    /// from a single source, which changes the port's source text rather than
+    /// adding a test.
+    ///
+    /// Nothing here is a memory layout, size, or byte-offset claim.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn in_source_order(
+        base: PresetBase,
+        estimate_ambient_light: bool,
+        ambient_light_intensity: f32,
+        ambient_base_color: Vec3,
+        ambient_no_gi_color: Vec3,
+        eye_light_diffuse_color: Vec3,
+        eye_light_specular_color: Vec3,
+        gi_diffuse_strength: f32,
+        gi_background_strength: f32,
+        tonemap_exposure: f32,
+        tonemap_white: f32,
+        tonemap_black: f32,
+        min_luminance: f32,
+        luminance_range: f32,
+        luma_update_time: f32,
+    ) -> PresetScene {
+        PresetScene {
+            base,
+            estimate_ambient_light,
+            ambient_light_intensity,
+            ambient_base_color,
+            ambient_no_gi_color,
+            eye_light_diffuse_color,
+            eye_light_specular_color,
+            gi_diffuse_strength,
+            gi_background_strength,
+            tonemap_exposure,
+            tonemap_white,
+            tonemap_black,
+            min_luminance,
+            luminance_range,
+            luma_update_time,
+        }
+    }
+
+    /// The four `hlslpp::float3` members in declaration order.
+    #[must_use]
+    pub const fn float3_members_in_source_order(&self) -> [Vec3; 4] {
+        [
+            self.ambient_base_color,
+            self.ambient_no_gi_color,
+            self.eye_light_diffuse_color,
+            self.eye_light_specular_color,
+        ]
+    }
+
+    /// The nine scalar `float` members in declaration order --
+    /// `ambientLightIntensity` (which precedes the colours) then the eight
+    /// that follow them.
+    #[must_use]
+    pub const fn float_members_in_source_order(&self) -> [f32; 9] {
+        [
+            self.ambient_light_intensity,
+            self.gi_diffuse_strength,
+            self.gi_background_strength,
+            self.tonemap_exposure,
+            self.tonemap_white,
+            self.tonemap_black,
+            self.min_luminance,
+            self.luminance_range,
+            self.luma_update_time,
+        ]
+    }
+
     /// Literal port of `PresetScene::PresetScene()` (`rt64_preset_scene.cpp`
     /// lines 12-27), in assignment order.
     ///
@@ -768,6 +864,69 @@ pub const READ_JSON_KEYS: [&str; 15] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_scene_in_source_order_maps_arguments_to_named_fields() {
+        // Checks that `in_source_order`'s fifteen arguments land in the fields
+        // its parameter names promise, and that both accessors agree.
+        //
+        // This is NOT a reorder detector: the four adjacent `Vec3` colours and
+        // the eight adjacent trailing `f32`s can still be swapped in the
+        // declaration with every test in this module staying green, because
+        // field-init shorthand and field access bind by name. Verified by
+        // mutation; see the constructor docs for why no added test can close
+        // this.
+        //
+        // Nothing here is a memory layout claim.
+        let s = PresetScene::in_source_order(
+            PresetBase { enabled: true },
+            false,
+            1.0,
+            Vec3::new(2.0, 3.0, 4.0),
+            Vec3::new(5.0, 6.0, 7.0),
+            Vec3::new(8.0, 9.0, 10.0),
+            Vec3::new(11.0, 12.0, 13.0),
+            14.0,
+            15.0,
+            16.0,
+            17.0,
+            18.0,
+            19.0,
+            20.0,
+            21.0,
+        );
+
+        assert_eq!(s.base, PresetBase { enabled: true });
+        assert!(!s.estimate_ambient_light);
+        assert_eq!(s.ambient_light_intensity, 1.0);
+        assert_eq!(s.ambient_base_color, Vec3::new(2.0, 3.0, 4.0));
+        assert_eq!(s.ambient_no_gi_color, Vec3::new(5.0, 6.0, 7.0));
+        assert_eq!(s.eye_light_diffuse_color, Vec3::new(8.0, 9.0, 10.0));
+        assert_eq!(s.eye_light_specular_color, Vec3::new(11.0, 12.0, 13.0));
+        assert_eq!(s.gi_diffuse_strength, 14.0);
+        assert_eq!(s.gi_background_strength, 15.0);
+        assert_eq!(s.tonemap_exposure, 16.0);
+        assert_eq!(s.tonemap_white, 17.0);
+        assert_eq!(s.tonemap_black, 18.0);
+        assert_eq!(s.min_luminance, 19.0);
+        assert_eq!(s.luminance_range, 20.0);
+        assert_eq!(s.luma_update_time, 21.0);
+
+        // Second, independent derivation of each same-typed run's order.
+        assert_eq!(
+            s.float3_members_in_source_order(),
+            [
+                Vec3::new(2.0, 3.0, 4.0),
+                Vec3::new(5.0, 6.0, 7.0),
+                Vec3::new(8.0, 9.0, 10.0),
+                Vec3::new(11.0, 12.0, 13.0),
+            ]
+        );
+        assert_eq!(
+            s.float_members_in_source_order(),
+            [1.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0]
+        );
+    }
 
     /// A receiver whose every field differs from BOTH the constructor default
     /// and the `readJson` fallback, so that an overwrite test cannot pass
