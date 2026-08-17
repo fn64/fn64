@@ -8872,7 +8872,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -8896,6 +8896,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_camera_controller.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "All four methods (moveCursor, movePerspective, rotatePerspective, lookAtPerspective) take DebuggerCamera& and return void; their entire observable effect is mutating that 8-member struct, declared at the uncited hle/rt64_workload.h:193-202 and already refused by name at rt64_workload_geometry.rs:241. Only moveCursor is ImGui-gated -- lookAtPerspective (lines 65-75) has zero ImGui references, and neither movePerspective nor rotatePerspective reference an ImGui symbol -- so the uncited-mutated-type argument is what actually carries the refusal, not ImGui control flow."
       }
     },
     {
@@ -9070,7 +9075,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9094,6 +9099,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_debugger_inspector.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "532 ImGui:: call sites over 1,507 substantive lines. Its math calls -- pseudoRandom, barycentricCoordinates, nearPlaneFromProj, farPlaneFromProj, fovFromProj -- are all defined in common/rt64_math.cpp, not here; barycentricCoordinates is already ported at rt64_math.rs:225."
       }
     },
     {
@@ -9141,7 +9151,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9165,6 +9175,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_debugger_inspector.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "An 11-field struct plus 8 method declarations (including the constructor). Field layout only; Workload, VI, DrawCallKey and RenderWindow are all from uncited files."
       }
     },
     {
@@ -9240,7 +9255,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9264,6 +9279,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_file_dialog.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "A thin wrapper over the nfd (Native File Dialog) library: NFD_Init, NFD_PickFolderN, NFD_OpenDialogN, NFD_SaveDialogN, NFD_FreePathN. Zero arithmetic in the file."
       }
     },
     {
@@ -9452,7 +9472,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9476,6 +9496,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_inspector.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Vulkan and D3D12 backend plumbing -- VkDescriptorPool, VkRenderPass, vkDestroyRenderPass, ImGui_ImplVulkan_Init, imgui_impl_dx12, imgui_impl_win32. fn64 targets wgpu; none of these APIs exist in the render crates."
       }
     },
     {
@@ -9525,7 +9550,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9549,6 +9574,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_inspector.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Declarations for the above, over Plume/Vulkan/SDL2 handle types."
       }
     },
     {
@@ -17144,7 +17174,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -17168,6 +17198,11 @@
         "exit_gate": "The M8 behavior fixture for src/imgui/imgui_impl_sdl2_custom.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Vendored Dear ImGui SDL2 platform backend, carrying upstream's own header and changelog. 126 SDL_ references. The workspace has no SDL2 dependency at all -- grep for sdl2 across every Cargo.toml returns nothing."
       }
     },
     {
@@ -17215,7 +17250,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -17239,6 +17274,11 @@
         "exit_gate": "The M8 behavior fixture for src/imgui/imgui_impl_sdl2_custom.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Nine IMGUI_IMPL_API function declarations over three forward-declared SDL types and one typedef; no enum and no body anywhere in the file."
       }
     },
     {
