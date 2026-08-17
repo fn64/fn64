@@ -17,7 +17,19 @@
 //! This is a **full port** of the cited file: the header's entire content is
 //! the 19 `RT64_ATTRIBUTE_*` macros, the `ExtraParams` struct's 20 fields, and
 //! `applyExtraAttributes`. All three are ported here; nothing in the file is
-//! left unported. See "Nonclaims" for the one construct that is deliberately
+//! left unported.
+//!
+//! Because this module ports the header where upstream actually declares
+//! `interop::ExtraParams`, and because it owns the 19 attribute masks and the
+//! `apply_extra_attributes` merge that operate on that type, **this module is
+//! the single definition of [`ExtraParams`] for the crate**. The sibling
+//! `rt64_preset_material.rs` -- which cites `src/preset/rt64_preset_material.
+//! {h,cpp}`, not this header, and so could not reach across to it when it was
+//! written -- previously declared its own identical copy; it now imports this
+//! one. That module continues to own the type's *default values*, which
+//! upstream declares in its files and not in this one; see the
+//! "This header declares no defaults at all" note below for why no default,
+//! `Default` impl, or `zeroed()` constructor is provided here. See "Nonclaims" for the one construct that is deliberately
 //! *not* modelled as a Rust language feature (the `#ifdef HLSL_CPU` /
 //! `namespace interop` scaffolding), which is preprocessor plumbing rather
 //! than behavior.
