@@ -1,0 +1,23 @@
+[package]
+name = "fn64-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "fn64 core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram model, overlays. See docs/DESIGN.md."
+
+[dependencies]
+# Stackful coroutines: docs/DESIGN.md section 2 option (b), the load-bearing
+# choice ("Recommendation: (b), single executor + stackful coroutines"). No
+# deviation from what DESIGN.md names -- corosensei gives each OSThread a
+# real machine stack switched to/from cooperatively on one host thread, which
+# is exactly the property that makes rung-18-class races unrepresentable.
+corosensei = "0.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+static_assertions = "1.1"
+# Test-only: the executor-drives-the-fallback-lane integration proof lives in
+# tests/executor_fallback.rs. Production dependency direction remains one-way;
+# the recompiler lane is linked only into fn64-runtime test binaries.
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime" }
