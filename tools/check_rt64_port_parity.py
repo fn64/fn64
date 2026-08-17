@@ -55,7 +55,7 @@ RUST_STATES = {"RUST_PENDING", "RUST_PASS", "RUST_BOUNDED_QUALIFICATION"}
 AUTHORITIES = {"hardware_reference", "admitted_full_rom", "base_renderer_matrix", "pinned_rt64"}
 AVAILABILITY = {"qualified", "unexercised", "build_not_enabled", "platform_unavailable"}
 CONTRACT_DIGEST = "7556031949f3093d616f75724e5be091beda5152140c489127213917ef382da0"
-STATE_DIGEST = "65f6438686713767b135ae74def03001679a93ae27c5f245dc2049be987ef9d5"
+STATE_DIGEST = "8763281ca7929b5cffab7a46288eff77dfd938e6315fa525eeb34e21976aab64"
 
 
 class ParityError(Exception):
@@ -815,7 +815,13 @@ def render_doc(rows: list[dict], metadata: dict[tuple[str, str], dict]) -> str:
         "The ordinary checker keeps a structurally sound development backlog green. The",
         "separate `--progress` gate remains red until every required row has both a",
         "qualified RT64 observation/classification and a qualified Rust result.", "",
-        "The first concrete backend runner is registered only for deferred frame history.",
+        "Two concrete runners are registered: the RT64 deferred-frame-history runner, and the",
+        "pure-Rust reference delegate qualifying `feature::native-renderer-rdram-sync`. That",
+        "single `RUST_PASS` records that fn64's *reference* CPU rasterizer reproduces an",
+        "independently derived RDRAM answer on one fixture at one observable layer. It is not",
+        "RT64 parity: `rt64_evidence.availability` on that row is still `unexercised`, so RT64",
+        "has never been run against it and no RT64-to-Rust comparison exists. It also says",
+        "nothing about the wgpu renderer, which this row does not exercise.",
         "Closed evidence remains fail-closed: the checker launches every fresh process and owns each random",
         "challenge. A public replay artifact contains only the Rust-decoded record, exact raw",
         "payload streams, and capture control; a separately registered verifier-private authority",
