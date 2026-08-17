@@ -28539,8 +28539,10 @@
       "port_delta": "unchanged",
       "milestone": "M1",
       "workstream": "semantic-ir",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_extra_params.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m1-src-shared-rt64-extra-params-h",
@@ -28553,7 +28555,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "F/xhigh",
         "writable_paths": [
-          "crates/fn64-render-ir/src/rt64_extra_params_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_extra_params.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
