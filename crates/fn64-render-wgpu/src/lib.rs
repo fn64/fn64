@@ -381,6 +381,7 @@ mod rt64_rsp_segment;
 mod rt64_rsp_smooth_normal;
 mod rt64_rsp_world_modify;
 mod rt64_shader_description;
+mod rt64_shared_params;
 mod rt64_texture_map_lru;
 mod rt64_texture_sampler;
 mod rt64_tmem_hasher;
