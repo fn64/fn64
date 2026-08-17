@@ -692,6 +692,66 @@ use super::*;
     }
 
 
+    /// The reserve half of the FullSync two-phase contract raises nothing.
+    ///
+    /// This is the evidence behind `RawDpcIrCapability::
+    /// TransactionalTmemFillFullSyncSiteOnly`'s nonclaim and behind the
+    /// `Clear`/`Clear` boundary the ABI producer supplies: a successful
+    /// `preflight_dp_full_sync` leaves the DP interrupt line down, the slot
+    /// free, no event scheduled, and the evidence snapshot byte-identical.
+    /// A renderer that has only reserved therefore has nothing to observe,
+    /// and a boundary claiming `interrupt_after == Asserted` off the back of
+    /// one would be fabricating an edge this test proves does not exist.
+    #[test]
+    fn preflight_dp_full_sync_reserves_without_raising_scheduling_or_consuming_the_slot() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0x100);
+        let before = fabric.evidence_snapshot();
+
+        fabric.preflight_dp_full_sync(Cycles::new(3)).unwrap();
+
+        // Nonmutating: no interrupt, no busy slot, no recorded evidence.
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+        assert!(!fabric.snapshot().dp_busy);
+        assert_eq!(fabric.evidence_snapshot(), before);
+
+        // No event was scheduled, so advancing well past any deadline the
+        // commit half would have used still produces nothing.
+        assert!(fabric
+            .advance_to(Cycles::new(10), &mut rdram)
+            .unwrap()
+            .is_empty());
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+
+        // The slot the reserve proved free is still free: the commit half
+        // succeeds afterwards, and only then does the interrupt arrive.
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        assert!(fabric.snapshot().dp_busy);
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+        assert_eq!(
+            fabric.advance_to(Cycles::new(13), &mut rdram).unwrap(),
+            vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
+        );
+        assert!(fabric.interrupt_pending(InterruptSource::Dp));
+    }
+
+    /// The reserve half rejects an occupied slot, which is what lets a
+    /// renderer be turned away before it observes or changes guest memory.
+    #[test]
+    fn preflight_dp_full_sync_rejects_an_occupied_slot_without_disturbing_it() {
+        let mut fabric = fabric();
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        let before = fabric.evidence_snapshot();
+
+        assert_eq!(
+            fabric.preflight_dp_full_sync(Cycles::new(1)),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.evidence_snapshot(), before);
+        assert!(fabric.snapshot().dp_busy);
+    }
+
+
     #[test]
     fn pi_channel_serializes_requests_and_time_never_moves_backward() {
         let mut fabric = fabric();

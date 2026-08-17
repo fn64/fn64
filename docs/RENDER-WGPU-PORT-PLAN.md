@@ -804,6 +804,28 @@ Accepted decisions:
 - **D6:** converge on one GPU device/surface/compositor path.
 - **D7:** retain conservative FullSync writeback until M9 proves complete
   read-observation and coherence.
+  - **Amended (FullSync two-phase contract).** The writeback deferral is
+    unchanged and still holds: nothing here proves read-observation or
+    coherence, and M9 still owns both. What changed is narrower — the
+    production raw-DPC seam no longer blanket-rejects `SYNC_FULL`. It admits
+    a decoded **site** under a two-phase contract: the nonmutating
+    `DeviceFabric::preflight_dp_full_sync` reserves the sole DP completion
+    slot before the backend is entered (reserve), and `start_dp_full_sync`
+    schedules the DP event after the transaction publishes (commit).
+    `RawDpcIrCapability::TransactionalTmemFillFullSyncSiteOnly` names this
+    exactly.
+  - **What is still NOT claimed.** A reservation is not an observation. The
+    DP interrupt for a raw FullSync is raised only inside
+    `DeviceFabric::advance_to`'s `DeviceEvent::Dp` arm, which runs strictly
+    after the capture, plan, execution, commit, and publication of the
+    submission that scheduled it — so at the moment a capture's
+    `FullSyncBoundary` must already exist, `interrupt_after == Asserted` is
+    not observable by construction. The production producer therefore
+    supplies `Clear`, and the observation half of this contract remains
+    deferred to M9 along with the writeback. The distinction is carried in
+    the boundary value itself, never in the capability enum, so a future
+    backend that genuinely observes the edge is distinguished by supplying
+    `Asserted` rather than by declaring a new capability.
 - **D8:** keep an initialized ubershader on the no-stall path; specialization is
   asynchronous and optional for correctness.
 - **D9:** treat hybrid ray tracing as broadly available only when semantic 3D

@@ -973,14 +973,15 @@ fn try_dispatch_raw_dpc_via_session(
         u32::try_from(real.len()).expect("registered RDRAM allocation fits a u32 byte length"),
     )
     .unwrap_or_else(|error| panic!("try_dispatch_raw_dpc_via_session: {error}"));
-    // T4 v11 scope is TMEM-only, no-FullSync: no admitted command in this
-    // slice can legitimately observe the DP interrupt line, so a fixed
-    // `Clear` snapshot is exact for every submission this backend accepts --
-    // `plan_raw_dpc`'s own FullSync rejection is what makes that true, not
-    // an assumption made here. `transaction_sequence` reuses this exact
-    // transaction's own fabric-issued token: real per-submission fabric
-    // identity, not a fabricated counter, matching the requirement to
-    // preserve the existing fabric token lifecycle through this new path.
+    // The `cmd_end` interrupt snapshot is a fixed `Clear`. That is exact, not
+    // an assumption: the DP interrupt for a raw FullSync is raised inside
+    // `DeviceFabric::advance_to`'s `DeviceEvent::Dp` arm, and device
+    // advancement cannot run during renderer dispatch, so the line cannot
+    // have been raised by this submission at the moment this boundary is
+    // built. `transaction_sequence` reuses this exact transaction's own
+    // fabric-issued token: real per-submission fabric identity, not a
+    // fabricated counter, matching the requirement to preserve the existing
+    // fabric token lifecycle through this new path.
     let token = transaction
         .token
         .expect("try_dispatch_raw_dpc_via_session: transaction committed twice");
@@ -988,12 +989,82 @@ fn try_dispatch_raw_dpc_via_session(
     let observation_start = source.submission.start();
     let observation_end = source.submission.end();
     let observation_words = source.submission.command_words();
-    let capture = fn64_render::OwnedRawDpcCapture::new(
-        source.submission,
-        memory_layout,
-        token,
-        fn64_render::ir::TemporalBoundary::new(token, fn64_render::ir::DpInterruptState::Clear),
-    );
+    let cmd_end =
+        fn64_render::ir::TemporalBoundary::new(token, fn64_render::ir::DpInterruptState::Clear);
+
+    // Reserve half of the FullSync two-phase contract.
+    //
+    // `fn64-render-ir` requires exactly one `FullSyncBoundary` per decoded
+    // `SYNC_FULL` opcode, so a submission carrying one cannot be planned at
+    // all unless this producer supplies it. Count the sites structurally
+    // (same stride walk, same six-bit masking as the RDRAM inspector) and,
+    // when there are any, prove the sole DP completion slot is free through
+    // the nonmutating `preflight_dp_full_sync` BEFORE the backend is entered
+    // or any guest byte is read -- which is precisely what that function's
+    // own doc says it exists for.
+    let full_sync_sites = fn64_render::count_raw_rdp_full_sync_sites(&observation_words)
+        .unwrap_or_else(|error| panic!("try_dispatch_raw_dpc_via_session: {error}"));
+    let capture = if full_sync_sites == 0 {
+        fn64_render::OwnedRawDpcCapture::new(source.submission, memory_layout, token, cmd_end)
+    } else {
+        // Interleaving closed exactly as `preflight_raw_dpc_completion`
+        // closes it on the legacy path: a prior FullSync may still be
+        // pending, and observing an occupied slot here rejects before the
+        // backend or RDRAM is touched.
+        with_host(|host| {
+            host.device_fabric
+                .preflight_dp_full_sync(fn64_runtime::Cycles::new(1))
+        })
+        .unwrap_or_else(|error| {
+            panic!("try_dispatch_raw_dpc_via_session: DP FullSync completion: {error}")
+        });
+
+        // HONESTY BOUNDARY -- read this before changing either state below.
+        //
+        // `interrupt_before` is `Clear` because it is genuinely observed:
+        // device advancement cannot run during dispatch, so nothing this
+        // submission did could have raised the line yet.
+        //
+        // `interrupt_after` is ALSO `Clear`, and that is the honest value,
+        // not a placeholder to be "fixed" later by writing `Asserted` here.
+        // A successful `preflight_dp_full_sync` is a RESERVATION: it is
+        // nonmutating, it schedules no `DeviceEvent::Dp`, and it raises no
+        // interrupt. The interrupt for this submission is raised only when
+        // `complete_committed_dpc` calls `start_live_dp_full_sync` and the
+        // guest later advances devices past the deadline -- strictly after
+        // this capture, this plan, this execution, and this publication have
+        // all already happened. There is therefore no point in this flow at
+        // which an `Asserted` value could be READ, and writing one would
+        // fabricate a guest-visible interrupt edge that never occurred.
+        //
+        // Delivering a truthful `Asserted` needs the post-commit read-
+        // observation and coherence work `docs/RENDER-WGPU-PORT-PLAN.md`'s
+        // D7 defers to M9. Until then the decoded site is recorded and the
+        // observation is not claimed.
+        //
+        // Sequences: `cmd_end` owns `token`, so each site's pair must be
+        // strictly increasing after it and its own interrupt sequence must
+        // exceed its site sequence -- `derive_stream`'s
+        // `NonMonotonicFullSyncSequence` check.
+        let boundaries = (0..full_sync_sites)
+            .map(|ordinal| {
+                let ordinal = ordinal as u64;
+                fn64_render::ir::FullSyncBoundary::new(
+                    token + 1 + ordinal * 2,
+                    token + 2 + ordinal * 2,
+                    fn64_render::ir::DpInterruptState::Clear,
+                    fn64_render::ir::DpInterruptState::Clear,
+                )
+            })
+            .collect();
+        fn64_render::OwnedRawDpcCapture::with_full_sync_boundaries(
+            source.submission,
+            memory_layout,
+            token,
+            cmd_end,
+            boundaries,
+        )
+    };
 
     let observation = dpc_observation(xbus, observation_start, observation_end, &observation_words);
 
@@ -1130,12 +1201,32 @@ fn try_dispatch_raw_dpc_via_session(
 
     record_rsp_rdp_observations(vec![observation.clone()]);
     record_rdp_renderer_publication_v1();
-    // v11 TMEM-only scope admits no FullSync command, and `plan_raw_dpc`
-    // already rejects one loudly before this point is ever reached -- so
-    // every submission that reaches here completes with FullSync NotReached,
-    // exactly like `preflight_raw_dpc_completion`'s own inspection would
-    // report for a command stream with none.
-    Some((fn64_render::DpFullSyncStatus::NotReached, observation))
+    // Commit half of the FullSync two-phase contract.
+    //
+    // `DpFullSyncStatus` keeps its exact existing meaning here -- "the
+    // backend reached the opcode" -- which is why no fourth variant was
+    // added: this enum is consumed by sticky-OR in five places
+    // (`rsp_commit.rs`'s two loops and `advance_one`, `raw_dpc_batch.rs`'s
+    // `aggregate_full_sync`, and the reference backend's `imp.rs`), and any
+    // new variant would read as "no interrupt" in every `!= Reached` test.
+    //
+    // Reporting `Reached` routes this submission into the caller's sticky-OR
+    // and, eventually, `complete_committed_dpc`'s `start_live_dp_full_sync`
+    // -- the mutating commit half that actually schedules the DP event. That
+    // is the same commit the legacy path performs for the same command
+    // stream; the T4 path no longer silently swallows it.
+    //
+    // Nonclaim: `Reached` means the opcode was walked and the slot was
+    // reserved. It does NOT mean the guest observed a DP interrupt. That
+    // claim lives only in a `FullSyncBoundary` whose `interrupt_after` is
+    // `Asserted`, and this path supplies `Clear` -- see the honesty boundary
+    // comment where the boundaries are built.
+    let full_sync = if full_sync_sites == 0 {
+        fn64_render::DpFullSyncStatus::NotReached
+    } else {
+        fn64_render::DpFullSyncStatus::Reached
+    };
+    Some((full_sync, observation))
 }
 
 /// Own the ABI side of an explicitly scheduled raw-DPC renderer transaction.
@@ -1392,12 +1483,22 @@ pub(crate) unsafe fn dispatch_dpc_submission(
         // `try_dispatch_raw_dpc_via_session` already commits the fabric
         // transaction (through `with_ready_commit`/`publish_raw_dpc`) and
         // records observations internally, exactly like
-        // `complete_committed_dpc` does for the legacy path below -- there
-        // is nothing left to do here for this submission. `full_sync` is
-        // always `NotReached` in this v11 TMEM-only slice (see that
-        // function's own doc comment), so no `start_live_dp_full_sync` call
-        // is needed either.
-        let _ = try_dispatch_raw_dpc_via_session(
+        // `complete_committed_dpc` does for the legacy path below.
+        //
+        // The DP completion is NOT already handled, though, and must be
+        // driven here. `complete_committed_dpc` is what calls
+        // `start_live_dp_full_sync` for the legacy path, and this branch
+        // deliberately does not go through it. Before FullSync was admitted
+        // this cost nothing because the session path could only ever report
+        // `NotReached`; now that it can report `Reached`, discarding the
+        // status would silently swallow the guest's DP interrupt for exactly
+        // the submissions the site admission exists to handle.
+        //
+        // This is the mutating commit half of the two-phase contract. Its
+        // reserve half already ran inside the call below, before the backend
+        // was entered -- so this scheduling cannot fail for a slot reason
+        // that a nonmutating check would have caught earlier.
+        let (full_sync, _observation) = try_dispatch_raw_dpc_via_session(
             rdram,
             SessionRawDpcSource {
                 submission: owned_submission,
@@ -1405,6 +1506,11 @@ pub(crate) unsafe fn dispatch_dpc_submission(
             transaction,
         )
         .expect("session_registered was already checked true under the same borrow");
+        if full_sync == fn64_render::DpFullSyncStatus::Reached {
+            crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
+                panic!("dispatch_raw_rdp: DP FullSync completion: {error}")
+            });
+        }
         return;
     }
 
