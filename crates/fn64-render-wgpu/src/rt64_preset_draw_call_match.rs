@@ -259,11 +259,14 @@
 //!   and `PresetDrawCall`'s JSON I/O (`to_json`/`from_json`/`readJson`/
 //!   `writeJson`) -- wall-to-wall ImGui and `nlohmann::json`, the excluded
 //!   "inspector half" per the ticket.
-//! - `PresetBase` (the parent type `PresetDrawCall` inherits `enabled`
-//!   from in the original) is not ported; this module's `PresetDrawCall`
-//!   analog carries only `key`, `mask`, and skips `materialPresetName`
-//!   (a plain `String` with no comparison semantics of its own) and
-//!   `enabled` (never read by `matches()` itself in the pinned source).
+//! - [`PresetBase`](crate::rt64_preset_scene::PresetBase) (the parent type
+//!   `PresetDrawCall` inherits `enabled` from in the original) is not
+//!   ported *by this module*: it is ported separately, in
+//!   `rt64_preset_scene.rs`. This module's `PresetDrawCall` analog does not
+//!   reuse it -- it carries only `key`, `mask`, and skips
+//!   `materialPresetName` (a plain `String` with no comparison semantics of
+//!   its own) and `enabled` (never read by `matches()` itself in the
+//!   pinned source).
 
 /// Bit position of `DrawAttribute::Combine` in `DrawCallMask::attribute`,
 /// per `src/hle/rt64_draw_call.h`'s `DrawAttribute` enum (`Combine = 7`).

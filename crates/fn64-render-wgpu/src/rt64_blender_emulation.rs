@@ -295,14 +295,24 @@
 //! this module ports only `EmulationRequirements`/
 //! `EmulationRequirements::Cycle`/`checkEmulationRequirements`/
 //! `Approximation` (lines 178-271, the ticket's named scope). It does
-//! **not** port `combineCycleCount`/`blendCycleCount`/`usesInput`/
-//! `usesCombinerAlpha`/`usesAlphaBlendCycle`/`usesAlphaBlend`/
-//! `usesStandardFogCycle`/`usesVisualizeCoverageCycle` (lines 45-175,
-//! `rt64_blender_analysis.rs`/M4.4's scope -- this module calls into that
-//! sibling's `blend_cycle_count` rather than redefining it), `inputToString`
+//! **not** port
+//! [`combineCycleCount`](crate::rt64_blender_analysis::combine_cycle_count)/
+//! [`blendCycleCount`](crate::rt64_blender_analysis::blend_cycle_count)/
+//! [`usesInput`](crate::rt64_blender_analysis::uses_input)/
+//! [`usesCombinerAlpha`](crate::rt64_blender_analysis::uses_combiner_alpha)/
+//! [`usesAlphaBlendCycle`](crate::rt64_blender_analysis::uses_alpha_blend_cycle)/
+//! [`usesAlphaBlend`](crate::rt64_blender_analysis::uses_alpha_blend)/
+//! [`usesStandardFogCycle`](crate::rt64_blender_analysis::uses_standard_fog_cycle)/
+//! [`usesVisualizeCoverageCycle`](crate::rt64_blender_analysis::uses_visualize_coverage_cycle)
+//! *here* (lines 45-175, `rt64_blender_analysis.rs`/M4.4's scope -- this
+//! module calls into that sibling's `blend_cycle_count` rather than
+//! redefining it). Read that as a refusal by *this* module, not as a claim
+//! the crate lacks the symbols: `rt64_blender_analysis.rs` ports all of
+//! these, as that module's own declared M4.4 scope. `inputToString`
 //! (lines 273-316, debug-only string formatting, not analysis, not named by
-//! this ticket), or `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run`
-//! (lines 324-505, the runtime evaluation half `blend.rs` already owns).
+//! this ticket), and `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run`
+//! (lines 324-505, the runtime evaluation half `blend.rs` already owns)
+//! remain genuinely unported.
 //! `docs/rt64-port-inventory.json`'s `port_state` for
 //! `src/shared/rt64_blender.h` may still read a state that does not name
 //! this module after this change lands (the inventory's `writable_paths`
