@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 70 `ported`, 195 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 72 `ported`, 193 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -220,8 +220,8 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/render/rt64_shader_library.cpp` | `unchanged` | `authority-gated` | -- | 919 | 3 | 10 | `M4` / `authority-overlay` | `source-digests-verified` | `not-run` / `candidate-observation` | `authority-evidence` (M/medium) | `rt64-port-m4-src-render-rt64-shader-library-cpp` |
 | `src/render/rt64_shader_library.h` | `unchanged` | `not-started` | -- | 66 | 2 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-render-rt64-shader-library-h` |
 | `src/render/rt64_texture.h` | `unchanged` | `not-started` | -- | 25 | 1 | 2 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-texture-h` |
-| `src/render/rt64_texture_cache.cpp` | `unchanged` | `not-started` | -- | 1791 | 58 | 8 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-texture-cache-cpp` |
-| `src/render/rt64_texture_cache.h` | `unchanged` | `not-started` | -- | 268 | 16 | 6 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-texture-cache-h` |
+| `src/render/rt64_texture_cache.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs` | 1791 | 58 | 8 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-texture-cache-cpp` |
+| `src/render/rt64_texture_cache.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs` | 268 | 16 | 6 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-texture-cache-h` |
 | `src/render/rt64_tile_processor.cpp` | `unchanged` | `not-started` | -- | 68 | 4 | 3 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-tile-processor-cpp` |
 | `src/render/rt64_tile_processor.h` | `unchanged` | `not-started` | -- | 32 | 4 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-render-rt64-tile-processor-h` |
 | `src/render/rt64_transform_processor.cpp` | `unchanged` | `not-started` | -- | 92 | 4 | 4 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-render-rt64-transform-processor-cpp` |
