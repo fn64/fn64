@@ -17,6 +17,18 @@
 //!    reaches a live cpal output stream. The linked game/harness separately
 //!    registers the recompiled ucode that produces those samples.
 //!
+//! ## Shell hotkeys
+//!
+//! Handled before the keyboard reaches the game, so they stay reachable
+//! whatever `input.toml` binds:
+//!
+//! | Key | Effect |
+//! |---|---|
+//! | F1 | Settings overlay (`overlay.rs`) |
+//! | F2 | Screenshot the game frame to a PNG (`screenshot.rs`) |
+//! | F11 | Toggle borderless fullscreen |
+//! | Esc | Close the overlay, or exit when it is closed |
+//!
 //! ## Game intake (same contract as oot-boot)
 //!
 //! The recompiled game is linked at BUILD time from `RECOMPILED_DIR`/
@@ -49,6 +61,8 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+#[allow(dead_code)]
+mod screenshot;
 #[allow(dead_code)]
 mod timing;
 
@@ -204,6 +218,15 @@ mod game {
         /// and the self-referential lifetime can't live in one struct.
         window: Option<Arc<Window>>,
         pixels: Option<Pixels<'static>>,
+        /// True once `present()` has unpacked a VI framebuffer into `rgba`.
+        /// Distinct from `reported_first_frame` (a logging latch): a capture
+        /// needs to know the buffer holds a real frame, because a freshly
+        /// allocated `rgba` is all-zero and would encode as a plausible but
+        /// fabricated black PNG.
+        rgba_holds_a_frame: bool,
+        /// Hands out the never-reused suffix that keeps two captures in the
+        /// same millisecond from overwriting each other.
+        screenshotter: crate::screenshot::Screenshotter,
         reported_first_frame: bool,
         last_heartbeat_swap: u64,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
@@ -438,6 +461,8 @@ mod game {
                 fb_width: FB_WIDTH,
                 window: None,
                 pixels: None,
+                rgba_holds_a_frame: false,
+                screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
                 next_frame_deadline: std::time::Instant::now(),
@@ -604,6 +629,10 @@ mod game {
                 self.fb_width,
                 &mut self.rgba,
             );
+            // `rgba` now holds a real frame, so F2 may encode it. Set here and
+            // not after `render()`: the bytes are what a screenshot wants, and
+            // a failed present does not make them fabricated.
+            self.rgba_holds_a_frame = true;
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
             pixels.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
@@ -747,6 +776,53 @@ mod game {
                 }
             }
         }
+
+        /// F2: write the frame currently in `rgba` to a PNG.
+        ///
+        /// Every outcome is reported -- the written path on success, the
+        /// concrete reason on failure -- because a screenshot key that
+        /// sometimes does nothing visible is the silent no-op `AGENTS.md`
+        /// forbids. Nothing here can end the session: the fallible work is
+        /// behind `screenshot::capture`'s `Result`, which is logged and
+        /// dropped, so a full disk or a read-only directory costs the player
+        /// a screenshot and not their progress.
+        fn save_screenshot(&mut self) {
+            let dir = crate::screenshot::resolve_dir(
+                std::env::var(crate::screenshot::DIR_ENV).ok().as_deref(),
+            );
+            let file = crate::screenshot::file_name(
+                crate::screenshot::now_unix_millis(),
+                self.screenshotter.next_seq(),
+            );
+            match crate::screenshot::capture(
+                &dir,
+                &file,
+                self.fb_width,
+                FB_HEIGHT,
+                &self.rgba,
+                self.rgba_holds_a_frame,
+            ) {
+                Ok(path) => {
+                    // Absolute where we can get it: a player who launched from
+                    // a shortcut has no idea what the working directory is.
+                    let shown = std::fs::canonicalize(&path).unwrap_or(path);
+                    println!(
+                        "[fn64-shell] screenshot saved: {} ({}x{FB_HEIGHT}, game frame only -- \
+                         the settings overlay is not captured)",
+                        shown.display(),
+                        self.fb_width
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[fn64-shell] screenshot FAILED: {e} (target directory {}; override it \
+                         with {}=<dir>)",
+                        dir.display(),
+                        crate::screenshot::DIR_ENV
+                    );
+                }
+            }
+        }
     }
 
     impl ApplicationHandler for Shell {
@@ -824,7 +900,14 @@ mod game {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = event.state == ElementState::Pressed;
                         // Shell chords, never game input: F1 settings,
-                        // F11 fullscreen.
+                        // F2 screenshot, F11 fullscreen. Checked ahead of
+                        // `pad.apply` like the others, so a chord stays a
+                        // chord even if a user's input.toml binds the same
+                        // key to a controller button.
+                        if code == KeyCode::F2 && pressed {
+                            self.save_screenshot();
+                            return;
+                        }
                         if code == KeyCode::F1 && pressed {
                             self.overlay.toggle();
                             if self.overlay.open {
@@ -951,6 +1034,18 @@ mod game {
             prepare_clean_exit();
             return;
         }
+
+        // The only place the chords are announced to a player who never opens
+        // a source file. The overlay's own hint line is shared with `--demo`
+        // (which has no screenshot handler), so F2 is advertised here rather
+        // than there -- a hint that lies in one of two modes is worse than no
+        // hint.
+        println!(
+            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into ./{}/, override with \
+             {}=<dir>) · F11 fullscreen · Esc exit",
+            crate::screenshot::resolve_dir(None).display(),
+            crate::screenshot::DIR_ENV
+        );
 
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
         // Poll (not Wait): the game runs continuously, we're not idle-waiting
