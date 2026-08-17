@@ -2231,7 +2231,8 @@
       "workstream": "feature-parity",
       "port_state": "ported",
       "ported_as": [
-        "crates/fn64-render-wgpu/src/rt64_math.rs"
+        "crates/fn64-render-wgpu/src/rt64_math.rs",
+        "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
       ],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -2245,7 +2246,8 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_math.rs"
+          "crates/fn64-render-wgpu/src/rt64_math.rs",
+          "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -2300,7 +2302,8 @@
       "workstream": "feature-parity",
       "port_state": "ported",
       "ported_as": [
-        "crates/fn64-render-wgpu/src/rt64_math.rs"
+        "crates/fn64-render-wgpu/src/rt64_math.rs",
+        "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
       ],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -2314,7 +2317,8 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_math.rs"
+          "crates/fn64-render-wgpu/src/rt64_math.rs",
+          "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -2756,8 +2760,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-common-rt64-replacement-database-cpp",
@@ -2770,7 +2776,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_replacement_database_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -2911,8 +2917,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-common-rt64-replacement-database-h",
@@ -2925,7 +2933,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_replacement_database_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -3480,8 +3488,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_user_configuration.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-common-rt64-user-configuration-cpp",
@@ -3494,7 +3504,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_user_configuration_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_user_configuration.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -3623,8 +3633,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_user_configuration.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-common-rt64-user-configuration-h",
@@ -3637,7 +3649,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_user_configuration_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_user_configuration.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -12051,8 +12063,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-game-frame-cpp",
@@ -12065,7 +12079,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_game_frame_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -12260,8 +12274,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-game-frame-h",
@@ -12274,7 +12290,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_game_frame_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -12531,8 +12547,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_light_estimation.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-light-manager-cpp",
@@ -12545,7 +12563,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_light_manager_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_light_estimation.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -12606,8 +12624,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_light_estimation.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-light-manager-h",
@@ -12620,7 +12640,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_light_manager_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_light_estimation.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
