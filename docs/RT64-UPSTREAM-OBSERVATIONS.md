@@ -159,6 +159,37 @@ caller tuned against this behavior would break if it were "corrected."
 contributes its face normal two or three times. This is weighting, not
 double-counting, and deduplicating it would change every smoothed normal.
 
+### 10. `PresetDrawCall::matches` rejects Combine only when BOTH halves differ
+
+`src/preset/rt64_preset_draw_call.cpp:166`:
+
+```cpp
+if ((key.colorCombiner.L != otherKey.colorCombiner.L) &&
+    (key.colorCombiner.H != otherKey.colorCombiner.H)) return false;
+```
+
+It is `&&`. An L-only or H-only Combine difference does NOT reject, so two
+draw calls with different colour combiners can match. The OtherMode check
+three lines below uses two independent masked comparisons, either of which
+rejects on its own — opposite semantics for adjacent fields in the same
+function.
+
+Plausibly deliberate: a preset that should apply across a combiner variant
+would want the looser test. But it is equally consistent with a `&&` that
+should have been `||`, and nothing in the source says which.
+
+**Impact:** a preset matches more draw calls than a strict reading would
+predict. Whether that is desired behavior or a latent over-match is not
+determinable from the source alone.
+
+**Pinned by:** three tests in
+`crates/fn64-render-wgpu/src/rt64_preset_draw_call_match.rs` (L-only
+accepts, H-only accepts, both-differ rejects), so a later "make these
+consistent" edit fails loudly.
+
+**Remediation:** none proposed. Resolving this needs upstream intent or a
+preset corpus showing which behavior real presets rely on.
+
 ## Withdrawn — not findings
 
 ### `GaussianFilterRGB3x3CS` interior weights sum to 1.0000020
