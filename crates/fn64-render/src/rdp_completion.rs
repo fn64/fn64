@@ -103,6 +103,53 @@ pub fn inspect_raw_rdp_full_sync(
     })
 }
 
+/// Count the `SYNC_FULL` sites in one owned raw-DPC command word image.
+///
+/// Unlike [`inspect_raw_rdp_full_sync`], which reads live RDRAM and answers a
+/// yes/no question, this walks a caller-owned big-endian word image and
+/// answers *how many* -- the number a producer needs in order to supply one
+/// [`fn64_render_ir::FullSyncBoundary`] per decoded site, which
+/// `fn64-render-ir`'s stream derivation requires exactly. It works for XBUS
+/// captures too, whose words never live in RDRAM at all.
+///
+/// Uses the same structural stride walk and the same six-bit opcode masking
+/// as the RDRAM inspector, for the same reason: a guessed stride
+/// resynchronizes the scan onto payload bytes and lets a triangle
+/// coefficient impersonate `G_RDPFULLSYNC`.
+///
+/// Nonclaim: a count is a count of decoded *sites*. It says nothing about
+/// whether any DP interrupt was raised or observed for them.
+pub fn count_raw_rdp_full_sync_sites(words: &[u32]) -> Result<usize, RenderError> {
+    let reject = |reason: String| RenderError::Backend {
+        backend: "rdp-full-sync-site-count",
+        reason,
+    };
+    let byte_len = words.len() * size_of::<u32>();
+    let mut sites = 0_usize;
+    let mut offset = 0_usize;
+    while offset < byte_len {
+        let wire_opcode = (words[offset / size_of::<u32>()] >> 24) as u8;
+        let opcode = wire_opcode & 0x3f;
+        if opcode == RDP_SYNC_FULL {
+            sites += 1;
+        }
+        let width = raw_rdp_command_width(opcode).ok_or_else(|| {
+            reject(format!(
+                "raw RDP opcode {opcode:#04x} (wire byte {wire_opcode:#04x}) at word offset \
+                 {offset:#x} has no public command width"
+            ))
+        })? as usize;
+        offset += width;
+        if offset > byte_len {
+            return Err(reject(format!(
+                "raw RDP command at byte offset {:#x} is truncated by image length {byte_len:#x}",
+                offset - width
+            )));
+        }
+    }
+    Ok(sites)
+}
+
 /// Byte width of one public raw RDP command, or `None` when no public
 /// documentation assigns a command -- and therefore a stride -- at that
 /// opcode. `None` is a rejection, never a hint to advance by eight.

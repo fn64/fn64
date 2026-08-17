@@ -21,8 +21,13 @@
 //! a partial-width fill (see `RdpFillRectangleCommand`). Its access slice
 //! comes from the decoder's own recorded span, never re-derived here.
 //!
-//! `FullSync` remains outside the admitted subset and is rejected loudly --
-//! never silently dropped -- the instant one is encountered.
+//! `FullSync` is admitted as a *site*: the opcode is walked, bound to the
+//! capture's own `FullSyncBoundary`, and pushed as an `RdpFullSyncSite` that
+//! declares zero resource accesses. Admitting the site claims the opcode was
+//! reached and the sole DP completion slot was proved free -- it claims
+//! nothing about a DP interrupt being raised or observed. A capture that
+//! carries no boundary for the site is still rejected loudly, never silently
+//! dropped.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
@@ -50,16 +55,18 @@ use crate::{
 /// nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
 /// `SetFillColor`/`SetEnvColor`/`SetPrimColor`/`SetBlendColor`/
 /// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`,
-/// `TextureRectangle`, and `FillRectangle` is rejected here, loudly, at the
-/// exact command index/location it was decoded at -- never silently dropped
-/// or aliased to a no-op push. Remaining blanket-rejected kind: `FullSync`.
-/// `NoOp` is not rejected: it is admitted and discarded (see
-/// `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
+/// `TextureRectangle`, `FillRectangle`, and `FullSync` is rejected here,
+/// loudly, at the exact command index/location it was decoded at -- never
+/// silently dropped or aliased to a no-op push. No command kind is blanket-
+/// rejected any more. `NoOp` is not rejected: it is admitted and discarded
+/// (see `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
 ///
-/// `FillRectangle` is admitted, but can still reach this error through its
-/// own narrowed rejection: a fill whose staged `SetColorImage`/
-/// `SetFillColor` this walk never observed is reported here rather than
-/// executed against invented state.
+/// Two admitted kinds can still reach this error through their own narrowed
+/// rejections: a `FillRectangle` whose staged `SetColorImage`/`SetFillColor`
+/// this walk never observed is reported here rather than executed against
+/// invented state, and a `FullSync` whose capture carries no boundary record
+/// is reported here rather than admitted as a site the producer never
+/// reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -236,6 +243,9 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         // state -- it is admitted and discarded, so its arm is likewise
         // unreachable in practice.
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
+        // Likewise still named after FullSync became a site admission: the
+        // `FullSync` arm's own narrowed rejection (a capture carrying no
+        // boundary record for the site) routes through here.
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
         RawDpcCommandKind::SetOtherMode(_)
@@ -594,6 +604,26 @@ fn tile_slot(index: TileIndex) -> usize {
     usize::from(index.get())
 }
 
+/// Whether the capture backing `writer` carries a boundary record for the
+/// FullSync site at `ordinal`.
+///
+/// This is the seam's proof that the producer took the reserve half. A
+/// boundary can only enter a capture through
+/// `OwnedRawDpcCapture::with_full_sync_boundaries`, whose contract requires
+/// `DeviceFabric::preflight_dp_full_sync` to have proved the sole DP
+/// completion slot free first; `OwnedRawDpcCapture::new` installs an empty
+/// list and no other constructor exists.
+///
+/// In practice this always returns `true` for a decoded site, because IR
+/// stream derivation already refuses to build a stream whose `SYNC_FULL`
+/// count exceeds its boundary count (`MissingFullSyncObservation`). It is
+/// checked anyway rather than asserted: the alternative is admitting a site
+/// on an assumption about a sibling crate's invariant, and a loud rejection
+/// costs nothing on a path that is not hot.
+fn full_sync_reserved_by_capture(writer: &ExactRawDpcPlanWriter, ordinal: u32) -> bool {
+    writer.capture().full_sync_boundaries().len() > ordinal as usize
+}
+
 /// Push every command in one already-decoded raw-DPC stream into `writer`,
 /// translating each into T0's neutral DTOs. `capture_words` is the exact
 /// flat word image of the submission `decoded` was decoded from
@@ -691,8 +721,9 @@ pub fn push_decoded_raw_dpc(
         // fixed-2-word slicer, or a texture rectangle's payload would be
         // silently truncated from 4 words to 2. `NoOp` and the two rejected
         // kinds below (`FillRectangle`/`FullSync`) never reach a
-        // `push_state`/`push_triangle` call, so slicing them with the
-        // fixed-2-word reader (their own wire shape) is harmless -- their
+        // `push_state`/`push_triangle` call, and `FullSync` is itself a
+        // fixed 2-word command, so slicing all three with the fixed-2-word
+        // reader (their own wire shape) is exact. `NoOp`'s
         // `raw_words`/`location` values are computed but discarded.
         let raw_words = if matches!(
             command.kind(),
@@ -1032,13 +1063,52 @@ pub fn push_decoded_raw_dpc(
                     accesses,
                 );
             }
-            other @ RawDpcCommandKind::FullSync(_) => {
-                return Err(UnadmittedRawDpcCommand {
-                    command_index,
-                    location: old_location,
-                    opcode_name: opcode_name(&other),
+            RawDpcCommandKind::FullSync(occurrence) => {
+                // Site-only admission. Reaching this arm means the decoder
+                // already found a capture-time `FullSyncBoundary` at exactly
+                // this stream offset and proved its chunk/source identity
+                // matches (`raw_dpc::mod`'s `FULL_SYNC` arm rejects both
+                // failures as `InvalidCommand` before this loop runs), so the
+                // boundary carried below is the decoder's own, not one
+                // re-derived here.
+                //
+                // A capture can only carry a boundary through
+                // `OwnedRawDpcCapture::with_full_sync_boundaries`, whose
+                // contract requires the producer to have reserved the sole DP
+                // completion slot via the nonmutating
+                // `DeviceFabric::preflight_dp_full_sync` before building it.
+                // `OwnedRawDpcCapture::new` installs an empty list, so a
+                // producer that never reserved cannot reach this arm at all:
+                // its stream derivation fails with
+                // `MissingFullSyncObservation` before decode.
+                //
+                // NONCLAIM. Admitting the site claims the opcode was walked
+                // and the slot was free. It claims nothing about a DP
+                // interrupt being raised or observed. The only observation
+                // claim in the whole path is
+                // `occurrence.interrupt_after == Asserted`, carried verbatim
+                // below and never synthesized here -- see `RdpFullSyncSite`.
+                let dp_slot_reserved = full_sync_reserved_by_capture(writer, occurrence.ordinal);
+                if !dp_slot_reserved {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
                 }
-                .into());
+                writer.push_full_sync_site(fn64_render::RdpFullSyncSite {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    ordinal: occurrence.ordinal,
+                    boundary: fn64_render_ir::FullSyncBoundary::new(
+                        occurrence.sequence,
+                        occurrence.interrupt_sequence,
+                        occurrence.interrupt_before,
+                        occurrence.interrupt_after,
+                    ),
+                    dp_slot_reserved,
+                });
             }
         }
     }
@@ -1235,11 +1305,18 @@ mod tests {
     /// the legacy multi-stream `WorkloadPacket` constructor those tests use.
     const FULL_SYNC: u8 = 0x29;
 
-    /// Every full-sync boundary this fixture's `words` observes, derived the
+    /// Every full-sync boundary this fixture's `words` requires, derived the
     /// same way `raw_dpc::mod::tests`'s own `packet()` helper does: scan
     /// each 2-word command slot for the `FULL_SYNC` opcode byte and record
     /// its exact stream/source position. `preflight_raw_dpc_capture` has no
     /// auto-derivation of its own -- a caller must supply this list.
+    ///
+    /// `interrupt_after` is `Clear`, matching what the real ABI producer
+    /// (`rsp_commit.rs`'s `try_dispatch_raw_dpc_via_session`) supplies: it
+    /// reserves the DP completion slot but cannot observe the interrupt,
+    /// which the device fabric raises only on a later `advance_to`. A
+    /// fixture claiming `Asserted` would be testing an observation the
+    /// production path does not make.
     fn full_sync_boundaries(words: &[u32]) -> Vec<fn64_render_ir::FullSyncBoundary> {
         words
             .chunks_exact(2)
@@ -1250,7 +1327,7 @@ mod tests {
                     2 + ordinal as u64 * 2,
                     3 + ordinal as u64 * 2,
                     fn64_render_ir::DpInterruptState::Clear,
-                    fn64_render_ir::DpInterruptState::Asserted,
+                    fn64_render_ir::DpInterruptState::Clear,
                 )
             })
             .collect()
@@ -1279,11 +1356,18 @@ mod tests {
         let full_syncs = full_sync_boundaries(&words);
         let submission =
             OwnedRawDpcSubmission::from_rdram_words(COMMAND_START, end, words.clone()).unwrap();
-        let capture = OwnedRawDpcCapture::new(
+        // Carry the boundaries on the capture itself, not only into
+        // `finalize_ticket`. `push_decoded_raw_dpc` reads
+        // `writer.capture().full_sync_boundaries()` to prove the producer
+        // took the reserve half, so a fixture that supplied them to the
+        // ticket alone would exercise the narrowed rejection instead of the
+        // site admission it means to test.
+        let capture = OwnedRawDpcCapture::with_full_sync_boundaries(
             submission,
             layout,
             7,
             TemporalBoundary::new(1, fn64_render_ir::DpInterruptState::Clear),
+            full_syncs.clone(),
         );
 
         // The real journal (which includes every TMEM destination access
@@ -1406,6 +1490,7 @@ mod tests {
         loads: Vec<TmemLoadSemantics>,
         states: Vec<RdpStateCommand>,
         triangles: Vec<fn64_render::RdpTriangleCommand>,
+        full_sync_sites: Vec<fn64_render::RdpFullSyncSite>,
         accesses: Vec<fn64_render_ir::ResourceAccess>,
     }
 
@@ -1416,6 +1501,9 @@ mod tests {
                 RawDpcSemanticCommandRef::State(state) => self.states.push(state.clone()),
                 RawDpcSemanticCommandRef::Triangle(triangle) => {
                     self.triangles.push(triangle.clone());
+                }
+                RawDpcSemanticCommandRef::FullSyncSite(site) => {
+                    self.full_sync_sites.push(site.clone());
                 }
                 other => unreachable!(
                     "RawDpcSemanticCommandRef gained a variant this test doesn't know about: \
@@ -2216,8 +2304,63 @@ mod tests {
         );
     }
 
+    /// A FullSync whose capture carries the matching boundary record is
+    /// admitted as a *site*: pushed into the plan, declaring zero resource
+    /// accesses, carrying the decoder's own boundary verbatim.
+    ///
+    /// The nonclaim is asserted, not merely documented: the admitted site's
+    /// `interrupt_after` is `Clear`, so nothing on this path can be read as
+    /// "the guest observed a DP interrupt". Admission records that the
+    /// opcode was reached and the DP slot was free -- no more.
     #[test]
-    fn full_sync_is_rejected_loudly_not_silently_omitted() {
+    fn full_sync_with_a_capture_boundary_is_admitted_as_a_site_claiming_no_observation() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, 8, 0x200));
+        words.extend(set_tile(7, 2, 0));
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+        words.extend([word(0x29, 0), 0]); // FULL_SYNC
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let accesses_before = journal.accesses().len();
+
+        let plan = push_and_visit(&decoded, capture, journal);
+
+        assert_eq!(
+            plan.full_sync_sites.len(),
+            1,
+            "the site is pushed, not dropped"
+        );
+        let site = &plan.full_sync_sites[0];
+        assert_eq!(site.ordinal, 0);
+        assert!(site.dp_slot_reserved);
+        // THE NONCLAIM. A reservation is not an observation.
+        assert_eq!(
+            site.boundary.interrupt_after(),
+            fn64_render_ir::DpInterruptState::Clear,
+            "admitting a FullSync site must not report an observed DP interrupt"
+        );
+        // A sync journals no resource region, so admitting it added no
+        // access -- the plan's access list still matches the journal exactly
+        // (which `finish` inside `push_and_visit` already proved by not
+        // erroring).
+        assert_eq!(plan.accesses.len(), accesses_before);
+        // The surrounding TMEM stream is unaffected.
+        assert_eq!(plan.loads.len(), 1);
+        assert_eq!(plan.states.len(), 3);
+    }
+
+    /// A FullSync whose capture carries NO boundary record is still rejected
+    /// loudly, never silently omitted and never admitted as a site the
+    /// producer did not reserve. This is the narrowed rejection that
+    /// replaced the old blanket one.
+    ///
+    /// The fixture reaches this state by building the capture through
+    /// `OwnedRawDpcCapture::new` (the no-FullSync constructor) while the
+    /// ticket is finalized with the boundary the IR requires -- i.e. a
+    /// producer that satisfied stream derivation but never took the reserve
+    /// half.
+    #[test]
+    fn full_sync_without_a_capture_boundary_is_rejected_loudly_not_admitted() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 2, 8, 0x200));
         words.extend(set_tile(7, 2, 0));
@@ -2229,8 +2372,18 @@ mod tests {
         let layout = capture.memory_layout();
         let submission_start = capture.submission().start();
         let capture_words = capture.submission().command_words();
+        // Rebuild the capture WITHOUT its boundary list, modelling a producer
+        // that never reserved the DP slot.
+        let unreserved = OwnedRawDpcCapture::new(
+            capture.submission().clone(),
+            layout,
+            capture.transaction_sequence(),
+            capture.cmd_end(),
+        );
+        assert!(unreserved.full_sync_boundaries().is_empty());
+
         let (session, authority) = new_raw_dpc_roles().unwrap();
-        let request = session.plan_request(capture);
+        let request = session.plan_request(unreserved);
         let mut writer = authority.begin_plan(request);
         let outcome = push_decoded_raw_dpc(
             &mut writer,
@@ -2241,8 +2394,9 @@ mod tests {
         );
         let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
             panic!(
-                "FullSync must be rejected via UnadmittedRawDpcCommand, not admitted or \
-                    rejected for a different reason: {outcome:?}"
+                "a FullSync with no capture boundary must be rejected via \
+                 UnadmittedRawDpcCommand, not admitted or rejected for a different reason: \
+                 {outcome:?}"
             );
         };
         assert_eq!(rejection.opcode_name, "FullSync");
@@ -2317,8 +2471,19 @@ mod tests {
         let layout = capture.memory_layout();
         let submission_start = capture.submission().start();
         let capture_words = capture.submission().command_words();
+        // Strip the boundary so the trailing FullSync takes its narrowed
+        // rejection -- the rejection whose `command_index` this test is
+        // about. With the boundary present the site is admitted instead,
+        // which is a different test
+        // (`full_sync_with_a_capture_boundary_is_admitted_as_a_site_...`).
+        let unreserved = OwnedRawDpcCapture::new(
+            capture.submission().clone(),
+            layout,
+            capture.transaction_sequence(),
+            capture.cmd_end(),
+        );
         let (session, authority) = new_raw_dpc_roles().unwrap();
-        let request = session.plan_request(capture);
+        let request = session.plan_request(unreserved);
         let mut writer = authority.begin_plan(request);
         let outcome = push_decoded_raw_dpc(
             &mut writer,
@@ -2329,13 +2494,46 @@ mod tests {
         );
         let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
             panic!(
-                "FullSync must still be rejected via UnadmittedRawDpcCommand even with NoOps \
-                 present in the stream: {outcome:?}"
+                "an unreserved FullSync must still be rejected via UnadmittedRawDpcCommand \
+                 even with NoOps present in the stream: {outcome:?}"
             );
         };
         assert_eq!(rejection.opcode_name, "FullSync");
-        assert_eq!(rejection.command_index, 5);
+        assert_eq!(
+            rejection.command_index, 5,
+            "every NoOp still counts as an ordinary indexed command"
+        );
         let _ = (session, journal);
+    }
+
+    /// The same NoOp-interleaved stream, this time WITH its capture boundary:
+    /// the trailing FullSync is admitted as a site at the same command index,
+    /// proving NoOps do not shift the admitted site's position either.
+    #[test]
+    fn no_op_interleaving_does_not_shift_an_admitted_full_sync_site() {
+        let mut words = Vec::new();
+        words.extend([word(0x00, 0), 0]); // NoOp, index 0
+        words.extend(set_texture_image(0, 2, 8, 0x200)); // index 1
+        words.extend([word(0x01, 0), 0]); // NoOp, index 2
+        words.extend(set_tile(7, 2, 0)); // index 3
+        words.extend([word(0x02, 0), 0]); // NoOp, index 4
+        words.extend([word(0x29, 0), 0]); // FULL_SYNC, index 5
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.full_sync_sites.len(), 1);
+        assert_eq!(
+            plan.full_sync_sites[0].ordinal, 0,
+            "first site in the stream"
+        );
+        assert_eq!(
+            plan.full_sync_sites[0].location.command_index, 5,
+            "NoOps still count as ordinary indexed commands for an admitted site"
+        );
+        assert_eq!(
+            plan.full_sync_sites[0].boundary.interrupt_after(),
+            fn64_render_ir::DpInterruptState::Clear
+        );
     }
 
     #[test]
