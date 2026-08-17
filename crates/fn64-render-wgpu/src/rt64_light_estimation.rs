@@ -115,6 +115,39 @@
 //! the literal, minimal caller-supplied-input shape for a `const` method
 //! read-only over `LightManager`'s accumulated fields.
 //!
+//! ## `PointLight`'s cited source
+//!
+//! The field set and order above are those of `src/shared/rt64_point_light.h`
+//! at the same pinned commit, SHA-256 of the whole file
+//! `cbca87e56011efca4c2f5eb4f110ffce59c7ba205cf29ae8daf3a9706797662e` (27
+//! newline-terminated lines plus a final unterminated line -- the trailing
+//! `#endif` -- which the inventory records as 28). That digest was computed
+//! here with `shasum -a 256` against the pinned checkout and cross-checked
+//! verbatim against `docs/rt64-port-inventory.json`'s
+//! `files[path="src/shared/rt64_point_light.h"].sources.port.sha256`, which
+//! records the identical digest; the inventory's `sources.oracle.sha256`
+//! agrees, so the oracle and port trees hold this file byte for byte alike.
+//!
+//! All **12** of the header's fields are present on [`PointLight`] with the
+//! same names in the same order, `float3` mapped to [`Vec3`] and `uint` to
+//! `u32`: `position`, `direction`, `diffuseColor`, `attenuationRadius`,
+//! `pointRadius`, `spotFalloffCosine`, `spotMaxCosine`, `specularColor`,
+//! `shadowOffset`, `attenuationExponent`, `flickerIntensity`, `groupBits`.
+//! Those 12 fields are the header's entire content -- its remaining lines are
+//! a license banner, `#pragma once`, the `rt64_hlsl.h` include, and the
+//! `#ifdef HLSL_CPU` / `namespace interop` guards, which are preprocessor
+//! plumbing rather than behavior.
+//!
+//! **The citation is not a transcription claim.** [`PointLight`] was written
+//! for *this* card -- `rt64_light_manager.h`/`.cpp` -- as the return type
+//! `estimatedSunLight` writes, and it is the workspace's sole definition;
+//! [`crate::rt64_lights_math`] (the `Lights.hlsli` card) re-exports it from
+//! here rather than declaring a second one. The field-for-field agreement
+//! with `rt64_point_light.h` is therefore a consequence of both cards
+//! describing the same RT64 type, not the result of transcribing this header.
+//! No claim is made about byte layout, `repr(C)`, size, alignment, or ABI
+//! compatibility with the C++ or HLSL struct -- see "Nonclaims".
+//!
 //! ## Admitted domain
 //!
 //! - **Tie-breaking in the `biggestDirLight` scan uses strict `>`, not
