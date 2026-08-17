@@ -97,15 +97,21 @@ PORT_STATES = {"ported", "not-started", "refused", "authority-gated"}
 # does NOT do is widen to a partial or behavioral claim -- `refused` says only
 # "an assessment settled this file", never "this file is done".
 #
-# Scope is closed at the two landed batch assessments. Every entry below is
-# one of the 17 `src/common` or 28 `src/render` sources those assessments
-# refused; nothing else may be added without a new landed assessment.
+# Scope is closed at the three landed batch assessments. Every entry below is
+# one of the 17 `src/common`, 28 `src/render`, or 6 `src/hle` sources those
+# assessments refused; nothing else may be added without a new landed
+# assessment. (The `src/gui`/`src/imgui` cluster has no landed assessment as
+# of this scope; see tools/rt64_port_inventory.py history -- it is deliberately
+# absent, not an oversight.)
 COMMON_ASSESSMENT_COMMIT = "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85"
 COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs already implements"
 COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
 RENDER_ASSESSMENT_COMMIT = "2e915940693019ae4fee9fcae93976d18d401371"
 RENDER_ASSESSMENT_SUBJECT = "port RT64's tile-bounds lerp, refuse 28 of 29 render files"
 RENDER_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs"
+HLE_ASSESSMENT_COMMIT = "d2980310ab227978c193426fdfee816a79ca2603"
+HLE_ASSESSMENT_SUBJECT = "port six HLE geometry sources, refuse six, find a dither trap"
+HLE_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
 SCOPING_EVIDENCE = "docs/RT64-M6-M7-SCOPING.md"
 
 
@@ -115,6 +121,10 @@ def _common_refusal(reason: str, evidence: str = COMMON_ASSESSMENT_EVIDENCE) -> 
 
 def _render_refusal(reason: str, evidence: str = RENDER_ASSESSMENT_EVIDENCE) -> dict:
     return {"commit": RENDER_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+def _hle_refusal(reason: str, evidence: str = HLE_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": HLE_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
 
 
 PORT_REFUSALS: dict[str, dict[str, str]] = {
@@ -286,6 +296,46 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_vi_renderer.h": _render_refusal(
         "Plume RHI declarations; its .cpp is authority-gated."
+    ),
+    # -- src/hle, 6 of the 12 files the batch assessment examined (the other
+    # six -- rt64_draw_call.{cpp,h}, rt64_framebuffer_pair.cpp,
+    # rt64_framebuffer_changes.cpp, rt64_projection.cpp, and a slice of
+    # rt64_rdp_tmem.cpp -- landed as `ported` in rt64_hle_geometry.rs).
+    "src/hle/rt64_framebuffer_pair.h": _hle_refusal(
+        "rt64_frame_compatibility.rs already owns the six scalar fields "
+        "(colorImage.{address,fmt,siz,width}, depthImage.{address,formatChanged}) its "
+        "predicates read; the rest is a FlushReason tag, a layout-only bitfield, and "
+        "RHI-adjacent containers with no arithmetic.",
+        "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs",
+    ),
+    "src/hle/rt64_projection.h": _hle_refusal(
+        "Projection's members are std::vector<GameCall>, LightManager, "
+        "std::vector<interop::PointLight> and FixedRect -- the HLE object graph, not "
+        "behavior; only its Type enum is needed to express the already-ported usesViewport."
+    ),
+    "src/hle/rt64_framebuffer_changes.h": _hle_refusal(
+        "Two struct declarations whose members are std::unique_ptr<RenderTexture>, "
+        "std::unique_ptr<...DescriptorSet> and std::map -- RHI-bound resource handles "
+        "with no arithmetic."
+    ),
+    "src/hle/rt64_game_call.h": _hle_refusal(
+        "A five-member aggregate (callDesc: DrawCall, shaderDesc: ShaderDescription, and "
+        "three anonymous sub-structs -- meshDesc, debuggerDesc, lerpDesc) plus a "
+        "#if SCRIPT_ENABLED callback pointer; ShaderDescription is already owned by "
+        "crate::rt64_shader_description and the rest is field declarations, no behavior."
+    ),
+    "src/hle/rt64_transform_group.h": _hle_refusal(
+        "Thirteen default-initialized fields, every default an already-owned G_EX_* "
+        "constant in rt64_extended_gbi.rs (G_EX_ID_AUTO, G_EX_COMPONENT_AUTO, "
+        "G_EX_COMPONENT_SKIP, G_EX_ORDER_AUTO, G_EX_ASPECT_AUTO, G_EX_EDIT_NONE); no "
+        "arithmetic, no predicate, no derived constant.",
+        "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs",
+    ),
+    "src/hle/rt64_microcode.h": _hle_refusal(
+        "Its entire content is struct Microcode { uint32_t half1; uint32_t half2; }; "
+        "field declaration order is not pinnable in safe Rust, and this card makes no "
+        "repr(C)/size/alignment/ABI claim, so a Rust struct here would assert nothing "
+        "testable."
     ),
 }
 REFUSAL_KEYS = {"commit", "evidence", "reason"}
@@ -636,6 +686,7 @@ def verify_refusals(root: Path) -> None:
         expected_subject = {
             COMMON_ASSESSMENT_COMMIT: COMMON_ASSESSMENT_SUBJECT,
             RENDER_ASSESSMENT_COMMIT: RENDER_ASSESSMENT_SUBJECT,
+            HLE_ASSESSMENT_COMMIT: HLE_ASSESSMENT_SUBJECT,
         }.get(commit)
         require(expected_subject is not None, f"{relative}: refusal cites an undeclared assessment: {commit}")
         require(
