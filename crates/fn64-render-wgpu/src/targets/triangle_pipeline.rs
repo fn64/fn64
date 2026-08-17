@@ -65,7 +65,7 @@ use crate::shader_manifest::{
     triangle_pipeline_fragment_wgsl, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
-use crate::state::OtherMode;
+use crate::state::{AlphaCompare, Color4, OtherMode};
 use crate::tmem::{
     TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES, TMEM_BYTE_WORDS,
     TMEM_VALIDITY_WORDS,
@@ -81,6 +81,7 @@ const STATUS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const RASTER_PARAMS_BYTES: u64 = 32;
 const COMBINE_PARAMS_BYTES: u64 = 16;
+const ALPHA_COMPARE_PARAMS_BYTES: u64 = 16;
 const TMEM_BYTES_BUFFER_SIZE: u64 = TMEM_BYTE_WORDS as u64 * 4;
 const TMEM_VALIDITY_BUFFER_SIZE: u64 = TMEM_VALIDITY_WORDS as u64 * 4;
 
@@ -166,6 +167,37 @@ fn fragment_combine_params_bytes(
     bytes
 }
 
+/// Serializes the fragment shader's `FragmentAlphaCompareParams` uniform
+/// (`shaders/triangle_pipeline_fragment.wgsl`, alpha-compare production card
+/// §3b): `mode` at bytes 0..4 (`OtherMode::alpha_compare()`'s wire encoding,
+/// guaranteed 0=`None` or 1=`Threshold` by the retrieval-time rejection of
+/// `Reserved`/`Dither` -- see `raw_dpc::triangle_draw_data`'s and this
+/// crate's `PlanCollector`'s own retrieval-time panics), `threshold_alpha`
+/// at bytes 4..8 (`blend_color.rgba8()[3]`, i.e. `G_SETBLENDCOLOR.a`,
+/// zero-extended to `u32`; `0` when `blend_color` is `None`, which only
+/// happens for `mode == 0` -- the WGSL callable's `None` branch never reads
+/// `threshold_alpha`, so this zero is never observed as a real threshold),
+/// bytes 8..16 left zero (`_reserved_0`/`_reserved_1`, matching this file's
+/// existing pad-to-16-byte-multiple convention).
+fn fragment_alpha_compare_params_bytes(
+    mode: AlphaCompare,
+    blend_color: Option<Color4>,
+) -> [u8; ALPHA_COMPARE_PARAMS_BYTES as usize] {
+    let mode_wire: u32 = match mode {
+        AlphaCompare::None => 0,
+        AlphaCompare::Threshold => 1,
+        AlphaCompare::Reserved | AlphaCompare::Dither => unreachable!(
+            "submit_admitted_triangle received an alpha-compare mode ({mode:?}) that must have \
+             been rejected at retrieval time before reaching the pipeline"
+        ),
+    };
+    let threshold_alpha = u32::from(blend_color.map_or(0, |color| color.rgba8()[3]));
+    let mut bytes = [0u8; ALPHA_COMPARE_PARAMS_BYTES as usize];
+    bytes[0..4].copy_from_slice(&mode_wire.to_le_bytes());
+    bytes[4..8].copy_from_slice(&threshold_alpha.to_le_bytes());
+    bytes
+}
+
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
 /// vertex shader's `RasterParams` uniform (`shaders/triangle_pipeline_vertex.wgsl`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,6 +236,11 @@ pub struct TriangleTargetExtent {
 /// `TileBindingParams` (or [`TileBindingParams::unbound`] when the triangle
 /// carries no real tile snapshot -- e.g. the flat-colored fixed fixtures
 /// this file's own tests still construct for the non-textured cases).
+/// `alpha_compare_mode`/`blend_color` (alpha-compare production card §3b)
+/// feed the real post-combiner `fs_main` discard gate -- `alpha_compare_mode`
+/// must already be `None` or `Threshold`; `Reserved`/`Dither` are rejected
+/// before a triangle ever reaches this struct (retrieval-time panic, see
+/// `raw_dpc::triangle_draw_data`/`production.rs`'s `PlanCollector`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TriangleFixture {
     pub vertices: [RasterVertex; 3],
@@ -212,6 +249,8 @@ pub struct TriangleFixture {
     pub extent: TriangleTargetExtent,
     pub tmem: TmemGpuProjection,
     pub tile_binding: TileBindingParams,
+    pub alpha_compare_mode: AlphaCompare,
+    pub blend_color: Option<Color4>,
 }
 
 pub enum TrianglePipelineDeviceOutcome {
@@ -309,6 +348,12 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let alpha_compare_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-alpha-compare-params"),
+            size: ALPHA_COMPARE_PARAMS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -370,6 +415,18 @@ impl UninitializedTrianglePipeline {
                     },
                     count: None,
                 },
+                // Alpha-compare production card §3b: `FragmentAlphaCompareParams`,
+                // the real post-combiner discard gate's mode/threshold uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // Prewarm-only bind group: exercised once here so a bind-group-layout
@@ -401,6 +458,10 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: tile_binding_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: alpha_compare_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -569,13 +630,22 @@ impl TrianglePipelineRenderer {
     /// (no arithmetic), and `combine_params` is the plan's own real
     /// `SetCombine` value, not a caller-supplied literal.
     ///
-    /// `other_mode` is accepted (the retrieval glue's other real admitted
-    /// value) but not yet consumed by this fixed-fixture pipeline: this
-    /// slice's vertex shader (`shaders/triangle_pipeline_vertex.wgsl`)
-    /// hardcodes `is_rect = false`/no Z-override, the same restriction the
-    /// GPU-pipeline card's own fixed fixture already carries (module doc,
-    /// `fixed_fixture_other_mode`) -- a future slice that wires the
-    /// Z-override branch into the vertex shader would read it here.
+    /// `other_mode` feeds the vertex shader's still-unconsumed Z-override
+    /// slice (this slice's vertex shader,
+    /// `shaders/triangle_pipeline_vertex.wgsl`, still hardcodes
+    /// `is_rect = false`/no Z-override -- module doc, `fixed_fixture_other_mode`
+    /// -- a future slice that wires the Z-override branch into the vertex
+    /// shader would read it here) and now also the real fragment-stage
+    /// alpha-compare gate: `other_mode.alpha_compare()` selects
+    /// `FragmentAlphaCompareParams::mode`, guaranteed `None` or `Threshold`
+    /// by the retrieval-time rejection of `Reserved`/`Dither` upstream
+    /// (`raw_dpc::triangle_draw_data`/`production.rs`'s `PlanCollector`) --
+    /// this call site asserts-unreachable on the other two for
+    /// defense-in-depth, matching this crate's "loud trap even for
+    /// should-be-unreachable state" convention, rather than re-deriving its
+    /// own `Reserved`/`Dither` match arms. `blend_color` is the plan's own
+    /// real `G_SETBLENDCOLOR` snapshot (`Some` only for `Threshold`, `None`
+    /// for `None` mode -- see `RetrievedTriangleDraw::blend_color`'s doc).
     /// `raster_params`/`extent` are caller-supplied because they describe
     /// the render target/viewport, not RDP command state this card's
     /// admission mechanism carries.
@@ -594,8 +664,15 @@ impl TrianglePipelineRenderer {
         extent: TriangleTargetExtent,
         tmem: TmemGpuProjection,
         tile_binding: TileBindingParams,
+        blend_color: Option<Color4>,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
-        let _ = other_mode;
+        let alpha_compare_mode = match other_mode.alpha_compare() {
+            mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
+            unsupported @ (AlphaCompare::Reserved | AlphaCompare::Dither) => unreachable!(
+                "submit_admitted_triangle received alpha-compare mode {unsupported:?}, which \
+                 must have been rejected at retrieval time before reaching the pipeline"
+            ),
+        };
         let fixture = TriangleFixture {
             vertices: vertices.map(neutral_vertex_to_raster_vertex),
             raster_params,
@@ -603,6 +680,8 @@ impl TrianglePipelineRenderer {
             extent,
             tmem,
             tile_binding,
+            alpha_compare_mode,
+            blend_color,
         };
         self.submit_triangle(fixture)
     }
@@ -675,6 +754,7 @@ impl TrianglePipelineRenderer {
             _tmem_bytes_buffer: wgpu::Buffer,
             _tmem_validity_buffer: wgpu::Buffer,
             _tile_binding_buffer: wgpu::Buffer,
+            _alpha_compare_params_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -736,6 +816,19 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&tile_binding_buffer, 0, &fixture.tile_binding.to_bytes());
 
+            let alpha_compare_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-alpha-compare-params"),
+                size: ALPHA_COMPARE_PARAMS_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let alpha_compare_bytes = fragment_alpha_compare_params_bytes(
+                fixture.alpha_compare_mode,
+                fixture.blend_color,
+            );
+            self.queue
+                .write_buffer(&alpha_compare_params_buffer, 0, &alpha_compare_bytes);
+
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fn64-triangle-pipeline-bind-group"),
                 layout: &self.bind_group_layout,
@@ -760,6 +853,10 @@ impl TrianglePipelineRenderer {
                         binding: 4,
                         resource: tile_binding_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: alpha_compare_params_buffer.as_entire_binding(),
+                    },
                 ],
             });
             draws.push(DrawResources {
@@ -770,6 +867,7 @@ impl TrianglePipelineRenderer {
                 _tmem_bytes_buffer: tmem_bytes_buffer,
                 _tmem_validity_buffer: tmem_validity_buffer,
                 _tile_binding_buffer: tile_binding_buffer,
+                _alpha_compare_params_buffer: alpha_compare_params_buffer,
             });
         }
 

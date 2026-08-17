@@ -42,7 +42,7 @@ use fn64_render::{
     RawDpcSemanticCommandRef, RdpStateCommand, RdpTriangleCommand,
 };
 
-use crate::state::OtherMode;
+use crate::state::{AlphaCompare, Color4, OtherMode};
 use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
 
@@ -67,8 +67,20 @@ pub const fn neutral_vertex_to_raster_vertex(vertex: NeutralTriangleVertex) -> R
 /// that is a hard error here, not a silent default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingTriangleDrawState {
-    NoOtherMode { triangle_index: usize },
-    NoCombine { triangle_index: usize },
+    NoOtherMode {
+        triangle_index: usize,
+    },
+    NoCombine {
+        triangle_index: usize,
+    },
+    /// A triangle whose `OtherMode::alpha_compare()` decodes `Threshold` was
+    /// visited before this plan's own first `SetBlendColor` (seeded or
+    /// in-plan) -- `Threshold` needs a real `G_SETBLENDCOLOR.a` to compare
+    /// against (`alpha_compare.rs:96-98`); a `None`-mode or `Dither`-rejected
+    /// triangle never reaches this check (module doc, card §4a).
+    NoBlendColor {
+        triangle_index: usize,
+    },
 }
 
 impl core::fmt::Display for MissingTriangleDrawState {
@@ -76,6 +88,7 @@ impl core::fmt::Display for MissingTriangleDrawState {
         let (missing, triangle_index) = match self {
             Self::NoOtherMode { triangle_index } => ("SetOtherMode", *triangle_index),
             Self::NoCombine { triangle_index } => ("SetCombine", *triangle_index),
+            Self::NoBlendColor { triangle_index } => ("SetBlendColor", *triangle_index),
         };
         write!(
             formatter,
@@ -105,6 +118,12 @@ pub struct RetrievedTriangleDraw {
     pub other_mode: OtherMode,
     pub combine_params: CombineParams,
     pub tile_binding: TileBindingParams,
+    /// `G_SETBLENDCOLOR` current at this triangle's own stream position --
+    /// `Some` only when `other_mode.alpha_compare() == AlphaCompare::Threshold`
+    /// (the only mode this pipeline wires that reads it, see
+    /// `alpha_compare_production.md` card §4a); `None` for `AlphaCompare::None`,
+    /// which never reads a possibly-absent threshold.
+    pub blend_color: Option<Color4>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -132,6 +151,10 @@ pub struct TriangleDrawStateCollector {
     /// no tile bound at all).
     current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
     current_tile0_size: Option<fn64_render::NeutralTileSize>,
+    /// `G_SETBLENDCOLOR` current at the walk's current stream position --
+    /// mirrors `current_other_mode`/`current_combine` exactly, a fourth
+    /// instance of the same command-time-snapshot pattern (card §4a).
+    current_blend_color: Option<Color4>,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -152,11 +175,35 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     let combine_params = self
                         .current_combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
+                    // Retrieval-time admission gate (card §4a): the natural
+                    // `require_supported_alpha_compare` call site this
+                    // module was always documented to need. `Reserved`/
+                    // `Dither` never reach `submit_admitted_triangle` --
+                    // loud, named panics here, not a silent None/Threshold
+                    // coercion (AGENTS.md "loud traps, no silent shrugs").
+                    let blend_color = match other_mode.alpha_compare() {
+                        AlphaCompare::Reserved => panic!(
+                            "triangle #{triangle_index} (plan order) selected reserved G_AC \
+                             alpha-compare mode 2"
+                        ),
+                        AlphaCompare::Dither => panic!(
+                            "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
+                             alpha-compare, which has no fragment-callable RT64 PRNG binding in \
+                             this pipeline (no frame-count uniform exists to seed it honestly; \
+                             see fn64-alpha-compare-production-card.md \u{a7}2)"
+                        ),
+                        AlphaCompare::Threshold => Some(
+                            self.current_blend_color
+                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?,
+                        ),
+                        AlphaCompare::None => None,
+                    };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
                         other_mode,
                         combine_params,
                         tile_binding,
+                        blend_color,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -169,6 +216,9 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 RdpStateCommand::SetCombine { combine, .. } => {
                     self.current_combine =
                         Some(CombineParams::from_wire(combine.low, combine.high));
+                }
+                RdpStateCommand::SetBlendColor { color, .. } => {
+                    self.current_blend_color = Some(Color4::from_wire(color.value));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -369,5 +419,141 @@ mod tests {
              command; a triangle draw cannot retrieve real state that was never admitted at \
              its own stream position"
         );
+        assert_eq!(
+            MissingTriangleDrawState::NoBlendColor { triangle_index: 3 }.to_string(),
+            "triangle #3 (plan order) was visited before this plan's own first SetBlendColor \
+             command; a triangle draw cannot retrieve real state that was never admitted at \
+             its own stream position"
+        );
+    }
+
+    fn blend_color_command(index: u32, value: u32) -> RdpStateCommand {
+        RdpStateCommand::SetBlendColor {
+            location: location(index),
+            raw_words: Box::new([0]),
+            color: fn64_render::NeutralColor4 { value },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_blend_color(fn64_render::NeutralColor4 {
+                value,
+            }),
+        }
+    }
+
+    /// Wire encoding `(0, 1)` decodes `AlphaCompare::Threshold`
+    /// (`state.rs`'s `alpha_compare()` table: bits 0:1 == 1).
+    fn threshold_other_mode_command(index: u32) -> RdpStateCommand {
+        other_mode_command(index, 0, 1)
+    }
+
+    #[test]
+    fn a_threshold_triangle_snapshots_blend_color_at_its_own_stream_position() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = threshold_other_mode_command(0);
+        let combine = combine_command(1, 1, 2);
+        let blend_color = blend_color_command(2, 0x1122_3344);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::State(&blend_color));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("threshold triangle has blend_color");
+        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x1122_3344)));
+    }
+
+    #[test]
+    fn a_none_mode_triangle_never_requires_blend_color() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 0); // None mode
+        let combine = combine_command(1, 1, 2);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("None-mode triangle needs no blend_color at all");
+        assert_eq!(draws[0].blend_color, None);
+    }
+
+    #[test]
+    fn a_threshold_triangle_before_any_blend_color_is_a_loud_named_error() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = threshold_other_mode_command(0);
+        let combine = combine_command(1, 1, 2);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let error = collector.finish().unwrap_err();
+        assert_eq!(
+            error,
+            MissingTriangleDrawState::NoBlendColor { triangle_index: 0 }
+        );
+    }
+
+    /// Two Threshold triangles separated by an intervening `SetBlendColor`
+    /// change must collect two different snapshots, not one collapsed
+    /// whole-plan-final value -- the same regression shape §4c documents for
+    /// `SetCombine`/`production.rs`'s `plan_collector_snapshots_each_
+    /// triangle_at_its_own_stream_position_not_the_final_value`.
+    #[test]
+    fn a_and_b_triangles_snapshot_distinct_blend_colors_not_a_collapsed_final_value() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = threshold_other_mode_command(0);
+        let combine = combine_command(1, 1, 2);
+        let blend_color_x = blend_color_command(2, 0x0000_00AA);
+        let triangle_a = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+        let blend_color_y = blend_color_command(4, 0x0000_00BB);
+        let triangle_b = triangle_command([vertex(10.0), vertex(11.0), vertex(12.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::State(&blend_color_x));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_a));
+        collector.command(RawDpcSemanticCommandRef::State(&blend_color_y));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
+
+        let draws = collector.finish().expect("both triangles have blend_color");
+        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x0000_00AA)));
+        assert_eq!(draws[1].blend_color, Some(Color4::from_wire(0x0000_00BB)));
+        assert_ne!(
+            draws[0].blend_color, draws[1].blend_color,
+            "triangle A must NOT be retroactively affected by a SetBlendColor that comes after \
+             it in plan order"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "selected reserved G_AC alpha-compare mode 2")]
+    fn a_reserved_alpha_compare_triangle_panics_loudly_at_retrieval_time() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 2); // Reserved
+        let combine = combine_command(1, 1, 2);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+    }
+
+    #[test]
+    #[should_panic(expected = "selected G_AC_DITHER alpha-compare")]
+    fn a_dither_alpha_compare_triangle_panics_loudly_naming_the_frame_count_gap() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 3); // Dither
+        let combine = combine_command(1, 1, 2);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     }
 }

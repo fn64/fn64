@@ -2214,3 +2214,81 @@ differentials (`production.rs`'s TEXEL0-passthrough fixtures, `color_d =
 TEXEL0`, an unconditional D reference) still evaluate to
 `texture_referenced = 1` and the real sampler still runs for them, loud
 failures included.
+
+## 2026-08-17: Production alpha compare in the triangle fragment path
+
+Wires `AlphaCompare::{None,Threshold}` into the real triangle fragment
+path (`shaders/triangle_pipeline_fragment.wgsl`'s `fs_main`) as a real
+per-fragment discard, reusing already-landed, already-admitted state —
+`OtherMode` (previously discarded at `submit_admitted_triangle`'s own
+`let _ = other_mode;`) and `SetBlendColor` (already durably retained in
+`RdpState`, already admitted into the `RdpStateCommand` stream — no new
+admission mechanism needed).
+
+**BlendColor snapshot, a fourth instance of an existing pattern.**
+`raw_dpc::triangle_draw_data::TriangleDrawStateCollector` and
+`production.rs`'s `PlanCollector` (its intentional in-crate duplicate) each
+gain a `current_blend_color: Option<Color4>` field, tracked on
+`RdpStateCommand::SetBlendColor` exactly like the existing
+`current_other_mode`/`current_combine` tracking — command-time snapshot at
+each triangle's own stream position, never a whole-plan-final value, and
+seeded from `WgpuBackend.rdp_state().blend_color()` for cross-submission
+carry-in (`PlanCollector::seeded`'s new third parameter). `RetrievedTriangleDraw`
+gains `blend_color: Option<Color4>` — `Some` only for `Threshold`-mode
+triangles (a `None`-mode triangle never reads a possibly-absent threshold).
+
+**Reserved/Dither: loud retrieval-time traps, not silent coercion.** Both
+collectors' triangle-snapshot closures now match on
+`other_mode.alpha_compare()`: `Reserved` panics naming the offending
+triangle (the first real call site for `require_supported_alpha_compare`'s
+documented purpose), `Dither` panics naming the exact reason — no
+fragment-callable RT64 PRNG binding exists in this pipeline, and no
+frame-count concept exists anywhere in this crate to seed one honestly
+(`random.wgsl` stays an unwired `@compute`-only characterization shim,
+`random.rs`'s own module doc already says so). A `Threshold`-mode triangle
+missing a `blend_color` snapshot at its own stream position is a new named
+`MissingTriangleDrawState::NoBlendColor` error, matching the existing
+`NoOtherMode`/`NoCombine` hard-error convention exactly.
+
+**WGSL wiring.** `alpha_compare_fragment_fn.wgsl`'s existing
+`alpha_compare_fragment_fn` callable (landed characterization-only, port
+card `541c5c9e`) is concatenated into the combined fragment source
+(`shader_manifest.rs`'s `triangle_pipeline_fragment_wgsl`) after
+`tmem_sample.wgsl` and before `triangle_pipeline_fragment.wgsl`'s own
+`@fragment` wrapper — reused verbatim, never re-typed inline. New binding
+5, `FragmentAlphaCompareParams` (16-byte uniform: `mode`, `threshold_alpha`,
+two reserved words), matching this crate's existing pad-to-16-byte-multiple
+convention. `fs_main` calls the callable after `run_one_cycle` produces
+`result.combiner_color` (the RDP alpha-compare stage's real input is the
+combiner's output alpha, not the raw vertex/texel alpha) and discards
+before `output` construction — `noise_byte` and `copy_cycle_rgba16` are
+always `0u` literals at this slice's call site (no wired PRNG, no
+copy-cycle triangle path yet).
+
+**`submit_admitted_triangle` stops discarding `other_mode`.** The method
+now derives `FragmentAlphaCompareParams::mode` from
+`other_mode.alpha_compare()` (guaranteed `None`/`Threshold` by the
+retrieval-time rejection upstream; this call site itself asserts-unreachable
+on `Reserved`/`Dither` for defense-in-depth) and takes a new `blend_color:
+Option<Color4>` parameter, threaded through `TriangleFixture`'s two new
+fields (`alpha_compare_mode`, `blend_color`) into the per-draw uniform
+buffer.
+
+**Host GPU evidence.** A new required host-GPU differential
+(`targets/triangle_pipeline/tests.rs`) submits two single-triangle draws —
+one `None`-mode at a low alpha (must still write, proving `None` never
+gates on alpha at all) and one `Threshold`-mode with the same low alpha
+against a provably higher `blend_color` threshold (must be discarded,
+leaving the `LoadOp::Clear` background and un-written depth untouched) —
+mirroring the existing depth-differential precedent's "second triangle
+drawn... performing a real GPU discard" shape.
+
+**Nonclaims.** No blend equation, no coverage accumulation, no depth
+clip/test wiring — unchanged, still out of scope. No `Dither` support — a
+named, tested, loud trap. No copy-cycle (`CycleType::Copy`) alpha-compare
+special case — this pipeline has no copy-cycle triangle path to hang it
+off of yet. No claim that discarded-fragment behavior matches real RDP
+silicon pixel-for-pixel — WGSL `discard` is the standard GPU mechanism for
+"this fragment contributes nothing," matching alpha-test semantics RT64
+itself implements via `clip()`/discard in `RasterPS.hlsl`, but this slice
+does not cite RT64's exact discard line.

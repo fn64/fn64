@@ -1,8 +1,13 @@
-// Alpha compare, fragment-callable form. Characterization-only; not wired
-// into any draw path, bind group layout, or entry point used elsewhere in
-// this crate -- see the sibling `alpha_compare.rs` module doc and
-// `alpha_compare.wgsl`'s own header for the exact scope boundary this file
-// shares.
+// Alpha compare, fragment-callable form. Concatenated by `shader_manifest.rs`
+// into the production triangle fragment shader
+// (`shaders/triangle_pipeline_fragment.wgsl`) and called from that file's
+// `fs_main` after combiner evaluation, gating the fragment with `discard`
+// before output construction -- see the sibling `alpha_compare.rs` module
+// doc and `alpha_compare.wgsl`'s own header for the exact scope boundary
+// this file shares. This wiring covers only the alpha-compare gate itself;
+// it makes no claim about Dither, copy-cycle RGBA16, parity, or
+// presentation -- see `triangle_pipeline_fragment.wgsl`'s own header and
+// this crate's README for those boundaries.
 //
 // Ordinary WGSL function re-expression of `alpha_compare.wgsl`'s existing
 // `general_compare`/`evaluate` logic (whole file), itself a literal
@@ -23,12 +28,12 @@
 // input/output contract `alpha_compare_value`/`copy_alpha_compare_value`
 // already use on the Rust side. This file declares no resource bindings and
 // no entry point of its own, so it is an ordinary callable concatenated at
-// build time into a future fragment entry point, the same mechanism
+// build time into the fragment entry point, the same mechanism
 // `shaders/triangle_pipeline_fragment.wgsl`'s own header already documents
-// for `color_combiner.wgsl`. No caller in this crate invokes it yet; the
-// bind-group plumbing and the `fs_main` call site are explicitly deferred
-// to a future slice (see `alpha_compare.rs`'s module doc and this crate's
-// README).
+// for `color_combiner.wgsl`. `shader_manifest.rs` performs that
+// concatenation and `triangle_pipeline_fragment.wgsl`'s `fs_main` is the one
+// caller in this crate (see `alpha_compare.rs`'s module doc and this
+// crate's README for the wiring's exact scope).
 
 fn alpha_compare_general(mode: u32, alpha: u32, threshold_alpha: u32, noise_byte: u32) -> bool {
     if (mode == 0u) {

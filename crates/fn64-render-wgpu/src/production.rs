@@ -35,9 +35,9 @@ use fn64_render_ir::{
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
-    CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode, PhysicalTmemError,
-    PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError, RdpState,
-    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
+    AlphaCompare, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode,
+    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError,
+    RdpState, RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
     TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
     TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
     TMEM_SAMPLE_STATUS_OK,
@@ -257,6 +257,7 @@ impl WgpuBackend {
                     extent,
                     tmem,
                     draw.tile_binding,
+                    draw.blend_color,
                 )
                 .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
             let output = in_flight
@@ -377,6 +378,13 @@ struct PlanCollector {
     /// states this file duplicates that collector's behavior).
     current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
     current_tile0_size: Option<fn64_render::NeutralTileSize>,
+    /// `G_SETBLENDCOLOR` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
+    /// time (`Self::seeded`), then updated on every `SetBlendColor` command
+    /// in plan order. Mirrors `current_other_mode`/`current_combine`
+    /// exactly, a third instance of the same seed-then-track pattern (card
+    /// §4d).
+    current_blend_color: Option<Color4>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -386,16 +394,20 @@ struct PlanCollector {
 }
 
 impl PlanCollector {
-    /// Seeds `current_other_mode`/`current_combine` from `WgpuBackend`'s
-    /// own durable `rdp_state` instead of `None` -- a real constructor
-    /// parameter, never a synthetic plan-stream entry. This is the
-    /// draw-state-*retrieval* half of durable cross-submission carry-in;
-    /// the admission-time half (`push_decoded_raw_dpc`'s own
+    /// Seeds `current_other_mode`/`current_combine`/`current_blend_color`
+    /// from `WgpuBackend`'s own durable `rdp_state` instead of `None` -- a
+    /// real constructor parameter, never a synthetic plan-stream entry.
+    /// This is the draw-state-*retrieval* half of durable cross-submission
+    /// carry-in; the admission-time half (`push_decoded_raw_dpc`'s own
     /// `TriangleBeforeAnyOtherMode` gate) already seeds identically from
     /// the same `rdp_state`, via `decode_raw_dpc`'s existing
     /// `durable_state` parameter -- see this card's own design notes for
     /// why neither half needed a signature change to close this gap.
-    fn seeded(other_mode: Option<OtherMode>, combine: Option<CombineParams>) -> Self {
+    fn seeded(
+        other_mode: Option<OtherMode>,
+        combine: Option<CombineParams>,
+        blend_color: Option<Color4>,
+    ) -> Self {
         Self {
             loads: Vec::new(),
             accesses: Vec::new(),
@@ -404,6 +416,7 @@ impl PlanCollector {
             current_combine: combine,
             current_tile0_descriptor: None,
             current_tile0_size: None,
+            current_blend_color: blend_color,
             triangles: Vec::new(),
         }
     }
@@ -425,6 +438,9 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 RdpStateCommand::SetCombine { combine, .. } => {
                     self.current_combine =
                         Some(CombineParams::from_wire(combine.low, combine.high));
+                }
+                RdpStateCommand::SetBlendColor { color, .. } => {
+                    self.current_blend_color = Some(Color4::from_wire(color.value));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -455,11 +471,34 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     let combine_params = self
                         .current_combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
+                    // Retrieval-time admission gate (card §4a), duplicated
+                    // from `TriangleDrawStateCollector` per this struct's
+                    // own module doc: `Reserved`/`Dither` never reach
+                    // `submit_admitted_triangle` -- loud, named panics here,
+                    // not a silent None/Threshold coercion.
+                    let blend_color = match other_mode.alpha_compare() {
+                        AlphaCompare::Reserved => panic!(
+                            "triangle #{triangle_index} (plan order) selected reserved G_AC \
+                             alpha-compare mode 2"
+                        ),
+                        AlphaCompare::Dither => panic!(
+                            "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
+                             alpha-compare, which has no fragment-callable RT64 PRNG binding in \
+                             this pipeline (no frame-count uniform exists to seed it honestly; \
+                             see fn64-alpha-compare-production-card.md \u{a7}2)"
+                        ),
+                        AlphaCompare::Threshold => Some(
+                            self.current_blend_color
+                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?,
+                        ),
+                        AlphaCompare::None => None,
+                    };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
                         other_mode,
                         combine_params,
                         tile_binding,
+                        blend_color,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -522,7 +561,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // placeholder left behind here is discarded immediately by the
         // caller (`execute_raw_dpc_inner`'s `let _ = plan_visitor;`), so
         // its exact seed values are irrelevant.
-        self.plan = core::mem::replace(plan_visitor, PlanCollector::seeded(None, None));
+        self.plan = core::mem::replace(plan_visitor, PlanCollector::seeded(None, None, None));
     }
 
     fn captured_reads(&mut self, reads: &[CapturedGuestRead]) {
@@ -790,6 +829,7 @@ impl RenderBackend for WgpuBackend {
             bound,
             self.rdp_state.other_mode(),
             self.rdp_state.combine(),
+            self.rdp_state.blend_color(),
         )
         .map_err(RenderError::from)?;
 
@@ -1052,18 +1092,19 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// `into_physical_successor` (T3 Phase A) result to
 /// `RawDpcCoordinator::complete_execution`.
 ///
-/// `durable_other_mode`/`durable_combine` are `WgpuBackend.rdp_state`'s
-/// own current values, passed in by the trait method (which has `self`)
-/// since this is a free function taking only `coordinator` -- they seed
-/// `PlanCollector`'s walk (`PlanCollector::seeded`) so a triangle in this
-/// submission with no `SetOtherMode`/`SetCombine` of its own still
-/// resolves its draw state from durable cross-submission carry-in, not
-/// `None`.
+/// `durable_other_mode`/`durable_combine`/`durable_blend_color` are
+/// `WgpuBackend.rdp_state`'s own current values, passed in by the trait
+/// method (which has `self`) since this is a free function taking only
+/// `coordinator` -- they seed `PlanCollector`'s walk (`PlanCollector::seeded`)
+/// so a triangle in this submission with no `SetOtherMode`/`SetCombine`/
+/// `SetBlendColor` of its own still resolves its draw state from durable
+/// cross-submission carry-in, not `None`.
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
     bound: BoundSubmittedRawDpc,
     durable_other_mode: Option<OtherMode>,
     durable_combine: Option<CombineParams>,
+    durable_blend_color: Option<Color4>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -1071,13 +1112,14 @@ fn execute_raw_dpc_inner(
     ),
     WgpuRawDpcExecutionError,
 > {
-    let mut plan_visitor = PlanCollector::seeded(durable_other_mode, durable_combine);
+    let mut plan_visitor =
+        PlanCollector::seeded(durable_other_mode, durable_combine, durable_blend_color);
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
         queue: bound.queue(),
         ordinal: bound.ordinal(),
         submission: bound.submission(),
-        plan: PlanCollector::seeded(durable_other_mode, durable_combine),
+        plan: PlanCollector::seeded(durable_other_mode, durable_combine, durable_blend_color),
         reads: Vec::new(),
         outcome: None,
     };
@@ -2312,6 +2354,7 @@ mod tests {
                 },
                 tmem,
                 tile_binding,
+                None,
             )
             .expect("textured triangle draw must submit cleanly")
             .complete()
@@ -2529,6 +2572,7 @@ mod tests {
                 },
                 tmem,
                 tile_binding,
+                None,
             )
             .expect("textured triangle draw must submit cleanly")
             .complete()
@@ -2624,6 +2668,7 @@ mod tests {
             other_mode: OtherMode::from_wire(0, 0),
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
+            blend_color: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)])
@@ -3132,7 +3177,7 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(None, None);
+        let mut collector = PlanCollector::seeded(None, None, None);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3157,7 +3202,7 @@ mod tests {
     fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine));
+        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None);
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3180,7 +3225,7 @@ mod tests {
     fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine));
+        let mut collector = PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None);
 
         let first_triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&first_triangle));
@@ -3216,8 +3261,11 @@ mod tests {
     #[test]
     fn plan_collector_lets_an_in_plan_set_other_mode_override_the_seed() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
-        let mut collector =
-            PlanCollector::seeded(Some(seed_other_mode), Some(CombineParams::from_wire(0, 0)));
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(CombineParams::from_wire(0, 0)),
+            None,
+        );
 
         let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
         collector.command(RawDpcSemanticCommandRef::State(&changed_other_mode));
@@ -3242,6 +3290,7 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
+            None,
         );
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));

@@ -84,6 +84,8 @@ fn covering_triangle_fixture() -> TriangleFixture {
         extent: EXTENT,
         tmem,
         tile_binding,
+        alpha_compare_mode: crate::state::AlphaCompare::None,
+        blend_color: None,
     }
 }
 
@@ -198,6 +200,50 @@ fn combined_fragment_wgsl_reuses_color_combiner_wgsl_byte_for_byte() {
     let source = crate::shader_manifest::triangle_pipeline_fragment_wgsl();
     assert!(source.starts_with(crate::combiner::COLOR_COMBINER_WGSL));
     assert!(source.contains("fn fs_main("));
+}
+
+/// Structural guard (alpha-compare production card §4g): the combined
+/// fragment source contains exactly one call site for
+/// `alpha_compare_fragment_fn(` (reused from `alpha_compare_fragment_fn.wgsl`,
+/// never re-typed inline -- card §3a/§3e) and exactly one `discard;`
+/// statement inside `fs_main`, and the callable itself is concatenated only
+/// once (no accidental double-concatenation at the `shader_manifest.rs`
+/// seam).
+#[test]
+fn combined_fragment_wgsl_has_exactly_one_alpha_compare_call_and_one_discard() {
+    let source = crate::shader_manifest::triangle_pipeline_fragment_wgsl();
+
+    let call_count = source.matches("alpha_compare_fragment_fn(").count();
+    assert_eq!(
+        call_count, 2,
+        "expected exactly one call site plus the callable's own `fn \
+         alpha_compare_fragment_fn(` declaration (2 total occurrences of the \
+         substring), got {call_count}"
+    );
+    let fn_declaration_count = source.matches("fn alpha_compare_fragment_fn(").count();
+    assert_eq!(
+        fn_declaration_count, 1,
+        "the callable itself must be concatenated exactly once, not duplicated \
+         at the shader_manifest.rs seam"
+    );
+
+    let discard_count = source.matches("discard;").count();
+    assert_eq!(
+        discard_count, 1,
+        "fs_main must have exactly one discard statement, got {discard_count}"
+    );
+
+    // Ordering: the alpha-compare callable's own declaration must precede
+    // fs_main (concatenation-seam order, card §3a: "after color_combiner.wgsl
+    // and tmem_sample.wgsl, before this file's own body").
+    let fn_index = source
+        .find("fn alpha_compare_fragment_fn(")
+        .expect("callable must exist");
+    let fs_main_index = source.find("fn fs_main(").expect("fs_main must exist");
+    assert!(
+        fn_index < fs_main_index,
+        "alpha_compare_fragment_fn must be concatenated before fs_main, not after"
+    );
 }
 
 /// Source-shape proof for the TMEM-sample gate (SHADE-only-triangle
@@ -371,6 +417,54 @@ fn fragment_combine_params_byte_layout_is_16_bytes_with_low_high_and_texture_ref
     assert_eq!(&textured_bytes[12..16], &[0u8; 4]);
 }
 
+/// Byte-offset proof for `FragmentAlphaCompareParams` (alpha-compare
+/// production card §3b): `mode` at 0..4, `threshold_alpha` at 4..8, bytes
+/// 8..16 (`_reserved_0`/`_reserved_1`) always zero. Covers all three real
+/// serialized shapes: `None` (mode 0, no blend_color), `Threshold` with a
+/// real blend_color (mode 1, threshold_alpha == blend_color.rgba8()[3]),
+/// and `Threshold` boundary values 0/255.
+#[test]
+fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold_alpha() {
+    let none_bytes = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::None, None);
+    assert_eq!(none_bytes.len(), ALPHA_COMPARE_PARAMS_BYTES as usize);
+    assert_eq!(&none_bytes[0..4], &0u32.to_le_bytes());
+    assert_eq!(&none_bytes[4..8], &0u32.to_le_bytes());
+    assert_eq!(&none_bytes[8..16], &[0u8; 8]);
+
+    let blend_color = crate::state::Color4::from_wire(0x1122_33AA);
+    let threshold_bytes = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Threshold,
+        Some(blend_color),
+    );
+    assert_eq!(&threshold_bytes[0..4], &1u32.to_le_bytes());
+    assert_eq!(&threshold_bytes[4..8], &0xAAu32.to_le_bytes());
+    assert_eq!(&threshold_bytes[8..16], &[0u8; 8]);
+
+    let zero_threshold = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Threshold,
+        Some(crate::state::Color4::from_wire(0)),
+    );
+    assert_eq!(&zero_threshold[4..8], &0u32.to_le_bytes());
+
+    let max_threshold = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Threshold,
+        Some(crate::state::Color4::from_wire(0xFFFF_FFFF)),
+    );
+    assert_eq!(&max_threshold[4..8], &255u32.to_le_bytes());
+}
+
+#[test]
+#[should_panic(expected = "must have been rejected at retrieval time")]
+fn fragment_alpha_compare_params_bytes_rejects_reserved_mode_defensively() {
+    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Reserved, None);
+}
+
+#[test]
+#[should_panic(expected = "must have been rejected at retrieval time")]
+fn fragment_alpha_compare_params_bytes_rejects_dither_mode_defensively() {
+    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Dither, None);
+}
+
 /// Device-unavailable degradation path (port card §7): a real GPU adapter
 /// cannot be forced absent deterministically in this test harness (no unit
 /// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
@@ -425,6 +519,8 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         extent: EXTENT,
         tmem,
         tile_binding,
+        alpha_compare_mode: crate::state::AlphaCompare::None,
+        blend_color: None,
     };
     assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
     assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
@@ -686,6 +782,108 @@ mod host_gpu_tests {
             assert!(
                 (observed_depth - 0.25).abs() < 1e-3,
                 "depth at ({x},{y}) = {observed_depth}, expected ~0.25 (nearer draw must have won)"
+            );
+        }
+    }
+
+    /// Uniform-alpha triangle, `covering_triangle_fixture`'s geometry with a
+    /// flat shade color at a caller-chosen alpha, and a caller-chosen
+    /// alpha-compare mode/blend_color -- the fixture shape the alpha-compare
+    /// differential (card §4g) needs: same screen coverage as every other
+    /// fixture in this file, but a flat (non-interpolated) alpha so a single
+    /// known combiner-output alpha applies to every covered pixel, no
+    /// barycentric interpolation math required to know what the gate sees.
+    fn uniform_alpha_fixture(
+        alpha: f32,
+        alpha_compare_mode: crate::state::AlphaCompare,
+        blend_color: Option<crate::state::Color4>,
+    ) -> TriangleFixture {
+        let mut fixture = covering_triangle_fixture();
+        for vertex in &mut fixture.vertices {
+            vertex.color = [1.0, 1.0, 1.0, alpha];
+        }
+        fixture.alpha_compare_mode = alpha_compare_mode;
+        fixture.blend_color = blend_color;
+        fixture
+    }
+
+    /// Required host GPU evidence (alpha-compare production card §4g): a
+    /// `None`-mode triangle must always write its fragment (color differs
+    /// from the `LoadOp::Clear` background), while a `Threshold`-mode
+    /// triangle whose combiner-output alpha is provably below
+    /// `blend_color`'s threshold must be discarded (color stays exactly at
+    /// the `LoadOp::Clear` background) -- real GPU-observed discard
+    /// evidence, not the CPU `alpha_compare_value` oracle called in
+    /// isolation. Each case is its own single-triangle submission (its own
+    /// fresh `Clear` target, matching `submit_triangle`'s doc) rather than
+    /// two draws sharing one target, so this test needs no draw-order
+    /// reasoning about a shared color attachment.
+    #[test]
+    fn required_host_alpha_compare_none_always_writes_and_threshold_discards_below_blend_color() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        // None mode: alpha_compare_fragment_fn(mode=0, ..) always returns
+        // true regardless of alpha -- a low alpha (0.1 -> combiner-output
+        // byte 26) must still write, proving None never gates on alpha at
+        // all, not merely that this particular alpha happens to pass a
+        // threshold.
+        let none_fixture = uniform_alpha_fixture(0.1, crate::state::AlphaCompare::None, None);
+        let none_output = renderer
+            .submit_triangle(none_fixture)
+            .unwrap()
+            .complete()
+            .unwrap();
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            assert_ne!(
+                rgba8_at(&none_output, x, y),
+                [0, 0, 0, 0],
+                "None-mode fragment at ({x},{y}) must write, matching LoadOp::Clear background \
+                 only if the fragment was wrongly discarded"
+            );
+        }
+
+        // Threshold mode: combiner-output alpha = 0.1 -> u32 byte 26
+        // (u32(clamp(0.1,0,1)*255.0+0.5) = 26). blend_color alpha = 200
+        // (wire byte 0, Color4's alpha byte per `rgba8()[3]`) is provably
+        // above 26, so `alpha_compare_fragment_fn(mode=1, alpha=26,
+        // threshold_alpha=200, ..)` returns `26 >= 200 == false` --
+        // discarded. blend_color's wire word packs alpha in bits 7:0
+        // (`Color4::rgba8`'s big-endian doc), so `0x0000_00C8` (200) is the
+        // threshold-only wire value; R/G/B are irrelevant to alpha compare.
+        let blend_color = crate::state::Color4::from_wire(0x0000_00C8);
+        let threshold_fixture = uniform_alpha_fixture(
+            0.1,
+            crate::state::AlphaCompare::Threshold,
+            Some(blend_color),
+        );
+        assert_eq!(blend_color.rgba8()[3], 200);
+        let threshold_output = renderer
+            .submit_triangle(threshold_fixture)
+            .unwrap()
+            .complete()
+            .unwrap();
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            assert_eq!(
+                rgba8_at(&threshold_output, x, y),
+                [0, 0, 0, 0],
+                "Threshold-mode fragment at ({x},{y}) with alpha=26 < threshold=200 must be \
+                 discarded, leaving the LoadOp::Clear background untouched -- observed a \
+                 written color instead"
+            );
+            assert_eq!(
+                depth_at(&threshold_output, x, y),
+                1.0,
+                "a discarded fragment must not write depth either -- the whole fragment is \
+                 discarded before either color-attachment write executes (card §3c)"
             );
         }
     }
@@ -1051,6 +1249,7 @@ mod host_gpu_tests {
                     EXTENT,
                     tmem,
                     tile_binding,
+                    draw.blend_color,
                 )
                 .unwrap()
                 .complete()

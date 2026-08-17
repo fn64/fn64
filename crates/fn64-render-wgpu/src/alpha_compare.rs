@@ -32,9 +32,23 @@
 //! Explicitly out of scope, per the port card: the general blend
 //! equation/coverage/depth pipeline, `BlendColor` register storage
 //! (`threshold_alpha` below is an explicit caller-supplied parameter, not
-//! crate-owned state), RDP noise-generator architecture (`AlphaCompareNoise`
-//! below is a narrow typed byte carrier, not a PRNG), draw-path integration,
+//! crate-owned state -- this module itself still does not own it; the
+//! draw-path collectors do, see below), RDP noise-generator architecture
+//! (`AlphaCompareNoise` below is a narrow typed byte carrier, not a PRNG),
 //! and any native GPU execution.
+//!
+//! **Draw-path integration is no longer fully out of scope** (2026-08-17,
+//! `fn64-alpha-compare-production-card.md`): `None`/`Threshold` are wired
+//! into the real triangle fragment path (`targets/triangle_pipeline.rs`'s
+//! `submit_admitted_triangle`, `shaders/triangle_pipeline_fragment.wgsl`'s
+//! `fs_main`, reusing `alpha_compare_fragment_fn.wgsl`'s callable verbatim),
+//! with `BlendColor` snapshotted per-triangle by
+//! `raw_dpc::triangle_draw_data::TriangleDrawStateCollector` and
+//! `production.rs`'s `PlanCollector` (this module still does not own that
+//! state itself). `Dither` remains a loud, named, unimplemented trap
+//! (no fragment-callable RT64 PRNG binding and no frame-count concept in
+//! this pipeline); `Reserved` is rejected at retrieval time via
+//! `require_supported_alpha_compare`'s first real call site.
 
 use crate::state::{
     AlphaCompare as AlphaCompareMode, AlphaDither as AlphaDitherMode, RgbDither as RgbDitherMode,
