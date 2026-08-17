@@ -19,11 +19,9 @@
 - **Milestones with no tickets:** `M6`, `M7`, `M9`, `M10`, `M12`
 - **Retrospective coverage:** 12/64; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`, `M4.4`, `M4.5`, `M4.6`, `M4.7`, `M4.8`, `M4.9`, `M4.10`, `M4.11`, `M4.12`, `M4.13`, `M4.14`, `M8.1`, `M8.2`, `M8.3`, `M8.4`, `M8.5`, `M8.6`, `M8.7`, `M8.8`, `M8.9`, `M8.10`, `M8.11`, `M8.12`, `M8.13`, `M8.14`, `M5.1`, `M5.2`, `M5.3`, `M5.4`, `M5.5`, `M5.6`, `M5.7`, `M5.8`, `M5.9`, `M11.1`, `M11.2`, `M11.3`, `M11.4`
 
-### RUNNING (2)
+### RUNNING (0)
 
-- `M0.3` — owner: integration lead; branch: `feat/egui-settings-drawer-hud` -> `main`; dependencies: none; reliability: **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)**; next: Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
-
-- `M4.2` — owner: /root/m4_2a_physical_state_impl; branch: `port/m4-2a-physical-state` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic)**; next: Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.
+None.
 
 ### READY_FOR_REVIEW — awaiting independent review only (0)
 
@@ -41,9 +39,9 @@ None.
 
 - `M4.7` — owner: fb-reinterpret kernel writer; branch: `port/m4-fb-reinterpret` -> `main`; dependencies: M4.6=READY; reliability: **NOT RECORDED**; next: Port each kernel as a pure function over an owned TMEM/TLUT slice; unit-test the four dispatch predicates plus both column-parity rules and both RGBA16toIA16 scale constants.
 
-- `M4.8` — owner: framebuffer-geometry writer; branch: `port/m4-framebuffer-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the cluster as pure functions plus a small owned Framebuffer-extent struct; unit-test the sub-word XOR-3 swap tail at 1/2/3 residual bytes and imageRowBytes across all four siz values.
+- `M4.8` — owner: framebuffer-geometry writer; branch: `port/m4-framebuffer-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Code has landed: the whole named cluster is ported with 67 tests, including the XOR-3 sub-word tail at 1/2/3 residual bytes and imageRowBytes across all four siz values. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
-- `M4.9` — owner: framebuffer-storage writer; branch: `port/m4-framebuffer-storage` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the arena and handle table as an owned Rust struct; unit-test the exact capacity growth sequence across repeated stores and assert get() returns the last of several handles sharing one address.
+- `M4.9` — owner: framebuffer-storage writer; branch: `port/m4-framebuffer-storage` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Code has landed: the arena and handle table are ported with 49 tests covering the exact capacity growth sequence and last-handle-wins lookup. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 - `M4.10` — owner: framebuffer-tile geometry writer; branch: `port/m4-make-framebuffer-tile` -> `main`; dependencies: M4.8=READY; reliability: **NOT RECORDED**; next: Port the solver as a pure function returning Result over an owned tile struct; unit-test all six rejection paths plus the two sentinel-derived branches independently.
 
@@ -51,7 +49,7 @@ None.
 
 - `M4.12` — owner: texture-map LRU writer; branch: `port/m4-texture-map-lru` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the slot table, access list and eviction sweep as an owned Rust structure over opaque handles; unit-test LIFO slot reuse, move-to-front on use, and the clamped-maxAge boundary at both ends.
 
-- `M4.13` — owner: render-target geometry writer; branch: `port/m4-render-target-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the four functions as pure math over owned scale/rect types; unit-test the pillarbox and letterbox branches separately and assert the misalignment result at several non-integer resolution scales.
+- `M4.13` — owner: render-target geometry writer; branch: `port/m4-render-target-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Code has landed: all four functions are ported as pure math with 39 tests, covering the pillarbox and letterbox branches separately and the misalignment result at non-integer resolution scales. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 - `M4.14` — owner: texture-sampler address writer; branch: `port/m4-texture-sampler-address` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the address arithmetic and the three filter blends as pure functions over caller-supplied texel samples; unit-test clamp, mirror and mask wrapping independently and pin the three-sample blend against hand-computed values at fx+fy on both sides of 1.0.
 
@@ -109,23 +107,27 @@ None.
 
 - `M11.4` — owner: gaussian filter writer; branch: `port/m11-gaussian-filter` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the weight table, offsets and combine as pure functions plus owned WGSL, assert each region's weights sum to 1, and validate the WGSL with Naga.
 
-### BLOCKED (3)
+### BLOCKED (5)
+
+- `M0.3` — owner: integration lead; branch: `feat/egui-settings-drawer-hud` -> `main`; dependencies: none; reliability: **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)**; next: Reassign a worker. Then exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, finish the outstanding 9 clean fn64-abi runs, and run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.; blocker: Worker gone: this card has been RUNNING since 2026-08-15 with no update since 2026-08-16 and no live integration-lead worker on 2026-08-17. Its own findings already record the substantive gap -- no real matched baseline exists because the C-RecompiledFuncs receipt and native device-identity query have no clean private linked-build validation to run against.
 
 - `M2.5` — owner: shader corpus execution lead; branch: `port/rt64-shader-corpus` -> `main`; dependencies: M2.4=INTEGRATED; reliability: **NOT RECORDED**; next: Complete M2.5.1 reference-valid corpus evidence, then use M2.5.2's typed assessment and M2.5.3's owned WGSL/runtime artifacts without treating reference validity as wgpu ingestibility.; blocker: The original single-corpus exit condition is impossible with the admitted DXC output and Naga 30: row one requires ShaderNonUniform, which the strict SPIR-V frontend rejects. M2.5.1 through M2.5.3 replace the conflated gate.
 
 - `M2.5.3` — owner: integration lead; branch: `port/rt64-runtime-shader-corpus` -> `main`; dependencies: M2.5.1=INTEGRATED, M2.5.2=READY; reliability: **NOT RECORDED**; next: Begin bounded owned WGSL vertical slices in parallel where authority fixtures exist, but do not claim a complete runtime corpus until both upstream tickets close.; blocker: The complete reference corpus and per-row wgpu assessment do not yet exist; runtime shader promotion also requires semantic differential fixtures.
 
-- `M4.3` — owner: integration lead; branch: `port/m4-texture-decode` -> `main`; dependencies: M4.2=RUNNING; reliability: **NOT RECORDED**; next: After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.; blocker: M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
+- `M4.2` — owner: /root/m4_2a_physical_state_impl; branch: `port/m4-2a-physical-state` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic)**; next: Assign an owner to reconcile this card against what actually shipped: confirm sub-cards M4.2a/2b/2c and M4.2d fully discharge the LoadTile/LoadBlock physical-state objective, record a reliability run for the merged tmem surface, then either close this card as superseded or promote it on that evidence. Do not restart the port.; blocker: Worker gone: owner /root/m4_2a_physical_state_impl is not alive on 2026-08-17 and its branch port/m4-2a-physical-state (5badcbd5) was never merged. The objective's work nevertheless reached main through separately reviewed sub-cards, so this card is a bookkeeping remnant: it needs an owner to confirm the sub-cards discharge it and close it, not more porting.
+
+- `M4.3` — owner: integration lead; branch: `port/m4-texture-decode` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Re-scope this card against what shipped. Point writable_paths at the real landed surface (crates/fn64-render-wgpu/src/tmem), settle first-row parity and noncanonical TLUT-bank behavior with explicit authority fixtures, then record a reliability run and take the remainder -- the owned-WGSL differential and bounded cache ownership -- in separately reviewed cards.; blocker: Stale blocker corrected on 2026-08-17. The dependency half is false: M4.1 is INTEGRATED and M4.2's physical state plus LoadTile/LoadBlock executors are on main. What still blocks is narrower and card-internal -- the frozen decode contract, first-row parity, and noncanonical TLUT-bank behavior still lack explicit authority fixtures, and sample.rs states first-row parity is caller-owned.
 
 ## Milestones
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:5, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:5 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:5, READY:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:2, READY:11, RUNNING:1 |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:2, INTEGRATED:2, READY:11 |
 | `M5` | `PLANNED` | GBI and deferred RSP | READY:9 |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -158,7 +160,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `RUNNING` |
+| state | `BLOCKED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `feat/egui-settings-drawer-hud` -> `main` |
@@ -172,7 +174,8 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - The headless route runs Shell::pump_one_frame outside the winit/pixels compositor; five counterbalanced control/instrumented pairs launch as fresh processes.
 - A control run can become comparison_ready only after the post-create verifier completes and both horizon endpoint observations are available and unchanged.
 - No real matched baseline has been recorded; the private linked-build and native-identity gates remain open.
-- This is an open evidence gap, not a stall: the C-program receipt and native device query have no linked private-game validation, so no real matched baseline exists yet. It blocks the performance/parity claim, not independent implementation, so the ticket remains RUNNING rather than BLOCKED.
+- Reclassified from RUNNING to BLOCKED on 2026-08-17 under the port plan's loop rule (any RUNNING ticket with a dead worker becomes BLOCKED with blocker text). The earlier finding argued this should stay RUNNING because the gap blocks the parity claim rather than implementation; that argument does not survive the worker being gone for a day.
+- Not promoted: verification_runs records cargo nextest -p fn64-abi --no-default-features at 1 of 10 required clean runs, so the declared reliability bar is unmet and no promotion is available even if a worker returned.
 
 **Verification:**
 
@@ -181,7 +184,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `cargo nextest run -p fn64-abi --no-default-features` | 1 | 10 | deterministic |
 | `tools/check_rt64_render_measurement.py` | 10 | 10 | deterministic |
 
-**Next action:** Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
+**Blocker:** Worker gone: this card has been RUNNING since 2026-08-15 with no update since 2026-08-16 and no live integration-lead worker on 2026-08-17. Its own findings already record the substantive gap -- no real matched baseline exists because the C-RecompiledFuncs receipt and native device-identity query have no clean private linked-build validation to run against.
+
+**Next action:** Reassign a worker. Then exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, finish the outstanding 9 clean fn64-abi runs, and run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
 
 ### `A0.1` -- Generate the machine-checked RT64 source/task denominator: assign every allowed project-owned host/shader module a milestone, workstream, port state, evidence state, and exclusive task-card owner.
 
@@ -891,7 +896,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M4` |
-| state | `RUNNING` |
+| state | `BLOCKED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m4_2a_physical_state_impl |
 | branch | `port/m4-2a-physical-state` -> `main` |
@@ -905,8 +910,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.
 - TextureImage supplies source format, size, width, and address. RT64's tile-size substitution, zero starting-row XOR, silent invalid-coordinate returns, and host-layout correction remain divergence candidates rather than fn64 authority.
 - The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit.
-- Commit 75e9025f integrates M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.
-- The accepted M4.2.0 source passed 101 unit tests plus nine compile-fail doctests in 10/10 consecutive guarded processes; it is a plan contract and makes no TMEM-mutation or execution claim.
+- Commit 75e9025f integrated M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.
+- The objective's work has since landed on main through sub-cards rather than this card's branch: f8f3aca7 added tmem/physical.rs (transactional physical TMEM, 24 tests), d618a1c8 the LoadTile executor, 39c82523 the LoadBlock executor, and ea695da1 (M4.2d) the ordered packet executor. crates/fn64-render-wgpu/src/tmem carries 176 unit tests in total.
+- Reclassified from RUNNING to BLOCKED on 2026-08-17 under the port plan's loop rule for a dead worker. Not promoted to INTEGRATED: the recorded guarded run is the sub-cards' evidence, and no reliability run is recorded against this card's own merged result, so promoting it here would be a false-completion shape.
 
 **Verification:**
 
@@ -914,7 +920,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 |---|---|---|---|
 | `scripts/guarded-cargo-test.zsh -p fn64-render-wgpu` | 10 | 10 | deterministic |
 
-**Next action:** Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.
+**Blocker:** Worker gone: owner /root/m4_2a_physical_state_impl is not alive on 2026-08-17 and its branch port/m4-2a-physical-state (5badcbd5) was never merged. The objective's work nevertheless reached main through separately reviewed sub-cards, so this card is a bookkeeping remnant: it needs an owner to confirm the sub-cards discharge it and close it, not more porting.
+
+**Next action:** Assign an owner to reconcile this card against what actually shipped: confirm sub-cards M4.2a/2b/2c and M4.2d fully discharge the LoadTile/LoadBlock physical-state objective, record a reliability run for the merged tmem surface, then either close this card as superseded or promote it on that evidence. Do not restart the port.
 
 ### `M4.3` -- Execute TLUT loads and decode committed, validity-checked TMEM into exact CPU and owned-WGSL texture representations without conflating load, decode, sampling, or cache state.
 
@@ -925,7 +933,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/m4-texture-decode` -> `main` |
-| dependencies | M4.2=RUNNING |
+| dependencies | none |
 | writable paths | `crates/fn64-render-ir/src/tmem`, `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/texture`, `crates/fn64-render-wgpu/src/shaders/tmem_decode.wgsl`, `crates/fn64-render-reference/src/tmem_decode.rs` |
 | reliability | **NOT RECORDED** |
 
@@ -935,10 +943,13 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - CI4 combines the tile palette high nibble with the texel nibble; CI8 ignores tile palette. TLUT mode selects RGBA16 or IA16 interpretation.
 - Decode identity contains committed TMEM snapshot, render format/size, base/line, TLUT mode, normalized palette, window, and row parity. Source-image and sampler/filter state do not belong in that cache key.
 - YUV remains a separate SetConvert/filter/combiner prerequisite. RT64's black result and eager RGB approximation are not acceptable authority.
+- Much of this objective has already landed on main through sub-cards, not through this card's branch: aec0ae1b (M4.3.2) the LoadTLUT executor, M4.3.3's tmem/texel.rs direct and indexed decode (44 tests), b07fc375 the committed point sampler, and 9b74f9d7 TMEM sampling in triangle fragments. This card's declared writable_paths are stale -- none of that landed under them.
+- The M4.2 dependency was dropped because it is discharged in substance: M4.1 is INTEGRATED and the physical-state and executor work M4.2 named is merged. M4.2 itself remains open only as a bookkeeping remnant of a dead worker, which is not a real prerequisite for this card.
+- Not promoted: this card has no verification_runs, so no promotion beyond BLOCKED is available without recording a reliability run against the landed decode/TLUT surface.
 
-**Blocker:** M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
+**Blocker:** Stale blocker corrected on 2026-08-17. The dependency half is false: M4.1 is INTEGRATED and M4.2's physical state plus LoadTile/LoadBlock executors are on main. What still blocks is narrower and card-internal -- the frozen decode contract, first-row parity, and noncanonical TLUT-bank behavior still lack explicit authority fixtures, and sample.rs states first-row parity is caller-owned.
 
-**Next action:** After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.
+**Next action:** Re-scope this card against what shipped. Point writable_paths at the real landed surface (crates/fn64-render-wgpu/src/tmem), settle first-row parity and noncanonical TLUT-bank behavior with explicit authority fixtures, then record a reliability run and take the remainder -- the owned-WGSL differential and bounded cache ownership -- in separately reviewed cards.
 
 ### `M4.4` -- Port rt64_blender.h's CPU-side shader-SELECTION analysis: combineCycleCount, blendCycleCount, usesInput/usesCombinerAlpha, usesAlphaBlendCycle/usesAlphaBlend, usesStandardFogCycle, usesVisualizeCoverageCycle. Unwired CPU predicates; no parity claim.
 
@@ -1056,16 +1067,15 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 **Findings:**
 
-- Sources: src/hle/rt64_framebuffer.cpp (202 lines) and src/hle/rt64_framebuffer.h (96 lines), plus NativeTarget::getNativeSize from src/render/rt64_native_target.cpp; take each sha256 from docs/rt64-port-inventory.json.
-- Symbol gate: image_row_bytes, best_dither_pattern, get_native_size and FramebufferTile have ZERO hits under crates/.
-- Explicitly EXCLUDES FramebufferTile::hash -- it is XXH3_64bits over the raw struct bytes and XXH3 is a triage reject. State that exclusion in the module's Nonclaims.
-- Also excludes the RenderWorker/RHI methods (copyRenderTargetToNative, readChangeFrom*, nativeTarget.copyFrom/ToRAM); only the pure arithmetic around them is in scope.
-- The sub-word tail of copyNativeToRAM is the trap: when fewer than 4 bytes remain, RT64 does NOT byte-swap a word, it writes dstFirstWordU8[i ^ 3] = dstBytes[i] into a saved copy of the ORIGINAL first word. Port both the >= 4-byte loop and the XOR-3 tail; a single memcpy is wrong.
-- imageRowBytes is `rowWidth << siz >> 1` -- left-then-right shift order matters for siz == 0 (4-bit) and must not be rewritten as a division.
-- bestDitherPattern returns the INDEX of the max element (first max wins on ties, per std::max_element), not the count.
+- Landed: crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs (1098 lines, declared at lib.rs:346) ports all ten named cluster items and both copyNativeToRAM byte-swap branches, with 67 unit tests. Its own doc header states "Complete for its stated scope" and "not waiting on any other card".
+- Sources: src/hle/rt64_framebuffer.cpp (202 lines) and src/hle/rt64_framebuffer.h (96 lines), plus NativeTarget::getNativeSize from src/render/rt64_native_target.cpp; each sha256 is recorded in the module header and matches docs/rt64-port-inventory.json.
+- FramebufferTile::hash stays excluded -- it is XXH3_64bits over the raw struct bytes and XXH3 is a triage reject. The module's Nonclaims records that exclusion, as the card required.
+- Also excluded, by design rather than deferral: the RenderWorker/RHI methods (copyRenderTargetToNative, readChangeFrom*, nativeTarget.copyFrom/ToRAM). Only the pure arithmetic around them was in scope and all of it is ported.
+- The sub-word tail of copyNativeToRAM was the trap and is ported literally: below 4 remaining bytes RT64 writes dstFirstWordU8[i ^ 3] = dstBytes[i] into a saved copy of the ORIGINAL first word rather than byte-swapping. Both that tail and the >= 4-byte loop are tested.
+- imageRowBytes is ported as `rowWidth << siz >> 1` with the shift order preserved (not rewritten as a division) and tested across all four siz values; bestDitherPattern returns the INDEX of the max element with first-max-wins ties, per std::max_element.
 - Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
 
-**Next action:** Port the cluster as pure functions plus a small owned Framebuffer-extent struct; unit-test the sub-word XOR-3 swap tail at 1/2/3 residual bytes and imageRowBytes across all four siz values.
+**Next action:** Code has landed: the whole named cluster is ported with 67 tests, including the XOR-3 sub-word tail at 1/2/3 residual bytes and imageRowBytes across all four siz values. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 ### `M4.9` -- Port FramebufferStorage: the append-only RDRAM arena with its 3/2 growth policy, plus the last-matching-handle-wins get() lookup bounded by maxFbPairIndex. Unwired CPU allocator; no parity claim.
 
@@ -1082,15 +1092,15 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 **Findings:**
 
-- Sources: src/hle/rt64_framebuffer_storage.cpp (61 lines) and .h (35 lines); take both sha256 values from docs/rt64-port-inventory.json.
-- Symbol gate: FramebufferStorage, framebuffer_storage and rdram_used have ZERO hits under crates/.
-- Fully self-contained: no RHI, no hashing, no threads, no filesystem. This is the cleanest remaining M4 file.
-- Growth is `newSize = (rdramUsed * 3) / 2` computed AFTER rdramUsed was already advanced by size, and resize never shrinks. Reproduce the exact capacity sequence, not merely 'a growing vec'.
-- get() does NOT return the first match: it scans the whole handle vector and keeps the LAST entry whose fbPairIndex <= maxFbPairIndex and whose address matches exactly. Returning early on first match is a real behavior change.
-- reset() clears the handle vector and zeroes rdramUsed but deliberately RETAINS the allocated rdramData buffer. Preserve that retention.
+- Landed: crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs (1002 lines, declared at lib.rs:347) ports both source files whole -- every FramebufferStorage member (constructor, reset, store, get, getRDRAM) plus the Handle record -- with 49 unit tests. Its doc header states "Complete for its stated scope" and "not waiting on any other card".
+- Sources: src/hle/rt64_framebuffer_storage.cpp (61 lines) and .h (35 lines); both sha256 values are recorded in the module header and match docs/rt64-port-inventory.json.
+- Fully self-contained as scoped: no RHI, no hashing, no threads, no filesystem.
+- The growth policy is ported exactly: `newSize = (rdramUsed * 3) / 2` computed AFTER rdramUsed was already advanced by size, with resize never shrinking. The tests assert the capacity sequence, not merely that a vec grows.
+- get() is ported as last-qualifying-handle-wins: it scans the whole handle vector and keeps the LAST entry whose fbPairIndex <= maxFbPairIndex and whose address matches exactly. A test asserts that against several handles sharing one address.
+- reset() clears the handle vector and zeroes rdramUsed while deliberately RETAINING the allocated rdramData buffer; that retention is preserved and covered.
 - Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
 
-**Next action:** Port the arena and handle table as an owned Rust struct; unit-test the exact capacity growth sequence across repeated stores and assert get() returns the last of several handles sharing one address.
+**Next action:** Code has landed: the arena and handle table are ported with 49 tests covering the exact capacity growth sequence and last-handle-wins lookup. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 ### `M4.10` -- Port FramebufferManager::makeFramebufferTile: the RDRAM-address-range to framebuffer-tile geometry solver, including every named rejection path. Unwired CPU geometry; no parity claim.
 
@@ -1185,16 +1195,15 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 **Findings:**
 
-- Sources: src/render/rt64_render_target.cpp (the two statics plus copyFromChanges's pillarbox block) and src/render/rt64_framebuffer_renderer.cpp's viewportScissorIntersection; take both sha256 values from docs/rt64-port-inventory.json.
-- Symbol gate: compute_scaled_size, compute_fixed_resolution_scale and viewport_scissor_intersection have ZERO hits under crates/.
-- The rest of both files is RHI plumbing (descriptor sets, barriers, command lists) and is out of scope; say so in Nonclaims.
-- computeScaledSize uses resolutionScale.y for the NATIVE width and the height but resolutionScale.x for the EXPANDED width. Swapping x and y here is silent and wrong -- the misalignment output depends on the difference between the two widths.
-- lround is round-half-away-from-zero, which Rust's f32::round matches; f32 as i64 truncates and does not. Use the rounding form, and clamp to MaxDimension 0x4000 with a floor of 1.
-- computeFixedResolutionScale forces an EVEN width via `w += w & 1` and then recomputes the scale as a ratio -- it returns a modified scale, not a size.
-- The pillarbox branch is selected by resolutionScale.x > resolutionScale.y and swaps which axis drives targetWidth/targetHeight; the scissor then floors the origin and ceils the extent. Port floor/ceil literally rather than rounding both.
+- Landed: crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs (819 lines, declared at lib.rs:372) ports all four named functions with 39 unit tests. Its doc header states "Complete for its stated scope" and "not waiting on any other card".
+- Sources: src/render/rt64_render_target.cpp lines 487-506 plus the 289-314 pillarbox block, and src/render/rt64_framebuffer_renderer.cpp lines 128-135 for viewportScissorIntersection; both sha256 values are recorded in the module header and match docs/rt64-port-inventory.json.
+- The rest of both files is RHI plumbing (descriptor sets, barriers, command lists, raytracing) and is declined by design, not deferred; the module's Nonclaims says so.
+- The x/y trap is ported correctly: computeScaledSize uses resolutionScale.y for the NATIVE width and the height but resolutionScale.x for the EXPANDED width, so the misalignment output depends on the difference between the two widths.
+- lround's round-half-away-from-zero is ported via f32::round rather than an `as i64` truncation, clamped to MaxDimension 0x4000 with a floor of 1.
+- computeFixedResolutionScale forces an EVEN width via `w += w & 1` and returns a modified scale rather than a size; the pillarbox branch (selected by resolutionScale.x > resolutionScale.y) floors the scissor origin and ceils the extent literally. Both branches are tested separately.
 - Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
 
-**Next action:** Port the four functions as pure math over owned scale/rect types; unit-test the pillarbox and letterbox branches separately and assert the misalignment result at several non-integer resolution scales.
+**Next action:** Code has landed: all four functions are ported as pure math with 39 tests, covering the pillarbox and letterbox branches separately and the misalignment result at non-integer resolution scales. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 ### `M4.14` -- Close TextureSampler.hlsli's deferred sampling cluster: clampWrapMirrorSample's texel address arithmetic and sampleTextureLevel's filter blends, including the three-sample bilinear. Unwired CPU address/blend math; no parity claim.
 
