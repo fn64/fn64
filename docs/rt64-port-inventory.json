@@ -16238,8 +16238,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "authority-overlay",
-      "port_state": "authority-gated",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_vi_timing.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-vi-cpp",
@@ -16252,7 +16254,7 @@
         "owner_lane": "authority-evidence",
         "recommended_profile": "M/medium",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_vi_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_vi_timing.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
