@@ -181,6 +181,10 @@ pub enum ValidationError {
     ReceiptEffectMismatch,
     GuestMemoryPreimageMismatch,
     EffectForReadOnlyAccess,
+    GuestRenderTargetWriteShapeMismatch {
+        mode: &'static str,
+        purpose: &'static str,
+    },
     EffectByteCountMismatch {
         expected: u32,
         actual: u32,
@@ -411,6 +415,10 @@ impl fmt::Display for ValidationError {
             Self::ReceiptEffectMismatch => formatter.write_str("receipt effects do not match the active workload or backend effects"),
             Self::GuestMemoryPreimageMismatch => formatter.write_str("guest memory no longer matches the exact captured transaction preimage"),
             Self::EffectForReadOnlyAccess => formatter.write_str("a completed write cannot name a read-only resource access"),
+            Self::GuestRenderTargetWriteShapeMismatch { mode, purpose } => write!(
+                formatter,
+                "single guest render-target write requires access mode Write and purpose RenderTarget; supplied write has mode {mode} and purpose {purpose}"
+            ),
             Self::EffectByteCountMismatch { expected, actual } => write!(formatter, "completed write reports {actual} bytes; declared region requires {expected}"),
             Self::EffectCountMismatch { field, expected, actual } => write!(formatter, "{field} count is {actual}; exact journal requires {expected}"),
             Self::EffectAccessMismatch { field, index } => write!(formatter, "{field} {index} does not match the exact ordered journal access/effect"),
@@ -437,3 +445,21 @@ impl fmt::Display for ValidationError {
 }
 
 impl std::error::Error for ValidationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidationError;
+
+    #[test]
+    fn guest_render_target_write_shape_mismatch_displays_both_offending_fields() {
+        let error = ValidationError::GuestRenderTargetWriteShapeMismatch {
+            mode: "Read",
+            purpose: "TmemLoadDestination",
+        };
+        assert_eq!(
+            error.to_string(),
+            "single guest render-target write requires access mode Write and purpose \
+             RenderTarget; supplied write has mode Read and purpose TmemLoadDestination"
+        );
+    }
+}

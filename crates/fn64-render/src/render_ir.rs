@@ -427,10 +427,11 @@ mod production {
     use std::rc::Rc;
 
     use fn64_render_ir::{
-        BackendCompletionAuthority, DeferredGuestReadCapture, DeferredGuestReadPlan,
-        GpuCompleteTicket, GuestCommitAuthority, GuestCommitEffectReport, GuestCommitReceipt,
-        GuestCommittedTicket, JournalIdentity, QueueIdentity, ResourceAccess, SubmissionIdentity,
-        SubmissionQueue, TicketAuthoritySet, TmemRange, ValidationError,
+        AccessMode, AccessPurpose, BackendCompletionAuthority, CompletedWrite,
+        DeferredGuestReadCapture, DeferredGuestReadPlan, GpuCompleteTicket, GuestCommitAuthority,
+        GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, JournalIdentity,
+        QueueIdentity, ResourceAccess, SubmissionIdentity, SubmissionQueue, TicketAuthoritySet,
+        TmemRange, ValidationError,
     };
 
     use crate::RawDpcSubmissionIdentity;
@@ -1865,8 +1866,11 @@ mod production {
         }
 
         /// Advance one backend-prepared submission through zero
-        /// guest-visible writes -- the frozen slice's only admitted
-        /// guest-commit shape (card v10 section 1 point 2) -- into the
+        /// guest-visible writes -- one of this slice's two admitted
+        /// guest-commit shapes, the other being exactly one
+        /// `RenderTarget`-purpose write via
+        /// [`Self::commit_single_guest_render_target_write`] (FillRectangle
+        /// guest-write publication design card) -- into the
         /// sealed [`GuestCommittedRawDpc`], moving plan, retirement, and
         /// ticket together. Consumes `prepared` (not a bare
         /// `GpuCompleteTicket`) and returns the sealed wrapper (not a bare
@@ -1898,6 +1902,60 @@ mod production {
                 "BackendPreparedRawDpc does not belong to this session's queue"
             );
             let effects = GuestCommitEffectReport::try_new(&prepared.complete, Vec::new())?;
+            let receipt: GuestCommitReceipt = self.guest.issue(&prepared.complete, effects)?;
+            let committed = prepared.complete.commit_guest(receipt)?;
+            let mut retirement = prepared.retirement;
+            retirement.advance_stage(RawDpcRetirementStage::GuestReceipt);
+            Ok(GuestCommittedRawDpc {
+                plan: prepared.plan,
+                committed,
+                retirement,
+            })
+        }
+
+        /// Advance one backend-prepared submission whose journal declares
+        /// exactly one guest-visible `RenderTarget` write -- a
+        /// FillRectangle color-target write; this is the FillRectangle-only
+        /// counterpart to [`Self::commit_zero_guest_writes`], not a general
+        /// N-write guest-commit path -- into the sealed
+        /// [`GuestCommittedRawDpc`], moving plan, retirement, and ticket
+        /// together, exactly like `commit_zero_guest_writes`.
+        ///
+        /// `write` must be the exact [`CompletedWrite`] the backend already
+        /// staged and reported inside `prepared`'s own `BackendEffectReport`
+        /// (checked structurally by `GuestCommitEffectReport::try_new`'s
+        /// content-digest equality check -- supplying any other content,
+        /// byte count, or access fails loudly, it is not merely re-trusted).
+        ///
+        /// Traps if the prepared value's queue does not match this
+        /// session's own queue, identically to `commit_zero_guest_writes`.
+        /// Before issuing the guest-commit receipt, this method first
+        /// checks `write`'s own access mode/purpose against the single
+        /// admitted shape (`AccessMode::Write`, `AccessPurpose::
+        /// RenderTarget`) -- a structural pre-check, not the sole
+        /// enforcement; `GuestCommitEffectReport::try_new`'s own
+        /// region-purpose-blind count/identity/content check (mirroring
+        /// `commit_zero_guest_writes`'s own re-checked-fact pattern) still
+        /// runs regardless and is what actually proves this write is the
+        /// one the backend staged.
+        pub fn commit_single_guest_render_target_write(
+            &mut self,
+            prepared: BackendPreparedRawDpc,
+            write: CompletedWrite,
+        ) -> Result<GuestCommittedRawDpc, ValidationError> {
+            assert!(
+                prepared.complete.queue() == self.queue.identity(),
+                "BackendPreparedRawDpc does not belong to this session's queue"
+            );
+            if write.access().mode() != AccessMode::Write
+                || write.access().purpose() != AccessPurpose::RenderTarget
+            {
+                return Err(ValidationError::GuestRenderTargetWriteShapeMismatch {
+                    mode: access_mode_name(write.access().mode()),
+                    purpose: access_purpose_name(write.access().purpose()),
+                });
+            }
+            let effects = GuestCommitEffectReport::try_new(&prepared.complete, vec![write])?;
             let receipt: GuestCommitReceipt = self.guest.issue(&prepared.complete, effects)?;
             let committed = prepared.complete.commit_guest(receipt)?;
             let mut retirement = prepared.retirement;
@@ -1944,6 +2002,42 @@ mod production {
                 fabric,
                 retirement,
             })
+        }
+    }
+
+    /// Stable diagnostic name for a [`ValidationError::
+    /// GuestRenderTargetWriteShapeMismatch`] field. `AccessMode::name` is
+    /// crate-private to `fn64-render-ir`, so this mirrors it locally rather
+    /// than widening that visibility for one error-formatting call site.
+    const fn access_mode_name(mode: AccessMode) -> &'static str {
+        match mode {
+            AccessMode::Read => "Read",
+            AccessMode::Write => "Write",
+            AccessMode::ReadWrite => "ReadWrite",
+        }
+    }
+
+    /// Stable diagnostic name for a [`ValidationError::
+    /// GuestRenderTargetWriteShapeMismatch`] field. `AccessPurpose::name` is
+    /// crate-private to `fn64-render-ir`, so this mirrors it locally rather
+    /// than widening that visibility for one error-formatting call site.
+    const fn access_purpose_name(purpose: AccessPurpose) -> &'static str {
+        match purpose {
+            AccessPurpose::CommandDecode => "CommandDecode",
+            AccessPurpose::UploadSource => "UploadSource",
+            AccessPurpose::TmemLoadSource => "TmemLoadSource",
+            AccessPurpose::TmemLoadDestination => "TmemLoadDestination",
+            AccessPurpose::RenderTarget => "RenderTarget",
+            AccessPurpose::DepthTarget => "DepthTarget",
+            AccessPurpose::CopySource => "CopySource",
+            AccessPurpose::CopyDestination => "CopyDestination",
+            AccessPurpose::ReinterpretSource => "ReinterpretSource",
+            AccessPurpose::ReinterpretDestination => "ReinterpretDestination",
+            AccessPurpose::ViScanout => "ViScanout",
+            AccessPurpose::CaptureSource => "CaptureSource",
+            AccessPurpose::CaptureDestination => "CaptureDestination",
+            AccessPurpose::GuestReadbackSource => "GuestReadbackSource",
+            AccessPurpose::GuestReadbackDestination => "GuestReadbackDestination",
         }
     }
 
@@ -4180,6 +4274,406 @@ mod production {
             assert!(
                 publication_impl_body.contains("pub fn commit("),
                 "the one CommittedRawDpcOutcome-returning method must be ReadyPublication::commit"
+            );
+        }
+
+        /// Shared fixture for `commit_single_guest_render_target_write`'s
+        /// test suite: a hand-built `BackendPreparedRawDpc` whose journal
+        /// declares exactly one command-decode read plus one
+        /// `RenderTarget`/`ColorFramebuffer` write, with a matching
+        /// `BackendEffectReport` already issued for that write. Mirrors
+        /// `commit_zero_guest_writes_rejects_a_packet_with_a_real_guest_write_even_via_a_hand_built_ticket`'s
+        /// hand-built-ticket recipe (same-module private-field construction
+        /// is the only way to reach this packet shape at all, since the
+        /// normal `ExactRawDpcPlanWriter` path cannot build a FillRectangle
+        /// write yet).
+        fn render_target_write_fixture(
+            queue: SubmissionQueue,
+            mut backend_authority: BackendCompletionAuthority,
+            guest: GuestCommitAuthority,
+            content: fn64_render_ir::ContentDigest,
+        ) -> (
+            SubmissionQueue,
+            BackendCompletionAuthority,
+            GuestCommitAuthority,
+            BackendPreparedRawDpc,
+            ResourceAccess,
+        ) {
+            let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(0x1000).unwrap();
+            let command_range = layout.range(0x100, 0x108).unwrap();
+            let guest_write_range = layout.range(0x200, 0x210).unwrap();
+            let command_read = ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(0),
+                AccessMode::Read,
+                AccessPurpose::CommandDecode,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::RawCommands,
+                    range: command_range,
+                },
+            )
+            .unwrap();
+            let guest_write = ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(1),
+                AccessMode::Write,
+                AccessPurpose::RenderTarget,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+                    range: guest_write_range,
+                },
+            )
+            .unwrap();
+            let journal = fn64_render_ir::ResourceJournal::try_new(
+                fn64_render_ir::ResourceJournalLimits::try_new(4, 0x100).unwrap(),
+                vec![command_read, guest_write],
+            )
+            .unwrap();
+            let stream = fn64_render_ir::RawCommandStream::Dram(
+                fn64_render_ir::DramCommandStream::try_new(vec![
+                    fn64_render_ir::DramCommandChunk::try_new(
+                        command_range,
+                        vec![0xf500_0000, 0],
+                        fn64_render_ir::TemporalBoundary::new(
+                            11,
+                            fn64_render_ir::DpInterruptState::Clear,
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            );
+            let packet = fn64_render_ir::WorkloadPacket::try_new(
+                layout,
+                fn64_render_ir::WorkloadAdmission::RawDpc {
+                    transaction_sequence: 7,
+                },
+                vec![stream],
+                journal,
+            )
+            .unwrap();
+
+            let mut queue = queue;
+            let submitted = queue
+                .submit(fn64_render_ir::DecodedTicket::new(packet))
+                .unwrap();
+            let write_effect =
+                CompletedWrite::try_new(guest_write, guest_write_range.len(), content).unwrap();
+            let report =
+                BackendEffectReport::try_new(submitted.packet(), vec![write_effect]).unwrap();
+            let receipt = backend_authority.issue(&submitted, report).unwrap();
+            let complete = submitted.gpu_complete(receipt).unwrap();
+
+            let (dummy_retirement, _handle) =
+                SubmittedRawDpcRetirement::new_pair(complete.submission());
+            let dummy_plan = ExactValidatedRawDpcPlan {
+                source_identity: crate::RawDpcSubmissionIdentity {
+                    source: RawDpcSource::Rdram,
+                    start: 0x100,
+                    end: 0x108,
+                    command_sha256: [0; 32],
+                },
+                journal_identity: complete.packet().journal().identity(),
+                commands: Vec::new().into_boxed_slice(),
+                accesses: Vec::new().into_boxed_slice(),
+            };
+            let prepared = BackendPreparedRawDpc {
+                plan: dummy_plan,
+                complete,
+                retirement: dummy_retirement,
+            };
+            (queue, backend_authority, guest, prepared, guest_write)
+        }
+
+        /// A session sharing the exact queue identity `queue`/`guest` were
+        /// minted with (the same `TicketAuthoritySet::into_roles()` call),
+        /// so both `commit_single_guest_render_target_write`'s own
+        /// queue-ownership assertion and `GuestCommitAuthority::issue`'s own
+        /// authority check pass, and only the guest-commit re-check under
+        /// test can reject the call.
+        fn matching_session_for(
+            queue: SubmissionQueue,
+            guest: GuestCommitAuthority,
+        ) -> RawDpcAbiSession {
+            RawDpcAbiSession {
+                queue,
+                guest,
+                ledger: RetirementLedger::default(),
+            }
+        }
+
+        /// Test 1 (design card section 13): happy path -- a packet whose
+        /// journal declares exactly one `RenderTarget`/`ColorFramebuffer`
+        /// write, committed with the matching `CompletedWrite`, succeeds
+        /// and reaches `RawDpcRetirementStage::GuestReceipt`.
+        #[test]
+        fn commit_single_guest_render_target_write_commits_the_matching_write() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let content = fn64_render_ir::effect_content_digest(&[0xcd; 16]);
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+
+            let mut session = matching_session_for(queue, guest);
+            let write = CompletedWrite::try_new(
+                guest_write,
+                guest_write.region().declared_bytes(),
+                content,
+            )
+            .unwrap();
+            let committed = session
+                .commit_single_guest_render_target_write(prepared, write)
+                .unwrap();
+            assert_eq!(committed.stage(), RawDpcRetirementStage::GuestReceipt);
+        }
+
+        /// Test 2 (design card section 13): the *old* `commit_zero_guest_writes`
+        /// still rejects this same packet with `EffectCountMismatch`
+        /// (mirrors the pre-existing hand-built-ticket proof), while the
+        /// *new* method succeeds on the same packet shape -- proving the
+        /// two methods are each correct for their own respective packet
+        /// shapes, not that one silently subsumes the other.
+        #[test]
+        fn old_zero_write_method_rejects_and_new_method_accepts_the_same_render_target_packet() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let content = fn64_render_ir::effect_content_digest(&[0xce; 16]);
+            let (queue, _backend_authority, guest, prepared, _guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+
+            let mut zero_write_session = matching_session_for(queue, guest);
+            assert_eq!(
+                zero_write_session
+                    .commit_zero_guest_writes(prepared)
+                    .unwrap_err(),
+                ValidationError::EffectCountMismatch {
+                    field: "guest commit access",
+                    expected: 1,
+                    actual: 0,
+                }
+            );
+
+            // Rebuild an equivalent prepared ticket (the prior one was
+            // consumed by the rejected call above) to prove the new method
+            // succeeds on this exact packet shape.
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+            let mut new_method_session = matching_session_for(queue, guest);
+            let write = CompletedWrite::try_new(
+                guest_write,
+                guest_write.region().declared_bytes(),
+                content,
+            )
+            .unwrap();
+            assert_eq!(
+                new_method_session
+                    .commit_single_guest_render_target_write(prepared, write)
+                    .unwrap()
+                    .stage(),
+                RawDpcRetirementStage::GuestReceipt
+            );
+        }
+
+        /// Test 3 (design card section 13): a TMEM-only packet (zero
+        /// guest-visible writes declared) supplied to the *new* method with
+        /// one fabricated `CompletedWrite` anyway must fail with
+        /// `EffectCountMismatch` (expected 0, actual 1) -- the new method
+        /// cannot smuggle a write past a packet that never declared one.
+        #[test]
+        fn commit_single_guest_render_target_write_rejects_a_packet_declaring_zero_guest_writes() {
+            let (mut session, mut authority) = new_raw_dpc_roles().unwrap();
+            let (planned, destination) = planned_fixture(&session, &authority, true);
+            let capture = matching_guest_read_capture(&planned);
+            let bound = session.finalize_and_submit(planned, capture).unwrap();
+            let write = CompletedWrite::try_new(
+                destination,
+                16,
+                fn64_render_ir::effect_content_digest(&[0x66; 16]),
+            )
+            .unwrap();
+            let effects =
+                BackendEffectReport::try_new(bound.submitted.packet(), vec![write]).unwrap();
+            let prepared = bound
+                .into_backend_prepared(&mut authority, effects)
+                .unwrap();
+
+            // The fabricated write must itself be `Write`/`RenderTarget`-
+            // shaped so it clears `commit_single_guest_render_target_write`'s
+            // own structural pre-check and reaches
+            // `GuestCommitEffectReport::try_new`'s count check -- proving
+            // *that* check (not the pre-check) is what rejects a
+            // TMEM-only packet's extra write.
+            let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(0x1000).unwrap();
+            let fabricated_range = layout.range(0x400, 0x410).unwrap();
+            let fabricated_access = ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(9),
+                AccessMode::Write,
+                AccessPurpose::RenderTarget,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+                    range: fabricated_range,
+                },
+            )
+            .unwrap();
+            let fabricated_write = CompletedWrite::try_new(
+                fabricated_access,
+                fabricated_range.len(),
+                fn64_render_ir::effect_content_digest(&[0x77; 16]),
+            )
+            .unwrap();
+            assert_eq!(
+                session
+                    .commit_single_guest_render_target_write(prepared, fabricated_write)
+                    .unwrap_err(),
+                ValidationError::EffectCountMismatch {
+                    field: "guest commit access",
+                    expected: 0,
+                    actual: 1,
+                }
+            );
+        }
+
+        /// Test 4 (design card section 13): a `CompletedWrite` whose access
+        /// does not match the journal's declared write access (here, a
+        /// different `ColorTargetKey`/range entirely -- otherwise
+        /// plausible) is rejected with `EffectAccessMismatch`.
+        #[test]
+        fn commit_single_guest_render_target_write_rejects_a_mismatched_access() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let content = fn64_render_ir::effect_content_digest(&[0x11; 16]);
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+            let mut session = matching_session_for(queue, guest);
+
+            let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(0x1000).unwrap();
+            let other_range = layout.range(0x300, 0x310).unwrap();
+            let other_access = ResourceAccess::try_new(
+                guest_write.operation(),
+                AccessMode::Write,
+                AccessPurpose::RenderTarget,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+                    range: other_range,
+                },
+            )
+            .unwrap();
+            let mismatched_write =
+                CompletedWrite::try_new(other_access, other_range.len(), content).unwrap();
+            assert_eq!(
+                session
+                    .commit_single_guest_render_target_write(prepared, mismatched_write)
+                    .unwrap_err(),
+                ValidationError::EffectAccessMismatch {
+                    field: "guest commit access",
+                    index: 0,
+                }
+            );
+        }
+
+        /// Test 5 (design card section 13): the single most important new
+        /// test -- a `CompletedWrite` with the *correct* access but a
+        /// *different* content digest than the one the backend already
+        /// staged in its `BackendEffectReport` is rejected. This proves the
+        /// new method cannot publish bytes other than what the backend
+        /// actually staged.
+        #[test]
+        fn commit_single_guest_render_target_write_rejects_a_content_digest_mismatch() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let staged_content = fn64_render_ir::effect_content_digest(&[0x22; 16]);
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, staged_content);
+            let mut session = matching_session_for(queue, guest);
+
+            let different_content = fn64_render_ir::effect_content_digest(&[0x33; 16]);
+            let corrupted_write = CompletedWrite::try_new(
+                guest_write,
+                guest_write.region().declared_bytes(),
+                different_content,
+            )
+            .unwrap();
+            assert_eq!(
+                session
+                    .commit_single_guest_render_target_write(prepared, corrupted_write)
+                    .unwrap_err(),
+                ValidationError::EffectAccessMismatch {
+                    field: "guest commit effect",
+                    index: 0,
+                }
+            );
+        }
+
+        /// Test 6 (design card section 13): a `CompletedWrite` proven
+        /// against one submission's ticket must not be acceptable to a
+        /// *different* submission's ticket, even on the exact same session
+        /// queue (same-session, cross-submission -- the new case this
+        /// design introduces; the cross-*session* variant is already
+        /// covered by `commit_zero_guest_writes_rejects_a_foreign_session_ticket`).
+        #[test]
+        fn commit_single_guest_render_target_write_rejects_a_same_session_cross_submission_write() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let content_a = fn64_render_ir::effect_content_digest(&[0x44; 16]);
+            let (queue, backend_authority, guest, _prepared_a, guest_write_a) =
+                render_target_write_fixture(queue, backend_authority, guest, content_a);
+            let write_a = CompletedWrite::try_new(
+                guest_write_a,
+                guest_write_a.region().declared_bytes(),
+                content_a,
+            )
+            .unwrap();
+
+            let content_b = fn64_render_ir::effect_content_digest(&[0x55; 16]);
+            let (queue, _backend_authority, guest, prepared_b, _guest_write_b) =
+                render_target_write_fixture(queue, backend_authority, guest, content_b);
+
+            let mut session = matching_session_for(queue, guest);
+            let outcome = session.commit_single_guest_render_target_write(prepared_b, write_a);
+            assert!(
+                outcome.is_err(),
+                "a CompletedWrite proven against submission A's ticket must not be \
+                 accepted against submission B's ticket, even from the same session queue"
+            );
+        }
+
+        /// Test 7 (design card section 13): a `CompletedWrite` whose access
+        /// mode/purpose does not match the single admitted shape (`Write`,
+        /// `RenderTarget`) is rejected by the method's own structural
+        /// pre-check before `GuestCommitEffectReport::try_new` is ever
+        /// called -- assert the specific error, not merely "some `Err`".
+        #[test]
+        fn commit_single_guest_render_target_write_rejects_wrong_mode_or_purpose_at_the_precheck() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let content = fn64_render_ir::effect_content_digest(&[0x88; 16]);
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+            let mut session = matching_session_for(queue, guest);
+
+            let tmem_destination_range = fn64_render_ir::TmemRange::try_new(0, 16).unwrap();
+            let wrong_purpose_access = ResourceAccess::try_new(
+                guest_write.operation(),
+                AccessMode::Write,
+                AccessPurpose::TmemLoadDestination,
+                fn64_render_ir::ResourceRegion::Tmem(tmem_destination_range),
+            )
+            .unwrap();
+            let wrong_purpose_write = CompletedWrite::try_new(
+                wrong_purpose_access,
+                tmem_destination_range.len(),
+                content,
+            )
+            .unwrap();
+            assert_eq!(
+                session
+                    .commit_single_guest_render_target_write(prepared, wrong_purpose_write)
+                    .unwrap_err(),
+                ValidationError::GuestRenderTargetWriteShapeMismatch {
+                    mode: "Write",
+                    purpose: "TmemLoadDestination",
+                }
             );
         }
     }
