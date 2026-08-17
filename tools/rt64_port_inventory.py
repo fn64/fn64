@@ -70,7 +70,226 @@ NON_FUNCTION_HINTS = {
     "return", "sizeof", "switch", "while",
 }
 MILESTONES = {"M1", "M3", "M4", "M5", "M6", "M8", "M10", "M11", "M12"}
-PORT_STATES = {"ported", "not-started", "authority-gated"}
+PORT_STATES = {"ported", "not-started", "refused", "authority-gated"}
+# Declared, citation-carrying refusals: sources a landed batch assessment
+# examined and settled as never-to-be-ported.
+#
+# `refused` is the one `port_state` that cannot be inferred from digests. A
+# digest proves a port happened; nothing in a byte stream can prove a human
+# read a file and concluded there is nothing in it worth owning. So this state
+# is *declared* -- and declared inputs are what this tool is built to distrust.
+# The distrust is discharged, not waived, by making every entry carry a
+# citation that the tool mechanically resolves against this repository:
+#
+#   `commit`   the full 40-hex SHA-1 of the landed assessment. `verify_refusals`
+#              resolves it with `git cat-file -t` in ROOT and requires a
+#              `commit` object whose message names this batch. A fabricated or
+#              rewritten-away SHA fails closed.
+#   `evidence` a repository-relative Rust module or document that records the
+#              reasoning. `verify_refusals` requires the file to exist. A
+#              refusal pointing at a deleted or invented file fails closed.
+#   `reason`   the one-line human judgement, for a reader who has the citation
+#              open in the other window.
+#
+# The `require()` in `validate_refusals` refuses a refusal with no citation
+# exactly as `port_state_for` refuses a `ported` claim with no digest: both
+# states must name the artifact a reader can check. What this deliberately
+# does NOT do is widen to a partial or behavioral claim -- `refused` says only
+# "an assessment settled this file", never "this file is done".
+#
+# Scope is closed at the two landed batch assessments. Every entry below is
+# one of the 17 `src/common` or 28 `src/render` sources those assessments
+# refused; nothing else may be added without a new landed assessment.
+COMMON_ASSESSMENT_COMMIT = "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85"
+COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs already implements"
+COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
+RENDER_ASSESSMENT_COMMIT = "2e915940693019ae4fee9fcae93976d18d401371"
+RENDER_ASSESSMENT_SUBJECT = "port RT64's tile-bounds lerp, refuse 28 of 29 render files"
+RENDER_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs"
+SCOPING_EVIDENCE = "docs/RT64-M6-M7-SCOPING.md"
+
+
+def _common_refusal(reason: str, evidence: str = COMMON_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": COMMON_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+def _render_refusal(reason: str, evidence: str = RENDER_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": RENDER_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+PORT_REFUSALS: dict[str, dict[str, str]] = {
+    # -- src/common, 17 of the 21 files the batch assessment refused. The other
+    # four (rt64_emulator_configuration.{cpp,h}, rt64_enhancement_configuration
+    # .{cpp,h}) were refused as *already fully owned* and are therefore
+    # `ported` via crates/fn64-render/src/settings.rs, not `refused`.
+    "src/common/rt64_dynamic_libraries.cpp": _common_refusal(
+        "Host dynamic-loader shim (dlopen/LoadLibrary); no CPU-side behavior to own."
+    ),
+    "src/common/rt64_dynamic_libraries.h": _common_refusal(
+        "Declarations for the host dynamic-loader shim; no arithmetic."
+    ),
+    "src/common/rt64_filesystem.h": _common_refusal(
+        "Abstract filesystem interface; pure virtual declarations, no behavior."
+    ),
+    "src/common/rt64_filesystem_directory.h": _common_refusal(
+        "std::filesystem directory-walk adapter; host I/O plumbing."
+    ),
+    "src/common/rt64_filesystem_zip.cpp": _common_refusal(
+        "miniz and zstd FFI archive reader over a mapped file; a vendored-library binding, "
+        "not portable behavior."
+    ),
+    "src/common/rt64_filesystem_zip.h": _common_refusal(
+        "Declarations over the miniz/zstd FFI archive reader."
+    ),
+    "src/common/rt64_hlslpp.h": _common_refusal(
+        "Third-party hlslpp include/pragma shim; 13 lines, no fn64-owned content."
+    ),
+    "src/common/rt64_load_types.cpp": _common_refusal(
+        "nlohmann to_json/from_json for the LoadTile and LoadTexture PODs; 38 of 60 lines "
+        "are one-to-one field copies and there is no arithmetic to own."
+    ),
+    "src/common/rt64_load_types.h": _common_refusal(
+        "POD field declarations for the above, over a vendored nlohmann json typedef."
+    ),
+    "src/common/rt64_mapped_file.cpp": _common_refusal(
+        "mmap / CreateFileMappingW host memory mapping; platform syscalls, not behavior."
+    ),
+    "src/common/rt64_mapped_file.h": _common_refusal(
+        "Declarations for the host memory-mapping wrapper."
+    ),
+    "src/common/rt64_plume.h": _common_refusal(
+        "Five-line include of RT64's plume RHI, which the port plan refuses to transliterate.",
+        SCOPING_EVIDENCE,
+    ),
+    "src/common/rt64_sommelier.h": _common_refusal(
+        "Wine/Sommelier host detection; compiles to nothing on macOS."
+    ),
+    "src/common/rt64_thread.cpp": _common_refusal(
+        "pthread_setname_np / SetThreadDescription thread naming; host threading only."
+    ),
+    "src/common/rt64_thread.h": _common_refusal(
+        "Declarations for the host thread-naming helper."
+    ),
+    "src/common/rt64_user_paths.cpp": _common_refusal(
+        "Per-platform user/config directory discovery; host path policy, not RT64 behavior."
+    ),
+    "src/common/rt64_user_paths.h": _common_refusal(
+        "Declarations for per-platform user-path discovery."
+    ),
+    # -- src/render, the 28 files the batch assessment refused (of the 29 it
+    # examined; the 29th, rt64_tile_processor.cpp, is `ported`).
+    "src/render/rt64_descriptor_sets.h": _render_refusal(
+        "677 lines of 21 RenderDescriptorSetBase subclasses; every non-declaration "
+        "line is a builder.add* call and there is zero arithmetic, enumerated not sampled."
+    ),
+    "src/render/rt64_framebuffer_renderer.h": _render_refusal(
+        "Framebuffer-renderer declarations over plume RHI handles; its .cpp arithmetic "
+        "is separately owned by rt64_render_target_geometry.rs."
+    ),
+    "src/render/rt64_framebuffer_renderer_call.h": _render_refusal(
+        "Renderer-call bitfields; refused rather than ported because this program makes "
+        "no repr(C)/size/alignment/ABI claim."
+    ),
+    "src/render/rt64_geometry_mode.cpp": _render_refusal(
+        "The briefed bit-decoding hypothesis fails: the body is `this->v = v;`, with no "
+        "bit decoding and no G_ZBUFFER/G_CULL constant anywhere in the file."
+    ),
+    "src/render/rt64_geometry_mode.h": _render_refusal(
+        "Companion declaration to the above; no constant and no arithmetic."
+    ),
+    "src/render/rt64_look_at_processor.h": _render_refusal(
+        "Bare declarations; the processor's interpolation body is already ported by "
+        "crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
+    ),
+    "src/render/rt64_native_target.h": _render_refusal(
+        "RHI-resource declarations; the geometry arithmetic in its .cpp is already ported "
+        "by crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs."
+    ),
+    "src/render/rt64_optimus.cpp": _render_refusal(
+        "Fourteen lines whose entire body is `#ifdef _WIN32`-guarded, exporting the single "
+        "`NvOptimusEnablement` DWORD; compiles to nothing on macOS."
+    ),
+    "src/render/rt64_projection_processor.h": _render_refusal(
+        "Bare declarations; the processor's body is already ported by "
+        "crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
+    ),
+    "src/render/rt64_raster_shader.h": _render_refusal(
+        "Declarations over plume RHI pipeline objects; its .cpp is authority-gated.",
+        SCOPING_EVIDENCE,
+    ),
+    "src/render/rt64_raster_shader_cache.h": _render_refusal(
+        "Thread-pool and RHI cache declarations; the port plan refuses plume's thread topology.",
+        SCOPING_EVIDENCE,
+    ),
+    "src/render/rt64_render_target.h": _render_refusal(
+        "RHI-handle declarations; its .cpp geometry is already ported by "
+        "crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs."
+    ),
+    "src/render/rt64_render_target_manager.cpp": _render_refusal(
+        "Its only non-plumbing content is hash() == XXH3_64bits(this, sizeof(RenderTargetKey)), "
+        "which hashes struct padding, so which keys collide depends on ABI layout. Refused "
+        "rather than decided; a future card wanting target-key identity needs an explicit ABI decision."
+    ),
+    "src/render/rt64_render_target_manager.h": _render_refusal(
+        "Declarations for the above, including the RenderTargetKey whose byte layout the "
+        "refused hash depends on."
+    ),
+    "src/render/rt64_render_worker.cpp": _render_refusal(
+        "Plume command-queue/list/fence plumbing with no arithmetic; the port plan refuses to "
+        "transliterate the plume RHI, and wgpu is already fn64's RHI.",
+        SCOPING_EVIDENCE,
+    ),
+    "src/render/rt64_render_worker.h": _render_refusal(
+        "Declarations for the plume command-queue worker.",
+        SCOPING_EVIDENCE,
+    ),
+    "src/render/rt64_rsp_processor.cpp": _render_refusal(
+        "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs "
+        "already refused in writing, calling GROUP_SIZE 64 \"a dispatch tile width\"."
+    ),
+    "src/render/rt64_rsp_processor.h": _render_refusal(
+        "Declarations for the above dispatch bookkeeping."
+    ),
+    "src/render/rt64_sampler_library.h": _render_refusal(
+        "Plume sampler-object declarations; no arithmetic."
+    ),
+    "src/render/rt64_shader_library.h": _render_refusal(
+        "Plume shader-object declarations; its .cpp is authority-gated."
+    ),
+    "src/render/rt64_texture.h": _render_refusal(
+        "RHI texture-handle declarations; the texture-cache behavior is separately owned by "
+        "crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs."
+    ),
+    "src/render/rt64_tile_processor.h": _render_refusal(
+        "Refused in full and deliberately not digest-cited: bare member and method declarations "
+        "plus a ProcessParams pointer bundle, whose only non-pointer contents are two call-site "
+        "float defaults."
+    ),
+    "src/render/rt64_transform_processor.cpp": _render_refusal(
+        "Its math is hlslpp::inverse/transpose plus a RigidBody::lerp that is separately owned."
+    ),
+    "src/render/rt64_transform_processor.h": _render_refusal(
+        "Declarations for the above."
+    ),
+    "src/render/rt64_upscaler.h": _render_refusal(
+        "Refused in full as an explicit non-goal of the post-process card that ported "
+        "rt64_upscaler.cpp; see crates/fn64-render-wgpu/src/rt64_postprocess.rs.",
+        "crates/fn64-render-wgpu/src/rt64_postprocess.rs",
+    ),
+    "src/render/rt64_vertex_processor.cpp": _render_refusal(
+        "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs "
+        "already refused in writing -- vertexStart/vertexCount \"exist only to index and bound "
+        "the dispatch\"."
+    ),
+    "src/render/rt64_vertex_processor.h": _render_refusal(
+        "Declarations for the above dispatch bookkeeping."
+    ),
+    "src/render/rt64_vi_renderer.h": _render_refusal(
+        "Plume RHI declarations; its .cpp is authority-gated."
+    ),
+}
+REFUSAL_KEYS = {"commit", "evidence", "reason"}
+FULL_SHA1 = re.compile(r"[0-9a-f]{40}")
 # Rust-port crates only: fn64-render-rt64 is a C++ FFI shim/authority-gate
 # guard crate, never itself a Rust reimplementation of RT64 source, so its
 # files (including its own guard/self-tests over the C++ overlay) are never
@@ -375,18 +594,77 @@ def route_for(relative: str, gates: dict[str, dict]) -> tuple[str, str, str, str
     raise InventoryError(f"unrouted admitted RT64 source: {relative}")
 
 
-def port_state_for(gated: bool, ported_as: list[str]) -> str:
-    """Derive `port_state` from mechanically detected port evidence.
+def refusal_for(relative: str) -> dict[str, str] | None:
+    """The declared, citation-carrying refusal record for a source, or None.
+
+    Unlike `ported`, this is not derivable from bytes: no digest can witness
+    a human having read a file and settled that it holds nothing to own. The
+    declaration is admitted only because `verify_refusals` resolves both of
+    its citations against this repository before any inventory is built.
+    """
+    return PORT_REFUSALS.get(relative)
+
+
+def verify_refusals(root: Path) -> None:
+    """Resolve every declared refusal's citations, or fail closed.
+
+    This is the `refused` state's analogue of the whole-file SHA-256 scan that
+    backs `ported`: a refusal is admitted only if a reader can follow it. The
+    assessing commit must exist in this repository as a `commit` object whose
+    message carries the batch's own subject line, and the cited evidence file
+    must exist. An asserted refusal with a fabricated, rewritten-away, or
+    absent citation raises rather than being silently believed.
+    """
+    resolved_subjects: dict[str, str] = {}
+    for relative, record in sorted(PORT_REFUSALS.items()):
+        require(set(record) == REFUSAL_KEYS, f"{relative}: refusal record fields changed")
+        for key in sorted(REFUSAL_KEYS):
+            value = record[key]
+            require(isinstance(value, str) and value.strip(), f"{relative}: refusal {key} is empty")
+        commit = record["commit"]
+        require(FULL_SHA1.fullmatch(commit) is not None, f"{relative}: refusal commit is not a full SHA-1")
+        evidence = record["evidence"]
+        require(not evidence.startswith(("/", "~/")), f"{relative}: refusal evidence is not repository-relative")
+        require((root / evidence).is_file(), f"{relative}: refusal cites a file that does not exist: {evidence}")
+        if commit not in resolved_subjects:
+            try:
+                kind = git(root, "cat-file", "-t", commit)
+            except InventoryError:
+                kind = None
+            require(kind == "commit", f"{relative}: refusal commit is not a commit object: {commit}")
+            resolved_subjects[commit] = git(root, "log", "-1", "--format=%s", commit)
+        expected_subject = {
+            COMMON_ASSESSMENT_COMMIT: COMMON_ASSESSMENT_SUBJECT,
+            RENDER_ASSESSMENT_COMMIT: RENDER_ASSESSMENT_SUBJECT,
+        }.get(commit)
+        require(expected_subject is not None, f"{relative}: refusal cites an undeclared assessment: {commit}")
+        require(
+            expected_subject in resolved_subjects[commit],
+            f"{relative}: refusal commit {commit[:8]} is not the declared assessment",
+        )
+
+
+def port_state_for(gated: bool, ported_as: list[str], refusal: dict[str, str] | None = None) -> str:
+    """Derive `port_state` from mechanically detected port evidence, plus the
+    one declared input this tool admits.
 
     `authority-gated` is a path-derived source-overlay constraint and takes
     priority (it is never itself completion evidence). Otherwise a source is
     `ported` only when at least one Rust module in a port-target crate cites
-    its exact whole-file SHA-256 digest (`ported_as_for`); everything else is
-    `not-started`. This never widens to a partial/behavioral claim.
+    its exact whole-file SHA-256 digest (`ported_as_for`). `refused` is the
+    single declared state: a landed batch assessment settled the file as
+    never-to-be-ported, and `verify_refusals` has resolved that assessment's
+    commit and evidence file before this runs. Digest evidence still wins over
+    a declaration -- if someone refuses a file a Rust module actually cites,
+    the citation is the stronger fact and the file reads `ported`. Everything
+    else is `not-started`. This never widens to a partial/behavioral claim:
+    `refused` asserts an assessment happened, never that behavior is covered.
     """
     if gated:
         return "authority-gated"
-    return "ported" if ported_as else "not-started"
+    if ported_as:
+        return "ported"
+    return "refused" if refusal else "not-started"
 
 
 def rust_port_source_files(root: Path) -> list[Path]:
@@ -505,6 +783,7 @@ def source_set_digest(files: list[dict]) -> str:
 def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict:
     validate_tree(oracle_tree, authority, "oracle")
     validate_tree(port_tree, authority, "port")
+    verify_refusals(ROOT)
     gates = {item["path"]: item for item in authority["overlays"]["source_gates"]}
     paths_by_source = {
         "oracle": source_paths(oracle_tree, authority),
@@ -522,7 +801,8 @@ def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict
             for name in SOURCE_SELECTIONS
         }
         ported_as = ported_as_for(sources, citation_index)
-        port_state = port_state_for(gated, ported_as)
+        refusal = refusal_for(relative)
+        port_state = port_state_for(gated, ported_as, refusal)
         writable_paths = ported_as if ported_as else [proposed_rust_destination(relative, milestone)]
         item = {
             "path": relative,
@@ -554,6 +834,8 @@ def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict
                 "claim_status": "candidate-observation",
             },
         }
+        if port_state == "refused":
+            item["port_refusal"] = dict(refusal)
         if relative in gates:
             item["authority_gate"] = {
                 "mechanisms": gates[relative]["mechanisms"],
@@ -664,6 +946,9 @@ def validate_inventory(value: dict, authority: dict) -> None:
     }
     gates = {item["path"]: item for item in authority["overlays"]["source_gates"]}
     require(set(gates) <= known, f"authority gates missing from inventory: {sorted(set(gates) - known)}")
+    verify_refusals(ROOT)
+    require(set(PORT_REFUSALS) <= known, f"declared refusals missing from inventory: {sorted(set(PORT_REFUSALS) - known)}")
+    require(not (set(PORT_REFUSALS) & set(gates)), f"refusal collides with an authority gate: {sorted(set(PORT_REFUSALS) & set(gates))}")
     citation_index = sha256_citation_index(ROOT)
     port_source_files = {
         path.resolve().relative_to(ROOT.resolve()).as_posix() for path in rust_port_source_files(ROOT)
@@ -673,7 +958,14 @@ def validate_inventory(value: dict, authority: dict) -> None:
     for item in files:
         path = item["path"]
         base_keys = {"path", "sources", "port_delta", "milestone", "workstream", "port_state", "ported_as", "evidence_state", "task_card"}
-        require(set(item) in (base_keys, base_keys | {"authority_gate"}), f"{path}: file entry fields changed")
+        # Still an exact closed key set, deliberately widened by exactly one
+        # optional key. `port_refusal` and `authority_gate` are mutually
+        # exclusive by construction (`authority-gated` wins in
+        # `port_state_for`), so no entry may carry both.
+        require(
+            set(item) in (base_keys, base_keys | {"authority_gate"}, base_keys | {"port_refusal"}),
+            f"{path}: file entry fields changed",
+        )
         in_prefix = path.startswith(tuple(prefix + "/" for prefix in SOURCE_PREFIXES))
         require(in_prefix or path in allowed_authority_exceptions(authority), f"out-of-scope source path: {path}")
         require(not path.startswith(EXCLUDED_PREFIXES) or path in allowed_authority_exceptions(authority), f"excluded path in inventory: {path}")
@@ -703,7 +995,19 @@ def validate_inventory(value: dict, authority: dict) -> None:
             require(module in port_source_files, f"{path}: ported_as cites a Rust file that does not exist: {module}")
             require(module.startswith("crates/") and "fn64-render-rt64/" not in module, f"{path}: ported_as cites a non-port-crate module: {module}")
         require(item["port_state"] in PORT_STATES, f"{path}: invalid port_state")
-        require(item["port_state"] == port_state_for(expected_gated, ported_as), f"{path}: port_state is not derived from gated status and ported_as")
+        expected_refusal = refusal_for(path)
+        require(
+            item["port_state"] == port_state_for(expected_gated, ported_as, expected_refusal),
+            f"{path}: port_state is not derived from gated status, ported_as, and the declared refusal",
+        )
+        if item["port_state"] == "refused":
+            # The refusal must carry its evidence, exactly as `ported` must
+            # carry its digest. `verify_refusals` has already resolved the
+            # cited commit and file; this pins the emitted record to it.
+            require("port_refusal" in item, f"{path}: refused without a citation")
+            require(item["port_refusal"] == expected_refusal, f"{path}: refusal record drift from the declared table")
+        else:
+            require("port_refusal" not in item, f"{path}: spurious refusal record")
         require(item["evidence_state"] == "source-digests-verified", f"{path}: source evidence state drift")
         require(card["id"] == card_id(path, item["milestone"]), f"{path}: task-card id drift")
         require(set(card["authority"]) == {"port_source", "comparison_oracle", "plan"}, f"{path}: task authority fields changed")
@@ -764,28 +1068,34 @@ def markdown(inventory: dict) -> str:
         f"- Primary semantic port input: [`{sources['port']['commit'][:7]}`]({sources['repository']}/commit/{sources['port']['commit']}) (`{sources['port']['authority_status']}`).",
         f"- Denominator: {len(files)} project-owned or explicitly authority-gated host/shader files; `{sum((item['sources']['port'] or item['sources']['oracle'])['lines'] for item in files) / 1000:.3f}` KLOC at the primary port pin.",
         f"- Port delta: {delta['added']} added, {delta['removed']} removed, {delta['modified']} modified, {delta['unchanged']} unchanged source files.",
-        f"- Port state: {state_counts['ported']} `ported`, {state_counts['not-started']} `not-started`, {state_counts['authority-gated']} `authority-gated` (of {len(files)}).",
+        f"- Port state: {state_counts['ported']} `ported`, {state_counts['not-started']} `not-started`, {state_counts['refused']} `refused`, {state_counts['authority-gated']} `authority-gated` (of {len(files)}).",
         f"- Source-set SHA-256: `{inventory['source_set_sha256']}`.",
         "- Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.",
         "- Paths are repository-relative; the checked artifact rejects machine-local paths.", "",
         "`candidate_hints` in the JSON are deliberately non-exhaustive regex navigation aids, not a symbol denominator.", "",
-        "`port_state` is mechanically derived, never hand-set: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
+        "`port_state` is mechanically derived from digests and paths, with one declared exception: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
+        "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the two landed batch assessments of `src/common` (17 files) and `src/render` (28 files).", "",
         "## Milestone denominator", "", "| milestone | files | primary-port KLOC |", "|---|---:|---:|",
     ]
     for milestone in sorted(totals, key=lambda item: int(item[1:])):
         count, lines = totals[milestone]
         output.append(f"| `{milestone}` | {count} | `{lines / 1000:.3f}` |")
-    output.extend(["", "## Source work cards", "", "Each row is one source-bound candidate card with its mechanically derived port state and writable destination(s). JSON carries its outcome, both authorities, exact destination(s), non-goals, baseline, exit gate, evidence state, and candidate-vs-claim status.", "", "| source | delta | port state | ported as | lines | hints | deps | milestone / workstream | source evidence | task evidence / claim | owner | card |", "|---|---|---|---|---:|---:|---:|---|---|---|---|---|"])
+    output.extend(["", "## Source work cards", "", "Each row is one source-bound candidate card with its mechanically derived port state and writable destination(s). JSON carries its outcome, both authorities, exact destination(s), non-goals, baseline, exit gate, evidence state, and candidate-vs-claim status.", "", "| source | delta | port state | ported as / refusal citation | lines | hints | deps | milestone / workstream | source evidence | task evidence / claim | owner | card |", "|---|---|---|---|---:|---:|---:|---|---|---|---|---|"])
     for item in files:
         primary = item["sources"]["port"] or item["sources"]["oracle"]
         card = item["task_card"]
         ported_as = ", ".join(f"`{module}`" for module in item["ported_as"]) or "--"
+        if "port_refusal" in item:
+            # A refused row carries its citation in the table itself, so the
+            # burndown reader can check it without opening the JSON.
+            refusal = item["port_refusal"]
+            ported_as = f"refused by `{refusal['commit'][:8]}`, see `{refusal['evidence']}`"
         output.append(
             f"| `{item['path']}` | `{item['port_delta']}` | `{item['port_state']}` | {ported_as} | {primary['lines']} | {len(primary['candidate_hints'])} | {len(primary['dependencies'])} | "
             f"`{item['milestone']}` / `{item['workstream']}` | `{item['evidence_state']}` | `{card['evidence_state']}` / `{card['claim_status']}` | "
             f"`{card['owner_lane']}` ({card['recommended_profile']}) | `{card['id']}` |"
         )
-    output.extend(["", "`authority-gated` is a source-overlay constraint, never completion evidence. Every task remains a candidate observation until its card exit gate and reliability bar pass.", ""])
+    output.extend(["", "`authority-gated` is a source-overlay constraint, never completion evidence. A `refused` row's `ported as` cell names the assessing commit and evidence file instead of a module, because a refusal is a documented human judgement and must be checkable; it credits no line as ported. Every task remains a candidate observation until its card exit gate and reliability bar pass.", ""])
     return "\n".join(output)
 
 
@@ -856,11 +1166,58 @@ def self_test() -> None:
     mutated = copy.deepcopy(base)
     ported = next(item for item in mutated["files"] if item["ported_as"])
     ported["port_state"] = "not-started"
-    expect_rejected(mutated, authority, "port_state is not derived from gated status and ported_as")
+    expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
     mutated = copy.deepcopy(base)
     not_started = next(item for item in mutated["files"] if item["port_state"] == "not-started")
     not_started["ported_as"] = ["crates/fn64-render-wgpu/src/rt64_math.rs"]
     expect_rejected(mutated, authority, "ported_as drift from mechanical SHA-256 citation scan")
+    # A refusal must carry its evidence, exactly as `ported` must carry its
+    # digest. Each mutation below is one way a reader could be lied to.
+    mutated = copy.deepcopy(base)
+    refused = next(item for item in mutated["files"] if item["port_state"] == "refused")
+    refused.pop("port_refusal")
+    expect_rejected(mutated, authority, "refused without a citation")
+    mutated = copy.deepcopy(base)
+    refused = next(item for item in mutated["files"] if item["port_state"] == "refused")
+    refused["port_refusal"] = dict(refused["port_refusal"], commit="0" * 40)
+    expect_rejected(mutated, authority, "refusal record drift from the declared table")
+    mutated = copy.deepcopy(base)
+    undeclared = next(item for item in mutated["files"] if item["port_state"] == "not-started")
+    undeclared["port_state"] = "refused"
+    expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
+    mutated = copy.deepcopy(base)
+    refused = next(item for item in mutated["files"] if item["port_state"] == "refused")
+    refused["port_state"] = "not-started"
+    expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
+    mutated = copy.deepcopy(base)
+    plain = next(item for item in mutated["files"] if item["port_state"] == "ported")
+    plain["port_refusal"] = {"commit": "0" * 40, "evidence": "docs/RT64-PORT-AUTHORITY.md", "reason": "asserted"}
+    expect_rejected(mutated, authority, "spurious refusal record")
+    # And a third key alongside both optional ones is still rejected outright,
+    # so widening the closed key set by one did not open it.
+    mutated = copy.deepcopy(base)
+    mutated["files"][0]["port_note"] = "asserted"
+    expect_rejected(mutated, authority, "file entry fields changed")
+    # And the declaration itself must resolve: a refusal with no citation, an
+    # unresolvable commit, or a missing evidence file must fail closed.
+    for broken, needle in (
+        ({"commit": RENDER_ASSESSMENT_COMMIT, "evidence": RENDER_ASSESSMENT_EVIDENCE}, "refusal record fields changed"),
+        ({"commit": RENDER_ASSESSMENT_COMMIT, "evidence": RENDER_ASSESSMENT_EVIDENCE, "reason": "  "}, "refusal reason is empty"),
+        ({"commit": "0" * 40, "evidence": RENDER_ASSESSMENT_EVIDENCE, "reason": "asserted"}, "refusal commit is not a commit object"),
+        ({"commit": "not-a-sha", "evidence": RENDER_ASSESSMENT_EVIDENCE, "reason": "asserted"}, "refusal commit is not a full SHA-1"),
+        ({"commit": RENDER_ASSESSMENT_COMMIT, "evidence": "docs/does-not-exist.md", "reason": "asserted"}, "refusal cites a file that does not exist"),
+        ({"commit": RENDER_ASSESSMENT_COMMIT, "evidence": "/Users/example/notes.md", "reason": "asserted"}, "refusal evidence is not repository-relative"),
+    ):
+        probe = "src/render/zzz_probe_only.h"
+        PORT_REFUSALS[probe] = broken
+        try:
+            verify_refusals(ROOT)
+        except InventoryError as error:
+            require(needle in str(error), f"uncited refusal rejected for the wrong reason: {error}")
+        else:
+            raise InventoryError(f"uncited refusal was accepted; expected {needle!r}")
+        finally:
+            del PORT_REFUSALS[probe]
     mutated = copy.deepcopy(base)
     not_started_two = [item for item in mutated["files"] if item["port_state"] == "not-started"][:2]
     require(len(not_started_two) == 2, "self-test fixture requires at least two not-started files")
