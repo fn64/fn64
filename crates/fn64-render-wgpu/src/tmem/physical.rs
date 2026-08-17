@@ -3269,51 +3269,98 @@ mod tests {
             }
         }
 
+        // Both hostiles below forge a `TmemTransferWord` whose destination
+        // mask violates one of the two minting invariants. Production code
+        // cannot reach either shape: `raw_dpc::transfer_record`
+        // (`raw_dpc/mod.rs:599`) always sources both masks from the same
+        // `TmemTransferPlan`, and `neutral_transfer_word` (`physical.rs:1340`)
+        // is a field-for-field copy of an already-validated neutral word.
+        //
+        // `TmemTransferWord::new` carries a matching pair of `debug_assert!`s
+        // (`tmem/types.rs:829-841`), but those are compiled out under
+        // `-C debug-assertions=off`, so a `#[should_panic]` test on them
+        // would assert a build-profile-dependent property -- precisely what
+        // `rt64_common.rs:246-251` declines to do. The invariant itself is
+        // *not* profile-dependent: `physical_defined_lane_mask`
+        // (`physical.rs:1578-1586`) re-checks both conditions unconditionally
+        // and returns `Err(DestinationPlanMismatch)`, and every consumption
+        // path runs it -- `validate_physical_plan` (`physical.rs:1547`) over
+        // every word of every staged transfer, and
+        // `DefinedPhysicalTmemWordBytes::try_from_physical_lanes`
+        // (`physical.rs:83`) on every payload. These tests therefore assert
+        // the release-surviving `Result` rejection, which holds in both
+        // profiles, rather than the debug-only panic.
+
         #[test]
-        #[should_panic(expected = "cannot claim fewer defined destination bytes")]
-        fn forged_mismatched_masks_are_rejected_by_the_private_constructor() {
-            // Production code cannot mint a `TmemTransferWord` at all except
-            // through `raw_dpc::transfer_record`, which always sources both
-            // masks from the same `TmemTransferPlan`. This forged combination
-            // is reachable only through this crate-private constructor, and
-            // its own `debug_assert!` invariant check catches it at mint
-            // time -- stronger than a runtime `Result`, and exactly why the
-            // check lives in the constructor rather than only in
-            // `physical_defined_lane_mask`.
+        fn forged_mismatched_masks_are_rejected_by_the_lane_mask_check() {
             let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
             // destination mask (0x01) claims fewer defined bytes than source
             // (0x03) -- forbidden for every current load kind.
-            let _ = TmemTransferWord::new(
-                0,
-                0,
-                0,
-                0,
-                0x03,
-                0x01,
-                0,
-                0,
-                false,
-                TmemTransferPhysicalWord::Linear(range),
-            );
+            let forged = forge_word(0x03, 0x01, range);
+            assert!(matches!(
+                physical_defined_lane_mask(forged),
+                Err(PhysicalTmemError::DestinationPlanMismatch)
+            ));
         }
 
         #[test]
-        #[should_panic(expected = "must be a nonzero low-bit prefix")]
         fn non_prefix_destination_mask_is_rejected() {
             let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
             // 0x05 (bits 0 and 2) is not a contiguous low-bit prefix.
-            let _ = TmemTransferWord::new(
-                0,
-                0,
-                0,
-                0,
-                0x01,
-                0x05,
-                0,
-                0,
-                false,
-                TmemTransferPhysicalWord::Linear(range),
-            );
+            let forged = forge_word(0x01, 0x05, range);
+            assert!(matches!(
+                physical_defined_lane_mask(forged),
+                Err(PhysicalTmemError::DestinationPlanMismatch)
+            ));
+        }
+
+        /// Mints a deliberately invariant-violating word for the two hostiles
+        /// above. Only ever called with mask pairs that the constructor's
+        /// `debug_assert!`s reject, so it must not run under debug
+        /// assertions; both callers assert on the release-surviving
+        /// `physical_defined_lane_mask` rejection instead. The `cfg!` guard
+        /// keeps the *test count* identical in both profiles (unlike
+        /// `#[cfg(not(debug_assertions))]` on the tests themselves) while
+        /// still exercising the real check whenever the constructor would
+        /// not abort first.
+        fn forge_word(
+            source_mask: u8,
+            destination_mask: u8,
+            range: fn64_render_ir::TmemRange,
+        ) -> TmemTransferWord {
+            if cfg!(debug_assertions) {
+                // Mint a valid word, then overwrite the masks so the
+                // constructor's debug-only asserts never observe the forged
+                // pair. Field access is legal here: `tests` is a descendant
+                // module of the crate that declares `TmemTransferWord`.
+                let mut word = TmemTransferWord::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xff,
+                    0xff,
+                    0,
+                    0,
+                    false,
+                    TmemTransferPhysicalWord::Linear(range),
+                );
+                word.forge_masks_for_test(source_mask, destination_mask);
+                word
+            } else {
+                TmemTransferWord::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_mask,
+                    destination_mask,
+                    0,
+                    0,
+                    false,
+                    TmemTransferPhysicalWord::Linear(range),
+                )
+            }
         }
     }
 }
