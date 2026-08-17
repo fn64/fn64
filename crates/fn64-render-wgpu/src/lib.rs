@@ -395,6 +395,7 @@ mod rt64_tmem_regions;
 mod rt64_upload_geometry;
 mod rt64_user_configuration;
 mod rt64_vi_registers;
+mod rt64_vi_timing;
 mod rt64_workload_geometry;
 mod shader_manifest;
 mod state;
