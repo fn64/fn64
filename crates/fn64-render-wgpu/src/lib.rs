@@ -357,6 +357,7 @@ mod rt64_gbi_rdp_decode;
 mod rt64_gbi_s2dex2;
 mod rt64_interpolation_helpers;
 mod rt64_light_estimation;
+mod rt64_lights_math;
 mod rt64_luminance_histogram;
 mod rt64_math;
 mod rt64_math_decompose;
