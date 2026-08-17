@@ -77,7 +77,7 @@ None.
 
 - `M8.11` — owner: shader-description serialization writer; branch: `port/m8-shader-description` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the packed description struct and toShader(); golden-test the emitted string for a set of representative combiner/othermode inputs.
 
-- `M8.12` — owner: frame-compatibility predicate writer; branch: `port/m8-frame-compatibility` -> `main`; dependencies: M8.3=READY; reliability: **NOT RECORDED**; next: Port the two predicates over local descriptor structs once M8.3 supplies matrixDifference; test the tolerance boundary and each rejecting field.
+- `M8.12` — owner: frame-compatibility predicate writer; branch: `port/m8-frame-compatibility` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Code has landed: both predicates are ported over local descriptor structs, with the tolerance boundary and each rejecting field tested. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 - `M8.13` — owner: lookat/projection helper writer; branch: `port/m8-lookat-projection-helpers` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the two fragments as free functions with the small POD inputs they need; test the lerp at weight 0, 1, and midpoint, and the aspect scale against hand-computed matrices.
 
@@ -1585,20 +1585,21 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
 | owner | frame-compatibility predicate writer |
 | branch | `port/m8-frame-compatibility` -> `main` |
-| dependencies | M8.3=READY |
+| dependencies | none |
 | writable paths | `crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs` |
 | reliability | **NOT RECORDED** |
 
 **Findings:**
 
-- Source: src/hle/rt64_game_frame.cpp (1042 lines) -- port ONLY the two predicates at lines 15-73. The file has zero ImGui, but the remaining ~970 lines (set/match/matchScene/matchTransform/buildCallHashMap) need WorkloadQueue, RenderWorker, and BufferUploader and are NOT in scope for this card.
-- The predicates themselves only compare depth/color image address, fmt, siz, width, and two matrix differences against a 1e-6 tolerance. Port them against minimal local descriptor structs rather than dragging in the workload graph.
-- Depends on M8.3 for matrixDifference, which isSceneCompatible calls. rt64_math.rs currently defers that symbol.
-- rt64_math.rs's Nonclaims already states 'rt64_game_frame.cpp itself remains unported' -- this card narrows that gap without contradicting it; update that sentence to name the two predicates now covered.
-- The 1e-6 MatrixDiffTolerance is a literal from the source; test at, just inside, and just outside it.
+- Source: src/hle/rt64_game_frame.cpp (1042 lines) -- ported ONLY the two predicates at lines 15-73. The file has zero ImGui; the remaining ~970 lines (set/match/matchScene/matchTransform/buildCallHashMap) were deliberately declined, not deferred: they are RHI/thread plumbing over WorkloadQueue, RenderWorker, and BufferUploader that this card's scope excludes by design.
+- Landed: crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs (896 lines, declared in lib.rs) ports both predicates over local descriptor structs (FramebufferPairIndex, ColorImageFields, DepthImageFields, FbPairFields) and covers them with 40 unit tests, including the 1e-6 tolerance at/just-inside/just-outside and one rejecting-field case per compared field.
+- The M8.3 dependency is discharged. It was recorded because isSceneCompatible calls matrixDifference, but the landed port takes the two matrix differences as caller-supplied f32 inputs, so it never calls that symbol. M8.3's matrix_difference has since landed in rt64_math_matrix.rs regardless.
+- The predicates only compare depth/color image address, fmt, siz, width, and two matrix differences against a 1e-6 tolerance -- ported against minimal local descriptor structs rather than dragging in the workload graph.
+- The union of what this card needs from RT64's HLE object graph is four scalar color-image fields, one depth address, two depth bools, and a two-u32 index pair. The wider Workload/WorkloadQueue graph exists to accumulate frames for motion interpolation, a feature fn64 does not implement, so it is out of scope by design rather than a pending prerequisite.
+- rt64_math.rs's Nonclaims sentence 'rt64_game_frame.cpp itself remains unported' was left as-is: narrowing it falls outside this card's exclusive-paths scope.
 - Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
 
-**Next action:** Port the two predicates over local descriptor structs once M8.3 supplies matrixDifference; test the tolerance boundary and each rejecting field.
+**Next action:** Code has landed: both predicates are ported over local descriptor structs, with the tolerance boundary and each rejecting field tested. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.
 
 ### `M8.13` -- Port the LookAtProcessor lerp formula and adjustProjectionMatrix as two small pure helpers, excluding all BufferUploader/RHI plumbing. Unwired CPU helper, no parity claim.
 
