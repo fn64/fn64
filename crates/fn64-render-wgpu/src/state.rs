@@ -6,15 +6,64 @@
 //! field widths, and variant ordering match exactly), cross-checked against
 //! the permitted MIT RT64 source pinned by `docs/RT64-PORT-AUTHORITY.md`:
 //! `src/shared/rt64_other_mode.h` (field selection: `alphaCompare`,
-//! `cycleType`, `combKey`, `cvgDst`, `clrOnCvg`, `cvgXAlpha`, `alphaCvgSel`,
-//! `forceBlend`, `textPersp`, `textFilt`, `textLOD`, `textDetail`, `textLUT`,
-//! `alphaDither`, `rgbDither`, `aaEn`, `zCmp`, `zUpd`, `zMode`, `zSource`) and
+//! `blenderInputs`, `cycleType`, `combKey`, `cvgDst`, `clrOnCvg`, `cvgXAlpha`,
+//! `alphaCvgSel`, `forceBlend`, `textPersp`, `textFilt`, `textLOD`,
+//! `textDetail`, `textLUT`, `alphaDither`, `rgbDither`, `aaEn`, `zCmp`,
+//! `zUpd`, `zMode`, `zSource`) and
 //! `src/shared/rt64_f3d_defines.h` (the `G_MDSFT_*` shift constants and
 //! `AA_EN`/`Z_CMP`/`Z_UPD`/`IM_RD`/`CLR_ON_CVG`/`CVG_DST_*`/`ZMODE_*`/
 //! `CVG_X_ALPHA`/`ALPHA_CVG_SEL`/`FORCE_BL` masks), pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`. `one_primitive_pipeline` (high
 //! bit 23) is not present in RT64's `OtherMode` struct; it is carried over
 //! from the reference's public `ultra64/gbi.h` provenance only.
+//!
+//! ## Corroboration against the pinned RT64 header
+//!
+//! The cross-checked source is `src/shared/rt64_other_mode.h` at that pinned
+//! commit, SHA-256 of the whole file
+//! `01096cbd3ff147bba9bdc334d0112e3a1dfa0f09a87b858bac9965bdcf38ca67` (104
+//! lines). That digest was computed here with `shasum -a 256` against the
+//! pinned checkout and cross-checked verbatim against
+//! `docs/rt64-port-inventory.json`'s
+//! `files[path="src/shared/rt64_other_mode.h"].sources.port.sha256`, which
+//! records the identical digest; the inventory's `sources.oracle.sha256`
+//! agrees, so the oracle and port trees hold this file byte for byte alike.
+//!
+//! **The digest citation is not a transcription claim.** The bit positions,
+//! field widths, and encoding values here descend from the admitted
+//! reference, whose own provenance is the public SGI SDK header
+//! `ultra64/gbi.h` (`gbi.h:497-627` for the field shifts, values, and
+//! coverage/Z/blender packing). RT64 is the *second* authority the same facts
+//! were checked against, not their origin.
+//!
+//! A bit-by-bit comparison of the two found **21/21 of the header's accessors
+//! agreeing in bit position, width, and mask, with zero divergences** -- two
+//! independently derived readings of the same public hardware contract
+//! corroborating each other. `blenderInputs` (low 16:31) agrees as a
+//! decomposition rather than a single accessor: RT64 returns the whole
+//! 16-bit window and `shared/rt64_blender.h` shifts within it, while
+//! `blender_cycle_1`/`blender_cycle_2` here pre-split it into the same eight
+//! two-bit selectors at the same absolute positions.
+//!
+//! fn64 is a strict **superset** by three accessors the pinned header has no
+//! accessor for:
+//! - `image_read_enabled` (low bit 6). `IM_RD 0x40` is *defined* at
+//!   `shared/rt64_f3d_defines.h:87` but never read anywhere in the pinned
+//!   tree.
+//! - `texture_convert` (high bits 9:11). No `G_MDSFT_TEXTCONV` appears
+//!   anywhere in the pinned tree.
+//! - `one_primitive_pipeline` (high bit 23), whose `ultra64/gbi.h` provenance
+//!   is disclosed above.
+//!
+//! The calling convention differs, losslessly. RT64's multi-bit accessors
+//! return the field **masked in place, unshifted**, leaving callers to shift
+//! or to compare against pre-shifted constants (`cvgDst() == CVG_DST_WRAP`);
+//! `blenderInputs` is the one exception that does shift down. The accessors
+//! here shift down and decode to typed enums instead, preserving reserved
+//! encodings as distinct variants (`TextureFilter::Reserved`,
+//! `AlphaCompare::Reserved`, `TextureLutModeError::ReservedEncoding`) rather
+//! than folding them into a neighboring mode. No claim is made about byte
+//! layout, `repr(C)`, or ABI compatibility with the C++ struct.
 //!
 //! This module does not import `fn64-render-reference` (no such crate
 //! dependency exists for `fn64-render-wgpu`); it is a self-contained literal
