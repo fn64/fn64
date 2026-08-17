@@ -5,6 +5,70 @@
 //! `src/common/rt64_user_configuration.{h,cpp}` at
 //! `f0728a2520d5aa735886240de3fee75cc805f6d6`. Invalid values are rejected at
 //! construction instead of inheriting upstream's clamping behavior.
+//!
+//! ## Provenance of the enhancement and emulator families
+//!
+//! [`RenderEnhancementSettings`] and [`RenderEmulatorSettings`] are complete
+//! typed images of the permitted MIT RT64 sources pinned at commit
+//! `5473732a822a4423b5696e7cb18fecc425a59875`
+//! (`docs/RT64-PORT-AUTHORITY.md`'s Rust-port source), SHA-256 of the whole
+//! files:
+//!
+//! - `src/common/rt64_enhancement_configuration.h` (52 lines)
+//!   `cc00e7c1d06be87371a21b2aa48fab39ff2fab49f442e2dfb75998ef4464c456`
+//! - `src/common/rt64_enhancement_configuration.cpp` (20 lines)
+//!   `86016ce174fe11e892e6239fc2aa2bca56cb99296ade83ccc7489d0ad8662e61`
+//! - `src/common/rt64_emulator_configuration.h` (26 lines)
+//!   `b09de95861fcaec0b63be9375bdbf94ea969a2741c787261c79dd8c9eaa51ed7`
+//! - `src/common/rt64_emulator_configuration.cpp` (16 lines)
+//!   `f558cd19e8b1e83c23994b2726916392fa9ba50b32b280da276831a951051678`
+//!
+//! Those digests were computed here with `shasum -a 256` against the pinned
+//! checkout and cross-checked verbatim against `docs/rt64-port-inventory.json`
+//! (`sources.port.sha256` for each of the four paths). For all four the
+//! inventory's `sources.oracle.sha256` records the identical digest and
+//! `port_delta` is `unchanged`, so the executable-oracle and port trees hold
+//! these files byte for byte alike and the citation is unambiguous whichever
+//! pin a reader consults.
+//!
+//! Field coverage is total in both directions, verified field by field
+//! against the two constructors:
+//!
+//! - `EnhancementConfiguration` -- all eight leaves across its six nested
+//!   structs (`framebuffer.reinterpretFixULS`, `presentation.mode`,
+//!   `presentation.removeBlackBorders`, `rect.fixRectLR`,
+//!   `f3dex.forceBranch`, `s2dex.fixBilerpMismatch`,
+//!   `s2dex.framebufferFastPath`, `textureLOD.scale`) are present here as
+//!   flattened fields, and every one of the eight constructor defaults
+//!   matches [`RenderEnhancementSettings::upstream_default`].
+//! - `EmulatorConfiguration` -- all four leaves (`dither.postBlendNoise`,
+//!   `dither.postBlendNoiseNegative`, `framebuffer.renderToRAM`,
+//!   `framebuffer.copyWithGPU`) are present, and all four constructor
+//!   defaults match [`RenderEmulatorSettings::upstream_default`], which is
+//!   also this type's [`Default`].
+//!
+//! [`RenderPresentationMode`]'s discriminants follow the declaration order of
+//! the pinned `Presentation::Mode` enum class, which assigns no explicit
+//! initializers: `Console = 0`, `SkipBuffering = 1`, `PresentEarly = 2`.
+//!
+//! **The two `Default` impls are this module's own design, not a divergence
+//! from RT64.** The pinned C++ offers a single constructor; this module
+//! deliberately splits that into two named entry points. `upstream_default()`
+//! reproduces the RT64 constructor exactly, while [`Default`] for
+//! [`RenderEnhancementSettings`] is fn64's faithful-off profile, which enables
+//! no corrective or fast-path enhancement implicitly. Read the faithful-off
+//! values as a deliberate fn64 policy choice sitting beside the reproduced
+//! upstream ones, never as a failure to match upstream.
+//!
+//! Nothing here is a claim about byte layout, `repr(C)`, size, alignment, or
+//! ABI compatibility with the C++ structs; the correspondence asserted is over
+//! field inventory and default values only.
+//!
+//! Note for anyone reconciling `docs/rt64-port-inventory.json`: this module
+//! lives in `fn64-render`, not `fn64-render-wgpu` where most ported RT64
+//! modules sit. The neighboring `rt64_user_configuration.{h,cpp}` sources are
+//! credited separately to `crates/fn64-render-wgpu/src/rt64_user_configuration.rs`
+//! and are not covered by the four digests above.
 
 use std::fmt;
 
