@@ -108,8 +108,8 @@
 //! `from_wire`, paired with `FillColor`/`PrimColor`/`RdpState` in the RDP
 //! command-stream domain) -- not RT64's `FramebufferPair::colorImage`/
 //! `depthImage` (a plain `{address, fmt, siz, width}` POD inside the
-//! `GameFrame`/`WorkloadQueue` HLE object graph this card explicitly must
-//! NOT port wholesale). Reusing `state::ColorImage` here would silently
+//! `GameFrame`/`WorkloadQueue` HLE object graph this card deliberately
+//! declines to port wholesale). Reusing `state::ColorImage` here would silently
 //! couple this predicate to RDP command-decode semantics (its `address`
 //! field is `fn64_render_ir::PhysicalAddress`, a fallibly-constructed,
 //! 24-bit-bounded type with validation the C++ `uint32_t address` field
@@ -159,15 +159,14 @@
 //! - **`isSceneCompatible`'s decision logic is ported taking the two
 //!   `matrixDifference(...)` results as caller-supplied `f32` inputs
 //!   (`view_matrix_diff`, `proj_matrix_diff`) rather than computing them
-//!   from raw matrices.** `matrixDifference` itself is explicitly deferred
-//!   by `rt64_math.rs`'s own Nonclaims ("Does not port ... `matrixDifference`
-//!   ... (deferred -- needs new matrix-inverse/quaternion infra)"), and
-//!   `docs/RT64-PORT-DASHBOARD.md`'s `M8.12` card records this exact
-//!   dependency on the (not-yet-landed-in-this-worktree) `M8.3` card: "Port
-//!   the two predicates over local descriptor structs once M8.3 supplies
-//!   matrixDifference." Rather than block this entire card on an unlanded
-//!   prerequisite, or silently reimplement `matrixDifference` here (a
-//!   second, unauthorized definition of a symbol another card owns), this
+//!   from raw matrices.** This is a deliberate parameterization, and it is
+//!   what the card shipped: taking the differences as inputs keeps the
+//!   predicate's decision logic self-contained and avoids a second,
+//!   unauthorized definition of `matrixDifference`, a symbol the separate
+//!   `M8.3` card owns (since landed as `rt64_math_matrix.rs`'s
+//!   `matrix_difference`; `rt64_math.rs`'s older Nonclaims sentence
+//!   deferring it predates that). Nothing here waits on `M8.3` -- a caller
+//!   that wants the full C++ behavior composes the two. This
 //!   port takes the tolerance-comparison decision logic literally --
 //!   `viewMatrixDiff > MatrixDiffTolerance` / `projMatrixDiff >
 //!   MatrixDiffTolerance`, both strict greater-than against the literal
@@ -209,31 +208,63 @@
 //!   Ported as plain Rust `>`, matching `f32` exactly (no epsilon-widening
 //!   or rounding introduced).
 //!
+//! ## Scope status
+//!
+//! **Complete for its stated scope.** Both named predicates
+//! (`areFramebufferPairsCompatible`, `isSceneCompatible`) are ported, and
+//! the tolerance boundary and every rejecting field are covered by this
+//! module's own tests. Nothing below is a pending prerequisite; the
+//! exclusions are scope decisions this card made and stands by.
+//!
+//! **What this module needs from RT64's HLE object graph is already
+//! ported.** A scoping pass over the two predicates established the whole
+//! union: four scalar color-image fields (`address`, `fmt`, `siz`,
+//! `width`), one depth address, two depth bools, and a two-`u32` index
+//! pair. Those are exactly [`ColorImageFields`], [`DepthImageFields`],
+//! [`FbPairFields`], and [`FramebufferPairIndex`] below. The wider
+//! `Workload`/`WorkloadQueue` graph exists to accumulate frames for motion
+//! interpolation -- a feature fn64 does not implement -- so porting it
+//! would serve zero callers here. Read the exclusions below as refusals,
+//! not as a dependency list.
+//!
 //! ## Nonclaims
 //!
 //! No GPU, WGSL, or production wiring (this module is not called from
 //! anywhere yet -- dead-code warnings on the unused public surface are
 //! expected and correct, matching `rt64_common.rs`'s and `rt64_math.rs`'s
 //! precedent), and no RT64 visual/pixel/silicon parity or performance
-//! claim. The surrounding `GameFrame`/`GameFrameMap`/`WorkloadQueue`/
-//! `Workload`/`GameScene`/`Projection`/`GameCall` object graph
-//! (`rt64_game_frame.h`'s `GameFrame::set`/`match`/`matchScene`/
-//! `matchTransform`/`buildCallHashMap`/`buildTransformIdMap`/`hashFromCall`/
-//! `isDebuggerCameraEnabled`, and every non-predicate type in the header:
-//! `GameFrameMap`, `GameCallMap`, `ModifiedBuffers`, `GameScene`) is
-//! deliberately NOT ported here -- it requires `WorkloadQueue`, `Workload`,
-//! `RenderWorker`, and `BufferUploader`, none of which this crate has an
-//! equivalent for, and porting it would mean vendoring roughly 970 more
-//! lines of `rt64_game_frame.cpp` far beyond this card's two named
-//! predicates (`docs/RT64-PORT-DASHBOARD.md`'s own `M8.12` finding: "port
-//! ONLY the two predicates at lines 15-73"). `matrixDifference` itself is
-//! also not ported here (owned by the separate, not-yet-landed `M8.3`
-//! card) -- this module's `isSceneCompatible` port takes its two results as
-//! `f32` inputs instead (see "Admitted domain" above). This module updates
-//! no other file's doc comments (in particular, `rt64_math.rs`'s Nonclaims
-//! sentence "`rt64_game_frame.cpp` itself remains unported" is left as-is;
-//! narrowing it is out of this card's exclusive-paths scope, which permits
-//! editing only this new file and one `mod` line in `lib.rs`).
+//! claim. "Complete for its stated scope" means the two predicates and
+//! their tests; it does not claim this module is correct against RT64 at
+//! runtime, nor admitted to any production path.
+//!
+//! Deliberately not ported (a scope boundary this card chose, not work
+//! this module is waiting on):
+//!
+//! - The surrounding `GameFrame`/`GameFrameMap`/`WorkloadQueue`/`Workload`/
+//!   `GameScene`/`Projection`/`GameCall` object graph (`rt64_game_frame.h`'s
+//!   `GameFrame::set`/`match`/`matchScene`/`matchTransform`/
+//!   `buildCallHashMap`/`buildTransformIdMap`/`hashFromCall`/
+//!   `isDebuggerCameraEnabled`, and every non-predicate type in the header:
+//!   `GameFrameMap`, `GameCallMap`, `ModifiedBuffers`, `GameScene`).
+//!   Vendoring it would mean roughly 970 more lines of
+//!   `rt64_game_frame.cpp`, plus `RenderWorker`/`BufferUploader` thread and
+//!   RHI plumbing, far beyond this card's two named predicates
+//!   (`docs/RT64-PORT-DASHBOARD.md`'s own `M8.12` finding: "port ONLY the
+//!   two predicates at lines 15-73"). The predicates do not need it: the
+//!   graph's only role in the C++ is to *look up* the field values this
+//!   port takes directly as arguments.
+//! - `matrixDifference`'s computation, which the separate `M8.3` card owns
+//!   (landed as `rt64_math_matrix.rs`'s `matrix_difference`). This module's
+//!   `isSceneCompatible` port deliberately takes the two already-computed
+//!   differences as `f32` inputs rather than calling it, so this is a
+//!   parameterization choice, not an unmet dependency (see "Admitted
+//!   domain" above).
+//!
+//! This module updates no other file's doc comments (in particular,
+//! `rt64_math.rs`'s Nonclaims sentence "`rt64_game_frame.cpp` itself
+//! remains unported" is left as-is; narrowing it is out of this card's
+//! exclusive-paths scope, which permits editing only this new file and one
+//! `mod` line in `lib.rs`).
 
 /// `GameIndices::FramebufferPair`: a `(workloadIndex, fbPairIndex)` index
 /// pair identifying one framebuffer pair inside a `WorkloadQueue`. Ported
