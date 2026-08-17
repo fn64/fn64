@@ -73,16 +73,16 @@ pub use render_ir::{
     CommittedSemanticWorkloadRecord, ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter,
     ExactValidatedRawDpcPlan, GuestCommittedRawDpc, IrGuestMemoryPreimage, IrGuestMemorySnapshot,
     IrRawDpcBackendCompletion, IrRawDpcPacketPreflight, NeutralColor4, NeutralColorImage,
-    NeutralCombineParams, NeutralFillColor, NeutralImageFormat, NeutralOtherMode,
-    NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage,
-    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
-    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
-    PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
-    RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
-    RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    ReadyPublication, ReadyRawDpcCommitCapsule, RdpStateCommand, RdpStateIdentity,
-    RdpTriangleCommand, RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
+    NeutralCombineParams, NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize,
+    NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode,
+    NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+    NeutralTmemTransferWord, NeutralTriangleVertex, PlannedRawDpcSubmission, RawDpcAbiSession,
+    RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator, RawDpcExecutionView,
+    RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage,
+    RawDpcSemanticCommandRef, RawDpcTerminalOutcome, RdpFillRectangleCommand, RdpStateCommand,
+    RdpStateIdentity, RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule,
+    RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
+    TmemLoadShape, TmemTransferLayout, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
@@ -1922,6 +1922,34 @@ pub trait RenderBackend {
             backend: "render/raw-dpc-execute",
             reason: "registered backend does not implement raw-DPC execution".to_string(),
         })
+    }
+
+    /// The guest-visible `RenderTarget` writes this backend staged for
+    /// `submission` during its own [`Self::execute_raw_dpc`] call, in exact
+    /// journal order. Empty for every submission this backend staged no
+    /// color-target write for -- which is every TMEM-only and triangle-only
+    /// submission, and every submission at all for a backend that admits no
+    /// fill.
+    ///
+    /// The caller hands this list straight back to
+    /// [`render_ir::RawDpcAbiSession::commit_guest_render_target_writes`],
+    /// which re-validates it against the packet's own journal and against
+    /// the backend's already-issued `BackendEffectReport`. This method is
+    /// therefore a *transport*, not an authority: a backend that returned a
+    /// fabricated list would be caught by that constructor, not trusted here.
+    ///
+    /// Returning an empty list for a submission this backend did stage a
+    /// write for is also safe-by-loudness rather than silently wrong: the
+    /// caller then takes the zero-write branch, which fails against the
+    /// packet's own nonempty guest-write journal with `EffectCountMismatch`.
+    ///
+    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<fn64_render_ir::CompletedWrite> {
+        let _ = submission;
+        Vec::new()
     }
 
     /// Jointly publish `publication`'s fabric commit, this backend's own
