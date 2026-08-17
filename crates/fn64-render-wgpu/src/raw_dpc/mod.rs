@@ -5,9 +5,13 @@ mod texture_rectangle;
 mod triangle;
 #[cfg(test)]
 mod triangle_composition;
+mod triangle_draw_data;
 mod triangle_vertices;
 
-pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
+pub use production_adapter::{
+    push_decoded_raw_dpc, PushDecodedRawDpcError, TriangleBeforeAnyOtherMode,
+    UnadmittedRawDpcCommand,
+};
 pub use texture_rectangle::{
     texture_rectangle_vertices, RawTextureRectangle, RawTextureRectangleError,
     TextureRectangleVertex, TextureRectangleVertices, TEXTURE_RECTANGLE_COMMAND_BYTES,
@@ -15,6 +19,10 @@ pub use texture_rectangle::{
 pub use triangle::{
     triangle_word_count, CoefficientWords, DepthWords, RawTriangle, RawWord, TriangleDecodeError,
     TriangleFlags,
+};
+pub use triangle_draw_data::{
+    neutral_vertex_to_raster_vertex, retrieve_triangle_draws, MissingTriangleDrawState,
+    RetrievedTriangleDraw, TriangleDrawStateCollector,
 };
 pub use triangle_vertices::{decode_triangle_vertices, TriangleVertex, TriangleVertices};
 

@@ -66,7 +66,8 @@ use crate::shader_manifest::{
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
 use crate::state::OtherMode;
-use crate::CombineParams;
+use crate::{neutral_vertex_to_raster_vertex, CombineParams};
+use fn64_render::NeutralTriangleVertex;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -433,6 +434,47 @@ impl TrianglePipelineRenderer {
         fixture: TriangleFixture,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
         self.submit_triangles(&[fixture])
+    }
+
+    /// Submits one triangle sourced from a real admitted raw-DPC plan
+    /// (`raw_dpc::triangle_draw_data`'s `RetrievedTriangleDraw`, snapshotted
+    /// at that triangle's own stream position) rather than a hand-built
+    /// fixture: `vertices` are the plan's own decoded `NeutralTriangleVertex`
+    /// triple, adapted field-by-field via [`neutral_vertex_to_raster_vertex`]
+    /// (no arithmetic), and `combine_params` is the plan's own real
+    /// `SetCombine` value, not a caller-supplied literal.
+    ///
+    /// `other_mode` is accepted (the retrieval glue's other real admitted
+    /// value) but not yet consumed by this fixed-fixture pipeline: this
+    /// slice's vertex shader (`shaders/triangle_pipeline_vertex.wgsl`)
+    /// hardcodes `is_rect = false`/no Z-override, the same restriction the
+    /// GPU-pipeline card's own fixed fixture already carries (module doc,
+    /// `fixed_fixture_other_mode`) -- a future slice that wires the
+    /// Z-override branch into the vertex shader would read it here.
+    /// `raster_params`/`extent` are caller-supplied because they describe
+    /// the render target/viewport, not RDP command state this card's
+    /// admission mechanism carries.
+    ///
+    /// `resolution`/`screen_scale`/`screen_offset`/depth conversion happen
+    /// inside the vertex shader itself, not here -- `vertices`' `position`
+    /// stays raw RDP screen-pixel `x`/`y`/`z`/`w`, matching
+    /// `triangle_pipeline_vertex.wgsl`'s own module doc.
+    pub fn submit_admitted_triangle(
+        &mut self,
+        vertices: [NeutralTriangleVertex; 3],
+        other_mode: OtherMode,
+        combine_params: CombineParams,
+        raster_params: TriangleRasterParams,
+        extent: TriangleTargetExtent,
+    ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
+        let _ = other_mode;
+        let fixture = TriangleFixture {
+            vertices: vertices.map(neutral_vertex_to_raster_vertex),
+            raster_params,
+            combine_params,
+            extent,
+        };
+        self.submit_triangle(fixture)
     }
 
     /// Submits one or more fixed-fixture triangle draws, in order, into ONE

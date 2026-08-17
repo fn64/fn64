@@ -21,12 +21,13 @@ pub use production::{
     NeutralColor4, NeutralColorImage, NeutralCombineParams, NeutralFillColor, NeutralImageFormat,
     NeutralOtherMode, NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage,
     NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
-    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, PlannedRawDpcSubmission,
-    RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator,
-    RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle,
-    RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome, RdpStateCommand,
-    RdpStateIdentity, ReadyPublication, ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout,
+    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
+    PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
+    RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
+    RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
+    RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, ReadyPublication,
+    ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
+    TmemTransferLayout,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -1337,6 +1338,43 @@ mod production {
         },
     }
 
+    /// Neutral mirror of one decoded triangle vertex (RT64's
+    /// `posWorkBuffer`/`colorWorkBuffer`/`texcoordWorkBuffer` write for one
+    /// triangle vertex), field-for-field identical to T1's private
+    /// `TriangleVertex` shape -- this crate cannot name that wgpu-crate type
+    /// directly (`fn64-render-wgpu` depends on `fn64-render`, not the
+    /// reverse), so this is a plain data mirror, not a reinterpretation.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct NeutralTriangleVertex {
+        pub x: f32,
+        pub y: f32,
+        pub z: f32,
+        pub w: f32,
+        pub color: [f32; 4],
+        pub texcoord: [f32; 2],
+    }
+
+    /// Neutral carrier for one admitted `RawTriangle` draw command: the
+    /// command's own raw wire words (variable-width, per
+    /// `raw_rdp_command_width`/`triangle_word_count` -- unlike every
+    /// `RdpStateCommand` variant's fixed 2-word shape) and the three already-
+    /// decoded triangle vertices, in RT64's exact `workBufferIndex + 0/1/2`
+    /// order. Deliberately has **no** `before`/`after` [`RdpStateIdentity`]
+    /// fields: a triangle is a draw event, not a value that persists in one
+    /// global slot and gets overwritten the way the nine pure-state
+    /// commands do, and it pushes zero [`ResourceAccess`] entries into the
+    /// owning plan, so [`ExactRawDpcPlanWriter::finish`]'s access-ordering
+    /// contract (which has zero coupling to the writer's pushed commands) is
+    /// trivially satisfied without one. `raw_words` is kept anyway, matching
+    /// this crate's characterization-first convention of never discarding
+    /// the raw bytes a command carried.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct RdpTriangleCommand {
+        pub location: RawDpcCommandLocation,
+        pub raw_words: Box<[u32]>,
+        pub vertices: [NeutralTriangleVertex; 3],
+    }
+
     /// One neutral, borrowed semantic view of a decoded raw-DPC command.
     /// `#[non_exhaustive]` because T1's private wgpu decoder is the sole
     /// producer of the owning [`ExactValidatedRawDpcPlan`] and may need to
@@ -1354,6 +1392,10 @@ mod production {
         /// no resource access -- required context for the load commands
         /// above.
         State(&'plan RdpStateCommand),
+        /// One admitted `RawTriangle` draw command -- geometry only, no
+        /// resource access and no before/after identity (see
+        /// [`RdpTriangleCommand`]'s own doc for why).
+        Triangle(&'plan RdpTriangleCommand),
     }
 
     /// Borrowed, nonextracting visitor over one validated plan's semantic
@@ -1392,6 +1434,7 @@ mod production {
     enum OwnedSemanticCommand {
         TmemLoad(TmemLoadSemantics),
         State(RdpStateCommand),
+        Triangle(RdpTriangleCommand),
     }
 
     impl OwnedSemanticCommand {
@@ -1399,6 +1442,7 @@ mod production {
             match self {
                 Self::TmemLoad(semantics) => RawDpcSemanticCommandRef::TmemLoad(semantics),
                 Self::State(state) => RawDpcSemanticCommandRef::State(state),
+                Self::Triangle(triangle) => RawDpcSemanticCommandRef::Triangle(triangle),
             }
         }
     }
@@ -1922,6 +1966,13 @@ mod production {
 
         pub fn push_state(&mut self, state: RdpStateCommand) {
             self.commands.push(OwnedSemanticCommand::State(state));
+        }
+
+        /// Pushes zero [`ResourceAccess`] entries -- see
+        /// [`RdpTriangleCommand`]'s own doc for why a triangle draw command
+        /// carries no resource access and no before/after identity.
+        pub fn push_triangle(&mut self, triangle: RdpTriangleCommand) {
+            self.commands.push(OwnedSemanticCommand::Triangle(triangle));
         }
 
         pub fn push_command_decode_access(&mut self, access: ResourceAccess) {

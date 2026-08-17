@@ -19,12 +19,14 @@ use fn64_render::{
     NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize, NeutralPrimColor,
     NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
     NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand, RdpStateIdentity,
-    TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics,
-    TmemTransferLayout as NeutralTmemTransferLayout,
+    NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand,
+    RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind,
+    TmemLoadSemantics, TmemTransferLayout as NeutralTmemTransferLayout,
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
+use crate::raw_dpc::decode_triangle_vertices;
+use crate::state::OtherMode;
 use crate::{
     DecodedRawDpc, ImageFormat, PixelSize, RawDpcCommandKind, RawDpcResourcePlan, TextureImage,
     TileAddressMode, TileDescriptor, TileIndex, TileSize, TmemLoad, TmemLoadKind,
@@ -59,6 +61,70 @@ impl core::fmt::Display for UnadmittedRawDpcCommand {
 }
 
 impl std::error::Error for UnadmittedRawDpcCommand {}
+
+/// A `RawTriangle` command was walked with no `OtherMode` established yet
+/// either by an earlier command in this same plan's own command order, or
+/// by durable state carried in from before this capture
+/// (`decoded.base_state`, itself set from `WgpuBackend`'s own durable
+/// `rdp_state` -- see `production_adapter.rs`'s `current_other_mode` doc).
+/// `current_other_mode`'s `texture_perspective()` bit feeds
+/// `decode_triangle_vertices` directly (RT64:
+/// `state->rdp->otherMode.textPersp()`) and changes decoded triangle
+/// geometry, so there is no safe silent default here (AGENTS.md "loud
+/// traps, no silent shrugs") -- unlike `StateIdentityTracker`'s `before`
+/// fields, which stay `None` for a plan's first occurrence of a state
+/// command and never feed a decode computation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriangleBeforeAnyOtherMode {
+    pub command_index: u32,
+    pub location: crate::RawDpcCommandLocation,
+}
+
+impl core::fmt::Display for TriangleBeforeAnyOtherMode {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "raw-DPC triangle command #{} at {} has no SetOtherMode established yet -- neither \
+             earlier in this plan nor carried in from durable state before this capture; \
+             texture_perspective() cannot be decoded from an unstated OtherMode",
+            self.command_index, self.location
+        )
+    }
+}
+
+impl std::error::Error for TriangleBeforeAnyOtherMode {}
+
+/// [`push_decoded_raw_dpc`]'s complete rejection set: either an unadmitted
+/// command kind, or an admitted `RawTriangle` that arrived before this
+/// plan's first `SetOtherMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushDecodedRawDpcError {
+    Unadmitted(UnadmittedRawDpcCommand),
+    TriangleBeforeAnyOtherMode(TriangleBeforeAnyOtherMode),
+}
+
+impl core::fmt::Display for PushDecodedRawDpcError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unadmitted(error) => core::fmt::Display::fmt(error, formatter),
+            Self::TriangleBeforeAnyOtherMode(error) => core::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for PushDecodedRawDpcError {}
+
+impl From<UnadmittedRawDpcCommand> for PushDecodedRawDpcError {
+    fn from(error: UnadmittedRawDpcCommand) -> Self {
+        Self::Unadmitted(error)
+    }
+}
+
+impl From<TriangleBeforeAnyOtherMode> for PushDecodedRawDpcError {
+    fn from(error: TriangleBeforeAnyOtherMode) -> Self {
+        Self::TriangleBeforeAnyOtherMode(error)
+    }
+}
 
 fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
     match kind {
@@ -204,6 +270,17 @@ fn neutral_combine(value: crate::CombineParams) -> NeutralCombineParams {
     }
 }
 
+fn neutral_triangle_vertex(vertex: crate::raw_dpc::TriangleVertex) -> NeutralTriangleVertex {
+    NeutralTriangleVertex {
+        x: vertex.x(),
+        y: vertex.y(),
+        z: vertex.z(),
+        w: vertex.w(),
+        color: vertex.color(),
+        texcoord: vertex.texcoord(),
+    }
+}
+
 fn neutral_load_kind(kind: TmemLoadKind) -> NeutralTmemLoadKind {
     match kind {
         TmemLoadKind::Block {
@@ -325,6 +402,28 @@ fn tmem_command_raw_words(
     words.to_vec()
 }
 
+/// Slices one `RawTriangle` command's own raw wire words out of the
+/// capture's full word stream. Unlike [`tmem_command_raw_words`]'s fixed
+/// 2-word assumption, a triangle command is variable-width (32..=176 bytes,
+/// per its opcode's optional shade/texture/depth coefficient blocks), so
+/// this keys the read off [`fn64_render::raw_rdp_command_width`] -- the same
+/// function `decode_stream` (`mod.rs:890`) already uses to size a triangle
+/// command's own read, rather than reimplementing that stride table here.
+fn triangle_command_raw_words(
+    capture_words: &[u32],
+    submission_start: u32,
+    old: crate::RawDpcCommandLocation,
+) -> Vec<u32> {
+    let width_bytes = fn64_render::raw_rdp_command_width(old.wire_opcode())
+        .expect("decode_stream already proved this opcode has a known width");
+    let width_words = (width_bytes / 4) as usize;
+    let start = ((old.source_byte_offset() - submission_start) / 4) as usize;
+    let words = capture_words
+        .get(start..start + width_words)
+        .expect("decode_stream already proved this command's bytes are in-bounds");
+    words.to_vec()
+}
+
 /// Per-plan `before`/`after` tile-state tracking this push loop must thread
 /// itself: [`RdpStateIdentity::of_tile_descriptor`]/`of_tile_size` need the
 /// prior identity for the *same* tile slot, and `of_texture_image` and each
@@ -372,9 +471,44 @@ pub fn push_decoded_raw_dpc(
     capture_words: &[u32],
     layout: PhysicalMemoryLayout,
     submission_start: u32,
-) -> Result<(), UnadmittedRawDpcCommand> {
+) -> Result<(), PushDecodedRawDpcError> {
     let resource_plan: &RawDpcResourcePlan = decoded.resource_plan();
     let mut tracker = StateIdentityTracker::default();
+    // `decode_triangle_vertices`'s own `texture_perspective` parameter is
+    // the live `G_TP_PERSP` OtherMode bit at the point a triangle command is
+    // decoded (RT64: `state->rdp->otherMode.textPersp()`), not this plan's
+    // final value -- mirrored locally here the same way `tracker` mirrors
+    // per-slot identity, since `DecodedRawDpcCommand` carries no OtherMode
+    // field of its own. Updated only inside the `SetOtherMode` arm below, so
+    // a triangle at stream position N always sees the most recent
+    // `SetOtherMode` at position < N in *this decode's own command order*,
+    // never a later one and never this plan's final value.
+    //
+    // Seeded from `decoded.base_state` -- the durable RDP state the caller
+    // held *before* this exact decode (`raw_dpc::mod`'s `decode_from_state`:
+    // `let base_state = state.fork_for_decode();`, stored on `DecodedRawDpc`
+    // itself). `production_adapter` is declared `mod production_adapter;`
+    // inside `raw_dpc/mod.rs`, so `base_state`'s no-modifier (module-tree)
+    // visibility already reaches this file with no new accessor. This is
+    // NOT a fabricated default: it is the same real prior state
+    // `WgpuBackend` (`production.rs`) already threads across submissions
+    // via `rdp_state`/`rdp_state.apply`, read here rather than duplicated.
+    //
+    // Still `None` only when this plan's OWN first submission has never had
+    // a `SetOtherMode` at all (a fresh renderer with no prior state) --
+    // deliberately NOT defaulted to wire `(0, 0)` in that case (AGENTS.md
+    // "loud traps, no silent shrugs"): this value feeds
+    // `texture_perspective()` directly into `decode_triangle_vertices`,
+    // changing decoded triangle geometry, so a silent default would be a
+    // real correctness risk, not mere bookkeeping the way
+    // `StateIdentityTracker`'s `before` fields are (they stay `None` for a
+    // plan's first occurrence and never feed a decode computation).
+    // Updated again inside the `SetOtherMode` arm below on every in-plan
+    // occurrence, so a triangle at stream position N always sees the most
+    // recent `SetOtherMode` at position < N -- either carried in from
+    // `base_state` or set later in this same plan -- never a later one and
+    // never this plan's final value.
+    let mut current_other_mode: Option<OtherMode> = decoded.base_state.other_mode();
 
     // The journal's ordered access list opens with one `CommandDecode` read
     // access per source stream (`decode_from_state` pushes these before it
@@ -394,12 +528,23 @@ pub fn push_decoded_raw_dpc(
     for (index, command) in decoded.commands().iter().enumerate() {
         let command_index = u32::try_from(index).expect("bounded command stream fits u32");
         let old_location = command.location();
-        let raw_words = tmem_command_raw_words(capture_words, submission_start, old_location);
+        // Every admitted TMEM/state opcode is a fixed 2-word command; a
+        // `RawTriangle` is variable-width (see `triangle_command_raw_words`'s
+        // own doc) and cannot use the fixed-2-word slicer. The two rejected
+        // kinds below (`NoOp`/`FillRectangle`/`FullSync`) never reach a
+        // `push_state`/`push_triangle` call, so slicing them with the
+        // fixed-2-word reader (their own wire shape) is harmless -- their
+        // `raw_words`/`location` values are computed but discarded.
+        let raw_words = if matches!(command.kind(), RawDpcCommandKind::RawTriangle(_)) {
+            triangle_command_raw_words(capture_words, submission_start, old_location)
+        } else {
+            tmem_command_raw_words(capture_words, submission_start, old_location)
+        };
         let location = neutral_location(
             command_index,
             old_location,
             layout,
-            u32::try_from(raw_words.len() * 4).expect("2-word commands fit u32 bytes"),
+            u32::try_from(raw_words.len() * 4).expect("command word count fits u32 bytes"),
         );
 
         match command.kind() {
@@ -471,6 +616,7 @@ pub fn push_decoded_raw_dpc(
                 let after = RdpStateIdentity::of_other_mode(neutral);
                 let before = tracker.other_mode;
                 tracker.other_mode = Some(after);
+                current_other_mode = Some(value);
                 writer.push_state(RdpStateCommand::SetOtherMode {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -583,15 +729,32 @@ pub fn push_decoded_raw_dpc(
                     after,
                 });
             }
+            RawDpcCommandKind::RawTriangle(triangle) => {
+                let Some(other_mode) = current_other_mode else {
+                    return Err(TriangleBeforeAnyOtherMode {
+                        command_index,
+                        location: old_location,
+                    }
+                    .into());
+                };
+                let decoded = decode_triangle_vertices(&triangle, other_mode.texture_perspective());
+                let vertices =
+                    core::array::from_fn(|index| neutral_triangle_vertex(decoded.vertex(index)));
+                writer.push_triangle(RdpTriangleCommand {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    vertices,
+                });
+            }
             other @ (RawDpcCommandKind::NoOp { .. }
             | RawDpcCommandKind::FillRectangle(_)
-            | RawDpcCommandKind::FullSync(_)
-            | RawDpcCommandKind::RawTriangle(_)) => {
+            | RawDpcCommandKind::FullSync(_)) => {
                 return Err(UnadmittedRawDpcCommand {
                     command_index,
                     location: old_location,
                     opcode_name: opcode_name(&other),
-                });
+                }
+                .into());
             }
         }
     }
@@ -813,6 +976,20 @@ mod tests {
         words: Vec<u32>,
         source_range: (u32, u32),
     ) -> (DecodedRawDpc, OwnedRawDpcCapture, ResourceJournal) {
+        decode_admitted_capture_with_state(words, source_range, RdpState::default())
+    }
+
+    /// Same as [`decode_admitted_capture`], but decodes against a
+    /// caller-supplied `RdpState` rather than a fresh `default()` -- the
+    /// "durable state a caller held before this capture" seam
+    /// `decode_from_state`'s `state.fork_for_decode()` stores as
+    /// `DecodedRawDpc::base_state`, exercised by the cross-submission
+    /// admission test.
+    fn decode_admitted_capture_with_state(
+        words: Vec<u32>,
+        source_range: (u32, u32),
+        initial_state: RdpState,
+    ) -> (DecodedRawDpc, OwnedRawDpcCapture, ResourceJournal) {
         let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let end = COMMAND_START + u32::try_from(words.len() * 4).unwrap();
         let full_syncs = full_sync_boundaries(&words);
@@ -839,7 +1016,7 @@ mod tests {
             .unwrap()
             .into_roles();
         let probe_submitted = probe_queue.submit(probe_ticket).unwrap();
-        let journal = match decode_raw_dpc(probe_submitted, &RdpState::default()) {
+        let journal = match decode_raw_dpc(probe_submitted, &initial_state) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => {
                 let accesses = expected.into_vec();
                 let declared = accesses
@@ -861,8 +1038,7 @@ mod tests {
             .unwrap()
             .into_roles();
         let submitted = queue.submit(ticket).unwrap();
-        let decoded =
-            decode_raw_dpc(submitted, &RdpState::default()).expect("fixture decodes cleanly");
+        let decoded = decode_raw_dpc(submitted, &initial_state).expect("fixture decodes cleanly");
         (decoded, capture, journal)
     }
 
@@ -945,6 +1121,7 @@ mod tests {
     struct RecordingVisitor {
         loads: Vec<TmemLoadSemantics>,
         states: Vec<RdpStateCommand>,
+        triangles: Vec<fn64_render::RdpTriangleCommand>,
         accesses: Vec<fn64_render_ir::ResourceAccess>,
     }
 
@@ -953,6 +1130,9 @@ mod tests {
             match command {
                 RawDpcSemanticCommandRef::TmemLoad(load) => self.loads.push(load.clone()),
                 RawDpcSemanticCommandRef::State(state) => self.states.push(state.clone()),
+                RawDpcSemanticCommandRef::Triangle(triangle) => {
+                    self.triangles.push(triangle.clone());
+                }
                 other => unreachable!(
                     "RawDpcSemanticCommandRef gained a variant this test doesn't know about: \
                      {other:?}"
@@ -1775,11 +1955,269 @@ mod tests {
             layout,
             submission_start,
         );
-        let Err(rejection) = outcome else {
-            panic!("FullSync must be rejected, not admitted into the plan");
+        let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
+            panic!(
+                "FullSync must be rejected via UnadmittedRawDpcCommand, not admitted or \
+                    rejected for a different reason: {outcome:?}"
+            );
         };
         assert_eq!(rejection.opcode_name, "FullSync");
         assert_eq!(rejection.command_index, 4);
         let _ = (session, journal);
+    }
+
+    const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
+
+    /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
+    /// four raw wire words -- the simplest admitted triangle opcode, same
+    /// shape `raw_dpc::mod::tests`' own `triangle_base_word0` builds.
+    fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
+        let w0 = word(
+            RAW_TRIANGLE_BASE_EDGE,
+            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
+        );
+        [
+            w0,
+            0,
+            0x0010_0000,
+            0,
+            0x0020_0000,
+            0x0000_8000,
+            0x0005_0000,
+            0,
+        ]
+    }
+
+    fn push_and_expect_error(words: Vec<u32>, source_range: (u32, u32)) -> PushDecodedRawDpcError {
+        let (decoded, capture, journal) = decode_admitted_capture(words, source_range);
+        let layout = capture.memory_layout();
+        let submission_start = capture.submission().start();
+        let capture_words = capture.submission().command_words();
+        let (session, authority) = new_raw_dpc_roles().unwrap();
+        let request = session.plan_request(capture);
+        let mut writer = authority.begin_plan(request);
+        let outcome = push_decoded_raw_dpc(
+            &mut writer,
+            &decoded,
+            &capture_words,
+            layout,
+            submission_start,
+        );
+        let _ = (session, journal);
+        outcome.expect_err("expected push_decoded_raw_dpc to reject this fixture")
+    }
+
+    #[test]
+    fn raw_triangle_before_any_set_other_mode_is_rejected_loudly_not_defaulted() {
+        // No SetOtherMode anywhere in this fixture: the triangle at index 0
+        // must be rejected, not silently decoded against a fabricated
+        // OtherMode(0, 0).
+        let words = triangle_base_edge_words(3, 2, 0x1234).to_vec();
+        let error = push_and_expect_error(words, (0x214, 0x224));
+        let PushDecodedRawDpcError::TriangleBeforeAnyOtherMode(rejection) = error else {
+            panic!("expected TriangleBeforeAnyOtherMode, got {error:?}");
+        };
+        assert_eq!(rejection.command_index, 0);
+    }
+
+    #[test]
+    fn raw_triangle_is_admitted_after_a_preceding_set_other_mode() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(triangle_base_edge_words(3, 2, 0x1234));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::RawTriangle(source_triangle) = decoded.commands()[1].kind() else {
+            panic!("expected RawTriangle as the second command");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1, "one SetOtherMode");
+        assert_eq!(plan.triangles.len(), 1, "one admitted triangle");
+
+        let expected_decoded = decode_triangle_vertices(&source_triangle, false);
+        let expected_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_decoded.vertex(index)));
+        assert_eq!(plan.triangles[0].vertices, expected_vertices);
+        assert!(
+            plan.accesses.is_empty() || plan.accesses.len() == 1,
+            "no TMEM access from a triangle push"
+        );
+    }
+
+    #[test]
+    fn a_set_other_mode_after_a_triangle_does_not_retroactively_change_its_already_decoded_vertices(
+    ) {
+        // Interleaved order: SetOtherMode(perspective off) -> triangle A ->
+        // SetOtherMode(perspective on) -> triangle B. Triangle A must decode
+        // with perspective off (the value current at ITS stream position),
+        // never with the later SetOtherMode's value.
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0)); // perspective off (bit 19 low)
+        words.extend(triangle_base_edge_words(0, 0, 0x0100));
+        words.extend(set_other_mode(0, 1 << 19)); // perspective on
+        words.extend(triangle_base_edge_words(1, 0, 0x0200));
+
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::RawTriangle(triangle_a) = decoded.commands()[1].kind() else {
+            panic!("expected RawTriangle at index 1");
+        };
+        let RawDpcCommandKind::RawTriangle(triangle_b) = decoded.commands()[3].kind() else {
+            panic!("expected RawTriangle at index 3");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.triangles.len(), 2);
+
+        let expected_a = decode_triangle_vertices(&triangle_a, false);
+        let expected_a_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_a.vertex(index)));
+        assert_eq!(
+            plan.triangles[0].vertices, expected_a_vertices,
+            "triangle A must decode with perspective OFF (its own stream-position OtherMode)"
+        );
+
+        let expected_b = decode_triangle_vertices(&triangle_b, true);
+        let expected_b_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_b.vertex(index)));
+        assert_eq!(
+            plan.triangles[1].vertices, expected_b_vertices,
+            "triangle B must decode with perspective ON"
+        );
+        assert_ne!(
+            expected_a_vertices, expected_b_vertices,
+            "the two OtherMode values must actually produce different decoded vertices, or this \
+             test cannot distinguish correct from incorrect ordering"
+        );
+    }
+
+    /// Builds one full-width triangle command's wire words for `opcode`
+    /// (`0x08..=0x0f`), filling every present optional coefficient block
+    /// (shade/texture/depth, per the opcode's own low three bits) with a
+    /// deterministic, distinct, nonzero pattern -- `raw_rdp_command_width`
+    /// determines the total byte count (32..=176), same source
+    /// `triangle_command_raw_words` itself keys off.
+    fn full_width_triangle_words(opcode: u8) -> Vec<u32> {
+        let width_bytes = fn64_render::raw_rdp_command_width(opcode)
+            .expect("every triangle opcode 0x08..=0x0f has a known width");
+        let width_words = (width_bytes / 4) as usize;
+        // Base edge block: reuse the same non-degenerate geometry as
+        // `triangle_base_edge_words` (tile/level/yl in w0, zero edges) --
+        // this test only cares about wire-word/location provenance, not
+        // decoded vertex values.
+        let w0 = word(opcode, (3u32 & 0x7) << 16 | (2u32 & 0x7) << 19 | 0x1234u32);
+        let mut words = vec![
+            w0,
+            0,
+            0x0010_0000,
+            0,
+            0x0020_0000,
+            0x0000_8000,
+            0x0005_0000,
+            0,
+        ];
+        // Fill every remaining word (the optional coefficient blocks) with a
+        // distinct, deterministic, nonzero pattern so a truncated or
+        // misaligned slice would show up as a mismatch, not an accidental
+        // zero-vs-zero pass.
+        let mut fill = 0x1000_0000u32;
+        while words.len() < width_words {
+            words.push(fill);
+            fill = fill.wrapping_add(0x0101_0101);
+        }
+        assert_eq!(words.len(), width_words);
+        words
+    }
+
+    /// Cross-submission admission test: a durable `OtherMode` established
+    /// by a prior submission (carried in as `RdpState`, matching how
+    /// `WgpuBackend`'s own `rdp_state`/`rdp_state.apply` threads durable
+    /// state across submissions in production) admits a triangle that has
+    /// no local `SetOtherMode` of its own -- proving `current_other_mode`
+    /// really does seed from `decoded.base_state`, not just from in-plan
+    /// commands.
+    #[test]
+    fn raw_triangle_is_admitted_using_durable_other_mode_carried_from_a_prior_submission() {
+        let mut durable_delta = crate::state::RdpStateDelta::default();
+        durable_delta.set_other_mode(crate::state::OtherMode::from_wire(0, 0));
+        let mut durable_state = RdpState::default();
+        durable_state.apply(&durable_delta);
+        assert_eq!(
+            durable_state.other_mode(),
+            Some(crate::state::OtherMode::from_wire(0, 0)),
+            "durable state fixture must actually carry a real OtherMode, or this test proves \
+             nothing"
+        );
+
+        // No SetOtherMode anywhere in THIS submission's own words -- only
+        // the carried-in durable state establishes it.
+        let words = triangle_base_edge_words(3, 2, 0x1234).to_vec();
+        let (decoded, capture, journal) =
+            decode_admitted_capture_with_state(words, (0x214, 0x224), durable_state);
+        let RawDpcCommandKind::RawTriangle(source_triangle) = decoded.commands()[0].kind() else {
+            panic!("expected RawTriangle as the only command");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(
+            plan.triangles.len(),
+            1,
+            "triangle must be admitted using the carried-in durable OtherMode, not rejected"
+        );
+
+        let expected_decoded = decode_triangle_vertices(&source_triangle, false);
+        let expected_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_decoded.vertex(index)));
+        assert_eq!(
+            plan.triangles[0].vertices, expected_vertices,
+            "triangle must decode using the carried-in durable OtherMode's texture_perspective()"
+        );
+    }
+
+    /// Wire-provenance sweep (independent-review finding): for every one of
+    /// the eight triangle opcodes (`0x08..=0x0f`, spanning the full 32..176
+    /// byte width range `raw_rdp_command_width`/`triangle_word_count`
+    /// admit), the admitted `RdpTriangleCommand`'s `raw_words`,
+    /// `location.source_byte_len`, `location.source_address`, and
+    /// `location.wire_opcode` must exactly match the source wire bytes --
+    /// proving `triangle_command_raw_words`'s variable-width slicer handles
+    /// the full opcode range correctly, not just the simplest (0x08,
+    /// 32-byte) case the other triangle tests exercise.
+    #[test]
+    fn triangle_raw_words_and_location_match_the_source_wire_bytes_across_every_opcode_width() {
+        for opcode in 0x08u8..=0x0f {
+            let mut words = Vec::new();
+            words.extend(set_other_mode(0, 0));
+            let triangle_words = full_width_triangle_words(opcode);
+            let triangle_start_word = words.len();
+            words.extend(triangle_words.clone());
+
+            let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+            let expected_source_address = capture
+                .memory_layout()
+                .address(
+                    capture.submission().start() + u32::try_from(triangle_start_word * 4).unwrap(),
+                )
+                .unwrap();
+            let plan = push_and_visit(&decoded, capture, journal);
+            assert_eq!(plan.triangles.len(), 1, "opcode {opcode:#04x}");
+
+            let triangle = &plan.triangles[0];
+            assert_eq!(
+                triangle.raw_words.as_ref(),
+                triangle_words.as_slice(),
+                "opcode {opcode:#04x}: raw_words must exactly match the source wire words"
+            );
+            assert_eq!(
+                triangle.location.source_byte_len,
+                u32::try_from(triangle_words.len() * 4).unwrap(),
+                "opcode {opcode:#04x}: source_byte_len must match this opcode's real wire width"
+            );
+            assert_eq!(
+                triangle.location.source_address, expected_source_address,
+                "opcode {opcode:#04x}: source_address must point at the triangle's own wire bytes, \
+                 not the preceding SetOtherMode"
+            );
+            assert_eq!(
+                triangle.location.wire_opcode, opcode,
+                "opcode {opcode:#04x}: wire_opcode must be preserved exactly"
+            );
+        }
     }
 }
