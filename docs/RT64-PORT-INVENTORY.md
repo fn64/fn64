@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 75 `ported`, 190 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 77 `ported`, 188 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -138,8 +138,8 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/hle/rt64_framebuffer_manager.h` | `modified` | `ported` | `crates/fn64-render-wgpu/src/rt64_tmem_regions.rs` | 230 | 14 | 11 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-manager-h` |
 | `src/hle/rt64_framebuffer_pair.cpp` | `unchanged` | `not-started` | -- | 104 | 6 | 2 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-pair-cpp` |
 | `src/hle/rt64_framebuffer_pair.h` | `unchanged` | `not-started` | -- | 64 | 2 | 2 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-pair-h` |
-| `src/hle/rt64_framebuffer_storage.cpp` | `unchanged` | `not-started` | -- | 61 | 5 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-storage-cpp` |
-| `src/hle/rt64_framebuffer_storage.h` | `unchanged` | `not-started` | -- | 35 | 2 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-storage-h` |
+| `src/hle/rt64_framebuffer_storage.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs` | 61 | 5 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-storage-cpp` |
+| `src/hle/rt64_framebuffer_storage.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs` | 35 | 2 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-hle-rt64-framebuffer-storage-h` |
 | `src/hle/rt64_game_call.h` | `unchanged` | `not-started` | -- | 39 | 1 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-game-call-h` |
 | `src/hle/rt64_game_configuration.h` | `unchanged` | `not-started` | -- | 15 | 1 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-game-configuration-h` |
 | `src/hle/rt64_game_frame.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs` | 1042 | 16 | 3 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-game-frame-cpp` |
