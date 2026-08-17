@@ -932,6 +932,7 @@ dependencies = [
  "fn64-render-ir",
  "fn64-runtime",
  "naga 30.0.0",
+ "pollster",
  "sha2",
  "wgpu 30.0.0",
 ]
