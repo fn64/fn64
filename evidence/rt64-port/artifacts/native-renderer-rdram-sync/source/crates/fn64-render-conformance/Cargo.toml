@@ -1,0 +1,47 @@
+[package]
+name = "fn64-render-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral bounded renderer fixtures and proof-bearing conformance receipts."
+
+[dependencies]
+fn64-render-ir = { path = "../fn64-render-ir" }
+fn64-render = { path = "../fn64-render", optional = true }
+fn64-render-reference = { path = "../fn64-render-reference", optional = true }
+fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false, optional = true }
+fn64-runtime = { path = "../fn64-runtime", optional = true }
+libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+conformance-test-runner = []
+reference-runner = [
+    "dep:fn64-render",
+    "dep:fn64-render-reference",
+    "dep:fn64-runtime",
+]
+rt64-deferred-history-runner = [
+    "dep:fn64-render",
+    "dep:fn64-render-rt64",
+    "dep:fn64-runtime",
+    "dep:libc",
+    "fn64-render-rt64/rt64",
+]
+
+[[bin]]
+name = "fn64-render-conformance-test-runner"
+path = "src/bin/fn64-render-conformance-test-runner.rs"
+required-features = ["conformance-test-runner"]
+
+[[bin]]
+name = "fn64-render-conformance-reference-runner"
+path = "src/bin/fn64-render-conformance-reference-runner.rs"
+required-features = ["reference-runner"]
+
+[[bin]]
+name = "fn64-render-conformance-rt64-deferred-history-runner"
+path = "src/bin/fn64-render-conformance-rt64-deferred-history-runner.rs"
+required-features = ["rt64-deferred-history-runner"]

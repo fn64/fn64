@@ -1,0 +1,10 @@
+[package]
+name = "fn64-render-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU-independent renderer semantics, immutable workloads, and typed completion ownership for fn64."
+
+[dependencies]
+sha2 = "0.10"
