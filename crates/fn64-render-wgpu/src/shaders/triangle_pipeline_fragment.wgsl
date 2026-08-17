@@ -107,6 +107,26 @@ struct FragmentCoverageParams {
 @group(0) @binding(6)
 var<uniform> fragment_coverage_params: FragmentCoverageParams;
 
+// Production literal combiner Slice B: the real per-triangle PRIMITIVE/
+// ENVIRONMENT/PRIM_LOD_FRAC combiner-input uniform, sourced from
+// `combiner_inputs_from_fragment_registers`'s already-tested normalization
+// (`combiner.rs`) via `SetEnvColor`/`SetPrimColor` command-time capture
+// (`RetrievedTriangleDraw.env_color`/`.prim_color`, Slice A). Absent
+// SetEnvColor/SetPrimColor before the triangle, the host serializes this
+// uniform as all-zero, matching `CombinerInputs`'s pre-Slice-B hardcoded
+// default exactly.
+struct FragmentMaterialParams {
+    env_color: vec4<f32>,       // offset 0,  size 16
+    prim_color: vec4<f32>,      // offset 16, size 16
+    prim_lod_frac: f32,         // offset 32, size 4
+    _reserved_0: f32,           // offset 36, size 4
+    _reserved_1: f32,           // offset 40, size 4
+    _reserved_2: f32,           // offset 44, size 4
+}                                // total: 48 bytes (16-byte aligned)
+
+@group(0) @binding(7)
+var<uniform> fragment_material_params: FragmentMaterialParams;
+
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) tmem_sample_status: u32,
@@ -139,13 +159,13 @@ fn fs_main(
     var inputs: CombinerInputs;
     inputs.tex_val0 = sample.color;
     inputs.tex_val1 = sample.color;
-    inputs.prim_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    inputs.prim_color = fragment_material_params.prim_color;
     inputs.shade_color = color;
-    inputs.env_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    inputs.env_color = fragment_material_params.env_color;
     inputs.key_center = vec3<f32>(0.0, 0.0, 0.0);
     inputs.key_scale = vec3<f32>(0.0, 0.0, 0.0);
     inputs.lod_fraction = 0.0;
-    inputs.prim_lod_frac = 0.0;
+    inputs.prim_lod_frac = fragment_material_params.prim_lod_frac;
     inputs.noise = 0.0;
     inputs.k4 = 0.0;
     inputs.k5 = 0.0;

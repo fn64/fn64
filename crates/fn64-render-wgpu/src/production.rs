@@ -258,6 +258,8 @@ impl WgpuBackend {
                     tmem,
                     draw.tile_binding,
                     draw.blend_color,
+                    draw.env_color,
+                    draw.prim_color,
                 )
                 .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
             let output = in_flight
@@ -1328,6 +1330,8 @@ mod tests {
     const FULL_SYNC: u8 = 0x29;
     const SET_OTHER_MODE: u8 = 0x2f;
     const SET_COMBINE: u8 = 0x3c;
+    const SET_ENV_COLOR: u8 = 0x3b;
+    const SET_PRIM_COLOR: u8 = 0x3a;
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     fn word(opcode: u8, payload: u32) -> u32 {
@@ -1340,6 +1344,20 @@ mod tests {
 
     fn set_combine(payload: u32, high: u32) -> [u32; 2] {
         [word(SET_COMBINE, payload & 0x00ff_ffff), high]
+    }
+
+    /// Mirrors `raw_dpc::production_adapter::tests::set_env_color` exactly
+    /// (that helper is private to its own module's tests, so this is a
+    /// local, identical copy, not a shared import -- same convention as
+    /// `triangle_base_edge_words` above).
+    fn set_env_color(color: u32) -> [u32; 2] {
+        [word(SET_ENV_COLOR, 0), color]
+    }
+
+    /// Mirrors `raw_dpc::production_adapter::tests::set_prim_color` exactly,
+    /// same local-copy convention.
+    fn set_prim_color(lod_frac: u32, lod_min: u32, color: u32) -> [u32; 2] {
+        [word(SET_PRIM_COLOR, lod_min << 8 | lod_frac), color]
     }
 
     /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
@@ -1788,11 +1806,16 @@ mod tests {
             Err(other) => panic!("create() failed for an unexpected reason: {other}"),
         }
 
-        // SHADE-passthrough SetCombine: (A-B)*C+D collapses to D=SHADE.
+        // PRIMITIVE-passthrough SetCombine: (A-B)*C+D collapses to D, and D
+        // now decodes to PRIMITIVE (index 3, `color_input_d`) instead of
+        // SHADE -- this genuinely exercises Slice B's new
+        // `fragment_material_params` uniform rather than continuing to
+        // collapse to a SHADE-only formula where env/prim would silently
+        // not matter (production-combiner-slice-b-card §6 step 2).
         let color_a: u32 = 0;
         let color_b: u32 = 0;
         let color_c: u32 = 0;
-        let color_d: u32 = 4;
+        let color_d: u32 = 3;
         let alpha_a: u32 = 0;
         let alpha_b: u32 = 0;
         let alpha_c: u32 = 1;
@@ -1805,9 +1828,23 @@ mod tests {
             | (alpha_c << 18)
             | alpha_d;
 
+        // Real SetEnvColor/SetPrimColor wire commands (card §6 step 1),
+        // pushed before the triangle so Slice A's command-time capture
+        // (`RetrievedTriangleDraw.env_color`/`.prim_color`) resolves them.
+        let env_color_wire: u32 = 0x1122_33AA;
+        let prim_lod_frac_wire: u32 = 0x40;
+        let prim_lod_min_wire: u32 = 0x05;
+        let prim_color_wire: u32 = 0x4455_66BB;
+
         let mut words = Vec::new();
         words.extend(set_other_mode(0, 0));
         words.extend(set_combine(low, high));
+        words.extend(set_env_color(env_color_wire));
+        words.extend(set_prim_color(
+            prim_lod_frac_wire,
+            prim_lod_min_wire,
+            prim_color_wire,
+        ));
         let triangle_color_255 = [64u32, 128, 192, 255];
         words.extend(shaded_covering_triangle_words(triangle_color_255));
 
@@ -1840,7 +1877,7 @@ mod tests {
             triangle_color_255[2] as f32 / 255.0,
             triangle_color_255[3] as f32 / 255.0,
         ];
-        let inputs = crate::combiner::CombinerInputs {
+        let base_inputs = crate::combiner::CombinerInputs {
             tex_val0: [0.0; 4],
             tex_val1: [0.0; 4],
             prim_color: [0.0; 4],
@@ -1854,6 +1891,19 @@ mod tests {
             k4: 0.0,
             k5: 0.0,
         };
+        // Real env_color/prim_color values (via
+        // combiner_inputs_from_fragment_registers, the exact Rust-side
+        // machinery Slice B's uniform mirrors) instead of hardcoded zero --
+        // proves the expected value matches what the production path now
+        // actually computes.
+        let inputs = crate::combiner::combiner_inputs_from_fragment_registers(
+            base_inputs,
+            crate::state::Color4::from_wire(env_color_wire),
+            crate::state::PrimColor::from_wire(
+                prim_lod_min_wire << 8 | prim_lod_frac_wire,
+                prim_color_wire,
+            ),
+        );
         let (expected_color, _alpha_compare) =
             crate::combiner::run_one_cycle(combine_params, inputs);
         let expected_u8 = expected_color.map(|component| (component * 255.0).round() as u8);
@@ -1872,7 +1922,20 @@ mod tests {
                  (real decoded CombineParams via the real WgpuBackend production seam)"
             );
         }
-        assert_eq!(expected_u8, triangle_color_255.map(|c| c as u8));
+        // D now decodes to PRIMITIVE (not SHADE), so the expected color's
+        // RGB channels come from prim_color_wire's real bytes; alpha_d is
+        // still SHADE(4), so alpha comes from the triangle's own shade
+        // alpha (triangle_color_255[3] == 255, normalized to 1.0).
+        let prim_color_rgba8 = prim_color_wire.to_be_bytes();
+        assert_eq!(
+            expected_u8,
+            [
+                prim_color_rgba8[0],
+                prim_color_rgba8[1],
+                prim_color_rgba8[2],
+                triangle_color_255[3] as u8,
+            ]
+        );
     }
 
     /// Published committed-TMEM textured-draw card §4: the frozen literal
@@ -2398,6 +2461,8 @@ mod tests {
                 tmem,
                 tile_binding,
                 None,
+                None,
+                None,
             )
             .expect("textured triangle draw must submit cleanly")
             .complete()
@@ -2615,6 +2680,8 @@ mod tests {
                 },
                 tmem,
                 tile_binding,
+                None,
+                None,
                 None,
             )
             .expect("textured triangle draw must submit cleanly")

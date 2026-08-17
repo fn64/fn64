@@ -101,7 +101,7 @@ use crate::shader_manifest::{
     triangle_pipeline_fragment_wgsl, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
-use crate::state::{AlphaCompare, Color4, CoverageDestination, OtherMode};
+use crate::state::{AlphaCompare, Color4, CoverageDestination, OtherMode, PrimColor};
 use crate::tmem::{
     TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES, TMEM_BYTE_WORDS,
     TMEM_VALIDITY_WORDS,
@@ -119,6 +119,7 @@ const RASTER_PARAMS_BYTES: u64 = 32;
 const COMBINE_PARAMS_BYTES: u64 = 16;
 const ALPHA_COMPARE_PARAMS_BYTES: u64 = 16;
 const COVERAGE_PARAMS_BYTES: u64 = 32;
+const MATERIAL_PARAMS_BYTES: u64 = 48;
 const TMEM_BYTES_BUFFER_SIZE: u64 = TMEM_BYTE_WORDS as u64 * 4;
 const TMEM_VALIDITY_BUFFER_SIZE: u64 = TMEM_VALIDITY_WORDS as u64 * 4;
 
@@ -296,6 +297,32 @@ fn fragment_coverage_params_bytes(
     bytes
 }
 
+/// Serializes the fragment shader's `FragmentMaterialParams` uniform
+/// (`shaders/triangle_pipeline_fragment.wgsl`, production literal combiner
+/// Slice B): `env_color` at bytes 0..16 and `prim_color` at bytes 16..32
+/// (both `Color4::normalized()`, RGBA8/255.0 -- RT64's own `setEnvColor`/
+/// `setPrimColor` normalization, `RasterPS.hlsl:169-183`), `prim_lod_frac`
+/// at bytes 32..36 (`PrimColor::lod().lod_frac_normalized()`, lodFrac/256.0,
+/// matching `primLOD.x` in the same RT64 assembly), bytes 36..48 left zero
+/// (`_reserved_0`/`_reserved_1`/`_reserved_2`). `None` (no `SetEnvColor`/
+/// `SetPrimColor` before this triangle) serializes as all-zero, matching
+/// `CombinerInputs`'s pre-Slice-B hardcoded default exactly.
+fn fragment_material_params_bytes(
+    env_color: Option<Color4>,
+    prim_color: Option<PrimColor>,
+) -> [u8; MATERIAL_PARAMS_BYTES as usize] {
+    let env = env_color.map_or([0.0f32; 4], Color4::normalized);
+    let (prim_rgba, prim_lod_frac) = prim_color.map_or(([0.0f32; 4], 0.0f32), |pc| {
+        (pc.color().normalized(), pc.lod().lod_frac_normalized())
+    });
+    let mut bytes = [0u8; MATERIAL_PARAMS_BYTES as usize];
+    bytes[0..16].copy_from_slice(&bytemuck_f32x4(env));
+    bytes[16..32].copy_from_slice(&bytemuck_f32x4(prim_rgba));
+    bytes[32..36].copy_from_slice(&prim_lod_frac.to_le_bytes());
+    // bytes[36..48] left zero: _reserved_0/_reserved_1/_reserved_2.
+    bytes
+}
+
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
 /// vertex shader's `RasterParams` uniform (`shaders/triangle_pipeline_vertex.wgsl`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -363,6 +390,8 @@ pub struct TriangleFixture {
     pub tile_binding: TileBindingParams,
     pub alpha_compare_mode: AlphaCompare,
     pub blend_color: Option<Color4>,
+    pub env_color: Option<Color4>,
+    pub prim_color: Option<PrimColor>,
     pub depth_compare_enabled: bool,
     pub depth_update_enabled: bool,
     pub coverage_destination: CoverageDestination,
@@ -518,6 +547,12 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let material_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-material-params"),
+            size: MATERIAL_PARAMS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -603,6 +638,19 @@ impl UninitializedTrianglePipeline {
                     },
                     count: None,
                 },
+                // Production literal combiner Slice B: `FragmentMaterialParams`,
+                // the real per-triangle PRIMITIVE/ENVIRONMENT/PRIM_LOD_FRAC
+                // combiner-input uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // Prewarm-only bind group: exercised once here so a bind-group-layout
@@ -642,6 +690,10 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: coverage_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: material_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -871,6 +923,8 @@ impl TrianglePipelineRenderer {
         tmem: TmemGpuProjection,
         tile_binding: TileBindingParams,
         blend_color: Option<Color4>,
+        env_color: Option<Color4>,
+        prim_color: Option<PrimColor>,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
         let alpha_compare_mode = match other_mode.alpha_compare() {
             mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
@@ -888,6 +942,8 @@ impl TrianglePipelineRenderer {
             tile_binding,
             alpha_compare_mode,
             blend_color,
+            env_color,
+            prim_color,
             depth_compare_enabled: other_mode.depth_compare_enabled(),
             depth_update_enabled: other_mode.depth_update_enabled(),
             coverage_destination: other_mode.coverage_destination(),
@@ -975,6 +1031,7 @@ impl TrianglePipelineRenderer {
             _tile_binding_buffer: wgpu::Buffer,
             _alpha_compare_params_buffer: wgpu::Buffer,
             _coverage_params_buffer: wgpu::Buffer,
+            _material_params_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -1066,6 +1123,17 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&coverage_params_buffer, 0, &coverage_bytes);
 
+            let material_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-material-params"),
+                size: MATERIAL_PARAMS_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let material_bytes =
+                fragment_material_params_bytes(fixture.env_color, fixture.prim_color);
+            self.queue
+                .write_buffer(&material_params_buffer, 0, &material_bytes);
+
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fn64-triangle-pipeline-bind-group"),
                 layout: &self.bind_group_layout,
@@ -1098,6 +1166,10 @@ impl TrianglePipelineRenderer {
                         binding: 6,
                         resource: coverage_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: material_params_buffer.as_entire_binding(),
+                    },
                 ],
             });
             draws.push(DrawResources {
@@ -1114,6 +1186,7 @@ impl TrianglePipelineRenderer {
                 _tile_binding_buffer: tile_binding_buffer,
                 _alpha_compare_params_buffer: alpha_compare_params_buffer,
                 _coverage_params_buffer: coverage_params_buffer,
+                _material_params_buffer: material_params_buffer,
             });
         }
 

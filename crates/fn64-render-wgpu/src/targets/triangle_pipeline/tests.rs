@@ -86,6 +86,8 @@ fn covering_triangle_fixture() -> TriangleFixture {
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
         blend_color: None,
+        env_color: None,
+        prim_color: None,
         // (Z_CMP, Z_UPD) = (set, set): the pipeline's prior sole state
         // (`depth_pipeline_index((true, true)) == 0`, `Less`/write-always)
         // -- this base fixture is the regression-guard default every
@@ -670,6 +672,39 @@ fn fragment_coverage_params_bytes_allows_clamp_and_wrap_without_image_read_enabl
     );
 }
 
+/// Byte-offset proof for `FragmentMaterialParams` (production literal
+/// combiner Slice B): `env_color` at 0..16, `prim_color` at 16..32,
+/// `prim_lod_frac` at 32..36, bytes 36..48 (`_reserved_0`/`_reserved_1`/
+/// `_reserved_2`) always zero. Covers the `None`/`None` all-zero case (a
+/// triangle drawn before any `SetEnvColor`/`SetPrimColor`) and a real
+/// known-wire `Color4`/`PrimColor` pair.
+#[test]
+fn fragment_material_params_byte_layout_is_48_bytes_with_env_prim_and_lod_frac() {
+    let none_bytes = fragment_material_params_bytes(None, None);
+    assert_eq!(none_bytes.len(), MATERIAL_PARAMS_BYTES as usize);
+    assert_eq!(&none_bytes[0..16], &[0u8; 16]);
+    assert_eq!(&none_bytes[16..32], &[0u8; 16]);
+    assert_eq!(&none_bytes[32..36], &0f32.to_le_bytes());
+    assert_eq!(&none_bytes[36..48], &[0u8; 12]);
+
+    let env_color = crate::state::Color4::from_wire(0x1122_33AA);
+    let prim_color = crate::state::PrimColor::from_wire(0x0000_0080, 0x4455_66BB);
+    let material_bytes = fragment_material_params_bytes(Some(env_color), Some(prim_color));
+    assert_eq!(
+        &material_bytes[0..16],
+        &bytemuck_f32x4(env_color.normalized())
+    );
+    assert_eq!(
+        &material_bytes[16..32],
+        &bytemuck_f32x4(prim_color.color().normalized())
+    );
+    assert_eq!(
+        &material_bytes[32..36],
+        &prim_color.lod().lod_frac_normalized().to_le_bytes()
+    );
+    assert_eq!(&material_bytes[36..48], &[0u8; 12]);
+}
+
 /// Device-unavailable degradation path (port card §7): a real GPU adapter
 /// cannot be forced absent deterministically in this test harness (no unit
 /// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
@@ -726,6 +761,8 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
         blend_color: None,
+        env_color: None,
+        prim_color: None,
         depth_compare_enabled: true,
         depth_update_enabled: true,
         coverage_destination: crate::state::CoverageDestination::Full,
@@ -1771,6 +1808,8 @@ mod host_gpu_tests {
                     tmem,
                     tile_binding,
                     draw.blend_color,
+                    draw.env_color,
+                    draw.prim_color,
                 )
                 .unwrap()
                 .complete()
