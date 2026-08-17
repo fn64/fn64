@@ -352,6 +352,7 @@ mod rt64_math;
 mod rt64_math_decompose;
 mod rt64_math_matrix;
 mod rt64_replacement_resolve;
+mod rt64_resample;
 mod rt64_rigid_body;
 mod rt64_rsp_matrix_stack;
 mod rt64_rsp_segment;
