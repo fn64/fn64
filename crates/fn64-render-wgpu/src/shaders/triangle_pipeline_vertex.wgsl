@@ -11,12 +11,15 @@
 // the `oUV`/`oSmoothColor` passthrough `raster_vs.rs`'s module doc states is
 // out of scope for that module ("there is no arithmetic to port").
 //
-// This slice fixes `is_rect = false` (confirmed for every triangle-sourced
-// draw by the landed `rt64-triangle-composition-precursor` commit, port card
-// §4) and `z_override = false` (the fixed fixture's `OtherMode` is
-// `from_wire(0, 0)`, whose `primitive_depth_source()` is false) -- so the
-// rect-skip and Z-override branches `raster_vs.wgsl` guards with dynamic
-// per-vertex flags are not reachable here and are omitted, not silently
+// `is_rect` (reusing the uniform's `reserved_0` slot, bit-reinterpreted as
+// `u32` -- same 32-bit slot, no layout change) now carries a real per-draw
+// flag: `true` for a `TextureRectangle`/`TextureRectangleFlip`-sourced
+// triangle, whose six vertices are already fixed NDC corners and must skip
+// the RDP-screen-to-NDC transform below, matching `raster_vs.wgsl`'s own
+// `is_rect == 0u` gate (lines 51-59). `z_override = false` (the fixed
+// fixture's `OtherMode` is `from_wire(0, 0)`, whose `primitive_depth_source()`
+// is false) -- the Z-override branch `raster_vs.wgsl` guards with a dynamic
+// per-vertex flag is still not reachable here and is omitted, not silently
 // dropped. `resolution`/`screen_scale`/`screen_offset` remain real per-draw
 // uniform inputs.
 
@@ -27,7 +30,7 @@ struct RasterParams {
     screen_scale_y: f32,
     screen_offset_x: f32,
     screen_offset_y: f32,
-    reserved_0: f32,
+    is_rect: u32,
     reserved_1: f32,
 }
 
@@ -53,15 +56,19 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var z = input.position.z;
     let w = input.position.w;
 
-    // renderFlagRect skip (raster_vs.wgsl:51-59): always taken for this
-    // slice's triangle-sourced vertices (is_rect = false, see module doc).
-    x -= raster_params.resolution_x / 2.0;
-    y -= raster_params.resolution_y / 2.0;
-    x /= raster_params.resolution_x / 2.0;
-    y /= raster_params.resolution_y / -2.0;
-    x *= w;
-    y *= w;
-    z *= w;
+    // renderFlagRect skip (raster_vs.wgsl:51-59): skipped for a
+    // TextureRectangle-sourced draw, whose six vertices are already fixed
+    // NDC corners; taken for every RawTriangle-sourced draw exactly as
+    // before this uniform carried a real is_rect value.
+    if (raster_params.is_rect == 0u) {
+        x -= raster_params.resolution_x / 2.0;
+        y -= raster_params.resolution_y / 2.0;
+        x /= raster_params.resolution_x / 2.0;
+        y /= raster_params.resolution_y / -2.0;
+        x *= w;
+        y *= w;
+        z *= w;
+    }
 
     x = (x * raster_params.screen_scale_x) + raster_params.screen_offset_x * w;
     y = (y * raster_params.screen_scale_y) + raster_params.screen_offset_y * w;

@@ -24,7 +24,7 @@ use fn64_render::{
     NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
     NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand,
     RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind,
-    TmemLoadSemantics, TmemTransferLayout as NeutralTmemTransferLayout,
+    TmemLoadSemantics, TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
@@ -863,6 +863,8 @@ pub fn push_decoded_raw_dpc(
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     vertices,
+                    source: TriangleSource::RawTriangle,
+                    viewport: None,
                 });
             }
             RawDpcCommandKind::TextureRectangle(rectangle) => {
@@ -916,11 +918,15 @@ pub fn push_decoded_raw_dpc(
                     location,
                     raw_words: raw_words.clone().into_boxed_slice(),
                     vertices: first,
+                    source: TriangleSource::TextureRectangle,
+                    viewport: Some(vertices.viewport),
                 });
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     vertices: second,
+                    source: TriangleSource::TextureRectangle,
+                    viewport: Some(vertices.viewport),
                 });
             }
             other @ (RawDpcCommandKind::NoOp { .. }
@@ -2637,6 +2643,38 @@ mod tests {
         });
         assert_eq!(plan.triangles[0].vertices, expected_first);
         assert_eq!(plan.triangles[1].vertices, expected_second);
+    }
+
+    /// Texture-rectangle placement card §2 invariant 2: both triangle
+    /// halves of one rectangle carry the identical `RectViewportPixels` --
+    /// RT64 computes `viewportRect` once per `DrawCall`, not once per
+    /// triangle.
+    #[test]
+    fn both_triangle_halves_of_one_texture_rectangle_share_the_same_viewport() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(texrect_words(TEXRECT, 0));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.triangles.len(), 2);
+        assert_eq!(plan.triangles[0].source, TriangleSource::TextureRectangle);
+        assert_eq!(plan.triangles[1].source, TriangleSource::TextureRectangle);
+        assert!(plan.triangles[0].viewport.is_some());
+        assert_eq!(plan.triangles[0].viewport, plan.triangles[1].viewport);
+    }
+
+    /// Texture-rectangle placement card §2 invariant 1: a `RawTriangle`
+    /// admits with `source == RawTriangle` and `viewport == None`.
+    #[test]
+    fn a_raw_triangle_has_no_viewport_override() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(triangle_base_edge_words(3, 2, 0x1234));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.triangles.len(), 1);
+        assert_eq!(plan.triangles[0].source, TriangleSource::RawTriangle);
+        assert_eq!(plan.triangles[0].viewport, None);
     }
 
     #[test]

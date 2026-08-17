@@ -106,6 +106,7 @@ fn covering_triangle_fixture() -> TriangleFixture {
         antialias_enabled: false,
         coverage_times_alpha: false,
         alpha_coverage_select: false,
+        is_rect: false,
     }
 }
 
@@ -705,6 +706,31 @@ fn fragment_material_params_byte_layout_is_48_bytes_with_env_prim_and_lod_frac()
     assert_eq!(&material_bytes[36..48], &[0u8; 12]);
 }
 
+/// `raster_params_bytes` proof (texture-rectangle placement card §1 item
+/// 7a): `is_rect=false` is byte-identical to `TriangleRasterParams::to_bytes`
+/// (the seam's required no-op case); `is_rect=true` sets bytes 24..28 to
+/// `1u32.to_le_bytes()` and leaves every other byte, including 28..32,
+/// unchanged from the `false` case -- proving the new function only ever
+/// touches bytes 24..28.
+#[test]
+fn raster_params_bytes_only_touches_the_is_rect_byte_range() {
+    let params = TriangleRasterParams {
+        resolution: [8.0, 8.0],
+        screen_scale: [1.0, 1.0],
+        screen_offset: [0.0, 0.0],
+    };
+    let plain = params.to_bytes();
+    let not_rect = raster_params_bytes(params, false);
+    assert_eq!(not_rect, plain);
+    assert_eq!(&not_rect[24..28], &0u32.to_le_bytes());
+    assert_eq!(&not_rect[28..32], &[0u8; 4]);
+
+    let is_rect = raster_params_bytes(params, true);
+    assert_eq!(&is_rect[0..24], &plain[0..24]);
+    assert_eq!(&is_rect[24..28], &1u32.to_le_bytes());
+    assert_eq!(&is_rect[28..32], &[0u8; 4]);
+}
+
 /// Device-unavailable degradation path (port card §7): a real GPU adapter
 /// cannot be forced absent deterministically in this test harness (no unit
 /// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
@@ -771,6 +797,7 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         antialias_enabled: false,
         coverage_times_alpha: false,
         alpha_coverage_select: false,
+        is_rect: false,
     };
     assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
     assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
@@ -1810,6 +1837,7 @@ mod host_gpu_tests {
                     draw.blend_color,
                     draw.env_color,
                     draw.prim_color,
+                    draw.source == fn64_render::TriangleSource::TextureRectangle,
                 )
                 .unwrap()
                 .complete()
