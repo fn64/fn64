@@ -252,12 +252,27 @@ impl RenderIndices {
     /// Builds a [`RenderIndices`] from **positional** arguments in the
     /// source's declaration order (`rt64_render_indices.h:13-17`).
     ///
-    /// Named-field construction cannot detect a declaration reorder, so every
-    /// order claim in this module is pinned by a positional constructor like
-    /// this one and exercised by a test that feeds it distinct values. Swap
-    /// two fields in the struct above without swapping them here and the
-    /// order test fails; swap them in both and the *documented line numbers*
-    /// in this signature no longer ascend, which is the reviewable artifact.
+    /// This transcribes the source's member order into an argument order a
+    /// reviewer can read against the header directly: the *documented line
+    /// numbers* in this signature ascend, which is the reviewable artifact.
+    ///
+    /// **CORRECTION.** Earlier revisions of this doc claimed that swapping two
+    /// field declarations without swapping this constructor's parameters would
+    /// make the order test fail. That is false, and was disproved by mutation:
+    /// `rdp_tile_index` and `rdp_tile_count` were swapped in the declaration
+    /// above and all four `render_indices` tests stayed green. The body uses
+    /// field-init shorthand, which binds by identifier rather than by
+    /// position, and `to_source_order` reads fields by name too -- so both
+    /// ends of the supposed pin are name-bound.
+    ///
+    /// In safe Rust there is no construction or access form for a named-field
+    /// struct that binds positionally, so **no added test can detect a
+    /// declaration reorder.** Doing so requires emitting the declaration and
+    /// an order witness from a single macro, which changes the port's source
+    /// text rather than adding a test. Every `in_source_order` /
+    /// `to_source_order` pair in this module and its siblings carries this
+    /// same limitation; they are readable transcriptions and convenience
+    /// constructors, not order pins.
     #[must_use]
     pub const fn in_source_order(
         instance_index: u32,
@@ -369,6 +384,44 @@ pub struct VideoInterfaceCb {
     pub gamma: f32,
 }
 
+impl VideoInterfaceCb {
+    /// Positional constructor in source declaration order
+    /// (`rt64_video_interface.h:13-15`). See
+    /// [`RenderIndices::in_source_order`] for why this exists.
+    ///
+    /// The two `float2` members are adjacent and identically typed, so a swap
+    /// of their declarations is invisible to every named-field construction --
+    /// **including this one**, whose body uses field-init shorthand, and
+    /// including [`Self::to_source_order`], which reads by name. Verified by
+    /// mutation. See [`RenderIndices::in_source_order`] for why no added test
+    /// can close that gap.
+    #[must_use]
+    pub const fn in_source_order(
+        video_resolution: [f32; 2],
+        texture_resolution: [f32; 2],
+        gamma: f32,
+    ) -> VideoInterfaceCb {
+        VideoInterfaceCb {
+            video_resolution,
+            texture_resolution,
+            gamma,
+        }
+    }
+
+    /// The three members flattened in declaration order, each `float2`
+    /// contributing its `x` then its `y`.
+    #[must_use]
+    pub const fn to_source_order(self) -> [f32; 5] {
+        [
+            self.video_resolution[0],
+            self.video_resolution[1],
+            self.texture_resolution[0],
+            self.texture_resolution[1],
+            self.gamma,
+        ]
+    }
+}
+
 /// `interop::FrameParams` (`rt64_frame_params.h:12-16`), all three members in
 /// declaration order. Note the *mixed* widths: two `uint` then one `float`.
 ///
@@ -387,6 +440,37 @@ pub struct FrameParams {
     pub dither_noise_strength: f32,
 }
 
+impl FrameParams {
+    /// Positional constructor in source declaration order
+    /// (`rt64_frame_params.h:13-15`). See
+    /// [`RenderIndices::in_source_order`] for why this exists.
+    ///
+    /// The two leading `uint` members are adjacent and identically typed, so a
+    /// swap of their declarations is undetectable by this constructor or by
+    /// [`Self::unsigned_members_in_source_order`], both of which bind by name
+    /// (see [`RenderIndices::in_source_order`]). The trailing `float` differs
+    /// in type, so retyping it is caught at compile time -- a width fact, not
+    /// an order fact.
+    #[must_use]
+    pub const fn in_source_order(
+        frame_count: u32,
+        view_ubershaders: u32,
+        dither_noise_strength: f32,
+    ) -> FrameParams {
+        FrameParams {
+            frame_count,
+            view_ubershaders,
+            dither_noise_strength,
+        }
+    }
+
+    /// The two `uint` members in declaration order.
+    #[must_use]
+    pub const fn unsigned_members_in_source_order(self) -> [u32; 2] {
+        [self.frame_count, self.view_ubershaders]
+    }
+}
+
 /// `interop::FramebufferParams` (`rt64_framebuffer_params.h:12-16`), all three
 /// members in declaration order.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -397,6 +481,43 @@ pub struct FramebufferParams {
     pub resolution_scale: [f32; 2],
     /// `float horizontalMisalignment` (line 15).
     pub horizontal_misalignment: f32,
+}
+
+impl FramebufferParams {
+    /// Positional constructor in source declaration order
+    /// (`rt64_framebuffer_params.h:13-15`). See
+    /// [`RenderIndices::in_source_order`] for why this exists.
+    ///
+    /// `resolution` and `resolutionScale` are adjacent `float2`s with the same
+    /// Rust type. Nothing in this module distinguishes their declaration
+    /// order: this constructor and [`Self::to_source_order`] both bind by
+    /// name, as verified by mutation. See
+    /// [`RenderIndices::in_source_order`].
+    #[must_use]
+    pub const fn in_source_order(
+        resolution: [f32; 2],
+        resolution_scale: [f32; 2],
+        horizontal_misalignment: f32,
+    ) -> FramebufferParams {
+        FramebufferParams {
+            resolution,
+            resolution_scale,
+            horizontal_misalignment,
+        }
+    }
+
+    /// The three members flattened in declaration order, each `float2`
+    /// contributing its `x` then its `y`.
+    #[must_use]
+    pub const fn to_source_order(self) -> [f32; 5] {
+        [
+            self.resolution[0],
+            self.resolution[1],
+            self.resolution_scale[0],
+            self.resolution_scale[1],
+            self.horizontal_misalignment,
+        ]
+    }
 }
 
 /// `#define FB_COMMON_WORKGROUP_SIZE 8` (`rt64_fb_common.h:9`). Declared
@@ -1135,6 +1256,24 @@ mod tests {
         assert_eq!(VideoInterfaceCb::default().gamma, 0.0);
     }
 
+    #[test]
+    fn shared_params_video_interface_cb_in_source_order_maps_arguments_to_fields() {
+        // Checks the constructor's arguments land in the fields its parameter
+        // names promise, and that `to_source_order` agrees.
+        //
+        // NOT a reorder detector: videoResolution (line 13) and
+        // textureResolution (line 14) are adjacent `float2`s of the same Rust
+        // type, and swapping their declarations keeps this test green
+        // (verified by mutation) because both the constructor and the
+        // accessor bind by name.
+        let cb = VideoInterfaceCb::in_source_order([11.0, 22.0], [33.0, 44.0], 55.0);
+        assert_eq!(cb.video_resolution, [11.0, 22.0]);
+        assert_eq!(cb.texture_resolution, [33.0, 44.0]);
+        assert_eq!(cb.gamma, 55.0);
+        // Second, independent derivation of the same order.
+        assert_eq!(cb.to_source_order(), [11.0, 22.0, 33.0, 44.0, 55.0]);
+    }
+
     // -- FrameParams (rt64_frame_params.h) --
 
     #[test]
@@ -1175,6 +1314,20 @@ mod tests {
         assert_eq!(params.frame_count, 4_294_967_295);
     }
 
+    #[test]
+    fn shared_params_frame_params_in_source_order_maps_arguments_to_fields() {
+        // Checks argument-to-field mapping and accessor agreement. NOT a
+        // reorder detector: frameCount (line 13) and viewUbershaders (line 14)
+        // are adjacent `uint`s and swapping their declarations keeps this
+        // green, since both forms bind by name.
+        let params = FrameParams::in_source_order(17, 29, 0.75);
+        assert_eq!(params.frame_count, 17);
+        assert_eq!(params.view_ubershaders, 29);
+        assert_eq!(params.dither_noise_strength, 0.75);
+        // Second, independent derivation of the two same-typed members' order.
+        assert_eq!(params.unsigned_members_in_source_order(), [17, 29]);
+    }
+
     // -- FramebufferParams (rt64_framebuffer_params.h) --
 
     #[test]
@@ -1200,6 +1353,19 @@ mod tests {
         };
         assert_eq!(params.horizontal_misalignment, -0.25_f32);
         assert!(params.horizontal_misalignment < 0.0);
+    }
+
+    #[test]
+    fn shared_params_framebuffer_params_in_source_order_maps_arguments_to_fields() {
+        // Checks argument-to-field mapping and accessor agreement. NOT a
+        // reorder detector: resolution (line 13) and resolutionScale (line 14)
+        // are adjacent `float2`s of identical Rust type, and swapping their
+        // declarations keeps this green, since both forms bind by name.
+        let params = FramebufferParams::in_source_order([61.0, 62.0], [63.0, 64.0], 65.0);
+        assert_eq!(params.resolution, [61.0, 62.0]);
+        assert_eq!(params.resolution_scale, [63.0, 64.0]);
+        assert_eq!(params.horizontal_misalignment, 65.0);
+        assert_eq!(params.to_source_order(), [61.0, 62.0, 63.0, 64.0, 65.0]);
     }
 
     // -- FbCommonCB (rt64_fb_common.h) --

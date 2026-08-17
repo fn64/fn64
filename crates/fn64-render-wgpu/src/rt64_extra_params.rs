@@ -423,6 +423,110 @@ pub struct ExtraParams {
 }
 
 impl ExtraParams {
+    /// Builds an [`ExtraParams`] from **positional** arguments in the
+    /// upstream declaration order (`rt64_extra_params.h:32-50`).
+    ///
+    /// This transcribes the header's twenty members into an argument order a
+    /// reviewer can read against `rt64_extra_params.h:32-50` directly.
+    ///
+    /// **It does not detect a declaration reorder, and no test here claims it
+    /// does.** The body uses field-init shorthand, which binds by identifier
+    /// rather than by position, as do the two accessors below; so swapping
+    /// (say) `roughness_factor` and `refraction_factor` in the declaration
+    /// leaves this constructor, the accessors, and every test in this module
+    /// passing unchanged. Verified by mutation. Safe Rust offers no
+    /// positional construction or access form for a named-field struct, so
+    /// catching a reorder requires generating the declaration and an order
+    /// witness together -- a change to the port's source text.
+    ///
+    /// This is not a `Default` and not a zero-fill: it takes every field, so
+    /// it invents no value the header declines to declare (see the module
+    /// doc's "This header declares no defaults at all"). The order it pins is
+    /// a **source-text** fact; no memory layout, size, offset, or
+    /// constant-buffer ABI claim is made or implied (see "Nonclaims").
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn in_source_order(
+        rsp_light_diffuse_mix: f32,
+        lock_mask: f32,
+        ignore_normal_factor: f32,
+        uv_detail_scale: f32,
+        reflection_factor: f32,
+        reflection_fresnel_factor: f32,
+        roughness_factor: f32,
+        refraction_factor: f32,
+        shadow_catcher_factor: f32,
+        specular_color: Vec3,
+        specular_exponent: f32,
+        solid_alpha_multiplier: f32,
+        shadow_alpha_multiplier: f32,
+        depth_order_bias: f32,
+        depth_decal_bias: f32,
+        shadow_ray_bias: f32,
+        self_light: Vec3,
+        light_group_mask_bits: u32,
+        diffuse_color_mix: Vec4,
+        enabled_attributes: u32,
+    ) -> ExtraParams {
+        ExtraParams {
+            rsp_light_diffuse_mix,
+            lock_mask,
+            ignore_normal_factor,
+            uv_detail_scale,
+            reflection_factor,
+            reflection_fresnel_factor,
+            roughness_factor,
+            refraction_factor,
+            shadow_catcher_factor,
+            specular_color,
+            specular_exponent,
+            solid_alpha_multiplier,
+            shadow_alpha_multiplier,
+            depth_order_bias,
+            depth_decal_bias,
+            shadow_ray_bias,
+            self_light,
+            light_group_mask_bits,
+            diffuse_color_mix,
+            enabled_attributes,
+        }
+    }
+
+    /// The fifteen bare `f32` members in declaration order.
+    ///
+    /// Deliberately the scalar `float`s only: `specular_color` /
+    /// `self_light` (`float3`) and `diffuse_color_mix` (`float4`) have
+    /// distinct types and so are already reorder-visible against their
+    /// neighbours; flattening them here would blur which run of same-typed
+    /// fields this accessor is pinning.
+    #[must_use]
+    pub const fn float_members_in_source_order(self) -> [f32; 15] {
+        [
+            self.rsp_light_diffuse_mix,
+            self.lock_mask,
+            self.ignore_normal_factor,
+            self.uv_detail_scale,
+            self.reflection_factor,
+            self.reflection_fresnel_factor,
+            self.roughness_factor,
+            self.refraction_factor,
+            self.shadow_catcher_factor,
+            self.specular_exponent,
+            self.solid_alpha_multiplier,
+            self.shadow_alpha_multiplier,
+            self.depth_order_bias,
+            self.depth_decal_bias,
+            self.shadow_ray_bias,
+        ]
+    }
+
+    /// The two `uint` members in declaration order:
+    /// `lightGroupMaskBits` (line 48) then `enabledAttributes` (line 50).
+    #[must_use]
+    pub const fn unsigned_members_in_source_order(self) -> [u32; 2] {
+        [self.light_group_mask_bits, self.enabled_attributes]
+    }
+
     /// Literal port of `ExtraParams::applyExtraAttributes`
     /// (`rt64_extra_params.h:54-127`), all 18 branches in upstream order.
     ///
@@ -508,6 +612,72 @@ impl ExtraParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_params_in_source_order_maps_arguments_to_named_fields() {
+        // Checks that `in_source_order`'s twenty arguments land in the fields
+        // its parameter names promise, and that both accessors agree.
+        //
+        // This is NOT a reorder detector: swapping any two of the fifteen
+        // bare `f32` members -- or the two `u32`s -- in the struct definition
+        // keeps this green, because field-init shorthand and field access
+        // both bind by name. Verified by mutation; see the constructor docs.
+        //
+        // Nothing here is a layout claim: the struct is not `repr(C)` and no
+        // size, alignment, or byte offset is asserted (module doc
+        // "Nonclaims").
+        let p = ExtraParams::in_source_order(
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            Vec3::new(10.0, 11.0, 12.0),
+            13.0,
+            14.0,
+            15.0,
+            16.0,
+            17.0,
+            18.0,
+            Vec3::new(19.0, 20.0, 21.0),
+            22,
+            Vec4::new(23.0, 24.0, 25.0, 26.0),
+            27,
+        );
+
+        assert_eq!(p.rsp_light_diffuse_mix, 1.0);
+        assert_eq!(p.lock_mask, 2.0);
+        assert_eq!(p.ignore_normal_factor, 3.0);
+        assert_eq!(p.uv_detail_scale, 4.0);
+        assert_eq!(p.reflection_factor, 5.0);
+        assert_eq!(p.reflection_fresnel_factor, 6.0);
+        assert_eq!(p.roughness_factor, 7.0);
+        assert_eq!(p.refraction_factor, 8.0);
+        assert_eq!(p.shadow_catcher_factor, 9.0);
+        assert_eq!(p.specular_color, Vec3::new(10.0, 11.0, 12.0));
+        assert_eq!(p.specular_exponent, 13.0);
+        assert_eq!(p.solid_alpha_multiplier, 14.0);
+        assert_eq!(p.shadow_alpha_multiplier, 15.0);
+        assert_eq!(p.depth_order_bias, 16.0);
+        assert_eq!(p.depth_decal_bias, 17.0);
+        assert_eq!(p.shadow_ray_bias, 18.0);
+        assert_eq!(p.self_light, Vec3::new(19.0, 20.0, 21.0));
+        assert_eq!(p.light_group_mask_bits, 22);
+        assert_eq!(p.diffuse_color_mix, Vec4::new(23.0, 24.0, 25.0, 26.0));
+        assert_eq!(p.enabled_attributes, 27);
+
+        // Second, independent derivation of the same order, per run of
+        // same-typed members -- the runs where a swap is otherwise silent.
+        assert_eq!(
+            p.float_members_in_source_order(),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0]
+        );
+        assert_eq!(p.unsigned_members_in_source_order(), [22, 27]);
+    }
 
     /// The 18 real attribute bits, in the macro-declaration order of the
     /// cited file. `RT64_ATTRIBUTE_NONE` is excluded: it is a zero mask, not
