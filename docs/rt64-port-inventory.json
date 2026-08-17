@@ -9744,8 +9744,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-application-cpp",
@@ -9758,7 +9760,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_application_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -16219,8 +16221,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-hle-rt64-vi-h",
@@ -16233,7 +16237,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_vi_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -16390,8 +16394,10 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m3-src-hle-rt64-workload-cpp",
@@ -16404,7 +16410,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "F/xhigh",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_workload_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -16575,8 +16581,10 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m3-src-hle-rt64-workload-h",
@@ -16589,7 +16597,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "F/xhigh",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_workload_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -16758,8 +16766,10 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m3-src-hle-rt64-workload-queue-cpp",
@@ -16772,7 +16782,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "F/xhigh",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_workload_queue_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -16861,8 +16871,10 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m3-src-hle-rt64-workload-queue-h",
@@ -16875,7 +16887,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "F/xhigh",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_workload_queue_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
