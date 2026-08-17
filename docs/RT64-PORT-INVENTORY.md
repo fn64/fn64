@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 192 `ported`, 0 `not-started`, 73 `refused`, 11 `authority-gated` (of 276).
+- Port state: 193 `ported`, 0 `not-started`, 73 `refused`, 10 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -168,7 +168,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/hle/rt64_state.cpp` | `modified` | `authority-gated` | -- | 2804 | 42 | 8 | `M3` / `authority-overlay` | `source-digests-verified` | `not-run` / `candidate-observation` | `authority-evidence` (M/medium) | `rt64-port-m3-src-hle-rt64-state-cpp` |
 | `src/hle/rt64_state.h` | `unchanged` | `refused` | refused by `49f6760b`, see `crates/fn64-render-wgpu/src/rt64_vi_registers.rs` | 177 | 5 | 24 | `M3` / `raw-dpc` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m3-src-hle-rt64-state-h` |
 | `src/hle/rt64_transform_group.h` | `unchanged` | `refused` | refused by `d2980310`, see `crates/fn64-render-wgpu/src/rt64_extended_gbi.rs` | 28 | 1 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-transform-group-h` |
-| `src/hle/rt64_vi.cpp` | `unchanged` | `authority-gated` | -- | 177 | 17 | 3 | `M8` / `authority-overlay` | `source-digests-verified` | `not-run` / `candidate-observation` | `authority-evidence` (M/medium) | `rt64-port-m8-src-hle-rt64-vi-cpp` |
+| `src/hle/rt64_vi.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_vi_timing.rs` | 177 | 17 | 3 | `M8` / `authority-overlay` | `source-digests-verified` | `not-run` / `candidate-observation` | `authority-evidence` (M/medium) | `rt64-port-m8-src-hle-rt64-vi-cpp` |
 | `src/hle/rt64_vi.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_vi_registers.rs` | 173 | 3 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-vi-h` |
 | `src/hle/rt64_workload.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_workload_geometry.rs` | 326 | 15 | 1 | `M3` / `raw-dpc` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m3-src-hle-rt64-workload-cpp` |
 | `src/hle/rt64_workload.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_workload_geometry.rs` | 257 | 13 | 16 | `M3` / `raw-dpc` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m3-src-hle-rt64-workload-h` |
