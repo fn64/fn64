@@ -23229,8 +23229,10 @@
       "port_delta": "unchanged",
       "milestone": "M11",
       "workstream": "modernization",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_postprocess.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m11-src-render-rt64-upscaler-cpp",
@@ -23243,7 +23245,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_upscaler_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_postprocess.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26510,8 +26512,10 @@
       "port_delta": "unchanged",
       "milestone": "M11",
       "workstream": "modernization",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_postprocess.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m11-src-shaders-postprocessps-hlsl",
@@ -26524,7 +26528,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/postprocessps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_postprocess.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
