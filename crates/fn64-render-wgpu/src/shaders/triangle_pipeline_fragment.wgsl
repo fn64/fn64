@@ -81,6 +81,32 @@ struct FragmentAlphaCompareParams {
 @group(0) @binding(5)
 var<uniform> fragment_alpha_compare_params: FragmentAlphaCompareParams;
 
+// Production coverage node 1: the real per-fragment `cvg_dst`/coverage-alpha
+// uniform, all six already-decoded `OtherMode` fields
+// (`coverage_destination`/`image_read_enabled`/`force_blend`/
+// `antialias_enabled`/`coverage_times_alpha`/`alpha_coverage_select`), one
+// value each, host-serialized `u32`s (bool fields 0/1) matching this file's
+// existing `FragmentAlphaCompareParams` convention. This slice is the
+// `Full`/no-image-read subset only: `image_read_enabled` reaching this
+// uniform as nonzero, or `coverage_destination == CVG_DST_SAVE` (3) at all,
+// is a host-side bug the CPU caller must reject before submission (see
+// `triangle_pipeline.rs`'s `submit_admitted_triangle` loud panic) --
+// `fs_main` below does not re-check either condition, it trusts the
+// contract this uniform's producer already enforced.
+struct FragmentCoverageParams {
+    coverage_destination: u32,
+    image_read_enabled: u32,
+    force_blend: u32,
+    antialias_enabled: u32,
+    coverage_times_alpha: u32,
+    alpha_coverage_select: u32,
+    _reserved_0: u32,
+    _reserved_1: u32,
+}
+
+@group(0) @binding(6)
+var<uniform> fragment_coverage_params: FragmentCoverageParams;
+
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) tmem_sample_status: u32,
@@ -146,8 +172,39 @@ fn fs_main(
         discard;
     }
 
+    // Production coverage node 1: called after alpha compare's discard,
+    // consistent with RT64's own real order (alpha compare first, its
+    // coverage estimate second) -- see this crate's README for the
+    // source-verified order statement. This repo's own data-flow is the
+    // primary justification for placing this call last: coverage/
+    // `alpha_coverage_select` composition only reads the already-computed
+    // combiner alpha, never alpha-compare's outcome, so sequencing it after
+    // the discard avoids computing coverage arithmetic for a fragment that
+    // is about to be thrown away -- a dead-work ordering choice, not a
+    // correctness one.
+    // `pixel_count` is always `COVERAGE_FULL` (8u) and `memory_count` is
+    // always `0u`: this slice's rasterizer produces only whole-pixel
+    // coverage (no `CoverageMask` sub-pixel geometry, node 3, out of scope)
+    // and no framebuffer-read mechanism exists to supply a real `memory`
+    // value (node 2, out of scope) -- the exact `Full`/no-image-read subset
+    // this uniform's host-side contract guarantees (struct doc above).
+    let coverage = coverage_fragment_fn(
+        COVERAGE_FULL,
+        0u,
+        fragment_coverage_params.image_read_enabled,
+        fragment_coverage_params.force_blend,
+        fragment_coverage_params.antialias_enabled,
+        fragment_coverage_params.coverage_destination,
+        fragment_coverage_params.coverage_times_alpha,
+        fragment_coverage_params.alpha_coverage_select,
+        alpha_u32,
+    );
+
     var output: FragmentOutput;
     output.color = result.combiner_color;
+    if (fragment_coverage_params.alpha_coverage_select != 0u) {
+        output.color.a = f32(coverage.adjusted_alpha) / 255.0;
+    }
     output.tmem_sample_status = sample.status;
     return output;
 }

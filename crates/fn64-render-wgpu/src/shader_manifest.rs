@@ -366,20 +366,23 @@ pub const TMEM_SAMPLE_WGSL: &str = include_str!("shaders/tmem_sample.wgsl");
 /// with `tmem_sample.wgsl`'s TMEM addressing/filter port,
 /// `alpha_compare_fragment_fn.wgsl`'s real per-fragment alpha-compare gate
 /// (alpha-compare production card §3a -- reused verbatim, not re-typed
-/// inline, matching this seam's own no-duplication convention), and this
-/// component's thin `@fragment` wrapper. WGSL has no cross-module include
-/// mechanism reachable from separate `wgpu::ShaderSource::Wgsl` strings in
-/// this wgpu version, so the four source files are combined into one module
-/// at this seam, not at shader-module-creation time in
-/// `targets/triangle_pipeline.rs` -- keeping that file free of string
-/// concatenation logic and this manifest the single place the combined
-/// source text is assembled.
+/// inline, matching this seam's own no-duplication convention),
+/// `coverage_fragment_fn.wgsl`'s existing, already-GPU-differentially-
+/// validated `Full`/`Save` `cvg_dst` callable (production coverage node 1 --
+/// reused verbatim, same no-duplication convention), and this component's
+/// thin `@fragment` wrapper. WGSL has no cross-module include mechanism
+/// reachable from separate `wgpu::ShaderSource::Wgsl` strings in this wgpu
+/// version, so the five source files are combined into one module at this
+/// seam, not at shader-module-creation time in `targets/triangle_pipeline.rs`
+/// -- keeping that file free of string concatenation logic and this manifest
+/// the single place the combined source text is assembled.
 pub fn triangle_pipeline_fragment_wgsl() -> String {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         crate::combiner::COLOR_COMBINER_WGSL,
         TMEM_SAMPLE_WGSL,
         crate::alpha_compare::ALPHA_COMPARE_FRAGMENT_FN_WGSL,
+        crate::coverage::COVERAGE_FRAGMENT_FN_WGSL,
         TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL
     )
 }
@@ -400,14 +403,14 @@ pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST_ENTRY_POINT: &str =
 // and assert they still match this frozen literal -- the public manifest
 // constant itself carries the real value, not a placeholder.
 pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256: [u8; 32] = [
-    0xd2, 0xda, 0x57, 0xed, 0xcf, 0x68, 0xfd, 0xd5, 0x3a, 0xfd, 0xc6, 0xdd, 0xdd, 0xc8, 0x2d, 0x33,
-    0xe4, 0xf0, 0x47, 0xf5, 0xd4, 0x03, 0x0f, 0xe0, 0x5b, 0x0e, 0xb9, 0x4b, 0x81, 0x29, 0x50, 0xf5,
+    0x22, 0xca, 0x68, 0xad, 0x81, 0x68, 0x34, 0xc0, 0xa2, 0xf3, 0x68, 0xdb, 0x55, 0x0c, 0xce, 0xce,
+    0x61, 0x85, 0x00, 0x59, 0x0d, 0x79, 0x69, 0xd3, 0x76, 0x3c, 0x10, 0xd1, 0x98, 0x3e, 0x12, 0x49,
 ];
 pub const TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256: [u8; 32] = [
-    0x88, 0x7f, 0x91, 0xaa, 0x3c, 0x20, 0x58, 0x74, 0x9d, 0x2c, 0xaf, 0x58, 0xba, 0x21, 0x50, 0x15,
-    0x6c, 0xe9, 0xd8, 0x01, 0x3f, 0x4e, 0x00, 0x53, 0xf1, 0x0b, 0x76, 0xc0, 0xae, 0x21, 0xc4, 0x6f,
+    0x4b, 0x18, 0x2b, 0xda, 0x9b, 0xf6, 0x34, 0x10, 0x4a, 0xd7, 0xe8, 0x4c, 0xd4, 0xc0, 0x12, 0x5b,
+    0xb9, 0x3b, 0x49, 0x10, 0x85, 0xde, 0x5b, 0xcd, 0x07, 0xc9, 0x3b, 0xf2, 0x9f, 0x5d, 0x6f, 0x59,
 ];
-pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 54_468;
+pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 62_365;
 
 pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST: RuntimeShaderComponentManifest =
     RuntimeShaderComponentManifest {
