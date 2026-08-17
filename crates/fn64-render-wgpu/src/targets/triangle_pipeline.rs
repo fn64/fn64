@@ -323,6 +323,138 @@ fn fragment_material_params_bytes(
     bytes
 }
 
+const BLEND_PARAMS_BYTES: u64 = 80;
+
+/// One resolved selector's wire number, matching
+/// `shaders/blend_fragment_fn.wgsl`'s header encoding exactly
+/// (`0=Combined/OneMinusA, 1=Framebuffer/FramebufferAlpha, 2=Blend/One,
+/// 3=Fog/Zero` for color, and the alpha table `0=Combined, 1=Fog, 2=Shade,
+/// 3=Zero`). Shared by `p`/`a`/`m`/`b` since `BlendColorInput`/
+/// `BlendAlphaInput`/`BlendBInput::from_wire` all decode a raw 2-bit field
+/// the same way; this helper just reads back the same wire value
+/// `from_wire` was built from, via each enum's own discriminant order
+/// (`Clone, Copy` closed enums, no hidden reserved encoding to worry about
+/// per `crate::blend`'s own module doc).
+const fn blend_color_input_wire(input: crate::blend::BlendColorInput) -> u32 {
+    match input {
+        crate::blend::BlendColorInput::Combined => 0,
+        crate::blend::BlendColorInput::Framebuffer => 1,
+        crate::blend::BlendColorInput::Blend => 2,
+        crate::blend::BlendColorInput::Fog => 3,
+    }
+}
+
+const fn blend_alpha_input_wire(input: crate::blend::BlendAlphaInput) -> u32 {
+    match input {
+        crate::blend::BlendAlphaInput::Combined => 0,
+        crate::blend::BlendAlphaInput::Fog => 1,
+        crate::blend::BlendAlphaInput::Shade => 2,
+        crate::blend::BlendAlphaInput::Zero => 3,
+    }
+}
+
+const fn blend_b_input_wire(input: crate::blend::BlendBInput) -> u32 {
+    match input {
+        crate::blend::BlendBInput::OneMinusA => 0,
+        crate::blend::BlendBInput::FramebufferAlpha => 1,
+        crate::blend::BlendBInput::One => 2,
+        crate::blend::BlendBInput::Zero => 3,
+    }
+}
+
+/// Typed host-side resolved fragment-blend parameter object (production
+/// blend wiring slice 1, card §4): carries only the admitted subset's cycle
+/// count/selectors/register bytes -- no raw parallel `OtherMode` decode, no
+/// framebuffer-dependent field. Built once per admitted triangle by
+/// `production.rs` from `crate::blend::BlendModeState`/`ResolvedBlendCycle`
+/// (the same landed selector types `crate::blend`'s own CPU characterization
+/// uses, reused here rather than re-decoded), after that caller has already
+/// rejected any active cycle whose selectors need a framebuffer sample (see
+/// `ResolvedBlendCycle::requires_framebuffer_sample`) -- constructing this
+/// type at all is proof the admitted-subset gate already passed for this
+/// triangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedFragmentBlendParams {
+    /// `crate::blend::BlendModeState::cycle_count()`: `0` (Copy/Fill
+    /// bypass), `1` (OneCycle), or `2` (TwoCycle).
+    pub cycle_count: u8,
+    /// Cycle 0's four selectors, meaningful only when `cycle_count >= 1`.
+    pub cycle0: crate::blend::ResolvedBlendCycle,
+    /// Cycle 1's four selectors, meaningful only when `cycle_count == 2`.
+    pub cycle1: crate::blend::ResolvedBlendCycle,
+    /// `G_SETBLENDCOLOR`, needed whenever an active cycle's `P`/`M` selects
+    /// [`crate::blend::BlendColorInput::Blend`].
+    pub blend_color: Option<Color4>,
+    /// `G_SETFOGCOLOR`, needed whenever an active cycle's `P`/`M` selects
+    /// [`crate::blend::BlendColorInput::Fog`] or `A` selects
+    /// [`crate::blend::BlendAlphaInput::Fog`].
+    pub fog_color: Option<Color4>,
+}
+
+impl ResolvedFragmentBlendParams {
+    /// The Copy/Fill bypass value (`cycle_count == 0`): `blend_fragment_cycle_fn`
+    /// returns `src` unchanged for this value, matching the pipeline's prior
+    /// `blend: None` no-op exactly (module doc, byte-identical-output
+    /// regression bar). This crate's own fixtures reuse this constant as
+    /// their no-blend default, the same "regression-guard default every
+    /// existing test reuses unmodified" convention already established for
+    /// `coverage_destination: Full`/`image_read_enabled: false`.
+    pub const NO_OP: Self = Self {
+        cycle_count: 0,
+        cycle0: crate::blend::ResolvedBlendCycle {
+            p: crate::blend::BlendColorInput::Combined,
+            a: crate::blend::BlendAlphaInput::Combined,
+            m: crate::blend::BlendColorInput::Combined,
+            b: crate::blend::BlendBInput::Zero,
+        },
+        cycle1: crate::blend::ResolvedBlendCycle {
+            p: crate::blend::BlendColorInput::Combined,
+            a: crate::blend::BlendAlphaInput::Combined,
+            m: crate::blend::BlendColorInput::Combined,
+            b: crate::blend::BlendBInput::Zero,
+        },
+        blend_color: None,
+        fog_color: None,
+    };
+}
+
+/// Serializes the fragment shader's `FragmentBlendParams` uniform
+/// (`shaders/triangle_pipeline_fragment.wgsl`, production blend wiring slice
+/// 1): `cycle_count` at bytes 0..4, cycle 0's `p/a/m/b` at bytes 4..20,
+/// cycle 1's `p/a/m/b` at bytes 20..36 (each wire-numbered exactly as
+/// `shaders/blend_fragment_fn.wgsl`'s header documents; `cycle1`'s bytes are
+/// zero and unread by the shader when `cycle_count < 2`, matching
+/// `blend_fragment_cycle_fn`'s own `cycle_count == 2u` gate), bytes 36..48
+/// left zero (`_reserved_0/_reserved_1/_reserved_2`), `blend_color` at bytes
+/// 48..64 and `fog_color` at bytes 64..80 (both `Color4::normalized()`,
+/// matching `fragment_material_params_bytes`'s own normalization
+/// convention). `None` (no `SetBlendColor`/`SetFogColor` before this
+/// triangle) serializes as all-zero, exactly like `fragment_material_params_
+/// bytes`'s own `None` handling -- this is safe here because the caller
+/// (`production.rs`) has already rejected, before this function ever runs,
+/// any admitted triangle whose active cycle selectors actually need the
+/// missing register (see `ResolvedFragmentBlendParams`'s own doc).
+fn fragment_blend_params_bytes(
+    params: ResolvedFragmentBlendParams,
+) -> [u8; BLEND_PARAMS_BYTES as usize] {
+    let mut bytes = [0u8; BLEND_PARAMS_BYTES as usize];
+    bytes[0..4].copy_from_slice(&u32::from(params.cycle_count).to_le_bytes());
+    bytes[4..8].copy_from_slice(&blend_color_input_wire(params.cycle0.p).to_le_bytes());
+    bytes[8..12].copy_from_slice(&blend_alpha_input_wire(params.cycle0.a).to_le_bytes());
+    bytes[12..16].copy_from_slice(&blend_color_input_wire(params.cycle0.m).to_le_bytes());
+    bytes[16..20].copy_from_slice(&blend_b_input_wire(params.cycle0.b).to_le_bytes());
+    bytes[20..24].copy_from_slice(&blend_color_input_wire(params.cycle1.p).to_le_bytes());
+    bytes[24..28].copy_from_slice(&blend_alpha_input_wire(params.cycle1.a).to_le_bytes());
+    bytes[28..32].copy_from_slice(&blend_color_input_wire(params.cycle1.m).to_le_bytes());
+    bytes[32..36].copy_from_slice(&blend_b_input_wire(params.cycle1.b).to_le_bytes());
+    // bytes[36..48] left zero: _reserved_0/_reserved_1/_reserved_2.
+    let blend_color = params.blend_color.map_or([0.0f32; 4], Color4::normalized);
+    let fog_color = params.fog_color.map_or([0.0f32; 4], Color4::normalized);
+    bytes[48..64].copy_from_slice(&bytemuck_f32x4(blend_color));
+    bytes[64..80].copy_from_slice(&bytemuck_f32x4(fog_color));
+    bytes
+}
+
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
 /// vertex shader's `RasterParams` uniform (`shaders/triangle_pipeline_vertex.wgsl`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -407,6 +539,12 @@ pub struct TriangleFixture {
     pub blend_color: Option<Color4>,
     pub env_color: Option<Color4>,
     pub prim_color: Option<PrimColor>,
+    /// Production blend wiring slice 1: the admitted-subset resolved
+    /// blend-cycle parameters this triangle's real `OtherMode` decoded to.
+    /// Always present (never `Option`) -- a `cycle_count == 0` value (built
+    /// from `BlendModeState::cycle_count()`'s own Copy/Fill short-circuit)
+    /// is a legitimate, common admitted value, not an absence.
+    pub blend_params: ResolvedFragmentBlendParams,
     pub depth_compare_enabled: bool,
     pub depth_update_enabled: bool,
     pub coverage_destination: CoverageDestination,
@@ -445,6 +583,7 @@ pub(crate) fn admitted_triangle_fixture(
     blend_color: Option<Color4>,
     env_color: Option<Color4>,
     prim_color: Option<PrimColor>,
+    blend_params: ResolvedFragmentBlendParams,
     is_rect: bool,
 ) -> TriangleFixture {
     let alpha_compare_mode = match other_mode.alpha_compare() {
@@ -465,6 +604,7 @@ pub(crate) fn admitted_triangle_fixture(
         blend_color,
         env_color,
         prim_color,
+        blend_params,
         depth_compare_enabled: other_mode.depth_compare_enabled(),
         depth_update_enabled: other_mode.depth_update_enabled(),
         coverage_destination: other_mode.coverage_destination(),
@@ -628,6 +768,12 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let blend_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-blend-params"),
+            size: BLEND_PARAMS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -726,6 +872,18 @@ impl UninitializedTrianglePipeline {
                     },
                     count: None,
                 },
+                // Production blend wiring slice 1: `FragmentBlendParams`,
+                // the admitted-subset resolved blend-cycle uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // Prewarm-only bind group: exercised once here so a bind-group-layout
@@ -769,6 +927,10 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: material_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: blend_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1000,6 +1162,7 @@ impl TrianglePipelineRenderer {
         blend_color: Option<Color4>,
         env_color: Option<Color4>,
         prim_color: Option<PrimColor>,
+        blend_params: ResolvedFragmentBlendParams,
         is_rect: bool,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
         let fixture = admitted_triangle_fixture(
@@ -1013,6 +1176,7 @@ impl TrianglePipelineRenderer {
             blend_color,
             env_color,
             prim_color,
+            blend_params,
             is_rect,
         );
         self.submit_triangle(fixture)
@@ -1094,6 +1258,7 @@ impl TrianglePipelineRenderer {
             _alpha_compare_params_buffer: wgpu::Buffer,
             _coverage_params_buffer: wgpu::Buffer,
             _material_params_buffer: wgpu::Buffer,
+            _blend_params_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -1199,6 +1364,16 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&material_params_buffer, 0, &material_bytes);
 
+            let blend_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-blend-params"),
+                size: BLEND_PARAMS_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let blend_params_bytes = fragment_blend_params_bytes(fixture.blend_params);
+            self.queue
+                .write_buffer(&blend_params_buffer, 0, &blend_params_bytes);
+
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fn64-triangle-pipeline-bind-group"),
                 layout: &self.bind_group_layout,
@@ -1235,6 +1410,10 @@ impl TrianglePipelineRenderer {
                         binding: 7,
                         resource: material_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: blend_params_buffer.as_entire_binding(),
+                    },
                 ],
             });
             draws.push(DrawResources {
@@ -1252,6 +1431,7 @@ impl TrianglePipelineRenderer {
                 _alpha_compare_params_buffer: alpha_compare_params_buffer,
                 _coverage_params_buffer: coverage_params_buffer,
                 _material_params_buffer: material_params_buffer,
+                _blend_params_buffer: blend_params_buffer,
             });
         }
 

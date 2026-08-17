@@ -33,11 +33,11 @@ use fn64_render_ir::{
 };
 
 use crate::raw_dpc::push_decoded_raw_dpc;
-use crate::targets::admitted_triangle_fixture;
+use crate::targets::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
-    AlphaCompare, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode,
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, PrimColor,
+    AlphaCompare, BlendModeState, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState,
+    OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, PrimColor,
     RawDpcDecodeError, RdpState, RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord,
     TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
     TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
@@ -264,7 +264,7 @@ impl WgpuBackend {
         let tmem = project_committed_tmem(self.coordinator.physical());
 
         let mut fixtures = Vec::with_capacity(triangles.len());
-        for draw in triangles {
+        for (triangle_index, draw) in triangles.into_iter().enumerate() {
             let draw = draw.map_err(WgpuRawDpcExecutionError::MissingTriangleDrawState)?;
             // Per-triangle, not loop-invariant: a `TextureRectangle`-sourced
             // draw's `screen_scale`/`screen_offset` come from its own
@@ -295,6 +295,26 @@ impl WgpuBackend {
                 screen_scale,
                 screen_offset,
             };
+            let blend_mode = BlendModeState {
+                other_mode: draw.other_mode,
+                blend_color_register: draw.blend_color.map_or([0u8; 4], |color| color.rgba8()),
+                fog_color: draw.fog_color.map_or([0u8; 4], |color| color.rgba8()),
+            };
+            let cycle_count = blend_mode.cycle_count();
+            let cycle0 = blend_mode.cycle(0);
+            let cycle1 = blend_mode.cycle(1);
+            if (cycle_count >= 1 && cycle0.requires_framebuffer_sample())
+                || (cycle_count == 2 && cycle1.requires_framebuffer_sample())
+            {
+                return Err(WgpuRawDpcExecutionError::BlendRequiresFramebuffer { triangle_index });
+            }
+            let blend_params = ResolvedFragmentBlendParams {
+                cycle_count,
+                cycle0,
+                cycle1,
+                blend_color: draw.blend_color,
+                fog_color: draw.fog_color,
+            };
             fixtures.push(admitted_triangle_fixture(
                 draw.vertices,
                 draw.other_mode,
@@ -306,6 +326,7 @@ impl WgpuBackend {
                 draw.blend_color,
                 draw.env_color,
                 draw.prim_color,
+                blend_params,
                 draw.source == TriangleSource::TextureRectangle,
             ));
         }
@@ -446,6 +467,13 @@ struct PlanCollector {
     /// `G_SETPRIMCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color` exactly.
     current_prim_color: Option<PrimColor>,
+    /// `G_SETFOGCOLOR` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
+    /// time (`Self::seeded`), then updated on every `SetFogColor` command
+    /// in plan order. Mirrors `current_env_color`/`current_prim_color`
+    /// exactly. Needed by the production blend-cycle wiring's `Fog`
+    /// selector.
+    current_fog_color: Option<Color4>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -470,6 +498,7 @@ impl PlanCollector {
         blend_color: Option<Color4>,
         env_color: Option<Color4>,
         prim_color: Option<PrimColor>,
+        fog_color: Option<Color4>,
     ) -> Self {
         Self {
             loads: Vec::new(),
@@ -482,6 +511,7 @@ impl PlanCollector {
             current_blend_color: blend_color,
             current_env_color: env_color,
             current_prim_color: prim_color,
+            current_fog_color: fog_color,
             triangles: Vec::new(),
         }
     }
@@ -515,6 +545,9 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
                         color.color,
                     ));
+                }
+                RdpStateCommand::SetFogColor { color, .. } => {
+                    self.current_fog_color = Some(Color4::from_wire(color.value));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -555,7 +588,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     // own module doc: `Reserved`/`Dither` never reach
                     // `submit_admitted_triangle` -- loud, named panics here,
                     // not a silent None/Threshold coercion.
-                    let blend_color = match other_mode.alpha_compare() {
+                    match other_mode.alpha_compare() {
                         AlphaCompare::Reserved => panic!(
                             "triangle #{triangle_index} (plan order) selected reserved G_AC \
                              alpha-compare mode 2"
@@ -566,11 +599,11 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                              this pipeline (no frame-count uniform exists to seed it honestly; \
                              see fn64-alpha-compare-production-card.md \u{a7}2)"
                         ),
-                        AlphaCompare::Threshold => Some(
+                        AlphaCompare::Threshold => {
                             self.current_blend_color
-                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?,
-                        ),
-                        AlphaCompare::None => None,
+                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?;
+                        }
+                        AlphaCompare::None => {}
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
@@ -579,9 +612,10 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         other_mode,
                         combine_params,
                         tile_binding,
-                        blend_color,
+                        blend_color: self.current_blend_color,
                         env_color: self.current_env_color,
                         prim_color: self.current_prim_color,
+                        fog_color: self.current_fog_color,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -646,7 +680,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // its exact seed values are irrelevant.
         self.plan = core::mem::replace(
             plan_visitor,
-            PlanCollector::seeded(None, None, None, None, None),
+            PlanCollector::seeded(None, None, None, None, None, None),
         );
     }
 
@@ -710,6 +744,18 @@ pub enum WgpuRawDpcExecutionError {
     TmemSampleFailed {
         status: u32,
     },
+    /// A triangle's resolved blend cycle selected
+    /// [`crate::blend::BlendColorInput::Framebuffer`] or
+    /// [`crate::blend::BlendBInput::FramebufferAlpha`] on an active cycle
+    /// (`ResolvedBlendCycle::requires_framebuffer_sample`) -- this slice's
+    /// admitted subset never reads a destination color (card §3c's
+    /// memory-dependent sub-case is explicitly out of scope; see
+    /// `crates/fn64-render-wgpu/README.md`'s "production blend wiring slice
+    /// 1" section). Rejected before GPU submission, never silently rendered
+    /// opaque and never given a manufactured destination sample.
+    BlendRequiresFramebuffer {
+        triangle_index: usize,
+    },
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -742,6 +788,12 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "a triangle draw's fragment shader reported a non-OK tmem_sample.wgsl status: \
                  {status}"
+            ),
+            Self::BlendRequiresFramebuffer { triangle_index } => write!(
+                formatter,
+                "triangle #{triangle_index} (plan order) selected a blend-cycle input that reads \
+                 the framebuffer; this slice's admitted subset does not implement \
+                 framebuffer-dependent blending"
             ),
         }
     }
@@ -918,6 +970,7 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.blend_color(),
             self.rdp_state.env_color(),
             self.rdp_state.prim_color(),
+            self.rdp_state.fog_color(),
         )
         .map_err(RenderError::from)?;
 
@@ -1181,13 +1234,15 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// `RawDpcCoordinator::complete_execution`.
 ///
 /// `durable_other_mode`/`durable_combine`/`durable_blend_color`/
-/// `durable_env_color`/`durable_prim_color` are `WgpuBackend.rdp_state`'s
-/// own current values, passed in by the trait method (which has `self`)
-/// since this is a free function taking only `coordinator` -- they seed
-/// `PlanCollector`'s walk (`PlanCollector::seeded`) so a triangle in this
-/// submission with no `SetOtherMode`/`SetCombine`/`SetBlendColor`/
-/// `SetEnvColor`/`SetPrimColor` of its own still resolves its draw state
-/// from durable cross-submission carry-in, not `None`.
+/// `durable_env_color`/`durable_prim_color`/`durable_fog_color` are
+/// `WgpuBackend.rdp_state`'s own current values, passed in by the trait
+/// method (which has `self`) since this is a free function taking only
+/// `coordinator` -- they seed `PlanCollector`'s walk (`PlanCollector::seeded`)
+/// so a triangle in this submission with no `SetOtherMode`/`SetCombine`/
+/// `SetBlendColor`/`SetEnvColor`/`SetPrimColor`/`SetFogColor` of its own
+/// still resolves its draw state from durable cross-submission carry-in, not
+/// `None`.
+#[allow(clippy::too_many_arguments)]
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
     bound: BoundSubmittedRawDpc,
@@ -1196,6 +1251,7 @@ fn execute_raw_dpc_inner(
     durable_blend_color: Option<Color4>,
     durable_env_color: Option<Color4>,
     durable_prim_color: Option<PrimColor>,
+    durable_fog_color: Option<Color4>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -1209,6 +1265,7 @@ fn execute_raw_dpc_inner(
         durable_blend_color,
         durable_env_color,
         durable_prim_color,
+        durable_fog_color,
     );
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
@@ -1221,6 +1278,7 @@ fn execute_raw_dpc_inner(
             durable_blend_color,
             durable_env_color,
             durable_prim_color,
+            durable_fog_color,
         ),
         reads: Vec::new(),
         outcome: None,
@@ -2783,6 +2841,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ResolvedFragmentBlendParams::NO_OP,
                 false,
             )
             .expect("textured triangle draw must submit cleanly")
@@ -3004,6 +3063,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ResolvedFragmentBlendParams::NO_OP,
                 false,
             )
             .expect("textured triangle draw must submit cleanly")
@@ -3105,6 +3165,7 @@ mod tests {
             blend_color: None,
             env_color: None,
             prim_color: None,
+            fog_color: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)])
@@ -3188,6 +3249,7 @@ mod tests {
             blend_color: None,
             env_color: None,
             prim_color: None,
+            fog_color: None,
         }
     }
 
@@ -3278,6 +3340,7 @@ mod tests {
             blend_color: None,
             env_color: None,
             prim_color: None,
+            fog_color: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)])
@@ -3811,6 +3874,107 @@ mod tests {
         }
     }
 
+    fn fixture_set_fog_color(value: u32) -> RdpStateCommand {
+        RdpStateCommand::SetFogColor {
+            location: fixture_location(0),
+            raw_words: Box::new([0]),
+            color: fn64_render::NeutralColor4 { value },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_fog_color(fn64_render::NeutralColor4 {
+                value,
+            }),
+        }
+    }
+
+    /// Production blend wiring slice 1: `SetFogColor(A)` -> triangle A ->
+    /// `SetFogColor(B)` -> triangle B must collect two distinct snapshots
+    /// through `PlanCollector`, mirroring `plan_collector_snapshots_
+    /// distinct_env_and_prim_colors_through_a_and_b_triangles` below exactly
+    /// for the new `current_fog_color` field.
+    #[test]
+    fn plan_collector_snapshots_distinct_fog_colors_through_a_and_b_triangles() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let fog_a = fixture_set_fog_color(0x7777_7777);
+        collector.command(RawDpcSemanticCommandRef::State(&fog_a));
+        let triangle_a = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_a));
+
+        let fog_b = fixture_set_fog_color(0x8888_8888);
+        collector.command(RawDpcSemanticCommandRef::State(&fog_b));
+        let triangle_b = fixture_triangle(10.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
+
+        assert_eq!(collector.triangles.len(), 2);
+        let first = collector.triangles[0].as_ref().unwrap();
+        let second = collector.triangles[1].as_ref().unwrap();
+        assert_eq!(first.fog_color, Some(Color4::from_wire(0x7777_7777)));
+        assert_eq!(second.fog_color, Some(Color4::from_wire(0x8888_8888)));
+        assert_ne!(
+            first.fog_color, second.fog_color,
+            "triangle A must NOT be retroactively affected by a SetFogColor after it in plan \
+             order"
+        );
+    }
+
+    /// Production blend wiring slice 1 (card §3d): a triangle whose resolved
+    /// blend cycle selects `BlendColorInput::Framebuffer`/
+    /// `BlendBInput::FramebufferAlpha` on an active cycle must be rejected
+    /// before GPU submission with a named `BlendRequiresFramebuffer` error --
+    /// never silently rendered opaque, never given a manufactured
+    /// destination sample. Mirrors `a_failed_triangle_draw_leaves_the_prior_
+    /// successful_output_untouched`'s own `create_inner`/`RetrievedTriangleDraw`
+    /// literal fixture pattern exactly.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn draw_admitted_triangles_rejects_a_blend_cycle_that_reads_the_framebuffer() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("create() must succeed on a real adapter");
+
+        // OneCycle (high bits 20:21 == 0, the default) with cycle 1's `P`
+        // selector (`blender_cycle_1().color_a`, low bits 30:31) = 1
+        // (Framebuffer, `BlendColorInput::from_wire`): the memory-dependent
+        // sub-case card §3c explicitly defers, not admitted by this slice.
+        let framebuffer_blend_other_mode = OtherMode::from_wire(0, 1 << 30);
+        let triangle = RetrievedTriangleDraw {
+            vertices: [
+                fixture_vertex(0.0),
+                fixture_vertex(1.0),
+                fixture_vertex(2.0),
+            ],
+            source: TriangleSource::RawTriangle,
+            viewport: None,
+            other_mode: framebuffer_blend_other_mode,
+            combine_params: CombineParams::from_wire(0, 0),
+            tile_binding: TileBindingParams::unbound(),
+            blend_color: None,
+            env_color: None,
+            prim_color: None,
+            fog_color: None,
+        };
+        let error = backend
+            .draw_admitted_triangles(vec![Ok(triangle)])
+            .expect_err("a framebuffer-dependent blend cycle must be rejected before submission");
+        assert!(
+            matches!(
+                error,
+                WgpuRawDpcExecutionError::BlendRequiresFramebuffer { triangle_index: 0 }
+            ),
+            "unexpected error variant: {error:?}"
+        );
+    }
+
     /// Command-time capture seam (card): `SetEnvColor(A)`/`SetPrimColor(A)`
     /// -> triangle A -> `SetEnvColor(B)`/`SetPrimColor(B)` -> triangle B
     /// must collect two distinct snapshots through `PlanCollector`,
@@ -3822,8 +3986,14 @@ mod tests {
     fn plan_collector_snapshots_distinct_env_and_prim_colors_through_a_and_b_triangles() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector =
-            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let env_a = fixture_set_env_color(0x1111_1111);
         let prim_a = fixture_set_prim_color(10, 5, 0x2222_2222);
@@ -3881,6 +4051,7 @@ mod tests {
             None,
             Some(seed_env_color),
             Some(seed_prim_color),
+            None,
         );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -3899,7 +4070,7 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(None, None, None, None, None);
+        let mut collector = PlanCollector::seeded(None, None, None, None, None, None);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3924,8 +4095,14 @@ mod tests {
     fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector =
-            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            None,
+            None,
+            None,
+            None,
+        );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -3948,8 +4125,14 @@ mod tests {
     fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector =
-            PlanCollector::seeded(Some(seed_other_mode), Some(seed_combine), None, None, None);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let first_triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&first_triangle));
@@ -3991,6 +4174,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
@@ -4016,6 +4200,7 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
+            None,
             None,
             None,
             None,

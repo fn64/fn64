@@ -2609,3 +2609,117 @@ final diff and reported zero findings at or above its confidence threshold,
 after two earlier review passes during implementation caught and fixed real
 bugs (the decode-time ordering/silent-default gap, and the retrieval-time
 whole-plan-final-value bug, both described above).
+
+## 2026-08-17: Production blend wiring slice 1 — admitted-subset blend-cycle compositing
+
+Wires the already-landed `crate::blend` CPU characterization ("Blender: full
+selector/cycle semantics (port-card §1)" above — `blend.rs`,
+`shared/rt64_blender.h:68-81,366-504`, pin
+`5473732a822a4423b5696e7cb18fecc425a59875`) into the real triangle fragment
+path, for the **admitted subset only**: Copy/Fill bypass, and OneCycle/
+TwoCycle whose active cycles' `P`/`M`/`B` selectors never name
+`BlendColorInput::Framebuffer`/`BlendBInput::FramebufferAlpha`. A triangle
+whose real `OtherMode` needs a framebuffer sample is rejected before GPU
+submission with a named `WgpuRawDpcExecutionError::BlendRequiresFramebuffer`
+error — never silently rendered opaque, never given a manufactured
+destination sample. The memory-dependent sub-case (native dual-source
+blending under `wgpu::Features::DUAL_SOURCE_BLENDING`, or
+`manual_blend_composite`'s integer-arithmetic fallback with a
+destination-color read) is explicitly deferred to a follow-up slice — no
+dual-source/manual-fallback wiring exists yet in this pipeline.
+
+**Command-time state.** `G_SETBLENDCOLOR` is now tracked unconditionally at
+every triangle's command-time position (`PlanCollector.current_blend_color`/
+`RetrievedTriangleDraw.blend_color`), not only under
+`AlphaCompare::Threshold` as before — both alpha-compare's threshold gate
+and the new blend-cycle wiring's `BlendColorInput::Blend` selector read the
+same real register value; each consumer validates presence only when its
+own selector/mode requires it (alpha-compare's existing
+`MissingTriangleDrawState::NoBlendColor` panic path is unchanged and still
+fires under `Threshold` with no prior `SetBlendColor`). `G_SETFOGCOLOR` is
+threaded the same way as a new field (`current_fog_color`/`fog_color`),
+mirroring `env_color`/`prim_color`'s existing unconditional
+command-time-snapshot pattern exactly — no second register-tracking shape
+invented.
+
+**Typed host-side parameter object.** `targets/triangle_pipeline.rs` adds
+`ResolvedFragmentBlendParams` (cycle count, both cycles' four selectors as
+`crate::blend`'s own closed enums, `blend_color`/`fog_color`) and
+`fragment_blend_params_bytes`, an 80-byte fixed serialization matching the
+new `FragmentBlendParams` WGSL uniform exactly. Built once per admitted
+triangle in `production.rs`'s `draw_admitted_triangles`, from
+`BlendModeState::cycle_count()`/`cycle()` constructed directly from the
+triangle's own decoded `OtherMode` plus its resolved `blend_color`/
+`fog_color` — no parallel `OtherMode` decode. Construction only proceeds
+after `ResolvedBlendCycle::requires_framebuffer_sample()` has rejected every
+active cycle that needs a memory sample; a `cycle_count == 0`
+(`ResolvedFragmentBlendParams::NO_OP`) value is the same byte-identical
+Copy/Fill bypass every pre-existing fixture already reused unmodified.
+
+**WGSL wiring.** `shaders/blend_fragment_fn.wgsl` (new file, concatenated by
+`shader_manifest.rs`'s `triangle_pipeline_fragment_wgsl` after
+`coverage_fragment_fn.wgsl` and before the `@fragment` wrapper) is an
+ordinary-WGSL re-expression of `blend_fragment`'s admitted-subset control
+flow: the sequential 1-or-2-cycle composite, the no-`FORCE_BL` last-cycle
+bypass gated on the same `coverage_fragment_fn`-produced `blend_enabled`
+value (no second gate), the zero-factor divisor collapse, and the general
+`(P*A + M*B) / (A+B)` divide — all restricted to selectors that never read a
+destination color; the `Framebuffer`/`FramebufferAlpha` arms are
+structurally unreachable (host-rejected before this shader ever runs) and
+fall back to a defensive, never-actually-taken value rather than indexing
+out of bounds. New binding 8, `FragmentBlendParams`, added at every
+bind-group-layout/bind-group site (prewarm and per-draw).
+
+**Manifest hash.** `shader_manifest.rs`'s frozen
+`TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`/`_FIXTURE_SHA256`/`_SOURCE_BYTES`
+constants are recomputed and refrozen for the new six-file combined source
+(previously five), via this file's existing `#[ignore]`
+freeze-print-and-paste convention — the hash-gated test that would have
+caught a stale freeze (`triangle_pipeline_fragment_manifest_retains_zero_
+row_promotion_and_matches_its_own_source`) is green against the refrozen
+values.
+
+**Out of scope, held (this slice).** The memory-dependent sub-case (§3c of
+the originating card): no storage-texture read-back binding, no second
+render pass, no native dual-source `@blend_src` output, no
+`manual_blend_composite` wiring — naming
+`WgpuRawDpcExecutionError::BlendRequiresFramebuffer` is a rejection, not an
+implementation of that path. No parity claim against RT64 or real hardware.
+No presentation/full-ROM/performance claim.
+
+**Evidence.** `cargo test -p fn64-render-wgpu --lib` clean (1091/1091
+passed, 3 ignored freeze-print tests) after refreezing the manifest hash;
+`cargo clippy -p fn64-render-wgpu --lib --tests --no-deps` clean (default and
+`--features host-gpu-tests`); `rustfmt --check` clean on every file this
+slice touches. All three `#[cfg(feature = "host-gpu-tests")]` tests added by
+this slice have now run on this crate's certified M2.2 Metal adapter (Apple
+M5 Pro): `draw_admitted_triangles_rejects_a_blend_cycle_that_reads_the_framebuffer`
+(`production.rs`, 1/1 passed); card §3f's WGSL-vs-Rust differential
+(`blend::tests::host_gpu_tests::required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures`,
+`blend/tests.rs` — a compute shim wrapping `blend_fragment_cycle_fn`
+unmodified, dispatched over 11 frozen fixtures spanning Copy/Fill bypass,
+both zero-factor collapses, the general divide, both directions of the
+two-cycle sequential handoff, the documented fog-then-pass pattern, and the
+no-`FORCE_BL` last-cycle bypass, each fixture's expected value computed by
+calling `blend_fragment(..., memory: None, ...)` itself — the existing Rust
+oracle, not a second formula, 11 fixtures x 4 channels passed); and card
+§3f's physical-Metal general-divide draw fixture
+(`targets::triangle_pipeline::tests::host_gpu_tests::required_host_general_divide_blend_draw_matches_the_rust_oracle_with_no_memory`,
+`targets/triangle_pipeline/tests.rs` — a real `TriangleFixture` draw with a
+`Blend`/`Fog`/`Fog`/`One` OneCycle selector combination chosen so neither
+zero-factor collapse applies, `force_blend: true` so the last-cycle bypass
+does not apply either, real-GPU readback compared against
+`blend_fragment(..., memory: None, ...)`, 1/1 passed). 3/3 named tests
+passed one run each. The first pre-repair run on this hardware failed the
+11-fixture differential: `blend/tests.rs`'s `case_data` packer wrote
+`RawCase`'s `src`/`blend_color`/`fog_color` `vec4<f32>` fields at tightly
+packed Rust `repr(C)` offsets instead of the WGSL host-shareable layout's
+required 16-byte-aligned offsets, so WGSL read `src`/`blend_color`/
+`fog_color` starting 8/20/20 bytes earlier than Rust had written them. The
+repair moved those three fields to their WGSL-correct offsets 48, 80, and 96
+(stride 112 total, `WGSL_CASE_STRIDE`), after which the same run passed
+3/3 clean. Final-source reliability then ran those same three exact tests in
+10 consecutive fresh-process ordinals on the same Apple M5 Pro: 30/30 test
+processes passed with no retry or source change. This satisfies AGENTS.md's
+deterministic 10x bar for this bounded slice; it is not a broader parity,
+performance, or full-ROM claim.
