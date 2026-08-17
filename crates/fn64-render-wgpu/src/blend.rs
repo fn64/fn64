@@ -167,6 +167,24 @@ impl ResolvedBlendCycle {
             b: BlendBInput::from_wire(cycle.alpha_b),
         }
     }
+
+    /// `true` when this cycle's `P`/`M`/`B` selectors name
+    /// [`BlendColorInput::Framebuffer`] or [`BlendBInput::FramebufferAlpha`]
+    /// -- i.e. this cycle cannot be evaluated without a real destination
+    /// sample ([`BlendFramebufferSample`]), matching exactly the selector
+    /// combinations [`blend_fragment`]'s own dispatch (`cycle.p ==
+    /// Framebuffer`/`cycle.m == Framebuffer`/`blend_b`'s
+    /// `FramebufferAlpha` arm) routes through the dual-source composite or
+    /// the [`BlendImageReadError`] rejection, rather than the general A/B
+    /// divide. A caller that wants to admit only the memory-independent
+    /// subset of the blender (this crate's current production wiring) uses
+    /// this predicate to reject a triangle before ever calling
+    /// [`blend_fragment`] with `memory: None`.
+    pub const fn requires_framebuffer_sample(self) -> bool {
+        matches!(self.p, BlendColorInput::Framebuffer)
+            || matches!(self.m, BlendColorInput::Framebuffer)
+            || matches!(self.b, BlendBInput::FramebufferAlpha)
+    }
 }
 
 /// The blender's per-fragment framebuffer sample, needed only when a
@@ -610,6 +628,13 @@ pub fn manual_blend_composite(output: DualSourceBlendOutput, destination_rgba: [
 
 pub const BLEND_WGSL: &str = include_str!("shaders/blend.wgsl");
 pub const BLEND_ENTRY_POINT: &str = "blend_fragment_cycle";
+
+/// Fragment-callable admitted-subset blend library (production blend wiring
+/// slice 1): concatenated into the production triangle fragment shader by
+/// `shader_manifest.rs`, same mechanism as `alpha_compare.rs`'s/
+/// `coverage.rs`'s own `*_FRAGMENT_FN_WGSL` constants. See
+/// `shaders/blend_fragment_fn.wgsl`'s own header for scope.
+pub const BLEND_FRAGMENT_FN_WGSL: &str = include_str!("shaders/blend_fragment_fn.wgsl");
 
 #[cfg(test)]
 mod tests;

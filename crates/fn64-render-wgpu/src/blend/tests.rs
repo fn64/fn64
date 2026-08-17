@@ -1147,3 +1147,670 @@ fn wgsl_general_divide_agrees_with_rust_oracle_across_a_representative_grid() {
         }
     }
 }
+
+// --- Production blend wiring slice 1, card §3f: WGSL-vs-Rust differential
+// for BLEND_FRAGMENT_FN_WGSL's blend_fragment_cycle_fn, GPU-executed via a
+// compute shim (the same idiom `coverage/tests.rs`'s `host_gpu_tests` module
+// established for `coverage_fragment_fn`) -- an actual dispatch on real
+// hardware, not the textual/structural differential above (which predates
+// this file having any compute-dispatch harness at all). Each fixture binds
+// exact command-time BlendColor/FogColor and coverage `blend_enabled`,
+// exercises a representative P/M/B selector combination, both cycles and
+// the cycle-1-to-cycle-2 handoff, and both the zero-factor collapse and the
+// general-divide denominator -- reusing this file's own curated
+// characterization cases (`one_cycle_mode_state`/`two_cycle_mode_state`)
+// rather than inventing a parallel selector-grid enumeration. Every
+// fixture's expected output comes from calling `blend_fragment` itself
+// (memory: None) -- never a second hand-rolled formula, matching this
+// module's existing `wgsl_general_divide_agrees_with_rust_oracle_across_a_
+// representative_grid`'s own textual precedent but for a real GPU dispatch.
+struct BlendFragmentFnCase {
+    name: &'static str,
+    cycle_count: u32,
+    cycle0: (u32, u32, u32, u32),
+    cycle1: (u32, u32, u32, u32),
+    src: [u8; 4],
+    shade_alpha: u8,
+    blend_color: [u8; 4],
+    fog_color: [u8; 4],
+    blend_enabled: bool,
+    expected_rgba: [u8; 4],
+}
+
+fn wire_tuple(cycle: ResolvedBlendCycle) -> (u32, u32, u32, u32) {
+    (
+        selector_wire(cycle.p) as u32,
+        alpha_wire(cycle.a) as u32,
+        selector_wire(cycle.m) as u32,
+        b_wire(cycle.b) as u32,
+    )
+}
+
+/// Builds one fixture from a `BlendModeState`/`src`/`shade_alpha`/
+/// `blend_enabled` combination by calling `blend_fragment` (memory: None)
+/// itself for the expected value -- the sole oracle, per this card's own
+/// instruction not to re-derive the formula a second time. Panics (test
+/// setup failure, not a fixture assertion) if the case selects a
+/// `Framebuffer`/`FramebufferAlpha` input, since every fixture here must be
+/// admitted-subset by construction, matching `blend_fragment_fn.wgsl`'s own
+/// scope.
+fn case(
+    name: &'static str,
+    state: BlendModeState,
+    src: [u8; 4],
+    shade_alpha: u8,
+    blend_enabled: bool,
+) -> BlendFragmentFnCase {
+    let expected =
+        blend_fragment(src, None, shade_alpha, state, blend_enabled).unwrap_or_else(|error| {
+            panic!("fixture {name}: oracle unexpectedly required memory: {error}")
+        });
+    let cycle0 = if state.cycle_count() >= 1 {
+        wire_tuple(state.cycle(0))
+    } else {
+        (0, 0, 0, 0)
+    };
+    let cycle1 = if state.cycle_count() == 2 {
+        wire_tuple(state.cycle(1))
+    } else {
+        (0, 0, 0, 0)
+    };
+    BlendFragmentFnCase {
+        name,
+        cycle_count: u32::from(state.cycle_count()),
+        cycle0,
+        cycle1,
+        src,
+        shade_alpha,
+        blend_color: state.blend_color_register,
+        fog_color: state.fog_color,
+        blend_enabled,
+        expected_rgba: expected.rgba,
+    }
+}
+
+/// Frozen fixture set: Copy/Fill bypass, both zero-factor collapses, the
+/// general divide, sequential two-cycle handoff (both directions), the
+/// documented fog-then-pass pattern, and the no-`FORCE_BL` last-cycle
+/// bypass -- the same representative cases this file's own Rust-only tests
+/// above already characterize individually, reused here rather than
+/// re-invented, so a WGSL divergence on any of them is caught by the exact
+/// scenario this file already names and explains.
+fn frozen_blend_fragment_fn_fixtures() -> Vec<BlendFragmentFnCase> {
+    vec![
+        case("copy_bypass", copy_mode_state(), [10, 20, 30, 40], 0, false),
+        case("fill_bypass", fill_mode_state(), [50, 60, 70, 80], 0, false),
+        case(
+            "zero_alpha_collapses_to_m",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Combined),
+                alpha_wire(BlendAlphaInput::Zero),
+                selector_wire(BlendColorInput::Blend),
+                b_wire(BlendBInput::One),
+                true,
+                false,
+                [9, 9, 9, 255],
+                [0, 0, 0, 0],
+            ),
+            [200, 200, 200, 200],
+            0,
+            true,
+        ),
+        case(
+            "zero_b_collapses_to_p",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Blend),
+                alpha_wire(BlendAlphaInput::Shade),
+                selector_wire(BlendColorInput::Fog),
+                b_wire(BlendBInput::Zero),
+                true,
+                false,
+                [11, 22, 33, 255],
+                [44, 55, 66, 255],
+            ),
+            [1, 2, 3, 4],
+            128,
+            true,
+        ),
+        case(
+            "mid_range_general_divide",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Combined),
+                alpha_wire(BlendAlphaInput::Combined),
+                selector_wire(BlendColorInput::Blend),
+                b_wire(BlendBInput::OneMinusA),
+                true,
+                false,
+                [0, 0, 0, 255],
+                [0, 0, 0, 0],
+            ),
+            [200, 100, 50, 128],
+            0,
+            true,
+        ),
+        case(
+            "max_a_and_b_general_divide",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Combined),
+                alpha_wire(BlendAlphaInput::Combined),
+                selector_wire(BlendColorInput::Blend),
+                b_wire(BlendBInput::One),
+                true,
+                false,
+                [50, 60, 70, 255],
+                [0, 0, 0, 0],
+            ),
+            [255, 255, 255, 255],
+            0,
+            true,
+        ),
+        case(
+            "two_cycle_first_reads_pre_blend_source",
+            two_cycle_mode_state(
+                (
+                    selector_wire(BlendColorInput::Combined),
+                    alpha_wire(BlendAlphaInput::Combined),
+                    selector_wire(BlendColorInput::Blend),
+                    b_wire(BlendBInput::One),
+                ),
+                (
+                    selector_wire(BlendColorInput::Combined),
+                    alpha_wire(BlendAlphaInput::Zero),
+                    selector_wire(BlendColorInput::Blend),
+                    b_wire(BlendBInput::One),
+                ),
+                true,
+                false,
+                [10, 10, 10, 255],
+                [0, 0, 0, 0],
+            ),
+            [255, 255, 255, 255],
+            0,
+            true,
+        ),
+        case(
+            "two_cycle_second_reads_first_cycles_result",
+            two_cycle_mode_state(
+                (
+                    selector_wire(BlendColorInput::Blend),
+                    alpha_wire(BlendAlphaInput::Zero),
+                    selector_wire(BlendColorInput::Blend),
+                    b_wire(BlendBInput::One),
+                ),
+                (
+                    selector_wire(BlendColorInput::Combined),
+                    alpha_wire(BlendAlphaInput::Shade),
+                    selector_wire(BlendColorInput::Fog),
+                    b_wire(BlendBInput::Zero),
+                ),
+                true,
+                false,
+                [77, 88, 99, 255],
+                [1, 2, 3, 4],
+            ),
+            [200, 200, 200, 200],
+            90,
+            true,
+        ),
+        case(
+            "documented_fog_then_pass",
+            two_cycle_mode_state(
+                (
+                    selector_wire(BlendColorInput::Combined),
+                    alpha_wire(BlendAlphaInput::Shade),
+                    selector_wire(BlendColorInput::Fog),
+                    b_wire(BlendBInput::OneMinusA),
+                ),
+                (
+                    selector_wire(BlendColorInput::Combined),
+                    alpha_wire(BlendAlphaInput::Zero),
+                    selector_wire(BlendColorInput::Combined),
+                    b_wire(BlendBInput::One),
+                ),
+                false,
+                false,
+                [0, 0, 0, 0],
+                [255, 0, 0, 255],
+            ),
+            [0, 0, 255, 255],
+            128,
+            false,
+        ),
+        case(
+            "one_cycle_no_force_bl_bypasses_to_p",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Combined),
+                alpha_wire(BlendAlphaInput::Zero),
+                selector_wire(BlendColorInput::Fog),
+                b_wire(BlendBInput::Zero),
+                false,
+                false,
+                [0, 0, 0, 0],
+                [1, 1, 1, 1],
+            ),
+            [42, 43, 44, 45],
+            0,
+            false,
+        ),
+        case(
+            "coverage_derived_blend_enabled_overrides_force_bl_false",
+            one_cycle_mode_state(
+                selector_wire(BlendColorInput::Combined),
+                alpha_wire(BlendAlphaInput::Combined),
+                selector_wire(BlendColorInput::Blend),
+                b_wire(BlendBInput::OneMinusA),
+                false,
+                false,
+                [0, 0, 0, 255],
+                [0, 0, 0, 0],
+            ),
+            [200, 100, 50, 128],
+            0,
+            true,
+        ),
+    ]
+}
+
+/// CPU-only sanity check, runs everywhere (no `host-gpu-tests` gate): the
+/// frozen fixture set itself is buildable without any fixture's selectors
+/// requiring a framebuffer sample from `blend_fragment` (a `case()` panic
+/// would otherwise only ever be observed inside the GPU-gated test below,
+/// far from this file's ordinary CPU test run), and every field this file's
+/// WGSL shim will serialize is in the range the shim's own wire decode
+/// expects -- every one of `BlendColorInput`/`BlendAlphaInput`/
+/// `BlendBInput::from_wire`'s two-bit domain.
+#[test]
+fn frozen_blend_fragment_fn_fixtures_build_without_panicking() {
+    let fixtures = frozen_blend_fragment_fn_fixtures();
+    assert_eq!(fixtures.len(), 11);
+    let mut saw_nonzero_shade_alpha = false;
+    let mut saw_nonzero_blend_color = false;
+    let mut saw_nonzero_fog_color = false;
+    let mut saw_blend_enabled = false;
+    let mut saw_blend_disabled = false;
+    for fixture in &fixtures {
+        saw_nonzero_shade_alpha |= fixture.shade_alpha != 0;
+        saw_nonzero_blend_color |= fixture.blend_color != [0; 4];
+        saw_nonzero_fog_color |= fixture.fog_color != [0; 4];
+        saw_blend_enabled |= fixture.blend_enabled;
+        saw_blend_disabled |= !fixture.blend_enabled;
+        assert!(
+            fixture.cycle_count <= 2,
+            "fixture {}: cycle_count out of range",
+            fixture.name
+        );
+        for wire in [
+            fixture.cycle0.0,
+            fixture.cycle0.1,
+            fixture.cycle0.2,
+            fixture.cycle0.3,
+            fixture.cycle1.0,
+            fixture.cycle1.1,
+            fixture.cycle1.2,
+            fixture.cycle1.3,
+        ] {
+            assert!(
+                wire <= 3,
+                "fixture {}: selector wire {wire} exceeds the two-bit domain",
+                fixture.name
+            );
+        }
+        if fixture.cycle_count == 0 {
+            assert_eq!(
+                fixture.expected_rgba, fixture.src,
+                "fixture {}: cycle_count==0 (Copy/Fill) must pass src through unchanged",
+                fixture.name
+            );
+        }
+    }
+    assert!(saw_nonzero_shade_alpha);
+    assert!(saw_nonzero_blend_color);
+    assert!(saw_nonzero_fog_color);
+    assert!(saw_blend_enabled);
+    assert!(saw_blend_disabled);
+}
+
+#[cfg(feature = "host-gpu-tests")]
+mod host_gpu_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct ThreadWake(std::thread::Thread);
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match Future::poll(future.as_mut(), &mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    /// Minimal compute-shim harness (same shape as `coverage/tests.rs`'s
+    /// `host_gpu_tests` module): wraps `blend_fragment_cycle_fn` (the new
+    /// fragment-callable function under test, unmodified) in a throwaway
+    /// `@compute` entry point that reads one `BlendFragmentFnCase` per
+    /// invocation from a storage buffer and writes its `vec4<f32>` result to
+    /// a second storage buffer -- new test-only scaffolding, not a claim
+    /// that the function runs inside any real fragment shader.
+    const SHIM_WGSL_HEADER: &str = "\
+struct BlendFragmentFnCase {
+    cycle_count: u32,
+    cycle0_p: u32,
+    cycle0_a: u32,
+    cycle0_m: u32,
+    cycle0_b: u32,
+    cycle1_p: u32,
+    cycle1_a: u32,
+    cycle1_m: u32,
+    cycle1_b: u32,
+    blend_enabled: u32,
+    src: vec4<f32>,
+    shade_alpha: f32,
+    blend_color: vec4<f32>,
+    fog_color: vec4<f32>,
+}
+
+@group(0) @binding(0)
+var<storage, read> cases: array<BlendFragmentFnCase>;
+
+@group(0) @binding(1)
+var<storage, read_write> results: array<vec4<f32>>;
+
+@compute @workgroup_size(1)
+fn blend_fragment_cycle_fn_shim(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let index = global_id.x;
+    if (index >= arrayLength(&cases)) {
+        return;
+    }
+    let one_case = cases[index];
+    results[index] = blend_fragment_cycle_fn(
+        one_case.cycle_count,
+        one_case.cycle0_p, one_case.cycle0_a, one_case.cycle0_m, one_case.cycle0_b,
+        one_case.cycle1_p, one_case.cycle1_a, one_case.cycle1_m, one_case.cycle1_b,
+        one_case.src,
+        one_case.shade_alpha,
+        one_case.blend_color,
+        one_case.fog_color,
+        one_case.blend_enabled,
+    );
+}
+";
+
+    fn shim_source() -> String {
+        format!("{BLEND_FRAGMENT_FN_WGSL}\n{SHIM_WGSL_HEADER}")
+    }
+
+    /// `src`/`shade_alpha`/`blend_color`/`fog_color` are normalized `[0,1]`
+    /// on the WGSL side (`blend_fragment_cycle_fn`'s own doc: this shader's
+    /// combiner/coverage pipeline works in normalized float, not `[u8; 4]`
+    /// byte scale) -- this shim normalizes each fixture's byte-scale inputs
+    /// the same way `Color4::normalized()`/the real fragment shader's own
+    /// `output.color`/`color.a` do, so the shim is an honest stand-in for
+    /// the real call site, not a rescaled approximation of it.
+    fn normalize_bytes(bytes: [u8; 4]) -> [f32; 4] {
+        [
+            f32::from(bytes[0]) / 255.0,
+            f32::from(bytes[1]) / 255.0,
+            f32::from(bytes[2]) / 255.0,
+            f32::from(bytes[3]) / 255.0,
+        ]
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawCase {
+        cycle_count: u32,
+        cycle0_p: u32,
+        cycle0_a: u32,
+        cycle0_m: u32,
+        cycle0_b: u32,
+        cycle1_p: u32,
+        cycle1_a: u32,
+        cycle1_m: u32,
+        cycle1_b: u32,
+        blend_enabled: u32,
+        src: [f32; 4],
+        shade_alpha: f32,
+        blend_color: [f32; 4],
+        fog_color: [f32; 4],
+    }
+
+    /// Required host GPU evidence (production blend wiring slice 1, card
+    /// §3f): dispatches the compute shim over every frozen fixture case on a
+    /// real native adapter and asserts the WGSL side agrees with
+    /// `blend_fragment`'s own byte output (rounded/rescaled the same way
+    /// `round_clamp_u8` does) to within a small float-rounding tolerance.
+    /// Panics with the typed no-adapter reason if this host has no native
+    /// GPU adapter, matching `targets/triangle_pipeline/tests.rs`'s and
+    /// `coverage/tests.rs`'s required-host-GPU convention rather than
+    /// silently skipping.
+    #[test]
+    fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
+        let fixtures = frozen_blend_fragment_fn_fixtures();
+        let cases: Vec<RawCase> = fixtures
+            .iter()
+            .map(|fixture| RawCase {
+                cycle_count: fixture.cycle_count,
+                cycle0_p: fixture.cycle0.0,
+                cycle0_a: fixture.cycle0.1,
+                cycle0_m: fixture.cycle0.2,
+                cycle0_b: fixture.cycle0.3,
+                cycle1_p: fixture.cycle1.0,
+                cycle1_a: fixture.cycle1.1,
+                cycle1_m: fixture.cycle1.2,
+                cycle1_b: fixture.cycle1.3,
+                blend_enabled: u32::from(fixture.blend_enabled),
+                src: normalize_bytes(fixture.src),
+                shade_alpha: f32::from(fixture.shade_alpha) / 255.0,
+                blend_color: normalize_bytes(fixture.blend_color),
+                fog_color: normalize_bytes(fixture.fog_color),
+            })
+            .collect();
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::VALIDATION,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        })) {
+            Ok(adapter) => adapter,
+            Err(wgpu::RequestAdapterError::NotFound { .. }) => {
+                panic!("required host GPU evidence unavailable: typed no-adapter for AnyNative")
+            }
+            Err(error) => panic!("adapter request failed: {error}"),
+        };
+        eprintln!(
+            "fn64-blend-fragment-fn: adapter={:?}",
+            adapter.get_info().name
+        );
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("fn64-blend-fragment-fn-shim"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .unwrap();
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fn64-blend-fragment-fn-shim"),
+            source: wgpu::ShaderSource::Wgsl(shim_source().into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fn64-blend-fragment-fn-shim"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("blend_fragment_cycle_fn_shim"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // WGSL host-shareable struct layout (not Rust's `repr(C)`, which
+        // leaves `[f32; 4]` fields 4-byte aligned): a `vec4<f32>` member
+        // forces the *struct* field to a 16-byte-aligned offset, so `src`
+        // and `blend_color` each need padding inserted before them that
+        // `std::mem::size_of::<RawCase>()` does not account for. Computed
+        // once here and reused below so the buffer size and the byte
+        // packer can never drift apart.
+        const WGSL_CASE_STRIDE: u64 = 112;
+        let case_bytes = (cases.len() as u64) * WGSL_CASE_STRIDE;
+        let result_bytes = (cases.len() * std::mem::size_of::<[f32; 4]>()) as u64;
+        let case_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-blend-fragment-fn-cases"),
+            size: case_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-blend-fragment-fn-results"),
+            size: result_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-blend-fragment-fn-readback"),
+            size: result_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let case_data: Vec<u8> = cases
+            .iter()
+            .flat_map(|case| {
+                let mut bytes = Vec::with_capacity(WGSL_CASE_STRIDE as usize);
+                for scalar in [
+                    case.cycle_count,
+                    case.cycle0_p,
+                    case.cycle0_a,
+                    case.cycle0_m,
+                    case.cycle0_b,
+                    case.cycle1_p,
+                    case.cycle1_a,
+                    case.cycle1_m,
+                    case.cycle1_b,
+                    case.blend_enabled,
+                ] {
+                    bytes.extend_from_slice(&scalar.to_le_bytes());
+                }
+                // `src: vec4<f32>` starts at offset 40 in a tightly packed
+                // layout, but WGSL's 16-byte `vec4<f32>` alignment forces it
+                // to offset 48 -- pad to match, or every field from here on
+                // reads shifted (this is exactly what made `copy_bypass`
+                // observe channel 0/1 holding `src`'s own channel 2/3).
+                bytes.extend_from_slice(&[0u8; 8]);
+                for value in case.src {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                bytes.extend_from_slice(&case.shade_alpha.to_le_bytes());
+                // `blend_color: vec4<f32>` starts at offset 68 packed, but
+                // needs offset 80 for the same 16-byte alignment reason.
+                bytes.extend_from_slice(&[0u8; 12]);
+                for value in case.blend_color {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in case.fog_color {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                debug_assert_eq!(bytes.len(), WGSL_CASE_STRIDE as usize);
+                bytes
+            })
+            .collect();
+        queue.write_buffer(&case_buffer, 0, &case_data);
+
+        let layout = pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-blend-fragment-fn-bind-group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: case_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: result_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fn64-blend-fragment-fn-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        loop {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if let Ok(result) = receiver.try_recv() {
+                result.unwrap();
+                break;
+            }
+        }
+        let observed: Vec<[f32; 4]> = {
+            let mapped = slice.get_mapped_range().unwrap();
+            mapped
+                .chunks_exact(16)
+                .map(|chunk| {
+                    let mut value = [0.0f32; 4];
+                    for (channel, word) in chunk.chunks_exact(4).enumerate() {
+                        value[channel] = f32::from_le_bytes(word.try_into().unwrap());
+                    }
+                    value
+                })
+                .collect()
+        };
+        readback_buffer.unmap();
+
+        assert_eq!(observed.len(), fixtures.len());
+        for (fixture, observed_normalized) in fixtures.iter().zip(observed.iter()) {
+            let observed_rgba = [
+                (observed_normalized[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (observed_normalized[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (observed_normalized[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (observed_normalized[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+            ];
+            for channel in 0..4 {
+                let diff =
+                    i32::from(observed_rgba[channel]) - i32::from(fixture.expected_rgba[channel]);
+                assert!(
+                    diff.abs() <= 1,
+                    "fixture {}: channel {channel} observed={observed_rgba:?} expected={:?} \
+                     (WGSL shim result diverged from crate::blend::blend_fragment's own byte \
+                     output by more than float-rounding tolerance)",
+                    fixture.name,
+                    fixture.expected_rgba
+                );
+            }
+        }
+    }
+}

@@ -126,21 +126,29 @@ pub struct RetrievedTriangleDraw {
     pub combine_params: CombineParams,
     pub tile_binding: TileBindingParams,
     /// `G_SETBLENDCOLOR` current at this triangle's own stream position --
-    /// `Some` only when `other_mode.alpha_compare() == AlphaCompare::Threshold`
-    /// (the only mode this pipeline wires that reads it, see
-    /// `alpha_compare_production.md` card §4a); `None` for `AlphaCompare::None`,
-    /// which never reads a possibly-absent threshold.
+    /// unconditionally tracked (mirrors `env_color`/`prim_color`'s
+    /// command-time-snapshot pattern), since both alpha-compare's
+    /// `Threshold` mode and the production blend-cycle wiring
+    /// (`BlendColorInput::Blend`) independently need the real register
+    /// value; each consumer validates presence only when its own
+    /// selector/mode requires it (alpha-compare's `Threshold` gate at
+    /// retrieval time; blend-cycle's `BlendColorInput::Blend`/
+    /// `BlendAlphaInput`-independent gate at draw-submission time) rather
+    /// than this struct duplicating one register behind two fields.
     pub blend_color: Option<Color4>,
     /// `G_SETENVCOLOR` current at this triangle's own stream position --
-    /// mirrors `blend_color`'s same command-time-snapshot pattern, but
-    /// unconditional: every triangle's combiner arithmetic can read
-    /// `ENVIRONMENT`, so this is not gated behind any `other_mode`/
-    /// `combine_params` selector the way `blend_color` is gated behind
-    /// `AlphaCompare::Threshold`.
+    /// mirrors `blend_color`'s same command-time-snapshot pattern,
+    /// unconditionally tracked.
     pub env_color: Option<Color4>,
     /// `G_SETPRIMCOLOR` current at this triangle's own stream position --
     /// mirrors `env_color` exactly.
     pub prim_color: Option<PrimColor>,
+    /// `G_SETFOGCOLOR` current at this triangle's own stream position --
+    /// mirrors `blend_color`/`env_color`/`prim_color` exactly. Needed by
+    /// the production blend-cycle wiring whenever a resolved cycle's `P`/
+    /// `M` selects [`crate::blend::BlendColorInput::Fog`] or its `A`
+    /// selects [`crate::blend::BlendAlphaInput::Fog`].
+    pub fog_color: Option<Color4>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -179,6 +187,9 @@ pub struct TriangleDrawStateCollector {
     /// `G_SETPRIMCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color` exactly.
     current_prim_color: Option<PrimColor>,
+    /// `G_SETFOGCOLOR` current at the walk's current stream position --
+    /// mirrors `current_env_color`/`current_prim_color` exactly.
+    current_fog_color: Option<Color4>,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -210,7 +221,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     // `Dither` never reach `submit_admitted_triangle` --
                     // loud, named panics here, not a silent None/Threshold
                     // coercion (AGENTS.md "loud traps, no silent shrugs").
-                    let blend_color = match other_mode.alpha_compare() {
+                    match other_mode.alpha_compare() {
                         AlphaCompare::Reserved => panic!(
                             "triangle #{triangle_index} (plan order) selected reserved G_AC \
                              alpha-compare mode 2"
@@ -221,11 +232,11 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                              this pipeline (no frame-count uniform exists to seed it honestly; \
                              see fn64-alpha-compare-production-card.md \u{a7}2)"
                         ),
-                        AlphaCompare::Threshold => Some(
+                        AlphaCompare::Threshold => {
                             self.current_blend_color
-                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?,
-                        ),
-                        AlphaCompare::None => None,
+                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?;
+                        }
+                        AlphaCompare::None => {}
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
@@ -234,9 +245,10 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         other_mode,
                         combine_params,
                         tile_binding,
-                        blend_color,
+                        blend_color: self.current_blend_color,
                         env_color: self.current_env_color,
                         prim_color: self.current_prim_color,
+                        fog_color: self.current_fog_color,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -261,6 +273,9 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
                         color.color,
                     ));
+                }
+                RdpStateCommand::SetFogColor { color, .. } => {
+                    self.current_fog_color = Some(Color4::from_wire(color.value));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,

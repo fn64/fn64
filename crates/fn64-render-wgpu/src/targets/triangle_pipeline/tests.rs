@@ -88,6 +88,7 @@ fn covering_triangle_fixture() -> TriangleFixture {
         blend_color: None,
         env_color: None,
         prim_color: None,
+        blend_params: ResolvedFragmentBlendParams::NO_OP,
         // (Z_CMP, Z_UPD) = (set, set): the pipeline's prior sole state
         // (`depth_pipeline_index((true, true)) == 0`, `Less`/write-always)
         // -- this base fixture is the regression-guard default every
@@ -789,6 +790,7 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         blend_color: None,
         env_color: None,
         prim_color: None,
+        blend_params: ResolvedFragmentBlendParams::NO_OP,
         depth_compare_enabled: true,
         depth_update_enabled: true,
         coverage_destination: crate::state::CoverageDestination::Full,
@@ -1473,6 +1475,155 @@ mod host_gpu_tests {
         }
     }
 
+    /// Production blend wiring slice 1, card §3f: the second still-missing
+    /// evidence fixture -- a real physical-Metal triangle draw whose
+    /// resolved blend cycle is a genuine non-`Framebuffer` general divide
+    /// (both `a`/`b` factors nonzero, so neither the `a==0`/`b==0` collapse
+    /// nor the last-cycle `blend_enabled==0` bypass short-circuits it),
+    /// compared against `crate::blend::blend_fragment(..., memory: None,
+    /// ...)` -- the same Rust oracle `blend.rs`'s own CPU characterization
+    /// tests use, not a second hand-rolled formula. `uniform_general_divide_
+    /// blend_fixture` gives every covered pixel the identical combiner
+    /// output (flat SHADE passthrough, matching `covering_triangle_fixture`'s
+    /// own sidestep of barycentric interpolation), so the oracle only needs
+    /// to be evaluated once and compared at several covered pixels.
+    #[test]
+    fn required_host_general_divide_blend_draw_matches_the_rust_oracle_with_no_memory() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+        eprintln!(
+            "fn64-triangle-pipeline-blend: backend={:?} adapter={:?}",
+            renderer.adapter_info().backend,
+            renderer.adapter_info().name
+        );
+
+        // OneCycle wire (cycle_type bits 20:21 == 0) with cycle 1's raw
+        // selectors P=2(Blend), A=1(Fog), M=3(Fog), B=2(One) packed at their
+        // documented bit positions (`state.rs`'s `blender_cycle_1`:
+        // color_a@30:31, alpha_a@26:27, color_b@22:23, alpha_b@18:19).
+        // `cycle` is derived FROM this real `OtherMode` via
+        // `BlendModeState::cycle(0)` -- the exact same route
+        // `production.rs`'s `draw_admitted_triangles` uses to build
+        // `ResolvedFragmentBlendParams` from a real triangle's decoded
+        // `OtherMode` -- rather than an independently hand-built
+        // `ResolvedBlendCycle` that could silently drift from what the wire
+        // bits actually decode to.
+        //
+        // Every selector is non-`Framebuffer`/non-`FramebufferAlpha` (the
+        // admitted subset), and `a`/`b` are both provably nonzero (`a`
+        // derives from a nonzero fog alpha, `b` is the constant `One`), so
+        // the real evaluated path is the general `(P*A + M*B)/(A+B)`
+        // divide, not either zero-factor collapse. `force_blend = true`
+        // makes `coverage_fragment_fn`'s `blend_enabled` unconditionally
+        // true (`coverage.rs:148`), so the no-`FORCE_BL` last-cycle bypass
+        // this cycle would otherwise take (it is both the first AND the
+        // last cycle in OneCycle mode) is also not the path exercised.
+        let other_mode = crate::state::OtherMode::from_wire(0, 0x84C8_0000);
+        let blend_color = crate::state::Color4::from_wire(0x14283C50); // [20,40,60,80]
+        let fog_color = crate::state::Color4::from_wire(0x465A6E82); // [70,90,110,130]
+        let shade_color = [0.2, 0.4, 0.6, 0.8];
+
+        let mode_state = crate::blend::BlendModeState {
+            other_mode,
+            blend_color_register: blend_color.rgba8(),
+            fog_color: fog_color.rgba8(),
+        };
+        assert_eq!(mode_state.cycle_count(), 1, "fixture must be OneCycle");
+        let cycle = mode_state.cycle(0);
+        assert_eq!(
+            cycle,
+            crate::blend::ResolvedBlendCycle {
+                p: crate::blend::BlendColorInput::Blend,
+                a: crate::blend::BlendAlphaInput::Fog,
+                m: crate::blend::BlendColorInput::Fog,
+                b: crate::blend::BlendBInput::One,
+            },
+            "the chosen OtherMode wire bits must decode to exactly the intended selectors"
+        );
+
+        let fixture =
+            uniform_general_divide_blend_fixture(cycle, blend_color, fog_color, shade_color);
+        let output = renderer
+            .submit_triangle(fixture)
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        // Independent Rust-oracle re-derivation: the SAME combiner oracle
+        // (`run_one_cycle`, `shade_passthrough_combine_params`) this file's
+        // other tests already use for `src`, and `crate::blend::
+        // blend_fragment` (memory: None) for the blend composite -- not a
+        // second hand-rolled formula, matching this card's own instruction.
+        let combiner_color = cpu_combiner_reference(shade_color);
+        let src_rgba8 = [
+            (combiner_color[0] * 255.0).round() as u8,
+            (combiner_color[1] * 255.0).round() as u8,
+            (combiner_color[2] * 255.0).round() as u8,
+            (combiner_color[3] * 255.0).round() as u8,
+        ];
+        let shade_alpha_255 = (shade_color[3] * 255.0).round() as u8;
+        let expected =
+            crate::blend::blend_fragment(src_rgba8, None, shade_alpha_255, mode_state, true);
+        // The admitted subset never selects Framebuffer/FramebufferAlpha, so
+        // the oracle must not error for lack of a memory sample.
+        let expected = expected.expect(
+            "the chosen selectors are non-Framebuffer/non-FramebufferAlpha by construction; the \
+             oracle must not require a memory sample",
+        );
+        // Sanity: this fixture genuinely exercises the general divide, not
+        // either zero-factor collapse -- `a` and `b` are both provably
+        // nonzero for this selector/color combination.
+        assert_ne!(
+            shade_alpha_255, 0,
+            "a must be nonzero (guards a==0 collapse)"
+        );
+
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            let observed = rgba8_at(&output, x, y);
+            assert_close_rgba8(observed, expected.rgba, 2);
+        }
+    }
+
+    /// Fixture builder for [`required_host_general_divide_blend_draw_matches_the_rust_oracle_with_no_memory`]:
+    /// a uniform-flat-shaded covering triangle (same screen geometry as
+    /// [`covering_triangle_fixture`], every vertex the same color so no
+    /// barycentric interpolation reasoning is needed) with `force_blend`
+    /// set and `blend_params` built from the caller's resolved cycle.
+    fn uniform_general_divide_blend_fixture(
+        cycle: crate::blend::ResolvedBlendCycle,
+        blend_color: crate::state::Color4,
+        fog_color: crate::state::Color4,
+        shade_color: [f32; 4],
+    ) -> TriangleFixture {
+        let mut fixture = covering_triangle_fixture();
+        for vertex in &mut fixture.vertices {
+            vertex.color = shade_color;
+        }
+        fixture.blend_color = Some(blend_color);
+        fixture.force_blend = true;
+        fixture.blend_params = ResolvedFragmentBlendParams {
+            cycle_count: 1,
+            cycle0: cycle,
+            cycle1: crate::blend::ResolvedBlendCycle {
+                p: crate::blend::BlendColorInput::Combined,
+                a: crate::blend::BlendAlphaInput::Combined,
+                m: crate::blend::BlendColorInput::Combined,
+                b: crate::blend::BlendBInput::Zero,
+            },
+            blend_color: Some(blend_color),
+            fog_color: Some(fog_color),
+        };
+        fixture
+    }
+
     // --- Sealed-plan end-to-end: real decoded input -> real sealed
     // admission -> admitted state -> real pipeline draw (production
     // triangle draw card §7) ---
@@ -1837,6 +1988,7 @@ mod host_gpu_tests {
                     draw.blend_color,
                     draw.env_color,
                     draw.prim_color,
+                    ResolvedFragmentBlendParams::NO_OP,
                     draw.source == fn64_render::TriangleSource::TextureRectangle,
                 )
                 .unwrap()
