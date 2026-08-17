@@ -42,7 +42,7 @@ use fn64_render::{
     RawDpcSemanticCommandRef, RdpStateCommand, RdpTriangleCommand,
 };
 
-use crate::state::{AlphaCompare, Color4, OtherMode};
+use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor};
 use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
 
@@ -124,6 +124,16 @@ pub struct RetrievedTriangleDraw {
     /// `alpha_compare_production.md` card §4a); `None` for `AlphaCompare::None`,
     /// which never reads a possibly-absent threshold.
     pub blend_color: Option<Color4>,
+    /// `G_SETENVCOLOR` current at this triangle's own stream position --
+    /// mirrors `blend_color`'s same command-time-snapshot pattern, but
+    /// unconditional: every triangle's combiner arithmetic can read
+    /// `ENVIRONMENT`, so this is not gated behind any `other_mode`/
+    /// `combine_params` selector the way `blend_color` is gated behind
+    /// `AlphaCompare::Threshold`.
+    pub env_color: Option<Color4>,
+    /// `G_SETPRIMCOLOR` current at this triangle's own stream position --
+    /// mirrors `env_color` exactly.
+    pub prim_color: Option<PrimColor>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -155,6 +165,13 @@ pub struct TriangleDrawStateCollector {
     /// mirrors `current_other_mode`/`current_combine` exactly, a fourth
     /// instance of the same command-time-snapshot pattern (card §4a).
     current_blend_color: Option<Color4>,
+    /// `G_SETENVCOLOR` current at the walk's current stream position --
+    /// mirrors `current_blend_color`, unconditionally tracked (no
+    /// `AlphaCompare` gate).
+    current_env_color: Option<Color4>,
+    /// `G_SETPRIMCOLOR` current at the walk's current stream position --
+    /// mirrors `current_env_color` exactly.
+    current_prim_color: Option<PrimColor>,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -204,6 +221,8 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         combine_params,
                         tile_binding,
                         blend_color,
+                        env_color: self.current_env_color,
+                        prim_color: self.current_prim_color,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -219,6 +238,15 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 }
                 RdpStateCommand::SetBlendColor { color, .. } => {
                     self.current_blend_color = Some(Color4::from_wire(color.value));
+                }
+                RdpStateCommand::SetEnvColor { color, .. } => {
+                    self.current_env_color = Some(Color4::from_wire(color.value));
+                }
+                RdpStateCommand::SetPrimColor { color, .. } => {
+                    self.current_prim_color = Some(PrimColor::from_wire(
+                        u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
+                        color.color,
+                    ));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -555,5 +583,103 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::State(&other_mode));
         collector.command(RawDpcSemanticCommandRef::State(&combine));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+    }
+
+    fn env_color_command(index: u32, value: u32) -> RdpStateCommand {
+        RdpStateCommand::SetEnvColor {
+            location: location(index),
+            raw_words: Box::new([0]),
+            color: fn64_render::NeutralColor4 { value },
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_env_color(fn64_render::NeutralColor4 {
+                value,
+            }),
+        }
+    }
+
+    fn prim_color_command(index: u32, lod_frac: u8, lod_min: u8, color: u32) -> RdpStateCommand {
+        let neutral = fn64_render::NeutralPrimColor {
+            lod_frac,
+            lod_min,
+            color,
+        };
+        RdpStateCommand::SetPrimColor {
+            location: location(index),
+            raw_words: Box::new([0, 0]),
+            color: neutral,
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_prim_color(neutral),
+        }
+    }
+
+    /// Command-time capture seam (card): `SetEnvColor(A)`/`SetPrimColor(A)`
+    /// -> triangle A -> `SetEnvColor(B)`/`SetPrimColor(B)` -> triangle B
+    /// must collect two distinct snapshots, exactly mirroring
+    /// `a_and_b_triangles_snapshot_distinct_blend_colors_not_a_collapsed_final_value`
+    /// above for the new `env_color`/`prim_color` fields.
+    #[test]
+    fn a_and_b_triangles_snapshot_distinct_env_and_prim_colors_not_a_collapsed_final_value() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 0); // None mode, no blend_color needed
+        let combine = combine_command(1, 1, 2);
+        let env_a = env_color_command(2, 0x1111_1111);
+        let prim_a = prim_color_command(3, 10, 5, 0x2222_2222);
+        let triangle_a = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+        let env_b = env_color_command(4, 0x3333_3333);
+        let prim_b = prim_color_command(5, 20, 10, 0x4444_4444);
+        let triangle_b = triangle_command([vertex(10.0), vertex(11.0), vertex(12.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::State(&env_a));
+        collector.command(RawDpcSemanticCommandRef::State(&prim_a));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_a));
+        collector.command(RawDpcSemanticCommandRef::State(&env_b));
+        collector.command(RawDpcSemanticCommandRef::State(&prim_b));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
+
+        let draws = collector.finish().expect("both triangles have state");
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].env_color, Some(Color4::from_wire(0x1111_1111)));
+        assert_eq!(
+            draws[0].prim_color,
+            Some(PrimColor::from_wire(10 | (5 << 8), 0x2222_2222))
+        );
+        assert_eq!(draws[1].env_color, Some(Color4::from_wire(0x3333_3333)));
+        assert_eq!(
+            draws[1].prim_color,
+            Some(PrimColor::from_wire(20 | (10 << 8), 0x4444_4444))
+        );
+        assert_ne!(
+            draws[0].env_color, draws[1].env_color,
+            "triangle A must NOT be retroactively affected by a SetEnvColor that comes after it \
+             in plan order"
+        );
+        assert_ne!(
+            draws[0].prim_color, draws[1].prim_color,
+            "triangle A must NOT be retroactively affected by a SetPrimColor that comes after it \
+             in plan order"
+        );
+    }
+
+    /// A triangle visited before any `SetEnvColor`/`SetPrimColor` still
+    /// resolves -- unlike `blend_color`, `env_color`/`prim_color` are
+    /// unconditionally `Option`, never a hard-error gate (module doc).
+    #[test]
+    fn a_triangle_before_any_env_or_prim_color_resolves_with_none() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 0);
+        let combine = combine_command(1, 1, 2);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("no env/prim color needed to resolve");
+        assert_eq!(draws[0].env_color, None);
+        assert_eq!(draws[0].prim_color, None);
     }
 }
