@@ -588,7 +588,7 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -612,6 +612,11 @@
         "exit_gate": "The M10 behavior fixture for src/common/rt64_dynamic_libraries.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Host dynamic-loader shim (dlopen/LoadLibrary); no CPU-side behavior to own."
       }
     },
     {
@@ -647,7 +652,7 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -671,6 +676,11 @@
         "exit_gate": "The M10 behavior fixture for src/common/rt64_dynamic_libraries.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Declarations for the host dynamic-loader shim; no arithmetic."
       }
     },
     {
@@ -1232,7 +1242,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1256,6 +1266,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_filesystem.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Abstract filesystem interface; pure virtual declarations, no behavior."
       }
     },
     {
@@ -1323,7 +1338,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1347,6 +1362,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_filesystem_directory.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "std::filesystem directory-walk adapter; host I/O plumbing."
       }
     },
     {
@@ -1496,7 +1516,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1520,6 +1540,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_filesystem_zip.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "miniz and zstd FFI archive reader over a mapped file; a vendored-library binding, not portable behavior."
       }
     },
     {
@@ -1587,7 +1612,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1611,6 +1636,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_filesystem_zip.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Declarations over the miniz/zstd FFI archive reader."
       }
     },
     {
@@ -1632,7 +1662,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1656,6 +1686,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_hlslpp.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Third-party hlslpp include/pragma shim; 13 lines, no fn64-owned content."
       }
     },
     {
@@ -1699,7 +1734,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1723,6 +1758,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_load_types.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "nlohmann to_json/from_json for the LoadTile and LoadTexture PODs; 38 of 60 lines are one-to-one field copies and there is no arithmetic to own."
       }
     },
     {
@@ -1810,7 +1850,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1834,6 +1874,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_load_types.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "POD field declarations for the above, over a vendored nlohmann json typedef."
       }
     },
     {
@@ -1901,7 +1946,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1925,6 +1970,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_mapped_file.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "mmap / CreateFileMappingW host memory mapping; platform syscalls, not behavior."
       }
     },
     {
@@ -1956,7 +2006,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -1980,6 +2030,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_mapped_file.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Declarations for the host memory-mapping wrapper."
       }
     },
     {
@@ -2373,7 +2428,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -2397,6 +2452,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_plume.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "docs/RT64-M6-M7-SCOPING.md",
+        "reason": "Five-line include of RT64's plume RHI, which the port plan refuses to transliterate."
       }
     },
     {
@@ -3010,7 +3070,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -3034,6 +3094,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_sommelier.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Wine/Sommelier host detection; compiles to nothing on macOS."
       }
     },
     {
@@ -3093,7 +3158,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -3117,6 +3182,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_thread.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "pthread_setname_np / SetThreadDescription thread naming; host threading only."
       }
     },
     {
@@ -3156,7 +3226,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -3180,6 +3250,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_thread.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Declarations for the host thread-naming helper."
       }
     },
     {
@@ -3744,7 +3819,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -3768,6 +3843,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_user_paths.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Per-platform user/config directory discovery; host path policy, not RT64 behavior."
       }
     },
     {
@@ -3799,7 +3879,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -3823,6 +3903,11 @@
         "exit_gate": "The M8 behavior fixture for src/common/rt64_user_paths.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85",
+        "evidence": "crates/fn64-render/src/settings.rs",
+        "reason": "Declarations for per-platform user-path discovery."
       }
     },
     {
@@ -18910,7 +18995,7 @@
       "port_delta": "unchanged",
       "milestone": "M6",
       "workstream": "performance-spine",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -18934,6 +19019,11 @@
         "exit_gate": "The M6 behavior fixture for src/render/rt64_descriptor_sets.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "677 lines of 21 RenderDescriptorSetBase subclasses; every non-declaration line is a builder.add* call and there is zero arithmetic, enumerated not sampled."
       }
     },
     {
@@ -19406,7 +19496,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -19430,6 +19520,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_framebuffer_renderer.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Framebuffer-renderer declarations over plume RHI handles; its .cpp arithmetic is separately owned by rt64_render_target_geometry.rs."
       }
     },
     {
@@ -19483,7 +19578,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -19507,6 +19602,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_framebuffer_renderer_call.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Renderer-call bitfields; refused rather than ported because this program makes no repr(C)/size/alignment/ABI claim."
       }
     },
     {
@@ -19542,7 +19642,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -19566,6 +19666,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_geometry_mode.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "The briefed bit-decoding hypothesis fails: the body is `this->v = v;`, with no bit decoding and no G_ZBUFFER/G_CULL constant anywhere in the file."
       }
     },
     {
@@ -19601,7 +19706,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -19625,6 +19730,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_geometry_mode.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Companion declaration to the above; no constant and no arithmetic."
       }
     },
     {
@@ -19773,7 +19883,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -19797,6 +19907,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_look_at_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Bare declarations; the processor's interpolation body is already ported by crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
       }
     },
     {
@@ -19995,7 +20110,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -20019,6 +20134,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_native_target.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "RHI-resource declarations; the geometry arithmetic in its .cpp is already ported by crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs."
       }
     },
     {
@@ -20040,7 +20160,7 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -20064,6 +20184,11 @@
         "exit_gate": "The M10 behavior fixture for src/render/rt64_optimus.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Fourteen lines whose entire body is `#ifdef _WIN32`-guarded, exporting the single `NvOptimusEnablement` DWORD; compiles to nothing on macOS."
       }
     },
     {
@@ -20214,7 +20339,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -20238,6 +20363,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_projection_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Bare declarations; the processor's body is already ported by crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
       }
     },
     {
@@ -20459,7 +20589,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -20483,6 +20613,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_raster_shader.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "docs/RT64-M6-M7-SCOPING.md",
+        "reason": "Declarations over plume RHI pipeline objects; its .cpp is authority-gated."
       }
     },
     {
@@ -20673,7 +20808,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -20697,6 +20832,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_raster_shader_cache.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "docs/RT64-M6-M7-SCOPING.md",
+        "reason": "Thread-pool and RHI cache declarations; the port plan refuses plume's thread topology."
       }
     },
     {
@@ -21035,7 +21175,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21059,6 +21199,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_render_target.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "RHI-handle declarations; its .cpp geometry is already ported by crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs."
       }
     },
     {
@@ -21214,7 +21359,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21238,6 +21383,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_render_target_manager.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Its only non-plumbing content is hash() == XXH3_64bits(this, sizeof(RenderTargetKey)), which hashes struct padding, so which keys collide depends on ABI layout. Refused rather than decided; a future card wanting target-key identity needs an explicit ABI decision."
       }
     },
     {
@@ -21309,7 +21459,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21333,6 +21483,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_render_target_manager.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Declarations for the above, including the RenderTargetKey whose byte layout the refused hash depends on."
       }
     },
     {
@@ -21392,7 +21547,7 @@
       "port_delta": "unchanged",
       "milestone": "M6",
       "workstream": "performance-spine",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21416,6 +21571,11 @@
         "exit_gate": "The M6 behavior fixture for src/render/rt64_render_worker.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "docs/RT64-M6-M7-SCOPING.md",
+        "reason": "Plume command-queue/list/fence plumbing with no arithmetic; the port plan refuses to transliterate the plume RHI, and wgpu is already fn64's RHI."
       }
     },
     {
@@ -21459,7 +21619,7 @@
       "port_delta": "unchanged",
       "milestone": "M6",
       "workstream": "performance-spine",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21483,6 +21643,11 @@
         "exit_gate": "The M6 behavior fixture for src/render/rt64_render_worker.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "docs/RT64-M6-M7-SCOPING.md",
+        "reason": "Declarations for the plume command-queue worker."
       }
     },
     {
@@ -21536,7 +21701,7 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21560,6 +21725,11 @@
         "exit_gate": "The M5 behavior fixture for src/render/rt64_rsp_processor.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs already refused in writing, calling GROUP_SIZE 64 \"a dispatch tile width\"."
       }
     },
     {
@@ -21621,7 +21791,7 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21645,6 +21815,11 @@
         "exit_gate": "The M5 behavior fixture for src/render/rt64_rsp_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Declarations for the above dispatch bookkeeping."
       }
     },
     {
@@ -21688,7 +21863,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -21712,6 +21887,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_sampler_library.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Plume sampler-object declarations; no arithmetic."
       }
     },
     {
@@ -22153,7 +22333,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -22177,6 +22357,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_shader_library.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Plume shader-object declarations; its .cpp is authority-gated."
       }
     },
     {
@@ -22214,7 +22399,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -22238,6 +22423,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_texture.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "RHI texture-handle declarations; the texture-cache behavior is separately owned by crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs."
       }
     },
     {
@@ -23108,7 +23298,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23132,6 +23322,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_tile_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Refused in full and deliberately not digest-cited: bare member and method declarations plus a ProcessParams pointer bundle, whose only non-pointer contents are two call-site float defaults."
       }
     },
     {
@@ -23197,7 +23392,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23221,6 +23416,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_transform_processor.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Its math is hlslpp::inverse/transpose plus a RigidBody::lerp that is separately owned."
       }
     },
     {
@@ -23280,7 +23480,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23304,6 +23504,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_transform_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Declarations for the above."
       }
     },
     {
@@ -23428,7 +23633,7 @@
       "port_delta": "unchanged",
       "milestone": "M11",
       "workstream": "modernization",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23452,6 +23657,11 @@
         "exit_gate": "The M11 behavior fixture for src/render/rt64_upscaler.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_postprocess.rs",
+        "reason": "Refused in full as an explicit non-goal of the post-process card that ported rt64_upscaler.cpp; see crates/fn64-render-wgpu/src/rt64_postprocess.rs."
       }
     },
     {
@@ -23505,7 +23715,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23529,6 +23739,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_vertex_processor.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs already refused in writing -- vertexStart/vertexCount \"exist only to index and bound the dispatch\"."
       }
     },
     {
@@ -23582,7 +23797,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23606,6 +23821,11 @@
         "exit_gate": "The M8 behavior fixture for src/render/rt64_vertex_processor.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Declarations for the above dispatch bookkeeping."
       }
     },
     {
@@ -23767,7 +23987,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -23791,6 +24011,11 @@
         "exit_gate": "The M4 behavior fixture for src/render/rt64_vi_renderer.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2e915940693019ae4fee9fcae93976d18d401371",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs",
+        "reason": "Plume RHI declarations; its .cpp is authority-gated."
       }
     },
     {
