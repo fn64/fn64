@@ -2500,3 +2500,83 @@ does not yet call into it. `TriangleDrawStateCollector`'s general
 non-production-caller status is unchanged by this slice — mirroring it here
 is about keeping its own documented invariant honest for the next reader,
 not about giving it a new caller.
+
+## 2026-08-16: RawTriangle sealed-plan admission
+
+Admits `RawTriangle` into the sealed `ExactRawDpcPlan`/
+`production_adapter.rs` production mechanism via a real
+`RawDpcSemanticCommandRef::Triangle`/`RdpTriangleCommand`/`push_triangle`
+admission path, not a bypass reading `DecodedRawDpc::commands()` directly
+(an earlier draft's rejected "escape hatch").
+
+**New types.** `render_ir.rs` gains a third
+`RawDpcSemanticCommandRef` variant, `Triangle(&RdpTriangleCommand)`
+(alongside `TmemLoad`/`State`; the enum stays `#[non_exhaustive]`), and
+`RdpTriangleCommand { location, raw_words, vertices: [NeutralTriangleVertex;
+3] }` — deliberately no before/after identity fields: `ExactRawDpcPlanWriter::
+finish()`'s access-ordering contract only compares `self.accesses` against
+the journal's own access list and has zero coupling to `self.commands`, so a
+triangle command pushing zero `ResourceAccess` entries trivially satisfies
+it. `NeutralTriangleVertex` mirrors T1's private `TriangleVertex` shape
+field-for-field (`fn64-render-wgpu` depends on `fn64-render`, not the
+reverse, so the wgpu-crate type cannot be named directly).
+
+**Stream-position `OtherMode` tracking.** `production_adapter.rs` decodes
+each triangle against the `OtherMode` current AT ITS OWN STREAM POSITION,
+never a later or final value: a local `Option<OtherMode>` walked forward
+through the push loop, seeded from `decoded.base_state.other_mode()` (the
+durable RDP state a caller held before this decode) and updated on every
+in-plan `SetOtherMode`. A triangle walked with no `OtherMode` established at
+all — neither carried in from `base_state` nor set earlier in this plan —
+is a loud, typed `TriangleBeforeAnyOtherMode` rejection (new
+`PushDecodedRawDpcError` variant), never a silent `(0, 0)` default: this
+value feeds `texture_perspective()` directly into `decode_triangle_vertices`
+and changes decoded geometry, so a fabricated default would be a real
+correctness risk.
+
+**Variable-width slicer.** A new `triangle_command_raw_words`, keyed off
+`fn64_render::raw_rdp_command_width`, since triangle opcodes `0x08..=0x0f`
+span 32..176 bytes depending on their shade/texture/depth coefficient flags
+— `tmem_command_raw_words`'s fixed-2-word assumption cannot be reused.
+
+**New `raw_dpc/triangle_draw_data.rs`** (sealed-plan composition into the
+pipeline's input shapes; does not itself reach `WgpuBackend`/
+`RenderBackend`): a plain `NeutralTriangleVertex` -> `RasterVertex` field
+adapter, and `TriangleDrawStateCollector`, an `ExactRawDpcPlanVisitor` (same
+shape as `production.rs`'s own `PlanCollector`) that snapshots the
+`SetOtherMode`/`SetCombine` state current at each triangle's OWN stream
+position onto that triangle — per-triangle `RetrievedTriangleDraw{vertices,
+other_mode, combine_params}`, never a single whole-plan-final value (a bug
+caught by independent review mid-implementation: the first draft collapsed
+all triangles to one shared final state, which would retroactively apply a
+later state change to an earlier draw — fixed to per-triangle snapshots with
+the loud, indexed `MissingTriangleDrawState{triangle_index}` naming exactly
+which triangle lacks state, before any decode happens against it).
+
+**`targets/triangle_pipeline.rs`** gains `TrianglePipelineRenderer::
+submit_admitted_triangle` — a thin function accepting real retrieved
+vertices/`OtherMode`/`CombineParams` plus caller-supplied
+`raster_params`/`extent` and forwarding into the existing `submit_triangle`
+entry point. `other_mode` is accepted but not yet consumed: this slice's
+vertex shader hardcodes `is_rect=false`/no Z-override, matching the
+GPU-pipeline card's own fixed-fixture scope.
+
+**Out of scope, held.** No multi-triangle batching, no texture
+sampling/blend/alpha-compare/coverage-write, no two-cycle combiner branch,
+no real draw-command-stream/frame assembly. Does not touch `combiner.rs`,
+`state.rs`, `fn64-render-reference`, any GPU/WGSL shader file, or
+`raster_vs.rs`/`raster_vs.wgsl`.
+
+**Evidence.** 10 consecutive clean `cargo test -p fn64-render-wgpu --lib`
+runs (925/925 passed) and 10 consecutive clean runs with `--features
+host-gpu-tests` (932/932 passed, real Metal execution evidence for the
+end-to-end host-GPU test `required_host_draws_a_real_admitted_triangle_
+matching_the_combiner_oracle`, which reaches its sealed plan through a real
+`RawDpcCoordinator` — `authority.into_coordinator(())` — not a bare-authority
+route, matching how `WgpuBackend` reaches its own plan in production).
+`cargo clippy -p fn64-render-wgpu --no-deps --all-targets` clean on both
+feature sets. One bounded independent adversarial review ran against the
+final diff and reported zero findings at or above its confidence threshold,
+after two earlier review passes during implementation caught and fixed real
+bugs (the decode-time ordering/silent-default gap, and the retrieval-time
+whole-plan-final-value bug, both described above).

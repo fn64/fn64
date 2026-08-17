@@ -2146,7 +2146,7 @@ mod tests {
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
-    /// four raw wire words -- the simplest admitted triangle opcode, same
+    /// eight raw wire words -- the simplest admitted triangle opcode, same
     /// shape `raw_dpc::mod::tests`' own `triangle_base_word0` builds.
     fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
         let w0 = word(
@@ -2262,6 +2262,158 @@ mod tests {
             expected_a_vertices, expected_b_vertices,
             "the two OtherMode values must actually produce different decoded vertices, or this \
              test cannot distinguish correct from incorrect ordering"
+        );
+    }
+
+    /// Real two-triangle A/B wire stream, decoded, pushed, sealed, and
+    /// visited exclusively through `RawDpcCoordinator::execution_view` (the
+    /// same coordinator-owned route `WgpuBackend`/`production.rs` uses in
+    /// production, never bare-authority `execution_view`) with
+    /// `TriangleDrawStateCollector` as the plan visitor -- closes the gap
+    /// `push_and_visit`'s bare-authority route and
+    /// `triangle_draw_data.rs`'s hand-fed-collector test each leave open on
+    /// their own: neither combines "real wire words" + "sealed plan" +
+    /// "coordinator-routed visit" + "two triangles with an intervening
+    /// state change" in one proof.
+    #[test]
+    fn two_triangles_with_an_intervening_state_change_retrieve_ordered_command_time_snapshots_through_the_coordinator(
+    ) {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0)); // OtherMode A
+        words.extend(set_combine(0x0000_0004, 0x0000_0000)); // Combine A
+        words.extend(triangle_base_edge_words(0, 0, 0x0100)); // Triangle A
+        words.extend(set_other_mode(1, 1 << 19)); // OtherMode B (2Cycle, perspective on)
+        words.extend(set_combine(0x0000_0005, 0x0080_0000)); // Combine B
+        words.extend(triangle_base_edge_words(1, 0, 0x0200)); // Triangle B
+
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::SetOtherMode(other_mode_a) = decoded.commands()[0].kind() else {
+            panic!("expected SetOtherMode as the first command");
+        };
+        let RawDpcCommandKind::SetCombine(combine_a) = decoded.commands()[1].kind() else {
+            panic!("expected SetCombine as the second command");
+        };
+        let RawDpcCommandKind::RawTriangle(triangle_a) = decoded.commands()[2].kind() else {
+            panic!("expected RawTriangle as the third command");
+        };
+        let RawDpcCommandKind::SetOtherMode(other_mode_b) = decoded.commands()[3].kind() else {
+            panic!("expected SetOtherMode as the fourth command");
+        };
+        let RawDpcCommandKind::SetCombine(combine_b) = decoded.commands()[4].kind() else {
+            panic!("expected SetCombine as the fifth command");
+        };
+        let RawDpcCommandKind::RawTriangle(triangle_b) = decoded.commands()[5].kind() else {
+            panic!("expected RawTriangle as the sixth command");
+        };
+
+        let layout = capture.memory_layout();
+        let submission_start = capture.submission().start();
+        let capture_words = capture.submission().command_words();
+        let (mut session, authority) = new_raw_dpc_roles().unwrap();
+        // Coordinator-owned route, not a bare-authority call -- unit `()`
+        // stands in for the coordinator's physical-state slot `P`: this
+        // test only needs the plan-writing/plan-visiting surface, not real
+        // TMEM state, matching `targets/triangle_pipeline/tests.rs`'s own
+        // coordinator-route precedent.
+        let coordinator = authority.into_coordinator(());
+        let request = session.plan_request(capture);
+        let mut writer = coordinator.begin_plan(request);
+        push_decoded_raw_dpc(
+            &mut writer,
+            &decoded,
+            &capture_words,
+            layout,
+            submission_start,
+        )
+        .expect("fixture stays inside the admitted state+triangle subset");
+        let planned = writer
+            .finish(journal)
+            .expect("pushed accesses match the journal exactly");
+        let reads = fn64_render_ir::DeferredGuestReadCapture::new(
+            planned
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    fn64_render_ir::CapturedGuestRead::try_new(
+                        *read,
+                        vec![0; read.range().len() as usize],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        let bound = session
+            .finalize_and_submit(planned, reads)
+            .expect("captured reads match the plan's own guest-read plan exactly");
+
+        // `execution_view` is the sealed API's sole route to plan contents
+        // once bound; never `decoded.commands()` from here on.
+        struct NoopExecutionView;
+        impl fn64_render::RawDpcExecutionView<crate::raw_dpc::TriangleDrawStateCollector>
+            for NoopExecutionView
+        {
+            fn plan_visited(
+                &mut self,
+                _plan_visitor: &mut crate::raw_dpc::TriangleDrawStateCollector,
+            ) {
+            }
+            fn captured_reads(&mut self, _reads: &[fn64_render_ir::CapturedGuestRead]) {}
+            fn submitted_packet(&mut self, _packet: &fn64_render_ir::WorkloadPacket) {}
+        }
+        let mut collector = crate::raw_dpc::TriangleDrawStateCollector::default();
+        let mut view = NoopExecutionView;
+        coordinator.execution_view(&bound, &mut collector, &mut view);
+        let retrieved = collector
+            .finish()
+            .expect("plan has two triangles with real state at each one's own stream position");
+        assert_eq!(retrieved.len(), 2);
+
+        assert_eq!(
+            retrieved[0].other_mode, other_mode_a,
+            "triangle A must retrieve the OtherMode current at its own stream position"
+        );
+        assert_eq!(
+            retrieved[0].combine_params, combine_a,
+            "triangle A must retrieve the CombineParams current at its own stream position"
+        );
+        assert_eq!(
+            retrieved[1].other_mode, other_mode_b,
+            "triangle B must retrieve the OtherMode current at its own stream position"
+        );
+        assert_eq!(
+            retrieved[1].combine_params, combine_b,
+            "triangle B must retrieve the CombineParams current at its own stream position"
+        );
+        assert_ne!(
+            retrieved[0].other_mode, retrieved[1].other_mode,
+            "the two OtherMode values must actually differ, or this test cannot distinguish \
+             correct per-triangle snapshots from a collapsed-to-one-value bug"
+        );
+        assert_ne!(
+            retrieved[0].combine_params, retrieved[1].combine_params,
+            "the two CombineParams values must actually differ, or this test cannot distinguish \
+             correct per-triangle snapshots from a collapsed-to-one-value bug"
+        );
+
+        let expected_a = decode_triangle_vertices(&triangle_a, false);
+        let expected_a_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_a.vertex(index)));
+        let expected_b = decode_triangle_vertices(&triangle_b, true);
+        let expected_b_vertices: [NeutralTriangleVertex; 3] =
+            core::array::from_fn(|index| neutral_triangle_vertex(expected_b.vertex(index)));
+        assert_eq!(
+            retrieved[0].vertices, expected_a_vertices,
+            "triangle A's retrieved vertices must match its own stream-position decode"
+        );
+        assert_eq!(
+            retrieved[1].vertices, expected_b_vertices,
+            "triangle B's retrieved vertices must match its own stream-position decode"
+        );
+        assert_ne!(
+            retrieved[0].vertices, retrieved[1].vertices,
+            "the two triangles' vertices must actually differ, confirming ordering, not just \
+             independent correctness"
         );
     }
 
