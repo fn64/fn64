@@ -1,0 +1,15 @@
+[package]
+name = "fn64-render-reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic pure-Rust reference RenderBackend and bounded N64 GBI/RDP/VI implementation."
+
+[dependencies]
+fn64-render = { path = "../fn64-render" }
+fn64-runtime = { path = "../fn64-runtime" }
+sha2 = "0.10"
+
+[dev-dependencies]
+insta = "1"
