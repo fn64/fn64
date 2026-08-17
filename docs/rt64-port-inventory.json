@@ -136,8 +136,10 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m10-src-apple-rt64-apple-h",
@@ -150,7 +152,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "P/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_apple_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -195,8 +197,10 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m10-src-apple-rt64-apple-mm",
@@ -209,7 +213,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "P/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_apple_mm.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -5656,8 +5660,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-f3d-h",
@@ -5670,7 +5676,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_f3d_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -5900,8 +5906,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-h",
@@ -5914,7 +5922,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -6748,8 +6756,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-f3d-h",
@@ -6762,7 +6772,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_f3d_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -6930,8 +6940,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-f3dex-h",
@@ -6944,7 +6956,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_f3dex_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -7785,8 +7797,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-l3dex2-cpp",
@@ -7799,7 +7813,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_l3dex2_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -7834,8 +7848,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-l3dex2-h",
@@ -7848,7 +7864,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_l3dex2_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -8520,8 +8536,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-s2dex-h",
@@ -8534,7 +8552,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_s2dex_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -8674,8 +8692,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-s2dex2-h",
@@ -8688,7 +8708,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_s2dex2_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -17575,8 +17595,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-preset-rt64-preset-inspector-h",
@@ -17589,7 +17611,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_preset_inspector_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -23826,8 +23848,10 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m10-src-rhi-rt64-render-hooks-cpp",
@@ -23840,7 +23864,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "P/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_render_hooks_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -23875,8 +23899,10 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m10-src-rhi-rt64-render-hooks-h",
@@ -23889,7 +23915,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "P/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_render_hooks_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -23950,8 +23976,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-background-hlsli",
@@ -23964,7 +23992,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/background_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24104,8 +24132,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-bluenoise-hlsli",
@@ -24118,7 +24148,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/bluenoise_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24337,8 +24367,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-composeps-hlsl",
@@ -24351,7 +24383,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/composeps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24593,8 +24625,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-debugps-hlsl",
@@ -24607,7 +24641,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/debugps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24743,8 +24777,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbchangesclearcs-hlsl",
@@ -24757,7 +24793,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbchangesclearcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24806,8 +24842,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbchangesdrawcolorps-hlsl",
@@ -24820,7 +24858,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbchangesdrawcolorps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -24869,8 +24907,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbchangesdrawdepthps-hlsl",
@@ -24883,7 +24923,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbchangesdrawdepthps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25061,8 +25101,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbreadanychangescs-hlsl",
@@ -25075,7 +25117,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbreadanychangescs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25112,8 +25154,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbreadanyfullcs-hlsl",
@@ -25126,7 +25170,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbreadanyfullcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25278,8 +25322,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbrenderercommon-hlsli",
@@ -25292,7 +25338,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbrenderercommon_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25337,8 +25383,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbrendererrt-hlsli",
@@ -25351,7 +25399,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbrendererrt_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25388,8 +25436,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbwritecolorcs-hlsl",
@@ -25402,7 +25452,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbwritecolorcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25439,8 +25489,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-fbwritedepthcs-hlsl",
@@ -25453,7 +25505,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/fbwritedepthcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25765,8 +25817,10 @@
       "port_delta": "unchanged",
       "milestone": "M12",
       "workstream": "ray-path-tracing",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m12-src-shaders-globalhitbuffers-hlsli",
@@ -25779,7 +25833,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/globalhitbuffers_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25873,8 +25927,10 @@
       "port_delta": "unchanged",
       "milestone": "M11",
       "workstream": "modernization",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m11-src-shaders-histogramclearcs-hlsl",
@@ -25887,7 +25943,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/histogramclearcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25932,8 +25988,10 @@
       "port_delta": "unchanged",
       "milestone": "M11",
       "workstream": "modernization",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m11-src-shaders-histogramsetcs-hlsl",
@@ -25946,7 +26004,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/histogramsetcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25977,8 +26035,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-idlecs-hlsl",
@@ -25991,7 +26051,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/idlecs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26032,8 +26092,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-im3dcommon-hlsli",
@@ -26046,7 +26108,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/im3dcommon_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26093,8 +26155,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-im3dps-hlsl",
@@ -26107,7 +26171,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/im3dps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26162,8 +26226,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-shaders-im3dvs-hlsl",
@@ -26176,7 +26242,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/im3dvs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26207,8 +26273,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-library-hlsli",
@@ -26221,7 +26289,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/library_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26525,8 +26593,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-postblenddithernoiseps-hlsl",
@@ -26539,7 +26609,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/postblenddithernoiseps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -26858,8 +26928,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-shaders-rspvertextestzcs-hlsl",
@@ -26872,7 +26944,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rspvertextestzcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27230,8 +27302,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-renderparams-hlsli",
@@ -27244,7 +27318,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/renderparams_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27285,8 +27359,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-renderparamsspecconstants-hlsli",
@@ -27299,7 +27375,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/renderparamsspecconstants_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27348,8 +27424,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-rtcopycolortodepthps-hlsl",
@@ -27362,7 +27440,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rtcopycolortodepthps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27411,8 +27489,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-rtcopydepthtocolorps-hlsl",
@@ -27425,7 +27505,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rtcopydepthtocolorps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27470,8 +27550,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-texturecopyps-hlsl",
@@ -27484,7 +27566,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/texturecopyps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27529,8 +27611,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-texturedecodecs-hlsl",
@@ -27543,7 +27627,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/texturedecodecs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -27844,8 +27928,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-textureresolveps-hlsl",
@@ -27858,7 +27944,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/textureresolveps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -28024,8 +28110,10 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-shaders-videointerfaceps-hlsl",
@@ -28038,7 +28126,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/videointerfaceps_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_present_shaders.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
