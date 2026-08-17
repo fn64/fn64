@@ -335,6 +335,7 @@ mod random;
 mod raster_vs;
 mod raw_dpc;
 mod rgb_dither;
+mod rt64_math;
 mod shader_manifest;
 mod state;
 mod targets;
