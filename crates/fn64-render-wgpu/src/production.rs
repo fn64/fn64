@@ -33,8 +33,10 @@ use fn64_render_ir::{
 
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::{
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError,
-    RdpState, TmemLoadSourceIdentity, TmemTransferWord,
+    HeadlessBackend, PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState,
+    RawDpcDecodeError, RdpState, TmemLoadSourceIdentity, TmemTransferWord,
+    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
+    UninitializedTrianglePipeline,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -54,6 +56,15 @@ pub struct WgpuBackend {
     /// prior submission set (e.g. a `SetTile` from submission N read by a
     /// `LoadBlock` in submission N+1).
     rdp_state: RdpState,
+    /// The real GPU triangle-draw pipeline, populated only by a successful
+    /// `RenderBackend::create` call -- never by `try_new`, never lazily on
+    /// first draw (`WgpuBackend` production triangle-draw integration card
+    /// §1a: eager, synchronous initialization is the owner's explicit
+    /// decision, superseding an earlier lazy-init draft). `None` until
+    /// `create` succeeds; a caller that never calls `create` never pays
+    /// GPU-adapter-negotiation cost, since every existing TMEM-only
+    /// caller/test already never calls it.
+    triangle_pipeline: Option<Box<TrianglePipelineRenderer>>,
 }
 
 /// Failure constructing a fresh [`WgpuBackend`]. Both sources are the T0
@@ -98,6 +109,7 @@ impl WgpuBackend {
             Self {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
+                triangle_pipeline: None,
             },
             session,
         ))
@@ -114,6 +126,72 @@ impl WgpuBackend {
     /// tests; advances only through a successful `plan_raw_dpc` call.
     pub fn rdp_state(&self) -> &RdpState {
         &self.rdp_state
+    }
+
+    /// `RenderBackend::create`'s body: block once, synchronously, on
+    /// `UninitializedTrianglePipeline::request()`, storing the resulting
+    /// renderer or reporting a richly-typed failure. Public and callable
+    /// directly (unlike `execute_raw_dpc_inner`, which is a private free
+    /// function) so a test can assert on the exact `WgpuCreateError`
+    /// variant -- specifically distinguishing a genuine `NoAdapter` from
+    /// any other failure -- which `RenderBackend::create`'s own
+    /// `Result<(), RenderError>` signature cannot preserve once converted
+    /// (`RenderError::Backend`'s `reason` is a plain `String`).
+    pub fn create_inner(&mut self, _cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
+        let outcome = pollster::block_on(
+            UninitializedTrianglePipeline::new(HeadlessBackend::default()).request(),
+        )
+        .map_err(WgpuCreateError::Request)?;
+        match outcome {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => {
+                self.triangle_pipeline = Some(renderer);
+                Ok(())
+            }
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => {
+                Err(WgpuCreateError::NoAdapter(no_adapter))
+            }
+        }
+    }
+}
+
+/// Named, loud rejection for one `RenderBackend::create` call -- kept
+/// distinct from `WgpuRawDpcExecutionError`/`WgpuBackendConstructionError`
+/// because this is specifically the triangle-pipeline device-request
+/// failure surface. Public so a caller/test can distinguish `NoAdapter`
+/// (no exotic device failure, just no matching adapter on this host) from
+/// `Request` (a genuine `TrianglePipelineError` -- adapter/device request
+/// rejected, or the pipeline prewarm itself reported a device error).
+#[derive(Debug)]
+pub enum WgpuCreateError {
+    NoAdapter(crate::NoAdapter),
+    Request(TrianglePipelineError),
+}
+
+impl core::fmt::Display for WgpuCreateError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoAdapter(no_adapter) => write!(
+                formatter,
+                "no GPU adapter available for the triangle-draw pipeline: {no_adapter:?}"
+            ),
+            Self::Request(error) => {
+                write!(
+                    formatter,
+                    "triangle-pipeline device request failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WgpuCreateError {}
+
+impl From<WgpuCreateError> for RenderError {
+    fn from(error: WgpuCreateError) -> Self {
+        RenderError::Backend {
+            backend: "render-wgpu/create",
+            reason: error.to_string(),
+        }
     }
 }
 
@@ -340,8 +418,25 @@ fn map_physical_lanes(
 }
 
 impl RenderBackend for WgpuBackend {
-    fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
-        Ok(())
+    /// Eagerly, synchronously requests the real GPU triangle-draw pipeline
+    /// (`WgpuBackend` production triangle-draw integration card §1a): blocks
+    /// once on `UninitializedTrianglePipeline::request()` via
+    /// `pollster::block_on`. A repeated call is an explicit full reset, not
+    /// a no-op and not an error -- it re-requests a device from scratch and
+    /// replaces `triangle_pipeline`, dropping the previous renderer's
+    /// device/queue/pipeline. `_cfg` is accepted (matching the trait
+    /// signature every other backend implements) but unused here: this
+    /// backend's fixed-fixture triangle pipeline does not size itself off
+    /// `RenderConfig`'s `width`/`height`/`tv_type` (per-draw extent is
+    /// supplied per call to `submit_admitted_triangle`, not fixed at
+    /// `create` time). Thin wrapper over `Self::create_inner`, mirroring
+    /// `execute_raw_dpc`/`execute_raw_dpc_inner`'s existing split in this
+    /// file -- `create_inner` returns the richly-typed `WgpuCreateError` a
+    /// test can assert on specifically (e.g. distinguishing a genuine
+    /// `NoAdapter` from any other failure), which `RenderError::Backend`'s
+    /// plain `String` reason cannot preserve once converted.
+    fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
+        self.create_inner(cfg).map_err(RenderError::from)
     }
 
     fn observe_non_rdp_write16(
@@ -1412,5 +1507,82 @@ mod tests {
             "a second execution against the same still-current active base (no publish \
              between the two calls) must also succeed, not be rejected as stale",
         );
+    }
+
+    fn test_render_config() -> fn64_render::RenderConfig {
+        fn64_render::RenderConfig {
+            width: 8,
+            height: 8,
+            tv_type: fn64_runtime::TvType::default(),
+        }
+    }
+
+    /// Positive: `RenderBackend::create` is a no-op on `WgpuBackend`'s
+    /// existing TMEM-only tests -- none of them call `create` at all, so
+    /// this backend's whole TMEM-only test surface above is completely
+    /// unaffected by `create`'s new eager triangle-pipeline
+    /// initialization. This test only proves `create` itself has not
+    /// broken compilation/basic construction on a backend that never
+    /// touches a triangle -- it deliberately does NOT call `create` before
+    /// exercising the existing TMEM-only path, matching every other test
+    /// in this module.
+    #[test]
+    fn tmem_only_path_never_calls_create_and_is_unaffected_by_its_existence() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        // No backend.create(...) call here, deliberately -- mirrors every
+        // other TMEM-only test in this module.
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, one_load_block_words());
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        backend
+            .execute_raw_dpc(bound)
+            .expect("TMEM-only execution must succeed without ever calling create()");
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    mod host_gpu_tests {
+        use super::*;
+
+        /// Required host evidence: a real adapter request succeeds and
+        /// `WgpuBackend::create` stores a real `TrianglePipelineRenderer`.
+        /// `create_inner` (not `create`) is called directly so a
+        /// `NoAdapter` outcome on a genuinely headless CI host is
+        /// reportable as a named, non-panicking skip rather than an
+        /// opaque `RenderError::Backend` string match.
+        #[test]
+        fn create_requests_a_real_adapter_and_stores_the_triangle_pipeline() {
+            let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+            match backend.create_inner(&test_render_config()) {
+                Ok(()) => {
+                    assert!(
+                        backend.triangle_pipeline.is_some(),
+                        "a successful create() must store a real TrianglePipelineRenderer"
+                    );
+                }
+                Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                    panic!(
+                        "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                    );
+                }
+                Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+            }
+        }
+
+        /// Repeated `create()` calls are an explicit full reset (card
+        /// §1a): re-requesting a device from scratch must succeed again,
+        /// not error as "already initialized" and not silently no-op.
+        #[test]
+        fn repeated_create_calls_reset_the_triangle_pipeline_each_time() {
+            let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+            backend
+                .create_inner(&test_render_config())
+                .expect("first create() must succeed on a real adapter");
+            assert!(backend.triangle_pipeline.is_some());
+            backend
+                .create_inner(&test_render_config())
+                .expect("a second create() call must also succeed, not error or no-op");
+            assert!(backend.triangle_pipeline.is_some());
+        }
     }
 }

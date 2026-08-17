@@ -15,6 +15,11 @@ fn64-render = { path = "../fn64-render" }
 fn64-render-ir = { path = "../fn64-render-ir" }
 fn64-runtime = { path = "../fn64-runtime" }
 wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl"] }
+# Already locked transitively at this exact version (pulled in by
+# fn64-shell's `pixels` dependency's own wgpu 0.19.4 tree) -- promoting it
+# to a direct dependency here makes an already-resolved version explicit,
+# it does not widen the resolved dependency graph.
+pollster = "0.3.0"
 
 [dev-dependencies]
 naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
