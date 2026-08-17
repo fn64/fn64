@@ -327,6 +327,7 @@ mod endian_swap;
 mod fbcommon;
 mod formats_dither;
 mod lifecycle;
+mod math_hlsli;
 mod native_contract;
 mod production;
 mod random;
@@ -386,6 +387,7 @@ pub use lifecycle::{
     FILL_FIXTURE_BYTES, FILL_FIXTURE_HEIGHT, FILL_FIXTURE_TEST_COLOR, FILL_FIXTURE_TEST_OUTPUT,
     FILL_FIXTURE_WIDTH,
 };
+pub use math_hlsli::{get_perpendicular_vector, modulo};
 pub use native_contract::{
     prepare_native_fill, CommittedNativeFrame, DeviceRgba16Bytes, InFlightNativeFill,
     N64RecompRdramStorageBytes, NativeContractError, NativeDurableState, NativeFrameBinding,
