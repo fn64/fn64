@@ -11113,7 +11113,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -11137,6 +11137,11 @@
         "exit_gate": "The M4 behavior fixture for src/hle/rt64_framebuffer_changes.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs",
+        "reason": "Two struct declarations whose members are std::unique_ptr<RenderTexture>, std::unique_ptr<...DescriptorSet> and std::map -- RHI-bound resource handles with no arithmetic."
       }
     },
     {
@@ -11797,7 +11802,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -11821,6 +11826,11 @@
         "exit_gate": "The M4 behavior fixture for src/hle/rt64_framebuffer_pair.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs",
+        "reason": "rt64_frame_compatibility.rs already owns the six scalar fields (colorImage.{address,fmt,siz,width}, depthImage.{address,formatChanged}) its predicates read; the rest is a FlushReason tag, a layout-only bitfield, and RHI-adjacent containers with no arithmetic."
       }
     },
     {
@@ -12020,7 +12030,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -12044,6 +12054,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_game_call.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs",
+        "reason": "A five-member aggregate (callDesc: DrawCall, shaderDesc: ShaderDescription, and three anonymous sub-structs -- meshDesc, debuggerDesc, lerpDesc) plus a #if SCRIPT_ENABLED callback pointer; ShaderDescription is already owned by crate::rt64_shader_description and the rest is field declarations, no behavior."
       }
     },
     {
@@ -12876,7 +12891,7 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -12900,6 +12915,11 @@
         "exit_gate": "The M5 behavior fixture for src/hle/rt64_microcode.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs",
+        "reason": "Its entire content is struct Microcode { uint32_t half1; uint32_t half2; }; field declaration order is not pinnable in safe Rust, and this card makes no repr(C)/size/alignment/ABI claim, so a Rust struct here would assert nothing testable."
       }
     },
     {
@@ -13355,7 +13375,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -13379,6 +13399,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_projection.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs",
+        "reason": "Projection's members are std::vector<GameCall>, LightManager, std::vector<interop::PointLight> and FixedRect -- the HLE object graph, not behavior; only its Type enum is needed to express the already-ported usesViewport."
       }
     },
     {
@@ -15915,7 +15940,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -15939,6 +15964,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_transform_group.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "d2980310ab227978c193426fdfee816a79ca2603",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs",
+        "reason": "Thirteen default-initialized fields, every default an already-owned G_EX_* constant in rt64_extended_gbi.rs (G_EX_ID_AUTO, G_EX_COMPONENT_AUTO, G_EX_COMPONENT_SKIP, G_EX_ORDER_AUTO, G_EX_ASPECT_AUTO, G_EX_EDIT_NONE); no arithmetic, no predicate, no derived constant."
       }
     },
     {
