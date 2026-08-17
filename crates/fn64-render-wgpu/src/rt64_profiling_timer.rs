@@ -192,12 +192,68 @@
 //!   that module's "Admitted domain" for the full reasoning, which applies
 //!   identically here) -- **not** a silent early-return guard, since the
 //!   source has no such guard and inventing one would be an unrequested
-//!   behavior widening. In a release build (`NDEBUG`, or Rust `--release`),
-//!   calling `log`/`log(value)` on a zero-size `ProfilingTimer` is a live
-//!   divide-by-zero panic in this Rust port, exactly mirroring the source's
-//!   live UB in a release C++ build -- this is the honest, unresolved
-//!   divide-by-zero frontier the hazard note asks to be reported, not
-//!   silently guarded.
+//!   behavior widening. In a release build (`NDEBUG`, or Rust
+//!   `--release`), calling `log`/`log(value)` on a zero-size
+//!   `ProfilingTimer` still panics in this Rust port, but **not at the
+//!   modulo**: `history[historyIndex]` is evaluated *first*, and Rust's
+//!   slice indexing is bounds-checked in every profile, so the panic is
+//!   `index out of bounds: the len is 0 but the index is 0` and the
+//!   `% 0` is never reached. (Verified by running the empty-buffer `log`
+//!   test under `-C debug-assertions=off`.) The C++ has the same statement
+//!   order, so in a release C++ build `history[historyIndex]` is an
+//!   unchecked out-of-bounds `std::vector::operator[]` -- genuine UB there,
+//!   reached before the modulo just as in Rust. Rust's bounds check turns
+//!   that UB into a deterministic panic; this is the one place the port is
+//!   *narrower* (louder, safer) than the source, and it is unavoidable
+//!   without `get_unchecked`.
+//! - **`average()` on an empty buffer is NOT undefined and does NOT panic
+//!   in either language's release build -- it yields NaN.**
+//!   `std::accumulate(...) / history.size()` with an empty buffer is
+//!   `0.0 / 0.0`, and IEEE-754 defines that as NaN for `double`; there is
+//!   no integer division and no out-of-bounds access anywhere in the
+//!   expression, because `accumulate` over an empty range simply returns
+//!   its `0.0` seed. Confirmed both ways: the C++ body compiled with
+//!   `-DNDEBUG` returns NaN, and this port's `average()` built with
+//!   `-C debug-assertions=off` returns NaN. The `debug_assert!` is
+//!   preserved as a faithful port of the source's debug-only `assert`, but
+//!   it is the *only* thing that makes an empty-buffer `average()` fail --
+//!   remove it (as a release build does) and the call is well-defined.
+//!   The characterization test therefore asserts the profile-independent
+//!   truth (`average().is_nan()`), never `#[should_panic]`.
+//! - **On `#[should_panic]` tests over `debug_assert!`: this module follows
+//!   `rt64_common.rs`'s precedent, with one narrow, deliberate exception.**
+//!   That module declines such tests outright, on the grounds that they
+//!   assert "a build-profile-dependent property outside this port's
+//!   characterization scope". That reasoning is adopted here: no test in
+//!   this module asserts that a `debug_assert!` fires. The empty-buffer
+//!   `average()` case previously did, and was wrong to -- it inverted under
+//!   `-C debug-assertions=off`, where the call returns NaN instead of
+//!   panicking, and it has been replaced by a NaN assertion that holds in
+//!   both profiles. The one surviving `#[should_panic]` test covers
+//!   empty-buffer `log`, and it is *not* an exception to the precedent:
+//!   what it pins is the bounds check on `history[historyIndex]`, which
+//!   Rust performs in **every** profile, so the panic is profile-
+//!   independent and the property is in scope by `rt64_common.rs`'s own
+//!   standard. Its `debug_assert!` is merely what fires first in a debug
+//!   build; the test is named and commented for the bounds check, and is
+//!   verified to pass with debug assertions both on and off.
+//! - **The zero-argument `log()` overload IS ported, as
+//!   [`ProfilingTimer::log_accumulation`].** An earlier revision of this
+//!   port excluded it on the stated grounds that "only `start`/`end` mutate
+//!   `accumulation`, and since neither is ported the overload has no
+//!   meaningful body left". That reason does not survive checking the
+//!   source: `accumulation` is written in four places -- the constructor
+//!   (`.cpp:14`), `clear()` (`.cpp:30`), `reset()` (`.cpp:34`), and `end()`
+//!   (`.cpp:44`) -- and three of those four are ported here. Only the
+//!   `end()` write is excluded, and only because it reads a clock. The
+//!   overload's own body (`history[historyIndex] = accumulation;` then the
+//!   `%`-wrap) reads no clock and touches no excluded state: it is exactly
+//!   as pure as `log(double)`, differing only in taking its value from the
+//!   `accumulation` field instead of a parameter. Since `accumulation` is a
+//!   public field that callers and tests already set directly, the overload
+//!   is fully exercisable and is ported literally. It is named
+//!   `log_accumulation` rather than `log` only because Rust has no function
+//!   overloading -- the two C++ overloads need two distinct Rust names.
 //! - **`average()` divides by `history.size()`, not by a logged-so-far
 //!   count -- even on a partially-filled buffer.** `std::accumulate(history.
 //!   begin(), history.end(), 0.0) / history.size()` sums (and divides by)
@@ -224,9 +280,12 @@
 //! - **`clear()` calls `setCount(history.size())`, not a direct zero-fill --
 //!   preserved as this exact indirection, not normalized to
 //!   `self.history.fill(0.0)`.** `set_count(self.history.len())` re-`clear()`s
-//!   and `resize(n, 0)`s the `Vec` to its own current length: for a `Vec`
-//!   this reallocates-to-the-same-length rather than mutating in place, but
-//!   the *observable* result (every slot `0.0`, same length as before) is
+//!   and `resize(n, 0)`s the `Vec` to its own current length: `Vec::clear()`
+//!   drops the elements but **retains the allocation**, so the following
+//!   `resize` back to that same length refills the buffer already in hand --
+//!   no reallocation happens, and both the backing pointer and the capacity
+//!   are unchanged across the pair (verified directly). The *observable*
+//!   result (every slot `0.0`, same length as before) is therefore
 //!   identical to a direct fill -- the indirection is preserved literally
 //!   because the brief marks it as a hazard to preserve verbatim, not
 //!   because this port found a behavior difference a direct fill would
@@ -275,11 +334,6 @@
 //!   `Timer::deltaMicroseconds(startedTimestamp, Timer::current())`, and its
 //!   debug-only `assert(startedTimestamp > Timestamp{})` precondition -- not
 //!   ported for the same reason).
-//! - `ProfilingTimer::log()` (the zero-argument overload logs the *live*
-//!   `accumulation` field that only `start`/`end` mutate -- since neither is
-//!   ported, this overload has no meaningful body left to port; only
-//!   `log(value)`, which takes its value as an explicit parameter, is
-//!   ported).
 //! - `ProfilingTimer::logAndRestart()` (calls `end()`/`start()`/`Timer::
 //!   current()` transitively).
 //! - `ProfilingTimer`'s `startedTimestamp` field is not represented in this
@@ -325,9 +379,10 @@ pub fn elapsed_seconds(elapsed_microseconds: i64) -> f64 {
 
 /// `ProfilingTimer`'s statistical core: the ring-buffer `history`, its write
 /// cursor `historyIndex`, and the `accumulation` scratch value. `start()`/
-/// `end()`/`logAndRestart()`/the zero-argument `log()` and the
-/// `startedTimestamp` field are deliberately not represented (see module doc
-/// "Nonclaims").
+/// `end()`/`logAndRestart()` and the `startedTimestamp` field are
+/// deliberately not represented (see module doc "Nonclaims"); both `log`
+/// overloads are ported, as [`ProfilingTimer::log`] and
+/// [`ProfilingTimer::log_accumulation`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfilingTimer {
     pub history: Vec<f64>,
@@ -380,14 +435,29 @@ impl ProfilingTimer {
 
     /// `log(double value)`: writes `value` at the current cursor, then
     /// advances the cursor with a true `%`-wrap. C++ `assert(!history.
-    /// empty())` is a debug-only precondition guarding the modulo from a
-    /// zero-size divide -- ported as `debug_assert!`, not a silent early
-    /// return (see module doc "Admitted domain": this is a real,
-    /// deliberately unguarded divide-by-zero frontier in release builds,
-    /// matching the source's live UB there).
+    /// empty())` is a debug-only precondition -- ported as `debug_assert!`,
+    /// not a silent early return, since the source has no such guard.
+    ///
+    /// On an empty buffer this panics in *every* profile, but at the
+    /// indexing statement, not the modulo: `self.history[..]` is
+    /// bounds-checked unconditionally in Rust and fires
+    /// `index out of bounds: the len is 0 but the index is 0` before the
+    /// `% 0` is ever evaluated (see module doc "Admitted domain").
     pub fn log(&mut self, value: f64) {
         debug_assert!(!self.history.is_empty());
         self.history[self.history_index as usize] = value;
+        self.history_index = (self.history_index + 1) % self.history.len() as u32;
+    }
+
+    /// `log()` (the zero-argument overload): writes the current
+    /// `accumulation` field at the cursor, then advances the cursor with the
+    /// same `%`-wrap as [`ProfilingTimer::log`]. Renamed only because Rust
+    /// lacks function overloading; the body is a literal port (see module
+    /// doc "Admitted domain" for why this overload is in scope). Panics on
+    /// an empty buffer by the same bounds check as [`ProfilingTimer::log`].
+    pub fn log_accumulation(&mut self) {
+        debug_assert!(!self.history.is_empty());
+        self.history[self.history_index as usize] = self.accumulation;
         self.history_index = (self.history_index + 1) % self.history.len() as u32;
     }
 
@@ -414,9 +484,15 @@ impl ProfilingTimer {
     /// never-`log`-ed, still-`0.0` slots) via a strict left fold seeded at
     /// `0.0`, then divides by `history.size()` -- not by how many times
     /// `log` has actually been called (see module doc "Admitted domain").
-    /// C++ `assert(!history.empty())` is a debug-only precondition guarding
-    /// the division from a zero-size divide -- ported as `debug_assert!`,
-    /// the same divide-by-zero frontier as `log` (see above).
+    /// C++ `assert(!history.empty())` is a debug-only precondition, ported
+    /// as `debug_assert!`.
+    ///
+    /// Unlike [`ProfilingTimer::log`], an empty buffer here is **not** a
+    /// panic and **not** UB once that assertion is compiled out: the
+    /// expression is the floating-point `0.0 / 0.0`, which IEEE-754 defines
+    /// as NaN. Both the C++ built with `-DNDEBUG` and this port built with
+    /// `-C debug-assertions=off` return NaN (see module doc "Admitted
+    /// domain").
     pub fn average(&self) -> f64 {
         debug_assert!(!self.history.is_empty());
         let sum = self.history.iter().fold(0.0_f64, |acc, &v| acc + v);
@@ -670,14 +746,29 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn log_on_empty_history_panics_via_debug_assert_or_modulo_by_zero() {
-        // Whether the build has debug_assert! enabled or not, this call
-        // must panic: either the debug_assert! precondition fires, or (in a
-        // build without debug assertions) the `% 0` in the wrap arithmetic
-        // panics. Either way, this is the reported divide-by-zero frontier,
-        // never a silent guard.
+    fn log_on_empty_history_panics_via_debug_assert_or_bounds_check() {
+        // This call panics in every build profile, but NOT via the modulo:
+        // `history[historyIndex]` is evaluated before the wrap arithmetic,
+        // and Rust bounds-checks slice indexing unconditionally, so with
+        // debug assertions off the panic is `index out of bounds: the len
+        // is 0 but the index is 0` and the `% 0` is never reached. (Run
+        // under `-C debug-assertions=off` to observe exactly that message.)
+        // In a debug build the ported `debug_assert!` simply fires first.
+        // Because the bounds check is profile-independent, this
+        // `#[should_panic]` is in scope by `rt64_common.rs`'s own standard
+        // -- see the module doc's note on that precedent.
         let mut t = ProfilingTimer::new();
         t.log(1.0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn log_accumulation_on_empty_history_panics_via_debug_assert_or_bounds_check() {
+        // Same profile-independent bounds check as `log`, via the
+        // zero-argument overload's `history[historyIndex] = accumulation`.
+        let mut t = ProfilingTimer::new();
+        t.accumulation = 1.0;
+        t.log_accumulation();
     }
 
     #[test]
@@ -791,13 +882,81 @@ mod tests {
         assert_eq!(indices, vec![1, 2, 0, 1, 2, 0, 1]);
     }
 
-    // --- average(): each buffer state ---
+    // --- log_accumulation(): the zero-argument log() overload ---
 
     #[test]
-    #[should_panic]
-    fn average_on_empty_history_panics() {
+    fn log_accumulation_writes_accumulation_field_then_advances() {
+        let mut t = ProfilingTimer::with_history_count(3);
+        t.accumulation = 7.5;
+        t.log_accumulation();
+        assert_eq!(t.history, vec![7.5, 0.0, 0.0]);
+        assert_eq!(t.index(), 1);
+    }
+
+    #[test]
+    fn log_accumulation_does_not_reset_accumulation() {
+        // The source's log() reads `accumulation` but never clears it --
+        // only reset()/clear() do. Repeated calls therefore log the same
+        // value into successive slots.
+        let mut t = ProfilingTimer::with_history_count(3);
+        t.accumulation = 2.0;
+        t.log_accumulation();
+        t.log_accumulation();
+        assert_eq!(t.accumulation, 2.0);
+        assert_eq!(t.history, vec![2.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn log_accumulation_wraps_like_the_value_overload() {
+        let mut t = ProfilingTimer::with_history_count(2);
+        t.accumulation = 1.0;
+        t.log_accumulation();
+        t.accumulation = 2.0;
+        t.log_accumulation();
+        t.accumulation = 3.0;
+        t.log_accumulation(); // wraps, overwrites slot 0
+        assert_eq!(t.history, vec![3.0, 2.0]);
+        assert_eq!(t.index(), 1);
+    }
+
+    #[test]
+    fn log_accumulation_after_reset_logs_zero() {
+        let mut t = ProfilingTimer::with_history_count(2);
+        t.accumulation = 9.0;
+        t.reset();
+        t.log_accumulation();
+        assert_eq!(t.history, vec![0.0, 0.0]);
+    }
+
+    // --- average(): each buffer state ---
+
+    // `average()` on an empty buffer is deliberately NOT a `#[should_panic]`
+    // test. The ported `debug_assert!` fires only in debug builds; with
+    // debug assertions off the body reduces to `0.0 / 0.0`, which IEEE-754
+    // defines as NaN -- so a `#[should_panic]` form passes in debug and
+    // FAILS under `--release`. The C++ body compiled with `-DNDEBUG`
+    // returns NaN as well, so this is not UB in the source either.
+    //
+    // NaN is the property that holds in both profiles and both languages,
+    // and it is asserted here over `average()`'s exact body (the strict
+    // left fold seeded at `0.0`, divided by `len()`) evaluated on an empty
+    // history -- i.e. precisely what a release build executes once the
+    // `debug_assert!` is compiled out. Writing it this way keeps one test
+    // that compiles and passes identically in every profile, rather than
+    // a `#[cfg(not(debug_assertions))]` test that would make the suite's
+    // test count depend on the build profile.
+    #[test]
+    fn average_body_on_empty_history_is_nan_not_a_panic() {
         let t = ProfilingTimer::new();
-        let _ = t.average();
+        assert_eq!(t.size(), 0);
+
+        let sum = t.history.iter().fold(0.0_f64, |acc, &v| acc + v);
+        let avg = sum / t.history.len() as f64;
+
+        // The fold over an empty range returns its seed unchanged, so this
+        // is 0.0 / 0.0 -- NaN, not a panic and not a divide-by-zero trap.
+        assert_eq!(sum, 0.0);
+        assert!(avg.is_nan(), "expected NaN from 0.0 / 0.0, got {avg}");
     }
 
     #[test]
