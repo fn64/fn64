@@ -64,6 +64,23 @@ struct FragmentCombineParams {
 @group(0) @binding(1)
 var<uniform> fragment_combine_params: FragmentCombineParams;
 
+// Alpha-compare production card §3b: the real post-combiner discard gate's
+// mode/threshold uniform. `mode` is `OtherMode::alpha_compare()`'s wire
+// encoding, guaranteed 0 (None) or 1 (Threshold) by CPU-side retrieval-time
+// rejection of Reserved/Dither (see `raw_dpc::triangle_draw_data`'s and
+// `production.rs`'s `PlanCollector`'s own retrieval-time panics) --
+// `alpha_compare_fragment_fn` is never called with `mode == 3u` (Dither) in
+// this slice. `threshold_alpha` is `G_SETBLENDCOLOR.a`, zero-extended.
+struct FragmentAlphaCompareParams {
+    mode: u32,
+    threshold_alpha: u32,
+    _reserved_0: u32,
+    _reserved_1: u32,
+}
+
+@group(0) @binding(5)
+var<uniform> fragment_alpha_compare_params: FragmentAlphaCompareParams;
+
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) tmem_sample_status: u32,
@@ -109,6 +126,25 @@ fn fs_main(
 
     let params = CombineParams(fragment_combine_params.low, fragment_combine_params.high);
     let result = run_one_cycle(params, inputs);
+
+    // Alpha-compare production card §3c: real post-combiner, pre-output
+    // discard gate. Operates on the combiner's own output alpha (its `.a`
+    // channel), matching `alpha_compare.rs`'s doc framing of alpha compare
+    // as a post-combine gate -- not the raw vertex/texel alpha. `noise_byte`
+    // is always `0u` (mode is guaranteed 0 or 1 by CPU-side rejection, see
+    // struct doc above); `copy_cycle_rgba16` is always `0u` (no copy-cycle
+    // triangle path exists in this pipeline yet).
+    let alpha_u32 = u32(clamp(result.combiner_color.a, 0.0, 1.0) * 255.0 + 0.5);
+    let alpha_compare_passed = alpha_compare_fragment_fn(
+        fragment_alpha_compare_params.mode,
+        alpha_u32,
+        fragment_alpha_compare_params.threshold_alpha,
+        0u,
+        0u,
+    );
+    if (!alpha_compare_passed) {
+        discard;
+    }
 
     var output: FragmentOutput;
     output.color = result.combiner_color;
