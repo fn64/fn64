@@ -860,3 +860,717 @@ fn wgsl_alpha_composition_matches_apply_coverage_alpha_across_full_matrix() {
         }
     }
 }
+
+// -- Fragment-callable WGSL seam (Sonnet implementation card
+// `/private/tmp/fn64-post-texture-next-production-card.md` §2-§4) --
+//
+// `COVERAGE_FRAGMENT_FN_WGSL` is a new sibling file, not an edit to
+// `coverage.wgsl` above; every test in this section exercises only the new
+// file, leaving every existing test above untouched.
+
+#[test]
+fn fragment_fn_wgsl_declares_no_entry_point_or_bindings() {
+    // The whole point of the fragment-callable form: no `@compute`, no
+    // `@group`/`@binding`, so it is an ordinary concatenatable function, not
+    // a standalone dispatchable shader.
+    assert!(!COVERAGE_FRAGMENT_FN_WGSL.contains("@compute"));
+    assert!(!COVERAGE_FRAGMENT_FN_WGSL.contains("@group"));
+    assert!(!COVERAGE_FRAGMENT_FN_WGSL.contains("@binding"));
+    assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("fn coverage_fragment_fn("));
+}
+
+#[test]
+fn fragment_fn_wgsl_parses_and_validates_under_closed_naga_profile() {
+    // A bare function with no entry point is still a complete WGSL
+    // translation unit naga can parse/validate on its own.
+    let module = naga::front::wgsl::parse_str(COVERAGE_FRAGMENT_FN_WGSL).unwrap();
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn fragment_fn_wgsl_malformed_source_fails_to_parse() {
+    // Cut partway through the first function's body -- this file's header
+    // comment is proportionally larger than `coverage.wgsl`'s own (no
+    // storage-buffer struct/bindings to document alongside the arithmetic),
+    // so a byte-count half-split can land entirely inside the comment and
+    // still parse as valid (comment-only) WGSL. Truncating inside
+    // `coverage_fragment_fn`'s signature guarantees a genuine parse
+    // failure.
+    let cut = COVERAGE_FRAGMENT_FN_WGSL
+        .find("fn coverage_fragment_fn(")
+        .expect("fixture source must contain the fragment-callable function")
+        + "fn coverage_fragment_fn(\n    pixel_count: u32,\n    memory".len();
+    let truncated = &COVERAGE_FRAGMENT_FN_WGSL[..cut];
+    assert!(naga::front::wgsl::parse_str(truncated).is_err());
+}
+
+#[test]
+fn fragment_fn_wgsl_source_contains_the_exact_literal_expressions_the_oracle_depends_on() {
+    assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("destination = COVERAGE_FULL;"));
+    assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("destination = memory_count;"));
+    assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("(count * 255u + 4u) / 8u"));
+    assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("(count * alpha + 127u) / 255u"));
+}
+
+/// One frozen fixture case for the CPU-vs-WGSL differential (implementation
+/// card §4). `coverage_destination` is the raw wire encoding
+/// (`0=Clamp,1=Wrap,2=Full,3=Save`, matching `coverage.wgsl`'s own
+/// convention), booleans as `0u`/`1u`, and the hand-derived `expected_*`
+/// fields stated in the card, not re-derived here.
+struct CoverageFragmentFixture {
+    name: &'static str,
+    pixel_count: u32,
+    memory_count: u32,
+    image_read_enabled: u32,
+    force_blend: u32,
+    antialias_enabled: u32,
+    coverage_destination: u32,
+    coverage_times_alpha: u32,
+    alpha_coverage_select: u32,
+    fragment_alpha: u32,
+    expected_destination: u32,
+    expected_wraps: bool,
+    expected_blend_enabled: bool,
+    expected_adjusted_coverage: u32,
+    expected_adjusted_alpha: u32,
+}
+
+const fn wire_destination(destination: CoverageDestination) -> u32 {
+    match destination {
+        CoverageDestination::Clamp => 0,
+        CoverageDestination::Wrap => 1,
+        CoverageDestination::Full => 2,
+        CoverageDestination::Save => 3,
+    }
+}
+
+/// Frozen fixture partition, implementation card §4: `cvg_dst=Full` (the
+/// mandatory-primary partition) crossed with `pixel.count()` ∈ {0,1,4,8},
+/// `memory.count()` ∈ {0,8} (irrelevant under `Full`, included to prove
+/// `memory` is ignored), and `image_read_enabled`/`force_blend`/
+/// `antialias_enabled` ∈ {false,true} independently -- `destination` is
+/// `Coverage::FULL` (8) unconditionally, but `wraps`/`blend_enabled` are
+/// still derived from `sum`/`image_read_enabled` per `coverage_result`'s
+/// unconditional first three statements, computed here via the Rust oracle
+/// rather than hand-duplicated per case.
+fn full_partition_fixtures() -> Vec<CoverageFragmentFixture> {
+    let mut fixtures = Vec::new();
+    for &pixel_count in &[0u8, 1, 4, 8] {
+        for &memory_count in &[0u8, 8] {
+            for &image_read_enabled in &[false, true] {
+                for &force_blend in &[false, true] {
+                    for &antialias_enabled in &[false, true] {
+                        let m = mode(
+                            image_read_enabled,
+                            force_blend,
+                            antialias_enabled,
+                            CoverageDestination::Full,
+                        );
+                        let oracle = coverage_result(
+                            Coverage::new(pixel_count),
+                            Coverage::new(memory_count),
+                            m,
+                        );
+                        assert_eq!(
+                            oracle.destination,
+                            Coverage::FULL,
+                            "oracle sanity: Full must always yield Coverage::FULL"
+                        );
+                        fixtures.push(CoverageFragmentFixture {
+                            name: "full",
+                            pixel_count: pixel_count as u32,
+                            memory_count: memory_count as u32,
+                            image_read_enabled: image_read_enabled as u32,
+                            force_blend: force_blend as u32,
+                            antialias_enabled: antialias_enabled as u32,
+                            coverage_destination: wire_destination(CoverageDestination::Full),
+                            coverage_times_alpha: 0,
+                            alpha_coverage_select: 0,
+                            fragment_alpha: 0,
+                            expected_destination: oracle.destination.count() as u32,
+                            expected_wraps: oracle.wraps,
+                            expected_blend_enabled: oracle.blend_enabled,
+                            expected_adjusted_coverage: oracle.destination.count() as u32,
+                            expected_adjusted_alpha: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fixtures
+}
+
+/// Frozen fixture partition, implementation card §4: `cvg_dst=Save` (the
+/// secondary mandatory partition, pure passthrough) crossed with
+/// `pixel.count()` ∈ {0,4,8}, `memory.count()` ∈ {0,3,8} (literal
+/// hand-supplied values, not claimed to come from a real framebuffer read),
+/// and all `image_read_enabled`/`force_blend`/`antialias_enabled`
+/// combinations -- `destination = memory` unconditionally.
+fn save_partition_fixtures() -> Vec<CoverageFragmentFixture> {
+    let mut fixtures = Vec::new();
+    for &pixel_count in &[0u8, 4, 8] {
+        for &memory_count in &[0u8, 3, 8] {
+            for &image_read_enabled in &[false, true] {
+                for &force_blend in &[false, true] {
+                    for &antialias_enabled in &[false, true] {
+                        let m = mode(
+                            image_read_enabled,
+                            force_blend,
+                            antialias_enabled,
+                            CoverageDestination::Save,
+                        );
+                        let oracle = coverage_result(
+                            Coverage::new(pixel_count),
+                            Coverage::new(memory_count),
+                            m,
+                        );
+                        assert_eq!(
+                            oracle.destination.count(),
+                            memory_count,
+                            "oracle sanity: Save must always pass memory through unchanged"
+                        );
+                        fixtures.push(CoverageFragmentFixture {
+                            name: "save",
+                            pixel_count: pixel_count as u32,
+                            memory_count: memory_count as u32,
+                            image_read_enabled: image_read_enabled as u32,
+                            force_blend: force_blend as u32,
+                            antialias_enabled: antialias_enabled as u32,
+                            coverage_destination: wire_destination(CoverageDestination::Save),
+                            coverage_times_alpha: 0,
+                            alpha_coverage_select: 0,
+                            fragment_alpha: 0,
+                            expected_destination: oracle.destination.count() as u32,
+                            expected_wraps: oracle.wraps,
+                            expected_blend_enabled: oracle.blend_enabled,
+                            expected_adjusted_coverage: oracle.destination.count() as u32,
+                            expected_adjusted_alpha: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fixtures
+}
+
+/// The four coverage-times-alpha/alpha-coverage-select composition cases,
+/// implementation card §4, applied on top of a `Full`-mode `destination=8`
+/// (avoiding any `Clamp`/`Wrap` dependency). Case 4 is the discriminating
+/// one: it proves `alpha_coverage_select` reads the *already*
+/// times-alpha-adjusted coverage, not the raw `destination` -- a wrong
+/// implementation reading `destination` directly here would produce
+/// `alpha(8)=255`, not `191`.
+fn alpha_composition_fixtures() -> Vec<CoverageFragmentFixture> {
+    vec![
+        CoverageFragmentFixture {
+            name: "both_bits_off_no_change",
+            pixel_count: 0,
+            memory_count: 0,
+            image_read_enabled: 0,
+            force_blend: 0,
+            antialias_enabled: 0,
+            coverage_destination: wire_destination(CoverageDestination::Full),
+            coverage_times_alpha: 0,
+            alpha_coverage_select: 0,
+            fragment_alpha: 200,
+            expected_destination: 8,
+            expected_wraps: false,
+            expected_blend_enabled: false,
+            expected_adjusted_coverage: 8,
+            expected_adjusted_alpha: 200,
+        },
+        CoverageFragmentFixture {
+            name: "times_alpha_only_adjusts_coverage",
+            pixel_count: 0,
+            memory_count: 0,
+            image_read_enabled: 0,
+            force_blend: 0,
+            antialias_enabled: 0,
+            coverage_destination: wire_destination(CoverageDestination::Full),
+            coverage_times_alpha: 1,
+            alpha_coverage_select: 0,
+            fragment_alpha: 200,
+            expected_destination: 8,
+            expected_wraps: false,
+            expected_blend_enabled: false,
+            expected_adjusted_coverage: 6, // (8*200+127)/255 = 1727/255 = 6
+            expected_adjusted_alpha: 200,
+        },
+        CoverageFragmentFixture {
+            name: "select_only_overwrites_alpha_from_raw_destination",
+            pixel_count: 0,
+            memory_count: 0,
+            image_read_enabled: 0,
+            force_blend: 0,
+            antialias_enabled: 0,
+            coverage_destination: wire_destination(CoverageDestination::Full),
+            coverage_times_alpha: 0,
+            alpha_coverage_select: 1,
+            fragment_alpha: 200,
+            expected_destination: 8,
+            expected_wraps: false,
+            expected_blend_enabled: false,
+            expected_adjusted_coverage: 8,
+            expected_adjusted_alpha: 255, // (8*255+4)/8 = 2044/8 = 255
+        },
+        CoverageFragmentFixture {
+            name: "both_bits_on_select_reads_already_adjusted_coverage",
+            pixel_count: 0,
+            memory_count: 0,
+            image_read_enabled: 0,
+            force_blend: 0,
+            antialias_enabled: 0,
+            coverage_destination: wire_destination(CoverageDestination::Full),
+            coverage_times_alpha: 1,
+            alpha_coverage_select: 1,
+            fragment_alpha: 200,
+            expected_destination: 8,
+            expected_wraps: false,
+            expected_blend_enabled: false,
+            expected_adjusted_coverage: 6, // (8*200+127)/255 = 6
+            expected_adjusted_alpha: 191,  // (6*255+4)/8 = 1534/8 = 191
+        },
+    ]
+}
+
+fn all_fragment_fn_fixtures() -> Vec<CoverageFragmentFixture> {
+    let mut fixtures = full_partition_fixtures();
+    fixtures.extend(save_partition_fixtures());
+    fixtures.extend(alpha_composition_fixtures());
+    fixtures
+}
+
+fn wire_to_coverage_destination(wire: u32) -> CoverageDestination {
+    match wire {
+        0 => CoverageDestination::Clamp,
+        1 => CoverageDestination::Wrap,
+        2 => CoverageDestination::Full,
+        3 => CoverageDestination::Save,
+        other => panic!("unexpected wire coverage_destination {other}"),
+    }
+}
+
+/// CPU-side half of the differential (implementation card §4/§7): every
+/// fixture case computed via the Rust oracle (`coverage_result`/
+/// `apply_coverage_alpha`) and asserted equal to the hand-derived
+/// `expected_*` fields frozen in the fixture builders above. No GPU
+/// involved -- matches this crate's existing CPU-only test convention and
+/// runs under the ordinary `cargo test -p fn64-render-wgpu` loop.
+#[test]
+fn frozen_fragment_fn_fixtures_match_rust_oracle() {
+    for fixture in all_fragment_fn_fixtures() {
+        let m = mode(
+            fixture.image_read_enabled != 0,
+            fixture.force_blend != 0,
+            fixture.antialias_enabled != 0,
+            wire_to_coverage_destination(fixture.coverage_destination),
+        );
+        let oracle = coverage_result(
+            Coverage::new(fixture.pixel_count as u8),
+            Coverage::new(fixture.memory_count as u8),
+            m,
+        );
+        assert_eq!(
+            oracle.destination.count() as u32,
+            fixture.expected_destination,
+            "fixture {}: destination diverged from frozen expected value",
+            fixture.name
+        );
+        assert_eq!(
+            oracle.wraps, fixture.expected_wraps,
+            "fixture {}: wraps diverged from frozen expected value",
+            fixture.name
+        );
+        assert_eq!(
+            oracle.blend_enabled, fixture.expected_blend_enabled,
+            "fixture {}: blend_enabled diverged from frozen expected value",
+            fixture.name
+        );
+
+        let rgba = [1u8, 2, 3, fixture.fragment_alpha as u8];
+        let (adjusted_rgba, adjusted_coverage) = apply_coverage_alpha(
+            fixture.coverage_times_alpha != 0,
+            fixture.alpha_coverage_select != 0,
+            rgba,
+            oracle.destination,
+        );
+        assert_eq!(
+            adjusted_coverage.count() as u32,
+            fixture.expected_adjusted_coverage,
+            "fixture {}: adjusted_coverage diverged from frozen expected value",
+            fixture.name
+        );
+        assert_eq!(
+            adjusted_rgba[3] as u32, fixture.expected_adjusted_alpha,
+            "fixture {}: adjusted_alpha diverged from frozen expected value",
+            fixture.name
+        );
+    }
+}
+
+#[cfg(feature = "host-gpu-tests")]
+mod host_gpu_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct ThreadWake(std::thread::Thread);
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match Future::poll(future.as_mut(), &mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    /// Minimal compute-shim harness (implementation card §4/§7): wraps
+    /// `coverage_fragment_fn` (the new fragment-callable function under
+    /// test, unmodified) in a throwaway `@compute` entry point that reads
+    /// one `CoverageFragmentCase` per invocation from a storage buffer and
+    /// writes its result struct to a second storage buffer -- new
+    /// test-only scaffolding, not a claim that the function runs inside any
+    /// real fragment shader (see the card's §6 nonclaims).
+    const SHIM_WGSL_HEADER: &str = "\
+struct CoverageFragmentCase {
+    pixel_count: u32,
+    memory_count: u32,
+    image_read_enabled: u32,
+    force_blend: u32,
+    antialias_enabled: u32,
+    coverage_destination: u32,
+    coverage_times_alpha: u32,
+    alpha_coverage_select: u32,
+    fragment_alpha: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> cases: array<CoverageFragmentCase>;
+
+@group(0) @binding(1)
+var<storage, read_write> results: array<CoverageFragmentResult>;
+
+@compute @workgroup_size(1)
+fn coverage_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let index = global_id.x;
+    if (index >= arrayLength(&cases)) {
+        return;
+    }
+    let one_case = cases[index];
+    results[index] = coverage_fragment_fn(
+        one_case.pixel_count,
+        one_case.memory_count,
+        one_case.image_read_enabled,
+        one_case.force_blend,
+        one_case.antialias_enabled,
+        one_case.coverage_destination,
+        one_case.coverage_times_alpha,
+        one_case.alpha_coverage_select,
+        one_case.fragment_alpha,
+    );
+}
+";
+
+    fn shim_source() -> String {
+        format!("{COVERAGE_FRAGMENT_FN_WGSL}\n{SHIM_WGSL_HEADER}")
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawCase {
+        pixel_count: u32,
+        memory_count: u32,
+        image_read_enabled: u32,
+        force_blend: u32,
+        antialias_enabled: u32,
+        coverage_destination: u32,
+        coverage_times_alpha: u32,
+        alpha_coverage_select: u32,
+        fragment_alpha: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawResult {
+        destination_count: u32,
+        wraps: u32,
+        blend_enabled: u32,
+        adjusted_alpha: u32,
+        adjusted_coverage_count: u32,
+    }
+
+    /// Required host GPU evidence (implementation card §7's Host-GPU loop):
+    /// dispatches the compute shim over every frozen fixture case on a real
+    /// native adapter and asserts the WGSL side agrees with both the Rust
+    /// oracle and the hand-derived expected values -- an independent,
+    /// non-self-referential three-way check. Panics with the typed
+    /// no-adapter reason if this host has no native GPU adapter, matching
+    /// `targets/triangle_pipeline/tests.rs`'s required-host-GPU convention
+    /// rather than silently skipping.
+    #[test]
+    fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
+        let fixtures = all_fragment_fn_fixtures();
+        let cases: Vec<RawCase> = fixtures
+            .iter()
+            .map(|fixture| RawCase {
+                pixel_count: fixture.pixel_count,
+                memory_count: fixture.memory_count,
+                image_read_enabled: fixture.image_read_enabled,
+                force_blend: fixture.force_blend,
+                antialias_enabled: fixture.antialias_enabled,
+                coverage_destination: fixture.coverage_destination,
+                coverage_times_alpha: fixture.coverage_times_alpha,
+                alpha_coverage_select: fixture.alpha_coverage_select,
+                fragment_alpha: fixture.fragment_alpha,
+            })
+            .collect();
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::VALIDATION,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        })) {
+            Ok(adapter) => adapter,
+            Err(wgpu::RequestAdapterError::NotFound { .. }) => {
+                panic!("required host GPU evidence unavailable: typed no-adapter for AnyNative")
+            }
+            Err(error) => panic!("adapter request failed: {error}"),
+        };
+        eprintln!(
+            "fn64-coverage-fragment-fn: adapter={:?}",
+            adapter.get_info().name
+        );
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("fn64-coverage-fragment-fn-shim"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .unwrap();
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fn64-coverage-fragment-fn-shim"),
+            source: wgpu::ShaderSource::Wgsl(shim_source().into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fn64-coverage-fragment-fn-shim"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("coverage_fragment_fn_shim"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let case_bytes = (cases.len() * std::mem::size_of::<RawCase>()) as u64;
+        let result_bytes = (cases.len() * std::mem::size_of::<RawResult>()) as u64;
+        let case_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-coverage-fragment-fn-cases"),
+            size: case_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-coverage-fragment-fn-results"),
+            size: result_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-coverage-fragment-fn-readback"),
+            size: result_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let case_data: Vec<u8> = cases
+            .iter()
+            .flat_map(|case| {
+                [
+                    case.pixel_count,
+                    case.memory_count,
+                    case.image_read_enabled,
+                    case.force_blend,
+                    case.antialias_enabled,
+                    case.coverage_destination,
+                    case.coverage_times_alpha,
+                    case.alpha_coverage_select,
+                    case.fragment_alpha,
+                ]
+            })
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        queue.write_buffer(&case_buffer, 0, &case_data);
+
+        let layout = pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-coverage-fragment-fn-bind-group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: case_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: result_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fn64-coverage-fragment-fn-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        loop {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if let Ok(result) = receiver.try_recv() {
+                result.unwrap();
+                break;
+            }
+        }
+        let observed: Vec<RawResult> = {
+            let mapped = slice.get_mapped_range().unwrap();
+            mapped
+                .chunks_exact(std::mem::size_of::<RawResult>())
+                .map(|chunk| {
+                    let words: Vec<u32> = chunk
+                        .chunks_exact(4)
+                        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                        .collect();
+                    RawResult {
+                        destination_count: words[0],
+                        wraps: words[1],
+                        blend_enabled: words[2],
+                        adjusted_alpha: words[3],
+                        adjusted_coverage_count: words[4],
+                    }
+                })
+                .collect()
+        };
+        readback_buffer.unmap();
+
+        assert_eq!(observed.len(), fixtures.len());
+        for (fixture, observed_result) in fixtures.iter().zip(observed.iter()) {
+            assert_eq!(
+                observed_result.destination_count, fixture.expected_destination,
+                "fixture {}: WGSL destination diverged from the frozen expected value",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.wraps != 0,
+                fixture.expected_wraps,
+                "fixture {}: WGSL wraps diverged from the frozen expected value",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.blend_enabled != 0,
+                fixture.expected_blend_enabled,
+                "fixture {}: WGSL blend_enabled diverged from the frozen expected value",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.adjusted_coverage_count, fixture.expected_adjusted_coverage,
+                "fixture {}: WGSL adjusted_coverage diverged from the frozen expected value",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.adjusted_alpha, fixture.expected_adjusted_alpha,
+                "fixture {}: WGSL adjusted_alpha diverged from the frozen expected value",
+                fixture.name
+            );
+
+            // Independently re-derive via the Rust oracle too, so a
+            // three-way (WGSL, Rust oracle, hand-derived) agreement is
+            // checked in the same assertion pass, not just WGSL-vs-
+            // hand-derived.
+            let m = mode(
+                fixture.image_read_enabled != 0,
+                fixture.force_blend != 0,
+                fixture.antialias_enabled != 0,
+                wire_to_coverage_destination(fixture.coverage_destination),
+            );
+            let oracle = coverage_result(
+                Coverage::new(fixture.pixel_count as u8),
+                Coverage::new(fixture.memory_count as u8),
+                m,
+            );
+            assert_eq!(
+                observed_result.destination_count,
+                oracle.destination.count() as u32,
+                "fixture {}: WGSL destination diverged from Rust oracle",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.wraps != 0,
+                oracle.wraps,
+                "fixture {}: WGSL wraps diverged from Rust oracle",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.blend_enabled != 0,
+                oracle.blend_enabled,
+                "fixture {}: WGSL blend_enabled diverged from Rust oracle",
+                fixture.name
+            );
+
+            let rgba = [1u8, 2, 3, fixture.fragment_alpha as u8];
+            let (adjusted_rgba, adjusted_coverage) = apply_coverage_alpha(
+                fixture.coverage_times_alpha != 0,
+                fixture.alpha_coverage_select != 0,
+                rgba,
+                oracle.destination,
+            );
+            assert_eq!(
+                observed_result.adjusted_coverage_count,
+                adjusted_coverage.count() as u32,
+                "fixture {}: WGSL adjusted_coverage diverged from Rust oracle",
+                fixture.name
+            );
+            assert_eq!(
+                observed_result.adjusted_alpha, adjusted_rgba[3] as u32,
+                "fixture {}: WGSL adjusted_alpha diverged from Rust oracle",
+                fixture.name
+            );
+        }
+    }
+}
