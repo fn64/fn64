@@ -118,9 +118,10 @@
 //! [`sample_texture_level_blend`] supply the four already-fetched texel
 //! samples (`samples[0..3]`, this port's `TexelSamples`) as plain `[f32; 4]`
 //! RGBA values. `sampleTexture`'s mip-level orchestration (`:217-359`,
-//! `computeLOD`/RDP mip-level selection, `flagHasMipmaps`, the final
-//! `alphaIsCvg` coverage-modulo correction) is out of scope for this ticket
-//! and is not ported by this module.
+//! [`computeLOD`](crate::texture_lod::compute_lod)/RDP mip-level selection,
+//! `flagHasMipmaps`, the final `alphaIsCvg` coverage-modulo correction) is
+//! out of scope for this ticket and is not ported *by this module*; it is
+//! ported separately, in `texture_lod.rs` (see "Nonclaims" below).
 //!
 //! ## Admitted domain
 //!
@@ -332,7 +333,8 @@
 //! other characterization-first `fn64-render-wgpu` port module's precedent.
 //! No RT64 visual/pixel/silicon parity or performance claim.
 //!
-//! This module does **not** port `computeLOD` (already landed in
+//! This module does **not** port
+//! [`computeLOD`](crate::texture_lod::compute_lod) *here* (already landed in
 //! `texture_lod.rs:27-72`, 46 of this file's 358 lines -- see that module's
 //! own doc header, reused here only by citation, not by re-porting), the
 //! resource-binding texel *fetch* (`sampleTMEM`, `gTextures[...].Load`,

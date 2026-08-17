@@ -285,16 +285,15 @@
 //! with RT64; no claim about which real N64 titles exercise which branch.
 //! Partial coverage of the header: this module ports only the
 //! shader-*selection* analysis cluster (lines 45-175) the ticket names. It
-//! does **not** port `EmulationRequirements`/`checkEmulationRequirements`
+//! does **not** port
+//! [`EmulationRequirements`](crate::rt64_blender_emulation::EmulationRequirements)/
+//! [`checkEmulationRequirements`](crate::rt64_blender_emulation::check_emulation_requirements)
 //! here (lines 178-271, a separate CPU analysis for blend *emulation
 //! strategy*, not pipeline *selection* -- out of scope per this module's
 //! ticket's named symbol list). Read that as a refusal by *this* module,
 //! not as a claim the crate lacks the symbol: `rt64_blender_emulation.rs`
-//! (ticket M4.5) ports both, as
-//! [`EmulationRequirements`](crate::rt64_blender_emulation::EmulationRequirements)
-//! and
-//! [`check_emulation_requirements`](crate::rt64_blender_emulation::check_emulation_requirements),
-//! which is that module's own declared scope. This module also does not
+//! (ticket M4.5) ports both, which is that module's own declared scope.
+//! This module also does not
 //! port `inputToString` (lines 273-316,
 //! debug-only string formatting, not analysis), or
 //! `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run` (lines
