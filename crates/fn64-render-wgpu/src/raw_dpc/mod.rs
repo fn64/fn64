@@ -906,12 +906,6 @@ fn decode_stream(
             0x00..=0x07 => RawDpcCommandKind::NoOp { variant: opcode },
             SET_OTHER_MODE => {
                 let value = OtherMode::from_wire(w0 & 0x00ff_ffff, w1);
-                if value.cycle_type() != CycleType::Fill {
-                    return Err(RawDpcDecodeError::InvalidCommand {
-                        location,
-                        reason: "SetOtherMode does not select fill cycle",
-                    });
-                }
                 delta.set_other_mode(value);
                 state.apply(delta);
                 RawDpcCommandKind::SetOtherMode(value)
@@ -2045,7 +2039,6 @@ mod tests {
     #[test]
     fn hostile_state_mutation_table_is_loud_and_located() {
         let mut cases = vec![
-            ("non-fill cycle", vec![word(0, SET_OTHER_MODE, 2 << 20), 0]),
             (
                 "reserved image format",
                 vec![word(0, SET_COLOR_IMAGE, 7 << 21 | 3 << 19 | 1), 0],
@@ -2095,6 +2088,63 @@ mod tests {
             );
             assert!(rendered.contains("wire opcode"), "{name}: {rendered}");
         }
+    }
+
+    /// This card removes `SET_OTHER_MODE`'s decode-time cycle-type gate
+    /// (`raw_dpc::mod.rs`'s old `if value.cycle_type() != CycleType::Fill`
+    /// check): every cycle type RT64's own `RDP::setOtherMode` accepts
+    /// (`OneCycle`/`TwoCycle`/`Copy`/`Fill` -- RT64 never gates this setter
+    /// on cycle type) must now decode successfully here too, not just
+    /// `Fill`.
+    #[test]
+    fn set_other_mode_decodes_successfully_for_every_cycle_type() {
+        for (name, cycle_bits) in [
+            ("OneCycle", 0u32),
+            ("TwoCycle", 1u32),
+            ("Copy", 2u32),
+            ("Fill", 3u32),
+        ] {
+            let words = vec![word(0, SET_OTHER_MODE, cycle_bits << 20), 0];
+            let decoded = decode(words).unwrap_or_else(|error| {
+                panic!("{name}: SetOtherMode must decode for every cycle type, got {error:?}")
+            });
+            assert!(
+                matches!(
+                    decoded.commands()[0].kind(),
+                    RawDpcCommandKind::SetOtherMode(_)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// The decode-time gate this card removes was strictly redundant with
+    /// `plan_fill`'s own independent fill-cycle check (card Section 1/5):
+    /// a `FillRectangle` preceded by a non-`Fill` `SetOtherMode` must still
+    /// be rejected -- just later, at `plan_fill`, with its existing
+    /// `"FillRectangle requires staged fill-cycle OtherMode"` reason, not at
+    /// decode.
+    #[test]
+    fn non_fill_cycle_other_mode_is_rejected_at_plan_fill_not_at_decode() {
+        let words = vec![
+            word(0, SET_OTHER_MODE, 2 << 20), // TwoCycle, not Fill
+            0,
+            word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
+            0,
+            word(0, SET_FILL_COLOR, 0),
+            0x213c_4d59,
+            word(0, FILL_RECTANGLE, 4 << 12 | 4),
+            0,
+        ];
+        let error = decode(words).unwrap_err();
+        let RawDpcDecodeError::InvalidCommand { location, reason } = error else {
+            panic!("expected FillRectangle to be rejected by plan_fill's own check");
+        };
+        assert_eq!(
+            reason, "FillRectangle requires staged fill-cycle OtherMode",
+            "rejection must carry plan_fill's own reason, not a decode-time gate's"
+        );
+        assert_eq!(location.wire_opcode() & 0x3f, FILL_RECTANGLE);
     }
 
     #[test]
