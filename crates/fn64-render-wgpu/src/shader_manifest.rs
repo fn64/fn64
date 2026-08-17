@@ -123,11 +123,15 @@ pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
 pub enum RuntimeShaderComponentId {
     DirectTexelDecodeV1,
     ThreeNearestFilterV1,
+    TrianglePipelineFragmentV1,
+    TrianglePipelineVertexV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeShaderStage {
     Compute,
+    Vertex,
+    Fragment,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +269,173 @@ pub const THREE_NEAREST_FILTER_MANIFEST: RuntimeShaderComponentManifest =
         dependency_sources: &THREE_NEAREST_FILTER_DEPENDENCY_SOURCES,
         candidate_consumers: &THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS,
     };
+
+// Triangle-pipeline fragment shader (port card §2d/§3 step 3): a real
+// @fragment entry point wrapping crate::combiner's existing WGSL
+// transcription (`shaders/color_combiner.wgsl`'s `run_one_cycle`), admitted
+// per this file's established shape -- same full field set as
+// `DIRECT_TEXEL_DECODE_MANIFEST`/`THREE_NEAREST_FILTER_MANIFEST`, including
+// the SHA-256 fixture-identity fields. Unlike those two compute kernels this
+// component has no *bulk* input/output buffer (it is a per-fragment render-
+// pipeline shader, exercised via `targets/triangle_pipeline.rs`'s vertex/
+// pixel fixtures and differential spot-checks per port card §6, not a
+// dispatched compute kernel over thousands of cases) -- so its "fixture" is
+// the combined WGSL source text itself (`TRIANGLE_PIPELINE_FRAGMENT_CASES`
+// = 1, `*_INPUT_BYTES`/`*_OUTPUT_BYTES` = the combined source's own byte
+// length), following `THREE_NEAREST_FILTER_MANIFEST`'s own precedent of a
+// non-RT64-CPU-source, non-uniform-fixture-shape component still carrying
+// every manifest field with a real, hash-checked value rather than an
+// explanatory omission.
+pub const TRIANGLE_PIPELINE_VERTEX_WGSL: &str =
+    include_str!("shaders/triangle_pipeline_vertex.wgsl");
+pub const TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT: &str = "vs_main";
+pub const TRIANGLE_PIPELINE_VERTEX_FIXTURE_SCHEMA: &str =
+    "fn64.render-wgpu.triangle-pipeline-vertex-fixture.v1";
+pub const TRIANGLE_PIPELINE_VERTEX_CASES: u32 = 1;
+pub const TRIANGLE_PIPELINE_VERTEX_RT64_SOURCE_COMMIT: &str =
+    "5473732a822a4423b5696e7cb18fecc425a59875";
+pub const TRIANGLE_PIPELINE_VERTEX_DEPENDENCY_SOURCES: [&str; 1] = ["src/shaders/RasterVS.hlsl"];
+pub const TRIANGLE_PIPELINE_VERTEX_CANDIDATE_CONSUMERS: [&str; 1] = ["src-shaders-rastervs"];
+
+// Filled only after the final owned source's deterministic digest is
+// generated (this file's established freeze convention, matching
+// `DIRECT_TEXEL_DECODE_SOURCE_SHA256`/`THREE_NEAREST_FILTER_SOURCE_SHA256`):
+// unlike the fragment shader's concatenated source (which still freezes to
+// a real literal, see `TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`, but needs
+// `recompute_triangle_pipeline_fragment_digests()` to verify it since the
+// combined text isn't a single `include_str!`), this file is a single
+// `include_str!` literal, so its digest is `const`-frozen directly, the
+// simpler of the two shapes. Tests independently recompute it.
+pub const TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256: [u8; 32] = [
+    0x66, 0x7d, 0x6f, 0xa1, 0x50, 0x99, 0x39, 0xf8, 0xc7, 0x35, 0xc1, 0xe7, 0xac, 0xd1, 0x98, 0x39,
+    0x22, 0x1c, 0xcd, 0xb5, 0xa9, 0x6b, 0x6b, 0x88, 0xeb, 0x05, 0x8b, 0xaf, 0x97, 0xcc, 0x85, 0xd1,
+];
+pub const TRIANGLE_PIPELINE_VERTEX_FIXTURE_SHA256: [u8; 32] = [
+    0x38, 0x0f, 0x86, 0xb7, 0x46, 0xaa, 0x05, 0x8f, 0xab, 0x7c, 0xc3, 0xd6, 0xcf, 0xa6, 0x63, 0xad,
+    0x55, 0x43, 0xf2, 0x59, 0xbd, 0xd6, 0xaa, 0xc8, 0x16, 0x1d, 0xc7, 0x49, 0x71, 0xf4, 0xe3, 0xe0,
+];
+
+pub const TRIANGLE_PIPELINE_VERTEX_MANIFEST: RuntimeShaderComponentManifest =
+    RuntimeShaderComponentManifest {
+        component: RuntimeShaderComponentId::TrianglePipelineVertexV1,
+        stage: RuntimeShaderStage::Vertex,
+        entry_point: TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT,
+        source_bytes: TRIANGLE_PIPELINE_VERTEX_WGSL.len() as u32,
+        source_sha256: TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256,
+        fixture_schema: TRIANGLE_PIPELINE_VERTEX_FIXTURE_SCHEMA,
+        fixture_sha256: TRIANGLE_PIPELINE_VERTEX_FIXTURE_SHA256,
+        promotion: RuntimeShaderPromotion::NotQualified,
+        native_state: RuntimeShaderNativeState::NativeUnverified,
+        rt64_source_commit: TRIANGLE_PIPELINE_VERTEX_RT64_SOURCE_COMMIT,
+        formats_sha256: "",
+        texture_decoder_sha256: "",
+        denominator_path: "",
+        denominator_sha256: "",
+        dependency_sources: &TRIANGLE_PIPELINE_VERTEX_DEPENDENCY_SOURCES,
+        candidate_consumers: &TRIANGLE_PIPELINE_VERTEX_CANDIDATE_CONSUMERS,
+    };
+
+pub const TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL: &str =
+    include_str!("shaders/triangle_pipeline_fragment.wgsl");
+pub const TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT: &str = "fs_main";
+pub const TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SCHEMA: &str =
+    "fn64.render-wgpu.triangle-pipeline-fragment-fixture.v1";
+pub const TRIANGLE_PIPELINE_FRAGMENT_CASES: u32 = 1;
+pub const TRIANGLE_PIPELINE_FRAGMENT_RT64_SOURCE_COMMIT: &str =
+    "5473732a822a4423b5696e7cb18fecc425a59875";
+pub const TRIANGLE_PIPELINE_FRAGMENT_DEPENDENCY_SOURCES: [&str; 2] =
+    ["src/shaders/RasterVS.hlsl", "src/shaders/RasterPS.hlsl"];
+// This slice's own restricted, textureless/opaque/no-blend RasterPS variant
+// (port card §3 restriction set) most closely corresponds to the base
+// non-MSAA dynamic-render-params RasterPS variant already named as a
+// candidate consumer of direct-texel-decode (§2d).
+pub const TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS: [&str; 1] =
+    ["src-shaders-rasterpsdynamic"];
+
+/// The fragment shader module actually submitted to `wgpu`: `color_combiner.wgsl`'s
+/// existing library functions (reused byte-for-byte, unmodified) concatenated
+/// with this component's thin `@fragment` wrapper. WGSL has no cross-module
+/// include mechanism reachable from two separate `wgpu::ShaderSource::Wgsl`
+/// strings in this wgpu version, so the two source files are combined into
+/// one module at this seam, not at shader-module-creation time in
+/// `targets/triangle_pipeline.rs` -- keeping that file free of string
+/// concatenation logic and this manifest the single place the combined
+/// source text is assembled.
+pub fn triangle_pipeline_fragment_wgsl() -> String {
+    format!(
+        "{}\n{}",
+        crate::combiner::COLOR_COMBINER_WGSL,
+        TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL
+    )
+}
+
+pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST_ENTRY_POINT: &str =
+    TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT;
+
+// Filled only after the final combined source's deterministic digest is
+// generated (this file's established freeze convention). The combined
+// source is the concatenation of two separately-owned `include_str!`
+// constants (`COLOR_COMBINER_WGSL` and `TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL`)
+// via `format!`, not a single literal -- `String` hashing is not
+// `const`-evaluable in this crate's Rust edition, so unlike
+// `TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256` these bytes were frozen by
+// running `triangle_pipeline_fragment_wgsl()` once (the ignored freeze test
+// below) and pasting its printed digest here, exactly like every other
+// frozen SHA-256 constant in this file. Tests independently recompute both
+// and assert they still match this frozen literal -- the public manifest
+// constant itself carries the real value, not a placeholder.
+pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256: [u8; 32] = [
+    0x4e, 0xe1, 0x19, 0xe4, 0x64, 0xe5, 0xde, 0x8d, 0x96, 0x34, 0x5e, 0x69, 0x4a, 0x5a, 0x74, 0x2a,
+    0xd4, 0x0f, 0x85, 0x3e, 0xcd, 0x6a, 0xcd, 0x84, 0x6c, 0xdb, 0x39, 0x99, 0xc2, 0xdf, 0x3a, 0xb5,
+];
+pub const TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256: [u8; 32] = [
+    0x24, 0x89, 0x26, 0x30, 0xb1, 0xf5, 0xb1, 0xfa, 0xeb, 0xc2, 0x48, 0x86, 0x67, 0xda, 0xd1, 0x88,
+    0x64, 0xfb, 0x51, 0xa9, 0x98, 0x0a, 0x9c, 0x2a, 0x5e, 0x88, 0x47, 0x02, 0x45, 0xec, 0x40, 0xb3,
+];
+pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 26_425;
+
+pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST: RuntimeShaderComponentManifest =
+    RuntimeShaderComponentManifest {
+        component: RuntimeShaderComponentId::TrianglePipelineFragmentV1,
+        stage: RuntimeShaderStage::Fragment,
+        entry_point: TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
+        source_bytes: TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES,
+        source_sha256: TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256,
+        fixture_schema: TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SCHEMA,
+        fixture_sha256: TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256,
+        promotion: RuntimeShaderPromotion::NotQualified,
+        native_state: RuntimeShaderNativeState::NativeUnverified,
+        rt64_source_commit: TRIANGLE_PIPELINE_FRAGMENT_RT64_SOURCE_COMMIT,
+        formats_sha256: "",
+        texture_decoder_sha256: "",
+        denominator_path: "",
+        denominator_sha256: "",
+        dependency_sources: &TRIANGLE_PIPELINE_FRAGMENT_DEPENDENCY_SOURCES,
+        candidate_consumers: &TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS,
+    };
+
+/// Recomputes [`TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`]/
+/// [`TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256`] from the live combined
+/// source text, for this module's own tests to assert against the frozen
+/// literals (proving the freeze is correct, not substituting for it --
+/// the public [`TRIANGLE_PIPELINE_FRAGMENT_MANIFEST`] carries the frozen
+/// values directly, this function is not consulted by any non-test code
+/// path). `sha2` is this crate's existing dev-only dependency, so this
+/// helper stays `#[cfg(test)]` rather than promoting it to a real
+/// dependency for a manifest-identity convenience.
+#[cfg(test)]
+pub fn recompute_triangle_pipeline_fragment_digests() -> (u32, [u8; 32], [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    let source = triangle_pipeline_fragment_wgsl();
+    let source_sha256: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+    let mut fixture_hasher = Sha256::new();
+    fixture_hasher.update(TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SCHEMA.as_bytes());
+    fixture_hasher.update([0]);
+    fixture_hasher.update((source.len() as u64).to_be_bytes());
+    fixture_hasher.update(source.as_bytes());
+    let fixture_sha256: [u8; 32] = fixture_hasher.finalize().into();
+    (source.len() as u32, source_sha256, fixture_sha256)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectTexelDecodeDeviceProfile;
@@ -849,6 +1020,169 @@ mod tests {
         );
         assert_eq!(DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS.len(), 21);
         assert_eq!(DIRECT_TEXEL_DECODE_WORKGROUPS, 2_058);
+    }
+
+    #[test]
+    fn triangle_pipeline_fragment_manifest_retains_zero_row_promotion_and_matches_its_own_source() {
+        let manifest = TRIANGLE_PIPELINE_FRAGMENT_MANIFEST;
+        assert_eq!(
+            manifest.component(),
+            RuntimeShaderComponentId::TrianglePipelineFragmentV1
+        );
+        assert_eq!(manifest.stage(), RuntimeShaderStage::Fragment);
+        assert_eq!(
+            manifest.entry_point(),
+            TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT
+        );
+        assert_eq!(manifest.promotion(), RuntimeShaderPromotion::NotQualified);
+        assert_eq!(
+            manifest.native_state(),
+            RuntimeShaderNativeState::NativeUnverified
+        );
+        assert_eq!(
+            manifest.rt64_source_commit(),
+            TRIANGLE_PIPELINE_FRAGMENT_RT64_SOURCE_COMMIT
+        );
+        assert_eq!(
+            manifest.dependency_sources(),
+            &TRIANGLE_PIPELINE_FRAGMENT_DEPENDENCY_SOURCES
+        );
+        assert_eq!(
+            manifest.candidate_consumers(),
+            &TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS
+        );
+        assert_eq!(TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS.len(), 1);
+        assert_eq!(TRIANGLE_PIPELINE_FRAGMENT_CASES, 1);
+
+        // The frozen public constant must match the live combined source,
+        // not a placeholder -- this is the check that would have caught the
+        // zero-value regression.
+        let (source_bytes, source_sha256, fixture_sha256) =
+            recompute_triangle_pipeline_fragment_digests();
+        assert_eq!(manifest.source_bytes(), source_bytes);
+        assert_eq!(manifest.source_sha256(), source_sha256);
+        assert_eq!(manifest.fixture_sha256(), fixture_sha256);
+        assert_ne!(manifest.source_sha256(), [0u8; 32]);
+        assert_ne!(manifest.fixture_sha256(), [0u8; 32]);
+    }
+
+    #[test]
+    fn triangle_pipeline_fragment_manifest_fixture_hash_is_hostile_to_a_source_mutation() {
+        let mutated_source = format!("{}\n// mutated", triangle_pipeline_fragment_wgsl());
+        let mutated_hash: [u8; 32] = {
+            use sha2::{Digest as _, Sha256};
+            Sha256::digest(mutated_source.as_bytes()).into()
+        };
+        assert_ne!(
+            TRIANGLE_PIPELINE_FRAGMENT_MANIFEST.source_sha256(),
+            mutated_hash
+        );
+    }
+
+    // #[ignore]: prints the exact digests to paste into the
+    // TRIANGLE_PIPELINE_FRAGMENT_*_SHA256/_SOURCE_BYTES constants above. Not
+    // part of the default 10x loop -- one-time freeze step, matching this
+    // file's other freeze-print precedents.
+    #[test]
+    #[ignore]
+    fn triangle_pipeline_fragment_fixture_freeze_prints_digests() {
+        let (source_bytes, source_sha256, fixture_sha256) =
+            recompute_triangle_pipeline_fragment_digests();
+        println!("source_bytes: {source_bytes}");
+        println!("source: {source_sha256:02x?}");
+        println!("fixture: {fixture_sha256:02x?}");
+    }
+
+    fn triangle_pipeline_vertex_fixture_identity() -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(TRIANGLE_PIPELINE_VERTEX_FIXTURE_SCHEMA.as_bytes());
+        hasher.update([0]);
+        hasher.update((TRIANGLE_PIPELINE_VERTEX_WGSL.len() as u64).to_be_bytes());
+        hasher.update(TRIANGLE_PIPELINE_VERTEX_WGSL.as_bytes());
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn triangle_pipeline_vertex_manifest_retains_zero_row_promotion_and_matches_its_own_source() {
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.component(),
+            RuntimeShaderComponentId::TrianglePipelineVertexV1
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.stage(),
+            RuntimeShaderStage::Vertex
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.entry_point(),
+            TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.promotion(),
+            RuntimeShaderPromotion::NotQualified
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.native_state(),
+            RuntimeShaderNativeState::NativeUnverified
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.rt64_source_commit(),
+            TRIANGLE_PIPELINE_VERTEX_RT64_SOURCE_COMMIT
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.dependency_sources(),
+            &TRIANGLE_PIPELINE_VERTEX_DEPENDENCY_SOURCES
+        );
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.candidate_consumers(),
+            &TRIANGLE_PIPELINE_VERTEX_CANDIDATE_CONSUMERS
+        );
+        assert_eq!(TRIANGLE_PIPELINE_VERTEX_CANDIDATE_CONSUMERS.len(), 1);
+        assert_eq!(TRIANGLE_PIPELINE_VERTEX_CASES, 1);
+        assert_eq!(
+            TRIANGLE_PIPELINE_VERTEX_MANIFEST.source_bytes() as usize,
+            TRIANGLE_PIPELINE_VERTEX_WGSL.len()
+        );
+        assert_eq!(
+            digest(TRIANGLE_PIPELINE_VERTEX_WGSL.as_bytes()),
+            TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256
+        );
+        assert_eq!(
+            triangle_pipeline_vertex_fixture_identity(),
+            TRIANGLE_PIPELINE_VERTEX_FIXTURE_SHA256
+        );
+    }
+
+    #[test]
+    fn triangle_pipeline_vertex_manifest_fixture_hash_is_hostile_to_a_source_mutation() {
+        let mutated = format!("{TRIANGLE_PIPELINE_VERTEX_WGSL}\n// mutated");
+        let mut hasher = Sha256::new();
+        hasher.update(TRIANGLE_PIPELINE_VERTEX_FIXTURE_SCHEMA.as_bytes());
+        hasher.update([0]);
+        hasher.update((mutated.len() as u64).to_be_bytes());
+        hasher.update(mutated.as_bytes());
+        let mutated_hash: [u8; 32] = hasher.finalize().into();
+        assert_ne!(TRIANGLE_PIPELINE_VERTEX_FIXTURE_SHA256, mutated_hash);
+        assert_ne!(
+            digest(mutated.as_bytes()),
+            TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256
+        );
+    }
+
+    // #[ignore]: prints the exact digests to paste into the
+    // TRIANGLE_PIPELINE_VERTEX_*_SHA256 constants above. Not part of the
+    // default 10x loop -- one-time freeze step, matching
+    // `three_nearest_filter_fixture_freeze_prints_digests`'s precedent.
+    #[test]
+    #[ignore]
+    fn triangle_pipeline_vertex_fixture_freeze_prints_digests() {
+        println!(
+            "source: {:02x?}",
+            digest(TRIANGLE_PIPELINE_VERTEX_WGSL.as_bytes())
+        );
+        println!(
+            "fixture: {:02x?}",
+            triangle_pipeline_vertex_fixture_identity()
+        );
     }
 
     #[test]

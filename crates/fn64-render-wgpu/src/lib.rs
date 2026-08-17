@@ -375,8 +375,8 @@ pub use endian_swap::{
     ENDIAN_SWAP_WGSL,
 };
 pub use formats_dither::{
-    alpha_dither_value, float4_to_rgba32, float_to_uint8, Rgba32Packed,
-    FORMATS_DITHER_ENTRY_POINT, FORMATS_DITHER_WGSL,
+    alpha_dither_value, float4_to_rgba32, float_to_uint8, Rgba32Packed, FORMATS_DITHER_ENTRY_POINT,
+    FORMATS_DITHER_WGSL,
 };
 pub use lifecycle::{
     NativeCompletionIdentity, StagedWgpuEffect, WgpuBackendCompletion, WgpuRenderError,
@@ -416,6 +416,7 @@ pub use rgb_dither::{
     CoverageModulo8, CoverageModulo8Error, DitherNoiseByte, DitherThreshold, DitherThresholdError,
     Rgba16Packed, Rgba16QuantizeInput, RGB_DITHER_ENTRY_POINT, RGB_DITHER_WGSL,
 };
+pub use shader_manifest::triangle_pipeline_fragment_wgsl;
 pub use shader_manifest::{
     DirectTexelDecodeDeviceProfile, DirectTexelDecodeNativeError, DirectTexelDecodeNativeReceipt,
     DirectTexelDecodeProfileError, DirectTexelShaderInput, DirectTexelShaderStatus,
@@ -440,6 +441,16 @@ pub use shader_manifest::{
     THREE_NEAREST_FILTER_OUTPUT_BYTES, THREE_NEAREST_FILTER_RT64_SOURCE_COMMIT,
     THREE_NEAREST_FILTER_SOURCE_SHA256, THREE_NEAREST_FILTER_TEXTURE_DECODER_SHA256,
     THREE_NEAREST_FILTER_WGSL, THREE_NEAREST_FILTER_WORKGROUPS,
+    TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS, TRIANGLE_PIPELINE_FRAGMENT_CASES,
+    TRIANGLE_PIPELINE_FRAGMENT_DEPENDENCY_SOURCES, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
+    TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SCHEMA, TRIANGLE_PIPELINE_FRAGMENT_MANIFEST,
+    TRIANGLE_PIPELINE_FRAGMENT_MANIFEST_ENTRY_POINT, TRIANGLE_PIPELINE_FRAGMENT_RT64_SOURCE_COMMIT,
+    TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL, TRIANGLE_PIPELINE_VERTEX_CANDIDATE_CONSUMERS,
+    TRIANGLE_PIPELINE_VERTEX_CASES, TRIANGLE_PIPELINE_VERTEX_DEPENDENCY_SOURCES,
+    TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_FIXTURE_SCHEMA,
+    TRIANGLE_PIPELINE_VERTEX_FIXTURE_SHA256, TRIANGLE_PIPELINE_VERTEX_MANIFEST,
+    TRIANGLE_PIPELINE_VERTEX_RT64_SOURCE_COMMIT, TRIANGLE_PIPELINE_VERTEX_SOURCE_SHA256,
+    TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
 pub use state::{
     AlphaCompare, AlphaDither, BlenderCycle, Color4, ColorImage, CoverageDestination, CycleType,
@@ -448,15 +459,17 @@ pub use state::{
     TextureLutModeError,
 };
 pub use targets::{
-    decode_fill_cycle_pixel, execute_fill_rectangle, pack_device_pixels,
+    decode_fill_cycle_pixel, execute_fill_rectangle, fixed_fixture_other_mode, pack_device_pixels,
     resolve_fill_pixel_rectangle, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
     ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame,
     CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, FillCoordinateError,
     FillCycleBypassHazards, FillExecutionError, FillPixelRectangle, InFlightNativeRasterFill,
-    InitializedCandidateColorTarget, InitializedRegionProof, NativeRasterDeviceOutcome,
-    NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, ResidentColorTarget, Rgba8,
-    TargetError, TargetGeneration, TargetRectangle, TargetRowRange, TargetRows,
-    UninitializedNativeRaster,
+    InFlightTriangleDraw, InitializedCandidateColorTarget, InitializedRegionProof,
+    NativeRasterDeviceOutcome, NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit,
+    RasterVertex, ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle,
+    TargetRowRange, TargetRows, TriangleDrawOutput, TriangleFixture, TrianglePipelineDeviceOutcome,
+    TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    UninitializedNativeRaster, UninitializedTrianglePipeline,
 };
 pub use texture_gen::{
     compute_texture_gen, normalize_safe, RspLookAt, WorldMatrix, TEXTURE_GEN_ENTRY_POINT,
