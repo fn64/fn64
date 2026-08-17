@@ -544,7 +544,15 @@ impl Quat {
         }
     }
 
-    fn dot(self, rhs: Self) -> f32 {
+    /// `hlslpp::dot(quaternion, quaternion)`: the conventional 4-component
+    /// dot product.
+    ///
+    /// `pub(crate)` rather than private because
+    /// `crate::rt64_rigid_body`'s `updateAngular` bias branch needs the
+    /// same product and previously re-derived it locally; that duplicate
+    /// has been retired in favour of this definition. `neg`/`normalize`
+    /// stay private -- no sibling module calls them.
+    pub(crate) fn dot(self, rhs: Self) -> f32 {
         self.x * rhs.x + self.y * rhs.y + self.z * rhs.z + self.w * rhs.w
     }
 
@@ -560,7 +568,14 @@ impl Quat {
 
 /// `hlslpp::lerp(a, b, t)` for a scalar: `a + t*(b-a)` (see module doc
 /// "Admitted domain").
-fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+///
+/// `pub(crate)` rather than private because the sibling
+/// `crate::rt64_math_matrix` ports the *matrix* half of the same
+/// `rt64_math.cpp` at the same pinned commit and needs the identical
+/// scalar `hlslpp::lerp` for `lerpMatrix`/`lerpMatrix3x3`/
+/// `lerpMatrixComponents`; it previously carried a character-identical
+/// copy. Changing this formula changes both modules' parity claims.
+pub(crate) fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
     a + t * (b - a)
 }
 
@@ -627,7 +642,16 @@ fn vec_combine(a: Vec3, b: Vec3, ascl: f32, bscl: f32) -> Vec3 {
     )
 }
 
-fn vec3_length(v: Vec3) -> f32 {
+/// `hlslpp::length(float3)`: `sqrt(x*x + y*y + z*z)`, unguarded -- a zero
+/// vector yields `0.0` and a `NaN` component propagates.
+///
+/// `pub(crate)` rather than private because `crate::rt64_rigid_body`'s
+/// `updateLinear` needs the identical `hlslpp::length(float3)` and
+/// previously carried a character-identical copy. This is *not* the same
+/// helper as `rt64_preset_light`'s or `rt64_lights_math`'s `length`: those
+/// cite different C++ authorities with their own ulp/NaN caveats and are
+/// deliberately kept separate.
+pub(crate) fn vec3_length(v: Vec3) -> f32 {
     (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
 }
 
