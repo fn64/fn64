@@ -66,7 +66,9 @@ pub use raw_dpc_batch::{
     RawDpcBatchCapability, RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource,
     RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
-pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
+pub use rdp_completion::{
+    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width,
+};
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
@@ -79,10 +81,10 @@ pub use render_ir::{
     NeutralTmemTransferWord, NeutralTriangleVertex, PlannedRawDpcSubmission, RawDpcAbiSession,
     RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator, RawDpcExecutionView,
     RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage,
-    RawDpcSemanticCommandRef, RawDpcTerminalOutcome, RdpFillRectangleCommand, RdpStateCommand,
-    RdpStateIdentity, RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule,
-    RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
-    TmemLoadShape, TmemTransferLayout, TriangleSource,
+    RawDpcSemanticCommandRef, RawDpcTerminalOutcome, RdpFillRectangleCommand, RdpFullSyncSite,
+    RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, ReadyPublication,
+    ReadyRawDpcCommitCapsule, RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,

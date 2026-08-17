@@ -54,8 +54,8 @@ fn one_load_block_words() -> Vec<u32> {
 }
 
 /// A command stream that appends a `FullSync` after an otherwise-admitted
-/// TMEM load -- the exact shape `plan_raw_dpc` must reject loudly per this
-/// card's "reject FullSync ... loudly" requirement.
+/// TMEM load -- the shape the FullSync two-phase contract admits as a
+/// decoded *site*.
 fn one_load_block_then_full_sync_words() -> Vec<u32> {
     let mut words = one_load_block_words();
     words.extend([word(FULL_SYNC, 0), 0]);
@@ -193,8 +193,15 @@ fn dram_producer_falls_back_to_legacy_path_when_no_session_registered() {
     teardown();
 }
 
+/// End-to-end proof of the FullSync two-phase contract through the real
+/// producer seam: a FullSync no longer panics, and the commit half schedules
+/// the DP completion the guest is owed.
+///
+/// Before this contract existed the same stream panicked here (the plan
+/// seam blanket-rejected `FullSync`), so a passing assertion of admission is
+/// itself the regression evidence.
 #[test]
-fn dram_producer_plan_rejects_full_sync_loudly_through_the_real_producer_seam() {
+fn dram_producer_admits_a_full_sync_site_and_schedules_dp_completion() {
     crate::load_rom(Vec::new());
     let mut rdram = rdram_with_texture_source();
     register_session_backend(rdram.len());
@@ -205,19 +212,84 @@ fn dram_producer_plan_rejects_full_sync_loudly_through_the_real_producer_seam() 
     let end = start + bytes.len() as u32;
     rdram[start as usize..end as usize].copy_from_slice(&bytes);
 
+    // Reserve half's precondition: the DP slot starts free, and the DP
+    // interrupt line starts down.
+    assert!(!with_host(|host| host.device_fabric.snapshot().dp_busy));
+    assert!(!with_host(|host| host
+        .device_fabric
+        .interrupt_pending(fn64_runtime::InterruptSource::Dp)));
+
+    let submission = admit_dram_submission(start, end);
+    unsafe {
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+    }
+
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "an admitted FullSync submission must publish, leaving no pending fabric transaction"
+    );
+
+    // Commit half ran: the DP completion is SCHEDULED (slot occupied).
+    assert!(
+        with_host(|host| host.device_fabric.snapshot().dp_busy),
+        "admitting a FullSync site must schedule the DP completion, not swallow it"
+    );
+
+    // THE NONCLAIM, asserted at the seam. Dispatch is over -- the capture,
+    // plan, execution, commit and publication have all already happened --
+    // and the DP interrupt line is still DOWN. There was therefore no
+    // `Asserted` state available for any boundary built during dispatch to
+    // have observed, which is exactly why the producer supplies `Clear`.
+    assert!(
+        !with_host(|host| host
+            .device_fabric
+            .interrupt_pending(fn64_runtime::InterruptSource::Dp)),
+        "the DP interrupt must NOT be asserted at the end of dispatch -- a boundary claiming \
+         interrupt_after == Asserted here would be fabricating an edge that has not occurred"
+    );
+
+    teardown();
+}
+
+/// The two-phase contract's reserve half is a real gate, not decoration: a DP
+/// completion already pending makes an incoming FullSync submission fail
+/// before the backend runs, and leaves the prior pending completion intact.
+#[test]
+fn dram_producer_full_sync_is_rejected_when_the_dp_slot_is_already_occupied() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend(rdram.len());
+
+    let words = one_load_block_then_full_sync_words();
+    let bytes = words_to_rdram_bytes(&words);
+    let start = 0x1000u32;
+    let end = start + bytes.len() as u32;
+    rdram[start as usize..end as usize].copy_from_slice(&bytes);
+
+    // Occupy the sole DP completion slot first.
+    crate::pi::start_live_dp_full_sync().expect("the slot starts free");
+    assert!(with_host(|host| host.device_fabric.snapshot().dp_busy));
+
     let submission = admit_dram_submission(start, end);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
     }));
     assert!(
         result.is_err(),
-        "a FullSync command reaching the real producer seam must panic, not silently admit"
+        "a FullSync arriving while a DP completion is pending must be rejected by the reserve \
+         half, not admitted"
     );
     // The rejected transaction must not leave a dangling pending fabric
     // submission behind -- `LiveDpcTransaction::drop` cancels on unwind.
     assert!(
         with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
         "a rejected FullSync submission must not leave the fabric transaction pending"
+    );
+    // The prior pending completion is untouched: the reserve half is
+    // nonmutating even when it rejects.
+    assert!(
+        with_host(|host| host.device_fabric.snapshot().dp_busy),
+        "rejecting must not consume or replace the pending DP completion"
     );
     teardown();
 }
@@ -825,12 +897,15 @@ fn tmem_only_captures_still_take_the_zero_write_branch() {
     teardown();
 }
 
-/// Hostile: `FullSync` is still rejected loudly at the real producer seam
-/// now that it no longer shares a match arm with `FillRectangle`. The
-/// split-arm regression proof, at the ABI boundary rather than in the
-/// backend's own unit tests.
+/// The split-arm regression proof, updated for the FullSync two-phase
+/// contract. Task A split `FillRectangle` and `FullSync` out of one shared
+/// rejection arm; this task admits the `FullSync` side as a site. The
+/// invariant that survives both changes is that the two arms remain
+/// INDEPENDENT: a fill followed by a FullSync must exercise both admissions,
+/// with the fill's guest-visible write and the FullSync's DP completion each
+/// happening exactly once and neither aliasing the other.
 #[test]
-fn a_full_sync_after_a_fill_still_traps_at_the_producer_seam() {
+fn a_fill_followed_by_a_full_sync_admits_both_independently() {
     crate::load_rom(Vec::new());
     let mut rdram = rdram_with_texture_source();
     register_session_backend_for_fills(rdram.len());
@@ -842,13 +917,31 @@ fn a_full_sync_after_a_fill_still_traps_at_the_producer_seam() {
     let end = start + bytes.len() as u32;
     rdram[start as usize..end as usize].copy_from_slice(&bytes);
 
+    assert!(!with_host(|host| host.device_fabric.snapshot().dp_busy));
+
     let submission = admit_dram_submission(start, end);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    unsafe {
         crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
-    }));
+    }
+
     assert!(
-        result.is_err(),
-        "admitting FillRectangle must not have admitted FullSync alongside it"
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "a fill-plus-FullSync submission must publish, leaving no pending fabric transaction"
+    );
+    // The FullSync side took its own admission: the DP completion is
+    // scheduled. If the two arms had re-merged, admitting the fill would
+    // have consumed the FullSync and left this slot free.
+    assert!(
+        with_host(|host| host.device_fabric.snapshot().dp_busy),
+        "the FullSync arm must schedule the DP completion independently of the fill arm"
+    );
+    // Same nonclaim as the DRAM-only sibling: dispatch is over and the DP
+    // interrupt line is still down.
+    assert!(
+        !with_host(|host| host
+            .device_fabric
+            .interrupt_pending(fn64_runtime::InterruptSource::Dp)),
+        "admitting a FullSync site must not assert the DP interrupt during dispatch"
     );
     teardown();
 }

@@ -25,9 +25,10 @@ pub use production::{
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
     RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    RdpFillRectangleCommand, RdpStateCommand, RdpStateIdentity, RdpTriangleCommand,
-    ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
+    RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
+    RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
+    TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape, TmemTransferLayout,
+    TriangleSource,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -464,6 +465,47 @@ mod production {
         /// any guest RDRAM byte is modified -- the fill executor writes a
         /// backend-owned buffer, and no RDRAM copyback exists in this slice.
         TransactionalTmemFillNoFullSync,
+        /// Everything [`Self::TransactionalTmemFillNoFullSync`] admits, plus a
+        /// decoded `SYNC_FULL` **site**: the backend walks the opcode, binds
+        /// it to the capture's own [`fn64_render_ir::FullSyncBoundary`], and
+        /// reserves the sole DP completion slot before it touches anything.
+        ///
+        /// Added rather than folded into the fill variant for the same reason
+        /// that one was added rather than folded into
+        /// [`Self::TransactionalTmemNoFullSync`]: a caller that reasons "this
+        /// backend rejects every FullSync" from the older variant would be
+        /// wrong about this one, and reserving the DP slot is a real
+        /// device-fabric interaction the older variants never perform.
+        ///
+        /// # Nonclaim -- a reservation is not an observation
+        ///
+        /// This variant claims a *site*, not a *boundary observation*. A
+        /// backend reporting it asserts only that:
+        ///
+        /// - it decoded the `SYNC_FULL` opcode and bound it to a capture-time
+        ///   boundary record, and
+        /// - `DeviceFabric::preflight_dp_full_sync` proved the sole DP
+        ///   completion slot was free -- a nonmutating reserve that raises no
+        ///   interrupt and schedules no event.
+        ///
+        /// It does **not** claim that a DP interrupt was raised, that the
+        /// guest observed one, or that any read-side coherence exists. Those
+        /// remain `docs/RENDER-WGPU-PORT-PLAN.md`'s D7/M9 work. Concretely:
+        /// the DP interrupt for a raw FullSync is raised inside
+        /// `DeviceFabric::advance_to`'s `DeviceEvent::Dp` arm, which runs
+        /// strictly *after* the whole capture/plan/execute/commit/publish
+        /// sequence -- so at the moment a capture's boundary must already
+        /// exist, `interrupt_after == Asserted` is not observable by
+        /// construction, and a backend reporting this variant supplies
+        /// [`fn64_render_ir::DpInterruptState::Clear`] for it.
+        ///
+        /// A future backend that genuinely observes the boundary is
+        /// distinguished not by a new capability variant but by the
+        /// `FullSyncBoundary` it supplies carrying
+        /// `interrupt_after == Asserted`. That is deliberately the *only*
+        /// place the observation claim lives, so it cannot be inferred from a
+        /// capability enum that a reserving backend also reports.
+        TransactionalTmemFillFullSyncSiteOnly,
     }
 
     /// The stage an in-flight submission's retirement was last known to
@@ -1438,6 +1480,53 @@ mod production {
         pub after: RdpStateIdentity,
     }
 
+    /// Neutral carrier for one decoded `SYNC_FULL` **site** (RDP opcode 0x29).
+    ///
+    /// # This is a site, not a boundary observation
+    ///
+    /// The name is deliberate. A `RdpFullSyncSite` records that the backend
+    /// walked a `SYNC_FULL` opcode at a known stream position and that the
+    /// sole DP completion slot was proved free before anything was touched.
+    /// It records nothing about whether a DP interrupt was subsequently
+    /// raised or observed.
+    ///
+    /// The observation, when a producer can honestly make one, lives in the
+    /// capture's own [`fn64_render_ir::FullSyncBoundary`] -- reachable from
+    /// [`Self::boundary`] -- and specifically in its
+    /// `interrupt_after == Asserted`. Nothing on this struct duplicates or
+    /// summarizes that bit, because a second copy is a second thing to get
+    /// out of sync with the first.
+    ///
+    /// Pushes zero [`ResourceAccess`] entries: a sync reads and writes no
+    /// resource. That is not a simplification -- `SYNC_FULL`'s effect is on
+    /// the RDP pipeline and the DP interrupt line, neither of which is a
+    /// journaled resource region.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct RdpFullSyncSite {
+        pub location: RawDpcCommandLocation,
+        pub raw_words: Box<[u32]>,
+        /// Zero-based index of this site among the decoded stream's
+        /// `SYNC_FULL` occurrences, matching
+        /// [`fn64_render_ir::FullSyncOccurrence::ordinal`].
+        pub ordinal: u32,
+        /// The capture-time boundary record this site was bound to during
+        /// decode, carried verbatim.
+        ///
+        /// `interrupt_after` is the *only* place an observation claim can
+        /// live. A backend that merely reserved the DP slot supplies
+        /// [`fn64_render_ir::DpInterruptState::Clear`] here; reading
+        /// `Asserted` off this field is the sole way a consumer may conclude
+        /// the interrupt was observed.
+        pub boundary: fn64_render_ir::FullSyncBoundary,
+        /// Whether the sole DP completion slot was proved free for this site
+        /// before the backend touched anything.
+        ///
+        /// Nonclaim: `true` means a nonmutating reserve succeeded. It does
+        /// **not** mean a DP event was scheduled, an interrupt was raised, or
+        /// the guest observed one.
+        pub dp_slot_reserved: bool,
+    }
+
     /// Which wire command admitted this triangle: a genuine `RawTriangle`
     /// (0xC8-0xCF family) versus one synthesized from a `TextureRectangle`/
     /// `TextureRectangleFlip` (0x24/0x25) two-triangle expansion. Constructed
@@ -1486,6 +1575,10 @@ mod production {
         /// here, this command declares N guest-visible `RenderTarget` write
         /// accesses (see [`RdpFillRectangleCommand`]).
         FillRectangle(&'plan RdpFillRectangleCommand),
+        /// One decoded `SYNC_FULL` site. Declares zero resource accesses and,
+        /// on its own, no DP-interrupt observation -- see
+        /// [`RdpFullSyncSite`].
+        FullSyncSite(&'plan RdpFullSyncSite),
     }
 
     /// Borrowed, nonextracting visitor over one validated plan's semantic
@@ -1526,6 +1619,7 @@ mod production {
         State(RdpStateCommand),
         Triangle(RdpTriangleCommand),
         FillRectangle(RdpFillRectangleCommand),
+        FullSyncSite(RdpFullSyncSite),
     }
 
     impl OwnedSemanticCommand {
@@ -1535,6 +1629,7 @@ mod production {
                 Self::State(state) => RawDpcSemanticCommandRef::State(state),
                 Self::Triangle(triangle) => RawDpcSemanticCommandRef::Triangle(triangle),
                 Self::FillRectangle(fill) => RawDpcSemanticCommandRef::FillRectangle(fill),
+                Self::FullSyncSite(site) => RawDpcSemanticCommandRef::FullSyncSite(site),
             }
         }
     }
@@ -2331,6 +2426,44 @@ mod production {
                 .push(OwnedSemanticCommand::FillRectangle(fill));
         }
 
+        /// Pushes one decoded `SYNC_FULL` site. Pushes zero
+        /// [`ResourceAccess`] entries -- a sync journals no resource region.
+        ///
+        /// The `site.boundary` a caller supplies must be the one the decoder
+        /// bound during decode (`RawDpcCommandKind::FullSync`'s own
+        /// [`fn64_render_ir::FullSyncOccurrence`]), which the decoder in turn
+        /// derived from this capture's own boundary list. Re-deriving it here
+        /// would let plan state and capture state disagree about the same
+        /// site.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `site.dp_slot_reserved` is `false`. A site reaching the
+        /// plan without its DP completion slot proved free means the reserve
+        /// half was skipped, which is a caller bug: the whole point of
+        /// `DeviceFabric::preflight_dp_full_sync` being nonmutating is that a
+        /// backend can be rejected *before* it observes or changes anything,
+        /// and a plan that records the site anyway would have discarded that
+        /// rejection.
+        ///
+        /// # What this method deliberately does *not* check
+        ///
+        /// It does not validate `site.boundary.interrupt_after()`. Whether an
+        /// `Asserted` value there is an honest observation or a fabrication
+        /// depends on *how the producer obtained it*, which is not visible
+        /// from a boundary value -- both cases are the same two bytes. That
+        /// obligation therefore lives at the one place it is knowable, in
+        /// [`crate::OwnedRawDpcCapture::with_full_sync_boundaries`]'s
+        /// contract, and pretending to re-check it here would be theater.
+        pub fn push_full_sync_site(&mut self, site: RdpFullSyncSite) {
+            assert!(
+                site.dp_slot_reserved,
+                "a decoded FullSync site reached the plan without its DP completion slot \
+                 reserved -- the nonmutating preflight_dp_full_sync reserve half was skipped"
+            );
+            self.commands.push(OwnedSemanticCommand::FullSyncSite(site));
+        }
+
         /// Finish this writer into the sealed [`PlannedRawDpcSubmission`]. `journal`
         /// must be the exact journal the caller is about to hand to
         /// [`super::preflight_raw_dpc_capture`] for this same `capture` --
@@ -2380,7 +2513,14 @@ mod production {
                 self.capture.transaction_sequence(),
                 submission.clone(),
                 self.capture.cmd_end(),
-                Vec::new(),
+                // The capture's own boundary list, never a fresh `Vec::new()`.
+                // Substituting an empty list here would make any capture whose
+                // payload contains a `SYNC_FULL` opcode fail derivation with
+                // `MissingFullSyncObservation` no matter what its producer
+                // supplied -- which is exactly why FullSync could not be
+                // planned before this field existed. Still empty, exactly, for
+                // every capture built through `OwnedRawDpcCapture::new`.
+                self.capture.full_sync_boundaries().to_vec(),
                 journal,
             )?;
             let plan = ExactValidatedRawDpcPlan {
