@@ -336,6 +336,7 @@ mod raster_vs;
 mod raw_dpc;
 mod rgb_dither;
 mod rt64_common;
+mod rt64_extended_gbi;
 mod rt64_frame_compatibility;
 mod rt64_fullscreen_vs;
 mod rt64_gbi_f3d;
