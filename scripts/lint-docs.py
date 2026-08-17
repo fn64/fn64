@@ -622,6 +622,22 @@ DOC_LINE = re.compile(r"^\s*//[/!] ?")
 # crate, which is the opposite of a deferral. Strip before extracting.
 INTRA_DOC_LINK = re.compile(r"\[`[^`\n]+`\]")
 BACKTICKED = re.compile(r"`([^`\n]+)`")
+# A deferral's SUBJECT can be third person: a survey sentence names a sibling
+# module ("the closest sibling `foo.rs` defines `A`, `B` ... and it
+# deliberately does not port `C`") and the refusal is a claim about THAT
+# sibling, not about the module whose doc comment this is. Detect this by the
+# clause immediately before the verb being a bare pronoun -- no symbol of its
+# own, nothing but the pronoun and an optional bare adverb.
+THIRD_PERSON_SUBJECT = re.compile(
+    r"^\s*[-*]?\s*(?:it|this|that)\s*(?:deliberately|specifically|explicitly)?\s*$",
+    re.I,
+)
+# `foo.rs` cited in backticks -- used to find the pronoun's antecedent.
+MODULE_RS_REF = re.compile(r"`([A-Za-z0-9_]+\.rs)`")
+# A real sentence end, not a period inside a `foo.rs` citation: require it be
+# followed by space or end-of-text, and not immediately by a backtick (which
+# would mean the period is part of a `name.rs` extension, not a full stop).
+SENTENCE_END = re.compile(r"[.!?](?!`)(?:\s|$)")
 RUST_ITEM = re.compile(
     r"^([^:]+):(\d+):(\s*)(pub(?:\([^)]*\))? )?(fn|struct|enum) ([A-Za-z_][A-Za-z0-9_]*)"
 )
@@ -669,6 +685,55 @@ def _refused_symbol(span: str) -> str | None:
         s = s.split("::")[-1]
     s = re.sub(r"\(.*$", "", s).strip()
     return s if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", s) else None
+
+
+def _surveys_another_module(text: str, clause_start: int, own_file: str) -> bool:
+    """True if the deferral's subject clause is a pronoun standing in for
+    ANOTHER module named earlier in the same unbroken run of clauses.
+
+    `rt64_preset_material.rs:196` survives this: "...the closest sibling
+    `rt64_preset_draw_call_match.rs` defines `DrawCallKey`, ... and it
+    deliberately does not port `PresetBase` either." "it" refers to the
+    SIBLING just named, not to this module -- the claim is about that
+    sibling's port, and it is true (verified against
+    `rt64_preset_scene.rs:359`, which the sibling's OWN doc comment credits
+    for `PresetBase` after this check landed).
+
+    Two conditions, both required, because either alone is unsafe:
+
+    1. The clause is a BARE pronoun ("it", "this", "that", optionally with
+       one adverb) -- checked by the caller via THIRD_PERSON_SUBJECT before
+       this function runs. A pronoun clause is necessary but not
+       sufficient: `rt64_preset_scene.rs` has "- It does not port
+       `PresetLibrary`'s `load`/`save`..." where "It" is THIS module,
+       carried over from an earlier bullet's "This module is not wired
+       in:". Silencing every bare-pronoun deferral would swallow that one.
+
+    2. Scanning BACKWARD from the pronoun to the nearest real sentence end
+       -- not a `;` or `:` (those are clause breaks the survey uses freely
+       within one sentence) but an actual `.`/`!`/`?` not glued to a
+       backtick (so `rt64_common.rs` and `rt64_preset_scene.rs`'s `.` are
+       not mistaken for one) -- the NEAREST backtick-cited `foo.rs` module
+       is a file OTHER than this one. That is the pronoun's antecedent: a
+       named sibling, not "this module". In the PresetLibrary case, the
+       nearest earlier `foo.rs` citation across the true sentence boundary
+       is `lib.rs`, and it sits in a DIFFERENT, already-terminated sentence
+       ("...`lib.rs` declares it `mod`... It is a characterization
+       surface.") -- the scan stops at that terminator and finds no `.rs`
+       citation in the run the pronoun actually belongs to, so condition 2
+       correctly fails and the real deferral still fires.
+
+    A deferral that reads "this module does not port `X`, which lives in
+    `other.rs`" is NOT caught by this rule even though it names another
+    file: `other.rs` there sits AFTER the verb, never examined by this
+    backward scan, and the subject clause is "this module", not a pronoun,
+    so condition 1 already rejects it.
+    """
+    preceding = text[:clause_start]
+    ends = list(SENTENCE_END.finditer(preceding))
+    run_start = ends[-1].end() if ends else 0
+    run = preceding[run_start:]
+    return any(f != own_file for f in MODULE_RS_REF.findall(run))
 
 
 def _crate_of(path: str) -> str:
@@ -860,6 +925,32 @@ def check_stale_deferrals() -> None:
                         head, _, rest = sentence.partition("`")
                         sentence = head + " " + rest
                 where = f"{path}:{lineno_at(begin)}"
+                # A refusal's SUBJECT can be a pronoun standing in for a
+                # sibling module named earlier in the same run of clauses --
+                # "the closest sibling `foo.rs` defines `A` ... and it
+                # deliberately does not port `B`" is a claim about `foo.rs`,
+                # not this module. Check the clause right before the verb
+                # (same split used below for the trailing-form case) before
+                # doing anything else: if it is a bare pronoun whose nearest
+                # antecedent is another module's `.rs` citation, this is a
+                # survey sentence about THAT module and is not a claim this
+                # file's check should evaluate at all. See
+                # _surveys_another_module for why a bare pronoun alone is not
+                # enough (rt64_preset_scene.rs's "It does not port
+                # `PresetLibrary`..." is first person and must still fire).
+                subject_probe = DEFERRAL.search(sentence)
+                if subject_probe:
+                    subject_clause = re.split(
+                        r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                        sentence[:subject_probe.start()],
+                    )[-1]
+                    if THIRD_PERSON_SUBJECT.match(subject_clause):
+                        stripped = subject_clause.strip()
+                        clause_pos = text.find(stripped, begin) if stripped else -1
+                        if clause_pos != -1 and _surveys_another_module(
+                            text, clause_pos, os.path.basename(path)
+                        ):
+                            continue
                 # A refusal governs what FOLLOWS it, not what precedes it.
                 # "Only the `ShaderDescription` struct and its `toShader()`
                 # method are ported (the `hash()` ... are explicitly not
@@ -988,6 +1079,67 @@ def selftest() -> int:
          and DEFERRAL.search("**deliberately not ported**")
          and not DEFERRAL.search("a YUV-deferred Tile/Block contract")
          and not DEFERRAL.search("no deferred-selector rejection path")),
+        # The rt64_preset_material.rs:196 false positive, reduced to its
+        # shape: a survey sentence names a sibling module, then refers back
+        # to it with a bare pronoun. Must be recognized as third-person --
+        # the claim is about the SIBLING, not this module -- so
+        # check_stale_deferrals skips it rather than evaluating `PresetBase`
+        # against THIS crate's port surface.
+        ("third-person survey is recognized", "pronoun's antecedent is a NAMED sibling module",
+         lambda: (lambda text=(
+             "the closest sibling `rt64_preset_draw_call_match.rs` defines "
+             "`DrawCallKey`, `DrawCallMask` -- none preset-material-adjacent, "
+             "and it deliberately does not port `PresetBase` either."
+         ): (
+             (probe := DEFERRAL.search(text)) is not None
+             and THIRD_PERSON_SUBJECT.match(
+                 re.split(r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                          text[:probe.start()])[-1]
+             ) is not None
+             and _surveys_another_module(
+                 text, text.find("it deliberately"), "rt64_preset_material.rs"
+             )
+         ))()),
+        # The DANGEROUS twin: a genuine first-person deferral that happens to
+        # name another module too, but AFTER the verb ("this module does not
+        # port X, which lives in other.rs"). A careless discriminator keyed
+        # only on "another .rs file appears somewhere in this sentence" would
+        # silence this -- it is a real, live deferral and must still be
+        # findable. THIRD_PERSON_SUBJECT must reject its subject clause
+        # ("This module", not a bare pronoun), which is the guard that keeps
+        # check_stale_deferrals looking at it.
+        ("first-person deferral naming another file still fires", "the case a careless rule would silence",
+         lambda: not THIRD_PERSON_SUBJECT.match(
+             re.split(
+                 r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                 "This module does not port `X`, which lives in `other_module.rs`."[
+                     :DEFERRAL.search(
+                         "This module does not port `X`, which lives in `other_module.rs`."
+                     ).start()
+                 ],
+             )[-1]
+         )),
+        # The SECOND danger, reduced from the real rt64_preset_scene.rs:305
+        # site: a bare pronoun subject ("It does not port `PresetLibrary`")
+        # is NOT by itself proof of a third-person survey -- "It" there
+        # carries over from an earlier bullet's "This module is not wired
+        # in", so it is first person. A bare pronoun alone (condition 1)
+        # must NOT be enough; _surveys_another_module's antecedent scan
+        # (condition 2) is what correctly finds no OTHER module's `.rs` cited
+        # in this bullet's own run and so reports false -- the deferral stays
+        # live.
+        ("bare pronoun without a named sibling still fires", "It != a survey just because it's a pronoun",
+         lambda: not _surveys_another_module(
+             "- This module is not wired in: `lib.rs` declares it `mod`. "
+             "It is a characterization surface. "
+             "- It does not port `PresetLibrary`'s `load`/`save`.",
+             (
+                 "- This module is not wired in: `lib.rs` declares it `mod`. "
+                 "It is a characterization surface. "
+                 "- It does not port `PresetLibrary`'s `load`/`save`."
+             ).rfind("- It does not port") + 2,
+             "rt64_preset_scene.rs",
+         )),
     ]
     bad = [name for name, why, fn in cases if not fn()]
     for name in bad:
