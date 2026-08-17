@@ -26310,8 +26310,10 @@
       "port_delta": "unchanged",
       "milestone": "M12",
       "workstream": "ray-path-tracing",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_lights_math.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m12-src-shaders-lights-hlsli",
@@ -26324,7 +26326,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/lights_hlsli.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_lights_math.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
