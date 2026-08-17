@@ -97,12 +97,13 @@ PORT_STATES = {"ported", "not-started", "refused", "authority-gated"}
 # does NOT do is widen to a partial or behavioral claim -- `refused` says only
 # "an assessment settled this file", never "this file is done".
 #
-# Scope is closed at the three landed batch assessments. Every entry below is
-# one of the 17 `src/common`, 28 `src/render`, or 6 `src/hle` sources those
-# assessments refused; nothing else may be added without a new landed
-# assessment. (The `src/gui`/`src/imgui` cluster has no landed assessment as
-# of this scope; see tools/rt64_port_inventory.py history -- it is deliberately
-# absent, not an oversight.)
+# Scope is closed at the five landed batch assessments. Every entry below is
+# one of the 17 `src/common`, 28 `src/render`, or 18 `src/hle` sources those
+# assessments refused (6 from the geometry batch, 10 from the VI-registers
+# batch, 2 from the workload-geometry batch); nothing else may be added
+# without a new landed assessment. (The `src/gui`/`src/imgui` cluster has no
+# landed assessment as of this scope; see tools/rt64_port_inventory.py history
+# -- it is deliberately absent, not an oversight.)
 COMMON_ASSESSMENT_COMMIT = "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85"
 COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs already implements"
 COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
@@ -112,6 +113,12 @@ RENDER_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_render_pipeline_t
 HLE_ASSESSMENT_COMMIT = "d2980310ab227978c193426fdfee816a79ca2603"
 HLE_ASSESSMENT_SUBJECT = "port six HLE geometry sources, refuse six, find a dither trap"
 HLE_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+VI_REGISTERS_ASSESSMENT_COMMIT = "49f6760b64ffc5926913132727d3c5b5834e98bf"
+VI_REGISTERS_ASSESSMENT_SUBJECT = "render-wgpu: compare RT64's VI registers against fn64, refuse ten of twelve"
+VI_REGISTERS_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
+WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT = "2b4253cb17b6a923345c9b194332a39d4a5f7780"
+WORKLOAD_GEOMETRY_ASSESSMENT_SUBJECT = "render-wgpu: port the workload cluster's config arithmetic, refuse the rest"
+WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
 SCOPING_EVIDENCE = "docs/RT64-M6-M7-SCOPING.md"
 
 
@@ -125,6 +132,14 @@ def _render_refusal(reason: str, evidence: str = RENDER_ASSESSMENT_EVIDENCE) -> 
 
 def _hle_refusal(reason: str, evidence: str = HLE_ASSESSMENT_EVIDENCE) -> dict:
     return {"commit": HLE_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+def _vi_registers_refusal(reason: str, evidence: str = VI_REGISTERS_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": VI_REGISTERS_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+def _workload_geometry_refusal(reason: str, evidence: str = WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
 
 
 PORT_REFUSALS: dict[str, dict[str, str]] = {
@@ -336,6 +351,71 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "field declaration order is not pinnable in safe Rust, and this card makes no "
         "repr(C)/size/alignment/ABI claim, so a Rust struct here would assert nothing "
         "testable."
+    ),
+    # -- src/hle, 10 of the last 12 files the batch assessment examined (the
+    # other two, rt64_vi.h and rt64_application.cpp, landed partially `ported`
+    # in rt64_vi_registers.rs; rt64_vi.cpp stays authority-gated). This closes
+    # out src/hle.
+    "src/hle/rt64_application_window.cpp": _vi_registers_refusal(
+        "425/425 refused: every one of its 66 arithmetic candidates is Win32 "
+        "(AdjustWindowRectEx, GetMonitorInfo, EnumDisplaySettings), SDL2 or XRandR. Its "
+        "only real arithmetic is a refreshRate * 2 for interlaced modes and a "
+        "(refreshRate % 10) == 9 truncation hack carrying its own // FIXME -- host-display "
+        "compensation with no guest meaning."
+    ),
+    "src/hle/rt64_state.h": _vi_registers_refusal(
+        "25 includes, an External object graph of 20 raw pointers (21 counting the "
+        "#if RT_ENABLED rtConfig), and 40 method declarations (including the constructor "
+        "and destructor) -- zero bodies."
+    ),
+    "src/hle/rt64_application.h": _vi_registers_refusal(
+        "Zero function bodies anywhere in the file (Core::decodeVI and every Application "
+        "method are declared only); config defaults plus enums plus an SDL/Win32 "
+        "ApplicationWindow::Listener override interface."
+    ),
+    "src/hle/rt64_shared_queue_resources.h": _vi_registers_refusal(
+        "Six unconditional inline bodies (a seventh, setRtConfig, is #if RT_ENABLED-only): "
+        "five are pure field assignment under std::scoped_lock<std::mutex>, but the sixth, "
+        "updateMultisampling, takes no lock and instead calls "
+        "renderTargetManager.destroyAll()/setMultisampling() -- RHI dispatch, not guarded "
+        "field assignment."
+    ),
+    "src/hle/rt64_application_window.h": _vi_registers_refusal(
+        "SDL/Win32 handle struct plus a pure-virtual Listener; no bodies."
+    ),
+    "src/hle/rt64_present_queue.h": _vi_registers_refusal(
+        "Object graph: a raw std::thread*, five mutexes, three condition variables, four "
+        "atomics, and a swapChainFramebuffers vector; every method is declared only."
+    ),
+    "src/hle/rt64_command_warning.h": _vi_registers_refusal(
+        "A 3-value IndexType tag and a union of three index payloads (load/tile/call); no "
+        "opcode classification, no severity logic."
+    ),
+    "src/hle/rt64_command_warning.cpp": _vi_registers_refusal(
+        "One vsnprintf varargs formatter, CommandWarning::format."
+    ),
+    "src/hle/rt64_rdp_tmem.h": _vi_registers_refusal(
+        "Declares TextureManager: two std::set<uint64_t> members and five method "
+        "declarations, all five bodies already adjudicated in writing by "
+        "rt64_hle_geometry.rs's uploadEmpty/uploadTMEM/uploadTexture/removeHashes/"
+        "dumpTexture refusals (:585-593).",
+        HLE_ASSESSMENT_EVIDENCE,
+    ),
+    "src/hle/rt64_game_configuration.h": _vi_registers_refusal(
+        "Five default-initialized tunables (sunLightIntensity, sunLightDistance, "
+        "estimateSunLight, rspLightAsDiffuse, rspLightIntensity); no logic."
+    ),
+    # -- src/hle, the last 2 of the batch: deliberately not digest-cited so
+    # the scanner cannot falsely credit them (they carry no arithmetic to
+    # port, but citing their SHA-256 would still register as `ported`).
+    "src/hle/rt64_interpreter.h": _workload_geometry_refusal(
+        "Zero bodies: five function declarations (constructor, setup, loadUCodeGBI, "
+        "processRDPLists, processDisplayLists) over six data members (state, gbiManager, "
+        "hleGBI, extendedOpCode, extendedFunction, and the anonymous-struct-typed UCode)."
+    ),
+    "src/hle/rt64_present.h": _workload_geometry_refusal(
+        "Two aggregate structs, DebuggerFramebuffer and Present -- no member functions, "
+        "field layout only."
     ),
 }
 REFUSAL_KEYS = {"commit", "evidence", "reason"}
@@ -687,6 +767,8 @@ def verify_refusals(root: Path) -> None:
             COMMON_ASSESSMENT_COMMIT: COMMON_ASSESSMENT_SUBJECT,
             RENDER_ASSESSMENT_COMMIT: RENDER_ASSESSMENT_SUBJECT,
             HLE_ASSESSMENT_COMMIT: HLE_ASSESSMENT_SUBJECT,
+            VI_REGISTERS_ASSESSMENT_COMMIT: VI_REGISTERS_ASSESSMENT_SUBJECT,
+            WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT: WORKLOAD_GEOMETRY_ASSESSMENT_SUBJECT,
         }.get(commit)
         require(expected_subject is not None, f"{relative}: refusal cites an undeclared assessment: {commit}")
         require(
