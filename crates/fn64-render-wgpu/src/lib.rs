@@ -339,6 +339,7 @@ mod rt64_common;
 mod rt64_extended_gbi;
 mod rt64_float4_quantize;
 mod rt64_frame_compatibility;
+mod rt64_framebuffer_geometry;
 mod rt64_fullscreen_vs;
 mod rt64_gaussian_filter;
 mod rt64_gbi_extended_decode;
