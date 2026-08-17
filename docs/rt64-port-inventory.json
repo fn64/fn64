@@ -9867,7 +9867,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9891,6 +9891,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_application.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "Zero function bodies anywhere in the file (Core::decodeVI and every Application method are declared only); config defaults plus enums plus an SDL/Win32 ApplicationWindow::Listener override interface."
       }
     },
     {
@@ -10012,7 +10017,7 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -10036,6 +10041,11 @@
         "exit_gate": "The M10 behavior fixture for src/hle/rt64_application_window.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "425/425 refused: every one of its 66 arithmetic candidates is Win32 (AdjustWindowRectEx, GetMonitorInfo, EnumDisplaySettings), SDL2 or XRandR. Its only real arithmetic is a refreshRate * 2 for interlaced modes and a (refreshRate % 10) == 9 truncation hack carrying its own // FIXME -- host-display compensation with no guest meaning."
       }
     },
     {
@@ -10081,7 +10091,7 @@
       "port_delta": "unchanged",
       "milestone": "M10",
       "workstream": "platform-cutover",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -10105,6 +10115,11 @@
         "exit_gate": "The M10 behavior fixture for src/hle/rt64_application_window.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "SDL/Win32 handle struct plus a pure-virtual Listener; no bodies."
       }
     },
     {
@@ -10320,7 +10335,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -10344,6 +10359,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_command_warning.cpp passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "One vsnprintf varargs formatter, CommandWarning::format."
       }
     },
     {
@@ -10387,7 +10407,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -10411,6 +10431,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_command_warning.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "A 3-value IndexType tag and a union of three index payloads (load/tile/call); no opcode classification, no severity logic."
       }
     },
     {
@@ -12092,7 +12117,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -12116,6 +12141,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_game_configuration.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "Five default-initialized tunables (sunLightIntensity, sunLightDistance, estimateSunLight, rspLightAsDiffuse, rspLightIntensity); no logic."
       }
     },
     {
@@ -12648,7 +12678,7 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -12672,6 +12702,11 @@
         "exit_gate": "The M3 behavior fixture for src/hle/rt64_interpreter.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2b4253cb17b6a923345c9b194332a39d4a5f7780",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs",
+        "reason": "Zero bodies: five function declarations (constructor, setup, loadUCodeGBI, processRDPLists, processDisplayLists) over six data members (state, gbiManager, hleGBI, extendedOpCode, extendedFunction, and the anonymous-struct-typed UCode)."
       }
     },
     {
@@ -12969,7 +13004,7 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -12993,6 +13028,11 @@
         "exit_gate": "The M3 behavior fixture for src/hle/rt64_present.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "2b4253cb17b6a923345c9b194332a39d4a5f7780",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs",
+        "reason": "Two aggregate structs, DebuggerFramebuffer and Present -- no member functions, field layout only."
       }
     },
     {
@@ -13221,7 +13261,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -13245,6 +13285,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_present_queue.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "Object graph: a raw std::thread*, five mutexes, three condition variables, four atomics, and a swapChainFramebuffers vector; every method is declared only."
       }
     },
     {
@@ -14246,7 +14291,7 @@
       "port_delta": "unchanged",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -14270,6 +14315,11 @@
         "exit_gate": "The M4 behavior fixture for src/hle/rt64_rdp_tmem.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs",
+        "reason": "Declares TextureManager: two std::set<uint64_t> members and five method declarations, all five bodies already adjudicated in writing by rt64_hle_geometry.rs's uploadEmpty/uploadTMEM/uploadTexture/removeHashes/dumpTexture refusals (:585-593)."
       }
     },
     {
@@ -15337,7 +15387,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -15361,6 +15411,11 @@
         "exit_gate": "The M8 behavior fixture for src/hle/rt64_shared_queue_resources.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "Six unconditional inline bodies (a seventh, setRtConfig, is #if RT_ENABLED-only): five are pure field assignment under std::scoped_lock<std::mutex>, but the sixth, updateMultisampling, takes no lock and instead calls renderTargetManager.destroyAll()/setMultisampling() -- RHI dispatch, not guarded field assignment."
       }
     },
     {
@@ -15881,7 +15936,7 @@
       "port_delta": "unchanged",
       "milestone": "M3",
       "workstream": "raw-dpc",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -15905,6 +15960,11 @@
         "exit_gate": "The M3 behavior fixture for src/hle/rt64_state.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "49f6760b64ffc5926913132727d3c5b5834e98bf",
+        "evidence": "crates/fn64-render-wgpu/src/rt64_vi_registers.rs",
+        "reason": "25 includes, an External object graph of 20 raw pointers (21 counting the #if RT_ENABLED rtConfig), and 40 method declarations (including the constructor and destructor) -- zero bodies."
       }
     },
     {
