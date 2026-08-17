@@ -184,8 +184,9 @@
 //! for both cycles at once (confirmed by shift arithmetic below), so this
 //! module calls those two accessors instead of re-deriving the header's
 //! four free `decodeInput*` functions from a raw word this crate does not
-//! expose. `state.rs` is read-only to this ticket (owned by M4.2, `RUNNING`);
-//! this module adds no field, accessor, or edit there.
+//! expose. `state.rs` is read-only to this ticket (owned by ticket M4.2,
+//! a separate module this ticket does not modify); this module adds no
+//! field, accessor, or edit there.
 //!
 //! ## Admitted domain
 //!
@@ -285,11 +286,19 @@
 //! Partial coverage of the header: this module ports only the
 //! shader-*selection* analysis cluster (lines 45-175) the ticket names. It
 //! does **not** port `EmulationRequirements`/`checkEmulationRequirements`
-//! (lines 178-271, a separate CPU analysis for blend *emulation strategy*,
-//! not pipeline *selection* -- out of scope per the ticket's named symbol
-//! list), `inputToString` (lines 273-316, debug-only string formatting, not
-//! analysis), or `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run`
-//! (lines 324-505, the runtime evaluation half `blend.rs` already owns).
+//! here (lines 178-271, a separate CPU analysis for blend *emulation
+//! strategy*, not pipeline *selection* -- out of scope per this module's
+//! ticket's named symbol list). Read that as a refusal by *this* module,
+//! not as a claim the crate lacks the symbol: `rt64_blender_emulation.rs`
+//! (ticket M4.5) ports both, as
+//! [`EmulationRequirements`](crate::rt64_blender_emulation::EmulationRequirements)
+//! and
+//! [`check_emulation_requirements`](crate::rt64_blender_emulation::check_emulation_requirements),
+//! which is that module's own declared scope. This module also does not
+//! port `inputToString` (lines 273-316,
+//! debug-only string formatting, not analysis), or
+//! `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run` (lines
+//! 324-505, the runtime evaluation half `blend.rs` already owns).
 //! `docs/rt64-port-inventory.json`'s `port_state` for this file may still
 //! read `not-started`/`ported_as: []` after this change lands (the
 //! inventory's `writable_paths` for this task card names
