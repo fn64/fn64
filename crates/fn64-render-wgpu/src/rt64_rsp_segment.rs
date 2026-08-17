@@ -229,10 +229,14 @@
 //!   `extendRDRAM(bool)` (the *setter* method -- distinct from the
 //!   `extended.extendRDRAM` `bool` field this module reads as an input
 //!   parameter, see below).
-//! - **Matrix/transform orchestrators**: `matrixCommon`, `matrix`,
-//!   `popMatrix`, `insertMatrix`, `forceMatrix`, `recalculateMatrices`
-//!   (viewport/scissor/light/fog/lookAt setters and every `set*`/`clear*`
-//!   RSP-state mutator not in the five named functions).
+//! - **Matrix/transform orchestrators**: `matrix`, `popMatrix`,
+//!   `insertMatrix`, `forceMatrix`, `recalculateMatrices` (viewport/
+//!   scissor/light/fog/lookAt setters and every `set*`/`clear*` RSP-state
+//!   mutator not in the five named functions). `matrixCommon` is *not* in
+//!   this list -- it was deferred by this module at the time this doc was
+//!   first written, but `rt64_rsp_matrix_stack.rs` (ticket M5.2) has since
+//!   ported it as [`matrix_common`](crate::rt64_rsp_matrix_stack::matrix_common),
+//!   closing that gap. This module still does not port it itself.
 //! - **Vertex/geometry orchestrators**: `setVertexCommon`, `setVertex`,
 //!   `setVertexColor`, `setVertexNormal`, `modifyVertex`,
 //!   `setVertexSegmentV1`, `readExtendedVertexSegment`, `drawIndexedTri`
