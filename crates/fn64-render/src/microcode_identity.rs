@@ -10,6 +10,17 @@ use twox_hash::xxhash3_64::Hasher;
 pub const F3DZEX2_IDENTITY_SOURCE: &str =
     "rt64@f0728a2520d5aa735886240de3fee75cc805f6d6:src/gbi/rt64_gbi.cpp";
 
+// `rt64_gbi.cpp` (SHA-256 of the whole file,
+// `ecb1dc7bb915576ba2fe4116fee0c8de9d4c696e2d5f6c87c67491335e40ae53`, matching
+// `docs/rt64-port-inventory.json`'s `sources.port.sha256` -- identical to
+// `sources.oracle.sha256` for this file, so the digest is simultaneously
+// both) is a partial port: only the six `textSegments`/`dataSegments` XXH3
+// row constants for the three F3DZEX2 NON-FIFO variants fn64 recognizes
+// (2.06H/2.08I/2.08J) are carried, copied verbatim from that file's
+// `GBISegment` tables; the surrounding classification code, the other ~90
+// text/data rows for other microcode families, and `GBIManager`'s broader
+// deduction logic are not ported.
+
 /// Pinned RT64 F3DZEX2 variant recognized from one raw text/data pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum F3dzex2Variant {
