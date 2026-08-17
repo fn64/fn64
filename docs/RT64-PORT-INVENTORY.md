@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 15 `ported`, 250 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 17 `ported`, 248 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -124,8 +124,8 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/hle/rt64_application.h` | `unchanged` | `not-started` | -- | 176 | 5 | 16 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-application-h` |
 | `src/hle/rt64_application_window.cpp` | `unchanged` | `not-started` | -- | 425 | 11 | 4 | `M10` / `platform-cutover` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (P/high) | `rt64-port-m10-src-hle-rt64-application-window-cpp` |
 | `src/hle/rt64_application_window.h` | `unchanged` | `not-started` | -- | 83 | 2 | 2 | `M10` / `platform-cutover` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (P/high) | `rt64-port-m10-src-hle-rt64-application-window-h` |
-| `src/hle/rt64_color_converter.cpp` | `unchanged` | `not-started` | -- | 71 | 5 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-color-converter-cpp` |
-| `src/hle/rt64_color_converter.h` | `unchanged` | `not-started` | -- | 25 | 4 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-color-converter-h` |
+| `src/hle/rt64_color_converter.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/color_converter.rs` | 71 | 5 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-color-converter-cpp` |
+| `src/hle/rt64_color_converter.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/color_converter.rs` | 25 | 4 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-color-converter-h` |
 | `src/hle/rt64_command_warning.cpp` | `unchanged` | `not-started` | -- | 27 | 1 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-command-warning-cpp` |
 | `src/hle/rt64_command_warning.h` | `unchanged` | `not-started` | -- | 38 | 2 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-command-warning-h` |
 | `src/hle/rt64_draw_call.cpp` | `unchanged` | `not-started` | -- | 91 | 8 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-hle-rt64-draw-call-cpp` |
