@@ -70,6 +70,13 @@ NON_FUNCTION_HINTS = {
     "return", "sizeof", "switch", "while",
 }
 MILESTONES = {"M1", "M3", "M4", "M5", "M6", "M8", "M10", "M11", "M12"}
+PORT_STATES = {"ported", "not-started", "authority-gated"}
+# Rust-port crates only: fn64-render-rt64 is a C++ FFI shim/authority-gate
+# guard crate, never itself a Rust reimplementation of RT64 source, so its
+# files (including its own guard/self-tests over the C++ overlay) are never
+# scanned as port evidence.
+PORT_CRATE_EXCLUDED_DIR_PARTS = ("fn64-render-rt64",)
+SHA256_LITERAL = re.compile(r"\b[0-9a-f]{64}\b")
 TASK_KEYS = {
     "id", "outcome", "authority", "owner_lane", "recommended_profile",
     "writable_paths", "non_goals", "baseline_command", "exit_gate",
@@ -323,45 +330,123 @@ def dependency_paths(tree: Path, relative: str, known: set[str]) -> list[str]:
     return sorted(result)
 
 
-def route_for(relative: str, gates: dict[str, dict]) -> tuple[str, str, str, str, str]:
-    """Return the audited primary milestone, workstream, lane, profile, state.
+def route_for(relative: str, gates: dict[str, dict]) -> tuple[str, str, str, str, bool]:
+    """Return the audited primary milestone, workstream, lane, profile, and
+    whether this path is authority-gated.
 
     Rules are deliberately closed: a new file that does not match a named
-    family traps instead of falling through to feature parity.
+    family traps instead of falling through to feature parity. The boolean
+    is purely a path-derived fact (never a completion claim); the final
+    `port_state` is computed separately from mechanically detected port
+    evidence, see `ported_as_for`/`port_state_for`.
     """
     if relative in gates:
         milestone = gates[relative]["port_milestone"]
         lane = "authority-evidence" if milestone != "M10" else "gpu-render"
         profile = "M/medium" if lane == "authority-evidence" else "P/high"
-        return milestone, "authority-overlay", lane, profile, "authority-gated"
+        return milestone, "authority-overlay", lane, profile, True
 
     lower = relative.lower()
     name = PurePosixPath(lower).name
     if relative == "include/rt64_extended_gbi.h" or "gbi_extended" in lower:
-        return "M8", "feature-parity", "semantic-frontend", "I/high", "not-started"
+        return "M8", "feature-parity", "semantic-frontend", "I/high", False
     if any(token in lower for token in ("raytracing", "globalhit", "lights.hlsli")):
-        return "M12", "ray-path-tracing", "gpu-render", "I/high", "not-started"
+        return "M12", "ray-path-tracing", "gpu-render", "I/high", False
     if lower.startswith("src/gbi/") or any(token in lower for token in ("/rt64_rsp", "microcode", "rspmodify", "rspprocess", "rspsmooth", "rspvertextest", "rspworld")):
-        return "M5", "gbi-deferred-rsp", "semantic-frontend", "I/high", "not-started"
+        return "M5", "gbi-deferred-rsp", "semantic-frontend", "I/high", False
     if lower.startswith("src/shared/") and any(token in name for token in ("f3d", "point_light", "rsp_")):
-        return "M5", "gbi-deferred-rsp", "semantic-frontend", "I/high", "not-started"
+        return "M5", "gbi-deferred-rsp", "semantic-frontend", "I/high", False
     if lower.startswith("src/shaders/fb") or any(token in lower for token in ("framebuffer", "/rt64_rdp", "raster", "texture", "tile_processor", "native_target", "render_target", "videointerface", "video_interface", "vi_renderer", "renderparams", "postblend", "rtcopy", "depth.hlsli", "random.hlsli", "bluenoise.hlsli", "background.hlsli", "library.hlsli")):
-        return "M4", "rdp-framebuffer", "gpu-render", "I/high", "not-started"
+        return "M4", "rdp-framebuffer", "gpu-render", "I/high", False
     if lower.startswith("src/shared/") and any(token in name for token in ("blender", "color_combiner", "fb_", "other_mode", "rdp_", "render_params", "render_indices", "render_flags", "gpu_tile", "interleaved")):
-        return "M4", "rdp-framebuffer", "gpu-render", "I/high", "not-started"
+        return "M4", "rdp-framebuffer", "gpu-render", "I/high", False
     if any(token in lower for token in ("state", "workload", "present.h", "interpreter.h")):
-        return "M3", "raw-dpc", "semantic-frontend", "F/xhigh", "not-started"
+        return "M3", "raw-dpc", "semantic-frontend", "F/xhigh", False
     if lower.startswith("src/shared/") and any(token in name for token in ("extra_params", "frame_params", "hlsl")):
-        return "M1", "semantic-ir", "semantic-frontend", "F/xhigh", "not-started"
+        return "M1", "semantic-ir", "semantic-frontend", "F/xhigh", False
     if any(token in lower for token in ("timer", "buffer_uploader", "descriptor_sets", "render_worker", "shader_compiler")):
-        return "M6", "performance-spine", "integration-performance", "I/high", "not-started"
+        return "M6", "performance-spine", "integration-performance", "I/high", False
     if lower.startswith(("src/apple/", "src/rhi/")) or any(token in lower for token in ("application_window", "dynamic_libraries", "optimus")):
-        return "M10", "platform-cutover", "gpu-render", "P/high", "not-started"
+        return "M10", "platform-cutover", "gpu-render", "P/high", False
     if any(token in lower for token in ("upscaler", "postprocess", "histogram", "bicubic", "boxfilter", "gaussian", "luminance")):
-        return "M11", "modernization", "gpu-render", "I/high", "not-started"
+        return "M11", "modernization", "gpu-render", "I/high", False
     if relative in AUDITED_M8_PATHS:
-        return "M8", "feature-parity", "semantic-frontend", "I/high", "not-started"
+        return "M8", "feature-parity", "semantic-frontend", "I/high", False
     raise InventoryError(f"unrouted admitted RT64 source: {relative}")
+
+
+def port_state_for(gated: bool, ported_as: list[str]) -> str:
+    """Derive `port_state` from mechanically detected port evidence.
+
+    `authority-gated` is a path-derived source-overlay constraint and takes
+    priority (it is never itself completion evidence). Otherwise a source is
+    `ported` only when at least one Rust module in a port-target crate cites
+    its exact whole-file SHA-256 digest (`ported_as_for`); everything else is
+    `not-started`. This never widens to a partial/behavioral claim.
+    """
+    if gated:
+        return "authority-gated"
+    return "ported" if ported_as else "not-started"
+
+
+def rust_port_source_files(root: Path) -> list[Path]:
+    """Every `.rs` file in a Rust-port-target crate, deterministically ordered.
+
+    `fn64-render-rt64` is excluded: it is the C++ FFI shim and
+    authority-gate integrity-guard crate, never a Rust reimplementation of
+    RT64 source (its own tests assert C++/CMake overlay text still contains
+    an RT64 source-gate digest, which is a different fact than "this Rust
+    module ports that source").
+    """
+    crates_dir = root / "crates"
+    if not crates_dir.is_dir():
+        return []
+    files = [
+        path
+        for path in crates_dir.rglob("*.rs")
+        if not (PORT_CRATE_EXCLUDED_DIR_PARTS and set(path.parts) & set(PORT_CRATE_EXCLUDED_DIR_PARTS))
+    ]
+    return sorted(files)
+
+
+def sha256_citation_index(root: Path) -> dict[str, list[str]]:
+    """Map each SHA-256 hex digest literal to the sorted Rust module paths
+    (repository-relative, POSIX) that contain it verbatim.
+
+    A whole-file SHA-256 digest is the only citation shape this tool trusts
+    as a fully mechanical, human-judgment-free port signal: every basename
+    or line-range citation style in this repository was, on inspection, also
+    used for cross-reference/call-site/inherited/explicitly-disclaimed
+    mentions that a fully mechanical scan cannot safely tell apart from a
+    genuine port. Under-claiming here (missing a real port that only cites a
+    partial-file line range, e.g. `endian_swap.rs`/`fbcommon.rs`/
+    `rsp_math.rs`) is the deliberately safe failure mode; see
+    `docs/RT64-PORT-INVENTORY.md`'s generation note.
+    """
+    index: dict[str, list[str]] = {}
+    for path in rust_port_source_files(root):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        digests = set(SHA256_LITERAL.findall(text))
+        if not digests:
+            continue
+        relative = path.resolve().relative_to(root.resolve()).as_posix()
+        for digest in digests:
+            index.setdefault(digest, []).append(relative)
+    for digest, paths in index.items():
+        paths.sort()
+    return index
+
+
+def ported_as_for(sources: dict, citation_index: dict[str, list[str]]) -> list[str]:
+    """Rust module paths that cite `sources["oracle"]`/`sources["port"]`'s
+    whole-file SHA-256 digest verbatim, sorted and de-duplicated."""
+    modules: set[str] = set()
+    for selection in SOURCE_SELECTIONS:
+        snapshot_value = sources[selection]
+        if snapshot_value is None:
+            continue
+        modules.update(citation_index.get(snapshot_value["sha256"], ()))
+    return sorted(modules)
 
 
 def card_id(relative: str, milestone: str) -> str:
@@ -369,19 +454,20 @@ def card_id(relative: str, milestone: str) -> str:
     return f"rt64-port-{milestone.lower()}-{slug}"
 
 
-def rust_destination(relative: str, milestone: str) -> str:
+def proposed_rust_destination(relative: str, milestone: str) -> str:
+    """A sensible, unique, not-yet-created destination for a source with no
+    mechanically detected port. Placed flat under the target crate's `src/`,
+    matching the real layout of every already-ported module in this
+    repository today (no milestone-keyed subdirectory of this shape exists;
+    inventing one here would just be a second, equally speculative guess
+    replacing the previous fabricated `src/features/`-style paths)."""
     path = PurePosixPath(relative)
     suffix = path.suffix.lstrip(".").lower()
     stem = re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_")
     if path.suffix in {".hlsl", ".hlsli"}:
-        return f"crates/fn64-render-wgpu/src/shaders/{stem}_{suffix}.wgsl"
-    area = {
-        "M1": "ported_ir", "M3": "raw_dpc", "M4": "rdp", "M5": "gbi",
-        "M6": "performance", "M8": "features", "M10": "platform",
-        "M11": "modernization", "M12": "tracing",
-    }[milestone]
+        return f"crates/fn64-render-wgpu/src/{stem}_{suffix}.wgsl"
     crate = "fn64-render-ir" if milestone == "M1" else "fn64-render-wgpu"
-    return f"crates/{crate}/src/{area}/{stem}_{suffix}.rs"
+    return f"crates/{crate}/src/{stem}_{suffix}.rs"
 
 
 def snapshot(tree: Path, relative: str, known: set[str]) -> dict:
@@ -428,13 +514,16 @@ def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict
     all_paths = sorted(known_by_source["oracle"] | known_by_source["port"])
     files: list[dict] = []
     trees = {"oracle": oracle_tree, "port": port_tree}
+    citation_index = sha256_citation_index(ROOT)
     for relative in all_paths:
-        milestone, workstream, owner, profile, port_state = route_for(relative, gates)
+        milestone, workstream, owner, profile, gated = route_for(relative, gates)
         sources = {
             name: snapshot(trees[name], relative, known_by_source[name]) if relative in known_by_source[name] else None
             for name in SOURCE_SELECTIONS
         }
-        destination = rust_destination(relative, milestone)
+        ported_as = ported_as_for(sources, citation_index)
+        port_state = port_state_for(gated, ported_as)
+        writable_paths = ported_as if ported_as else [proposed_rust_destination(relative, milestone)]
         item = {
             "path": relative,
             "sources": sources,
@@ -442,6 +531,7 @@ def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict
             "milestone": milestone,
             "workstream": workstream,
             "port_state": port_state,
+            "ported_as": ported_as,
             "evidence_state": "source-digests-verified",
             "task_card": {
                 "id": card_id(relative, milestone),
@@ -453,7 +543,7 @@ def build_inventory(oracle_tree: Path, port_tree: Path, authority: dict) -> dict
                 },
                 "owner_lane": owner,
                 "recommended_profile": profile,
-                "writable_paths": [destination],
+                "writable_paths": writable_paths,
                 "non_goals": [
                     "Do not edit, vendor, or transliterate the RT64 C++ source.",
                     "Do not claim parity from source translation or inventory status.",
@@ -574,11 +664,15 @@ def validate_inventory(value: dict, authority: dict) -> None:
     }
     gates = {item["path"]: item for item in authority["overlays"]["source_gates"]}
     require(set(gates) <= known, f"authority gates missing from inventory: {sorted(set(gates) - known)}")
-    destinations: set[str] = set()
+    citation_index = sha256_citation_index(ROOT)
+    port_source_files = {
+        path.resolve().relative_to(ROOT.resolve()).as_posix() for path in rust_port_source_files(ROOT)
+    }
+    proposed_destinations: set[str] = set()
     counts = {kind: 0 for kind in ("added", "removed", "modified", "unchanged")}
     for item in files:
         path = item["path"]
-        base_keys = {"path", "sources", "port_delta", "milestone", "workstream", "port_state", "evidence_state", "task_card"}
+        base_keys = {"path", "sources", "port_delta", "milestone", "workstream", "port_state", "ported_as", "evidence_state", "task_card"}
         require(set(item) in (base_keys, base_keys | {"authority_gate"}), f"{path}: file entry fields changed")
         in_prefix = path.startswith(tuple(prefix + "/" for prefix in SOURCE_PREFIXES))
         require(in_prefix or path in allowed_authority_exceptions(authority), f"out-of-scope source path: {path}")
@@ -592,11 +686,24 @@ def validate_inventory(value: dict, authority: dict) -> None:
         expected_delta = delta_kind(source_values["oracle"], source_values["port"])
         require(item["port_delta"] == expected_delta, f"{path}: port delta classification drift")
         counts[expected_delta] += 1
-        expected_route = route_for(path, gates)
+        expected_milestone, expected_workstream, expected_owner, expected_profile, expected_gated = route_for(path, gates)
         card = item["task_card"]
         require(isinstance(card, dict) and set(card) == TASK_KEYS, f"{path}: task-card fields changed")
-        require((item["milestone"], item["workstream"], card["owner_lane"], card["recommended_profile"], item["port_state"]) == expected_route, f"{path}: audited route drift")
+        require(
+            (item["milestone"], item["workstream"], card["owner_lane"], card["recommended_profile"]) == (expected_milestone, expected_workstream, expected_owner, expected_profile),
+            f"{path}: audited route drift",
+        )
         require(item["milestone"] in MILESTONES, f"{path}: invalid milestone")
+        ported_as = item["ported_as"]
+        require(isinstance(ported_as, list) and all(isinstance(entry, str) for entry in ported_as), f"{path}: ported_as must be a list of strings")
+        require(ported_as == sorted(set(ported_as)), f"{path}: ported_as is not sorted and de-duplicated")
+        expected_ported_as = ported_as_for(source_values, citation_index)
+        require(ported_as == expected_ported_as, f"{path}: ported_as drift from mechanical SHA-256 citation scan")
+        for module in ported_as:
+            require(module in port_source_files, f"{path}: ported_as cites a Rust file that does not exist: {module}")
+            require(module.startswith("crates/") and "fn64-render-rt64/" not in module, f"{path}: ported_as cites a non-port-crate module: {module}")
+        require(item["port_state"] in PORT_STATES, f"{path}: invalid port_state")
+        require(item["port_state"] == port_state_for(expected_gated, ported_as), f"{path}: port_state is not derived from gated status and ported_as")
         require(item["evidence_state"] == "source-digests-verified", f"{path}: source evidence state drift")
         require(card["id"] == card_id(path, item["milestone"]), f"{path}: task-card id drift")
         require(set(card["authority"]) == {"port_source", "comparison_oracle", "plan"}, f"{path}: task authority fields changed")
@@ -610,11 +717,15 @@ def validate_inventory(value: dict, authority: dict) -> None:
         require(card["evidence_state"] == "not-run", f"{path}: task evidence state drift")
         require(card["claim_status"] == "candidate-observation", f"{path}: task claim status drift")
         writable = card["writable_paths"]
-        require(writable == [rust_destination(path, item["milestone"])], f"{path}: Rust writable destination drift")
-        destination = writable[0]
-        require(destination.startswith("crates/fn64-render"), f"{path}: task does not target Rust renderer source")
-        require(destination not in destinations, f"duplicate writable destination: {destination}")
-        destinations.add(destination)
+        expected_writable = ported_as if ported_as else [proposed_rust_destination(path, item["milestone"])]
+        require(writable == expected_writable, f"{path}: Rust writable destination drift")
+        require(writable, f"{path}: task has no writable destination")
+        for destination in writable:
+            require(destination.startswith("crates/fn64-render"), f"{path}: task does not target Rust renderer source")
+        if not ported_as:
+            destination = writable[0]
+            require(destination not in proposed_destinations, f"duplicate proposed writable destination: {destination}")
+            proposed_destinations.add(destination)
         if path in gates:
             require("authority_gate" in item, f"{path}: authority gate metadata missing")
             require(item["authority_gate"] == {"mechanisms": gates[path]["mechanisms"], "oracle_sha256": gates[path]["sha256"]}, f"{path}: authority gate drift")
@@ -637,10 +748,13 @@ def markdown(inventory: dict) -> str:
         totals[item["milestone"]] = count + 1, lines + primary["lines"]
     sources = inventory["sources"]
     delta = inventory["port_delta_counts"]
+    state_counts = {state: 0 for state in sorted(PORT_STATES)}
+    for item in files:
+        state_counts[item["port_state"]] += 1
     output = [
         "# RT64 port inventory", "",
         "<!-- Generated by tools/rt64_port_inventory.py from two admitted clean checkouts and docs/rt64-port-authority.json. -->", "",
-        "This is the dual-pin mechanical work denominator for the RT64-to-Rust program. It records source identities, port deltas, include edges, non-exhaustive navigation hints, and dispatch-card contracts. It is not a behavior or parity claim.", "",
+        "This is the dual-pin mechanical work denominator for the RT64-to-Rust program. It records source identities, port deltas, include edges, non-exhaustive navigation hints, mechanically detected port evidence, and dispatch-card contracts. It is not a behavior or parity claim.", "",
         "Regenerate or source-check it from explicit clean checkouts:", "",
         "```sh",
         "python3 tools/rt64_port_inventory.py --oracle-dir /absolute/path/to/clean/oracle --port-dir /absolute/path/to/clean/port-source",
@@ -650,21 +764,24 @@ def markdown(inventory: dict) -> str:
         f"- Primary semantic port input: [`{sources['port']['commit'][:7]}`]({sources['repository']}/commit/{sources['port']['commit']}) (`{sources['port']['authority_status']}`).",
         f"- Denominator: {len(files)} project-owned or explicitly authority-gated host/shader files; `{sum((item['sources']['port'] or item['sources']['oracle'])['lines'] for item in files) / 1000:.3f}` KLOC at the primary port pin.",
         f"- Port delta: {delta['added']} added, {delta['removed']} removed, {delta['modified']} modified, {delta['unchanged']} unchanged source files.",
+        f"- Port state: {state_counts['ported']} `ported`, {state_counts['not-started']} `not-started`, {state_counts['authority-gated']} `authority-gated` (of {len(files)}).",
         f"- Source-set SHA-256: `{inventory['source_set_sha256']}`.",
         "- Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.",
         "- Paths are repository-relative; the checked artifact rejects machine-local paths.", "",
         "`candidate_hints` in the JSON are deliberately non-exhaustive regex navigation aids, not a symbol denominator.", "",
+        "`port_state` is mechanically derived, never hand-set: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
         "## Milestone denominator", "", "| milestone | files | primary-port KLOC |", "|---|---:|---:|",
     ]
     for milestone in sorted(totals, key=lambda item: int(item[1:])):
         count, lines = totals[milestone]
         output.append(f"| `{milestone}` | {count} | `{lines / 1000:.3f}` |")
-    output.extend(["", "## Source work cards", "", "Each row is one source-bound candidate card with a unique Rust destination. JSON carries its outcome, both authorities, exact destination, non-goals, baseline, exit gate, evidence state, and candidate-vs-claim status.", "", "| source | delta | lines | hints | deps | milestone / workstream | source evidence | task evidence / claim | owner | card |", "|---|---|---:|---:|---:|---|---|---|---|---|"])
+    output.extend(["", "## Source work cards", "", "Each row is one source-bound candidate card with its mechanically derived port state and writable destination(s). JSON carries its outcome, both authorities, exact destination(s), non-goals, baseline, exit gate, evidence state, and candidate-vs-claim status.", "", "| source | delta | port state | ported as | lines | hints | deps | milestone / workstream | source evidence | task evidence / claim | owner | card |", "|---|---|---|---|---:|---:|---:|---|---|---|---|---|"])
     for item in files:
         primary = item["sources"]["port"] or item["sources"]["oracle"]
         card = item["task_card"]
+        ported_as = ", ".join(f"`{module}`" for module in item["ported_as"]) or "--"
         output.append(
-            f"| `{item['path']}` | `{item['port_delta']}` | {primary['lines']} | {len(primary['candidate_hints'])} | {len(primary['dependencies'])} | "
+            f"| `{item['path']}` | `{item['port_delta']}` | `{item['port_state']}` | {ported_as} | {primary['lines']} | {len(primary['candidate_hints'])} | {len(primary['dependencies'])} | "
             f"`{item['milestone']}` / `{item['workstream']}` | `{item['evidence_state']}` | `{card['evidence_state']}` / `{card['claim_status']}` | "
             f"`{card['owner_lane']}` ({card['recommended_profile']}) | `{card['id']}` |"
         )
@@ -732,6 +849,23 @@ def self_test() -> None:
     routed = next(item for item in mutated["files"] if item["milestone"] == "M4" and "authority_gate" not in item)
     routed["milestone"] = "M8"
     expect_rejected(mutated, authority, "audited route drift")
+    mutated = copy.deepcopy(base)
+    ported = next(item for item in mutated["files"] if item["ported_as"])
+    ported["ported_as"] = sorted(set(ported["ported_as"]) | {"crates/fn64-render-wgpu/src/zzz_not_a_real_module.rs"})
+    expect_rejected(mutated, authority, "ported_as drift from mechanical SHA-256 citation scan")
+    mutated = copy.deepcopy(base)
+    ported = next(item for item in mutated["files"] if item["ported_as"])
+    ported["port_state"] = "not-started"
+    expect_rejected(mutated, authority, "port_state is not derived from gated status and ported_as")
+    mutated = copy.deepcopy(base)
+    not_started = next(item for item in mutated["files"] if item["port_state"] == "not-started")
+    not_started["ported_as"] = ["crates/fn64-render-wgpu/src/rt64_math.rs"]
+    expect_rejected(mutated, authority, "ported_as drift from mechanical SHA-256 citation scan")
+    mutated = copy.deepcopy(base)
+    not_started_two = [item for item in mutated["files"] if item["port_state"] == "not-started"][:2]
+    require(len(not_started_two) == 2, "self-test fixture requires at least two not-started files")
+    not_started_two[0]["task_card"]["writable_paths"] = list(not_started_two[1]["task_card"]["writable_paths"])
+    expect_rejected(mutated, authority, "Rust writable destination drift")
 
     with tempfile.TemporaryDirectory() as temporary:
         tree = Path(temporary) / "rt64"
