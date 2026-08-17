@@ -1633,6 +1633,39 @@ mod production {
             Ok(prepared)
         }
 
+        /// Complete one bound submission's backend-side execution exactly
+        /// like [`Self::complete_execution`] -- same authority/queue
+        /// validation, via the same [`BoundSubmittedRawDpc::
+        /// into_backend_prepared`] call -- but for a submission whose
+        /// effects never touch physical state at all (a triangle-only raw-
+        /// DPC packet has nothing to load into or publish out of a `P`).
+        /// Records the ready-publication metadata against the *currently
+        /// active* slot index, not the inactive one `complete_execution`
+        /// uses, and never reads, writes, or constructs a `P`: neither slot
+        /// in `self.slots` is touched. `prepare_publication`/`commit` need
+        /// no knowledge of which of the two methods produced a given ready
+        /// record -- `commit` flipping `active` to its own already-active
+        /// value is simply a no-op write.
+        ///
+        /// Matches [`Self::complete_execution`]'s own replacement semantics
+        /// exactly: like that method, this one unconditionally overwrites
+        /// any prior `self.ready`, with no busy-gate or rejection if an
+        /// earlier ready-but-unpublished completion is still outstanding.
+        pub fn complete_execution_preserving_physical(
+            &mut self,
+            bound: BoundSubmittedRawDpc,
+            effects: fn64_render_ir::BackendEffectReport,
+        ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
+            self.ready = Some(ReadyPhysicalSlot {
+                queue: self.authority.authority.queue_identity(),
+                submission: prepared.submission(),
+                slot_index: self.active,
+                retirement_slot: Rc::clone(&prepared.retirement.slot),
+            });
+            Ok(prepared)
+        }
+
         /// Validate every queue/submission/ready-slot fact this coordinator
         /// privately recorded at [`Self::complete_execution`] time against
         /// `capsule`, *before* any physical publication exists as a value --
@@ -3355,6 +3388,231 @@ mod production {
                 "the superseded id=1 candidate must drop exactly here, inside \
                  complete_execution -- not deferred to a later commit"
             );
+        }
+
+        /// Build one bound submission ready to hand to
+        /// `complete_execution_preserving_physical`, without going through
+        /// `guest_committed_fixture` (which always calls the ordinary
+        /// `complete_execution` and requires a `next_physical`).
+        fn bound_submission_fixture(
+            session: &mut RawDpcAbiSession,
+            authority: &RawDpcBackendAuthority,
+        ) -> (BoundSubmittedRawDpc, fn64_render_ir::BackendEffectReport) {
+            let (planned, destination) = planned_fixture(session, authority, true);
+            let capture = matching_guest_read_capture(&planned);
+            let bound = session.finalize_and_submit(planned, capture).unwrap();
+            let write = CompletedWrite::try_new(
+                destination,
+                16,
+                fn64_render_ir::effect_content_digest(&[0x55; 16]),
+            )
+            .unwrap();
+            let effects =
+                BackendEffectReport::try_new(bound.submitted.packet(), vec![write]).unwrap();
+            (bound, effects)
+        }
+
+        #[test]
+        fn preserving_completion_never_clones_touches_or_replaces_either_physical_slot() {
+            let drops = Rc::new(RefCell::new(Vec::new()));
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(DroppableFakePhysical {
+                id: 0,
+                drops: Rc::clone(&drops),
+            });
+
+            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+            let _prepared = coordinator
+                .complete_execution_preserving_physical(bound, effects)
+                .unwrap();
+
+            assert_eq!(
+                coordinator.physical().id,
+                0,
+                "the active slot's physical identity must survive a preserving completion \
+                 unchanged"
+            );
+            assert!(
+                coordinator.slots[1].is_none(),
+                "the inactive slot must remain untouched -- no successor is produced or \
+                 consumed by a preserving completion"
+            );
+            assert!(
+                drops.borrow().is_empty(),
+                "no P is ever cloned, dropped, or otherwise touched by a preserving completion"
+            );
+        }
+
+        #[test]
+        fn preserving_completion_leaves_an_occupied_inactive_slot_untouched() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(0));
+            // Occupy the inactive slot via an ordinary completion first, so
+            // there is real content there to prove untouched.
+            let _first = guest_committed_fixture(&mut session, &mut coordinator, FakePhysical(42));
+            assert_eq!(coordinator.slots[1], Some(FakePhysical(42)));
+
+            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+            let _prepared = coordinator
+                .complete_execution_preserving_physical(bound, effects)
+                .unwrap();
+
+            assert_eq!(
+                coordinator.slots[1],
+                Some(FakePhysical(42)),
+                "a preserving completion must not read, overwrite, or clear the inactive slot"
+            );
+            assert_eq!(coordinator.physical(), &FakePhysical(0));
+        }
+
+        #[test]
+        fn a_second_preserving_completion_replaces_the_first_readys_metadata() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(0));
+
+            let (bound_a, effects_a) =
+                bound_submission_fixture(&mut session, &coordinator.authority);
+            let prepared_a = coordinator
+                .complete_execution_preserving_physical(bound_a, effects_a)
+                .unwrap();
+            let submission_a = prepared_a.submission();
+            let ready_after_a = coordinator.ready.as_ref().unwrap();
+            assert_eq!(ready_after_a.submission, submission_a);
+
+            let (bound_b, effects_b) =
+                bound_submission_fixture(&mut session, &coordinator.authority);
+            let prepared_b = coordinator
+                .complete_execution_preserving_physical(bound_b, effects_b)
+                .unwrap();
+            let submission_b = prepared_b.submission();
+            assert_ne!(submission_a, submission_b);
+
+            let ready_after_b = coordinator.ready.as_ref().unwrap();
+            assert_eq!(
+                ready_after_b.submission, submission_b,
+                "a second preserving completion must cleanly replace the first's ready \
+                 metadata, matching complete_execution's own unconditional overwrite \
+                 semantics -- not be rejected as \"busy\""
+            );
+
+            // Dropping the first prepared capsule (abandoned, never
+            // published) must not retroactively poison the second's -- each
+            // ordinal owns its own retirement slot.
+            drop(prepared_a);
+            drop(prepared_b);
+        }
+
+        #[test]
+        fn dropping_an_abandoned_preserving_completion_does_not_validate_a_later_unrelated_capsule()
+        {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(0));
+
+            let (bound_a, effects_a) =
+                bound_submission_fixture(&mut session, &coordinator.authority);
+            let prepared_a = coordinator
+                .complete_execution_preserving_physical(bound_a, effects_a)
+                .unwrap();
+            // Abandon it: dropped without ever reaching
+            // prepare_publication/commit. Its retirement records `Rejected`
+            // at `BackendReceipt` in its own shared slot.
+            drop(prepared_a);
+
+            // A later, unrelated capsule must still be independently
+            // provable: complete a fresh ordinal and carry it all the way to
+            // a real publication.
+            let committed =
+                guest_committed_fixture(&mut session, &mut coordinator, FakePhysical(3));
+            let submission_b = committed.submission();
+
+            let mut fabric = admitted_fabric();
+            let token = fabric.pending_dpc_submission().unwrap().token;
+            let ready = fabric.prepare_dpc_commit(token).unwrap();
+            let capsule = session.seal_publication(committed, ready).unwrap();
+
+            let publication = coordinator.prepare_publication(capsule);
+            let outcome = publication.commit();
+            assert_eq!(
+                outcome.submission(),
+                submission_b,
+                "the later capsule must publish as itself, not be confused with the \
+                 abandoned preserving completion's identity"
+            );
+            assert_eq!(coordinator.physical(), &FakePhysical(3));
+        }
+
+        #[test]
+        fn preserving_completion_rejects_a_foreign_authority_before_recording_a_ready_slot() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let coordinator = authority.into_coordinator(FakePhysical(0));
+            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+
+            let (_, foreign_authority) = new_raw_dpc_roles().unwrap();
+            // Drive the validation-failing call through a genuinely
+            // *foreign* coordinator instead, so the original `coordinator`
+            // (and its `self.ready`) is provably untouched by the rejected
+            // attempt.
+            let mut foreign_coordinator = foreign_authority.into_coordinator(FakePhysical(0));
+            let trapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                foreign_coordinator.complete_execution_preserving_physical(bound, effects)
+            }));
+            assert!(
+                trapped.is_err(),
+                "a bound submission paired with an unrelated authority must trap before any \
+                 ReadyPhysicalSlot is recorded"
+            );
+            assert!(
+                foreign_coordinator.ready.is_none(),
+                "a validation failure must never record a ready slot"
+            );
+            assert!(coordinator.ready.is_none());
+        }
+
+        #[test]
+        fn replacement_preserve_replacement_leaves_the_coordinator_able_to_publish_a_real_successor(
+        ) {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(0));
+
+            // 1. A normal complete_execution with a real successor.
+            let committed_1 =
+                guest_committed_fixture(&mut session, &mut coordinator, FakePhysical(11));
+            let mut fabric_1 = admitted_fabric();
+            let token_1 = fabric_1.pending_dpc_submission().unwrap().token;
+            let ready_1 = fabric_1.prepare_dpc_commit(token_1).unwrap();
+            let capsule_1 = session.seal_publication(committed_1, ready_1).unwrap();
+            coordinator.prepare_publication(capsule_1).commit();
+            assert_eq!(coordinator.physical(), &FakePhysical(11));
+
+            // 2. A preserving completion in between -- must not disturb
+            // either slot or block a future real completion.
+            let (bound_mid, effects_mid) =
+                bound_submission_fixture(&mut session, &coordinator.authority);
+            let _prepared_mid = coordinator
+                .complete_execution_preserving_physical(bound_mid, effects_mid)
+                .unwrap();
+            assert_eq!(coordinator.physical(), &FakePhysical(11));
+            assert_eq!(
+                coordinator.slots[0],
+                Some(FakePhysical(0)),
+                "the preserving completion must not touch the (now-inactive) slot 0, still \
+                 holding the pre-flip seed value"
+            );
+
+            // 3. Another normal complete_execution with a real successor --
+            // must cleanly replace the preserving call's ready metadata and
+            // publish correctly afterward.
+            let committed_3 =
+                guest_committed_fixture(&mut session, &mut coordinator, FakePhysical(22));
+            let submission_3 = committed_3.submission();
+            let mut fabric_3 = admitted_fabric();
+            let token_3 = fabric_3.pending_dpc_submission().unwrap().token;
+            let ready_3 = fabric_3.prepare_dpc_commit(token_3).unwrap();
+            let capsule_3 = session.seal_publication(committed_3, ready_3).unwrap();
+            let outcome_3 = coordinator.prepare_publication(capsule_3).commit();
+
+            assert_eq!(outcome_3.submission(), submission_3);
+            assert_eq!(coordinator.physical(), &FakePhysical(22));
         }
 
         #[test]
