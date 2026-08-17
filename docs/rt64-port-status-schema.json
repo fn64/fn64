@@ -68,6 +68,7 @@
     "max_goal_chars": 600,
     "max_text_field_chars": 400,
     "max_array_items": 40,
+    "max_ticket_items": 400,
     "max_findings_items": 20,
     "max_verification_runs_items": 20,
     "max_writable_paths_items": 20,

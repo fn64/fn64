@@ -180,7 +180,13 @@ def validate_tickets(schema: dict, tickets: list, milestone_ids: set[str]) -> li
     bounds = schema["bounds"]
     id_re = re.compile(schema["id_pattern"])
     require(isinstance(tickets, list) and tickets, "tickets: must be a non-empty list")
-    require(len(tickets) <= bounds["max_array_items"], "tickets: exceeds max_array_items")
+    # The ticket list is the program's whole work breakdown, not an ordinary
+    # bounded field: 276 admitted RT64 sources decompose into far more cards
+    # than the 40-item cap every other array here carries.
+    require(
+        len(tickets) <= bounds["max_ticket_items"],
+        "tickets: exceeds max_ticket_items",
+    )
 
     seen_ids: set[str] = set()
     for ticket in tickets:

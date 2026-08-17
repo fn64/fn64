@@ -15,9 +15,9 @@
 ## Workflow frontier
 
 - **COMPLETE milestones:** 0/13
-- **INTEGRATED / recorded tickets:** 20/26 — recorded ticket scope, **not a percent-to-goal**.
-- **Milestones with no tickets:** `M5`, `M6`, `M7`, `M8`, `M9`, `M10`, `M11`, `M12`
-- **Retrospective coverage:** 12/26; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`
+- **INTEGRATED / recorded tickets:** 20/40 — recorded ticket scope, **not a percent-to-goal**.
+- **Milestones with no tickets:** `M5`, `M6`, `M7`, `M9`, `M10`, `M11`, `M12`
+- **Retrospective coverage:** 12/40; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`, `M8.1`, `M8.2`, `M8.3`, `M8.4`, `M8.5`, `M8.6`, `M8.7`, `M8.8`, `M8.9`, `M8.10`, `M8.11`, `M8.12`, `M8.13`, `M8.14`
 
 ### RUNNING (2)
 
@@ -29,9 +29,37 @@
 
 None.
 
-### READY (1)
+### READY (15)
 
 - `M2.5.2` — owner: integration lead; branch: `port/rt64-wgpu-ingestion-assessment` -> `main`; dependencies: M2.5.1=INTEGRATED; reliability: **NOT RECORDED**; next: Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
+
+- `M8.1` — owner: extended-GBI encoder writer; branch: `port/m8-extended-gbi-encode` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port PARAM plus the G_EX_* constant set and the gEX* encoders as pure functions returning (word0, word1) pairs; unit-test each encoder against the literal bit layout quoted from the header.
+
+- `M8.2` — owner: extended-GBI decoder writer; branch: `port/m8-extended-gbi-decode` -> `main`; dependencies: M8.1=READY; reliability: **NOT RECORDED**; next: Port the p0/p1 extraction half of each handler into `decode_<opcode>(words) -> Params`; assert encoder/decoder round-trip for every opcode M8.1 encodes.
+
+- `M8.3` — owner: rt64-math decomposition writer; branch: `port/m8-rt64-math-matrix-cluster` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the listed matrix helpers against fn64-render-ir's Mat4, extending rt64_math.rs's Nonclaims to record what is now covered; unit-test each against literal hand-computed matrices.
+
+- `M8.4` — owner: rt64-math quaternion writer; branch: `port/m8-rt64-math-decompose` -> `main`; dependencies: M8.3=READY; reliability: **NOT RECORDED**; next: Introduce the quaternion and matrix-inverse helpers, then port decomposeMatrix/recomposeMatrix/lerpTransforms; prove decompose->recompose round-trips within a stated epsilon.
+
+- `M8.5` — owner: rigid-body interpolation writer; branch: `port/m8-rigid-body` -> `main`; dependencies: M8.4=READY; reliability: **NOT RECORDED**; next: After M8.4 lands the decomposition core, port the five RigidBody methods and unit-test the skip/interpolate heuristic decisions at their epsilon boundaries.
+
+- `M8.6` — owner: port-provenance repair writer; branch: `port/m8-color-converter-provenance` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Add the two sha256 citations to color_converter.rs's module doc, then run the inventory checker and confirm both rows report ported.
+
+- `M8.7` — owner: replacement-path resolution writer; branch: `port/m8-replacement-resolve` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the eight named functions with the filter structs they need as plain Rust types; table-test checkWildcard including empty-pattern and multi-wildcard cases.
+
+- `M8.8` — owner: user-configuration validation writer; branch: `port/m8-user-config-validate` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the enum set plus the three functions; unit-test clamping at bounds and full enum coverage for msaaSampleCount.
+
+- `M8.9` — owner: draw-call preset matching writer; branch: `port/m8-preset-draw-call-match` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the key/mask types and matches(); test that masked-out fields are genuinely ignored by comparison and that unmasked mismatches reject.
+
+- `M8.10` — owner: light estimation writer; branch: `port/m8-light-estimation` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the accumulator fields and the two estimator functions; test zero-light, single-light, and weighted multi-light cases.
+
+- `M8.11` — owner: shader-description serialization writer; branch: `port/m8-shader-description` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the packed description struct and toShader(); golden-test the emitted string for a set of representative combiner/othermode inputs.
+
+- `M8.12` — owner: frame-compatibility predicate writer; branch: `port/m8-frame-compatibility` -> `main`; dependencies: M8.3=READY; reliability: **NOT RECORDED**; next: Port the two predicates over local descriptor structs once M8.3 supplies matrixDifference; test the tolerance boundary and each rejecting field.
+
+- `M8.13` — owner: lookat/projection helper writer; branch: `port/m8-lookat-projection-helpers` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the two fragments as free functions with the small POD inputs they need; test the lerp at weight 0, 1, and midpoint, and the aspect scale against hand-computed matrices.
+
+- `M8.14` — owner: fullscreen-triangle shader writer; branch: `port/m8-fullscreen-vs` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the vertex formula as a CPU oracle plus owned WGSL, assert the three vertex outputs exactly, and validate the WGSL with Naga.
 
 ### BLOCKED (3)
 
@@ -53,7 +81,7 @@ None.
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
-| `M8` | `PLANNED` | Complete RT64 feature parity | none |
+| `M8` | `PLANNED` | Complete RT64 feature parity | READY:14 |
 | `M9` | `PLANNED` | Typed CPU/GPU coherence optimization | none |
 | `M10` | `PLANNED` | Platform certification and cutover | none |
 | `M11` | `PLANNED` | Post-parity modernization | none |
@@ -951,6 +979,345 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Cause: The assertion did not delimit the frontier before milestone and ticket detail.
 - Prevention: Frontier tests now slice before detail and assert queue facts in that bounded region.
 - Estimated minutes saved: 10
+
+### `M8.1` -- Port RT64's rt64_extended_gbi.h opcode/word-packing ABI (PARAM, G_EX_* opcodes and enums, gEX* command encoders) as an unwired CPU encoder module. No interpreter wiring and no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | extended-GBI encoder writer |
+| branch | `port/m8-extended-gbi-encode` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_extended_gbi.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: include/rt64_extended_gbi.h, 582 lines. Cite its sha256 in the module doc from docs/rt64-port-inventory.json (sources.port.sha256); digests are not restated here to keep them test-gated at the code.
+- Manifest gate: no existing ticket claims rt64_extended_gbi.rs.
+- Provenance gate: that file's port digest appears nowhere under crates/; inventory port_state is not-started.
+- Symbol gate: G_EX_ has zero hits in crates/. ExtendedAlignment hits only README/texture_rectangle.rs prose that explicitly names it as an unimplemented nonclaim, so no landed encoder is duplicated.
+- Computation is real: PARAM(value,bits,shift) masks to `bits` then shifts, and each gEX* macro composes fixed bit fields into word0/word1 pairs -- exactly characterizable by table-driven unit tests.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port PARAM plus the G_EX_* constant set and the gEX* encoders as pure functions returning (word0, word1) pairs; unit-test each encoder against the literal bit layout quoted from the header.
+
+### `M8.2` -- Port the rt64_gbi_extended.cpp bit-field DECODERS as pure word-pair -> parameter-struct functions and round-trip them against M8.1's encoders. Decode helpers only; no State/rdp/rsp dispatch.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | extended-GBI decoder writer |
+| branch | `port/m8-extended-gbi-decode` -> `main` |
+| dependencies | M8.1=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/gbi/rt64_gbi_extended.cpp, 445 lines; take its sha256 from the inventory when writing the module doc.
+- Scope split is deliberate: each handler in this file is (a) a pure sequence of DisplayList p0/p1 bit extractions followed by (b) a call into state->rdp/state->rsp. Only (a) is portable.
+- Part (b) needs the whole HLE State machine and belongs to M5, not here. Port only the extraction half into parameter structs.
+- Depends on M8.1 for the shared G_EX_* opcode constants and the ExtendedAlignment field layout; do not redefine them.
+- Round-trip test is the point: encode with M8.1, decode here, assert the parameter struct is recovered exactly.
+- Symbol gate: no decoder for these opcodes exists under crates/.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the p0/p1 extraction half of each handler into `decode_<opcode>(words) -> Params`; assert encoder/decoder round-trip for every opcode M8.1 encodes.
+
+### `M8.3` -- Close rt64_math's deferred matrix cluster: extract3x3, rotationFrom3x3, matrixDifference, lerpMatrix/lerpMatrix3x3/lerpMatrixComponents, and matrixScale/Translation/RotationX/Y/Z. Unwired CPU math, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | rt64-math decomposition writer |
+| branch | `port/m8-rt64-math-matrix-cluster` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_math_matrix.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- This is NOT a duplicate of the landed rt64_math.rs. That module's own Nonclaims section explicitly defers exactly these symbols: 'Does not port matrixScale, matrixTranslation, matrixRotationX/Y/Z, extract3x3, rotationFrom3x3, matrixDifference, lerpMatrix/lerpMatrix3x3/lerpMatrixComponents ...'.
+- Symbol gate: every hit for these names under crates/ is inside that deferral sentence -- prose, not an implementation.
+- Inventory says src/common/rt64_math.cpp/.h are port_state=ported, which is true only for the bounded scalar/predicate cluster that landed. Treat the inventory row as coarse, not as proof of coverage.
+- Deliberately EXCLUDES decomposeMatrix/recomposeMatrix/DecomposedTransform/lerpTransforms -- those need quaternion and matrix-inverse infrastructure and are M8.4's scope.
+- matrixDifference is the direct prerequisite for rt64_game_frame's isSceneCompatible tolerance check, so this unblocks later HFR work.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the listed matrix helpers against fn64-render-ir's Mat4, extending rt64_math.rs's Nonclaims to record what is now covered; unit-test each against literal hand-computed matrices.
+
+### `M8.4` -- Port rt64_math's quaternion decomposition core: DecomposedTransform, decomposeMatrix, recomposeMatrix, lerpTransforms, matrixDecomposeViewProj. Unwired CPU math helper, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `F` / `high` / Claude Sonnet 5 |
+| owner | rt64-math quaternion writer |
+| branch | `port/m8-rt64-math-decompose` -> `main` |
+| dependencies | M8.3=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_math_decompose.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Same deferral evidence as M8.3: rt64_math.rs names 'decomposeMatrix/recomposeMatrix, DecomposedTransform/lerpTransforms (deferred -- needs new matrix-inverse/quaternion infra)'. That sentence is the only hit under crates/; nothing is implemented.
+- This card is what supplies the missing infra: a quaternion type plus a 4x4 inverse, both of which the deferral sentence names as the blocking reason.
+- Depends on M8.3 for extract3x3/rotationFrom3x3, which decomposeMatrix calls; do not re-port them.
+- Numerically sensitive: decompose/recompose round-trip must be tested with an explicit epsilon, and shear/negative-scale cases must be covered or explicitly declared out of scope in the module doc.
+- This is the sole blocker for a faithful RigidBody port (M8.5).
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Introduce the quaternion and matrix-inverse helpers, then port decomposeMatrix/recomposeMatrix/lerpTransforms; prove decompose->recompose round-trips within a stated epsilon.
+
+### `M8.5` -- Port RT64's RigidBody interpolation heuristics (updateLinear, updateAngular, updatePerspective, updateDecomposition, lerp) as an unwired CPU helper. No frame-graph wiring, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | rigid-body interpolation writer |
+| branch | `port/m8-rigid-body` -> `main` |
+| dependencies | M8.4=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_rigid_body.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/hle/rt64_rigid_body.cpp (138 lines) and .h (42 lines); take both sha256 values from the inventory.
+- Symbol gate: RigidBody has ZERO hits under crates/. DecomposedTransform's one hit is rt64_math.rs's deferral prose.
+- Real computation: velocity/acceleration epsilon heuristics, a dot-product auto-interpolation decision, and an acos-of-trace rotation-angle test -- all deterministically testable.
+- Hard dependency on M8.4: lerp() delegates its core to lerpTransforms and recomposeMatrix. Porting this before M8.4 yields a module that cannot express lerp() faithfully.
+- G_EX_COMPONENT_* constants come from M8.1's ported constant set rather than being redefined locally.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** After M8.4 lands the decomposition core, port the five RigidBody methods and unit-test the skip/interpolate heuristic decisions at their epsilon boundaries.
+
+### `M8.6` -- Repair provenance for the ALREADY-LANDED color_converter.rs: add the missing SHA-256 citations for rt64_color_converter.h/.cpp so the inventory stops reporting a ported file as not-started. Citation only.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `M` / `low` / Claude Sonnet 5 |
+| owner | port-provenance repair writer |
+| branch | `port/m8-color-converter-provenance` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/color_converter.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- NOT A PORT CARD. crates/fn64-render-wgpu/src/color_converter.rs already exists (579 lines) and is a complete literal port of ColorConverter::RGBA16/RGBA32/D16, and lib.rs line 319 declares `mod color_converter;` -- so it is landed AND wired.
+- Root cause of the false negative: the module cites the commit and the file paths but contains NO sha256 at all, and tools/rt64_port_inventory.py derives port_state by digest matching.
+- The two files are byte-identical across the oracle and port commits (inventory port_delta=unchanged), so citing the port-source digests asserts nothing new about behavior.
+- Take the two digests to cite from docs/rt64-port-inventory.json rows src/hle/rt64_color_converter.cpp and .h (sources.port.sha256). They belong in the module doc, where the inventory scan gates them -- not restated in this ticket.
+- Do NOT rewrite the port or restate its behavior claims; only add the digest citations, then re-run the inventory to confirm port_state flips to ported for both rows.
+
+**Next action:** Add the two sha256 citations to color_converter.rs's module doc, then run the inventory checker and confirm both rows report ported.
+
+### `M8.7` -- Port ReplacementDatabase's pure string/hash algorithms: checkWildcard, stringToHash, hashToString, toLower, endsWith, removeKnownExtension, resolveOperation, resolveShift. Unwired CPU helper, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | replacement-path resolution writer |
+| branch | `port/m8-replacement-resolve` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/common/rt64_replacement_database.cpp (410 lines); port ONLY the free/static functions at lines 19, 112, 130, 257, 261-267, 284, 293, 298 -- roughly 120 lines of real algorithm.
+- Explicitly EXCLUDED: every nlohmann-JSON to_json/from_json block (a dependency this card must not pull in) and resolvePaths, which takes a FileSystem* and does directory probing.
+- checkWildcard is a hand-written glob matcher -- the single best unit-test target in the whole M8 common cluster.
+- Symbol gate: ReplacementDatabase's 5 hits under crates/ are in the fn64-render-rt64 C++ FFI shim and docs, not a Rust port. Confirm at implementation time that no Rust glob matcher already covers this.
+- resolveOperation/resolveShift walk an ordered filter list and first-match wins; test ordering precedence explicitly.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the eight named functions with the filter structs they need as plain Rust types; table-test checkWildcard including empty-pattern and multi-wildcard cases.
+
+### `M8.8` -- Port UserConfiguration's validation logic: clampEnum, validate() range clamping, and msaaSampleCount(). Unwired CPU helper; excludes JSON and platform graphics-API policy. No parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | user-configuration validation writer |
+| branch | `port/m8-user-config-validate` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_user_configuration.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/common/rt64_user_configuration.cpp (180) and .h (177).
+- Port ONLY clampEnum<T>, UserConfiguration::validate(), and msaaSampleCount(). These are genuine bounds/dispatch logic over the config enums and are deterministically testable.
+- Explicitly EXCLUDED: all NLOHMANN_JSON_SERIALIZE_ENUM macro blocks and ConfigurationJSON::read/write (JSON + iostream dependency), and isGraphicsAPISupported/resolveGraphicsAPI, which are #ifdef platform policy plus Sommelier Wine detection, not portable computation.
+- Symbol gate: UserConfiguration's 3 hits under crates/ are in the fn64-render-rt64 C++ FFI shim, not a Rust port.
+- Test the clamps at both bounds and one step outside each, and assert every enum value maps to the documented MSAA sample count.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the enum set plus the three functions; unit-test clamping at bounds and full enum coverage for msaaSampleCount.
+
+### `M8.9` -- Port DrawCallKey/DrawCallMask comparison and PresetDrawCall::matches() as an unwired CPU helper, excluding the ImGui inspector half and the XXH3 hash(). No parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | draw-call preset matching writer |
+| branch | `port/m8-preset-draw-call-match` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_preset_draw_call_match.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/preset/rt64_preset_draw_call.cpp (486 lines) and .h (78). Roughly the first 239 lines are data logic; lines ~241-485 are PresetDrawCallLibraryInspector, wall-to-wall ImGui.
+- Port ONLY DrawCallKey::fromDrawCall, DrawCallKey::operator==, the DrawCallMask field masking, and PresetDrawCall::matches(). That is real masked-comparison logic worth characterizing.
+- Explicitly EXCLUDED: DrawCallKey::hash(), which calls XXH3_64bits. Pulling xxhash is a dependency decision that must not ride along in a mechanical port card -- see the M8 triage note on XXH3.
+- Also excluded: the whole inspector class and every JSON block.
+- fromDrawCall reads a live DrawCall; port it against a minimal local struct holding only the fields the key actually samples, and say so in the module doc.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the key/mask types and matches(); test that masked-out fields are genuinely ignored by comparison and that unmasked mismatches reject.
+
+### `M8.10` -- Port LightManager::estimatedSunLight and estimatedAmbientLight as pure functions over already-accumulated light state. Unwired CPU helper, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | light estimation writer |
+| branch | `port/m8-light-estimation` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_light_estimation.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/hle/rt64_light_manager.cpp (166 lines) and .h (34 lines).
+- Port ONLY estimatedSunLight and estimatedAmbientLight. Both are pure functions of the already-accumulated directionalLights / ambientColSum / ambientSum fields -- weighted-average selection and normalization.
+- Explicitly EXCLUDED: processDirLight/processAmbientLight/processLight, which read live state->rsp->lights register state and cannot be characterized without faking the whole RSP light-register format.
+- Also excluded: processPointLight, which sits inside #if ENABLE_AUTOMATIC_POINT_LIGHTS with the macro defined to 0 immediately above -- it is dead code that never compiles.
+- Symbol gate: LightManager and light_manager both have zero hits under crates/.
+- Port the accumulator struct as a plain input type so the two estimators are directly unit-testable.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the accumulator fields and the two estimator functions; test zero-light, single-light, and weighted multi-light cases.
+
+### `M8.11` -- Port ShaderDescription::toShader() deterministic shader-source serialization from rt64_shader_common, excluding the XXH3 hash(). Unwired CPU helper, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | shader-description serialization writer |
+| branch | `port/m8-shader-description` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_shader_description.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/render/rt64_shader_common.cpp (34) and .h (29).
+- toShader() builds shader source text deterministically from the packed ColorCombiner/OtherMode/RenderFlags bitfields -- pure string formatting, fully testable with no RHI or device.
+- Explicitly EXCLUDED: ShaderDescription::hash(), which calls XXH3_64bits. Do not add an xxhash dependency in this card.
+- Also excluded: maskUnusedParameters(), which is an empty TODO stub in the source -- porting an empty body would be a false coverage claim.
+- The interop bitfield structs it reads (rt64_color_combiner.h, rt64_other_mode.h, rt64_render_params.h) are plain POD bit layouts; check whether combiner.rs already models any of them before redefining, and reuse if so.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the packed description struct and toShader(); golden-test the emitted string for a set of representative combiner/othermode inputs.
+
+### `M8.12` -- Port GameFrame::areFramebufferPairsCompatible and isSceneCompatible as pure predicates over minimal local descriptor structs. Unwired CPU helper, no frame-graph wiring, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `medium` / Claude Sonnet 5 |
+| owner | frame-compatibility predicate writer |
+| branch | `port/m8-frame-compatibility` -> `main` |
+| dependencies | M8.3=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/hle/rt64_game_frame.cpp (1042 lines) -- port ONLY the two predicates at lines 15-73. The file has zero ImGui, but the remaining ~970 lines (set/match/matchScene/matchTransform/buildCallHashMap) need WorkloadQueue, RenderWorker, and BufferUploader and are NOT in scope for this card.
+- The predicates themselves only compare depth/color image address, fmt, siz, width, and two matrix differences against a 1e-6 tolerance. Port them against minimal local descriptor structs rather than dragging in the workload graph.
+- Depends on M8.3 for matrixDifference, which isSceneCompatible calls. rt64_math.rs currently defers that symbol.
+- rt64_math.rs's Nonclaims already states 'rt64_game_frame.cpp itself remains unported' -- this card narrows that gap without contradicting it; update that sentence to name the two predicates now covered.
+- The 1e-6 MatrixDiffTolerance is a literal from the source; test at, just inside, and just outside it.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the two predicates over local descriptor structs once M8.3 supplies matrixDifference; test the tolerance boundary and each rejecting field.
+
+### `M8.13` -- Port the LookAtProcessor lerp formula and adjustProjectionMatrix as two small pure helpers, excluding all BufferUploader/RHI plumbing. Unwired CPU helper, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `low` / Claude Sonnet 5 |
+| owner | lookat/projection helper writer |
+| branch | `port/m8-lookat-projection-helpers` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/render/rt64_look_at_processor.cpp (66) and src/render/rt64_projection_processor.cpp (163).
+- Deliberately a SMALL card. Both files are majority RHI upload plumbing over WorkloadQueue/GameFrame/BufferUploader; only two fragments are portable computation.
+- From look_at_processor: the RSPLookAt x/y lerp `cur - delta * (1 - weight)` at lines ~40-41.
+- From projection_processor: adjustProjectionMatrix, the aspect-ratio column scale helper.
+- Grouped together precisely BECAUSE each alone is too small to justify a module; neither warrants its own card.
+- Symbol gate: LookAtProcessor and ProjectionProcessor both have zero hits under crates/.
+- Everything else in both files (setup/process/processScene/upload) is out of scope and must be named as such in the module doc.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the two fragments as free functions with the small POD inputs they need; test the lerp at weight 0, 1, and midpoint, and the aspect scale against hand-computed matrices.
+
+### `M8.14` -- Port the two self-contained RT64 shaders FullScreenVS.hlsl and Constants.hlsli into the owned WGSL/constant corpus with a CPU oracle. No GPU execution and no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M8` |
+| state | `READY` |
+| profile / effort / model | `I` / `low` / Claude Sonnet 5 |
+| owner | fullscreen-triangle shader writer |
+| branch | `port/m8-fullscreen-vs` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_fullscreen_vs.rs`, `crates/fn64-render-wgpu/src/shaders/fullscreen_vs.wgsl` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/shaders/FullScreenVS.hlsl (9 lines) and src/shaders/Constants.hlsli (12 lines); cite both sha256 values from the inventory in the module doc.
+- FullScreenVS is the standard oversized-triangle trick: uv.x = (id==2)?2:0, uv.y = (id==1)?2:0, pos = uv*(2,-2)+(-1,1). Fully determined by SV_VertexID, so a 3-vertex CPU oracle characterizes it exhaustively -- no GPU needed.
+- Constants.hlsli is 5 #defines (APPLY_LIGHTS_MINIMUM_ALPHA, APPLY_LIGHTS_DITHER_ALPHA, and three ray-query masks). Carried as named constants only; the ray-query masks are inert until M12.
+- These two are the ONLY M8 shaders portable in isolation. DebugPS, ComposePS, Im3DPS and Im3DVS all bind FbRendererRT ray-tracing resources (gShadingPosition, gDirectLightAccum, RtParams) that do not exist in this renderer yet -- see the triage list.
+- Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the vertex formula as a CPU oracle plus owned WGSL, assert the three vertex outputs exactly, and validate the WGSL with Naga.
 
 ## Regenerating
 
