@@ -987,6 +987,41 @@ mod host_gpu_tests {
         ]
     }
 
+    /// Compares a reading draw's blended output against the oracle, and --
+    /// when this case's blend arm is one that provably transforms the
+    /// destination -- first proves the draw actually rasterized.
+    ///
+    /// Liveness cannot be asserted as `observed != destination`
+    /// unconditionally. The no-`FORCE_BL` bypass arm with
+    /// `P == Framebuffer` sets `final_alpha == 0.0` (`blend.rs:444-448`),
+    /// and the final composite (`blend.rs:501-509`) then reduces to
+    /// `dst * 1.0` on every channel: its correct output *is* the
+    /// destination, byte for byte. Case 2 below is exactly that arm, so a
+    /// blanket `observed != destination` guard reports a false drop for a
+    /// draw that ran and produced the right answer.
+    ///
+    /// `transforms_destination` is therefore supplied per case, `false`
+    /// only for that bypass arm -- whose own liveness is instead pinned by
+    /// the `expected.rgba[3] == dst_rgba8[3]` assertion its case already
+    /// makes, plus the fact that the two neighbouring cases share this
+    /// fixture builder and would catch a systematic drop.
+    fn assert_blended_over_destination(
+        observed: [u8; 4],
+        destination: [u8; 4],
+        expected: [u8; 4],
+        tolerance: i32,
+        transforms_destination: bool,
+    ) {
+        if transforms_destination {
+            assert_ne!(
+                observed, destination,
+                "reading draw never blended: target still holds the destination \
+                 bytes verbatim, so the blend branch under test never executed"
+            );
+        }
+        assert_close_rgba8(observed, expected, tolerance);
+    }
+
     fn assert_close_rgba8(observed: [u8; 4], expected: [u8; 4], tolerance: i32) {
         for channel in 0..4 {
             let diff = i32::from(observed[channel]) - i32::from(expected[channel]);
@@ -1807,7 +1842,13 @@ mod host_gpu_tests {
             .expect("memory is supplied; P==Framebuffer must not error");
 
             let (x, y) = CHECK_XY;
-            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+            assert_blended_over_destination(
+                rgba8_at(&output, x, y),
+                dst_rgba8,
+                expected.rgba,
+                2,
+                true,
+            );
         }
 
         // --- Case 2 (review Bug A): no-FORCE_BL bypass, P == Framebuffer.
@@ -1867,7 +1908,16 @@ mod host_gpu_tests {
             );
 
             let (x, y) = CHECK_XY;
-            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+            // The bypass arm's correct output IS the destination
+            // (`final_alpha == 0.0`), so the drop guard cannot apply here --
+            // see `assert_blended_over_destination`'s own doc.
+            assert_blended_over_destination(
+                rgba8_at(&output, x, y),
+                dst_rgba8,
+                expected.rgba,
+                2,
+                false,
+            );
         }
 
         // --- Case 3 (review Bug B): general divide, M == Framebuffer,
@@ -1936,7 +1986,13 @@ mod host_gpu_tests {
             );
 
             let (x, y) = CHECK_XY;
-            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+            assert_blended_over_destination(
+                rgba8_at(&output, x, y),
+                dst_rgba8,
+                expected.rgba,
+                2,
+                true,
+            );
         }
     }
 
@@ -1975,6 +2031,15 @@ mod host_gpu_tests {
         for vertex in &mut fixture.vertices {
             vertex.color = shade_color;
         }
+        // The destination draw and this reading draw share
+        // `covering_triangle_fixture`'s single `z = 0.5`, so the inherited
+        // `Less` depth test rejects every fragment of the second draw
+        // (`0.5 < 0.5` is false) and the blend branch under test never
+        // executes -- the target keeps the destination bytes verbatim.
+        // `Always` is the semantic this differential needs: depth behavior
+        // is not the property being measured, and the depth matrix has its
+        // own dedicated tests.
+        fixture.depth_compare_enabled = false;
         fixture.blend_color = Some(blend_color);
         fixture.force_blend = force_blend;
         fixture.blend_params = ResolvedFragmentBlendParams {
