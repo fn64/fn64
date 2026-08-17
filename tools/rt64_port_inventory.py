@@ -98,13 +98,11 @@ PORT_STATES = {"ported", "not-started", "refused", "authority-gated"}
 # "an assessment settled this file", never "this file is done".
 #
 # Scope is closed at the six landed batch assessments. Every entry below is
-# one of the 17 `src/common`, 28 `src/render`, 18 `src/hle`, or 8
+# one of the 17 `src/common`, 28 `src/render`, 18 `src/hle`, or 10
 # `src/gui`/`src/imgui` sources those assessments refused (6 from the
 # geometry batch, 10 from the VI-registers batch, 2 from the
-# workload-geometry batch, 8 of the 10 the GUI batch refused --
-# rt64_camera_controller.h and rt64_file_dialog.h stay `not-started`, see the
-# comment at PORT_REFUSALS for why); nothing else may be added without a new
-# landed assessment.
+# workload-geometry batch, all 10 the GUI batch refused); nothing else may be
+# added without a new landed assessment.
 COMMON_ASSESSMENT_COMMIT = "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85"
 COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs already implements"
 COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
@@ -425,20 +423,14 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "Two aggregate structs, DebuggerFramebuffer and Present -- no member functions, "
         "field layout only."
     ),
-    # -- src/gui and src/imgui, 8 of the 10 files the GUI batch assessment
-    # examined. `rt64_camera_controller.h` and `rt64_file_dialog.h` stay
-    # `not-started` on purpose: recording all ten would empty the
-    # `not-started` set entirely, and `self_test()`'s own mutation fixtures
-    # (two independent probes, one requiring one not-started row and one
-    # requiring two) read live rows out of the committed inventory and raise
-    # `StopIteration`/fail their own `require()` if none remain. That guard
-    # is load-bearing infrastructure this pass does not touch, so two files
-    # are held back rather than driving the fixture to zero. Both held-back
-    # files were verified against the pinned source exactly as the other
-    # eight were, and their refusal reasoning is a strict subset of their
-    # already-recorded sibling's (rt64_camera_controller.cpp's DebuggerCamera
-    # argument covers .h too; rt64_file_dialog.cpp's nfd-wrapper argument
-    # covers .h too) -- so nothing is lost by a reader who follows the pair.
+    # -- src/gui and src/imgui, all 10 files the GUI batch assessment examined.
+    # `rt64_camera_controller.h` and `rt64_file_dialog.h` were held back by the
+    # batch that recorded the other eight, because `self_test`'s `not-started`
+    # mutation fixtures then read live rows out of the committed inventory and
+    # would have raised `StopIteration` once this set emptied. Those probes now
+    # synthesize their own rows (`with_synthetic_not_started`), so the fixture
+    # no longer depends on the port being unfinished and both files are
+    # recorded here on their own re-verified reasoning.
     "src/gui/rt64_debugger_inspector.cpp": _gui_refusal(
         "532 ImGui:: call sites over 1,507 substantive lines. Its math calls -- "
         "pseudoRandom, barycentricCoordinates, nearPlaneFromProj, farPlaneFromProj, "
@@ -463,6 +455,14 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "NFD_PickFolderN, NFD_OpenDialogN, NFD_SaveDialogN, NFD_FreePathN. Zero "
         "arithmetic in the file."
     ),
+    "src/gui/rt64_file_dialog.h": _gui_refusal(
+        "Declarations for the nfd wrapper above: FileDialog is one static "
+        "std::atomic<bool> plus five bodiless static declarations (initialize, finish, "
+        "getDirectoryPath, getOpenFilename, getSaveFilename). The file's only body is "
+        "FileFilter's constructor, whose two branches assign the same two string fields "
+        "and differ solely in calling win32::Utf8ToUtf16 from the excluded "
+        "src/contrib/utf8conv on _WIN32. No arithmetic anywhere in the file."
+    ),
     "src/gui/rt64_camera_controller.cpp": _gui_refusal(
         "All four methods (moveCursor, movePerspective, rotatePerspective, "
         "lookAtPerspective) take DebuggerCamera& and return void; their entire "
@@ -473,6 +473,14 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "movePerspective nor rotatePerspective reference an ImGui symbol -- so the "
         "uncited-mutated-type argument is what actually carries the refusal, not "
         "ImGui control flow."
+    ),
+    "src/gui/rt64_camera_controller.h": _gui_refusal(
+        "Zero bodies: CameraController is one data member (hlslpp::int2 lastCursorPos) "
+        "plus five declarations -- the constructor and the four methods whose "
+        "definitions rt64_camera_controller.cpp already refuses. All four take "
+        "DebuggerCamera&, the 8-member struct at hle/rt64_workload.h:193-202 that "
+        "rt64_workload_geometry.rs refuses by name as field layout. Declaration shape "
+        "only; nothing here to own that the .cpp refusal does not already settle."
     ),
     "src/imgui/imgui_impl_sdl2_custom.cpp": _gui_refusal(
         "Vendored Dear ImGui SDL2 platform backend, carrying upstream's own header and "
@@ -1274,7 +1282,7 @@ def markdown(inventory: dict) -> str:
         "- Paths are repository-relative; the checked artifact rejects machine-local paths.", "",
         "`candidate_hints` in the JSON are deliberately non-exhaustive regex navigation aids, not a symbol denominator.", "",
         "`port_state` is mechanically derived from digests and paths, with one declared exception: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
-        "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the six landed batch assessments of `src/common` (17 files), `src/render` (28 files), `src/hle` (18 files), and `src/gui`/`src/imgui` (8 of the 10 the batch refused).", "",
+        "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the six landed batch assessments of `src/common` (17 files), `src/render` (28 files), `src/hle` (18 files), and `src/gui`/`src/imgui` (10 files).", "",
         "## Milestone denominator", "", "| milestone | files | primary-port KLOC |", "|---|---:|---:|",
     ]
     for milestone in sorted(totals, key=lambda item: int(item[1:])):
@@ -1310,6 +1318,126 @@ def expect_rejected(value: dict, authority: dict, needle: str) -> None:
         require(needle in str(error), f"mutation failed for the wrong reason: {error}")
     else:
         raise InventoryError(f"mutation was accepted; expected {needle!r}")
+
+
+# Self-test fixture paths. These are not RT64 sources and never appear in a
+# generated inventory; they exist only so `self_test`'s `not-started` probes
+# own their fixture instead of borrowing a live row. Each name is chosen to
+# route through a real, named family in `route_for` (both hit the `workload`
+# token -> M3/raw-dpc), so a synthesized entry is a genuinely representative
+# `not-started` row rather than a routing special case, and `route_for`
+# staying closed is still exercised by the unrouted-path probe above.
+SELF_TEST_PROBE_PATHS = (
+    "src/render/rt64_zzz_self_test_workload_probe_one.h",
+    "src/render/rt64_zzz_self_test_workload_probe_two.h",
+)
+
+
+def synthetic_not_started(authority: dict, relative: str) -> dict:
+    """Build a well-formed `not-started` inventory entry for `relative`.
+
+    The `not-started` mutation probes used to pull live rows out of the
+    committed inventory and require them to still be `not-started`. That made
+    a guard's coverage a function of how far the port had progressed: as the
+    real `not-started` set drains toward zero -- which is the whole point of
+    the program -- those probes lose their fixture and the self-test fails
+    because the project succeeded, not because a guard broke. So the probes
+    construct what they need instead.
+
+    Every derived field is produced by the same helpers `build_inventory`
+    uses (`route_for`, `card_id`, `proposed_rust_destination`,
+    `authority_locator`), so the fixture cannot drift away from the shape
+    `validate_inventory` demands, and a future change to any of those rules
+    updates the fixture with the production path rather than silently
+    leaving a stale hand-written literal behind. The digest is derived from
+    the path so it is stable, nonzero, and -- being no real file's content
+    hash -- cited by no Rust module, which is exactly what makes the entry
+    legitimately `not-started` under `ported_as_for`/`port_state_for`.
+    """
+    require(relative not in PORT_REFUSALS, f"self-test fixture path is a declared refusal: {relative}")
+    gates = {item["path"]: item for item in authority["overlays"]["source_gates"]}
+    require(relative not in gates, f"self-test fixture path is an authority gate: {relative}")
+    milestone, workstream, owner, profile, gated = route_for(relative, gates)
+    require(not gated, f"self-test fixture path is authority-gated: {relative}")
+    snapshot_value = {
+        "sha256": digest_bytes(f"fn64 self-test fixture: {relative}".encode()),
+        "lines": 1,
+        "candidate_hints": [],
+        "dependencies": [],
+    }
+    require(port_state_for(gated, [], None) == "not-started", "synthetic fixture is not not-started")
+    return {
+        "path": relative,
+        "sources": {name: copy.deepcopy(snapshot_value) for name in SOURCE_SELECTIONS},
+        "port_delta": "unchanged",
+        "milestone": milestone,
+        "workstream": workstream,
+        "port_state": "not-started",
+        "ported_as": [],
+        "evidence_state": "source-digests-verified",
+        "task_card": {
+            "id": card_id(relative, milestone),
+            "outcome": f"Port the admitted behavior represented by {relative} into an owned Rust module without widening behavior claims.",
+            "authority": {
+                "port_source": authority_locator(authority, "port", relative),
+                "comparison_oracle": authority_locator(authority, "oracle", relative),
+                "plan": "docs/RENDER-WGPU-PORT-PLAN.md",
+            },
+            "owner_lane": owner,
+            "recommended_profile": profile,
+            "writable_paths": [proposed_rust_destination(relative, milestone)],
+            "non_goals": [
+                "Do not edit, vendor, or transliterate the RT64 C++ source.",
+                "Do not claim parity from source translation or inventory status.",
+            ],
+            "baseline_command": "python3 tools/rt64_port_inventory.py --check --oracle-dir <clean-oracle> --port-dir <clean-port-source>",
+            "exit_gate": f"The {milestone} behavior fixture for {relative} passes its declared differential and required 10/20-run reliability bar.",
+            "evidence_state": "not-run",
+            "claim_status": "candidate-observation",
+        },
+    }
+
+
+def with_synthetic_not_started(base: dict, authority: dict, count: int) -> tuple[dict, list[dict]]:
+    """A deep copy of `base` carrying `count` synthesized `not-started` rows.
+
+    Returns the fixture and the inserted rows, so a probe can mutate a row it
+    owns. Rows are inserted in sorted position because `validate_inventory`
+    requires deterministic path order, and the whole-inventory
+    `source_set_sha256` and `port_delta_counts` guards run only *after* the
+    per-file loop -- so a per-file mutation still raises its own message
+    first. The probes below assert on that message, so this is checked, not
+    assumed: `expect_rejected` fails loudly if a fixture's own bookkeeping
+    drift ever masks the mutation under test.
+    """
+    require(count <= len(SELF_TEST_PROBE_PATHS), "not enough declared self-test fixture paths")
+    fixture = copy.deepcopy(base)
+    known = {item["path"] for item in fixture["files"]}
+    added = []
+    for relative in SELF_TEST_PROBE_PATHS[:count]:
+        require(relative not in known, f"self-test fixture path collides with a real source: {relative}")
+        entry = synthetic_not_started(authority, relative)
+        fixture["files"].append(entry)
+        added.append(entry)
+    fixture["files"].sort(key=lambda item: item["path"])
+    fixture["port_delta_counts"]["unchanged"] += count
+    return fixture, added
+
+
+def expect_fixture_only_rejection(fixture: dict, authority: dict) -> None:
+    """Assert an unmutated synthetic fixture is rejected *only* by the
+    whole-inventory digest pin, never by a per-file guard.
+
+    This is what makes the `not-started` probes trustworthy. Each of them
+    asserts a specific per-file message; if a synthesized row were itself
+    malformed, that row could raise the probe's expected message on its own
+    and the probe would pass while testing nothing. Pinning the pre-mutation
+    failure to `source-set digest mismatch` proves every per-file guard --
+    routing, task card, writable destination, ported_as, port_state -- is
+    already satisfied, so any per-file message a probe then observes can only
+    have come from the mutation that probe applied.
+    """
+    expect_rejected(fixture, authority, "source-set digest mismatch")
 
 
 def self_test() -> None:
@@ -1367,8 +1495,13 @@ def self_test() -> None:
     ported = next(item for item in mutated["files"] if item["ported_as"])
     ported["port_state"] = "not-started"
     expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
-    mutated = copy.deepcopy(base)
-    not_started = next(item for item in mutated["files"] if item["port_state"] == "not-started")
+    # A `not-started` row may not fabricate port evidence: claiming a Rust
+    # module that does not cite this source's digest must fail the mechanical
+    # scan. The fixture is synthesized rather than borrowed from the committed
+    # inventory, so this guard keeps its coverage after the real `not-started`
+    # set drains to zero.
+    mutated, (not_started,) = with_synthetic_not_started(base, authority, 1)
+    expect_fixture_only_rejection(mutated, authority)
     not_started["ported_as"] = ["crates/fn64-render-wgpu/src/rt64_math.rs"]
     expect_rejected(mutated, authority, "ported_as drift from mechanical SHA-256 citation scan")
     # A refusal must carry its evidence, exactly as `ported` must carry its
@@ -1381,8 +1514,11 @@ def self_test() -> None:
     refused = next(item for item in mutated["files"] if item["port_state"] == "refused")
     refused["port_refusal"] = dict(refused["port_refusal"], commit="0" * 40)
     expect_rejected(mutated, authority, "refusal record drift from the declared table")
-    mutated = copy.deepcopy(base)
-    undeclared = next(item for item in mutated["files"] if item["port_state"] == "not-started")
+    # An *undeclared* refusal -- `refused` asserted for a path that carries no
+    # entry in `PORT_REFUSALS` -- must be refused, or the one declared state
+    # would be self-certifying. Synthesized fixture, same reason as above.
+    mutated, (undeclared,) = with_synthetic_not_started(base, authority, 1)
+    expect_fixture_only_rejection(mutated, authority)
     undeclared["port_state"] = "refused"
     expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
     mutated = copy.deepcopy(base)
@@ -1418,10 +1554,19 @@ def self_test() -> None:
             raise InventoryError(f"uncited refusal was accepted; expected {needle!r}")
         finally:
             del PORT_REFUSALS[probe]
-    mutated = copy.deepcopy(base)
-    not_started_two = [item for item in mutated["files"] if item["port_state"] == "not-started"][:2]
-    require(len(not_started_two) == 2, "self-test fixture requires at least two not-started files")
-    not_started_two[0]["task_card"]["writable_paths"] = list(not_started_two[1]["task_card"]["writable_paths"])
+    # Two un-ported sources may not be pointed at the same proposed Rust
+    # destination: for a `not-started` row the writable path is derived, so
+    # borrowing another row's destination is drift. This needs two rows that
+    # both lack port evidence, which is precisely the fixture the real
+    # inventory stops being able to supply once the port finishes; both are
+    # synthesized.
+    mutated, (first, second) = with_synthetic_not_started(base, authority, 2)
+    expect_fixture_only_rejection(mutated, authority)
+    require(
+        first["task_card"]["writable_paths"] != second["task_card"]["writable_paths"],
+        "self-test fixture rows must start with distinct writable destinations",
+    )
+    first["task_card"]["writable_paths"] = list(second["task_card"]["writable_paths"])
     expect_rejected(mutated, authority, "Rust writable destination drift")
 
     with tempfile.TemporaryDirectory() as temporary:
