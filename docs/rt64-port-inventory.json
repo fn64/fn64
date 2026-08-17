@@ -5775,8 +5775,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render/src/microcode_identity.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-gbi-rt64-gbi-cpp",
@@ -5789,7 +5791,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_gbi_cpp.rs"
+          "crates/fn64-render/src/microcode_identity.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",

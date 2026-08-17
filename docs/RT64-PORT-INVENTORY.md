@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 86 `ported`, 179 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 87 `ported`, 178 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -86,7 +86,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/contrib/plume/plume_metal.cpp` | `modified` | `authority-gated` | -- | 4229 | 213 | 0 | `M10` / `authority-overlay` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (P/high) | `rt64-port-m10-src-contrib-plume-plume-metal-cpp` |
 | `src/gbi/rt64_display_list.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs` | 16 | 1 | 0 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-display-list-h` |
 | `src/gbi/rt64_f3d.h` | `unchanged` | `not-started` | -- | 47 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-f3d-h` |
-| `src/gbi/rt64_gbi.cpp` | `unchanged` | `not-started` | -- | 561 | 8 | 13 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-cpp` |
+| `src/gbi/rt64_gbi.cpp` | `unchanged` | `ported` | `crates/fn64-render/src/microcode_identity.rs` | 561 | 8 | 13 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-cpp` |
 | `src/gbi/rt64_gbi.h` | `unchanged` | `not-started` | -- | 77 | 6 | 3 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-gbi-rt64-gbi-h` |
 | `src/gbi/rt64_gbi_extended.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs` | 445 | 56 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-gbi-rt64-gbi-extended-cpp` |
 | `src/gbi/rt64_gbi_extended.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs` | 17 | 0 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-gbi-rt64-gbi-extended-h` |
