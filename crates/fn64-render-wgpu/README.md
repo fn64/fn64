@@ -2724,6 +2724,183 @@ processes passed with no retry or source change. This satisfies AGENTS.md's
 deterministic 10x bar for this bounded slice; it is not a broader parity,
 performance, or full-ROM claim.
 
+## 2026-08-17: Framebuffer-blend Slice B — manual destination-color read (plain `Framebuffer` only)
+
+Extends the already-landed "Production blend wiring slice 1" mechanism (§
+above) in place — no second uniform, no second entry point, no second
+admission predicate — to admit and render the **destination-*color*** half
+of the framebuffer-dependent blend selectors:
+`BlendColorInput::Framebuffer` on an active cycle's `P`/`M`. The
+destination-*alpha* (coverage-count) half, `BlendBInput::FramebufferAlpha`,
+remains explicitly deferred and rejected — no coverage-count GPU write
+exists anywhere in this crate yet (`coverage_fragment_fn`'s WGSL call in
+`fs_main` still hardcodes `memory_count` to `0u`).
+
+**Admission split.** `crate::blend::ResolvedBlendCycle` gains one new method,
+`requires_framebuffer_alpha` — `true` exactly when the cycle's `B` selector
+is `FramebufferAlpha` — alongside the unchanged
+`requires_framebuffer_sample`. `production.rs`'s `draw_admitted_triangles`
+now rejects on `requires_framebuffer_alpha` (not the broader
+`requires_framebuffer_sample`) and separately computes
+`reads_framebuffer_color` (`true` when any active cycle's `P`/`M` is
+`Framebuffer`) to thread onto the fixture. `BlendRequiresFramebuffer`'s
+`Display`/doc text now says "references `FramebufferAlpha`"; a plain
+`Framebuffer`-selecting cycle is admitted, not rejected. The pre-existing
+rejection test now exercises a real `FramebufferAlpha` selector (bit 18 of
+cycle 1's wire word) instead of the now-admitted `Framebuffer` color
+selector it previously (and, since Slice 1 landed, incorrectly) used.
+
+**Typed host-side surface.** `ResolvedFragmentBlendParams` gains one new
+field, `reads_framebuffer_color: bool` — `NO_OP`'s only new default is
+`false`, so every existing call site compiles unchanged. `fragment_blend_
+params_bytes` gains a `row_stride_words: u32` parameter (see "Row stride
+correctness" below) and now serializes both of `FragmentBlendParams`'s
+`u32` reserved words: `has_framebuffer_color` (was `_reserved_0`) and
+`row_stride_words` (was `_reserved_1`); the third (`_reserved_2`) stays
+zero/unused. The struct's byte size is unchanged (80 bytes).
+
+**Binding 9 and the snapshot buffer.** A new read-only storage-buffer layout
+entry at binding 9 (binding 8 is `FragmentBlendParams`, landed by Slice 1):
+`framebuffer_color_snapshot`, one padded-row-stride-packed RGBA8 word per
+pixel. A fixture whose `reads_framebuffer_color` is `false` still binds
+*some* buffer here (wgpu requires every layout entry to have a resource) —
+a single always-allocated 4-byte dummy buffer
+(`TrianglePipelineRenderer::framebuffer_color_dummy_buffer`), reused across
+every non-reading fixture and every submission, never a per-fixture or
+per-submission allocation.
+
+**Pass splitting.** `submit_triangles` was previously exactly one render
+pass for the whole `fixtures` slice. A framebuffer-color-reading fixture
+must snapshot the color attachment *after* every earlier-ordered draw has
+landed and *before* its own draw runs — impossible within an already-open
+pass. `split_fixture_runs` (new, pure, independently tested) partitions the
+draws into maximal contiguous runs, with every framebuffer-color-reading
+fixture a singleton run of its own; a run of only non-reading fixtures still
+costs one pass, not one per fixture. Only the first run's color/status/depth
+attachments use `LoadOp::Clear`; every later run uses `LoadOp::Load` on all
+three — the status attachment's `LoadOp::Load` is load-bearing, since
+`complete()`'s single post-loop `status_readback` copy would otherwise lose
+every earlier run's `tmem_sample_status` writes. The final three-texture
+readback (`complete()`) is unchanged — only how many passes produced the
+color texture's content before that readback runs.
+
+**Row stride correctness.** The snapshot buffer is written at
+`padded_bytes_per_row`-aligned stride (`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`-
+rounded, the same computation the final color/depth/status readback buffers
+already use) but this crate's actual fixture sizes have an unaligned natural
+row width (8×8: 32 vs 256 padded bytes/row; 16×16: 64 vs 256) — writing at
+padded stride while indexing at `extent.width`-word stride in WGSL would
+corrupt every row after row 0. `submit_triangles` computes
+`row_stride_words = padded_bytes_per_row / 4` once and threads that single
+value into both the serialized uniform and the copy's own `bytes_per_row` —
+one source of "width," not two independently computed ones. A CPU-side
+layout test (`row_stride_words_differs_from_extent_width_for_both_real_
+fixture_sizes`) asserts `padded_bytes_per_row / 4 != extent.width` for both
+8×8 and 16×16 and that the serialized bytes carry the former, never the
+latter.
+
+**WGSL: extends `fs_main`, no second entry point.** `fs_main` gains one new
+`@builtin(position)` parameter and a conditional branch after its existing
+`blend_fragment_cycle_fn` call site: when `has_framebuffer_color != 0u`, the
+fragment's `(x, y)` position indexes `framebuffer_color_snapshot` at
+`y * row_stride_words + x`, decodes the packed RGBA8 word, and calls a new
+`blend_fragment_memory_composite_fn` (in `blend_fragment_fn.wgsl`, alongside
+the existing `blend_fragment_cycle_fn`/`blend_one_cycle_fn`/
+`blend_color_fragment_fn` family) **instead of**
+`blend_fragment_cycle_fn` — the two are mutually exclusive per fragment,
+matching `blend_fragment`'s own single Rust-oracle dispatch. `pipelines`
+stays exactly 4 precreated variants (`DEPTH_STENCIL_VARIANTS`) — no new
+pipeline variant is needed since the single entry point handles both cases
+via the uniform flag.
+
+`blend_fragment_memory_composite_fn` is a **second, independent
+transcription** of `blend_fragment`'s entire cycle loop
+(`blend.rs:400-499`), not a post-hoc patch bolted onto
+`blend_fragment_cycle_fn`'s already-collapsed two-cycle result — the
+admitted-subset function has already discarded the per-cycle `final_alpha`
+history and any memory involvement by the time it returns, so a patch
+applied afterward cannot reproduce cycle 0's `Combined`-reads-prior-cycle
+handoff into cycle 1 or the last cycle's `final_alpha` correctly. It ports:
+
+- The three-way `Framebuffer` dispatch (`cycle.p == Framebuffer` /
+  `cycle.m == Framebuffer` / general A/B divide) via a new
+  `blend_color_memory_fragment_fn` — `blend_color_fragment_fn`'s
+  counterpart, taking one additional `dst_rgb` parameter and returning the
+  real destination sample on the `Framebuffer` arm instead of the admitted
+  subset's defensive `running_rgb` fallback.
+- The no-`FORCE_BL` last-cycle bypass arm (`blend.rs:421-437`) — for the
+  last cycle only, when `blend_enabled` is false, evaluates **only** `P`
+  (never `M`/`A`/`B`) and sets `final_alpha` to `0.0` iff `P == Framebuffer`
+  else `1.0`, a materially different rule from the three-way branch's own
+  `final_alpha` derivation. Checked first, mirroring
+  `blend_one_cycle_fn`'s own bypass priority but with memory-aware
+  arithmetic (`blend_one_memory_cycle_fn`).
+- The full final composite (`blend.rs:488-496`), **both channels**: RGB per
+  channel as `blender_rgb[c] * final_alpha + dst_rgb[c] * (1.0 -
+  final_alpha)`, and a *separately* derived output alpha,
+  `255.0 * final_alpha + dst_alpha * (1.0 - final_alpha)` — not `src.a`
+  passed through unchanged (drops the destination's own alpha contribution
+  whenever `final_alpha != 1.0`) and not `final_alpha` itself returned as
+  the alpha channel (conflates the blend fraction with the actual output
+  alpha).
+
+**Manifest hash.** `shader_manifest.rs`'s frozen
+`TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`/`_FIXTURE_SHA256`/`_SOURCE_BYTES`
+constants are recomputed and refrozen for the extended combined source
+(86,405 bytes, up from 75,087), via this file's existing `#[ignore]`
+freeze-print-and-paste convention.
+
+**Out of scope, held (this slice).** `BlendBInput::FramebufferAlpha`
+(coverage-count reads) — still loudly rejected, now scoped precisely to
+that condition rather than over-broadly covering color too. Slice A (native
+`DUAL_SOURCE_BLENDING`) — orthogonal, still blocked on the `R32Uint`
+second-color-target conflict this crate's status capsule already names.
+`coverage.rs`, `alpha_compare.rs`, and the existing
+`CoverageDestination::Save`/`Clamp`+`image_read_enabled` panic path are
+untouched — `image_read_enabled` adds no admission invariant for this slice
+(`blend_fragment`'s Rust oracle never reads it; it is an independent
+hardware bit from the blend selectors this slice admits). No RT64 parity
+claim, no performance claim (one extra texture-to-buffer copy plus one
+extra render pass per framebuffer-color-reading fixture, unmeasured).
+
+**Evidence.** `cargo test -p fn64-render-wgpu --lib` (CPU-only, no
+`host-gpu-tests`): 1156/1156 passed, 3 ignored freeze-print tests.
+`cargo clippy -p fn64-render-wgpu --lib --tests --features host-gpu-tests
+--no-deps` clean on every file this slice touches (two findings fixed
+during development: a dead `row_stride_words` field on the since-simplified
+`FramebufferColorSnapshot`, and a `needless_range_loop` in the new
+pass-splitting draw/bind-group loops, resolved with direct slice
+iteration/`zip`). `rustfmt --check` clean on every file this slice touches.
+
+**GPU evidence: unavailable, typed.** This slice's required physical-Metal
+nonzero-row differential is written --
+`required_host_framebuffer_color_blend_matches_the_rust_oracle_at_nonzero_row`
+(`targets/triangle_pipeline/tests.rs`) -- a two-triangle fixture (an opaque
+uniform-color destination draw, then a reading draw whose blend cycle
+selects `P=Framebuffer`/`M=Framebuffer`), asserting the row-`y>=4` readback
+color against `blend_fragment`'s own Rust computation for the identical
+selectors/inputs, and folds in both review-required characterization cases
+in the same test: the no-`FORCE_BL` last-cycle bypass pair (review Bug A --
+asserts `final_alpha == 0.0`/output alpha exactly the destination's alpha
+byte when `P == Framebuffer` under `force_blend == false`) and the
+memory-alpha-differs-from-source-alpha case (review Bug B -- asserts the
+output alpha equals the real two-term composite, distinct from both
+`src.a`-passthrough and `final_alpha`-as-alpha). It was not *run* to
+completion (10 consecutive clean runs per AGENTS.md's deterministic-fix
+bar): this build environment has no GPU adapter for any backend, reproduced
+identically by **every** pre-existing `host-gpu-tests` test in this crate --
+including tests in files this slice does not touch (`targets/raster.rs`,
+`device.rs`, `alpha_compare.rs`, `coverage.rs`) -- confirming this is an
+environmental sandbox limitation, not a regression this slice introduced.
+All CPU-derivable evidence (compile, lint, format, and every non-GPU
+characterization test named above, including the row-stride layout test,
+the run-splitting table test, and the admission-split predicate/fixture
+tests) is green; the new differential test panics with the same typed
+`NoAdapter` reason as the 32 other `host-gpu-tests` tests, not a distinct
+failure. Next slice/session with real Metal hardware access must run this
+test 10 consecutive clean times before this mechanism can be marked
+hardware-verified.
+
 ## RDP LOD-fraction / tile-index selection (`computeLOD`, `texture_lod`)
 
 `texture_lod` is a characterization-first literal port of the permitted MIT

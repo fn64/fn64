@@ -122,6 +122,11 @@ const COVERAGE_PARAMS_BYTES: u64 = 32;
 const MATERIAL_PARAMS_BYTES: u64 = 48;
 const TMEM_BYTES_BUFFER_SIZE: u64 = TMEM_BYTE_WORDS as u64 * 4;
 const TMEM_VALIDITY_BUFFER_SIZE: u64 = TMEM_VALIDITY_WORDS as u64 * 4;
+/// Binding 9's shared dummy buffer for every fixture in a submission whose
+/// `reads_framebuffer_color` is false -- wgpu requires every layout entry to
+/// have a bound resource even when the shader's `has_framebuffer_color`
+/// uniform flag skips reading it. One word is sufficient: never indexed.
+const FRAMEBUFFER_COLOR_DUMMY_BUFFER_SIZE: u64 = 4;
 
 /// Card §6's "no tile binding was snapshotted" status
 /// (`tmem_sample.wgsl`'s `TMEM_SAMPLE_STATUS_NO_TILE_BINDING`) --
@@ -389,6 +394,15 @@ pub struct ResolvedFragmentBlendParams {
     /// [`crate::blend::BlendColorInput::Fog`] or `A` selects
     /// [`crate::blend::BlendAlphaInput::Fog`].
     pub fog_color: Option<Color4>,
+    /// Framebuffer-blend Slice B: `true` when this fixture's active cycle(s)
+    /// select [`crate::blend::BlendColorInput::Framebuffer`] on `P` or `M`
+    /// -- computed once in `production.rs`'s `draw_admitted_triangles` from
+    /// the same selectors `cycle0`/`cycle1` above already carry, not
+    /// re-derived here. Never `true` together with an active cycle whose `B`
+    /// selects `FramebufferAlpha` reaching this struct at all -- that
+    /// combination is rejected by `production.rs` before construction (see
+    /// `ResolvedBlendCycle::requires_framebuffer_alpha`).
+    pub reads_framebuffer_color: bool,
 }
 
 impl ResolvedFragmentBlendParams {
@@ -415,27 +429,38 @@ impl ResolvedFragmentBlendParams {
         },
         blend_color: None,
         fog_color: None,
+        reads_framebuffer_color: false,
     };
 }
 
 /// Serializes the fragment shader's `FragmentBlendParams` uniform
-/// (`shaders/triangle_pipeline_fragment.wgsl`, production blend wiring slice
-/// 1): `cycle_count` at bytes 0..4, cycle 0's `p/a/m/b` at bytes 4..20,
-/// cycle 1's `p/a/m/b` at bytes 20..36 (each wire-numbered exactly as
-/// `shaders/blend_fragment_fn.wgsl`'s header documents; `cycle1`'s bytes are
-/// zero and unread by the shader when `cycle_count < 2`, matching
-/// `blend_fragment_cycle_fn`'s own `cycle_count == 2u` gate), bytes 36..48
-/// left zero (`_reserved_0/_reserved_1/_reserved_2`), `blend_color` at bytes
-/// 48..64 and `fog_color` at bytes 64..80 (both `Color4::normalized()`,
-/// matching `fragment_material_params_bytes`'s own normalization
-/// convention). `None` (no `SetBlendColor`/`SetFogColor` before this
-/// triangle) serializes as all-zero, exactly like `fragment_material_params_
-/// bytes`'s own `None` handling -- this is safe here because the caller
-/// (`production.rs`) has already rejected, before this function ever runs,
-/// any admitted triangle whose active cycle selectors actually need the
-/// missing register (see `ResolvedFragmentBlendParams`'s own doc).
+/// (`shaders/triangle_pipeline_fragment.wgsl`): `cycle_count` at bytes 0..4,
+/// cycle 0's `p/a/m/b` at bytes 4..20, cycle 1's `p/a/m/b` at bytes 20..36
+/// (each wire-numbered exactly as `shaders/blend_fragment_fn.wgsl`'s header
+/// documents; `cycle1`'s bytes are zero and unread by the shader when
+/// `cycle_count < 2`, matching `blend_fragment_cycle_fn`'s own
+/// `cycle_count == 2u` gate), `has_framebuffer_color`
+/// (`params.reads_framebuffer_color` as `0`/`1`, the former `_reserved_0`)
+/// at bytes 36..40, `row_stride_words` (the caller-supplied value, the
+/// former `_reserved_1`) at bytes 40..44, bytes 44..48 left zero
+/// (`_reserved_2`, unused by this card), `blend_color` at bytes 48..64 and
+/// `fog_color` at bytes 64..80 (both `Color4::normalized()`, matching
+/// `fragment_material_params_bytes`'s own normalization convention). `None`
+/// (no `SetBlendColor`/`SetFogColor` before this triangle) serializes as
+/// all-zero, exactly like `fragment_material_params_bytes`'s own `None`
+/// handling -- this is safe here because the caller (`production.rs`) has
+/// already rejected, before this function ever runs, any admitted triangle
+/// whose active cycle selectors actually need the missing register (see
+/// `ResolvedFragmentBlendParams`'s own doc).
+///
+/// `row_stride_words` must be `padded_bytes_per_row / 4` (the caller's own
+/// already-computed value at snapshot-creation time in `submit_triangles`),
+/// never re-derived from `params`/`fixture.extent.width` here -- the row-
+/// stride correctness fix (this card) depends on there being exactly one
+/// source of "width" for this value, not two that can silently disagree.
 fn fragment_blend_params_bytes(
     params: ResolvedFragmentBlendParams,
+    row_stride_words: u32,
 ) -> [u8; BLEND_PARAMS_BYTES as usize] {
     let mut bytes = [0u8; BLEND_PARAMS_BYTES as usize];
     bytes[0..4].copy_from_slice(&u32::from(params.cycle_count).to_le_bytes());
@@ -447,12 +472,23 @@ fn fragment_blend_params_bytes(
     bytes[24..28].copy_from_slice(&blend_alpha_input_wire(params.cycle1.a).to_le_bytes());
     bytes[28..32].copy_from_slice(&blend_color_input_wire(params.cycle1.m).to_le_bytes());
     bytes[32..36].copy_from_slice(&blend_b_input_wire(params.cycle1.b).to_le_bytes());
-    // bytes[36..48] left zero: _reserved_0/_reserved_1/_reserved_2.
+    bytes[36..40].copy_from_slice(&u32::from(params.reads_framebuffer_color).to_le_bytes());
+    bytes[40..44].copy_from_slice(&row_stride_words.to_le_bytes());
+    // bytes[44..48] left zero: _reserved_2.
     let blend_color = params.blend_color.map_or([0.0f32; 4], Color4::normalized);
     let fog_color = params.fog_color.map_or([0.0f32; 4], Color4::normalized);
     bytes[48..64].copy_from_slice(&bytemuck_f32x4(blend_color));
     bytes[64..80].copy_from_slice(&bytemuck_f32x4(fog_color));
     bytes
+}
+
+/// The snapshot resource for one framebuffer-color-dependent draw's
+/// destination read (framebuffer-blend Slice B): a `STORAGE`-usage buffer
+/// holding a `copy_texture_to_buffer` capture of the color attachment,
+/// matching this crate's existing TMEM storage-buffer convention (bindings
+/// 2/3) rather than a second bindable texture.
+struct FramebufferColorSnapshot {
+    buffer: wgpu::Buffer,
 }
 
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
@@ -774,6 +810,12 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let framebuffer_color_dummy_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-framebuffer-color-dummy"),
+            size: FRAMEBUFFER_COLOR_DUMMY_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -884,6 +926,23 @@ impl UninitializedTrianglePipeline {
                     },
                     count: None,
                 },
+                // Framebuffer-blend Slice B: the per-draw destination-color
+                // snapshot, read-only storage (this crate's TMEM
+                // storage-buffer convention, bindings 2/3). A fixture whose
+                // `reads_framebuffer_color` is false still binds SOME buffer
+                // here (wgpu requires every layout entry to have a bound
+                // resource) -- a single always-allocated dummy buffer shared
+                // across every non-reading fixture in a submission.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // Prewarm-only bind group: exercised once here so a bind-group-layout
@@ -931,6 +990,10 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: blend_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: framebuffer_color_dummy_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1021,6 +1084,7 @@ impl UninitializedTrianglePipeline {
                 queue,
                 pipelines,
                 bind_group_layout,
+                framebuffer_color_dummy_buffer,
                 errors,
             },
         )))
@@ -1071,6 +1135,36 @@ const fn validate_triangle_extent(
     Ok(())
 }
 
+/// Framebuffer-blend Slice B: partitions `fixtures.len()` draws into maximal
+/// contiguous runs, one render pass per run, such that every
+/// framebuffer-color-reading fixture (where `reads_framebuffer_color[i]` is
+/// `true`) is a singleton run of its own -- a framebuffer-color-reading
+/// draw must snapshot the color attachment *after* every earlier-ordered
+/// draw has landed and *before* its own draw runs, which is impossible
+/// within an already-open pass. A run of only non-reading fixtures needs no
+/// split (unaffected fixtures still cost one pass total, not one pass
+/// each). Returns each run as a `(start, end)` index pair into `fixtures`
+/// (`end` exclusive), in submission order. Pure and independently testable
+/// without a device.
+fn split_fixture_runs(reads_framebuffer_color: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < reads_framebuffer_color.len() {
+        if reads_framebuffer_color[start] {
+            runs.push((start, start + 1));
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < reads_framebuffer_color.len() && !reads_framebuffer_color[end] {
+            end += 1;
+        }
+        runs.push((start, end));
+        start = end;
+    }
+    runs
+}
+
 pub struct TrianglePipelineRenderer {
     _instance: wgpu::Instance,
     adapter_info: wgpu::AdapterInfo,
@@ -1080,6 +1174,11 @@ pub struct TrianglePipelineRenderer {
     /// [`depth_pipeline_index`]; see module doc and [`DEPTH_STENCIL_VARIANTS`].
     pipelines: [wgpu::RenderPipeline; 4],
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Binding 9's shared dummy resource for every fixture in a submission
+    /// whose `reads_framebuffer_color` is false -- one always-allocated
+    /// buffer reused across every non-reading fixture and every submission,
+    /// never a per-fixture or per-submission allocation.
+    framebuffer_color_dummy_buffer: wgpu::Buffer,
     errors: Arc<BoundedErrorSink>,
 }
 
@@ -1226,39 +1325,46 @@ impl TrianglePipelineRenderer {
         // `COPY_BYTES_PER_ROW_ALIGNMENT`-aligned offset; this slice's 8x8/
         // 16x16 fixed targets (port card §3) have an unaligned natural row
         // stride (e.g. 8 pixels * 4 bytes = 32), so the readback buffers use
-        // a padded stride and `complete()` strips the padding back out.
+        // a padded stride and `complete()` strips the padding back out. The
+        // framebuffer-color snapshot buffer (Slice B) reuses this exact
+        // padded stride, in words, so the WGSL side and the host side never
+        // have two independent notions of "row width" (row-stride
+        // correctness fix).
         let unpadded_bytes_per_row = extent.width * 4;
         let padded_bytes_per_row = unpadded_bytes_per_row
             .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let row_stride_words = padded_bytes_per_row / 4;
         let color_bytes = u64::from(padded_bytes_per_row) * u64::from(extent.height);
         let depth_bytes = u64::from(padded_bytes_per_row) * u64::from(extent.height);
+        let snapshot_bytes = color_bytes;
 
         // Each draw gets its own vertex buffer and its own raster/combine/
         // tmem/tile-binding uniform+storage buffers + bind group:
         // mid-render-pass `queue.write_buffer` calls are not safe against a
         // buffer already bound by an in-flight pass, so per-draw uniforms
         // must be distinct resources written before the pass opens, not
-        // one shared buffer rewritten between draws.
+        // one shared buffer rewritten between draws. Binding 9's resource is
+        // NOT built here -- it depends on which pass-splitting run this
+        // fixture falls into (see below), so it is added to each bind group
+        // when that run is processed.
         struct DrawResources {
             vertex_buffer: wgpu::Buffer,
-            bind_group: wgpu::BindGroup,
             // This draw's precreated pipeline-variant index (production
             // depth-slice task card §3), from this fixture's own
             // `depth_compare_enabled`/`depth_update_enabled` -- selected per
             // draw at `pass.set_pipeline`, not once for the whole pass.
             depth_pipeline_index: usize,
-            // Kept alive only because the bind group above borrows them
-            // (`as_entire_binding`); never read after construction.
-            _raster_params_buffer: wgpu::Buffer,
-            _combine_params_buffer: wgpu::Buffer,
-            _tmem_bytes_buffer: wgpu::Buffer,
-            _tmem_validity_buffer: wgpu::Buffer,
-            _tile_binding_buffer: wgpu::Buffer,
-            _alpha_compare_params_buffer: wgpu::Buffer,
-            _coverage_params_buffer: wgpu::Buffer,
-            _material_params_buffer: wgpu::Buffer,
-            _blend_params_buffer: wgpu::Buffer,
+            reads_framebuffer_color: bool,
+            raster_params_buffer: wgpu::Buffer,
+            combine_params_buffer: wgpu::Buffer,
+            tmem_bytes_buffer: wgpu::Buffer,
+            tmem_validity_buffer: wgpu::Buffer,
+            tile_binding_buffer: wgpu::Buffer,
+            alpha_compare_params_buffer: wgpu::Buffer,
+            coverage_params_buffer: wgpu::Buffer,
+            material_params_buffer: wgpu::Buffer,
+            blend_params_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -1370,68 +1476,27 @@ impl TrianglePipelineRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let blend_params_bytes = fragment_blend_params_bytes(fixture.blend_params);
+            let blend_params_bytes =
+                fragment_blend_params_bytes(fixture.blend_params, row_stride_words);
             self.queue
                 .write_buffer(&blend_params_buffer, 0, &blend_params_bytes);
 
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fn64-triangle-pipeline-bind-group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: raster_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: combine_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: tmem_bytes_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: tmem_validity_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: tile_binding_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: alpha_compare_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: coverage_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: material_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: blend_params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
             draws.push(DrawResources {
                 vertex_buffer,
-                bind_group,
                 depth_pipeline_index: depth_pipeline_index(
                     fixture.depth_compare_enabled,
                     fixture.depth_update_enabled,
                 ),
-                _raster_params_buffer: raster_params_buffer,
-                _combine_params_buffer: combine_params_buffer,
-                _tmem_bytes_buffer: tmem_bytes_buffer,
-                _tmem_validity_buffer: tmem_validity_buffer,
-                _tile_binding_buffer: tile_binding_buffer,
-                _alpha_compare_params_buffer: alpha_compare_params_buffer,
-                _coverage_params_buffer: coverage_params_buffer,
-                _material_params_buffer: material_params_buffer,
-                _blend_params_buffer: blend_params_buffer,
+                reads_framebuffer_color: fixture.blend_params.reads_framebuffer_color,
+                raster_params_buffer,
+                combine_params_buffer,
+                tmem_bytes_buffer,
+                tmem_validity_buffer,
+                tile_binding_buffer,
+                alpha_compare_params_buffer,
+                coverage_params_buffer,
+                material_params_buffer,
+                blend_params_buffer,
             });
         }
 
@@ -1508,7 +1573,136 @@ impl TrianglePipelineRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("fn64-triangle-pipeline-submit"),
             });
-        {
+
+        // Framebuffer-blend Slice B: partition the draws into maximal
+        // contiguous runs, one render pass per run, with every
+        // framebuffer-color-reading fixture a singleton run of its own (see
+        // `split_fixture_runs`'s own doc) -- a reading fixture must snapshot
+        // the color attachment *after* every earlier-ordered draw has landed
+        // and *before* its own draw runs, impossible within an
+        // already-open pass. Every fixture still shares the one clear (only
+        // the first run clears; every later run uses `LoadOp::Load` on all
+        // three attachments) and the one final readback below, exactly as
+        // the prior single-pass code did -- only the number of passes that
+        // produced the color texture's content changes, not how it is read
+        // back.
+        let reads_framebuffer_color: Vec<bool> = draws
+            .iter()
+            .map(|draw| draw.reads_framebuffer_color)
+            .collect();
+        let runs = split_fixture_runs(&reads_framebuffer_color);
+        // Kept alive until `encoder.finish()`: each reading run's snapshot
+        // buffer is bound by that run's bind group(s) via `as_entire_binding`.
+        let mut snapshots: Vec<FramebufferColorSnapshot> = Vec::new();
+        // Kept alive until `encoder.finish()`: every bind group built below.
+        let mut bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+        for (run_index, &(start, end)) in runs.iter().enumerate() {
+            let run_reads_framebuffer_color = reads_framebuffer_color[start];
+            let framebuffer_color_binding: wgpu::BindingResource<'_> =
+                if run_reads_framebuffer_color {
+                    // This run's one fixture reads framebuffer color: snapshot
+                    // the live color attachment (already
+                    // `RENDER_ATTACHMENT | COPY_SRC`) at `padded_bytes_per_row`
+                    // stride before opening this run's pass, so the shader
+                    // reads every earlier-ordered draw's committed output.
+                    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("fn64-triangle-pipeline-framebuffer-color-snapshot"),
+                        size: snapshot_bytes,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &color_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(padded_bytes_per_row),
+                                rows_per_image: Some(extent.height),
+                            },
+                        },
+                        wgpu::Extent3d {
+                            width: extent.width,
+                            height: extent.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    snapshots.push(FramebufferColorSnapshot { buffer });
+                    snapshots
+                        .last()
+                        .expect("just pushed")
+                        .buffer
+                        .as_entire_binding()
+                } else {
+                    self.framebuffer_color_dummy_buffer.as_entire_binding()
+                };
+
+            for resources in &draws[start..end] {
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fn64-triangle-pipeline-bind-group"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: resources.raster_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: resources.combine_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: resources.tmem_bytes_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: resources.tmem_validity_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: resources.tile_binding_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: resources.alpha_compare_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: resources.coverage_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: resources.material_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: resources.blend_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: framebuffer_color_binding.clone(),
+                        },
+                    ],
+                });
+                bind_groups.push(bind_group);
+            }
+
+            let is_first_run = run_index == 0;
+            let load_op_color = if is_first_run {
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+            } else {
+                wgpu::LoadOp::Load
+            };
+            let load_op_depth = if is_first_run {
+                wgpu::LoadOp::Clear(1.0)
+            } else {
+                wgpu::LoadOp::Load
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fn64-triangle-pipeline-pass"),
                 color_attachments: &[
@@ -1517,16 +1711,23 @@ impl TrianglePipelineRenderer {
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: load_op_color,
                             store: wgpu::StoreOp::Store,
                         },
                     }),
+                    // The status attachment's `LoadOp::Load` on every
+                    // non-first run is load-bearing: `complete()`'s
+                    // `status_readback` copies the status texture to the CPU
+                    // exactly once, after every run's pass has ended, so a
+                    // `LoadOp::Clear` here on any non-first run would
+                    // silently discard every prior run's
+                    // `tmem_sample_status` writes.
                     Some(wgpu::RenderPassColorAttachment {
                         view: &status_view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: load_op_color,
                             store: wgpu::StoreOp::Store,
                         },
                     }),
@@ -1534,7 +1735,7 @@ impl TrianglePipelineRenderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: load_op_depth,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -1543,13 +1744,14 @@ impl TrianglePipelineRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            for resources in &draws {
+            for (resources, bind_group) in draws[start..end].iter().zip(&bind_groups[start..end]) {
                 pass.set_pipeline(&self.pipelines[resources.depth_pipeline_index]);
-                pass.set_bind_group(0, &resources.bind_group, &[]);
+                pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, resources.vertex_buffer.slice(..));
                 pass.draw(0..3, 0..1);
             }
         }
+
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &color_texture,

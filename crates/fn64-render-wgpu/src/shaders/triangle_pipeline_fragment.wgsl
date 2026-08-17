@@ -127,20 +127,33 @@ struct FragmentMaterialParams {
 @group(0) @binding(7)
 var<uniform> fragment_material_params: FragmentMaterialParams;
 
-// Production blend wiring slice 1: the admitted-subset resolved blend-cycle
-// uniform. `cycle_count` is `crate::blend::BlendModeState::cycle_count()`
-// (0=Copy/Fill bypass, 1=OneCycle, 2=TwoCycle); `cycleN_p/a/m/b` are
+// Resolved blend-cycle uniform. `cycle_count` is
+// `crate::blend::BlendModeState::cycle_count()` (0=Copy/Fill bypass,
+// 1=OneCycle, 2=TwoCycle); `cycleN_p/a/m/b` are
 // `crate::blend::ResolvedBlendCycle`'s four selectors, wire-numbered exactly
 // as `shaders/blend_fragment_fn.wgsl`'s header documents. `blend_color`/
 // `fog_color` are `G_SETBLENDCOLOR`/`G_SETFOGCOLOR`, normalized `[0,1]`
 // (`Color4::normalized()`, matching `fragment_material_params`'s own
 // env/prim normalization). Host-side construction rejects, before this
 // uniform is ever populated, any admitted triangle whose active cycle
-// selectors require a framebuffer sample (`ResolvedBlendCycle::
-// requires_framebuffer_sample`) -- this uniform's `cycleN_*` fields are
-// therefore never `BLEND_COLOR_FRAMEBUFFER`/`BLEND_B_FRAMEBUFFER_ALPHA` for
-// an active cycle in this pipeline today (see `production.rs`'s
-// `WgpuRawDpcExecutionError::BlendRequiresFramebuffer`).
+// selectors require a framebuffer-*alpha* sample
+// (`ResolvedBlendCycle::requires_framebuffer_alpha`) -- this uniform's
+// `cycleN_b` fields are therefore never `BLEND_B_FRAMEBUFFER_ALPHA` for an
+// active cycle in this pipeline today (see `production.rs`'s
+// `WgpuRawDpcExecutionError::BlendRequiresFramebuffer`). `cycleN_p`/
+// `cycleN_m` MAY be `BLEND_COLOR_FRAMEBUFFER` -- that is exactly what
+// `has_framebuffer_color`/binding 9 below exist to serve (framebuffer-blend
+// Slice B).
+//
+// `has_framebuffer_color` (was `_reserved_0`): `0`/`1`, `true` when this
+// fixture's active cycle(s) select `BlendColorInput::Framebuffer` on `P` or
+// `M` -- computed host-side in `production.rs`, matching
+// `ResolvedFragmentBlendParams::reads_framebuffer_color`.
+// `row_stride_words` (was `_reserved_1`): the exact `u32` word stride of
+// `framebuffer_color_snapshot` below (`padded_bytes_per_row / 4`, never
+// `extent.width` -- see "Row stride correctness" in the port card). WGSL
+// struct layout is unaffected by this rename -- still 80 bytes, still four
+// `u32` words after `cycle1_b`.
 struct FragmentBlendParams {
     cycle_count: u32,
     cycle0_p: u32,
@@ -151,8 +164,8 @@ struct FragmentBlendParams {
     cycle1_a: u32,
     cycle1_m: u32,
     cycle1_b: u32,
-    _reserved_0: u32,
-    _reserved_1: u32,
+    has_framebuffer_color: u32,
+    row_stride_words: u32,
     _reserved_2: u32,
     blend_color: vec4<f32>,
     fog_color: vec4<f32>,
@@ -161,6 +174,16 @@ struct FragmentBlendParams {
 @group(0) @binding(8)
 var<uniform> fragment_blend_params: FragmentBlendParams;
 
+// Framebuffer-blend Slice B: this draw's destination-color snapshot, a
+// `copy_texture_to_buffer` capture of the color attachment taken before this
+// draw's own pass opened, padded-row-stride-packed RGBA8 words (see
+// `fragment_blend_params.row_stride_words` above). Read-only storage,
+// matching this crate's TMEM storage-buffer convention (bindings 2/3).
+// Fixtures whose `has_framebuffer_color` is `0u` are still bound to SOME
+// buffer here (a shared host-side dummy) but never index into it.
+@group(0) @binding(9)
+var<storage, read> framebuffer_color_snapshot: array<u32>;
+
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) tmem_sample_status: u32,
@@ -168,6 +191,7 @@ struct FragmentOutput {
 
 @fragment
 fn fs_main(
+    @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
 ) -> FragmentOutput {
@@ -260,28 +284,66 @@ fn fs_main(
         output.color.a = f32(coverage.adjusted_alpha) / 255.0;
     }
 
-    // Production blend wiring slice 1: the admitted-subset blend-cycle
-    // composite, gated on the SAME `blend_enabled` `coverage_fragment_fn`
-    // already computed above -- no second gate. `cycle_count == 0u`
-    // (Copy/Fill) is `blend_fragment_cycle_fn`'s own internal bypass
-    // (returns `output.color` unchanged), matching
+    // Blend-cycle composite, gated on the SAME `blend_enabled`
+    // `coverage_fragment_fn` already computed above -- no second gate.
+    // `cycle_count == 0u` (Copy/Fill) is `blend_fragment_cycle_fn`'s own
+    // internal bypass (returns `output.color` unchanged), matching
     // `crate::blend::blend_fragment`'s identical short-circuit.
-    output.color = blend_fragment_cycle_fn(
-        fragment_blend_params.cycle_count,
-        fragment_blend_params.cycle0_p,
-        fragment_blend_params.cycle0_a,
-        fragment_blend_params.cycle0_m,
-        fragment_blend_params.cycle0_b,
-        fragment_blend_params.cycle1_p,
-        fragment_blend_params.cycle1_a,
-        fragment_blend_params.cycle1_m,
-        fragment_blend_params.cycle1_b,
-        output.color,
-        color.a,
-        fragment_blend_params.blend_color,
-        fragment_blend_params.fog_color,
-        coverage.blend_enabled,
-    );
+    //
+    // Framebuffer-blend Slice B: when `has_framebuffer_color != 0u`, this
+    // fragment's active cycle(s) selected `BlendColorInput::Framebuffer` on
+    // `P`/`M` -- `blend_fragment_memory_composite_fn` runs INSTEAD OF
+    // `blend_fragment_cycle_fn` (never chained after it; see that
+    // function's own doc for why), taking the pre-blend combiner color
+    // (`output.color`, unmodified by `blend_fragment_cycle_fn`, which never
+    // runs on this branch) and the decoded destination sample from
+    // `framebuffer_color_snapshot`.
+    if (fragment_blend_params.has_framebuffer_color != 0u) {
+        let px = u32(position.x);
+        let py = u32(position.y);
+        let word_index = py * fragment_blend_params.row_stride_words + px;
+        let packed = framebuffer_color_snapshot[word_index];
+        let dst = vec4<f32>(
+            f32(packed & 0xffu) / 255.0,
+            f32((packed >> 8u) & 0xffu) / 255.0,
+            f32((packed >> 16u) & 0xffu) / 255.0,
+            f32((packed >> 24u) & 0xffu) / 255.0,
+        );
+        output.color = blend_fragment_memory_composite_fn(
+            fragment_blend_params.cycle_count,
+            fragment_blend_params.cycle0_p,
+            fragment_blend_params.cycle0_a,
+            fragment_blend_params.cycle0_m,
+            fragment_blend_params.cycle0_b,
+            fragment_blend_params.cycle1_p,
+            fragment_blend_params.cycle1_a,
+            fragment_blend_params.cycle1_m,
+            fragment_blend_params.cycle1_b,
+            output.color,
+            color.a,
+            fragment_blend_params.blend_color,
+            fragment_blend_params.fog_color,
+            coverage.blend_enabled,
+            dst,
+        );
+    } else {
+        output.color = blend_fragment_cycle_fn(
+            fragment_blend_params.cycle_count,
+            fragment_blend_params.cycle0_p,
+            fragment_blend_params.cycle0_a,
+            fragment_blend_params.cycle0_m,
+            fragment_blend_params.cycle0_b,
+            fragment_blend_params.cycle1_p,
+            fragment_blend_params.cycle1_a,
+            fragment_blend_params.cycle1_m,
+            fragment_blend_params.cycle1_b,
+            output.color,
+            color.a,
+            fragment_blend_params.blend_color,
+            fragment_blend_params.fog_color,
+            coverage.blend_enabled,
+        );
+    }
 
     output.tmem_sample_status = sample.status;
     return output;
