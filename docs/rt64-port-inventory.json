@@ -8936,7 +8936,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -8960,6 +8960,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_camera_controller.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Zero bodies: CameraController is one data member (hlslpp::int2 lastCursorPos) plus five declarations -- the constructor and the four methods whose definitions rt64_camera_controller.cpp already refuses. All four take DebuggerCamera&, the 8-member struct at hle/rt64_workload.h:193-202 that rt64_workload_geometry.rs refuses by name as field layout. Declaration shape only; nothing here to own that the .cpp refusal does not already settle."
       }
     },
     {
@@ -9331,7 +9336,7 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
+      "port_state": "refused",
       "ported_as": [],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -9355,6 +9360,11 @@
         "exit_gate": "The M8 behavior fixture for src/gui/rt64_file_dialog.h passes its declared differential and required 10/20-run reliability bar.",
         "evidence_state": "not-run",
         "claim_status": "candidate-observation"
+      },
+      "port_refusal": {
+        "commit": "be52ea716f319113985155c6ce097fa6ba813e30",
+        "evidence": "docs/RT64-GUI-ASSESSMENT.md",
+        "reason": "Declarations for the nfd wrapper above: FileDialog is one static std::atomic<bool> plus five bodiless static declarations (initialize, finish, getDirectoryPath, getOpenFilename, getSaveFilename). The file's only body is FileFilter's constructor, whose two branches assign the same two string fields and differ solely in calling win32::Utf8ToUtf16 from the excluded src/contrib/utf8conv on _WIN32. No arithmetic anywhere in the file."
       }
     },
     {
