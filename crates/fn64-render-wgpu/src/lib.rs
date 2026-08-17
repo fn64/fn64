@@ -322,6 +322,7 @@ mod depth_mode;
 mod depth_strict_less;
 mod device;
 mod endian_swap;
+mod fbcommon;
 mod formats_dither;
 mod lifecycle;
 mod native_contract;
