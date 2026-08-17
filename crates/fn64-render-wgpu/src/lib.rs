@@ -344,6 +344,7 @@ mod rt64_gbi_f3dex;
 mod rt64_gbi_s2dex2;
 mod rt64_light_estimation;
 mod rt64_math;
+mod rt64_math_decompose;
 mod rt64_math_matrix;
 mod rt64_replacement_resolve;
 mod rt64_tmem_hasher;
