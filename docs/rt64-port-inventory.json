@@ -26697,8 +26697,10 @@
       "port_delta": "unchanged",
       "milestone": "M5",
       "workstream": "gbi-deferred-rsp",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_smooth_normal.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m5-src-shaders-rspsmoothnormalcs-hlsl",
@@ -26711,7 +26713,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rspsmoothnormalcs_hlsl.wgsl"
+          "crates/fn64-render-wgpu/src/rt64_rsp_smooth_normal.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
