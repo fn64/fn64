@@ -24921,7 +24921,8 @@
       "port_state": "ported",
       "ported_as": [
         "crates/fn64-render-wgpu/src/endian_swap.rs",
-        "crates/fn64-render-wgpu/src/fbcommon.rs"
+        "crates/fn64-render-wgpu/src/fbcommon.rs",
+        "crates/fn64-render-wgpu/src/rt64_float4_quantize.rs"
       ],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -24936,7 +24937,8 @@
         "recommended_profile": "I/high",
         "writable_paths": [
           "crates/fn64-render-wgpu/src/endian_swap.rs",
-          "crates/fn64-render-wgpu/src/fbcommon.rs"
+          "crates/fn64-render-wgpu/src/fbcommon.rs",
+          "crates/fn64-render-wgpu/src/rt64_float4_quantize.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -25502,6 +25504,7 @@
       "workstream": "feature-parity",
       "port_state": "ported",
       "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_float4_quantize.rs",
         "crates/fn64-render-wgpu/src/shader_manifest.rs",
         "crates/fn64-render-wgpu/src/tmem/texel.rs"
       ],
@@ -25517,6 +25520,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
+          "crates/fn64-render-wgpu/src/rt64_float4_quantize.rs",
           "crates/fn64-render-wgpu/src/shader_manifest.rs",
           "crates/fn64-render-wgpu/src/tmem/texel.rs"
         ],
@@ -27851,6 +27855,7 @@
       "workstream": "rdp-framebuffer",
       "port_state": "ported",
       "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_texture_sampler.rs",
         "crates/fn64-render-wgpu/src/texture_lod.rs"
       ],
       "evidence_state": "source-digests-verified",
@@ -27865,6 +27870,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
+          "crates/fn64-render-wgpu/src/rt64_texture_sampler.rs",
           "crates/fn64-render-wgpu/src/texture_lod.rs"
         ],
         "non_goals": [
