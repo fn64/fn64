@@ -14,9 +14,14 @@
 //! `lerpMatrix`/`lerpMatrix3x3`/`lerpMatrixComponents` ... (deferred --
 //! needs new matrix-inverse/quaternion infra)"); this module closes that
 //! deferral for the six matrix-shaped functions only. The quaternion
-//! `decomposeMatrix`/`recomposeMatrix`/`DecomposedTransform`/
-//! `lerpTransforms` cluster in the same source file is a separate,
-//! independently-owned port and is NOT ported here (see "Nonclaims").
+//! [`decomposeMatrix`](crate::rt64_math_decompose::decompose_matrix)/
+//! [`recomposeMatrix`](crate::rt64_math_decompose::recompose_matrix)/
+//! [`DecomposedTransform`](crate::rt64_math_decompose::DecomposedTransform)/
+//! [`lerpTransforms`](crate::rt64_math_decompose::lerp_transforms) cluster
+//! in the same source file is a separate, independently-owned port and is
+//! NOT ported *here* (see "Nonclaims") -- read that as a refusal by *this*
+//! module, not as a claim the crate lacks the symbols: `rt64_math_decompose.rs`
+//! (a separate ticket, owned by another executor) ports all four.
 //!
 //! Source line ranges (`src/common/rt64_math.cpp`):
 //!
@@ -342,11 +347,20 @@
 //! correct, matching `rt64_math.rs`'s and every other characterization-
 //! first module's precedent). Does not port any other function from
 //! `rt64_math.h`/`.cpp` beyond the six named above -- in particular, the
-//! quaternion cluster `decomposeMatrix`, `recomposeMatrix`,
-//! `DecomposedTransform` (and its constructor), and `lerpTransforms`, plus
-//! their `vecCombine`/`vecScale` helpers, are a separate ticket (owned by
-//! another executor) and are deliberately NOT ported here: they need a
-//! `hlslpp::quaternion`-equivalent type that this module does not add.
+//! quaternion cluster
+//! [`decomposeMatrix`](crate::rt64_math_decompose::decompose_matrix),
+//! [`recomposeMatrix`](crate::rt64_math_decompose::recompose_matrix),
+//! [`DecomposedTransform`](crate::rt64_math_decompose::DecomposedTransform)
+//! (and its constructor), and
+//! [`lerpTransforms`](crate::rt64_math_decompose::lerp_transforms) are
+//! deliberately NOT ported *here*: this module needed a
+//! `hlslpp::quaternion`-equivalent type it does not add. Read that as a
+//! refusal by *this* module, not as a claim the crate lacks the symbols --
+//! `rt64_math_decompose.rs` (a separate ticket, owned by another executor)
+//! ports all four, under its own `Quat` type rather than a
+//! `hlslpp::quaternion` port. Their `vecCombine`/`vecScale` helpers remain
+//! private there (not part of that module's public surface) and are still
+//! genuinely unported as reusable symbols anywhere in this crate.
 //! `matrixDecomposeViewProj` and `pseudoRandom` remain out of scope exactly
 //! as `rt64_math.rs` already stated.
 //!
