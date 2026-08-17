@@ -19,8 +19,8 @@ pub use production::{
     new_raw_dpc_roles, BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
     ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter, ExactValidatedRawDpcPlan, GuestCommittedRawDpc,
     NeutralColor4, NeutralColorImage, NeutralCombineParams, NeutralFillColor, NeutralImageFormat,
-    NeutralOtherMode, NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage,
-    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
+    NeutralOtherMode, NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralScissor,
+    NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
     NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
@@ -1138,6 +1138,17 @@ mod production {
             ))
         }
 
+        /// Identity of one `SetScissor`'s tracked rect. Its own domain tag
+        /// (`rdp-state-scissor.v1`) keeps it disjoint from every other
+        /// state slot's identity space, exactly as [`Self::of_fog_color`]
+        /// and its siblings do.
+        pub fn of_scissor(value: NeutralScissor) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-scissor.v1\0",
+                &[&scissor_bytes(value)],
+            ))
+        }
+
         pub const fn digest(self) -> fn64_render_ir::ContentDigest {
             self.0
         }
@@ -1279,13 +1290,45 @@ mod production {
         bytes
     }
 
+    /// Neutral mirror of `SetScissor`'s decoded operands (RDP opcode `0x2d`),
+    /// field-for-field as RT64's `setScissor` decode reads them: a 2-bit
+    /// `mode` plus four 12-bit fixed-point coordinates (10 integer bits, 2
+    /// fractional -- the same `<< 2` scale `FillRectangle`/`TexRect` use), all
+    /// zero-extended and therefore never negative.
+    ///
+    /// **Tracked state only.** This carrier exists so a stream containing
+    /// `SetScissor` is admitted rather than rejected; nothing in the raster
+    /// path reads it. It is deliberately *not* mirrored into
+    /// `RdpState`/`RdpStateDelta` the way the nine applied pure-state
+    /// commands are, because that is precisely the channel a draw would use
+    /// to consult it. Actually clipping to this rect is separate, later work.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralScissor {
+        pub mode: u8,
+        pub upper_left_x: u16,
+        pub upper_left_y: u16,
+        pub lower_right_x: u16,
+        pub lower_right_y: u16,
+    }
+
+    fn scissor_bytes(value: NeutralScissor) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(9);
+        bytes.push(value.mode);
+        bytes.extend_from_slice(&value.upper_left_x.to_be_bytes());
+        bytes.extend_from_slice(&value.upper_left_y.to_be_bytes());
+        bytes.extend_from_slice(&value.lower_right_x.to_be_bytes());
+        bytes.extend_from_slice(&value.lower_right_y.to_be_bytes());
+        bytes
+    }
+
     /// Neutral payload for one staged, resource-access-free state command
     /// (`SetTile`, `SetTileSize`, `SetTextureImage`, `SyncLoad`, plus the
     /// nine pure-RDP-state commands admitted alongside them: `SetOtherMode`,
     /// `SetColorImage`, `SetFillColor`, `SetEnvColor`, `SetPrimColor`,
-    /// `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `SetCombine`) that a
-    /// following load or draw command depends on. T3 needs these fields to
-    /// reconstruct tile/RDP state without rereading command bytes.
+    /// `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `SetCombine`, plus
+    /// the tracked-only `SetScissor`) that a following load or draw command
+    /// depends on. T3 needs these fields to reconstruct tile/RDP state
+    /// without rereading command bytes.
     ///
     /// Every variant except `SyncLoad` carries `raw_words` (the command's own
     /// wire words) and an ordered `before`/`after` [`RdpStateIdentity`] pair:
@@ -1391,6 +1434,23 @@ mod production {
             location: RawDpcCommandLocation,
             raw_words: Box<[u32]>,
             combine: NeutralCombineParams,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        /// RDP opcode `0x2d`, admitted as **tracked state only**: the rect
+        /// is carried here so a stream containing `SetScissor` parses and
+        /// plans instead of dying at `UnsupportedCommand`, but no draw,
+        /// clip, or bounds computation reads it. Unlike the nine applied
+        /// pure-state commands above, this one's value is deliberately
+        /// absent from `RdpState`/`RdpStateDelta`, so there is no channel
+        /// through which the raster path could consult it even by accident.
+        /// It still threads `before`/`after` over its own single global
+        /// slot exactly like its siblings, so admitting it later (as
+        /// applied state) is an additive change rather than a reshape.
+        SetScissor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            scissor: NeutralScissor,
             before: Option<RdpStateIdentity>,
             after: RdpStateIdentity,
         },

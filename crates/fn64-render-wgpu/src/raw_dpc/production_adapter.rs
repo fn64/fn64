@@ -32,10 +32,11 @@
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
     NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize, NeutralPrimColor,
-    NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
-    NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation,
-    RdpFillRectangleCommand, RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch,
+    NeutralPrimDepth, NeutralScissor, NeutralTextureImage, NeutralTileAddressMode,
+    NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+    NeutralTmemTransferWord, NeutralTriangleVertex,
+    RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpFillRectangleCommand,
+    RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch,
     TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics,
     TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
 };
@@ -249,6 +250,7 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
         RawDpcCommandKind::SetOtherMode(_)
+        | RawDpcCommandKind::SetScissor(_)
         | RawDpcCommandKind::SetColorImage(_)
         | RawDpcCommandKind::SetFillColor(_)
         | RawDpcCommandKind::SetEnvColor(_)
@@ -267,6 +269,34 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         | RawDpcCommandKind::TextureRectangle(_) => {
             unreachable!("admitted kinds are pushed, never rejected")
         }
+    }
+}
+
+/// Widen one `SetScissor` decode into its neutral mirror.
+///
+/// [`crate::rt64_gbi_rdp_decode::decode_set_scissor`] types its four
+/// coordinates `i32` to mirror RT64's `int32_t` locals, but every one is a
+/// zero-extended 12-bit extraction (`p0`/`p1` mask to `bits` width and never
+/// sign-extend), so the true domain is `0..=4095` -- comfortably inside
+/// `u16`. The `expect`s below are loud traps on that invariant rather than
+/// silent `as` truncations: if the decoder is ever changed to sign-extend,
+/// this panics naming the field instead of quietly wrapping a negative
+/// coordinate into a huge positive one.
+fn neutral_scissor(value: crate::rt64_gbi_rdp_decode::SetScissorDecoded) -> NeutralScissor {
+    fn coordinate(field: &str, raw: i32) -> u16 {
+        u16::try_from(raw).unwrap_or_else(|_| {
+            panic!(
+                "SetScissor {field} decoded to {raw}, outside the zero-extended 12-bit \
+                 domain 0..=4095 that decode_set_scissor is proven to produce"
+            )
+        })
+    }
+    NeutralScissor {
+        mode: value.mode,
+        upper_left_x: coordinate("ulx", value.ulx),
+        upper_left_y: coordinate("uly", value.uly),
+        lower_right_x: coordinate("lrx", value.lrx),
+        lower_right_y: coordinate("lry", value.lry),
     }
 }
 
@@ -598,6 +628,10 @@ struct StateIdentityTracker {
     fog_color: Option<RdpStateIdentity>,
     prim_depth: Option<RdpStateIdentity>,
     combine: Option<RdpStateIdentity>,
+    /// Tracked-only, exactly like the applied slots above -- `SetScissor`
+    /// still owns one global slot whose `before`/`after` chain threads
+    /// through this plan, even though no consumer reads the value.
+    scissor: Option<RdpStateIdentity>,
 }
 
 fn tile_slot(index: TileIndex) -> usize {
@@ -894,6 +928,19 @@ pub fn push_decoded_raw_dpc(
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetScissor(value) => {
+                let neutral = neutral_scissor(value);
+                let after = RdpStateIdentity::of_scissor(neutral);
+                let before = tracker.scissor;
+                tracker.scissor = Some(after);
+                writer.push_state(RdpStateCommand::SetScissor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    scissor: neutral,
                     before,
                     after,
                 });
@@ -1251,6 +1298,11 @@ mod tests {
     const SET_FOG_COLOR: u8 = 0x38;
     const SET_PRIM_DEPTH: u8 = 0x2e;
     const SET_COMBINE: u8 = 0x3c;
+    /// Spelled independently of the decoder's own `SET_SCISSOR`, exactly
+    /// like every sibling above -- so a typo in either one is caught by
+    /// `set_scissor_is_admitted_and_matches_the_decoded_command` rather
+    /// than cancelling out.
+    const SET_SCISSOR: u8 = 0x2d;
 
     fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
         [word(SET_OTHER_MODE, cycle_type << 20), low]
@@ -1285,6 +1337,15 @@ mod tests {
 
     fn set_prim_depth(z: u32, dz: u32) -> [u32; 2] {
         [word(SET_PRIM_DEPTH, 0), z << 16 | dz]
+    }
+
+    /// `SetScissor` wire words: `w0` payload packs `ulx << 12 | uly`, `w1`
+    /// packs `mode << 24 | lrx << 12 | lry`.
+    fn set_scissor(mode: u32, ulx: u32, uly: u32, lrx: u32, lry: u32) -> [u32; 2] {
+        [
+            word(SET_SCISSOR, ulx << 12 | uly),
+            mode << 24 | lrx << 12 | lry,
+        ]
     }
 
     /// `CombineParams::from_wire(w0, w1)` stores `w0` unmasked -- the opcode
@@ -2205,6 +2266,357 @@ mod tests {
         assert_eq!(raw_words.as_ref(), words.as_slice());
         assert_eq!(*color, neutral_color4(source));
         assert!(before.is_none());
+    }
+
+    // -- SetScissor (tracked state only) --------------------------------
+
+    #[test]
+    fn set_scissor_is_admitted_and_matches_the_decoded_command() {
+        // ulx = 0x0A0 (160), uly = 0x0B0 (176), lrx = 0x0C0 (192),
+        // lry = 0x0D0 (208), mode = 1 -- hand-derived, each inside its own
+        // 12-bit (coordinate) or 2-bit (mode) field.
+        let words = set_scissor(1, 0x0A0, 0x0B0, 0x0C0, 0x0D0).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetScissor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(
+            plan.states.len(),
+            1,
+            "SetScissor must reach the plan as a state command, exactly as SetFogColor does"
+        );
+        let RdpStateCommand::SetScissor {
+            raw_words,
+            scissor,
+            before,
+            after,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*scissor, neutral_scissor(source));
+        assert!(
+            before.is_none(),
+            "first SetScissor in the plan has no prior"
+        );
+        assert_eq!(*after, RdpStateIdentity::of_scissor(*scissor));
+
+        // Hand-derived field values, independent of the decoder.
+        assert_eq!(scissor.mode, 1);
+        assert_eq!(scissor.upper_left_x, 0x0A0);
+        assert_eq!(scissor.upper_left_y, 0x0B0);
+        assert_eq!(scissor.lower_right_x, 0x0C0);
+        assert_eq!(scissor.lower_right_y, 0x0D0);
+    }
+
+    #[test]
+    fn set_scissor_pushes_zero_resource_accesses() {
+        // A pure state command, like SetFogColor: it plans no reads and no
+        // writes of its own, so it can neither touch RDRAM nor reorder
+        // anything that does. Both fixtures are one two-word command, so
+        // even the command-decode read spans match byte for byte.
+        let words = set_scissor(0, 0, 0, 320 * 4, 240 * 4).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        let fog_words = set_fog_color(0x11223344).to_vec();
+        let (fog_decoded, fog_capture, fog_journal) =
+            decode_admitted_capture(fog_words, (0x214, 0x224));
+        let fog_plan = push_and_visit(&fog_decoded, fog_capture, fog_journal);
+        assert_eq!(
+            plan.accesses, fog_plan.accesses,
+            "SetScissor must declare exactly the accesses a SetFogColor does -- none of its own"
+        );
+    }
+
+    #[test]
+    fn set_scissor_threads_before_after_identity_across_two_occurrences() {
+        let mut words = Vec::new();
+        words.extend(set_scissor(0, 0, 0, 320 * 4, 240 * 4));
+        words.extend(set_scissor(1, 16, 16, 300 * 4, 220 * 4));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 2);
+
+        let RdpStateCommand::SetScissor {
+            before: b0,
+            after: a0,
+            scissor: v0,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetScissor first");
+        };
+        let RdpStateCommand::SetScissor {
+            before: b1,
+            after: a1,
+            scissor: v1,
+            ..
+        } = &plan.states[1]
+        else {
+            panic!("expected SetScissor second");
+        };
+        assert_ne!(v0, v1, "the fixture's two rects must differ");
+        assert!(b0.is_none());
+        assert_eq!(*b1, Some(*a0), "the second's before is the first's after");
+        assert_ne!(a0, a1, "distinct rects must hash to distinct identities");
+    }
+
+    #[test]
+    fn set_scissor_identity_is_disjoint_from_every_other_state_slot() {
+        // The all-zero rect must not collide with any other slot's all-zero
+        // value: each identity carries its own domain tag.
+        let zero = NeutralScissor {
+            mode: 0,
+            upper_left_x: 0,
+            upper_left_y: 0,
+            lower_right_x: 0,
+            lower_right_y: 0,
+        };
+        let scissor = RdpStateIdentity::of_scissor(zero);
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_fog_color(NeutralColor4 { value: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_fill_color(NeutralFillColor { value: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_combine(NeutralCombineParams { low: 0, high: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_prim_depth(NeutralPrimDepth { z: 0, dz: 0 })
+        );
+    }
+
+    /// **The card's core evidence.** Adding `SetScissor` commands to a
+    /// stream must leave the produced plan's rendered effect bit-identical:
+    /// every non-scissor state command, every triangle, every resource
+    /// access, and every full-sync site must be exactly what the
+    /// scissor-free stream produced, in exactly the same order.
+    ///
+    /// Because `SetScissor` is tracked state only -- it stages nothing into
+    /// `RdpState` and pushes no `ResourceAccess` -- the only differences
+    /// between the two plans may be the tracked `RdpStateCommand::SetScissor`
+    /// entries themselves and the length of the command-decode read that
+    /// covers the longer display list.
+    #[test]
+    fn admitting_set_scissor_changes_no_rendered_output() {
+        fn stream(with_scissor: bool) -> Vec<u32> {
+            let mut words = Vec::new();
+            if with_scissor {
+                words.extend(set_scissor(0, 0, 0, 320 * 4, 240 * 4));
+            }
+            words.extend(set_other_mode(3, 0)); // Fill
+            if with_scissor {
+                words.extend(set_scissor(1, 16, 16, 300 * 4, 220 * 4));
+            }
+            words.extend(set_color_image(0, 2, 8, 0x200));
+            words.extend(set_fill_color(0xf801_f801));
+            if with_scissor {
+                words.extend(set_scissor(2, 0, 0, 0xFFF, 0xFFF));
+            }
+            words.extend(set_env_color(0x11223344));
+            words.extend(set_prim_color(10, 5, 0x11223344));
+            words.extend(set_blend_color(0x55667788));
+            words.extend(set_fog_color(0x11223344));
+            words.extend(set_prim_depth(100, 200));
+            words.extend(set_combine(0x0034_5678, 0x9abc_def0));
+            if with_scissor {
+                words.extend(set_scissor(3, 4095, 4095, 4095, 4095));
+            }
+            words
+        }
+
+        fn plan_of(words: Vec<u32>) -> RecordingVisitor {
+            let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+            push_and_visit(&decoded, capture, journal)
+        }
+
+        let without = plan_of(stream(false));
+        let with = plan_of(stream(true));
+
+        // The scissor commands really are there -- otherwise every equality
+        // below is vacuous.
+        let scissor_count = with
+            .states
+            .iter()
+            .filter(|state| matches!(state, RdpStateCommand::SetScissor { .. }))
+            .count();
+        assert_eq!(scissor_count, 4, "all four SetScissor commands admitted");
+        assert!(!without
+            .states
+            .iter()
+            .any(|state| matches!(state, RdpStateCommand::SetScissor { .. })));
+
+        // Everything that can reach a pixel is identical. The only
+        // difference permitted is the tracked SetScissor entries.
+        let with_non_scissor: Vec<_> = with
+            .states
+            .iter()
+            .filter(|state| !matches!(state, RdpStateCommand::SetScissor { .. }))
+            .collect();
+        let without_states: Vec<_> = without.states.iter().collect();
+        assert_eq!(
+            with_non_scissor.len(),
+            without_states.len(),
+            "no state command may be added or dropped"
+        );
+        for (index, (left, right)) in with_non_scissor
+            .iter()
+            .zip(without_states.iter())
+            .enumerate()
+        {
+            // `location`/`raw_words` legitimately shift (the scissor words
+            // move later commands' byte offsets), so compare the variant
+            // and the staged value, which are what a consumer reads.
+            assert_eq!(
+                std::mem::discriminant(*left),
+                std::mem::discriminant(*right),
+                "state command {index} changed variant"
+            );
+            assert_eq!(
+                state_command_value_debug(left),
+                state_command_value_debug(right),
+                "state command {index} changed its staged value"
+            );
+            // The `before`/`after` identity chain must be untouched too:
+            // a SetScissor that wrote into some *other* slot's tracker
+            // entry would leave every staged value intact while silently
+            // corrupting that slot's differential history, which T3 uses
+            // to reconstruct state without rereading command bytes.
+            assert_eq!(
+                state_command_identities(left),
+                state_command_identities(right),
+                "state command {index} changed its before/after identity chain"
+            );
+        }
+
+        assert_eq!(
+            with.triangles.len(),
+            without.triangles.len(),
+            "no triangle may appear or vanish"
+        );
+
+        // Accesses: the only entry either plan declares is the
+        // `CommandDecode` read of the display list itself, and the
+        // scissored stream's is longer by exactly the four SetScissor
+        // commands' own eight bytes each -- reading more command words is
+        // not a rendered effect. Every *other* access must match exactly,
+        // which here means neither plan gained one.
+        fn command_decode_span(accesses: &[fn64_render_ir::ResourceAccess]) -> u64 {
+            let mut spans = accesses.iter().filter_map(|access| {
+                matches!(
+                    access.purpose(),
+                    fn64_render_ir::AccessPurpose::CommandDecode
+                )
+                .then(|| match access.region() {
+                    fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                        u64::from(range.end()) - u64::from(range.start().get())
+                    }
+                    other => panic!("CommandDecode read an unexpected region: {other:?}"),
+                })
+            });
+            let span = spans
+                .next()
+                .expect("every plan reads its own command words");
+            assert!(spans.next().is_none(), "exactly one CommandDecode access");
+            span
+        }
+
+        let non_decode = |accesses: &[fn64_render_ir::ResourceAccess]| {
+            accesses
+                .iter()
+                .filter(|access| {
+                    !matches!(
+                        access.purpose(),
+                        fn64_render_ir::AccessPurpose::CommandDecode
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            non_decode(&with.accesses),
+            non_decode(&without.accesses),
+            "SetScissor must declare no resource access of its own beyond the command read"
+        );
+        assert_eq!(
+            command_decode_span(&with.accesses),
+            command_decode_span(&without.accesses) + 4 * 8,
+            "the command-decode read grows by exactly the four SetScissor commands' own bytes"
+        );
+
+        assert_eq!(with.full_sync_sites, without.full_sync_sites);
+        assert_eq!(with.loads, without.loads);
+    }
+
+    /// The `before`/`after` identity pair one state command threads through
+    /// its own slot. `SyncLoad` has no identity pair (it threads TMEM load
+    /// epochs instead), so it reports `None`.
+    ///
+    /// Deliberately an **exhaustive** match with no `_` arm, for the same
+    /// reason [`state_command_value_debug`] is.
+    fn state_command_identities(
+        command: &RdpStateCommand,
+    ) -> Option<(Option<RdpStateIdentity>, RdpStateIdentity)> {
+        match command {
+            RdpStateCommand::SetOtherMode { before, after, .. }
+            | RdpStateCommand::SetColorImage { before, after, .. }
+            | RdpStateCommand::SetFillColor { before, after, .. }
+            | RdpStateCommand::SetEnvColor { before, after, .. }
+            | RdpStateCommand::SetPrimColor { before, after, .. }
+            | RdpStateCommand::SetBlendColor { before, after, .. }
+            | RdpStateCommand::SetFogColor { before, after, .. }
+            | RdpStateCommand::SetPrimDepth { before, after, .. }
+            | RdpStateCommand::SetCombine { before, after, .. }
+            | RdpStateCommand::SetScissor { before, after, .. }
+            | RdpStateCommand::SetTile { before, after, .. }
+            | RdpStateCommand::SetTileSize { before, after, .. }
+            | RdpStateCommand::SetTextureImage { before, after, .. } => Some((*before, *after)),
+            RdpStateCommand::SyncLoad { .. } => None,
+        }
+    }
+
+    /// The staged value of one state command, excluding `location` and
+    /// `raw_words` (both of which legitimately shift when other commands
+    /// are inserted ahead of them in the stream).
+    ///
+    /// Deliberately an **exhaustive** match with no `_` arm: a future
+    /// `RdpStateCommand` variant must be classified here explicitly rather
+    /// than silently escaping the no-pixel-change comparison above.
+    fn state_command_value_debug(command: &RdpStateCommand) -> String {
+        match command {
+            RdpStateCommand::SetOtherMode { other_mode, .. } => format!("{other_mode:?}"),
+            RdpStateCommand::SetColorImage { image, .. } => format!("{image:?}"),
+            RdpStateCommand::SetFillColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetEnvColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetPrimColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetBlendColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetFogColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetPrimDepth { depth, .. } => format!("{depth:?}"),
+            RdpStateCommand::SetCombine { combine, .. } => format!("{combine:?}"),
+            RdpStateCommand::SetScissor { scissor, .. } => format!("{scissor:?}"),
+            RdpStateCommand::SetTile {
+                tile_index,
+                descriptor,
+                ..
+            } => format!("{tile_index:?}{descriptor:?}"),
+            RdpStateCommand::SetTileSize {
+                tile_index, size, ..
+            } => format!("{tile_index:?}{size:?}"),
+            RdpStateCommand::SetTextureImage { image, .. } => format!("{image:?}"),
+            RdpStateCommand::SyncLoad {
+                input_epoch,
+                output_epoch,
+                ..
+            } => format!("{input_epoch:?}{output_epoch:?}"),
+        }
     }
 
     #[test]
