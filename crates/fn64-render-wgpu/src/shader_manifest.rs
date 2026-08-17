@@ -1260,6 +1260,72 @@ mod tests {
         .unwrap();
     }
 
+    fn hex(bytes: [u8; 32]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").unwrap();
+            out
+        })
+    }
+
+    /// `deterministic_fixture_is_exact_and_oracle_derived` already recomputes
+    /// all four DirectTexelDecodeV1 identities, but it compares against
+    /// `[u8; 32]` literals. `docs/RT64-RUNTIME-SHADER-CORPUS.md` republishes
+    /// the same identities as hex text, and nothing tied the two
+    /// representations together -- so an identity could be re-frozen in code
+    /// while the doc kept asserting the stale digest as evidence. This test
+    /// owns the doc's hex rows directly: it re-derives each digest from
+    /// committed inputs, renders it as hex, and requires the published table
+    /// to contain exactly that string.
+    #[test]
+    fn published_corpus_doc_cites_the_recomputed_direct_texel_identities() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/RT64-RUNTIME-SHADER-CORPUS.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", doc_path.display()));
+
+        // The published hex appears here as source text on purpose. It makes
+        // the recomputation checkable against a literal a reader can compare
+        // to the doc by eye, and it is what `scripts/lint-docs.py` greps for
+        // when it asks whether a documented hash is owned by a test.
+        let fixture = fixture();
+        for (row, actual, published) in [
+            (
+                "source SHA-256",
+                digest(DIRECT_TEXEL_DECODE_WGSL.as_bytes()),
+                "2f59380f62db77f1c11b81e149894947d01ad8c812ee11e3771125317fff3880",
+            ),
+            (
+                "fixture SHA-256",
+                fixture.identity,
+                "f24aca795ae8954ae362280cd91c75017623bf7db1601688e9bc2775dcfb7d37",
+            ),
+            (
+                "input SHA-256",
+                digest(&fixture.input_bytes),
+                "6199dd74587f3a8ca86e24fbab5949bb0dcb04db8c4c47f3e9a65504edd9c274",
+            ),
+            (
+                "expected-output SHA-256",
+                digest(&fixture.expected_bytes),
+                "89bce88b397fa2a5e08eb1549498eba49465368968ff844ed0e42e407c17114f",
+            ),
+        ] {
+            assert_eq!(
+                hex(actual),
+                published,
+                "DirectTexelDecodeV1 {row} recomputed from committed inputs no \
+                 longer equals the frozen identity",
+            );
+            let expected = format!("| {row} | `{published}` |");
+            assert!(
+                doc.lines().any(|line| line.trim() == expected),
+                "docs/RT64-RUNTIME-SHADER-CORPUS.md must publish the recomputed \
+                 DirectTexelDecodeV1 {row} row as `{expected}`",
+            );
+        }
+    }
+
     #[test]
     fn typed_profile_rejects_each_insufficient_limit() {
         let profile = DirectTexelDecodeDeviceProfile;
