@@ -341,6 +341,7 @@ mod rt64_gbi_f3d;
 mod rt64_gbi_f3dex;
 mod rt64_gbi_s2dex2;
 mod rt64_math;
+mod rt64_math_matrix;
 mod rt64_tmem_hasher;
 mod shader_manifest;
 mod state;
