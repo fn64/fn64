@@ -7,7 +7,13 @@ The ordinary checker keeps a structurally sound development backlog green. The
 separate `--progress` gate remains red until every required row has both a
 qualified RT64 observation/classification and a qualified Rust result.
 
-The first concrete backend runner is registered only for deferred frame history.
+Two concrete runners are registered: the RT64 deferred-frame-history runner, and the
+pure-Rust reference delegate qualifying `feature::native-renderer-rdram-sync`. That
+single `RUST_PASS` records that fn64's *reference* CPU rasterizer reproduces an
+independently derived RDRAM answer on one fixture at one observable layer. It is not
+RT64 parity: `rt64_evidence.availability` on that row is still `unexercised`, so RT64
+has never been run against it and no RT64-to-Rust comparison exists. It also says
+nothing about the wgpu renderer, which this row does not exercise.
 Closed evidence remains fail-closed: the checker launches every fresh process and owns each random
 challenge. A public replay artifact contains only the Rust-decoded record, exact raw
 payload streams, and capture control; a separately registered verifier-private authority
@@ -20,11 +26,11 @@ contains expected observations/effects and is never sent to the child.
 | `RT64_PASS` | 1 |
 | `RT64_DIVERGES` | 0 |
 | `RT64_PUBLICLY_UNAVAILABLE` | 0 |
-| `RUST_PENDING` | 50 |
-| `RUST_PASS` | 0 |
+| `RUST_PENDING` | 49 |
+| `RUST_PASS` | 1 |
 | `RUST_BOUNDED_QUALIFICATION` | 0 |
 
-Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertised RT64 features); **50 Rust rows pending** and **49 RT64 observations pending**.
+Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertised RT64 features); **49 Rust rows pending** and **49 RT64 observations pending**.
 
 ## Rows
 
@@ -70,7 +76,7 @@ Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertis
 | `feature::texture-pack-dds` | [RT64 feature](rt64-public-feature-inventory.json) / `texture-pack-dds` — DDS texture-pack replacements | `pinned_rt64` | `resource_journal_guest_memory_effects` → `shader_parameters` | `RUST_PENDING` | `unexercised` |
 | `feature::texture-pack-rice-filenames` | [RT64 feature](rt64-public-feature-inventory.json) / `texture-pack-rice-filenames` — Texture packs compatible with Rice filenames | `pinned_rt64` | `resource_journal_guest_memory_effects` | `RUST_PENDING` | `unexercised` |
 | `feature::texture-pack-async-streaming` | [RT64 feature](rt64-public-feature-inventory.json) / `texture-pack-async-streaming` — Asynchronous texture-pack streaming | `pinned_rt64` | `resource_journal_guest_memory_effects` | `RUST_PENDING` | `unexercised` |
-| `feature::native-renderer-rdram-sync` | [RT64 feature](rt64-public-feature-inventory.json) / `native-renderer-rdram-sync` — Native-resolution renderer preserves game-visible RDRAM behavior | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_native` | `RUST_PENDING` | `unexercised` |
+| `feature::native-renderer-rdram-sync` | [RT64 feature](rt64-public-feature-inventory.json) / `native-renderer-rdram-sync` — Native-resolution renderer preserves game-visible RDRAM behavior | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_native` | `RUST_PASS` | `unexercised` |
 | `feature::framebuffer-detection-region-copy` | [RT64 feature](rt64-public-feature-inventory.json) / `framebuffer-detection-region-copy` — Framebuffer detection copies sampled framebuffer regions | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_native` | `RUST_PENDING` | `unexercised` |
 | `feature::framebuffer-upscaling` | [RT64 feature](rt64-public-feature-inventory.json) / `framebuffer-upscaling` — Upscale framebuffer effects and associated region copies | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_high` | `RUST_PENDING` | `unexercised` |
 | `feature::framebuffer-reinterpretation` | [RT64 feature](rt64-public-feature-inventory.json) / `framebuffer-reinterpretation` — High-resolution per-pixel framebuffer reinterpretation | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_native` → `framebuffer_high` | `RUST_PENDING` | `unexercised` |
