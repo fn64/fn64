@@ -856,22 +856,39 @@ def port_state_for(gated: bool, ported_as: list[str], refusal: dict[str, str] | 
     """Derive `port_state` from mechanically detected port evidence, plus the
     one declared input this tool admits.
 
-    `authority-gated` is a path-derived source-overlay constraint and takes
-    priority (it is never itself completion evidence). Otherwise a source is
-    `ported` only when at least one Rust module in a port-target crate cites
-    its exact whole-file SHA-256 digest (`ported_as_for`). `refused` is the
-    single declared state: a landed batch assessment settled the file as
-    never-to-be-ported, and `verify_refusals` has resolved that assessment's
-    commit and evidence file before this runs. Digest evidence still wins over
-    a declaration -- if someone refuses a file a Rust module actually cites,
-    the citation is the stronger fact and the file reads `ported`. Everything
-    else is `not-started`. This never widens to a partial/behavioral claim:
-    `refused` asserts an assessment happened, never that behavior is covered.
+    **Digest evidence outranks every declaration and every path-derived
+    fact.** A source is `ported` when at least one Rust module in a port-target
+    crate cites its exact whole-file SHA-256 digest (`ported_as_for`); that
+    citation is the strongest fact this tool can observe, so it wins over both
+    the `refused` declaration and the `authority-gated` path fact. Failing a
+    digest, the ranking is `authority-gated`, then `refused`, then
+    `not-started`.
+
+    `authority-gated` is a path-derived source-overlay constraint, and it is
+    neither completion evidence nor a veto. It records that fn64 applies
+    textual overlays to this file in the native C++ build
+    (`crates/fn64-render-rt64/ffi/CMakeLists.txt`), where the pinned digest is
+    a build-time tripwire on the *input* bytes so a silent upstream change
+    cannot make a patch land in the wrong place. It says nothing about whether
+    the file's behavior has been reimplemented in Rust -- the tool schedules a
+    port card with a Rust destination for every gated file -- so it cannot
+    raise a digest-less file to `ported`, and equally it cannot suppress a
+    real, cited port back down to `authority-gated`. The gate fact is never
+    lost by that ranking: it is emitted as its own `authority_gate` record,
+    keyed off the path in `authority["overlays"]["source_gates"]` rather than
+    off `port_state`, and `validate_inventory` requires that record present and
+    digest-matched for every gated path whatever its state.
+
+    `refused` is the single declared state: a landed batch assessment settled
+    the file as never-to-be-ported, and `verify_refusals` has resolved that
+    assessment's commit and evidence file before this runs. Everything else is
+    `not-started`. This never widens to a partial/behavioral claim: `refused`
+    asserts an assessment happened, never that behavior is covered.
     """
-    if gated:
-        return "authority-gated"
     if ported_as:
         return "ported"
+    if gated:
+        return "authority-gated"
     return "refused" if refusal else "not-started"
 
 
@@ -1168,8 +1185,13 @@ def validate_inventory(value: dict, authority: dict) -> None:
         base_keys = {"path", "sources", "port_delta", "milestone", "workstream", "port_state", "ported_as", "evidence_state", "task_card"}
         # Still an exact closed key set, deliberately widened by exactly one
         # optional key. `port_refusal` and `authority_gate` are mutually
-        # exclusive by construction (`authority-gated` wins in
-        # `port_state_for`), so no entry may carry both.
+        # exclusive because the declared refusal set and the gate set are
+        # required disjoint above ("refusal collides with an authority gate"),
+        # so no entry may carry both. That disjointness is the load-bearing
+        # fact, not the ranking inside `port_state_for`: a gated path now reads
+        # `ported` when a Rust module cites its digest, yet still emits its
+        # `authority_gate` record, so the two keys are decoupled from the
+        # state.
         require(
             set(item) in (base_keys, base_keys | {"authority_gate"}, base_keys | {"port_refusal"}),
             f"{path}: file entry fields changed",
@@ -1281,7 +1303,7 @@ def markdown(inventory: dict) -> str:
         "- Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.",
         "- Paths are repository-relative; the checked artifact rejects machine-local paths.", "",
         "`candidate_hints` in the JSON are deliberately non-exhaustive regex navigation aids, not a symbol denominator.", "",
-        "`port_state` is mechanically derived from digests and paths, with one declared exception: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
+        "`port_state` is mechanically derived from digests and paths, with one declared exception. `ported` outranks everything: it means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`. Failing a digest, the ranking is `authority-gated`, then `refused`, then `not-started`. `authority-gated` is a path-derived source-overlay constraint (never completion evidence, and never a veto either): it records that fn64 patches this file textually in the native C++ build, where the pinned digest is a build-time tripwire on the input bytes, so it can neither raise a digest-less file to `ported` nor suppress a genuinely cited port. A gated file keeps emitting its `authority_gate` record whatever its `port_state`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
         "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the six landed batch assessments of `src/common` (17 files), `src/render` (28 files), `src/hle` (18 files), and `src/gui`/`src/imgui` (10 files).", "",
         "## Milestone denominator", "", "| milestone | files | primary-port KLOC |", "|---|---:|---:|",
     ]
@@ -1303,7 +1325,7 @@ def markdown(inventory: dict) -> str:
             f"`{item['milestone']}` / `{item['workstream']}` | `{item['evidence_state']}` | `{card['evidence_state']}` / `{card['claim_status']}` | "
             f"`{card['owner_lane']}` ({card['recommended_profile']}) | `{card['id']}` |"
         )
-    output.extend(["", "`authority-gated` is a source-overlay constraint, never completion evidence. A `refused` row's `ported as` cell names the assessing commit and evidence file instead of a module, because a refusal is a documented human judgement and must be checkable; it credits no line as ported. Every task remains a candidate observation until its card exit gate and reliability bar pass.", ""])
+    output.extend(["", "`authority-gated` is a source-overlay constraint, never completion evidence -- and never a veto: digest evidence outranks it, so a gated file some Rust module actually cites reads `ported` while still carrying its `authority_gate` record. A `refused` row's `ported as` cell names the assessing commit and evidence file instead of a module, because a refusal is a documented human judgement and must be checkable; it credits no line as ported. Every task remains a candidate observation until its card exit gate and reliability bar pass.", ""])
     return "\n".join(output)
 
 
@@ -1494,6 +1516,39 @@ def self_test() -> None:
     mutated = copy.deepcopy(base)
     ported = next(item for item in mutated["files"] if item["ported_as"])
     ported["port_state"] = "not-started"
+    expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
+    # Digest evidence outranks the authority gate. The gate pins the *input*
+    # bytes fn64's native C++ build patches textually; it is not a prohibition
+    # on porting, and the tool schedules a Rust destination for every gated
+    # file. So a gated source a Rust module actually cites must read `ported`,
+    # while a gated source with no citation stays `authority-gated`. Asserted
+    # on `port_state_for` directly, because no real gated file currently
+    # carries a digest citation and the committed inventory therefore cannot
+    # supply the positive fixture -- the same reason the `not-started` probes
+    # above synthesize theirs. Reverting the two branches breaks the first
+    # assertion.
+    require(
+        port_state_for(True, ["crates/fn64-render-wgpu/src/rt64_math.rs"], None) == "ported",
+        "a cited digest must outrank the authority gate",
+    )
+    require(
+        port_state_for(True, [], None) == "authority-gated",
+        "an uncited authority-gated source must stay authority-gated",
+    )
+    # And the gate must outrank a declared refusal it can never actually
+    # collide with (they are required disjoint), pinning the middle of the
+    # ranking rather than leaving it to accident.
+    require(
+        port_state_for(True, [], PORT_REFUSALS[min(PORT_REFUSALS)]) == "authority-gated",
+        "the authority gate must outrank a declared refusal",
+    )
+    # End-to-end: a real gated row that claims `ported` with no citation is
+    # still rejected, so the reordering did not make the gated state
+    # self-certifying.
+    mutated = copy.deepcopy(base)
+    gated_row = next(item for item in mutated["files"] if item["port_state"] == "authority-gated")
+    require(not gated_row["ported_as"], "gated probe fixture must start with no port evidence")
+    gated_row["port_state"] = "ported"
     expect_rejected(mutated, authority, "port_state is not derived from gated status, ported_as, and the declared refusal")
     # A `not-started` row may not fabricate port evidence: claiming a Rust
     # module that does not cite this source's digest must fail the mechanical
