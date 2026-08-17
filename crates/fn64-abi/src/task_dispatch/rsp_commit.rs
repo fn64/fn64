@@ -928,12 +928,27 @@ struct SessionRawDpcSource {
 /// `plan_raw_dpc`/`execute_raw_dpc`/`publish_raw_dpc`.
 ///
 /// `plan_raw_dpc` (`fn64-render-wgpu`'s `WgpuBackend`) already rejects a
-/// `FullSync` command or any command outside the admitted TMEM/state subset
-/// as a loud `RenderError`; `commit_zero_guest_writes` independently
-/// re-rejects any guest-visible write with `EffectCountMismatch`. Neither
-/// rejection is caught here -- both `.unwrap_or_else(|error| panic!(...))`
-/// through, matching this card's "TMEM-only, reject FullSync and all
-/// guest-write journals loudly" requirement and AGENTS.md's loud-trap rule.
+/// `FullSync` command or any command outside the admitted TMEM/state/fill
+/// subset as a loud `RenderError`.
+///
+/// Which guest-commit method runs is decided by what the backend itself
+/// says it staged, read back through `staged_guest_render_target_writes`:
+///
+/// - An empty list takes `commit_zero_guest_writes`, which independently
+///   re-rejects any guest-visible write with `EffectCountMismatch`. This is
+///   every TMEM-only and triangle-only submission.
+/// - A nonempty list takes `commit_guest_render_target_writes`, which
+///   re-validates every element's access mode/purpose and then, through
+///   `GuestCommitEffectReport::try_new`, its count, order, identity, and
+///   content digest against the packet's own guest-write journal. A backend
+///   that reported a fabricated list is caught there, not trusted here.
+///
+/// Neither rejection is caught: both `.unwrap_or_else(|error| panic!(...))`
+/// through, matching AGENTS.md's loud-trap rule.
+///
+/// Nonclaim: taking the nonempty branch modifies no guest RDRAM byte. The
+/// writes are ranges plus content digests describing a backend-local buffer;
+/// no RDRAM copyback exists on this path.
 /// A submission this backend cannot admit is a hard stop, not a silent
 /// fallback to the legacy path: falling back would let a T4-registered
 /// session quietly downgrade capture fidelity for exactly the submissions
@@ -1043,14 +1058,38 @@ fn try_dispatch_raw_dpc_via_session(
             .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
     });
 
+    // The guest-visible `RenderTarget` writes the backend staged for THIS
+    // submission during the `execute_raw_dpc` call just above, read back in
+    // its own borrow because `RENDER_BACKEND` and `RAW_DPC_SESSION` are
+    // separate `RefCell`s that this function has always borrowed
+    // separately. Empty for every TMEM-only and triangle-only submission,
+    // which is every submission admitted before FillRectangle was.
+    //
+    // This list is transport, not authority: whichever commit branch it
+    // selects below re-validates it against the packet's own journal and
+    // against the backend's already-issued `BackendEffectReport`.
+    let staged_writes = RENDER_BACKEND.with(|cell| {
+        let mut backend = cell.borrow_mut();
+        let backend = backend
+            .as_mut()
+            .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
+        backend.staged_guest_render_target_writes(prepared.submission())
+    });
+
     let committed = RAW_DPC_SESSION.with(|cell| {
         let mut session = cell.borrow_mut();
         let session = session
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
-        session
-            .commit_zero_guest_writes(prepared)
-            .unwrap_or_else(|error| panic!("commit_zero_guest_writes: {error}"))
+        if staged_writes.is_empty() {
+            session
+                .commit_zero_guest_writes(prepared)
+                .unwrap_or_else(|error| panic!("commit_zero_guest_writes: {error}"))
+        } else {
+            session
+                .commit_guest_render_target_writes(prepared, staged_writes)
+                .unwrap_or_else(|error| panic!("commit_guest_render_target_writes: {error}"))
+        }
     });
 
     // Mirrors the legacy path's own `transaction.validate_atomic_completion()`

@@ -146,7 +146,11 @@ pub struct FillRectangle {
 }
 
 impl FillRectangle {
-    #[cfg(test)]
+    /// Reconstructs the decode payload from the four raw 12-bit wire
+    /// fields. No longer test-only: `production`'s fill executor
+    /// reconstructs one from the neutral `RdpFillRectangleCommand`, which
+    /// carries the identical undivided wire fields precisely so the
+    /// execution-time rectangle is the decoder's own, not a re-derivation.
     pub(crate) const fn from_wire_fields(
         upper_left_x: u16,
         upper_left_y: u16,
@@ -232,6 +236,43 @@ pub struct RawDpcResourcePlan {
     tmem_source_identity: TmemLoadSourceIdentity,
     accesses: Box<[ResourceAccess]>,
     tmem_transfers: Box<[TmemTransferRecord]>,
+    fill_spans: Box<[FillAccessSpan]>,
+}
+
+/// The exact ordered `ResourceAccess` run one admitted `FillRectangle`
+/// pushed into the plan's own access list, recorded by `plan_fill` at the
+/// moment it pushed them.
+///
+/// Exists so the production adapter can hand
+/// `ExactRawDpcPlanWriter::push_fill_rectangle` the *decoder's* access slice
+/// rather than re-deriving it: two independent derivations of the same
+/// access list is exactly the divergence `ExactRawDpcPlanWriter::finish`'s
+/// access-for-access check exists to catch, and re-deriving would turn that
+/// sealed guarantee into a runtime coin flip.
+///
+/// `count` is `1` for a full-image-width fill and the rectangle's pixel
+/// height otherwise -- a partial-width rectangle's rows occupy disjoint,
+/// width-strided RDRAM ranges, so collapsing them would declare untouched
+/// inter-row bytes as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillAccessSpan {
+    command_index: u32,
+    first_access_index: u32,
+    count: u32,
+}
+
+impl FillAccessSpan {
+    pub const fn command_index(self) -> u32 {
+        self.command_index
+    }
+
+    pub const fn first_access_index(self) -> u32 {
+        self.first_access_index
+    }
+
+    pub const fn count(self) -> u32 {
+        self.count
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,6 +309,39 @@ impl BoundTmemTransfer<'_> {
         self.words
     }
 }
+
+/// A recorded `FillRectangle` access span could not be bound back to the
+/// plan's own ordered access list. Every variant means the decoder and the
+/// resource plan disagree about what an admitted fill writes -- a loud
+/// rejection, never a silently substituted access slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillAccessSpanError {
+    FillNotDeclared { command_index: u32 },
+    AccessSliceOutOfBounds { command_index: u32 },
+    AccessDescriptorsDiffer { command_index: u32 },
+}
+
+impl fmt::Display for FillAccessSpanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FillNotDeclared { command_index } => write!(
+                formatter,
+                "no FillRectangle access span was declared for command #{command_index}"
+            ),
+            Self::AccessSliceOutOfBounds { command_index } => write!(
+                formatter,
+                "FillRectangle command #{command_index}'s access span is out of bounds"
+            ),
+            Self::AccessDescriptorsDiffer { command_index } => write!(
+                formatter,
+                "FillRectangle command #{command_index}'s access span is not a run of \
+                 RenderTarget color-framebuffer writes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FillAccessSpanError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmemLoadSourcePlanError {
@@ -315,6 +389,55 @@ impl std::error::Error for TmemLoadSourcePlanError {}
 impl RawDpcResourcePlan {
     pub fn accesses(&self) -> &[ResourceAccess] {
         &self.accesses
+    }
+
+    /// The exact ordered access slice `plan_fill` pushed for the admitted
+    /// `FillRectangle` at decode-order position `command_index`, together
+    /// with the span record itself.
+    ///
+    /// Every returned access is re-checked here to be an
+    /// `AccessMode::Write`/`AccessPurpose::RenderTarget` RDRAM
+    /// `ColorFramebuffer` region: the span was recorded by the decoder, but
+    /// a span that no longer describes render-target writes means the plan
+    /// and the decoder disagree, which is a loud rejection rather than a
+    /// slice handed on unchecked.
+    pub fn bind_fill_rectangle(
+        &self,
+        command_index: u32,
+    ) -> Result<(FillAccessSpan, &[ResourceAccess]), FillAccessSpanError> {
+        let span = self
+            .fill_spans
+            .iter()
+            .copied()
+            .find(|span| span.command_index == command_index)
+            .ok_or(FillAccessSpanError::FillNotDeclared { command_index })?;
+        let start = usize::try_from(span.first_access_index)
+            .map_err(|_| FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let end = start
+            .checked_add(span.count as usize)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        if accesses.is_empty() {
+            return Err(FillAccessSpanError::AccessSliceOutOfBounds { command_index });
+        }
+        let exact = accesses.iter().all(|access| {
+            access.mode() == AccessMode::Write
+                && access.purpose() == AccessPurpose::RenderTarget
+                && matches!(
+                    access.region(),
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        ..
+                    }
+                )
+        });
+        if !exact {
+            return Err(FillAccessSpanError::AccessDescriptorsDiffer { command_index });
+        }
+        Ok((span, accesses))
     }
 
     pub fn tmem_load_source_accesses(
@@ -755,6 +878,7 @@ fn decode_from_state(
 
     let mut delta = RdpStateDelta::default();
     let mut commands = Vec::new();
+    let mut fill_spans: Vec<FillAccessSpan> = Vec::new();
     for (stream_index, stream) in packet.streams().iter().enumerate() {
         let flattened = FlattenedStream::new(workload, stream_index, stream);
         decode_stream(
@@ -765,6 +889,7 @@ fn decode_from_state(
             &mut delta,
             &mut planned,
             &mut commands,
+            &mut fill_spans,
         )?;
     }
 
@@ -804,6 +929,7 @@ fn decode_from_state(
             tmem_source_identity,
             accesses: resource_accesses,
             tmem_transfers,
+            fill_spans: fill_spans.into_boxed_slice(),
         },
         origin,
     })
@@ -897,6 +1023,7 @@ fn decode_stream(
     delta: &mut RdpStateDelta,
     planned: &mut Vec<ResourceAccess>,
     commands: &mut Vec<DecodedRawDpcCommand>,
+    fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
     let mut offset = 0usize;
     while offset < stream.bytes.len() {
@@ -1019,7 +1146,27 @@ fn decode_stream(
                     lower_right_x: ((w0 >> 12) & 0x0fff) as u16,
                     lower_right_y: (w0 & 0x0fff) as u16,
                 };
-                plan_fill(location, rectangle, layout, state, planned)?;
+                // `commands.len()` is this command's own decode-order
+                // index: `commands` accumulates across every stream in the
+                // packet and this command is pushed at the bottom of this
+                // same loop iteration, so the value read here is exactly
+                // the index it will occupy. The span is recorded by
+                // `plan_fill` itself, at the moment it pushes the accesses,
+                // so the recorded run can never drift from the pushed one.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_fill(
+                    location,
+                    command_index,
+                    rectangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                )?;
                 RawDpcCommandKind::FillRectangle(rectangle)
             }
             LOAD_SYNC | LOAD_TLUT | SET_TILE_SIZE | LOAD_BLOCK | LOAD_TILE | SET_TILE
@@ -1142,10 +1289,12 @@ fn decode_stream(
 
 fn plan_fill(
     location: RawDpcCommandLocation,
+    command_index: u32,
     rectangle: FillRectangle,
     layout: fn64_render_ir::PhysicalMemoryLayout,
     state: &RdpState,
     planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
     if state.other_mode().map(OtherMode::cycle_type) != Some(CycleType::Fill) {
         return Err(RawDpcDecodeError::InvalidCommand {
@@ -1229,6 +1378,14 @@ fn plan_fill(
             reason: "FillRectangle exceeds the bounded resource-plan access count",
         });
     }
+    // Recorded before the push loop below and paired with `planned_rows`
+    // after it, so the span this decoder publishes is derived from the same
+    // loop that pushes the accesses -- never from a second, independent
+    // derivation of the same math.
+    let first_access_index =
+        u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        })?;
     let rows: Box<dyn Iterator<Item = (u32, u32)>> = if planned_rows == 1 {
         Box::new(core::iter::once((y0, y1)))
     } else {
@@ -1285,6 +1442,20 @@ fn plan_fill(
             },
         )?;
     }
+    let count = u32::try_from(planned.len() - first_access_index as usize).map_err(|_| {
+        RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        }
+    })?;
+    debug_assert_eq!(
+        count as usize, planned_rows,
+        "plan_fill pushed a different number of accesses than it planned"
+    );
+    fill_spans.push(FillAccessSpan {
+        command_index,
+        first_access_index,
+        count,
+    });
     Ok(())
 }
 
@@ -1784,6 +1955,7 @@ mod tests {
                 &mut delta,
                 &mut planned,
                 &mut commands,
+                &mut Vec::new(),
             )
             .unwrap_err();
             assert!(matches!(
@@ -1821,6 +1993,7 @@ mod tests {
             &mut RdpState::default(),
             source_identity,
             &mut RdpStateDelta::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -4016,6 +4189,7 @@ mod tests {
             &mut delta,
             &mut planned,
             &mut commands,
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(error, RawDpcDecodeError::TruncatedCommand { .. }));
