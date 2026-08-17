@@ -89,8 +89,10 @@
       "port_delta": "unchanged",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-include-rt64-extended-gbi-h",
@@ -103,7 +105,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_extended_gbi_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -2232,6 +2234,7 @@
       "port_state": "ported",
       "ported_as": [
         "crates/fn64-render-wgpu/src/rt64_math.rs",
+        "crates/fn64-render-wgpu/src/rt64_math_decompose.rs",
         "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
       ],
       "evidence_state": "source-digests-verified",
@@ -2247,6 +2250,7 @@
         "recommended_profile": "I/high",
         "writable_paths": [
           "crates/fn64-render-wgpu/src/rt64_math.rs",
+          "crates/fn64-render-wgpu/src/rt64_math_decompose.rs",
           "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
         ],
         "non_goals": [
@@ -2303,6 +2307,7 @@
       "port_state": "ported",
       "ported_as": [
         "crates/fn64-render-wgpu/src/rt64_math.rs",
+        "crates/fn64-render-wgpu/src/rt64_math_decompose.rs",
         "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
       ],
       "evidence_state": "source-digests-verified",
@@ -2318,6 +2323,7 @@
         "recommended_profile": "I/high",
         "writable_paths": [
           "crates/fn64-render-wgpu/src/rt64_math.rs",
+          "crates/fn64-render-wgpu/src/rt64_math_decompose.rs",
           "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
         ],
         "non_goals": [
