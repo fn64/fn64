@@ -219,6 +219,19 @@ pub const fn apply_alpha_dither(
 pub const ALPHA_COMPARE_WGSL: &str = include_str!("alpha_compare.wgsl");
 pub const ALPHA_COMPARE_ENTRY_POINT: &str = "alpha_compare_fragment";
 
+/// Fragment-callable twin of [`ALPHA_COMPARE_WGSL`]'s existing
+/// `general_compare`/`evaluate` compute-shader logic: an ordinary WGSL
+/// function (`alpha_compare_fragment_fn`, no `@compute`, no
+/// `@group`/`@binding`, no entry point) taking scalar arguments and
+/// returning `bool`, concatenatable into a future `@fragment` entry point
+/// the same way `color_combiner.wgsl` already is per
+/// `shaders/triangle_pipeline_fragment.wgsl`'s header. Not wired into any
+/// draw path, bind group layout, or pipeline used elsewhere in this crate --
+/// see this module's doc comment and the sibling `alpha_compare.wgsl`'s own
+/// header for the shared scope boundary. The existing `ALPHA_COMPARE_WGSL`
+/// `@compute` entry point is untouched by this addition.
+pub const ALPHA_COMPARE_FRAGMENT_FN_WGSL: &str = include_str!("alpha_compare_fragment_fn.wgsl");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,5 +819,527 @@ mod tests {
         assert!(ALPHA_COMPARE_WGSL.contains("return true;"));
         assert!(ALPHA_COMPARE_WGSL.contains("return alpha >= threshold_alpha;"));
         assert!(ALPHA_COMPARE_WGSL.contains("alpha * 256u > noise_byte * 255u"));
+    }
+
+    // -- Fragment-callable WGSL seam (port card
+    // `/private/tmp/fn64-rt64-alpha-compare-fragment-seam-card.md` §2-§4) --
+    //
+    // `ALPHA_COMPARE_FRAGMENT_FN_WGSL` is a new sibling file, not an edit to
+    // `alpha_compare.wgsl` above; every test in this section exercises only
+    // the new file, leaving every existing test above untouched.
+
+    #[test]
+    fn fragment_fn_wgsl_declares_no_entry_point_or_bindings() {
+        // The whole point of the fragment-callable form: no `@compute`, no
+        // `@group`/`@binding`, so it is an ordinary concatenatable function,
+        // not a standalone dispatchable shader.
+        assert!(!ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("@compute"));
+        assert!(!ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("@group"));
+        assert!(!ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("@binding"));
+        assert!(ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("fn alpha_compare_fragment_fn("));
+    }
+
+    #[test]
+    fn fragment_fn_wgsl_parses_and_validates_under_closed_naga_profile() {
+        // A bare function with no entry point is still a complete WGSL
+        // translation unit naga can parse/validate on its own.
+        let module = naga::front::wgsl::parse_str(ALPHA_COMPARE_FRAGMENT_FN_WGSL).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+
+    #[test]
+    fn fragment_fn_wgsl_malformed_source_fails_to_parse() {
+        // Truncate mid-declaration rather than at the file's exact
+        // midpoint: this file's header comment is proportionally larger
+        // than `alpha_compare.wgsl`'s (no storage-buffer struct/bindings to
+        // document), so a byte-count half-split can land entirely inside
+        // the comment and still parse as valid (comment-only) WGSL. Cutting
+        // partway through the first function's body guarantees a genuine
+        // parse failure while still exercising the same "truncated source"
+        // shape as the sibling test.
+        let cut = ALPHA_COMPARE_FRAGMENT_FN_WGSL
+            .find("fn alpha_compare_general")
+            .expect("fixture source must contain the first function")
+            + "fn alpha_compare_general(mode: u32, alpha: u32, threshold_alpha".len();
+        let truncated = &ALPHA_COMPARE_FRAGMENT_FN_WGSL[..cut];
+        assert!(naga::front::wgsl::parse_str(truncated).is_err());
+    }
+
+    #[test]
+    fn fragment_fn_wgsl_source_uses_the_exact_cross_multiply_once() {
+        assert_eq!(
+            ALPHA_COMPARE_FRAGMENT_FN_WGSL
+                .matches("alpha * 256u > noise_byte * 255u")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fragment_fn_wgsl_source_contains_the_exact_literal_expressions_the_oracle_depends_on() {
+        assert!(ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("return true;"));
+        assert!(ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("return alpha >= threshold_alpha;"));
+        assert!(ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("alpha * 256u > noise_byte * 255u"));
+        assert!(ALPHA_COMPARE_FRAGMENT_FN_WGSL.contains("return alpha != 0u;"));
+    }
+
+    /// One frozen fixture case for the CPU-vs-WGSL differential (port card
+    /// §4): mode as the raw wire encoding (`0=None,1=Threshold,2=Reserved,
+    /// 3=Dither`, matching `alpha_compare.wgsl`'s own convention),
+    /// `copy_cycle_rgba16` as `0u`/`1u`, and the hand-derived `expected`
+    /// boolean stated in the port card, not re-derived here.
+    struct AlphaCompareFixture {
+        name: &'static str,
+        mode: u32,
+        alpha: u32,
+        threshold_alpha: u32,
+        noise_byte: u32,
+        copy_cycle_rgba16: u32,
+        expected: bool,
+    }
+
+    const fn wire_mode(mode: AlphaCompareMode) -> u32 {
+        match mode {
+            AlphaCompareMode::None => 0,
+            AlphaCompareMode::Threshold => 1,
+            AlphaCompareMode::Reserved => 2,
+            AlphaCompareMode::Dither => 3,
+        }
+    }
+
+    /// Frozen fixture partition, port card §4, literal values verified
+    /// against `alpha_compare_value`/`copy_alpha_compare_value`'s own
+    /// arithmetic above (`AlphaCompareMode::Threshold => alpha >=
+    /// threshold_alpha`, `AlphaCompareMode::Dither => alpha*256 >
+    /// noise_byte*255`, and `copy_alpha_compare_value`'s RGBA16
+    /// hard-alpha-bit fallthrough), not placeholders.
+    fn frozen_fixtures() -> Vec<AlphaCompareFixture> {
+        vec![
+            // Threshold mode, four boundary cases.
+            AlphaCompareFixture {
+                name: "threshold_equal_passes_not_strict",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 128,
+                threshold_alpha: 128,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            AlphaCompareFixture {
+                name: "threshold_just_below_fails",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 127,
+                threshold_alpha: 128,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: false,
+            },
+            AlphaCompareFixture {
+                name: "threshold_zero_equal_passes",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 0,
+                threshold_alpha: 0,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            AlphaCompareFixture {
+                name: "threshold_max_equal_passes",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 255,
+                threshold_alpha: 255,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            // Dither mode, the exact cross-multiply tie boundary.
+            AlphaCompareFixture {
+                name: "dither_tie_boundary_passes",
+                mode: wire_mode(AlphaCompareMode::Dither),
+                alpha: 128,
+                threshold_alpha: 0,
+                noise_byte: 128,
+                copy_cycle_rgba16: 0,
+                expected: true, // 128*256=32768 > 128*255=32640
+            },
+            AlphaCompareFixture {
+                name: "dither_just_below_tie_fails",
+                mode: wire_mode(AlphaCompareMode::Dither),
+                alpha: 127,
+                threshold_alpha: 0,
+                noise_byte: 128,
+                copy_cycle_rgba16: 0,
+                expected: false, // 127*256=32512 < 128*255=32640
+            },
+            AlphaCompareFixture {
+                name: "dither_alpha_zero_always_rejects",
+                mode: wire_mode(AlphaCompareMode::Dither),
+                alpha: 0,
+                threshold_alpha: 0,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: false, // 0*256=0, not > 0*255=0
+            },
+            AlphaCompareFixture {
+                name: "dither_alpha_max_always_passes",
+                mode: wire_mode(AlphaCompareMode::Dither),
+                alpha: 255,
+                threshold_alpha: 0,
+                noise_byte: 255,
+                copy_cycle_rgba16: 0,
+                expected: true, // 255*256=65280 > 255*255=65025
+            },
+            // None mode: unconditional pass regardless of the other inputs.
+            AlphaCompareFixture {
+                name: "none_mode_always_passes",
+                mode: wire_mode(AlphaCompareMode::None),
+                alpha: 0,
+                threshold_alpha: 255,
+                noise_byte: 0,
+                copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            // Copy-cycle RGBA16 special case.
+            AlphaCompareFixture {
+                name: "copy_cycle_rgba16_nonzero_alpha_passes_ignoring_threshold",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 1,
+                threshold_alpha: 255,
+                noise_byte: 0,
+                copy_cycle_rgba16: 1,
+                expected: true,
+            },
+            AlphaCompareFixture {
+                name: "copy_cycle_rgba16_zero_alpha_rejects",
+                mode: wire_mode(AlphaCompareMode::Threshold),
+                alpha: 0,
+                threshold_alpha: 0,
+                noise_byte: 0,
+                copy_cycle_rgba16: 1,
+                expected: false,
+            },
+        ]
+    }
+
+    /// CPU-side half of the differential (port card §4/§7): every fixture
+    /// case computed via the Rust oracle
+    /// (`alpha_compare_value`/`copy_alpha_compare_value`) and asserted equal
+    /// to the hand-derived `expected` boolean frozen in `frozen_fixtures`.
+    /// No GPU involved -- matches this crate's existing CPU-only test
+    /// convention and runs under the ordinary `cargo test -p
+    /// fn64-render-wgpu` loop.
+    #[test]
+    fn frozen_fixtures_match_rust_oracle() {
+        for fixture in frozen_fixtures() {
+            let mode = match fixture.mode {
+                0 => AlphaCompareMode::None,
+                1 => AlphaCompareMode::Threshold,
+                3 => AlphaCompareMode::Dither,
+                other => panic!("fixture {}: unexpected wire mode {other}", fixture.name),
+            };
+            let alpha = fixture.alpha as u8;
+            let threshold_alpha = fixture.threshold_alpha as u8;
+            let noise_byte = noise(fixture.noise_byte as u8);
+            let actual = if fixture.copy_cycle_rgba16 != 0 {
+                copy_alpha_compare_value(
+                    mode,
+                    CopyCycleSourceFormat::RGBA16,
+                    alpha,
+                    threshold_alpha,
+                    noise_byte,
+                )
+            } else {
+                alpha_compare_value(mode, alpha, threshold_alpha, noise_byte)
+            };
+            assert_eq!(
+                actual, fixture.expected,
+                "fixture {} diverged from the frozen expected boolean",
+                fixture.name
+            );
+        }
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    mod host_gpu_tests {
+        use super::*;
+        use std::future::Future;
+        use std::pin::pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        fn block_on<F: Future>(future: F) -> F::Output {
+            struct ThreadWake(std::thread::Thread);
+            impl Wake for ThreadWake {
+                fn wake(self: Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+            let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            let mut context = Context::from_waker(&waker);
+            let mut future = pin!(future);
+            loop {
+                match Future::poll(future.as_mut(), &mut context) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => std::thread::park(),
+                }
+            }
+        }
+
+        /// Minimal compute-shim harness (port card §4/§7): wraps
+        /// `alpha_compare_fragment_fn` (the new fragment-callable function
+        /// under test, unmodified) in a throwaway `@compute` entry point
+        /// that reads one `AlphaCompareCase` per invocation from a storage
+        /// buffer and writes its `bool` result (as `u32`) to a second
+        /// storage buffer -- new test-only scaffolding, not a claim that the
+        /// function runs inside any real fragment shader (see the port
+        /// card's §6 nonclaims).
+        const SHIM_WGSL_HEADER: &str = "\
+struct AlphaCompareCase {
+    mode: u32,
+    alpha: u32,
+    threshold_alpha: u32,
+    noise_byte: u32,
+    copy_cycle_rgba16: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> cases: array<AlphaCompareCase>;
+
+@group(0) @binding(1)
+var<storage, read_write> results: array<u32>;
+
+@compute @workgroup_size(1)
+fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let index = global_id.x;
+    if (index >= arrayLength(&cases)) {
+        return;
+    }
+    let one_case = cases[index];
+    let passed = alpha_compare_fragment_fn(
+        one_case.mode,
+        one_case.alpha,
+        one_case.threshold_alpha,
+        one_case.noise_byte,
+        one_case.copy_cycle_rgba16,
+    );
+    if (passed) {
+        results[index] = 1u;
+    } else {
+        results[index] = 0u;
+    }
+}
+";
+
+        fn shim_source() -> String {
+            format!("{ALPHA_COMPARE_FRAGMENT_FN_WGSL}\n{SHIM_WGSL_HEADER}")
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct RawCase {
+            mode: u32,
+            alpha: u32,
+            threshold_alpha: u32,
+            noise_byte: u32,
+            copy_cycle_rgba16: u32,
+        }
+
+        /// Required host GPU evidence (port card §7's Host-GPU loop):
+        /// dispatches the compute shim over every frozen fixture case on a
+        /// real native adapter and asserts the WGSL side agrees with both
+        /// the Rust oracle and the hand-derived `expected` boolean -- an
+        /// independent, non-self-referential three-way check. Panics with
+        /// the typed no-adapter reason if this host has no native GPU
+        /// adapter, matching `targets/triangle_pipeline/tests.rs`'s
+        /// required-host-GPU convention rather than silently skipping.
+        #[test]
+        fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
+            let fixtures = frozen_fixtures();
+            let cases: Vec<RawCase> = fixtures
+                .iter()
+                .map(|fixture| RawCase {
+                    mode: fixture.mode,
+                    alpha: fixture.alpha,
+                    threshold_alpha: fixture.threshold_alpha,
+                    noise_byte: fixture.noise_byte,
+                    copy_cycle_rgba16: fixture.copy_cycle_rgba16,
+                })
+                .collect();
+
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+                flags: wgpu::InstanceFlags::VALIDATION,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                apply_limit_buckets: false,
+            })) {
+                Ok(adapter) => adapter,
+                Err(wgpu::RequestAdapterError::NotFound { .. }) => {
+                    panic!("required host GPU evidence unavailable: typed no-adapter for AnyNative")
+                }
+                Err(error) => panic!("adapter request failed: {error}"),
+            };
+            eprintln!(
+                "fn64-alpha-compare-fragment-fn: adapter={:?}",
+                adapter.get_info().name
+            );
+            let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-shim"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            }))
+            .unwrap();
+
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-shim"),
+                source: wgpu::ShaderSource::Wgsl(shim_source().into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-shim"),
+                layout: None,
+                module: &shader,
+                entry_point: Some("alpha_compare_fragment_fn_shim"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+            let case_bytes = (cases.len() * std::mem::size_of::<RawCase>()) as u64;
+            let result_bytes = (cases.len() * std::mem::size_of::<u32>()) as u64;
+            let case_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-cases"),
+                size: case_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-results"),
+                size: result_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-readback"),
+                size: result_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            let case_data: Vec<u8> = cases
+                .iter()
+                .flat_map(|case| {
+                    [
+                        case.mode,
+                        case.alpha,
+                        case.threshold_alpha,
+                        case.noise_byte,
+                        case.copy_cycle_rgba16,
+                    ]
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            queue.write_buffer(&case_buffer, 0, &case_data);
+
+            let layout = pipeline.get_bind_group_layout(0);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fn64-alpha-compare-fragment-fn-bind-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: case_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: result_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("fn64-alpha-compare-fragment-fn-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_bytes);
+            queue.submit(Some(encoder.finish()));
+
+            let slice = readback_buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            loop {
+                let _ = device.poll(wgpu::PollType::Poll);
+                if let Ok(result) = receiver.try_recv() {
+                    result.unwrap();
+                    break;
+                }
+            }
+            let observed: Vec<u32> = {
+                let mapped = slice.get_mapped_range().unwrap();
+                mapped
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect()
+            };
+            readback_buffer.unmap();
+
+            assert_eq!(observed.len(), fixtures.len());
+            for (fixture, &observed_u32) in fixtures.iter().zip(observed.iter()) {
+                let observed_bool = observed_u32 != 0;
+                assert_eq!(
+                    observed_bool, fixture.expected,
+                    "fixture {}: WGSL result diverged from the frozen expected boolean",
+                    fixture.name
+                );
+                // Independently re-derive via the Rust oracle too, so a
+                // three-way (WGSL, Rust oracle, hand-derived) agreement is
+                // checked in the same assertion pass, not just WGSL-vs-
+                // hand-derived.
+                let mode = match fixture.mode {
+                    0 => AlphaCompareMode::None,
+                    1 => AlphaCompareMode::Threshold,
+                    3 => AlphaCompareMode::Dither,
+                    other => panic!("fixture {}: unexpected wire mode {other}", fixture.name),
+                };
+                let alpha = fixture.alpha as u8;
+                let threshold_alpha = fixture.threshold_alpha as u8;
+                let noise_byte = noise(fixture.noise_byte as u8);
+                let cpu_result = if fixture.copy_cycle_rgba16 != 0 {
+                    copy_alpha_compare_value(
+                        mode,
+                        CopyCycleSourceFormat::RGBA16,
+                        alpha,
+                        threshold_alpha,
+                        noise_byte,
+                    )
+                } else {
+                    alpha_compare_value(mode, alpha, threshold_alpha, noise_byte)
+                };
+                assert_eq!(
+                    observed_bool, cpu_result,
+                    "fixture {}: WGSL result diverged from Rust oracle",
+                    fixture.name
+                );
+            }
+        }
     }
 }

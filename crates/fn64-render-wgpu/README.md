@@ -1741,3 +1741,79 @@ correctly reporting `None`.
 slice), no `production_adapter.rs` admission of `SetCombine` into the v11
 TMEM-only production plan, no shader/pipeline/draw-path integration, and no
 RT64 pixel/visual/silicon parity or performance claim.
+
+## 2026-08-16: Alpha compare, fragment-callable WGSL seam
+
+Per `/private/tmp/fn64-rt64-alpha-compare-fragment-seam-card.md` (a read-only
+planning artifact, not a file committed to this repository): re-expresses
+the already-characterized, already-tested RDP alpha-compare arithmetic
+(`None`/`Threshold`/`Dither` general gate plus the copy-cycle RGBA16
+hard-alpha-bit special case, "Alpha compare (port card §3)" above) as a
+plain, fragment-callable WGSL function, alongside the existing standalone
+`@compute` seam it already had.
+
+`alpha_compare.wgsl`'s existing `general_compare`/`evaluate` functions take
+a single `AlphaCompareInput` struct read from a storage buffer and return
+`u32` (`1u`/`0u`), matching that file's `@compute @workgroup_size(64)`
+dispatch shape. The new sibling file, `alpha_compare_fragment_fn.wgsl`,
+re-expresses the identical arithmetic verbatim as `alpha_compare_fragment_fn`
+— an ordinary function taking five scalar `u32` arguments (`mode`, `alpha`,
+`threshold_alpha`, `noise_byte`, `copy_cycle_rgba16`) and returning `bool`,
+with no `@compute`, `@group`/`@binding`, or entry point of its own. This
+mirrors `alpha_compare_value`/`copy_alpha_compare_value`'s own Rust-side
+signature exactly, rather than inventing a new call shape, and is callable
+from a future `@fragment` entry point via WGSL's ordinary
+function-concatenation build seam — the same mechanism
+`shaders/triangle_pipeline_fragment.wgsl`'s own header already documents for
+`color_combiner.wgsl`. `alpha_compare.rs` exposes it as a new constant,
+`ALPHA_COMPARE_FRAGMENT_FN_WGSL` (`include_str!`), re-exported from this
+crate's root alongside the existing `ALPHA_COMPARE_WGSL`/
+`ALPHA_COMPARE_ENTRY_POINT` constants. The existing `alpha_compare.wgsl`
+`@compute` entry point, and every existing test in `alpha_compare.rs`, are
+unmodified.
+
+**Tests.** Naga parse/validation and textual structural guards (the exact
+cross-multiply expression, the exact `None`/`Threshold`/copy-cycle literal
+returns) mirror the sibling file's own existing convention. The load-bearing
+addition is a CPU-vs-WGSL differential over a frozen fixture partition
+(Threshold mode's four boundary cases including the non-strict `>=` equal
+case; Dither mode's exact `alpha*256 > noise_byte*255` cross-multiply tie
+boundary and its neighbors; unconditional `None`-mode pass; and the
+copy-cycle RGBA16 hard-alpha-bit special case, including the case that most
+sharply distinguishes it from the general `Threshold` path). Every fixture
+case is computed three independent ways and asserted equal: the frozen,
+hand-derived expected boolean; the Rust oracle
+(`alpha_compare_value`/`copy_alpha_compare_value`, `#[cfg(test)]`, no GPU);
+and the new WGSL function itself, executed on a real native adapter through
+a minimal `#[cfg(feature = "host-gpu-tests")]` compute-shim harness — a
+throwaway `@compute` entry point that calls `alpha_compare_fragment_fn`
+directly per fixture case and reads its boolean result back via a storage
+buffer. That harness is new test-only scaffolding; it does not claim the
+function runs inside any real fragment shader (see Nonclaims below). The
+harness ran 10 consecutive times from a clean process each time on this
+crate's certified M2.2 Metal adapter (`Apple M5 Pro`), all passing, with no
+`NoAdapter` fallback observed.
+
+**Nonclaims.** This slice does not touch `targets/triangle_pipeline.rs`,
+`shaders/triangle_pipeline_{fragment,vertex}.wgsl`, or `production.rs` — no
+triangle drawn through the real production pipeline is alpha-compare-gated
+by this slice, and no bind-group/uniform layout for `threshold_alpha`,
+mode, or a per-fragment noise sample is decided here. Two other lanes
+already claim those three files concurrently as of this slice's freeze
+(varying-UV committed-TMEM texture sampling into the production triangle
+draw path, and `TextureRectangle`/`TextureRectangleFlip` decode admission);
+this slice is independent of both — it touches none of their claimed paths
+and requires nothing either produces. The deferred wire-in step (adding a
+bind-group entry or uniform field to `triangle_pipeline_fragment.wgsl`,
+calling this function from `fs_main`, deciding the discard-vs-alpha-zero
+mechanism for a failed compare, and sourcing `threshold_alpha`/mode/noise
+from already-staged `SetBlendColor` state and the fragment's own combiner
+alpha output) becomes safe to dispatch once either lane's own
+`RasterParams`/`fs_main` diff is known, so this new function can be
+composed into it without reopening either lane's in-flight work — not
+attempted in this slice. Also out of scope, matching the port card: alpha
+dither (`apply_alpha_dither`, a distinct pre-blend mechanism, already ported
+but untouched here), `Dither` mode's noise-source architecture (this slice
+supplies literal noise bytes only, same as the existing Rust tests),
+`depth_mode`/`coverage`/`blend`'s equally-unwired characterized seams, RT64
+pixel/visual parity, and any performance or throughput claim.
