@@ -67,7 +67,9 @@
 //!   field list and field order are read from there only as the type
 //!   definition the ported constructor's `memset` and the ported fallback
 //!   table both operate on; `applyExtraAttributes`' 18-branch body is not
-//!   ported and no claim is made about it.
+//!   ported *here* and this module makes no claim about it. Both the type and
+//!   that body are ported by the sibling module that does cite the header,
+//!   `rt64_extra_params.rs`, from which this module now imports the type.
 //! - `SCRIPT_ENABLED`-gated `interpolation.callMatchCallback` (`.h` lines
 //!   32-34, `.cpp` lines 70-72): a raw `CallMatchCallback *` under a
 //!   compile-time feature this port does not model. Omitted; its only
@@ -175,8 +177,19 @@
 //! ## Reuse, not new type
 //!
 //! `crates/fn64-render-wgpu/src/` was grepped for an existing `ExtraParams`,
-//! `extra_params`, `ignore_normal_factor`, `light_group_mask*`: no hit, so
-//! nothing here duplicates a landed type of this card's own. `rt64_math.rs`
+//! `extra_params`, `ignore_normal_factor`, `light_group_mask*`. That search
+//! read "no hit" when this module was first written, and on that reading it
+//! declared its own `ExtraParams` -- correctly flagged at the time, since the
+//! header that declares the type upstream was outside this card's cited
+//! sources and could not be reached across the path boundary. The reading is
+//! now **out of date**: the sibling `rt64_extra_params.rs` is a full port of
+//! `src/shared/rt64_extra_params.h` and owns `ExtraParams`. This module no
+//! longer defines the type; it imports
+//! [`crate::rt64_extra_params::ExtraParams`], and the two definitions were
+//! confirmed identical field-for-field (20 fields, same names, same order,
+//! same types, same derives) before the duplicate was removed. What this
+//! module still owns is the *defaults*, which upstream declares in the two
+//! files cited here and not in that header. `rt64_math.rs`
 //! defines only `Mat3` (and consumes `Mat4` from `fn64-render-ir`);
 //! `rt64_common.rs` defines `FixedRect` and `FixedMatrix`;
 //! `rt64_float4_quantize.rs` quantizes bare `[f32; 4]` rather than owning a
@@ -316,41 +329,26 @@
 
 use fn64_render_ir::{Vec3, Vec4};
 
-/// Literal port of `interop::ExtraParams`' field list
-/// (`src/shared/rt64_extra_params.h`, read as the type definition the two
-/// cited files operate on -- see module doc's Admitted domain). Field order
-/// matches the C++ declaration order exactly, because the ported
-/// constructor's `memset` is whole-struct.
+/// `interop::ExtraParams` is **not** defined here. It is declared upstream in
+/// `src/shared/rt64_extra_params.h`, which is not one of this card's two
+/// cited sources, and it is ported by the sibling module that does cite that
+/// header: [`crate::rt64_extra_params::ExtraParams`]. That module is the full
+/// port of the header and owns the type's field set, its field order, the 19
+/// `RT64_ATTRIBUTE_*` masks, and `apply_extra_attributes`. This module imports
+/// it rather than declaring a second, identical copy.
 ///
-/// `interop::float3` / `interop::float4` reuse `fn64_render_ir::Vec3` /
-/// `fn64_render_ir::Vec4` (see module doc "Reuse, not new type");
-/// `interop::uint` is `uint32_t`, so `u32`.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct ExtraParams {
-    pub rsp_light_diffuse_mix: f32,
-    /// Written by neither `from_json` nor `to_json` -- it has no JSON key at
-    /// all. Zeroed by the constructor's `memset`, carried through unchanged
-    /// by [`extra_params_from_json_defaults`].
-    pub lock_mask: f32,
-    pub ignore_normal_factor: f32,
-    pub uv_detail_scale: f32,
-    pub reflection_factor: f32,
-    pub reflection_fresnel_factor: f32,
-    pub roughness_factor: f32,
-    pub refraction_factor: f32,
-    pub shadow_catcher_factor: f32,
-    pub specular_color: Vec3,
-    pub specular_exponent: f32,
-    pub solid_alpha_multiplier: f32,
-    pub shadow_alpha_multiplier: f32,
-    pub depth_order_bias: f32,
-    pub depth_decal_bias: f32,
-    pub shadow_ray_bias: f32,
-    pub self_light: Vec3,
-    pub light_group_mask_bits: u32,
-    pub diffuse_color_mix: Vec4,
-    pub enabled_attributes: u32,
-}
+/// This module still owns the *defaults* for that type, because the two files
+/// it cites are where upstream actually declares them: the constructor's
+/// whole-struct `memset` ([`ExtraParams::zeroed`], below) and `from_json`'s
+/// 19-entry fallback table ([`extra_params_from_json_defaults`]). The owning
+/// module deliberately declares none, since its header declares none.
+///
+/// One field-level fact from this card's own sources, which the shared
+/// definition documents from the header's side instead: `lock_mask` is
+/// written by neither `from_json` nor `to_json` -- it has no JSON key at all.
+/// It is zeroed by the constructor's `memset` and carried through unchanged by
+/// [`extra_params_from_json_defaults`].
+use crate::rt64_extra_params::ExtraParams;
 
 impl ExtraParams {
     /// Literal port of `memset(&description, 0, sizeof(description))`
