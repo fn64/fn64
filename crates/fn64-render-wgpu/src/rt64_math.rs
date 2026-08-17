@@ -110,14 +110,31 @@
 //! No GPU, WGSL, camera/view-matrix wiring, HFR/projection-matching
 //! integration (`rt64_game_frame.cpp` itself remains unported), triangle
 //! rasterizer integration, or RT64 visual/pixel/silicon parity or
-//! performance claim. Does not port `matrixScale`, `matrixTranslation`,
-//! `matrixRotationX/Y/Z`, `extract3x3`, `rotationFrom3x3`,
-//! `matrixDifference`, `lerpMatrix`/`lerpMatrix3x3`/`lerpMatrixComponents`,
-//! `matrixDecomposeViewProj`, `decomposeMatrix`/`recomposeMatrix`,
-//! `DecomposedTransform`/`lerpTransforms` (deferred -- needs new
-//! matrix-inverse/quaternion infra), or `pseudoRandom` (bit-identical to
-//! `random.rs`'s already-landed `RandomState::advance`, would be a literal
-//! duplicate under a new name).
+//! performance claim. Read the exclusions below as refusals by *this
+//! module*, not as a claim that the crate lacks the symbol -- most of them
+//! now live elsewhere.
+//!
+//! Not ported here, landed in sibling modules instead:
+//! `extract3x3`/`rotationFrom3x3`/`matrixDifference`/`lerpMatrix`/
+//! `lerpMatrix3x3`/`lerpMatrixComponents` as [`extract_3x3`]/
+//! [`rotation_from_3x3`]/[`matrix_difference`]/[`lerp_matrix`]/
+//! [`lerp_matrix_3x3`]/[`lerp_matrix_components`] in
+//! `rt64_math_matrix.rs`; `decomposeMatrix`/`recomposeMatrix`/
+//! `DecomposedTransform`/`lerpTransforms` as [`decompose_matrix`]/
+//! [`recompose_matrix`]/[`DecomposedTransform`]/[`lerp_transforms`] in
+//! `rt64_math_decompose.rs`; and `matrixDecomposeViewProj` as
+//! [`matrix_decompose_view_proj`] in `rt64_rsp_matrix_stack.rs`.
+//! `matrixTranslation` also exists, but only as a private recompose-only
+//! helper (`matrix_translation` in `rt64_math_decompose.rs`, not part of
+//! that module's public surface).
+//!
+//! Still genuinely unported anywhere in this crate: `matrixScale(float)`
+//! and `matrixRotationX/Y/Z` (a private `matrixScale(const float3&)`
+//! overload exists as a `rt64_math_decompose.rs` recompose-only helper, but
+//! that is a different signature). `pseudoRandom` is not ported either, by
+//! design: it would be bit-identical to `random.rs`'s already-landed
+//! `RandomState::advance`, so porting it would be a literal duplicate under
+//! a new name.
 
 use fn64_render_ir::{Mat4, Vec4};
 
