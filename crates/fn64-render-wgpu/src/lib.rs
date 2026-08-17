@@ -335,6 +335,7 @@ mod random;
 mod raster_vs;
 mod raw_dpc;
 mod rgb_dither;
+mod rt64_blender_analysis;
 mod rt64_common;
 mod rt64_extended_gbi;
 mod rt64_float4_quantize;
