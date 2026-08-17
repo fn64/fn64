@@ -9,8 +9,8 @@ mod triangle_draw_data;
 mod triangle_vertices;
 
 pub use production_adapter::{
-    push_decoded_raw_dpc, PushDecodedRawDpcError, TriangleBeforeAnyOtherMode,
-    UnadmittedRawDpcCommand,
+    push_decoded_raw_dpc, DegenerateTextureRectangle, PushDecodedRawDpcError,
+    TextureRectangleBeforeAnyOtherMode, TriangleBeforeAnyOtherMode, UnadmittedRawDpcCommand,
 };
 pub use texture_rectangle::{
     texture_rectangle_vertices, RawTextureRectangle, RawTextureRectangleError,
@@ -53,6 +53,12 @@ const SET_COLOR_IMAGE: u8 = 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 const FULL_SYNC: u8 = 0x29;
+/// `G_TEXRECT` (`texrectLLE`, opcode `0x24`); public SGI *RDP Command
+/// Summary* "Texture Rectangle".
+const TEXRECT: u8 = 0x24;
+/// `G_TEXRECTFLIP` (`texrectFlipLLE`, opcode `0x25`); public SGI *RDP
+/// Command Summary* "Texture Rectangle Flip".
+const TEXRECT_FLIP: u8 = 0x25;
 /// `G_SETPRIMDEPTH` (`src/shared/rt64_f3d_defines.h:157`, pinned commit
 /// `5473732a822a4423b5696e7cb18fecc425a59875`); public SGI *RDP Command
 /// Summary* "Set Primitive Depth".
@@ -202,6 +208,7 @@ pub enum RawDpcCommandKind {
     LoadTlut(TmemLoad),
     FullSync(FullSyncOccurrence),
     RawTriangle(RawTriangle),
+    TextureRectangle(RawTextureRectangle),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1107,6 +1114,18 @@ fn decode_stream(
                     .expect("command slice length was already proven exact above");
                 RawDpcCommandKind::RawTriangle(triangle)
             }
+            TEXRECT | TEXRECT_FLIP => {
+                // `command` is already sliced to exactly `width` bytes above,
+                // and `width` came from `raw_rdp_command_width(opcode)`,
+                // which returns 16 for both `TEXRECT`/`TEXRECT_FLIP`
+                // (`fn64-render/src/rdp_completion.rs`'s
+                // `RDP_TEXRECT | RDP_TEXRECTFLIP => 16` arm) -- exactly
+                // `TEXTURE_RECTANGLE_COMMAND_BYTES`, so this length can
+                // never actually mismatch here.
+                let rectangle = texture_rectangle::RawTextureRectangle::decode(opcode, command)
+                    .expect("command slice length was already proven exact above");
+                RawDpcCommandKind::TextureRectangle(rectangle)
+            }
             _ => {
                 return Err(RawDpcDecodeError::UnsupportedCommand {
                     location,
@@ -1670,7 +1689,12 @@ mod tests {
 
     #[test]
     fn every_public_width_is_used_before_subset_rejection() {
-        for (opcode, width) in [(0x24, 16), (0x25, 16), (0x3e, 8)] {
+        // 0x2a is an unassigned single-word opcode slot (known width via
+        // `raw_rdp_command_width`, no `decode_stream` dispatch arm) -- a
+        // stand-in for "any unsupported opcode", not a texture-rectangle
+        // fixture. 0x24/0x25 moved to the "decodes successfully" test below
+        // now that they are admitted opcodes.
+        for (opcode, width) in [(0x2a, 8), (0x3e, 8)] {
             let mut words = vec![0; width / 4];
             words[0] = word(0x80, opcode, 0);
             let error = decode(words).unwrap_err();
@@ -1711,6 +1735,25 @@ mod tests {
             assert!(matches!(
                 decoded.commands()[0].kind(),
                 RawDpcCommandKind::RawTriangle(_)
+            ));
+        }
+    }
+
+    /// `0x24`/`0x25` are no longer part of the "still unsupported" table
+    /// above -- they decode. This proves each one's full 16-byte public
+    /// width is consumed successfully rather than rejected, mirroring the
+    /// triangle-width precedent immediately above.
+    #[test]
+    fn every_texture_rectangle_opcode_decodes_successfully_before_subset_rejection_table() {
+        for opcode in [0x24u8, 0x25] {
+            let mut words = vec![0u32; 4];
+            words[0] = word(0x80, opcode, 0);
+            let decoded = decode(words)
+                .unwrap_or_else(|error| panic!("opcode {opcode:#04x} must decode: {error}"));
+            assert_eq!(decoded.commands().len(), 1);
+            assert!(matches!(
+                decoded.commands()[0].kind(),
+                RawDpcCommandKind::TextureRectangle(_)
             ));
         }
     }
@@ -1794,9 +1837,14 @@ mod tests {
 
     #[test]
     fn unsupported_offset_table_is_byte_exact() {
+        // 0x2a is an unassigned single-word opcode slot (known width via
+        // `raw_rdp_command_width`'s `RDP_SYNC_LOAD..=0x3f` catch-all, but no
+        // `decode_stream` dispatch arm) -- a stand-in for "any unsupported
+        // opcode", not a texture-rectangle-specific fixture. 0x24/0x25 are
+        // no longer valid stand-ins for this now that they decode.
         for noops in [0usize, 1, 3, 7] {
             let mut words = vec![0; noops * 2];
-            words.extend([word(0x40, 0x24, 0), 0, 0, 0]);
+            words.extend([word(0x40, 0x2a, 0), 0]);
             let submitted = submit(packet(7, words, &[]));
             let error = decode_raw_dpc(submitted, &RdpState::default()).unwrap_err();
             let rendered = error.to_string();
@@ -1806,7 +1854,7 @@ mod tests {
             let offset = u32::try_from(noops * 8).unwrap();
             assert_eq!(location.stream_byte_offset(), offset);
             assert_eq!(location.source_byte_offset(), COMMAND_START + offset);
-            assert_eq!(location.wire_opcode(), 0x64);
+            assert_eq!(location.wire_opcode(), 0x6a);
             assert!(rendered.contains("chunk 0 source byte offset"));
         }
     }
@@ -1828,8 +1876,12 @@ mod tests {
                 DramCommandChunk::try_new(
                     second_range,
                     {
+                        // 0x2a is an unassigned single-word opcode slot, not
+                        // a texture-rectangle-specific fixture -- 0x24/0x25
+                        // are no longer valid stand-ins for "unsupported"
+                        // now that they decode.
                         let mut words = vec![0; 8];
-                        words[0] = word(0x80, 0x24, 0);
+                        words[0] = word(0x80, 0x2a, 0);
                         words
                     },
                     TemporalBoundary::new(2, DpInterruptState::Clear),
@@ -1872,7 +1924,7 @@ mod tests {
         assert_eq!(location.chunk_index(), 1);
         assert_eq!(location.stream_byte_offset(), 8);
         assert_eq!(location.source_byte_offset(), COMMAND_START + 8);
-        assert_eq!(location.wire_opcode(), 0xa4);
+        assert_eq!(location.wire_opcode(), 0xaa);
     }
 
     #[test]
@@ -3598,6 +3650,104 @@ mod tests {
             decoded.commands()[4].kind(),
             RawDpcCommandKind::FullSync(_)
         ));
+    }
+
+    // -- Texture rectangle decode wired into the real command stream --
+
+    /// One `TextureRectangle`/`TextureRectangleFlip` command's 4-word wire
+    /// payload, following `texture_rectangle.rs`'s own bit layout exactly:
+    /// word 0 = `(lrx << 12) | lry`, word 1 = `(tile << 24) | (ulx << 12) |
+    /// uly`, word 2 = `(uls << 16) | ult`, word 3 = `(dsdx << 16) | dtdy`.
+    /// The frozen card fixture: `ulx=0x0040` (16.0px), `uly=0`,
+    /// `lrx=0x0100` (64.0px), `lry=0x00C0` (48.0px) -- a 48x48 rectangle,
+    /// upper-left `(16, 0)`, lower-right `(64, 48)`.
+    fn texrect_words(prefix: u8, opcode: u8, tile: u32) -> [u32; 4] {
+        let ulx: u32 = 0x0040;
+        let uly: u32 = 0;
+        let lrx: u32 = 0x0100;
+        let lry: u32 = 0x00c0;
+        let uls: u32 = 0;
+        let ult: u32 = 0;
+        let dsdx: u32 = 0x0100;
+        let dtdy: u32 = 0x0100;
+        [
+            word(prefix, opcode, (lrx << 12) | lry),
+            (tile & 0x7) << 24 | (ulx << 12) | uly,
+            (uls << 16) | ult,
+            (dsdx << 16) | dtdy,
+        ]
+    }
+
+    /// A `TextureRectangle` (`0x24`) decoded from a real command stream
+    /// frames exactly against a following `FullSync` at the fixed 16-byte
+    /// boundary `raw_rdp_command_width` declares for both texrect opcodes --
+    /// proving the dispatch arm added at `decode_stream`'s `TEXRECT |
+    /// TEXRECT_FLIP` match consumes exactly 4 words, never truncating to
+    /// the 2-word tmem/state stride or over-reading into the next command.
+    #[test]
+    fn texture_rectangle_frames_exactly_against_a_following_full_sync() {
+        let prefix = 0;
+        let mut words = state_words(prefix);
+        words.extend(texrect_words(prefix, TEXRECT, 0));
+        words.extend([word(prefix, FULL_SYNC, 0), 0]);
+
+        let submitted = submit(packet(9, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+
+        assert_eq!(decoded.commands().len(), 5);
+        let RawDpcCommandKind::TextureRectangle(rectangle) = decoded.commands()[3].kind() else {
+            panic!("fourth command must decode as TextureRectangle");
+        };
+        assert_eq!(rectangle.ulx(), 0x0040);
+        assert_eq!(rectangle.uly(), 0);
+        assert_eq!(rectangle.lrx(), 0x0100);
+        assert_eq!(rectangle.lry(), 0x00c0);
+        assert_eq!(rectangle.tile(), 0);
+        assert_eq!(rectangle.uls(), 0);
+        assert_eq!(rectangle.ult(), 0);
+        assert_eq!(rectangle.dsdx(), 0x0100);
+        assert_eq!(rectangle.dtdy(), 0x0100);
+        assert!(!rectangle.flip(), "opcode 0x24 must decode flip=false");
+        assert!(matches!(
+            decoded.commands()[4].kind(),
+            RawDpcCommandKind::FullSync(_)
+        ));
+        // Exactly 16 bytes (4 words) between this command and the next --
+        // proving no coefficient byte was misread as part of the boundary
+        // and no truncation to the fixed-2-word tmem/state stride occurred.
+        assert_eq!(
+            decoded.commands()[4].location().stream_byte_offset()
+                - decoded.commands()[3].location().stream_byte_offset(),
+            16
+        );
+    }
+
+    /// `TextureRectangleFlip` (`0x25`) decodes with `flip=true` and the same
+    /// exact 16-byte framing as `0x24` -- the two opcodes share one wire
+    /// shape and differ only in the derived `flip` field (mod.rs's
+    /// `TEXRECT | TEXRECT_FLIP` dispatch arm, `RawTextureRectangle::decode`'s
+    /// own opcode match), never a wire bit.
+    #[test]
+    fn texture_rectangle_flip_decodes_flip_true_with_identical_framing() {
+        let prefix = 0;
+        let mut words = state_words(prefix);
+        words.extend(texrect_words(prefix, TEXRECT_FLIP, 0));
+        words.extend([word(prefix, FULL_SYNC, 0), 0]);
+
+        let submitted = submit(packet(9, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+
+        assert_eq!(decoded.commands().len(), 5);
+        let RawDpcCommandKind::TextureRectangle(rectangle) = decoded.commands()[3].kind() else {
+            panic!("fourth command must decode as TextureRectangle");
+        };
+        assert!(rectangle.flip(), "opcode 0x25 must decode flip=true");
+        assert_eq!(
+            decoded.commands()[4].location().stream_byte_offset()
+                - decoded.commands()[3].location().stream_byte_offset(),
+            16,
+            "TextureRectangleFlip must frame exactly like TextureRectangle"
+        );
     }
 
     // -- Fragment constant registers (SetEnvColor/SetPrimColor/

@@ -6,11 +6,14 @@
 //! (`crate::tmem` types) into `fn64_render::production`'s neutral DTOs,
 //! pushing each into an [`fn64_render::ExactRawDpcPlanWriter`]. This seam
 //! admits the TMEM/load subset (`SetTile`/`SetTileSize`/`SetTextureImage`/
-//! `LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`) plus the nine pure-RDP-state
+//! `LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`), the nine pure-RDP-state
 //! commands (`SetOtherMode`, `SetColorImage`, `SetFillColor`, `SetEnvColor`,
 //! `SetPrimColor`, `SetBlendColor`, `SetFogColor`, `SetPrimDepth`,
-//! `SetCombine`); every other decoded command kind (`NoOp`, `FillRectangle`,
-//! `FullSync`, `RawTriangle`) remains outside the admitted zero-guest-write
+//! `SetCombine`), `RawTriangle`, and `TextureRectangle`/
+//! `TextureRectangleFlip` (admitted as two `RdpTriangleCommand` pushes each,
+//! reusing the same triangle draw path -- see `push_decoded_raw_dpc`'s
+//! `TextureRectangle` arm); every other decoded command kind (`NoOp`,
+//! `FillRectangle`, `FullSync`) remains outside the admitted zero-guest-write
 //! subset and is rejected loudly -- never silently dropped -- the instant
 //! one is encountered.
 
@@ -25,7 +28,7 @@ use fn64_render::{
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
-use crate::raw_dpc::decode_triangle_vertices;
+use crate::raw_dpc::{decode_triangle_vertices, texture_rectangle_vertices};
 use crate::state::OtherMode;
 use crate::{
     DecodedRawDpc, ImageFormat, PixelSize, RawDpcCommandKind, RawDpcResourcePlan, TextureImage,
@@ -35,13 +38,14 @@ use crate::{
 
 /// A decoded raw-DPC command this production seam does not admit. Every
 /// command kind carried by [`RawDpcCommandKind`] outside `SetTextureImage`/
-/// `SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut` and
-/// the nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
+/// `SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`, the
+/// nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
 /// `SetFillColor`/`SetEnvColor`/`SetPrimColor`/`SetBlendColor`/
-/// `SetFogColor`/`SetPrimDepth`/`SetCombine`) is rejected here, loudly, at
-/// the exact command index/location it was decoded at -- never silently
-/// dropped or aliased to a no-op push. Remaining rejected kinds: `NoOp`,
-/// `FillRectangle`, `FullSync`, `RawTriangle`.
+/// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`, and
+/// `TextureRectangle` is rejected here, loudly, at the exact command
+/// index/location it was decoded at -- never silently dropped or aliased to
+/// a no-op push. Remaining rejected kinds: `NoOp`, `FillRectangle`,
+/// `FullSync`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -94,13 +98,71 @@ impl core::fmt::Display for TriangleBeforeAnyOtherMode {
 
 impl std::error::Error for TriangleBeforeAnyOtherMode {}
 
+/// A `TextureRectangle`/`TextureRectangleFlip` command was walked with no
+/// `OtherMode` established yet, either by an earlier command in this same
+/// plan's own command order or by durable state carried in from before this
+/// capture (mirrors [`TriangleBeforeAnyOtherMode`]'s rationale exactly:
+/// `texture_rectangle_vertices`'s `cycle_type` parameter feeds its copy/fill
+/// rounding branches directly and changes decoded rectangle geometry, so
+/// there is no safe silent default here either).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureRectangleBeforeAnyOtherMode {
+    pub command_index: u32,
+    pub location: crate::RawDpcCommandLocation,
+}
+
+impl core::fmt::Display for TextureRectangleBeforeAnyOtherMode {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "raw-DPC texture-rectangle command #{} at {} has no SetOtherMode established yet -- \
+             neither earlier in this plan nor carried in from durable state before this capture; \
+             cycle_type cannot be decoded from an unstated OtherMode",
+            self.command_index, self.location
+        )
+    }
+}
+
+impl std::error::Error for TextureRectangleBeforeAnyOtherMode {}
+
+/// An admitted `TextureRectangle`/`TextureRectangleFlip` command whose wire
+/// bounds are reversed or empty after copy/fill-mode rounding --
+/// `texture_rectangle_vertices` returning `None`, RT64's own exact
+/// `FixedRect::isEmpty()` early return (see that function's doc). This must
+/// surface as a loud, named rejection, never a silently-skipped command and
+/// never a vacuously-successful zero-area draw (AGENTS.md "loud traps, no
+/// silent shrugs").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DegenerateTextureRectangle {
+    pub command_index: u32,
+    pub location: crate::RawDpcCommandLocation,
+}
+
+impl core::fmt::Display for DegenerateTextureRectangle {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "raw-DPC texture-rectangle command #{} at {} is empty or reversed after copy/fill-mode \
+             rounding -- texture_rectangle_vertices returned None, matching RT64's own \
+             FixedRect::isEmpty() early return",
+            self.command_index, self.location
+        )
+    }
+}
+
+impl std::error::Error for DegenerateTextureRectangle {}
+
 /// [`push_decoded_raw_dpc`]'s complete rejection set: either an unadmitted
-/// command kind, or an admitted `RawTriangle` that arrived before this
-/// plan's first `SetOtherMode`.
+/// command kind, an admitted `RawTriangle` that arrived before this plan's
+/// first `SetOtherMode`, an admitted `TextureRectangle` that arrived before
+/// this plan's first `SetOtherMode`, or an admitted `TextureRectangle` whose
+/// bounds are degenerate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushDecodedRawDpcError {
     Unadmitted(UnadmittedRawDpcCommand),
     TriangleBeforeAnyOtherMode(TriangleBeforeAnyOtherMode),
+    TextureRectangleBeforeAnyOtherMode(TextureRectangleBeforeAnyOtherMode),
+    DegenerateTextureRectangle(DegenerateTextureRectangle),
 }
 
 impl core::fmt::Display for PushDecodedRawDpcError {
@@ -108,6 +170,10 @@ impl core::fmt::Display for PushDecodedRawDpcError {
         match self {
             Self::Unadmitted(error) => core::fmt::Display::fmt(error, formatter),
             Self::TriangleBeforeAnyOtherMode(error) => core::fmt::Display::fmt(error, formatter),
+            Self::TextureRectangleBeforeAnyOtherMode(error) => {
+                core::fmt::Display::fmt(error, formatter)
+            }
+            Self::DegenerateTextureRectangle(error) => core::fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -123,6 +189,18 @@ impl From<UnadmittedRawDpcCommand> for PushDecodedRawDpcError {
 impl From<TriangleBeforeAnyOtherMode> for PushDecodedRawDpcError {
     fn from(error: TriangleBeforeAnyOtherMode) -> Self {
         Self::TriangleBeforeAnyOtherMode(error)
+    }
+}
+
+impl From<TextureRectangleBeforeAnyOtherMode> for PushDecodedRawDpcError {
+    fn from(error: TextureRectangleBeforeAnyOtherMode) -> Self {
+        Self::TextureRectangleBeforeAnyOtherMode(error)
+    }
+}
+
+impl From<DegenerateTextureRectangle> for PushDecodedRawDpcError {
+    fn from(error: DegenerateTextureRectangle) -> Self {
+        Self::DegenerateTextureRectangle(error)
     }
 }
 
@@ -147,7 +225,8 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         | RawDpcCommandKind::LoadSync(_)
         | RawDpcCommandKind::LoadBlock(_)
         | RawDpcCommandKind::LoadTile(_)
-        | RawDpcCommandKind::LoadTlut(_) => {
+        | RawDpcCommandKind::LoadTlut(_)
+        | RawDpcCommandKind::TextureRectangle(_) => {
             unreachable!("admitted kinds are pushed, never rejected")
         }
     }
@@ -281,6 +360,29 @@ fn neutral_triangle_vertex(vertex: crate::raw_dpc::TriangleVertex) -> NeutralTri
     }
 }
 
+/// Maps one [`crate::raw_dpc::TextureRectangleVertex`] (RT64's
+/// `triPosFloats`/`triColorFloats`/`triTcFloats` push, four-component
+/// clip-space-ready position, always-zero color, one texcoord pair) onto
+/// [`NeutralTriangleVertex`]'s field shape so a texture rectangle's six
+/// converted vertices can reuse `RdpTriangleCommand`/`push_triangle` exactly
+/// like a `RawTriangle`'s three (§3b Option A: no new `fn64-render` DTO).
+/// `position()` is `[x, y, z, w]`; `w` is always `1.0` per
+/// `texture_rectangle.rs`'s `RECT_POS_FLOATS`, matching `NeutralTriangleVertex`'s
+/// separate `x`/`y`/`z`/`w` fields one-for-one.
+fn neutral_texture_rectangle_vertex(
+    vertex: crate::raw_dpc::TextureRectangleVertex,
+) -> NeutralTriangleVertex {
+    let [x, y, z, w] = vertex.position();
+    NeutralTriangleVertex {
+        x,
+        y,
+        z,
+        w,
+        color: vertex.color(),
+        texcoord: vertex.texcoord(),
+    }
+}
+
 fn neutral_load_kind(kind: TmemLoadKind) -> NeutralTmemLoadKind {
     match kind {
         TmemLoadKind::Block {
@@ -402,14 +504,24 @@ fn tmem_command_raw_words(
     words.to_vec()
 }
 
-/// Slices one `RawTriangle` command's own raw wire words out of the
-/// capture's full word stream. Unlike [`tmem_command_raw_words`]'s fixed
-/// 2-word assumption, a triangle command is variable-width (32..=176 bytes,
-/// per its opcode's optional shade/texture/depth coefficient blocks), so
-/// this keys the read off [`fn64_render::raw_rdp_command_width`] -- the same
-/// function `decode_stream` (`mod.rs:890`) already uses to size a triangle
-/// command's own read, rather than reimplementing that stride table here.
-fn triangle_command_raw_words(
+/// Slices one command's own raw wire words out of the capture's full word
+/// stream, sized by the command's own declared width rather than any fixed
+/// assumption. Unlike [`tmem_command_raw_words`]'s fixed 2-word assumption,
+/// every command routed through this function is wider than 2 words -- a
+/// `RawTriangle` is variable-width (32..=176 bytes, per its opcode's
+/// optional shade/texture/depth coefficient blocks) and a `TextureRectangle`/
+/// `TextureRectangleFlip` is a fixed 16 bytes / 4 words
+/// (`TEXTURE_RECTANGLE_COMMAND_BYTES`) -- so this keys the read off
+/// [`fn64_render::raw_rdp_command_width`] -- the same function
+/// `decode_stream` (`mod.rs:890`) already uses to size every wide command's
+/// own read, rather than reimplementing that stride table here. This
+/// width-driven design is deliberate: any future command kind wider than 2
+/// words can route through this same slicer by width alone, with no new
+/// per-kind branch and no risk of the kind of silent truncation
+/// [`tmem_command_raw_words`]'s fixed-2-word reader would cause if misapplied
+/// to a wider command (e.g. a texture rectangle's 4-word payload truncated to
+/// 2 words).
+fn width_keyed_command_raw_words(
     capture_words: &[u32],
     submission_start: u32,
     old: crate::RawDpcCommandLocation,
@@ -529,14 +641,21 @@ pub fn push_decoded_raw_dpc(
         let command_index = u32::try_from(index).expect("bounded command stream fits u32");
         let old_location = command.location();
         // Every admitted TMEM/state opcode is a fixed 2-word command; a
-        // `RawTriangle` is variable-width (see `triangle_command_raw_words`'s
-        // own doc) and cannot use the fixed-2-word slicer. The two rejected
-        // kinds below (`NoOp`/`FillRectangle`/`FullSync`) never reach a
+        // `RawTriangle` is variable-width and a `TextureRectangle` is a
+        // fixed 4-word (16-byte) command -- both wider than 2 words, so
+        // both must go through `width_keyed_command_raw_words`'s
+        // `raw_rdp_command_width`-keyed reader (see its own doc), never the
+        // fixed-2-word slicer, or a texture rectangle's payload would be
+        // silently truncated from 4 words to 2. The three rejected kinds
+        // below (`NoOp`/`FillRectangle`/`FullSync`) never reach a
         // `push_state`/`push_triangle` call, so slicing them with the
         // fixed-2-word reader (their own wire shape) is harmless -- their
         // `raw_words`/`location` values are computed but discarded.
-        let raw_words = if matches!(command.kind(), RawDpcCommandKind::RawTriangle(_)) {
-            triangle_command_raw_words(capture_words, submission_start, old_location)
+        let raw_words = if matches!(
+            command.kind(),
+            RawDpcCommandKind::RawTriangle(_) | RawDpcCommandKind::TextureRectangle(_)
+        ) {
+            width_keyed_command_raw_words(capture_words, submission_start, old_location)
         } else {
             tmem_command_raw_words(capture_words, submission_start, old_location)
         };
@@ -746,6 +865,64 @@ pub fn push_decoded_raw_dpc(
                     vertices,
                 });
             }
+            RawDpcCommandKind::TextureRectangle(rectangle) => {
+                let Some(other_mode) = current_other_mode else {
+                    return Err(TextureRectangleBeforeAnyOtherMode {
+                        command_index,
+                        location: old_location,
+                    }
+                    .into());
+                };
+                let Some(vertices) = texture_rectangle_vertices(rectangle, other_mode.cycle_type())
+                else {
+                    return Err(DegenerateTextureRectangle {
+                        command_index,
+                        location: old_location,
+                    }
+                    .into());
+                };
+                // `texture_rectangle_vertices` returns exactly six vertices
+                // forming two triangles, RT64's own two-triangle push order
+                // for one rectangle (`texture_rectangle.rs`'s module doc:
+                // "two triangles... `flip` swapping only the texcoord
+                // pairing"). §3b Option A (this card's recommended default,
+                // taken here): no new `fn64-render` DTO -- split the six
+                // vertices into the two three-vertex groups (0,1,2 and
+                // 3,4,5) and push each through the same
+                // `RdpTriangleCommand`/`push_triangle` path a `RawTriangle`
+                // already uses, so a texture rectangle becomes, from the
+                // collector's perspective, "two more triangles in the
+                // stream" with no new command-kind branch anywhere
+                // downstream.
+                let first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+                    neutral_texture_rectangle_vertex(vertices.vertex(index))
+                });
+                let second: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+                    neutral_texture_rectangle_vertex(vertices.vertex(index + 3))
+                });
+                // Both triangle halves come from the same origin command
+                // (one texture rectangle = one wire command producing two
+                // triangles, not two independent wire commands), so both
+                // pushes deliberately reuse the identical `location`/
+                // `raw_words` content -- `location` is `Copy`
+                // (`NeutralRawDpcCommandLocation`), and `raw_words` is
+                // cloned once here (`Vec<u32>::clone` then
+                // `into_boxed_slice` on each half) rather than shared via
+                // `Rc`/`Arc`, matching `RdpTriangleCommand::raw_words`'s
+                // plain `Box<[u32]>` field shape -- a rectangle's wire words
+                // are a handful of `u32`s, so this is not a hot-path
+                // allocation concern.
+                writer.push_triangle(RdpTriangleCommand {
+                    location,
+                    raw_words: raw_words.clone().into_boxed_slice(),
+                    vertices: first,
+                });
+                writer.push_triangle(RdpTriangleCommand {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    vertices: second,
+                });
+            }
             other @ (RawDpcCommandKind::NoOp { .. }
             | RawDpcCommandKind::FillRectangle(_)
             | RawDpcCommandKind::FullSync(_)) => {
@@ -850,7 +1027,7 @@ mod tests {
     };
     use fn64_render_ir::{ResourceJournal, ResourceJournalLimits, TemporalBoundary};
 
-    use crate::{decode_raw_dpc, RawDpcDecodeError, RdpState};
+    use crate::{decode_raw_dpc, CycleType, RawDpcDecodeError, RdpState};
 
     use super::*;
 
@@ -2093,7 +2270,7 @@ mod tests {
     /// (shade/texture/depth, per the opcode's own low three bits) with a
     /// deterministic, distinct, nonzero pattern -- `raw_rdp_command_width`
     /// determines the total byte count (32..=176), same source
-    /// `triangle_command_raw_words` itself keys off.
+    /// `width_keyed_command_raw_words` itself keys off.
     fn full_width_triangle_words(opcode: u8) -> Vec<u32> {
         let width_bytes = fn64_render::raw_rdp_command_width(opcode)
             .expect("every triangle opcode 0x08..=0x0f has a known width");
@@ -2176,9 +2353,9 @@ mod tests {
     /// admit), the admitted `RdpTriangleCommand`'s `raw_words`,
     /// `location.source_byte_len`, `location.source_address`, and
     /// `location.wire_opcode` must exactly match the source wire bytes --
-    /// proving `triangle_command_raw_words`'s variable-width slicer handles
-    /// the full opcode range correctly, not just the simplest (0x08,
-    /// 32-byte) case the other triangle tests exercise.
+    /// proving `width_keyed_command_raw_words`'s variable-width slicer
+    /// handles the full opcode range correctly, not just the simplest
+    /// (0x08, 32-byte) case the other triangle tests exercise.
     #[test]
     fn triangle_raw_words_and_location_match_the_source_wire_bytes_across_every_opcode_width() {
         for opcode in 0x08u8..=0x0f {
@@ -2217,6 +2394,339 @@ mod tests {
             assert_eq!(
                 triangle.location.wire_opcode, opcode,
                 "opcode {opcode:#04x}: wire_opcode must be preserved exactly"
+            );
+        }
+    }
+
+    // --- TextureRectangle/TextureRectangleFlip admission ---
+
+    const TEXRECT: u8 = 0x24;
+    const TEXRECT_FLIP: u8 = 0x25;
+
+    /// One `TextureRectangle`/`TextureRectangleFlip` command's 4-word wire
+    /// payload, following `texture_rectangle.rs`'s own bit layout: word 0 =
+    /// `(lrx << 12) | lry` (with the opcode in the top byte via `word()`),
+    /// word 1 = `(tile << 24) | (ulx << 12) | uly`, word 2 = `(uls << 16) |
+    /// ult`, word 3 = `(dsdx << 16) | dtdy`.
+    ///
+    /// The frozen card fixture: `ulx=0x0040` (16.0px), `uly=0`,
+    /// `lrx=0x0100` (64.0px), `lry=0x00C0` (48.0px) -- a 48x48 rectangle,
+    /// upper-left `(16, 0)`, lower-right `(64, 48)`; `uls=0`, `ult=0`,
+    /// `dsdx=0x0100` (`1.0` in `s10.5`, one texel per pixel), `dtdy`
+    /// identical.
+    fn texrect_words(opcode: u8, tile: u32) -> [u32; 4] {
+        let ulx: u32 = 0x0040;
+        let uly: u32 = 0;
+        let lrx: u32 = 0x0100;
+        let lry: u32 = 0x00c0;
+        let uls: u32 = 0;
+        let ult: u32 = 0;
+        let dsdx: u32 = 0x0100;
+        let dtdy: u32 = 0x0100;
+        [
+            word(opcode, (lrx << 12) | lry),
+            (tile & 0x7) << 24 | (ulx << 12) | uly,
+            (uls << 16) | ult,
+            (dsdx << 16) | dtdy,
+        ]
+    }
+
+    /// A wire fixture that decodes as `is_null()` (`ulx > lrx`), matching
+    /// RT64's own `FixedRect::isEmpty()` early return -- `ulx=0x0100`
+    /// (64.0px) with `lrx=0x0040` (16.0px), reversed.
+    fn reversed_texrect_words(opcode: u8) -> [u32; 4] {
+        let ulx: u32 = 0x0100;
+        let uly: u32 = 0;
+        let lrx: u32 = 0x0040;
+        let lry: u32 = 0x00c0;
+        [
+            word(opcode, (lrx << 12) | lry),
+            (ulx << 12) | uly,
+            0,
+            (0x0100u32 << 16) | 0x0100,
+        ]
+    }
+
+    #[test]
+    fn texture_rectangle_before_any_set_other_mode_is_rejected_loudly_not_defaulted() {
+        let words = texrect_words(TEXRECT, 0).to_vec();
+        let error = push_and_expect_error(words, (0x214, 0x224));
+        let PushDecodedRawDpcError::TextureRectangleBeforeAnyOtherMode(rejection) = error else {
+            panic!("expected TextureRectangleBeforeAnyOtherMode, got {error:?}");
+        };
+        assert_eq!(rejection.command_index, 0);
+    }
+
+    #[test]
+    fn texture_rectangle_is_admitted_after_a_preceding_set_other_mode() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0)); // OneCycle
+        words.extend(texrect_words(TEXRECT, 0));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::TextureRectangle(source_rectangle) = decoded.commands()[1].kind()
+        else {
+            panic!("expected TextureRectangle as the second command");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1, "one SetOtherMode");
+        assert_eq!(
+            plan.triangles.len(),
+            2,
+            "one texture rectangle admits as exactly two RdpTriangleCommand pushes (§3b Option A)"
+        );
+
+        let expected_vertices = texture_rectangle_vertices(source_rectangle, CycleType::OneCycle)
+            .expect("this fixture's rectangle is non-degenerate");
+        let expected_first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_vertices.vertex(index))
+        });
+        let expected_second: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_vertices.vertex(index + 3))
+        });
+        assert_eq!(plan.triangles[0].vertices, expected_first);
+        assert_eq!(plan.triangles[1].vertices, expected_second);
+    }
+
+    #[test]
+    fn texture_rectangle_flip_is_admitted_with_flip_swapped_texcoords() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(texrect_words(TEXRECT_FLIP, 0));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::TextureRectangle(source_rectangle) = decoded.commands()[1].kind()
+        else {
+            panic!("expected TextureRectangle as the second command");
+        };
+        assert!(source_rectangle.flip(), "0x25 must decode flip=true");
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.triangles.len(), 2);
+
+        let expected_vertices = texture_rectangle_vertices(source_rectangle, CycleType::OneCycle)
+            .expect("this fixture's rectangle is non-degenerate");
+        let expected_first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_vertices.vertex(index))
+        });
+        let expected_second: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_vertices.vertex(index + 3))
+        });
+        assert_eq!(plan.triangles[0].vertices, expected_first);
+        assert_eq!(plan.triangles[1].vertices, expected_second);
+
+        // Independent geometry check: flip must actually change the
+        // texcoord pairing versus the non-flip fixture, or this test cannot
+        // distinguish correct flip handling from a no-op.
+        let nonflip_words = texrect_words(TEXRECT, 0);
+        let nonflip_rectangle =
+            crate::RawTextureRectangle::decode(TEXRECT, &texrect_command_bytes(nonflip_words))
+                .unwrap();
+        let nonflip_vertices = texture_rectangle_vertices(nonflip_rectangle, CycleType::OneCycle)
+            .expect("non-degenerate");
+        assert_ne!(
+            expected_vertices.vertex(1).texcoord(),
+            nonflip_vertices.vertex(1).texcoord(),
+            "flip must change vertex 1's texcoord pairing versus the non-flip fixture"
+        );
+    }
+
+    /// Converts a 4-word fixture (as built by [`texrect_words`]) into the
+    /// big-endian byte slice `RawTextureRectangle::decode` expects, mirroring
+    /// how `decode_stream` slices `stream.bytes` before calling it.
+    fn texrect_command_bytes(words: [u32; 4]) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        for (index, word) in words.iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn degenerate_texture_rectangle_is_rejected_loudly_not_a_vacuous_zero_area_draw() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(reversed_texrect_words(TEXRECT));
+        let error = push_and_expect_error(words, (0x214, 0x224));
+        let PushDecodedRawDpcError::DegenerateTextureRectangle(rejection) = error else {
+            panic!("expected DegenerateTextureRectangle, got {error:?}");
+        };
+        assert_eq!(
+            rejection.command_index, 1,
+            "the texrect is the second command (index 1)"
+        );
+    }
+
+    #[test]
+    fn a_set_other_mode_after_a_texture_rectangle_does_not_retroactively_change_its_geometry() {
+        // Interleaved order: SetOtherMode(OneCycle) -> texrect A ->
+        // SetOtherMode(Copy) -> texrect B. Texrect A must decode using
+        // OneCycle (its own stream-position OtherMode), never the later
+        // SetOtherMode's Copy-mode dsdx/lrx/lry mutation.
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0)); // OneCycle
+        words.extend(texrect_words(TEXRECT, 0));
+        words.extend(set_other_mode(2, 0)); // Copy (bits 20:21 = 2)
+        words.extend(texrect_words(TEXRECT, 1));
+
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let RawDpcCommandKind::TextureRectangle(rectangle_a) = decoded.commands()[1].kind() else {
+            panic!("expected TextureRectangle at index 1");
+        };
+        let RawDpcCommandKind::TextureRectangle(rectangle_b) = decoded.commands()[3].kind() else {
+            panic!("expected TextureRectangle at index 3");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.triangles.len(), 4, "two texrects, two triangles each");
+
+        let expected_a = texture_rectangle_vertices(rectangle_a, CycleType::OneCycle)
+            .expect("OneCycle fixture is non-degenerate");
+        let expected_a_first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_a.vertex(index))
+        });
+        assert_eq!(
+            plan.triangles[0].vertices, expected_a_first,
+            "texrect A must decode with OneCycle (its own stream-position OtherMode)"
+        );
+
+        let expected_b = texture_rectangle_vertices(rectangle_b, CycleType::Copy)
+            .expect("Copy-mode fixture is non-degenerate");
+        let expected_b_first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_b.vertex(index))
+        });
+        assert_eq!(
+            plan.triangles[2].vertices, expected_b_first,
+            "texrect B must decode with Copy (its own stream-position OtherMode)"
+        );
+
+        // Vertex index 3 carries `[u2, v2]`, derived from `lrs`/`lrt`, which
+        // depend on `uv_width`/`uv_height` -- and those depend on Copy
+        // mode's `dsdx >>= 2; lrx |= 3; lry |= 3;` mutation (vertex 0's
+        // `[u1, v1]` does not, since it comes straight from `uls`/`ult`
+        // with no copy-mode-dependent term), so index 3 is the vertex that
+        // actually distinguishes the two modes for this fixture.
+        let expected_a_under_copy = texture_rectangle_vertices(rectangle_a, CycleType::Copy)
+            .expect("Copy-mode reinterpretation is also non-degenerate for this fixture");
+        assert_ne!(
+            expected_a.vertex(3).texcoord(),
+            expected_a_under_copy.vertex(3).texcoord(),
+            "OneCycle vs Copy must actually produce different geometry for rectangle A's wire \
+             bytes, or this test cannot distinguish correct from incorrect OtherMode timing"
+        );
+    }
+
+    #[test]
+    fn texture_rectangle_is_admitted_using_durable_other_mode_carried_from_a_prior_submission() {
+        let mut durable_delta = crate::state::RdpStateDelta::default();
+        durable_delta.set_other_mode(crate::state::OtherMode::from_wire(0, 0));
+        let mut durable_state = RdpState::default();
+        durable_state.apply(&durable_delta);
+
+        // No SetOtherMode anywhere in THIS submission's own words -- only
+        // the carried-in durable state establishes it.
+        let words = texrect_words(TEXRECT, 0).to_vec();
+        let (decoded, capture, journal) =
+            decode_admitted_capture_with_state(words, (0x214, 0x224), durable_state);
+        let RawDpcCommandKind::TextureRectangle(source_rectangle) = decoded.commands()[0].kind()
+        else {
+            panic!("expected TextureRectangle as the only command");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(
+            plan.triangles.len(),
+            2,
+            "texture rectangle must be admitted using the carried-in durable OtherMode, not \
+             rejected"
+        );
+
+        let expected_vertices = texture_rectangle_vertices(source_rectangle, CycleType::OneCycle)
+            .expect("non-degenerate");
+        let expected_first: [NeutralTriangleVertex; 3] = core::array::from_fn(|index| {
+            neutral_texture_rectangle_vertex(expected_vertices.vertex(index))
+        });
+        assert_eq!(
+            plan.triangles[0].vertices, expected_first,
+            "texture rectangle must decode using the carried-in durable OtherMode's cycle_type()"
+        );
+    }
+
+    #[test]
+    fn texture_rectangle_raw_words_and_location_match_the_source_wire_bytes_for_both_opcodes() {
+        for opcode in [TEXRECT, TEXRECT_FLIP] {
+            let mut words = Vec::new();
+            words.extend(set_other_mode(0, 0));
+            let rectangle_words = texrect_words(opcode, 0);
+            let rectangle_start_word = words.len();
+            words.extend(rectangle_words);
+
+            let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+            let expected_source_address = capture
+                .memory_layout()
+                .address(
+                    capture.submission().start() + u32::try_from(rectangle_start_word * 4).unwrap(),
+                )
+                .unwrap();
+            let plan = push_and_visit(&decoded, capture, journal);
+            assert_eq!(plan.triangles.len(), 2, "opcode {opcode:#04x}");
+
+            // Both triangle halves originate from the same wire command, so
+            // both must carry identical raw_words/location provenance.
+            for (half_index, triangle) in plan.triangles.iter().enumerate() {
+                assert_eq!(
+                    triangle.raw_words.as_ref(),
+                    rectangle_words.as_slice(),
+                    "opcode {opcode:#04x} half {half_index}: raw_words must exactly match the \
+                     source wire words"
+                );
+                assert_eq!(
+                    triangle.location.source_byte_len,
+                    u32::try_from(rectangle_words.len() * 4).unwrap(),
+                    "opcode {opcode:#04x} half {half_index}: source_byte_len must be exactly 16"
+                );
+                assert_eq!(
+                    triangle.location.source_address, expected_source_address,
+                    "opcode {opcode:#04x} half {half_index}: source_address must point at the \
+                     rectangle's own wire bytes, not the preceding SetOtherMode"
+                );
+                assert_eq!(
+                    triangle.location.wire_opcode, opcode,
+                    "opcode {opcode:#04x} half {half_index}: wire_opcode must be preserved \
+                     exactly"
+                );
+            }
+            assert_eq!(
+                plan.triangles[0].location, plan.triangles[1].location,
+                "opcode {opcode:#04x}: both halves share one origin command, so location must be \
+                 identical, not independently derived"
+            );
+        }
+    }
+
+    /// Mutation-hostile check: flipping a single bit in each of the four
+    /// wire words changes at least one decoded vertex -- proving the
+    /// admission path does not silently ignore any word (e.g. an accidental
+    /// fixed-2-word read that only ever sees the first half).
+    #[test]
+    fn mutating_any_of_the_four_wire_words_changes_the_admitted_vertices() {
+        let baseline = texrect_words(TEXRECT, 0);
+        for bit_index in 0..4usize {
+            let mut mutated = baseline;
+            mutated[bit_index] ^= 1;
+
+            let mut baseline_words = Vec::new();
+            baseline_words.extend(set_other_mode(0, 0));
+            baseline_words.extend(baseline);
+            let (decoded, capture, journal) =
+                decode_admitted_capture(baseline_words, (0x214, 0x224));
+            let baseline_plan = push_and_visit(&decoded, capture, journal);
+
+            let mut mutated_words = Vec::new();
+            mutated_words.extend(set_other_mode(0, 0));
+            mutated_words.extend(mutated);
+            let (decoded, capture, journal) =
+                decode_admitted_capture(mutated_words, (0x214, 0x224));
+            let mutated_plan = push_and_visit(&decoded, capture, journal);
+
+            assert_ne!(
+                baseline_plan.triangles[0].raw_words, mutated_plan.triangles[0].raw_words,
+                "flipping bit 0 of word {bit_index} must change the admitted raw_words"
             );
         }
     }
