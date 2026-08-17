@@ -1651,11 +1651,22 @@ mod production {
         /// exactly: like that method, this one unconditionally overwrites
         /// any prior `self.ready`, with no busy-gate or rejection if an
         /// earlier ready-but-unpublished completion is still outstanding.
+        ///
+        /// Takes no caller-supplied `effects`: a generic coordinator cannot
+        /// mechanically prove an arbitrary [`fn64_render_ir::
+        /// BackendEffectReport`] describes zero physical writes, so it must
+        /// never accept one. Instead this method constructs the report
+        /// itself with an explicitly empty write list --
+        /// [`fn64_render_ir::BackendEffectReport::try_new`] validates that
+        /// empty list against `bound`'s own packet journal, so a submission
+        /// whose plan actually declares any write access is rejected here,
+        /// structurally, before `self.ready` is ever touched.
         pub fn complete_execution_preserving_physical(
             &mut self,
             bound: BoundSubmittedRawDpc,
-            effects: fn64_render_ir::BackendEffectReport,
         ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let effects =
+                fn64_render_ir::BackendEffectReport::try_new(bound.submitted.packet(), Vec::new())?;
             let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
             self.ready = Some(ReadyPhysicalSlot {
                 queue: self.authority.authority.queue_identity(),
@@ -2559,6 +2570,79 @@ mod production {
             (planned, tmem_destination)
         }
 
+        /// Build one triangle-only, genuinely zero-write plan: a single
+        /// command-decode read access (so the journal is non-empty --
+        /// [`fn64_render_ir::ResourceJournal::try_new`] rejects an empty
+        /// access list outright) plus one [`RdpTriangleCommand`], which
+        /// itself pushes zero [`ResourceAccess`] entries (see that type's
+        /// own doc comment). Unlike [`planned_fixture`], no TMEM
+        /// source/destination access exists anywhere in this plan's journal
+        /// -- this is the realistic shape
+        /// `complete_execution_preserving_physical` exists for.
+        fn triangle_planned_fixture(
+            session: &RawDpcAbiSession,
+            authority: &RawDpcBackendAuthority,
+        ) -> PlannedRawDpcSubmission {
+            let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+            // 0xc8 (TRI_FILL, `command & 0x3f == 0x08`) is a 32-byte (8-word)
+            // command per `raw_rdp_command_width` -- the stream must supply
+            // the full width or the preflight's own truncation scan rejects
+            // it before this fixture's `writer.finish` is ever reached.
+            let command_range = layout.range(0x100, 0x120).unwrap();
+
+            let command_read = ResourceAccess::try_new(
+                OperationId::new(0),
+                AccessMode::Read,
+                AccessPurpose::CommandDecode,
+                ResourceRegion::Rdram {
+                    resource: RdramResource::RawCommands,
+                    range: command_range,
+                },
+            )
+            .unwrap();
+            let journal = ResourceJournal::try_new(
+                ResourceJournalLimits::try_new(4, 0x100).unwrap(),
+                vec![command_read],
+            )
+            .unwrap();
+
+            let words = vec![0xc800_0000, 0, 0, 0, 0, 0, 0, 0];
+            let submission =
+                OwnedRawDpcSubmission::from_rdram_words(0x100, 0x120, words.clone()).unwrap();
+            let capture = OwnedRawDpcCapture::new(
+                submission,
+                layout,
+                7,
+                TemporalBoundary::new(11, DpInterruptState::Clear),
+            );
+
+            let request = session.plan_request(capture);
+            let mut writer = authority.begin_plan(request);
+            writer.push_command_decode_access(command_read);
+            let location = RawDpcCommandLocation {
+                command_index: 0,
+                stream_index: 0,
+                chunk_index: 0,
+                source_address: layout.address(command_range.start().get()).unwrap(),
+                source_byte_offset: 0,
+                source_byte_len: 32,
+                wire_opcode: 0xc8,
+            };
+            writer.push_triangle(RdpTriangleCommand {
+                location,
+                raw_words: words.into_boxed_slice(),
+                vertices: [NeutralTriangleVertex {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 1.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    texcoord: [0.0, 0.0],
+                }; 3],
+            });
+            writer.finish(journal).unwrap()
+        }
+
         fn matching_guest_read_capture(
             planned: &PlannedRawDpcSubmission,
         ) -> DeferredGuestReadCapture {
@@ -3394,22 +3478,18 @@ mod production {
         /// `complete_execution_preserving_physical`, without going through
         /// `guest_committed_fixture` (which always calls the ordinary
         /// `complete_execution` and requires a `next_physical`).
+        /// A genuinely zero-write, triangle-only bound submission -- the
+        /// exact class of packet [`RawDpcCoordinator::
+        /// complete_execution_preserving_physical`] exists for. Built from
+        /// [`triangle_planned_fixture`], never [`planned_fixture`] (whose
+        /// plan always carries a real TMEM destination write access).
         fn bound_submission_fixture(
             session: &mut RawDpcAbiSession,
             authority: &RawDpcBackendAuthority,
-        ) -> (BoundSubmittedRawDpc, fn64_render_ir::BackendEffectReport) {
-            let (planned, destination) = planned_fixture(session, authority, true);
+        ) -> BoundSubmittedRawDpc {
+            let planned = triangle_planned_fixture(session, authority);
             let capture = matching_guest_read_capture(&planned);
-            let bound = session.finalize_and_submit(planned, capture).unwrap();
-            let write = CompletedWrite::try_new(
-                destination,
-                16,
-                fn64_render_ir::effect_content_digest(&[0x55; 16]),
-            )
-            .unwrap();
-            let effects =
-                BackendEffectReport::try_new(bound.submitted.packet(), vec![write]).unwrap();
-            (bound, effects)
+            session.finalize_and_submit(planned, capture).unwrap()
         }
 
         #[test]
@@ -3421,9 +3501,9 @@ mod production {
                 drops: Rc::clone(&drops),
             });
 
-            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound = bound_submission_fixture(&mut session, &coordinator.authority);
             let _prepared = coordinator
-                .complete_execution_preserving_physical(bound, effects)
+                .complete_execution_preserving_physical(bound)
                 .unwrap();
 
             assert_eq!(
@@ -3452,9 +3532,9 @@ mod production {
             let _first = guest_committed_fixture(&mut session, &mut coordinator, FakePhysical(42));
             assert_eq!(coordinator.slots[1], Some(FakePhysical(42)));
 
-            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound = bound_submission_fixture(&mut session, &coordinator.authority);
             let _prepared = coordinator
-                .complete_execution_preserving_physical(bound, effects)
+                .complete_execution_preserving_physical(bound)
                 .unwrap();
 
             assert_eq!(
@@ -3470,19 +3550,17 @@ mod production {
             let (mut session, authority) = new_raw_dpc_roles().unwrap();
             let mut coordinator = authority.into_coordinator(FakePhysical(0));
 
-            let (bound_a, effects_a) =
-                bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound_a = bound_submission_fixture(&mut session, &coordinator.authority);
             let prepared_a = coordinator
-                .complete_execution_preserving_physical(bound_a, effects_a)
+                .complete_execution_preserving_physical(bound_a)
                 .unwrap();
             let submission_a = prepared_a.submission();
             let ready_after_a = coordinator.ready.as_ref().unwrap();
             assert_eq!(ready_after_a.submission, submission_a);
 
-            let (bound_b, effects_b) =
-                bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound_b = bound_submission_fixture(&mut session, &coordinator.authority);
             let prepared_b = coordinator
-                .complete_execution_preserving_physical(bound_b, effects_b)
+                .complete_execution_preserving_physical(bound_b)
                 .unwrap();
             let submission_b = prepared_b.submission();
             assert_ne!(submission_a, submission_b);
@@ -3508,10 +3586,9 @@ mod production {
             let (mut session, authority) = new_raw_dpc_roles().unwrap();
             let mut coordinator = authority.into_coordinator(FakePhysical(0));
 
-            let (bound_a, effects_a) =
-                bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound_a = bound_submission_fixture(&mut session, &coordinator.authority);
             let prepared_a = coordinator
-                .complete_execution_preserving_physical(bound_a, effects_a)
+                .complete_execution_preserving_physical(bound_a)
                 .unwrap();
             // Abandon it: dropped without ever reaching
             // prepare_publication/commit. Its retirement records `Rejected`
@@ -3545,7 +3622,7 @@ mod production {
         fn preserving_completion_rejects_a_foreign_authority_before_recording_a_ready_slot() {
             let (mut session, authority) = new_raw_dpc_roles().unwrap();
             let coordinator = authority.into_coordinator(FakePhysical(0));
-            let (bound, effects) = bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound = bound_submission_fixture(&mut session, &coordinator.authority);
 
             let (_, foreign_authority) = new_raw_dpc_roles().unwrap();
             // Drive the validation-failing call through a genuinely
@@ -3554,7 +3631,7 @@ mod production {
             // attempt.
             let mut foreign_coordinator = foreign_authority.into_coordinator(FakePhysical(0));
             let trapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                foreign_coordinator.complete_execution_preserving_physical(bound, effects)
+                foreign_coordinator.complete_execution_preserving_physical(bound)
             }));
             assert!(
                 trapped.is_err(),
@@ -3586,10 +3663,9 @@ mod production {
 
             // 2. A preserving completion in between -- must not disturb
             // either slot or block a future real completion.
-            let (bound_mid, effects_mid) =
-                bound_submission_fixture(&mut session, &coordinator.authority);
+            let bound_mid = bound_submission_fixture(&mut session, &coordinator.authority);
             let _prepared_mid = coordinator
-                .complete_execution_preserving_physical(bound_mid, effects_mid)
+                .complete_execution_preserving_physical(bound_mid)
                 .unwrap();
             assert_eq!(coordinator.physical(), &FakePhysical(11));
             assert_eq!(
@@ -3613,6 +3689,108 @@ mod production {
 
             assert_eq!(outcome_3.submission(), submission_3);
             assert_eq!(coordinator.physical(), &FakePhysical(22));
+        }
+
+        #[test]
+        fn preserving_completion_rejects_a_write_bearing_packet_before_recording_a_ready_slot() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let coordinator = authority.into_coordinator(FakePhysical(0));
+            // `planned_fixture`'s plan carries a real TMEM destination write
+            // access -- the exact shape `complete_execution_preserving_physical`
+            // must refuse, since it builds its own effects report with an
+            // explicitly empty write list and lets
+            // `BackendEffectReport::try_new`'s journal-vs-writes length check
+            // reject any mismatch.
+            let (planned, _destination) = planned_fixture(&session, &coordinator.authority, true);
+            let capture = matching_guest_read_capture(&planned);
+            let bound = session.finalize_and_submit(planned, capture).unwrap();
+
+            let mut coordinator = coordinator;
+            let outcome = coordinator.complete_execution_preserving_physical(bound);
+            assert!(
+                matches!(outcome, Err(ValidationError::EffectCountMismatch { .. })),
+                "a write-bearing packet must be rejected before any ReadyPhysicalSlot is \
+                 recorded, not silently accepted with a fabricated empty-writes report"
+            );
+            assert!(
+                coordinator.ready.is_none(),
+                "a rejected preserving completion must never record a ready slot"
+            );
+        }
+
+        #[test]
+        fn preserving_completion_publishes_end_to_end_preserving_the_exact_physical_identity() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(5));
+
+            let bound = bound_submission_fixture(&mut session, &coordinator.authority);
+            let prepared = coordinator
+                .complete_execution_preserving_physical(bound)
+                .unwrap();
+            let committed = session.commit_zero_guest_writes(prepared).unwrap();
+            let submission = committed.submission();
+
+            let mut fabric = admitted_fabric();
+            let token = fabric.pending_dpc_submission().unwrap().token;
+            let ready = fabric.prepare_dpc_commit(token).unwrap();
+            let capsule = session.seal_publication(committed, ready).unwrap();
+
+            let publication = coordinator.prepare_publication(capsule);
+            let outcome = publication.commit();
+
+            assert_eq!(outcome.submission(), submission);
+            assert_eq!(
+                coordinator.physical(),
+                &FakePhysical(5),
+                "the exact pre-existing physical identity must survive a preserving \
+                 completion's full publish cycle unchanged -- no successor was ever produced"
+            );
+            assert_eq!(fabric.rsp_execution_state().dpc_current, 0x108);
+            assert_eq!(
+                session.ledger.handles[0].outcome(),
+                Some(RawDpcTerminalOutcome::Published)
+            );
+        }
+
+        #[test]
+        fn dropping_an_unconsumed_ready_publication_after_a_preserving_completion_rejects_without_flipping_active(
+        ) {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(5));
+
+            let bound = bound_submission_fixture(&mut session, &coordinator.authority);
+            let prepared = coordinator
+                .complete_execution_preserving_physical(bound)
+                .unwrap();
+            let committed = session.commit_zero_guest_writes(prepared).unwrap();
+
+            let mut fabric = admitted_fabric();
+            let token = fabric.pending_dpc_submission().unwrap().token;
+            let ready = fabric.prepare_dpc_commit(token).unwrap();
+            let capsule = session.seal_publication(committed, ready).unwrap();
+
+            // Mirrors the normal complete_execution path's own
+            // dropping_an_unconsumed_ready_publication_... coverage below:
+            // an unconsumed ReadyPublication for a *preserving* completion
+            // must roll back the fabric and reject the retirement exactly
+            // the same way, and must never flip `active` -- there is no
+            // successor slot to flip to in the first place.
+            drop(coordinator.prepare_publication(capsule));
+
+            assert!(fabric.pending_dpc_submission().is_none());
+            assert!(matches!(
+                session.ledger.handles[0].outcome(),
+                Some(RawDpcTerminalOutcome::Rejected {
+                    stage: RawDpcRetirementStage::PhysicalPrepare,
+                    ..
+                })
+            ));
+            assert_eq!(
+                coordinator.physical(),
+                &FakePhysical(5),
+                "a dropped, unconsumed ReadyPublication for a preserving completion must \
+                 never flip the active slot"
+            );
         }
 
         #[test]
