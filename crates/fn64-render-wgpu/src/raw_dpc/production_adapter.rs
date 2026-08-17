@@ -4,22 +4,23 @@
 //! walks one already-`decode_raw_dpc`'d [`DecodedRawDpc`] command stream and
 //! translates each command's already-computed private geometry
 //! (`crate::tmem` types) into `fn64_render::production`'s neutral DTOs,
-//! pushing each into an [`fn64_render::ExactRawDpcPlanWriter`]. v11's frozen
-//! scope for this seam is TMEM-only: `SetTile`/`SetTileSize`/
-//! `SetTextureImage`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut` are pushed;
-//! every other decoded command kind (`NoOp`, `SetOtherMode`,
-//! `SetColorImage`, `SetFillColor`, `SetEnvColor`, `SetPrimColor`,
-//! `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `SetCombine`,
-//! `FillRectangle`, `FullSync`, `RawTriangle`) is outside the admitted
-//! zero-guest-write TMEM/state subset and is rejected loudly -- never
-//! silently dropped -- the instant one is encountered.
+//! pushing each into an [`fn64_render::ExactRawDpcPlanWriter`]. This seam
+//! admits the TMEM/load subset (`SetTile`/`SetTileSize`/`SetTextureImage`/
+//! `LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`) plus the nine pure-RDP-state
+//! commands (`SetOtherMode`, `SetColorImage`, `SetFillColor`, `SetEnvColor`,
+//! `SetPrimColor`, `SetBlendColor`, `SetFogColor`, `SetPrimDepth`,
+//! `SetCombine`); every other decoded command kind (`NoOp`, `FillRectangle`,
+//! `FullSync`, `RawTriangle`) remains outside the admitted zero-guest-write
+//! subset and is rejected loudly -- never silently dropped -- the instant
+//! one is encountered.
 
 use fn64_render::{
-    ExactRawDpcPlanWriter, NeutralImageFormat, NeutralPixelSize, NeutralTextureImage,
-    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
-    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    RawDpcCommandLocation as NeutralRawDpcCommandLocation, TmemLoadEpoch,
-    TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics, TmemStateCommand, TmemStateIdentity,
+    ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
+    NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize, NeutralPrimColor,
+    NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
+    NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
+    RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand, RdpStateIdentity,
+    TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics,
     TmemTransferLayout as NeutralTmemTransferLayout,
 };
 use fn64_render_ir::PhysicalMemoryLayout;
@@ -30,13 +31,15 @@ use crate::{
     TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferWord,
 };
 
-/// A decoded raw-DPC command this v11 production seam does not admit.
-/// v11's frozen scope is TMEM-only, no-FullSync, no-guest-write (card v11
-/// section 1); every command kind carried by [`RawDpcCommandKind`] outside
-/// `SetTextureImage`/`SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/
-/// `LoadTile`/`LoadTlut` is rejected here, loudly, at the exact command
-/// index/location it was decoded at -- never silently dropped or aliased to
-/// a no-op push.
+/// A decoded raw-DPC command this production seam does not admit. Every
+/// command kind carried by [`RawDpcCommandKind`] outside `SetTextureImage`/
+/// `SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut` and
+/// the nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
+/// `SetFillColor`/`SetEnvColor`/`SetPrimColor`/`SetBlendColor`/
+/// `SetFogColor`/`SetPrimDepth`/`SetCombine`) is rejected here, loudly, at
+/// the exact command index/location it was decoded at -- never silently
+/// dropped or aliased to a no-op push. Remaining rejected kinds: `NoOp`,
+/// `FillRectangle`, `FullSync`, `RawTriangle`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -60,19 +63,19 @@ impl std::error::Error for UnadmittedRawDpcCommand {}
 fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
     match kind {
         RawDpcCommandKind::NoOp { .. } => "NoOp",
-        RawDpcCommandKind::SetOtherMode(_) => "SetOtherMode",
-        RawDpcCommandKind::SetColorImage(_) => "SetColorImage",
-        RawDpcCommandKind::SetFillColor(_) => "SetFillColor",
-        RawDpcCommandKind::SetEnvColor(_) => "SetEnvColor",
-        RawDpcCommandKind::SetPrimColor(_) => "SetPrimColor",
-        RawDpcCommandKind::SetBlendColor(_) => "SetBlendColor",
-        RawDpcCommandKind::SetFogColor(_) => "SetFogColor",
-        RawDpcCommandKind::SetPrimDepth(_) => "SetPrimDepth",
-        RawDpcCommandKind::SetCombine(_) => "SetCombine",
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
-        RawDpcCommandKind::SetTextureImage(_)
+        RawDpcCommandKind::SetOtherMode(_)
+        | RawDpcCommandKind::SetColorImage(_)
+        | RawDpcCommandKind::SetFillColor(_)
+        | RawDpcCommandKind::SetEnvColor(_)
+        | RawDpcCommandKind::SetPrimColor(_)
+        | RawDpcCommandKind::SetBlendColor(_)
+        | RawDpcCommandKind::SetFogColor(_)
+        | RawDpcCommandKind::SetPrimDepth(_)
+        | RawDpcCommandKind::SetCombine(_)
+        | RawDpcCommandKind::SetTextureImage(_)
         | RawDpcCommandKind::SetTile { .. }
         | RawDpcCommandKind::SetTileSize { .. }
         | RawDpcCommandKind::LoadSync(_)
@@ -143,6 +146,61 @@ fn neutral_texture_image(image: TextureImage, layout: PhysicalMemoryLayout) -> N
         address: layout
             .address(image.address().get())
             .expect("decoder-staged texture image address already fits the capture's own layout"),
+    }
+}
+
+fn neutral_other_mode(value: crate::OtherMode) -> NeutralOtherMode {
+    NeutralOtherMode {
+        high: value.high(),
+        low: value.low(),
+    }
+}
+
+fn neutral_color_image(
+    image: crate::ColorImage,
+    layout: PhysicalMemoryLayout,
+) -> NeutralColorImage {
+    NeutralColorImage {
+        format: neutral_image_format(image.format()),
+        size: neutral_pixel_size(image.size()),
+        width: image.width(),
+        address: layout
+            .address(image.address().get())
+            .expect("decoder-staged color image address already fits the capture's own layout"),
+    }
+}
+
+fn neutral_fill_color(value: crate::FillColor) -> NeutralFillColor {
+    NeutralFillColor {
+        value: value.value(),
+    }
+}
+
+fn neutral_color4(value: crate::Color4) -> NeutralColor4 {
+    NeutralColor4 {
+        value: value.value(),
+    }
+}
+
+fn neutral_prim_color(value: crate::PrimColor) -> NeutralPrimColor {
+    NeutralPrimColor {
+        lod_frac: value.lod().lod_frac(),
+        lod_min: value.lod().lod_min(),
+        color: value.color().value(),
+    }
+}
+
+fn neutral_prim_depth(value: crate::PrimDepth) -> NeutralPrimDepth {
+    NeutralPrimDepth {
+        z: value.z(),
+        dz: value.dz(),
+    }
+}
+
+fn neutral_combine(value: crate::CombineParams) -> NeutralCombineParams {
+    NeutralCombineParams {
+        low: value.low(),
+        high: value.high(),
     }
 }
 
@@ -268,20 +326,29 @@ fn tmem_command_raw_words(
 }
 
 /// Per-plan `before`/`after` tile-state tracking this push loop must thread
-/// itself: [`TmemStateIdentity::of_tile_descriptor`]/`of_tile_size` need the
-/// prior identity for the *same* tile slot, and `of_texture_image` needs the
-/// prior texture-image identity, neither of which
-/// [`crate::DecodedRawDpcCommand`] carries on its own. `before` stays `None`
-/// until this plan's own first state command touching that slot/image runs;
-/// this tracker is scoped to one `push_decoded_raw_dpc` call and does not
-/// persist across submissions (T0's writer is itself one-shot per
-/// submission).
+/// itself: [`RdpStateIdentity::of_tile_descriptor`]/`of_tile_size` need the
+/// prior identity for the *same* tile slot, and `of_texture_image` and each
+/// pure-RDP-state kind need the prior identity for their own single global
+/// slot, neither of which [`crate::DecodedRawDpcCommand`] carries on its
+/// own. `before` stays `None` until this plan's own first state command
+/// touching that slot/image runs; this tracker is scoped to one
+/// `push_decoded_raw_dpc` call and does not persist across submissions (T0's
+/// writer is itself one-shot per submission).
 #[derive(Default)]
 struct StateIdentityTracker {
-    tile_descriptor: [Option<TmemStateIdentity>; 8],
-    tile_size: [Option<TmemStateIdentity>; 8],
-    texture_image: Option<TmemStateIdentity>,
+    tile_descriptor: [Option<RdpStateIdentity>; 8],
+    tile_size: [Option<RdpStateIdentity>; 8],
+    texture_image: Option<RdpStateIdentity>,
     load_epoch: Option<TmemLoadEpoch>,
+    other_mode: Option<RdpStateIdentity>,
+    color_image: Option<RdpStateIdentity>,
+    fill_color: Option<RdpStateIdentity>,
+    env_color: Option<RdpStateIdentity>,
+    prim_color: Option<RdpStateIdentity>,
+    blend_color: Option<RdpStateIdentity>,
+    fog_color: Option<RdpStateIdentity>,
+    prim_depth: Option<RdpStateIdentity>,
+    combine: Option<RdpStateIdentity>,
 }
 
 fn tile_slot(index: TileIndex) -> usize {
@@ -338,10 +405,10 @@ pub fn push_decoded_raw_dpc(
         match command.kind() {
             RawDpcCommandKind::SetTextureImage(image) => {
                 let neutral_image = neutral_texture_image(image, layout);
-                let after = TmemStateIdentity::of_texture_image(neutral_image);
+                let after = RdpStateIdentity::of_texture_image(neutral_image);
                 let before = tracker.texture_image;
                 tracker.texture_image = Some(after);
-                writer.push_state(TmemStateCommand::SetTextureImage {
+                writer.push_state(RdpStateCommand::SetTextureImage {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     image: neutral_image,
@@ -351,11 +418,11 @@ pub fn push_decoded_raw_dpc(
             }
             RawDpcCommandKind::SetTile { tile, descriptor } => {
                 let neutral_descriptor = neutral_tile_descriptor(descriptor);
-                let after = TmemStateIdentity::of_tile_descriptor(tile.get(), neutral_descriptor);
+                let after = RdpStateIdentity::of_tile_descriptor(tile.get(), neutral_descriptor);
                 let slot = tile_slot(tile);
                 let before = tracker.tile_descriptor[slot];
                 tracker.tile_descriptor[slot] = Some(after);
-                writer.push_state(TmemStateCommand::SetTile {
+                writer.push_state(RdpStateCommand::SetTile {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     tile_index: tile.get(),
@@ -366,11 +433,11 @@ pub fn push_decoded_raw_dpc(
             }
             RawDpcCommandKind::SetTileSize { tile, size } => {
                 let neutral_size = neutral_tile_size(size);
-                let after = TmemStateIdentity::of_tile_size(tile.get(), neutral_size);
+                let after = RdpStateIdentity::of_tile_size(tile.get(), neutral_size);
                 let slot = tile_slot(tile);
                 let before = tracker.tile_size[slot];
                 tracker.tile_size[slot] = Some(after);
-                writer.push_state(TmemStateCommand::SetTileSize {
+                writer.push_state(RdpStateCommand::SetTileSize {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     tile_index: tile.get(),
@@ -386,7 +453,7 @@ pub fn push_decoded_raw_dpc(
                 );
                 let input_epoch = tracker.load_epoch;
                 tracker.load_epoch = Some(output_epoch);
-                writer.push_state(TmemStateCommand::SyncLoad {
+                writer.push_state(RdpStateCommand::SyncLoad {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     input_epoch,
@@ -399,16 +466,124 @@ pub fn push_decoded_raw_dpc(
             RawDpcCommandKind::LoadTlut(load) => {
                 push_tmem_load(writer, resource_plan, location, raw_words, load);
             }
+            RawDpcCommandKind::SetOtherMode(value) => {
+                let neutral = neutral_other_mode(value);
+                let after = RdpStateIdentity::of_other_mode(neutral);
+                let before = tracker.other_mode;
+                tracker.other_mode = Some(after);
+                writer.push_state(RdpStateCommand::SetOtherMode {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    other_mode: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetColorImage(image) => {
+                let neutral = neutral_color_image(image, layout);
+                let after = RdpStateIdentity::of_color_image(neutral);
+                let before = tracker.color_image;
+                tracker.color_image = Some(after);
+                writer.push_state(RdpStateCommand::SetColorImage {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    image: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetFillColor(value) => {
+                let neutral = neutral_fill_color(value);
+                let after = RdpStateIdentity::of_fill_color(neutral);
+                let before = tracker.fill_color;
+                tracker.fill_color = Some(after);
+                writer.push_state(RdpStateCommand::SetFillColor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetEnvColor(value) => {
+                let neutral = neutral_color4(value);
+                let after = RdpStateIdentity::of_env_color(neutral);
+                let before = tracker.env_color;
+                tracker.env_color = Some(after);
+                writer.push_state(RdpStateCommand::SetEnvColor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetPrimColor(value) => {
+                let neutral = neutral_prim_color(value);
+                let after = RdpStateIdentity::of_prim_color(neutral);
+                let before = tracker.prim_color;
+                tracker.prim_color = Some(after);
+                writer.push_state(RdpStateCommand::SetPrimColor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetBlendColor(value) => {
+                let neutral = neutral_color4(value);
+                let after = RdpStateIdentity::of_blend_color(neutral);
+                let before = tracker.blend_color;
+                tracker.blend_color = Some(after);
+                writer.push_state(RdpStateCommand::SetBlendColor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetFogColor(value) => {
+                let neutral = neutral_color4(value);
+                let after = RdpStateIdentity::of_fog_color(neutral);
+                let before = tracker.fog_color;
+                tracker.fog_color = Some(after);
+                writer.push_state(RdpStateCommand::SetFogColor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    color: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetPrimDepth(value) => {
+                let neutral = neutral_prim_depth(value);
+                let after = RdpStateIdentity::of_prim_depth(neutral);
+                let before = tracker.prim_depth;
+                tracker.prim_depth = Some(after);
+                writer.push_state(RdpStateCommand::SetPrimDepth {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    depth: neutral,
+                    before,
+                    after,
+                });
+            }
+            RawDpcCommandKind::SetCombine(value) => {
+                let neutral = neutral_combine(value);
+                let after = RdpStateIdentity::of_combine(neutral);
+                let before = tracker.combine;
+                tracker.combine = Some(after);
+                writer.push_state(RdpStateCommand::SetCombine {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    combine: neutral,
+                    before,
+                    after,
+                });
+            }
             other @ (RawDpcCommandKind::NoOp { .. }
-            | RawDpcCommandKind::SetOtherMode(_)
-            | RawDpcCommandKind::SetColorImage(_)
-            | RawDpcCommandKind::SetFillColor(_)
-            | RawDpcCommandKind::SetEnvColor(_)
-            | RawDpcCommandKind::SetPrimColor(_)
-            | RawDpcCommandKind::SetBlendColor(_)
-            | RawDpcCommandKind::SetFogColor(_)
-            | RawDpcCommandKind::SetPrimDepth(_)
-            | RawDpcCommandKind::SetCombine(_)
             | RawDpcCommandKind::FillRectangle(_)
             | RawDpcCommandKind::FullSync(_)
             | RawDpcCommandKind::RawTriangle(_)) => {
@@ -548,6 +723,61 @@ mod tests {
 
     fn load_sync() -> [u32; 2] {
         [word(LOAD_SYNC, 0), 0]
+    }
+
+    const SET_OTHER_MODE: u8 = 0x2f;
+    const SET_COLOR_IMAGE: u8 = 0x3f;
+    const SET_FILL_COLOR: u8 = 0x37;
+    const SET_ENV_COLOR: u8 = 0x3b;
+    const SET_PRIM_COLOR: u8 = 0x3a;
+    const SET_BLEND_COLOR: u8 = 0x39;
+    const SET_FOG_COLOR: u8 = 0x38;
+    const SET_PRIM_DEPTH: u8 = 0x2e;
+    const SET_COMBINE: u8 = 0x3c;
+
+    fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
+        [word(SET_OTHER_MODE, cycle_type << 20), low]
+    }
+
+    fn set_color_image(format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
+        [
+            word(SET_COLOR_IMAGE, format << 21 | size << 19 | (width - 1)),
+            address,
+        ]
+    }
+
+    fn set_fill_color(color: u32) -> [u32; 2] {
+        [word(SET_FILL_COLOR, 0), color]
+    }
+
+    fn set_env_color(color: u32) -> [u32; 2] {
+        [word(SET_ENV_COLOR, 0), color]
+    }
+
+    fn set_prim_color(lod_frac: u32, lod_min: u32, color: u32) -> [u32; 2] {
+        [word(SET_PRIM_COLOR, lod_min << 8 | lod_frac), color]
+    }
+
+    fn set_blend_color(color: u32) -> [u32; 2] {
+        [word(SET_BLEND_COLOR, 0), color]
+    }
+
+    fn set_fog_color(color: u32) -> [u32; 2] {
+        [word(SET_FOG_COLOR, 0), color]
+    }
+
+    fn set_prim_depth(z: u32, dz: u32) -> [u32; 2] {
+        [word(SET_PRIM_DEPTH, 0), z << 16 | dz]
+    }
+
+    /// `CombineParams::from_wire(w0, w1)` stores `w0` unmasked -- the opcode
+    /// byte `word()` bakes into the top 8 bits stays part of `low`, matching
+    /// RT64's `combineL = combine & 0xFFFFFFFF` (`combiner.rs` module doc).
+    /// `payload` is only the low 24 bits (the command's real 24-bit
+    /// payload field); the opcode byte occupies bits 24:31 of the wire word
+    /// itself, exactly like every other command this fixture module builds.
+    fn set_combine(payload: u32, high: u32) -> [u32; 2] {
+        [word(SET_COMBINE, payload & 0x00ff_ffff), high]
     }
 
     /// Build one owned, admitted, `SubmittedTicket`-decoded raw-DPC capture
@@ -714,7 +944,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingVisitor {
         loads: Vec<TmemLoadSemantics>,
-        states: Vec<TmemStateCommand>,
+        states: Vec<RdpStateCommand>,
         accesses: Vec<fn64_render_ir::ResourceAccess>,
     }
 
@@ -989,28 +1219,486 @@ mod tests {
         let plan = push_and_visit(&decoded, capture, journal);
 
         assert_eq!(plan.states.len(), 4);
-        let TmemStateCommand::SetTextureImage { before, .. } = &plan.states[0] else {
+        let RdpStateCommand::SetTextureImage { before, .. } = &plan.states[0] else {
             panic!("expected SetTextureImage first");
         };
         assert!(
             before.is_none(),
             "first state command touching this slot has no prior identity"
         );
-        let TmemStateCommand::SetTile { before, .. } = &plan.states[1] else {
+        let RdpStateCommand::SetTile { before, .. } = &plan.states[1] else {
             panic!("expected SetTile second");
         };
         assert!(before.is_none());
-        let TmemStateCommand::SetTileSize { before, .. } = &plan.states[2] else {
+        let RdpStateCommand::SetTileSize { before, .. } = &plan.states[2] else {
             panic!("expected SetTileSize third");
         };
         assert!(before.is_none());
-        let TmemStateCommand::SyncLoad { input_epoch, .. } = &plan.states[3] else {
+        let RdpStateCommand::SyncLoad { input_epoch, .. } = &plan.states[3] else {
             panic!("expected SyncLoad fourth");
         };
         assert!(
             input_epoch.is_none(),
             "first LoadSync in a plan has no prior epoch"
         );
+    }
+
+    /// New coverage for this card: each of the nine pure-RDP-state commands'
+    /// two-occurrence `before`/`after` identity chaining. This is NOT an
+    /// extension of already-proven behavior -- the independent review that
+    /// froze this card found the "second occurrence, `before == Some(first's
+    /// after)`" chaining shape untested for any existing single-slot field
+    /// (including `SetTextureImage`) prior to this test. The mechanism
+    /// itself is real (it falls out of `StateIdentityTracker`'s ordinary
+    /// mutate-then-store pattern, identical in shape for every field), but
+    /// this is the first test that actually exercises two occurrences of the
+    /// same single-slot state command in one plan and asserts the second's
+    /// `before` equals the first's `after`.
+    #[test]
+    fn new_pure_state_commands_thread_before_after_identity_across_two_occurrences() {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(3, 0)); // Fill
+        words.extend(set_other_mode(0, 0)); // OneCycle
+        words.extend(set_color_image(0, 2, 8, 0x200));
+        words.extend(set_color_image(0, 2, 4, 0x400));
+        words.extend(set_fill_color(0xf801_f801));
+        words.extend(set_fill_color(0x0000_0000));
+        words.extend(set_env_color(0x11223344));
+        words.extend(set_env_color(0x55667788));
+        words.extend(set_prim_color(10, 5, 0x11223344));
+        words.extend(set_prim_color(20, 10, 0x55667788));
+        words.extend(set_blend_color(0x11223344));
+        words.extend(set_blend_color(0x55667788));
+        words.extend(set_fog_color(0x11223344));
+        words.extend(set_fog_color(0x55667788));
+        words.extend(set_prim_depth(100, 200));
+        words.extend(set_prim_depth(300, 400));
+        words.extend(set_combine(0x1234_5678, 0x9abc_def0));
+        words.extend(set_combine(0x0000_0001, 0x0000_0002));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+
+        assert_eq!(
+            plan.states.len(),
+            18,
+            "two occurrences of each of nine commands"
+        );
+
+        fn assert_chains<T: std::fmt::Debug>(
+            label: &str,
+            first: (Option<RdpStateIdentity>, RdpStateIdentity),
+            second: (Option<RdpStateIdentity>, RdpStateIdentity),
+            distinguishing_first: T,
+            distinguishing_second: T,
+        ) {
+            assert!(
+                first.0.is_none(),
+                "{label}: first occurrence in this plan has no prior identity"
+            );
+            assert_eq!(
+                second.0,
+                Some(first.1),
+                "{label}: second occurrence's before must equal the first's after"
+            );
+            assert_ne!(
+                first.1, second.1,
+                "{label}: distinct values ({distinguishing_first:?} vs \
+                 {distinguishing_second:?}) must produce distinct identities"
+            );
+        }
+
+        let RdpStateCommand::SetOtherMode {
+            before: b0,
+            after: a0,
+            other_mode: v0,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetOtherMode first");
+        };
+        let RdpStateCommand::SetOtherMode {
+            before: b1,
+            after: a1,
+            other_mode: v1,
+            ..
+        } = &plan.states[1]
+        else {
+            panic!("expected SetOtherMode second");
+        };
+        assert_chains("SetOtherMode", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetColorImage {
+            before: b0,
+            after: a0,
+            image: v0,
+            ..
+        } = &plan.states[2]
+        else {
+            panic!("expected SetColorImage first");
+        };
+        let RdpStateCommand::SetColorImage {
+            before: b1,
+            after: a1,
+            image: v1,
+            ..
+        } = &plan.states[3]
+        else {
+            panic!("expected SetColorImage second");
+        };
+        assert_chains("SetColorImage", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetFillColor {
+            before: b0,
+            after: a0,
+            color: v0,
+            ..
+        } = &plan.states[4]
+        else {
+            panic!("expected SetFillColor first");
+        };
+        let RdpStateCommand::SetFillColor {
+            before: b1,
+            after: a1,
+            color: v1,
+            ..
+        } = &plan.states[5]
+        else {
+            panic!("expected SetFillColor second");
+        };
+        assert_chains("SetFillColor", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetEnvColor {
+            before: b0,
+            after: a0,
+            color: v0,
+            ..
+        } = &plan.states[6]
+        else {
+            panic!("expected SetEnvColor first");
+        };
+        let RdpStateCommand::SetEnvColor {
+            before: b1,
+            after: a1,
+            color: v1,
+            ..
+        } = &plan.states[7]
+        else {
+            panic!("expected SetEnvColor second");
+        };
+        assert_chains("SetEnvColor", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetPrimColor {
+            before: b0,
+            after: a0,
+            color: v0,
+            ..
+        } = &plan.states[8]
+        else {
+            panic!("expected SetPrimColor first");
+        };
+        let RdpStateCommand::SetPrimColor {
+            before: b1,
+            after: a1,
+            color: v1,
+            ..
+        } = &plan.states[9]
+        else {
+            panic!("expected SetPrimColor second");
+        };
+        assert_chains("SetPrimColor", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetBlendColor {
+            before: b0,
+            after: a0,
+            color: v0,
+            ..
+        } = &plan.states[10]
+        else {
+            panic!("expected SetBlendColor first");
+        };
+        let RdpStateCommand::SetBlendColor {
+            before: b1,
+            after: a1,
+            color: v1,
+            ..
+        } = &plan.states[11]
+        else {
+            panic!("expected SetBlendColor second");
+        };
+        assert_chains("SetBlendColor", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetFogColor {
+            before: b0,
+            after: a0,
+            color: v0,
+            ..
+        } = &plan.states[12]
+        else {
+            panic!("expected SetFogColor first");
+        };
+        let RdpStateCommand::SetFogColor {
+            before: b1,
+            after: a1,
+            color: v1,
+            ..
+        } = &plan.states[13]
+        else {
+            panic!("expected SetFogColor second");
+        };
+        assert_chains("SetFogColor", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetPrimDepth {
+            before: b0,
+            after: a0,
+            depth: v0,
+            ..
+        } = &plan.states[14]
+        else {
+            panic!("expected SetPrimDepth first");
+        };
+        let RdpStateCommand::SetPrimDepth {
+            before: b1,
+            after: a1,
+            depth: v1,
+            ..
+        } = &plan.states[15]
+        else {
+            panic!("expected SetPrimDepth second");
+        };
+        assert_chains("SetPrimDepth", (*b0, *a0), (*b1, *a1), *v0, *v1);
+
+        let RdpStateCommand::SetCombine {
+            before: b0,
+            after: a0,
+            combine: v0,
+            ..
+        } = &plan.states[16]
+        else {
+            panic!("expected SetCombine first");
+        };
+        let RdpStateCommand::SetCombine {
+            before: b1,
+            after: a1,
+            combine: v1,
+            ..
+        } = &plan.states[17]
+        else {
+            panic!("expected SetCombine second");
+        };
+        assert_chains("SetCombine", (*b0, *a0), (*b1, *a1), *v0, *v1);
+    }
+
+    /// One test per newly admitted command, decoding a fixture stream
+    /// containing that command, pushing it through `push_decoded_raw_dpc`,
+    /// and asserting the pushed `RdpStateCommand` variant's fields match the
+    /// decoded source exactly (wire words, decoded value, location) -- same
+    /// shape as `load_block_differential_matches_the_decoded_command`.
+    #[test]
+    fn set_other_mode_is_admitted_and_matches_the_decoded_command() {
+        let words = set_other_mode(3, 0x00c0_0000).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetOtherMode(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetOtherMode");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetOtherMode {
+            raw_words,
+            other_mode,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetOtherMode");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*other_mode, neutral_other_mode(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_color_image_is_admitted_and_matches_the_decoded_command() {
+        let words = set_color_image(0, 2, 8, 0x200).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetColorImage(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetColorImage");
+        };
+        let layout = capture.memory_layout();
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetColorImage {
+            raw_words,
+            image,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetColorImage");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*image, neutral_color_image(source, layout));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_fill_color_is_admitted_and_matches_the_decoded_command() {
+        let words = set_fill_color(0xf801_f801).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetFillColor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetFillColor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetFillColor {
+            raw_words,
+            color,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetFillColor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*color, neutral_fill_color(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_env_color_is_admitted_and_matches_the_decoded_command() {
+        let words = set_env_color(0x11223344).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetEnvColor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetEnvColor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetEnvColor {
+            raw_words,
+            color,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetEnvColor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*color, neutral_color4(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_prim_color_is_admitted_and_matches_the_decoded_command() {
+        let words = set_prim_color(10, 5, 0x11223344).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetPrimColor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetPrimColor {
+            raw_words,
+            color,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*color, neutral_prim_color(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_blend_color_is_admitted_and_matches_the_decoded_command() {
+        let words = set_blend_color(0x11223344).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetBlendColor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetBlendColor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetBlendColor {
+            raw_words,
+            color,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetBlendColor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*color, neutral_color4(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_fog_color_is_admitted_and_matches_the_decoded_command() {
+        let words = set_fog_color(0x11223344).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetFogColor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetFogColor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetFogColor {
+            raw_words,
+            color,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetFogColor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*color, neutral_color4(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_prim_depth_is_admitted_and_matches_the_decoded_command() {
+        let words = set_prim_depth(100, 200).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetPrimDepth(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimDepth");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetPrimDepth {
+            raw_words,
+            depth,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetPrimDepth");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*depth, neutral_prim_depth(source));
+        assert!(before.is_none());
+    }
+
+    #[test]
+    fn set_combine_is_admitted_and_matches_the_decoded_command() {
+        let words = set_combine(0x1234_5678, 0x9abc_def0).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetCombine(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetCombine");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 1);
+        let RdpStateCommand::SetCombine {
+            raw_words,
+            combine,
+            before,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetCombine");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*combine, neutral_combine(source));
+        assert!(before.is_none());
     }
 
     #[test]

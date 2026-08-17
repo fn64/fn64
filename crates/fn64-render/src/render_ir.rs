@@ -18,13 +18,15 @@ use crate::{OwnedRawDpcSubmission, RawDpcSource};
 pub use production::{
     new_raw_dpc_roles, BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
     ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter, ExactValidatedRawDpcPlan, GuestCommittedRawDpc,
-    NeutralImageFormat, NeutralPixelSize, NeutralTextureImage, NeutralTileAddressMode,
-    NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
-    NeutralTmemTransferWord, PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority,
-    RawDpcCommandLocation, RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability,
-    RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef,
-    RawDpcTerminalOutcome, ReadyPublication, ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSemantics, TmemLoadShape, TmemStateCommand, TmemStateIdentity, TmemTransferLayout,
+    NeutralColor4, NeutralColorImage, NeutralCombineParams, NeutralFillColor, NeutralImageFormat,
+    NeutralOtherMode, NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage,
+    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
+    NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, PlannedRawDpcSubmission,
+    RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator,
+    RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle,
+    RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome, RdpStateCommand,
+    RdpStateIdentity, ReadyPublication, ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -977,16 +979,16 @@ mod production {
         Tlut,
     }
 
-    /// Content identity for one neutral tile/texture-image/epoch state
+    /// Content identity for one neutral tile/texture-image/epoch/RDP-state
     /// value, so a state transition can name what it superseded and what it
     /// established without T3 having to reread or re-derive either snapshot
     /// from raw bytes. Distinct hash domains per state kind keep a
     /// `SetTile` identity from ever colliding with a `SetTextureImage`
     /// identity for coincidentally identical bit patterns.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct TmemStateIdentity(fn64_render_ir::ContentDigest);
+    pub struct RdpStateIdentity(fn64_render_ir::ContentDigest);
 
-    impl TmemStateIdentity {
+    impl RdpStateIdentity {
         pub fn of_tile_descriptor(tile_index: u8, descriptor: NeutralTileDescriptor) -> Self {
             Self(fn64_render_ir::ContentDigest::hash(
                 b"fn64.render.tmem-state-tile-descriptor.v1\0",
@@ -1011,6 +1013,69 @@ mod production {
             Self(fn64_render_ir::ContentDigest::hash(
                 b"fn64.render.tmem-state-texture-image.v1\0",
                 &[&texture_image_bytes(image)],
+            ))
+        }
+
+        pub fn of_other_mode(value: NeutralOtherMode) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-other-mode.v1\0",
+                &[&other_mode_bytes(value)],
+            ))
+        }
+
+        pub fn of_color_image(value: NeutralColorImage) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-color-image.v1\0",
+                &[&color_image_bytes(value)],
+            ))
+        }
+
+        pub fn of_fill_color(value: NeutralFillColor) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-fill-color.v1\0",
+                &[&fill_color_bytes(value)],
+            ))
+        }
+
+        pub fn of_env_color(value: NeutralColor4) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-env-color.v1\0",
+                &[&color4_bytes(value)],
+            ))
+        }
+
+        pub fn of_prim_color(value: NeutralPrimColor) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-prim-color.v1\0",
+                &[&prim_color_bytes(value)],
+            ))
+        }
+
+        pub fn of_blend_color(value: NeutralColor4) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-blend-color.v1\0",
+                &[&color4_bytes(value)],
+            ))
+        }
+
+        pub fn of_fog_color(value: NeutralColor4) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-fog-color.v1\0",
+                &[&color4_bytes(value)],
+            ))
+        }
+
+        pub fn of_prim_depth(value: NeutralPrimDepth) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-prim-depth.v1\0",
+                &[&prim_depth_bytes(value)],
+            ))
+        }
+
+        pub fn of_combine(value: NeutralCombineParams) -> Self {
+            Self(fn64_render_ir::ContentDigest::hash(
+                b"fn64.render.rdp-state-combine.v1\0",
+                &[&combine_bytes(value)],
             ))
         }
 
@@ -1046,50 +1111,229 @@ mod production {
         bytes
     }
 
-    /// Neutral payload for one staged, resource-access-free state command
-    /// (`SetTile`, `SetTileSize`, `SetTextureImage`, `SyncLoad`) that a
-    /// following load command depends on. T3 needs these fields to
-    /// reconstruct tile state without rereading command bytes.
+    /// Neutral mirror of `SetOtherMode`'s staged pure-state value.
     ///
-    /// Every variant carries `raw_words` (the command's own wire words) and
-    /// an ordered `before`/`after` [`TmemStateIdentity`] pair: `before` is
-    /// `None` only for the first state command touching that slot in a
-    /// plan (there is no prior state to identify); `after` is always the
-    /// identity of the value this command just staged. `SyncLoad` instead
-    /// carries `input_epoch`/`output_epoch` -- the epoch this command
-    /// superseded (`None` only for a plan's first `SyncLoad`) and the new
-    /// epoch it established -- since a load-sync boundary has no tile/image
-    /// value of its own to hash.
+    /// Kept as the raw `high`/`low` wire pair, matching
+    /// `crate::state::OtherMode`'s own internal representation, rather than
+    /// decomposed into its ~20 derived fields: every one of those fields is
+    /// already a cheap computed accessor on `OtherMode` (`cycle_type`,
+    /// `texture_lut_mode`, `blender_cycle_1`, etc.), so decomposing here
+    /// would duplicate that bit-math in a second place for no reader this
+    /// admission-only card serves. A future consumer needing named fields can
+    /// call `OtherMode`'s own accessors after reconstructing it from
+    /// `high`/`low`. Open, non-blocking per this card's Section 2d.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralOtherMode {
+        pub high: u32,
+        pub low: u32,
+    }
+
+    fn other_mode_bytes(value: NeutralOtherMode) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&value.high.to_be_bytes());
+        bytes.extend_from_slice(&value.low.to_be_bytes());
+        bytes
+    }
+
+    /// Neutral mirror of `SetColorImage`'s staged pure-state value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralColorImage {
+        pub format: NeutralImageFormat,
+        pub size: NeutralPixelSize,
+        pub width: u32,
+        pub address: fn64_render_ir::PhysicalAddress,
+    }
+
+    fn color_image_bytes(value: NeutralColorImage) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(10);
+        bytes.push(value.format as u8);
+        bytes.push(value.size as u8);
+        bytes.extend_from_slice(&value.width.to_be_bytes());
+        bytes.extend_from_slice(&value.address.get().to_be_bytes());
+        bytes
+    }
+
+    /// Neutral mirror of `SetFillColor`'s staged raw 32-bit wire value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralFillColor {
+        pub value: u32,
+    }
+
+    fn fill_color_bytes(value: NeutralFillColor) -> Vec<u8> {
+        value.value.to_be_bytes().to_vec()
+    }
+
+    /// Neutral mirror of one fragment constant-register RGBA color, shared by
+    /// `SetEnvColor`/`SetBlendColor`/`SetFogColor` -- all three decode via
+    /// the identical `Color4::from_wire(w1)` (card Section 2d).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralColor4 {
+        pub value: u32,
+    }
+
+    fn color4_bytes(value: NeutralColor4) -> Vec<u8> {
+        value.value.to_be_bytes().to_vec()
+    }
+
+    /// Neutral mirror of `SetPrimColor`'s staged LOD-fraction/LOD-min/color
+    /// fields.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralPrimColor {
+        pub lod_frac: u8,
+        pub lod_min: u8,
+        pub color: u32,
+    }
+
+    fn prim_color_bytes(value: NeutralPrimColor) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6);
+        bytes.push(value.lod_frac);
+        bytes.push(value.lod_min);
+        bytes.extend_from_slice(&value.color.to_be_bytes());
+        bytes
+    }
+
+    /// Neutral mirror of `SetPrimDepth`'s staged masked depth/delta-Z fields.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralPrimDepth {
+        pub z: u16,
+        pub dz: u16,
+    }
+
+    fn prim_depth_bytes(value: NeutralPrimDepth) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(4);
+        bytes.extend_from_slice(&value.z.to_be_bytes());
+        bytes.extend_from_slice(&value.dz.to_be_bytes());
+        bytes
+    }
+
+    /// Neutral mirror of `SetCombine`'s staged raw low/high wire words.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct NeutralCombineParams {
+        pub low: u32,
+        pub high: u32,
+    }
+
+    fn combine_bytes(value: NeutralCombineParams) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&value.low.to_be_bytes());
+        bytes.extend_from_slice(&value.high.to_be_bytes());
+        bytes
+    }
+
+    /// Neutral payload for one staged, resource-access-free state command
+    /// (`SetTile`, `SetTileSize`, `SetTextureImage`, `SyncLoad`, plus the
+    /// nine pure-RDP-state commands admitted alongside them: `SetOtherMode`,
+    /// `SetColorImage`, `SetFillColor`, `SetEnvColor`, `SetPrimColor`,
+    /// `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `SetCombine`) that a
+    /// following load or draw command depends on. T3 needs these fields to
+    /// reconstruct tile/RDP state without rereading command bytes.
+    ///
+    /// Every variant except `SyncLoad` carries `raw_words` (the command's own
+    /// wire words) and an ordered `before`/`after` [`RdpStateIdentity`] pair:
+    /// `before` is `None` only for the first state command touching that
+    /// slot in a plan (there is no prior state to identify); `after` is
+    /// always the identity of the value this command just staged. `SyncLoad`
+    /// instead carries `input_epoch`/`output_epoch` -- the epoch this
+    /// command superseded (`None` only for a plan's first `SyncLoad`) and
+    /// the new epoch it established -- since a load-sync boundary has no
+    /// tile/image value of its own to hash. The nine pure-state commands
+    /// each occupy one single global slot in `RdpState`/`RdpStateDelta`
+    /// (`Option<T>`, not a per-tile array), so `before` threads exactly the
+    /// way `SetTextureImage`'s single-slot `texture_image` field already
+    /// does, not the 8-slot tile arrays.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum TmemStateCommand {
+    pub enum RdpStateCommand {
         SetTile {
             location: RawDpcCommandLocation,
             raw_words: Box<[u32]>,
             tile_index: u8,
             descriptor: NeutralTileDescriptor,
-            before: Option<TmemStateIdentity>,
-            after: TmemStateIdentity,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
         },
         SetTileSize {
             location: RawDpcCommandLocation,
             raw_words: Box<[u32]>,
             tile_index: u8,
             size: NeutralTileSize,
-            before: Option<TmemStateIdentity>,
-            after: TmemStateIdentity,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
         },
         SetTextureImage {
             location: RawDpcCommandLocation,
             raw_words: Box<[u32]>,
             image: NeutralTextureImage,
-            before: Option<TmemStateIdentity>,
-            after: TmemStateIdentity,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
         },
         SyncLoad {
             location: RawDpcCommandLocation,
             raw_words: Box<[u32]>,
             input_epoch: Option<TmemLoadEpoch>,
             output_epoch: TmemLoadEpoch,
+        },
+        SetOtherMode {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            other_mode: NeutralOtherMode,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetColorImage {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            image: NeutralColorImage,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetFillColor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            color: NeutralFillColor,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetEnvColor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            color: NeutralColor4,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetPrimColor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            color: NeutralPrimColor,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetBlendColor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            color: NeutralColor4,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetFogColor {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            color: NeutralColor4,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetPrimDepth {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            depth: NeutralPrimDepth,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
+        },
+        SetCombine {
+            location: RawDpcCommandLocation,
+            raw_words: Box<[u32]>,
+            combine: NeutralCombineParams,
+            before: Option<RdpStateIdentity>,
+            after: RdpStateIdentity,
         },
     }
 
@@ -1109,7 +1353,7 @@ mod production {
         /// A supported state/sync command carrying its own staged fields but
         /// no resource access -- required context for the load commands
         /// above.
-        State(&'plan TmemStateCommand),
+        State(&'plan RdpStateCommand),
     }
 
     /// Borrowed, nonextracting visitor over one validated plan's semantic
@@ -1147,7 +1391,7 @@ mod production {
     #[derive(Clone, Debug)]
     enum OwnedSemanticCommand {
         TmemLoad(TmemLoadSemantics),
-        State(TmemStateCommand),
+        State(RdpStateCommand),
     }
 
     impl OwnedSemanticCommand {
@@ -1676,7 +1920,7 @@ mod production {
             self.commands.push(OwnedSemanticCommand::TmemLoad(load));
         }
 
-        pub fn push_state(&mut self, state: TmemStateCommand) {
+        pub fn push_state(&mut self, state: RdpStateCommand) {
             self.commands.push(OwnedSemanticCommand::State(state));
         }
 
