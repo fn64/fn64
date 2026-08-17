@@ -319,6 +319,7 @@ mod blend;
 mod color_converter;
 mod combiner;
 mod coverage;
+mod depth_encode;
 mod depth_mode;
 mod depth_strict_less;
 mod device;
