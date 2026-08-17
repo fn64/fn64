@@ -14,18 +14,25 @@
 //! reusing the same triangle draw path -- see `push_decoded_raw_dpc`'s
 //! `TextureRectangle` arm). `NoOp` is admitted and discarded: it carries no
 //! resource identity or state delta, so it is pushed nowhere and simply
-//! skipped. Every other decoded command kind (`FillRectangle`, `FullSync`)
-//! remains outside the admitted zero-guest-write subset and is rejected
-//! loudly -- never silently dropped -- the instant one is encountered.
+//! skipped.
+//!
+//! `FillRectangle` is admitted too, as the one command here that declares
+//! guest-visible `RenderTarget` write accesses -- N of them, one per row for
+//! a partial-width fill (see `RdpFillRectangleCommand`). Its access slice
+//! comes from the decoder's own recorded span, never re-derived here.
+//!
+//! `FullSync` remains outside the admitted subset and is rejected loudly --
+//! never silently dropped -- the instant one is encountered.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
     NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize, NeutralPrimColor,
     NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
     NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand,
-    RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind,
-    TmemLoadSemantics, TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
+    NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation,
+    RdpFillRectangleCommand, RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch,
+    TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics,
+    TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
@@ -42,12 +49,17 @@ use crate::{
 /// `SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`, the
 /// nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
 /// `SetFillColor`/`SetEnvColor`/`SetPrimColor`/`SetBlendColor`/
-/// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`, and
-/// `TextureRectangle` is rejected here, loudly, at the exact command
-/// index/location it was decoded at -- never silently dropped or aliased to
-/// a no-op push. Remaining rejected kinds: `FillRectangle`, `FullSync`.
+/// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`,
+/// `TextureRectangle`, and `FillRectangle` is rejected here, loudly, at the
+/// exact command index/location it was decoded at -- never silently dropped
+/// or aliased to a no-op push. Remaining blanket-rejected kind: `FullSync`.
 /// `NoOp` is not rejected: it is admitted and discarded (see
 /// `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
+///
+/// `FillRectangle` is admitted, but can still reach this error through its
+/// own narrowed rejection: a fill whose staged `SetColorImage`/
+/// `SetFillColor` this walk never observed is reported here rather than
+/// executed against invented state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -165,6 +177,10 @@ pub enum PushDecodedRawDpcError {
     TriangleBeforeAnyOtherMode(TriangleBeforeAnyOtherMode),
     TextureRectangleBeforeAnyOtherMode(TextureRectangleBeforeAnyOtherMode),
     DegenerateTextureRectangle(DegenerateTextureRectangle),
+    /// An admitted `FillRectangle`'s recorded access span could not be
+    /// bound back to the plan's own ordered access list -- the decoder and
+    /// the resource plan disagree about what this fill writes.
+    FillAccessSpan(crate::raw_dpc::FillAccessSpanError),
 }
 
 impl core::fmt::Display for PushDecodedRawDpcError {
@@ -176,6 +192,7 @@ impl core::fmt::Display for PushDecodedRawDpcError {
                 core::fmt::Display::fmt(error, formatter)
             }
             Self::DegenerateTextureRectangle(error) => core::fmt::Display::fmt(error, formatter),
+            Self::FillAccessSpan(error) => core::fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -209,6 +226,15 @@ impl From<DegenerateTextureRectangle> for PushDecodedRawDpcError {
 fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
     match kind {
         RawDpcCommandKind::NoOp { .. } => "NoOp",
+        // Still named, deliberately, even though `FillRectangle` is now
+        // admitted rather than blanket-rejected: this arm remains reachable
+        // from the narrowed fill rejections in `push_decoded_raw_dpc`'s own
+        // `FillRectangle` arm (a fill whose staged `SetColorImage`/
+        // `SetFillColor` the walk never saw). Deleting it would make those
+        // rejections hit the `unreachable!` below and panic instead of
+        // naming the opcode. `NoOp` above is already in the same defensive
+        // state -- it is admitted and discarded, so its arm is likewise
+        // unreachable in practice.
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
@@ -624,6 +650,21 @@ pub fn push_decoded_raw_dpc(
     // never this plan's final value.
     let mut current_other_mode: Option<OtherMode> = decoded.base_state.other_mode();
 
+    // The staged `SetColorImage`/`SetFillColor` *values* (not merely their
+    // `RdpStateIdentity`s, which `tracker` already carries) current at the
+    // walk's position. An admitted `FillRectangle` copies both onto its own
+    // neutral command so the execution-time color-target identity is derived
+    // from the same values plan time used, rather than re-tracked
+    // independently at the far end.
+    //
+    // Seeded from `decoded.base_state` for the same reason
+    // `current_other_mode` is: a `FillRectangle` may legitimately depend on
+    // a `SetColorImage` issued by an earlier submission. `plan_fill`'s own
+    // admission gate reads the identical durable state, so a fill this loop
+    // sees is one `plan_fill` already proved has both staged.
+    let mut current_color_image: Option<crate::ColorImage> = decoded.base_state.color_image();
+    let mut current_fill_color: Option<crate::FillColor> = decoded.base_state.fill_color();
+
     // The journal's ordered access list opens with one `CommandDecode` read
     // access per source stream (`decode_from_state` pushes these before it
     // ever walks a command), *before* any TMEM source/destination pair. T1's
@@ -751,6 +792,7 @@ pub fn push_decoded_raw_dpc(
                 let after = RdpStateIdentity::of_color_image(neutral);
                 let before = tracker.color_image;
                 tracker.color_image = Some(after);
+                current_color_image = Some(image);
                 writer.push_state(RdpStateCommand::SetColorImage {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -764,6 +806,7 @@ pub fn push_decoded_raw_dpc(
                 let after = RdpStateIdentity::of_fill_color(neutral);
                 let before = tracker.fill_color;
                 tracker.fill_color = Some(after);
+                current_fill_color = Some(value);
                 writer.push_state(RdpStateCommand::SetFillColor {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -932,7 +975,64 @@ pub fn push_decoded_raw_dpc(
                 });
             }
             RawDpcCommandKind::NoOp { .. } => {}
-            other @ (RawDpcCommandKind::FillRectangle(_) | RawDpcCommandKind::FullSync(_)) => {
+            RawDpcCommandKind::FillRectangle(rectangle) => {
+                // Narrow admission. `plan_fill` has already refused every
+                // fill this backend cannot execute -- non-Fill cycle,
+                // missing `SetColorImage`/`SetFillColor`, a non-RGBA16/32
+                // color image, fractional or reversed edges, a rectangle
+                // wider than the staged image, or a write outside installed
+                // RDRAM -- as a `RawDpcDecodeError::InvalidCommand` before
+                // this loop ever runs. Reaching this arm therefore means the
+                // decoder already proved the fill admissible; nothing is
+                // silently downgraded to a zero-write no-op here.
+                //
+                // The access slice comes from the decoder's own recorded
+                // span, never re-derived: `ExactRawDpcPlanWriter::finish`
+                // proves the pushed accesses equal the journal's one for
+                // one, and a second independent derivation of the same
+                // geometry would turn that sealed guarantee into a runtime
+                // coin flip.
+                let (span, accesses) = resource_plan
+                    .bind_fill_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                let Some(color_image) = current_color_image else {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
+                };
+                let Some(fill_color) = current_fill_color else {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
+                };
+                let neutral_image = neutral_color_image(color_image, layout);
+                let neutral_fill = neutral_fill_color(fill_color);
+                let after = RdpStateIdentity::of_color_image(neutral_image);
+                writer.push_fill_rectangle(
+                    RdpFillRectangleCommand {
+                        location,
+                        raw_words: raw_words.into_boxed_slice(),
+                        upper_left_x: rectangle.upper_left_x(),
+                        upper_left_y: rectangle.upper_left_y(),
+                        lower_right_x: rectangle.lower_right_x(),
+                        lower_right_y: rectangle.lower_right_y(),
+                        color_image: neutral_image,
+                        fill_color: neutral_fill,
+                        first_access_index: span.first_access_index(),
+                        access_count: span.count(),
+                        before: tracker.color_image,
+                        after,
+                    },
+                    accesses,
+                );
+            }
+            other @ RawDpcCommandKind::FullSync(_) => {
                 return Err(UnadmittedRawDpcCommand {
                     command_index,
                     location: old_location,
