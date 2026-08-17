@@ -3345,8 +3345,10 @@
       "port_delta": "modified",
       "milestone": "M8",
       "workstream": "feature-parity",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_tmem_hasher.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m8-src-common-rt64-tmem-hasher-h",
@@ -3359,7 +3361,7 @@
         "owner_lane": "semantic-frontend",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_tmem_hasher_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_tmem_hasher.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",

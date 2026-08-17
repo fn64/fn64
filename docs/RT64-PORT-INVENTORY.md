@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 11 `ported`, 254 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 12 `ported`, 253 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -78,7 +78,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/common/rt64_thread.h` | `unchanged` | `not-started` | -- | 25 | 2 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-thread-h` |
 | `src/common/rt64_timer.cpp` | `unchanged` | `not-started` | -- | 74 | 4 | 1 | `M6` / `performance-spine` | `source-digests-verified` | `not-run` / `candidate-observation` | `integration-performance` (I/high) | `rt64-port-m6-src-common-rt64-timer-cpp` |
 | `src/common/rt64_timer.h` | `unchanged` | `not-started` | -- | 21 | 1 | 0 | `M6` / `performance-spine` | `source-digests-verified` | `not-run` / `candidate-observation` | `integration-performance` (I/high) | `rt64-port-m6-src-common-rt64-timer-h` |
-| `src/common/rt64_tmem_hasher.h` | `modified` | `not-started` | -- | 209 | 5 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-tmem-hasher-h` |
+| `src/common/rt64_tmem_hasher.h` | `modified` | `ported` | `crates/fn64-render-wgpu/src/rt64_tmem_hasher.rs` | 209 | 5 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-tmem-hasher-h` |
 | `src/common/rt64_user_configuration.cpp` | `unchanged` | `not-started` | -- | 180 | 10 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-user-configuration-cpp` |
 | `src/common/rt64_user_configuration.h` | `unchanged` | `not-started` | -- | 177 | 12 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-user-configuration-h` |
 | `src/common/rt64_user_paths.cpp` | `unchanged` | `not-started` | -- | 76 | 3 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-user-paths-cpp` |
