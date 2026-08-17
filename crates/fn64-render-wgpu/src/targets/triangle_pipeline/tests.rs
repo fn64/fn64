@@ -267,6 +267,63 @@ fn raster_params_byte_layout_is_32_bytes_and_pads_two_trailing_reserved_f32() {
     assert_eq!(&bytes[24..32], &[0u8; 8]);
 }
 
+/// Device-unavailable degradation path (port card §7): a real GPU adapter
+/// cannot be forced absent deterministically in this test harness (no unit
+/// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
+/// either -- `UninitializedTrianglePipeline::request` genuinely calls
+/// `wgpu::Instance::request_adapter`, and every `host_gpu_tests` test in
+/// this module panics loudly, by established convention, if that returns
+/// `NoAdapter` on a CI host assumed to have one). What this card's own
+/// `submit_admitted_triangle` adds ahead of any device call -- the
+/// `NeutralTriangleVertex -> RasterVertex` adaptation and `TriangleFixture`
+/// assembly -- is proven not to panic and to build the exact fixture a real
+/// device call would receive, entirely without a device: if this ever
+/// needs a device to run, it would silently stop covering the
+/// device-unavailable case (any panic here would occur before device
+/// request, same as a real `NoAdapter` return -- so this is the same
+/// coverage `NativeRasterDeviceOutcome::NoAdapter`'s non-panicking
+/// construction gets elsewhere in this crate, applied to this card's new
+/// pre-device logic).
+#[test]
+fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
+    let vertices = [
+        fn64_render::NeutralTriangleVertex {
+            x: 0.0,
+            y: 0.0,
+            z: 0.5,
+            w: 1.0,
+            color: [1.0, 0.0, 0.0, 1.0],
+            texcoord: [0.0, 0.0],
+        },
+        fn64_render::NeutralTriangleVertex {
+            x: 8.0,
+            y: 0.0,
+            z: 0.5,
+            w: 1.0,
+            color: [0.0, 1.0, 0.0, 1.0],
+            texcoord: [1.0, 0.0],
+        },
+        fn64_render::NeutralTriangleVertex {
+            x: 0.0,
+            y: 8.0,
+            z: 0.5,
+            w: 1.0,
+            color: [0.0, 0.0, 1.0, 1.0],
+            texcoord: [0.0, 1.0],
+        },
+    ];
+    let raster_vertices = vertices.map(crate::neutral_vertex_to_raster_vertex);
+    let fixture = TriangleFixture {
+        vertices: raster_vertices,
+        raster_params: identity_raster_params(),
+        combine_params: shade_passthrough_combine_params(),
+        extent: EXTENT,
+    };
+    assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
+    assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
+    assert_eq!(fixture.vertices[2].color, [0.0, 0.0, 1.0, 1.0]);
+}
+
 #[cfg(feature = "host-gpu-tests")]
 mod host_gpu_tests {
     use super::*;
@@ -523,6 +580,413 @@ mod host_gpu_tests {
                 (observed_depth - 0.25).abs() < 1e-3,
                 "depth at ({x},{y}) = {observed_depth}, expected ~0.25 (nearer draw must have won)"
             );
+        }
+    }
+
+    // --- Sealed-plan end-to-end: real decoded input -> real sealed
+    // admission -> admitted state -> real pipeline draw (production
+    // triangle draw card §7) ---
+
+    mod sealed_plan_end_to_end {
+        use super::*;
+        use crate::raw_dpc::{push_decoded_raw_dpc, TriangleDrawStateCollector};
+        use crate::state::OtherMode as CrateOtherMode;
+        use crate::{
+            decode_raw_dpc, decode_triangle_vertices, CombineParams, RawDpcCommandKind, RdpState,
+        };
+        use fn64_render::{new_raw_dpc_roles, OwnedRawDpcCapture, OwnedRawDpcSubmission};
+        use fn64_render_ir::{
+            PhysicalMemoryLayout, ResourceJournal, ResourceJournalLimits, TemporalBoundary,
+        };
+
+        const LAYOUT_BYTES: u32 = 0x4000;
+        const COMMAND_START: u32 = 0x1000;
+        const SET_OTHER_MODE: u8 = 0x2f;
+        const SET_COMBINE: u8 = 0x3c;
+        const RAW_TRIANGLE_SHADED: u8 = 0x0c; // shaded, no texture, no depth
+
+        fn word(opcode: u8, payload: u32) -> u32 {
+            u32::from(opcode) << 24 | payload
+        }
+
+        fn set_other_mode_words(cycle_type: u32, low: u32) -> [u32; 2] {
+            [word(SET_OTHER_MODE, cycle_type << 20), low]
+        }
+
+        // Same wire split `combiner.rs`'s own doc documents:
+        // `CombineParams::from_wire(w0, w1)` stores `w0` unmasked.
+        fn set_combine_words(payload: u32, high: u32) -> [u32; 2] {
+            [word(SET_COMBINE, payload & 0x00ff_ffff), high]
+        }
+
+        /// A shaded (0x0c), non-textured, non-Z triangle covering the whole
+        /// 8x8 target (screen-pixel corners (0,0)/(0,8)/(8,0), matching
+        /// `covering_triangle_fixture`'s own screen geometry) with a FLAT
+        /// uniform shade color -- every shade `dx`/`de` coefficient word is
+        /// zero, so the interleaved-fixed-point decode
+        /// (`triangle_vertices.rs`'s `decode_shade`) collapses to exactly
+        /// `base / 255.0` at every vertex, sidestepping barycentric
+        /// interpolation math entirely: this test only needs to prove real
+        /// decoded-plan data reaches the real GPU output, not re-derive
+        /// RT64's shade-gradient arithmetic.
+        ///
+        /// `decode_triangle_vertices`'s own formula: `y1=yh`, `y2=yl`,
+        /// `y3=ym`; `x1=x2` come from the major edge (`xh`/`dxhdy`, evaluated
+        /// at `y1`/`y2`); `x3=xl` independently (`triangle_vertices.rs:130-
+        /// 158`). `RawTriangle::decode` reads `yl` from word0's low 16 bits,
+        /// `ym`/`yh` from word1's high/low 16 bits (`triangle.rs:187-189`).
+        /// Choosing `yl=32` (y2=8.0px, `/4` fixed-point), `yh=0` (y1=0),
+        /// `ym=0` (y3=0), `xh=0`/`dxhdy=0` (x1=x2=0.0px), `xl=8.0px`
+        /// (Q16.16, x3=8.0px) yields vertices (0,0)/(0,8)/(8,0) -- the same
+        /// right-triangle area `covering_triangle_fixture` covers.
+        fn shaded_covering_triangle_words(color_255: [u32; 4]) -> Vec<u32> {
+            let mut words = vec![
+                // tile=0, level=0, yl=32 (8.0px).
+                word(RAW_TRIANGLE_SHADED, 32u32),
+                0, // ym=0, yh=0 (word1)
+                // xl/dxldy (edge word 1): x3 = xl = 8.0px in Q16.16.
+                (8i32 << 16) as u32,
+                0,
+                // xh/dxhdy (edge word 2): x1=x2=0.0px, slope 0.
+                0,
+                0,
+                // xm/dxmdy (edge word 3): unused by decode_triangle_vertices
+                // (RT64's own dead `mIntercept`/`x3` uses `xl`, not `xm`).
+                0,
+                0,
+            ];
+            // Shade block: base (words[0]/[2]) carries R/G in word0's
+            // high/low 16 bits and B/A in word1's high/low 16 bits, exactly
+            // `decode_shade`'s `interleave_words_pair(shade[0], shade[2])`
+            // layout (word0=shade[0], word1=shade[2] contributes only its
+            // low-order fractional half, zero here). dx (words[1]/[3]) and
+            // de (words[4]/[6]) all zero -- flat color, no gradient.
+            let base_w0 = (color_255[0] << 16) | (color_255[1] & 0xffff);
+            let base_w1 = (color_255[2] << 16) | (color_255[3] & 0xffff);
+            words.extend([
+                base_w0, base_w1, // shade[0]
+                0, 0, // shade[1] (dx)
+                0, 0, // shade[2] (base low half, zero)
+                0, 0, // shade[3] (dx low half)
+                0, 0, // shade[4] (de)
+                0, 0, // shade[5] (unused by decode_shade)
+                0, 0, // shade[6] (de low half)
+                0, 0, // shade[7] (unused)
+            ]);
+            words
+        }
+
+        fn journal_for(
+            capture: &OwnedRawDpcCapture,
+            source_range: (u32, u32),
+            layout: PhysicalMemoryLayout,
+        ) -> ResourceJournal {
+            use fn64_render_ir::{
+                AccessMode, AccessPurpose, OperationId, RdramResource, ResourceAccess,
+                ResourceRegion,
+            };
+            let bytes = u32::try_from(capture.submission().command_words().len() * 4).unwrap();
+            let command_access = ResourceAccess::try_new(
+                OperationId::new(0),
+                AccessMode::Read,
+                AccessPurpose::CommandDecode,
+                ResourceRegion::Rdram {
+                    resource: RdramResource::RawCommands,
+                    range: layout.range(COMMAND_START, COMMAND_START + bytes).unwrap(),
+                },
+            )
+            .unwrap();
+            let source_access = ResourceAccess::try_new(
+                OperationId::new(1),
+                AccessMode::Read,
+                AccessPurpose::TmemLoadSource,
+                ResourceRegion::Rdram {
+                    resource: RdramResource::Buffer,
+                    range: layout.range(source_range.0, source_range.1).unwrap(),
+                },
+            )
+            .unwrap();
+            let accesses = vec![command_access, source_access];
+            let declared = accesses
+                .iter()
+                .map(|access| access.region().declared_bytes())
+                .sum::<u32>();
+            ResourceJournal::try_new(
+                ResourceJournalLimits::try_new(64, declared.max(1)).unwrap(),
+                accesses,
+            )
+            .unwrap()
+        }
+
+        fn finalize_ticket(
+            capture: &OwnedRawDpcCapture,
+            layout: PhysicalMemoryLayout,
+            journal: ResourceJournal,
+        ) -> fn64_render_ir::DecodedTicket {
+            let preflight = fn64_render::preflight_raw_dpc_capture(
+                layout,
+                7,
+                capture.submission().clone(),
+                capture.cmd_end(),
+                Vec::new(),
+                journal,
+            )
+            .expect("fixture journal has valid limits for this capture's own command bytes");
+            let guest_capture = fn64_render_ir::DeferredGuestReadCapture::new(
+                preflight
+                    .guest_read_plan()
+                    .reads()
+                    .iter()
+                    .map(|read| {
+                        fn64_render_ir::CapturedGuestRead::try_new(
+                            *read,
+                            vec![0; read.range().len() as usize],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            );
+            preflight
+                .finalize(guest_capture)
+                .expect("captured reads match the plan's own guest-read plan exactly")
+        }
+
+        fn decode_fixture_capture(
+            words: Vec<u32>,
+            source_range: (u32, u32),
+        ) -> (crate::DecodedRawDpc, OwnedRawDpcCapture, ResourceJournal) {
+            let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+            let end = COMMAND_START + u32::try_from(words.len() * 4).unwrap();
+            let submission =
+                OwnedRawDpcSubmission::from_rdram_words(COMMAND_START, end, words.clone()).unwrap();
+            let capture = OwnedRawDpcCapture::new(
+                submission,
+                layout,
+                7,
+                TemporalBoundary::new(1, fn64_render_ir::DpInterruptState::Clear),
+            );
+            let probe_journal = journal_for(&capture, source_range, layout);
+            let probe_ticket = finalize_ticket(&capture, layout, probe_journal);
+            let (mut probe_queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+                .unwrap()
+                .into_roles();
+            let probe_submitted = probe_queue.submit(probe_ticket).unwrap();
+            let journal = match decode_raw_dpc(probe_submitted, &RdpState::default()) {
+                Err(crate::RawDpcDecodeError::JournalMismatch { expected, .. }) => {
+                    let accesses = expected.into_vec();
+                    let declared = accesses
+                        .iter()
+                        .map(|access| access.region().declared_bytes())
+                        .sum::<u32>();
+                    ResourceJournal::try_new(
+                        ResourceJournalLimits::try_new(64, declared.max(1)).unwrap(),
+                        accesses,
+                    )
+                    .unwrap()
+                }
+                Ok(_) => journal_for(&capture, source_range, layout),
+                Err(error) => panic!("fixture probe failed before journal comparison: {error}"),
+            };
+            let ticket = finalize_ticket(&capture, layout, journal.clone());
+            let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+                .unwrap()
+                .into_roles();
+            let submitted = queue.submit(ticket).unwrap();
+            let decoded =
+                decode_raw_dpc(submitted, &RdpState::default()).expect("fixture decodes cleanly");
+            (decoded, capture, journal)
+        }
+
+        /// The card's required end-to-end assertion (§7): decode a fixture
+        /// capture containing `SetOtherMode`, `SetCombine`, and one
+        /// `RawTriangle`; push ALL of them through `push_decoded_raw_dpc`
+        /// into one sealed plan; walk the plan via `ExactRawDpcPlanVisitor`
+        /// (through `TriangleDrawStateCollector`, the same collector
+        /// `retrieve_triangle_draws` wraps, never `decoded.commands()`
+        /// directly) for both the `State` and `Triangle` arms; fill a
+        /// vertex buffer; submit through `TrianglePipelineRenderer`; assert
+        /// real-GPU fragment output at known-covered pixels matches
+        /// `combiner.rs`'s `run_one_cycle` called with the real decoded
+        /// `CombineParams`.
+        ///
+        /// Reaches the plan through a `RawDpcCoordinator` (`authority.
+        /// into_coordinator(())` -- unit `()` as the trivial physical-state
+        /// fixture `P`, since this test needs no real `PhysicalTmemState`),
+        /// not a bare `authority.begin_plan`/`bound.execution_view(&authority,
+        /// ..)` call: this test is the predecessor proof for the parallel
+        /// production-integration lane (`rt64-wgpu-backend-triangle-
+        /// integration`), which reaches its sealed plan the same way
+        /// `WgpuBackend` (`production.rs`) already does -- through its own
+        /// owned coordinator, never a second bare-authority route alongside
+        /// it.
+        #[test]
+        fn required_host_draws_a_real_admitted_triangle_matching_the_combiner_oracle() {
+            // SHADE-passthrough SetCombine (same wire construction as
+            // `shade_passthrough_combine_params` in the parent module, one
+            // level up): (A-B)*C+D collapses to D=SHADE.
+            let color_a: u32 = 0;
+            let color_b: u32 = 0;
+            let color_c: u32 = 0;
+            let color_d: u32 = 4;
+            let alpha_a: u32 = 0;
+            let alpha_b: u32 = 0;
+            let alpha_c: u32 = 1;
+            let alpha_d: u32 = 4;
+            let low = (color_a << 5) | color_c;
+            let high = (color_b << 24)
+                | (color_d << 6)
+                | (alpha_a << 21)
+                | (alpha_b << 3)
+                | (alpha_c << 18)
+                | alpha_d;
+
+            let mut words = Vec::new();
+            words.extend(set_other_mode_words(0, 0)); // OneCycle, no z-source-prim
+            words.extend(set_combine_words(low, high));
+            let triangle_color_255 = [64u32, 128, 192, 255];
+            words.extend(shaded_covering_triangle_words(triangle_color_255));
+
+            let (decoded, capture, journal) = decode_fixture_capture(words, (0x214, 0x224));
+            let RawDpcCommandKind::RawTriangle(source_triangle) = decoded.commands()[2].kind()
+            else {
+                panic!("expected RawTriangle as the third command");
+            };
+            let RawDpcCommandKind::SetCombine(source_combine) = decoded.commands()[1].kind() else {
+                panic!("expected SetCombine as the second command");
+            };
+
+            let layout = capture.memory_layout();
+            let submission_start = capture.submission().start();
+            let capture_words = capture.submission().command_words();
+            let (session, authority) = new_raw_dpc_roles().unwrap();
+            // Coordinator-owned route, not a bare-authority call -- this
+            // test is the predecessor proof for the parallel production-
+            // integration lane, which reaches its sealed plan the same way
+            // `WgpuBackend` already does. Unit `()` stands in for the
+            // coordinator's physical-state slot `P`: this test only needs
+            // the plan-writing/plan-visiting surface, not real TMEM state.
+            let coordinator = authority.into_coordinator(());
+            let request = session.plan_request(capture);
+            let mut writer = coordinator.begin_plan(request);
+            push_decoded_raw_dpc(
+                &mut writer,
+                &decoded,
+                &capture_words,
+                layout,
+                submission_start,
+            )
+            .expect("fixture stays inside the admitted state+triangle subset");
+            let planned = writer
+                .finish(journal)
+                .expect("pushed accesses match the journal exactly");
+            let reads = fn64_render_ir::DeferredGuestReadCapture::new(
+                planned
+                    .guest_read_plan()
+                    .reads()
+                    .iter()
+                    .map(|read| {
+                        fn64_render_ir::CapturedGuestRead::try_new(
+                            *read,
+                            vec![0; read.range().len() as usize],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            );
+            let mut session = session;
+            let bound = session.finalize_and_submit(planned, reads).unwrap();
+
+            // Walk the sealed plan through the real nonextracting visitor --
+            // `execution_view` is the sealed API's sole route to plan
+            // contents once bound; never `decoded.commands()` from here on.
+            struct NoopExecutionView;
+            impl fn64_render::RawDpcExecutionView<TriangleDrawStateCollector> for NoopExecutionView {
+                fn plan_visited(&mut self, _plan_visitor: &mut TriangleDrawStateCollector) {}
+                fn captured_reads(&mut self, _reads: &[fn64_render_ir::CapturedGuestRead]) {}
+                fn submitted_packet(&mut self, _packet: &fn64_render_ir::WorkloadPacket) {}
+            }
+            let mut collector = TriangleDrawStateCollector::default();
+            let mut view = NoopExecutionView;
+            coordinator.execution_view(&bound, &mut collector, &mut view);
+            let retrieved = collector
+                .finish()
+                .expect("plan has one triangle with real state at its own stream position");
+            assert_eq!(retrieved.len(), 1);
+            let draw = retrieved[0];
+
+            // Cross-check the retrieved combine value against the source
+            // decode -- the sealed plan really carries the real decoded
+            // SetCombine, not a fixture literal.
+            let expected_combine =
+                CombineParams::from_wire(source_combine.low(), source_combine.high());
+            assert_eq!(draw.combine_params, expected_combine);
+            let expected_other_mode = CrateOtherMode::from_wire(0, 0);
+            assert_eq!(draw.other_mode, expected_other_mode);
+
+            let requested =
+                block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                    .unwrap();
+            let mut renderer = match requested {
+                TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+                TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                    no_adapter.requested()
+                ),
+            };
+
+            let output = renderer
+                .submit_admitted_triangle(
+                    draw.vertices,
+                    draw.other_mode,
+                    draw.combine_params,
+                    identity_raster_params(),
+                    EXTENT,
+                )
+                .unwrap()
+                .complete()
+                .unwrap();
+
+            // Known-covered pixel (uniform flat shade -> every covered pixel
+            // has the same combiner output, no barycentric interpolation
+            // needed): assert the real-GPU fragment output matches
+            // `run_one_cycle` called with the REAL decoded CombineParams and
+            // the real decoded shade color -- not a fixture literal.
+            let source_vertices = decode_triangle_vertices(&source_triangle, false);
+            let shade_color = source_vertices.vertex(0).color();
+            let expected_color =
+                cpu_combiner_reference_with_params(draw.combine_params, shade_color);
+            let observed = rgba8_at(&output, 1, 1);
+            let expected_u8 = [
+                (expected_color[0] * 255.0).round() as u8,
+                (expected_color[1] * 255.0).round() as u8,
+                (expected_color[2] * 255.0).round() as u8,
+                (expected_color[3] * 255.0).round() as u8,
+            ];
+            assert_close_rgba8(observed, expected_u8, 2);
+            assert_eq!(expected_u8, triangle_color_255.map(|c| c as u8));
+        }
+
+        fn cpu_combiner_reference_with_params(
+            params: CombineParams,
+            shade_color: [f32; 4],
+        ) -> [f32; 4] {
+            use crate::combiner::{run_one_cycle, CombinerInputs};
+            let inputs = CombinerInputs {
+                tex_val0: [0.0; 4],
+                tex_val1: [0.0; 4],
+                prim_color: [0.0; 4],
+                shade_color,
+                env_color: [0.0; 4],
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            };
+            let (color, _alpha_compare) = run_one_cycle(params, inputs);
+            color
         }
     }
 }
