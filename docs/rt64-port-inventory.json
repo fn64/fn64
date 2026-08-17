@@ -14848,6 +14848,7 @@
       "port_state": "ported",
       "ported_as": [
         "crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs",
+        "crates/fn64-render-wgpu/src/rt64_rsp_patch.rs",
         "crates/fn64-render-wgpu/src/rt64_rsp_segment.rs"
       ],
       "evidence_state": "source-digests-verified",
@@ -14863,6 +14864,7 @@
         "recommended_profile": "I/high",
         "writable_paths": [
           "crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs",
+          "crates/fn64-render-wgpu/src/rt64_rsp_patch.rs",
           "crates/fn64-render-wgpu/src/rt64_rsp_segment.rs"
         ],
         "non_goals": [
@@ -15007,6 +15009,7 @@
       "port_state": "ported",
       "ported_as": [
         "crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs",
+        "crates/fn64-render-wgpu/src/rt64_rsp_patch.rs",
         "crates/fn64-render-wgpu/src/rt64_rsp_segment.rs"
       ],
       "evidence_state": "source-digests-verified",
@@ -15022,6 +15025,7 @@
         "recommended_profile": "I/high",
         "writable_paths": [
           "crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs",
+          "crates/fn64-render-wgpu/src/rt64_rsp_patch.rs",
           "crates/fn64-render-wgpu/src/rt64_rsp_segment.rs"
         ],
         "non_goals": [
