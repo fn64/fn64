@@ -196,37 +196,40 @@
 //! provide, because `updateAngular` and `RigidBody::lerp` are the first
 //! functions in this file cluster that need them:
 //!
-//! - `vec3_length`/`vec3_normalize` (`hlslpp::length`/vector-scalar-divide
-//!   for `float3`): neither `fn64_render_ir::Vec3` nor either sibling module
-//!   exposes a length function (`rt64_math_decompose.rs` has a private
-//!   `vec3_length` of its own, not reusable across module boundaries without
-//!   making it `pub`, which is outside this ticket's edit rights over that
-//!   file).
+//! - `vec3_scale_div` (vector-scalar-divide for `float3`): neither
+//!   `fn64_render_ir::Vec3` nor any sibling module exposes it.
+//!   `hlslpp::length(float3)` itself is **not** redefined here -- this
+//!   module calls [`crate::rt64_math_decompose::vec3_length`], which was
+//!   widened to `pub(crate)` for exactly this caller. (An earlier revision
+//!   of this doc said that helper was private and "not reusable across
+//!   module boundaries without making it `pub`, which is outside this
+//!   ticket's edit rights"; that is no longer true and the local duplicate
+//!   it justified has been retired.) Note that
+//!   `rt64_preset_light`/`rt64_lights_math`/`rt64_rsp_smooth_normal` each
+//!   have their own `length`, cited to *different* C++ authorities with
+//!   their own ulp and NaN caveats -- those are deliberately separate and
+//!   must not be folded into this one.
 //! - `mat3_mul`/`mat3_inverse` (`hlslpp::mul(float3x3,float3x3)` and
 //!   `hlslpp::inverse(float3x3)`): no 3x3 matrix multiply or inverse exists
 //!   anywhere in this crate or `fn64_render_ir` -- `rt64_math_decompose.rs`
 //!   only built a **4x4** `mat4_mul`/`inverse4` (for `decomposeMatrix`'s
 //!   `float4x4` perspective-matrix inverse), which is a different-sized,
 //!   non-reusable operation for `updateAngular`'s `float3x3` inverse.
-//! - `quat_mul` (`hlslpp::mul(quaternion,quaternion)`, Hamilton product),
+//! - `quat_mul` (`hlslpp::mul(quaternion,quaternion)`, Hamilton product) and
 //!   `quat_rotation_axis` (`hlslpp::quaternion::rotation_axis(axis, angle)`,
-//!   axis-angle quaternion constructor), and `quat_dot` (quaternion dot
-//!   product): `crate::rt64_math_decompose::Quat`'s `dot`/`neg`/`normalize`
-//!   methods are private (`fn`, not `pub fn` -- confirmed by reading that
-//!   module's source; they exist only to serve that module's own
-//!   `lerp_transforms`, and this ticket's exclusive paths do not include
-//!   editing `rt64_math_decompose.rs` to widen their visibility), so this
-//!   module cannot call `Quat::dot` directly. `quat_mul` and
-//!   `quat_rotation_axis` are new operations regardless (no `mul`/
-//!   `rotation_axis` exists on `Quat` at any visibility) -- both are
+//!   axis-angle quaternion constructor) are genuinely new operations: no
+//!   `mul`/`rotation_axis` exists on `Quat` at any visibility. Both are
 //!   implemented as free functions taking/returning
 //!   `crate::rt64_math_decompose::Quat` directly (not a second quaternion
-//!   type), since `Quat`'s fields (`x, y, z, w`) are `pub` even though its
-//!   methods are not. `quat_dot` is a minimal local re-derivation of the same
-//!   4-component dot product `Quat::dot` already computes privately --
-//!   duplicated here rather than widening a sibling ticket's module surface,
-//!   same reasoning `rt64_math_decompose.rs`'s own module doc gives for not
-//!   reusing `rt64_math.rs::epsilon_equal` across a module boundary.
+//!   type), since `Quat`'s fields (`x, y, z, w`) are `pub`.
+//!
+//!   The quaternion dot product is **not** among them. An earlier revision
+//!   of this module carried a local `quat_dot`, justified by the claim that
+//!   `Quat`'s `dot`/`neg`/`normalize` "are private ... so this module cannot
+//!   call `Quat::dot` directly". `Quat::dot` is now `pub(crate)` and the
+//!   `updateAngular` bias branch calls it directly; the duplicate is gone.
+//!   `neg` and `normalize` remain private -- nothing outside
+//!   `rt64_math_decompose` calls them, so neither was widened.
 //!
 //! ## Admitted domain
 //!
@@ -374,7 +377,9 @@
 
 use crate::rt64_extended_gbi::{G_EX_COMPONENT_AUTO, G_EX_COMPONENT_INTERPOLATE};
 use crate::rt64_math::{trace_from_3x3, Mat3};
-use crate::rt64_math_decompose::{lerp_transforms, recompose_matrix, DecomposedTransform, Quat};
+use crate::rt64_math_decompose::{
+    lerp_transforms, recompose_matrix, vec3_length, DecomposedTransform, Quat,
+};
 use crate::rt64_math_matrix::{extract_3x3, lerp_matrix_components, rotation_from_3x3};
 use fn64_render_ir::{Mat4, Vec3};
 
@@ -554,10 +559,10 @@ impl RigidBody {
             );
 
             let mut rot_dot_product =
-                quat_dot(prev_transform_copy.rotation, cur_transform.rotation).abs();
-            let x_rot_dot_product = quat_dot(x_rot, cur_transform.rotation).abs();
-            let y_rot_dot_product = quat_dot(y_rot, cur_transform.rotation).abs();
-            let z_rot_dot_product = quat_dot(z_rot, cur_transform.rotation).abs();
+                Quat::dot(prev_transform_copy.rotation, cur_transform.rotation).abs();
+            let x_rot_dot_product = Quat::dot(x_rot, cur_transform.rotation).abs();
+            let y_rot_dot_product = Quat::dot(y_rot, cur_transform.rotation).abs();
+            let z_rot_dot_product = Quat::dot(z_rot, cur_transform.rotation).abs();
 
             if x_rot_dot_product > rot_dot_product {
                 prev_transform_copy.rotation = x_rot;
@@ -615,13 +620,6 @@ impl Default for RigidBody {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// `hlslpp::length(float3)`. Not present on `fn64_render_ir::Vec3` or
-/// reusable from `rt64_math_decompose.rs`'s private `vec3_length` (see
-/// module doc "Reuse, not new type").
-fn vec3_length(v: Vec3) -> f32 {
-    (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
 }
 
 /// `v / s` for a `float3` divided by a scalar (used for
@@ -696,14 +694,6 @@ fn mat3_inverse(m: Mat3) -> Mat3 {
             Vec3::new(c02 / det, c12 / det, c22 / det),
         ],
     }
-}
-
-/// `hlslpp::dot(quaternion, quaternion)`: conventional 4-component dot
-/// product, matching `crate::rt64_math_decompose::Quat`'s own private `dot`
-/// (see module doc "Reuse, not new type" for why this is a local
-/// re-derivation rather than a cross-module call).
-fn quat_dot(a: Quat, b: Quat) -> f32 {
-    a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
 }
 
 /// `hlslpp::mul(quaternion, quaternion)`: standard Hamilton quaternion
