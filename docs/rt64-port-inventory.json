@@ -10798,7 +10798,8 @@
       "workstream": "rdp-framebuffer",
       "port_state": "ported",
       "ported_as": [
-        "crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs"
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs",
+        "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
       ],
       "evidence_state": "source-digests-verified",
       "task_card": {
@@ -10812,7 +10813,8 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs"
+          "crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs",
+          "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -11299,8 +11301,10 @@
       "port_delta": "modified",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-hle-rt64-framebuffer-manager-cpp",
@@ -11313,7 +11317,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_framebuffer_manager_cpp.rs"
+          "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
@@ -11482,8 +11486,10 @@
       "port_delta": "modified",
       "milestone": "M4",
       "workstream": "rdp-framebuffer",
-      "port_state": "not-started",
-      "ported_as": [],
+      "port_state": "ported",
+      "ported_as": [
+        "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
+      ],
       "evidence_state": "source-digests-verified",
       "task_card": {
         "id": "rt64-port-m4-src-hle-rt64-framebuffer-manager-h",
@@ -11496,7 +11502,7 @@
         "owner_lane": "gpu-render",
         "recommended_profile": "I/high",
         "writable_paths": [
-          "crates/fn64-render-wgpu/src/rt64_framebuffer_manager_h.rs"
+          "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
         ],
         "non_goals": [
           "Do not edit, vendor, or transliterate the RT64 C++ source.",
