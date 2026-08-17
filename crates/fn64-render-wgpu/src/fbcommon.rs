@@ -92,14 +92,19 @@
 //!
 //! ## Nonclaims
 //!
-//! This module does not port `Float4ToUINT16`'s or `Float4ToUINT`'s RGBA
-//! branch: both call `Float4ToRGBA16(float4 i, uint dither, bool usesHDR)`,
-//! whose full-`float4`+HDR signature `rgb_dither::
+//! This module does not port
+//! [`Float4ToUINT16`](crate::rt64_float4_quantize::float4_to_uint16)'s or
+//! [`Float4ToUINT`](crate::rt64_float4_quantize::float4_to_uint)'s RGBA
+//! branch *here*: both call `Float4ToRGBA16(float4 i, uint dither, bool
+//! usesHDR)`, whose full-`float4`+HDR signature `rgb_dither::
 //! quantize_post_float_rgba16_non_hdr` does not provide (it only accepts
 //! already-`u8` channels, a precomputed `CoverageModulo8`, and declines the
 //! `usesHDR == true` branch entirely -- see its own "Frontier" doc,
 //! `rgb_dither.rs:280-322`). Closing that frontier is a separate, larger
-//! slice and is not attempted here. This module does not claim the
+//! slice and is not attempted here. Read that as a refusal by *this*
+//! module, not as a claim the crate lacks the symbols: both functions,
+//! RGBA branch included, are fully ported in `rt64_float4_quantize.rs`,
+//! which does provide `usesHDR` handling for that branch. This module does not claim the
 //! `rt64-port-m4-src-shaders-fbcommon-hlsli` task card in
 //! `docs/rt64-port-inventory.json` is complete (5 of 7 named functions land;
 //! 2 do not). It does not claim GPU, WGSL-pipeline, TMEM-wiring, combiner,
