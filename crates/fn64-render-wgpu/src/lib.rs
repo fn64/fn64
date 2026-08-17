@@ -372,6 +372,7 @@ mod rt64_preset_light;
 mod rt64_preset_material;
 mod rt64_preset_scene;
 mod rt64_profiling_timer;
+mod rt64_rdp_state;
 mod rt64_render_flags;
 mod rt64_render_pipeline_types;
 mod rt64_render_target_geometry;
