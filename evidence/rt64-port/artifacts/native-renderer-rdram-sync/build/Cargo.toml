@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fn64-runtime",
+    "crates/fn64-abi",
+    "crates/fn64-boot-harness",
+    "crates/fn64-shell",
+    "crates/fn64-render-ir",
+    "crates/fn64-render-conformance",
+    "crates/fn64-render",
+    "crates/fn64-render-reference",
+    "crates/fn64-render-rt64",
+    "crates/fn64-render-wgpu",
+    "crates/fn64-certification",
+    "crates/fn64-audio",
+    "crates/fn64-recomp",
+    "crates/fn64-cpu-runtime",
+    "crates/fn64-cpu-runtime-codegen",
+    "crates/fn64-diff",
+    "crates/fn64-discover",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fn64/fn64"
+
+[profile.dev]
+# Recompiled MIPS call graphs are deep and this is a scheduler/queue-heavy
+# workload; keep debug builds usable without opting every contributor into
+# release-only iteration.
+opt-level = 1
+# Line tables instead of full debug info. Backtraces keep file and line
+# numbers -- what CI failures and gate output actually need -- while variable
+# inspection under a debugger is lost. Measured cost of the default: this
+# workspace's `target/debug` reached 155 GB against 1.5 GB for `target/release`,
+# a 100x ratio, because `fn64-discover` alone declares 46 bin targets and each
+# links its own copy of the workspace rlibs with full debug info (623,440 files
+# under `target/debug/deps`). Set `debug = 2` locally when stepping through a
+# debugger.
+debug = 1
+# Keep debug info in separate .dSYM-style artifacts rather than inlined in
+# every binary. On macOS this is the difference between each of those 46
+# binaries carrying its own copy and them referencing one.
+split-debuginfo = "unpacked"

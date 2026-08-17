@@ -885,6 +885,7 @@ version = "0.0.0"
 dependencies = [
  "fn64-render",
  "fn64-render-ir",
+ "fn64-render-reference",
  "fn64-render-rt64",
  "fn64-runtime",
  "libc",
