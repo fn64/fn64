@@ -1,7 +1,15 @@
 //! `EndianSwapUINT16`/`EndianSwapUINT32`/`EndianSwapUINT`: a literal port of
 //! the permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
-//! `src/shaders/FbCommon.hlsli:9-33`:
+//! `src/shaders/FbCommon.hlsli:9-33` (SHA-256 of the whole file,
+//! `6ffa6f2d3e2cbb9ce92943ef9965ddefff0e5f4a4c936130308fbed646fc3591`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! path -- which for this file is identical to its `sources.oracle.sha256`,
+//! so the digest is simultaneously the oracle and port digest, confirmed
+//! independently here by `shasum -a 256` against the pinned port-commit
+//! checkout. The digest names the whole file; this module ports only its
+//! three endian-swap primitives, with the sibling `fbcommon.rs` porting five
+//! more of the file's ten functions -- see "Nonclaims" below):
 //!
 //! ```text
 //! uint EndianSwapUINT16(uint i) {

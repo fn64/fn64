@@ -2,10 +2,17 @@
 //!
 //! Characterization-first port. Source: MIT RT64, pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`'s
-//! Rust-port source pin), `src/shared/rt64_color_combiner.h` (fn64's own
+//! Rust-port source pin), `src/shared/rt64_color_combiner.h` (SHA-256 of the
+//! whole file,
+//! `bc116cd9d8a86ca74ebb8f3294fa48bc9e605c0eec53bcac5e07503dfd668b02`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! path, confirmed independently here by `shasum -a 256` against the pinned
+//! port-commit checkout; fn64's own
 //! `docs/RT64-PORT-INVENTORY.md:291` records this file `unchanged` /
-//! `source-digests-verified` against the executable-comparison oracle, so
-//! unlike `rt64_state.cpp` there is no drift caveat here).
+//! `source-digests-verified` against the executable-comparison oracle -- the
+//! `unchanged` delta is exactly the statement that this digest is also the
+//! file's `sources.oracle.sha256`, so unlike `rt64_state.cpp` there is no
+//! drift caveat here).
 //!
 //! Decode is exact and complete for every wire-legal `(slot, index,
 //! second_cycle)` triple: [`CombineParams::decode_color`]/[`decode_alpha`]
