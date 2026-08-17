@@ -606,6 +606,15 @@ struct PlanCollector {
     /// `RdpFillRectangleCommand`), so nothing needs to be tracked across
     /// the walk for it.
     fills: Vec<(u32, fn64_render::RdpFillRectangleCommand)>,
+    /// One entry per admitted `FullSync` site, in plan order, paired with
+    /// its own decode-order command index.
+    ///
+    /// Collected for accounting only -- this backend performs no GPU work
+    /// for a sync and schedules no DP completion (the device fabric does
+    /// that, from the ABI seam). Retaining the site keeps the executed plan
+    /// able to account for every command it carried instead of silently
+    /// losing one.
+    full_sync_sites: Vec<(u32, fn64_render::RdpFullSyncSite)>,
 }
 
 impl PlanCollector {
@@ -640,6 +649,7 @@ impl PlanCollector {
             current_fog_color: fog_color,
             triangles: Vec::new(),
             fills: Vec::new(),
+            full_sync_sites: Vec::new(),
         }
     }
 }
@@ -753,6 +763,23 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
             // rather than failing to compile.
             RawDpcSemanticCommandRef::FillRectangle(fill) => {
                 self.fills.push((command_index, fill.clone()));
+            }
+            // Mandatory alongside `push_full_sync_site`'s admission, for the
+            // same `#[non_exhaustive]` reason as the arm above.
+            //
+            // Collected, not executed. A `SYNC_FULL` site has no GPU work:
+            // its whole effect is on the RDP pipeline and the DP interrupt
+            // line, and the DP completion is scheduled by the device fabric
+            // (`start_dp_full_sync`, driven from the ABI seam), never by this
+            // backend. Dropping it silently would be wrong in the other
+            // direction, though -- the site is retained so the executed plan
+            // still accounts for every command the plan carried.
+            //
+            // Nonclaim: retaining a site here is not an observation of a DP
+            // interrupt. `site.boundary.interrupt_after()` is the only field
+            // that could carry one, and this backend never writes it.
+            RawDpcSemanticCommandRef::FullSyncSite(site) => {
+                self.full_sync_sites.push((command_index, site.clone()));
             }
             other => unreachable!(
                 "RawDpcSemanticCommandRef gained a variant WgpuBackend does not know about: \
@@ -1185,12 +1212,20 @@ impl RenderBackend for WgpuBackend {
         &[]
     }
 
-    /// Returned unconditionally, never varying with whether a fill has yet
-    /// been admitted: a capability is a statement about what this backend
-    /// *will* admit, not about what it has admitted, and a value that
-    /// changes under the caller is worse than a wider constant one.
+    /// Returned unconditionally, never varying with whether a fill or a
+    /// FullSync site has yet been admitted: a capability is a statement about
+    /// what this backend *will* admit, not about what it has admitted, and a
+    /// value that changes under the caller is worse than a wider constant
+    /// one.
+    ///
+    /// Nonclaim: the `SiteOnly` half of this variant's name is load-bearing.
+    /// This backend decodes a `SYNC_FULL` opcode and binds it to the
+    /// capture's boundary; it does not observe a DP interrupt and does not
+    /// claim the guest did. See `RawDpcIrCapability`'s own doc for why that
+    /// distinction cannot be recovered from the capability value alone and
+    /// lives in the supplied `FullSyncBoundary` instead.
     fn raw_dpc_ir_capability(&self) -> RawDpcIrCapability {
-        RawDpcIrCapability::TransactionalTmemFillNoFullSync
+        RawDpcIrCapability::TransactionalTmemFillFullSyncSiteOnly
     }
 
     fn plan_raw_dpc(
@@ -1332,6 +1367,7 @@ fn plan_raw_dpc_inner(
         capture.transaction_sequence(),
         submission.clone(),
         capture.cmd_end(),
+        capture.full_sync_boundaries().to_vec(),
         probe_journal,
     )
     .map_err(|error| format!("raw-DPC plan probe preflight failed: {error}"))?;
@@ -1369,6 +1405,7 @@ fn plan_raw_dpc_inner(
         capture.transaction_sequence(),
         submission,
         capture.cmd_end(),
+        capture.full_sync_boundaries().to_vec(),
         journal.clone(),
     )
     .map_err(|error| format!("raw-DPC plan preflight failed: {error}"))?;
@@ -1412,11 +1449,19 @@ fn submit_locally(decoded: DecodedTicket) -> Result<SubmittedTicket, ValidationE
 /// own access-count/order check (and, for the probe, the deliberate
 /// `JournalMismatch` this function is built to catch) never inspects read
 /// content, only shape.
+///
+/// `full_sync_boundaries` is NOT zero-filled the way the read bytes are, and
+/// must be the originating capture's own list. Stream derivation requires one
+/// boundary per decoded `SYNC_FULL` opcode, so an empty list here would fail
+/// both internal decode passes with `MissingFullSyncObservation` for any
+/// capture containing a FullSync -- making the site unplannable no matter
+/// what its producer supplied. Shape, unlike content, is load-bearing here.
 fn finalize_with_zero_reads(
     layout: fn64_render_ir::PhysicalMemoryLayout,
     transaction_sequence: u64,
     submission: fn64_render::OwnedRawDpcSubmission,
     cmd_end: fn64_render_ir::TemporalBoundary,
+    full_sync_boundaries: Vec<fn64_render_ir::FullSyncBoundary>,
     journal: ResourceJournal,
 ) -> Result<DecodedTicket, ValidationError> {
     let preflight = fn64_render::preflight_raw_dpc_capture(
@@ -1424,7 +1469,7 @@ fn finalize_with_zero_reads(
         transaction_sequence,
         submission,
         cmd_end,
-        Vec::new(),
+        full_sync_boundaries,
         journal,
     )?;
     let capture = fn64_render_ir::DeferredGuestReadCapture::new(
@@ -2171,6 +2216,39 @@ mod tests {
             layout,
             7,
             TemporalBoundary::new(1, DpInterruptState::Clear),
+        )
+    }
+
+    /// Same fixture shape as `capture`, but carrying one `FullSyncBoundary`
+    /// per `SYNC_FULL` opcode in `words` -- what a producer that took the
+    /// nonmutating `preflight_dp_full_sync` reserve half supplies.
+    ///
+    /// Both interrupt states are `Clear`. That mirrors the real ABI producer
+    /// exactly: a reservation observes no interrupt, and the device fabric
+    /// raises the DP line only on a later `advance_to`, strictly after this
+    /// capture would have been built.
+    fn full_sync_capture(words: Vec<u32>) -> fn64_render::OwnedRawDpcCapture {
+        let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let end = COMMAND_START + u32::try_from(words.len() * 4).unwrap();
+        let sites = fn64_render::count_raw_rdp_full_sync_sites(&words).unwrap();
+        let submission =
+            OwnedRawDpcSubmission::from_rdram_words(COMMAND_START, end, words.clone()).unwrap();
+        let boundaries = (0..sites as u64)
+            .map(|ordinal| {
+                fn64_render_ir::FullSyncBoundary::new(
+                    2 + ordinal * 2,
+                    3 + ordinal * 2,
+                    DpInterruptState::Clear,
+                    DpInterruptState::Clear,
+                )
+            })
+            .collect();
+        fn64_render::OwnedRawDpcCapture::with_full_sync_boundaries(
+            submission,
+            layout,
+            7,
+            TemporalBoundary::new(1, DpInterruptState::Clear),
+            boundaries,
         )
     }
 
@@ -3928,17 +4006,18 @@ mod tests {
         );
     }
 
-    /// Positive: `raw_dpc_ir_capability` reports the real TMEM-plus-fill
-    /// capability, not the trait's `Unsupported` default and not the older
-    /// TMEM-only value -- a caller must be able to tell this backend apart
-    /// both from a non-raw-DPC-capable one and from one that admits no
-    /// guest-visible write at all, without attempting a submission.
+    /// Positive: `raw_dpc_ir_capability` reports the real TMEM-plus-fill-
+    /// plus-FullSync-site capability, not the trait's `Unsupported` default
+    /// and not either older value -- a caller must be able to tell this
+    /// backend apart from a non-raw-DPC-capable one, from one that admits no
+    /// guest-visible write, and from one that rejects every FullSync,
+    /// without attempting a submission.
     #[test]
-    fn raw_dpc_ir_capability_reports_transactional_tmem_fill_no_full_sync() {
+    fn raw_dpc_ir_capability_reports_transactional_tmem_fill_full_sync_site_only() {
         let (backend, _session) = WgpuBackend::try_new().unwrap();
         assert_eq!(
             backend.raw_dpc_ir_capability(),
-            RawDpcIrCapability::TransactionalTmemFillNoFullSync
+            RawDpcIrCapability::TransactionalTmemFillFullSyncSiteOnly
         );
         assert_ne!(
             backend.raw_dpc_ir_capability(),
@@ -3946,22 +4025,56 @@ mod tests {
             "the older TMEM-only value would tell a caller this backend declares zero \
              guest-visible writes, which is no longer true"
         );
+        assert_ne!(
+            backend.raw_dpc_ir_capability(),
+            RawDpcIrCapability::TransactionalTmemFillNoFullSync,
+            "the fill-only value would tell a caller this backend rejects every FullSync, \
+             which is no longer true"
+        );
     }
 
-    /// Hostile: T1's push loop rejects any command outside the admitted
-    /// TMEM/state subset -- `plan_raw_dpc` must surface that as a loud
-    /// `RenderError`, never a silently truncated plan.
+    /// Hostile: a FullSync whose capture carries no boundary record -- a
+    /// producer that never took the reserve half -- must be surfaced as a
+    /// loud `RenderError`, never a silently truncated plan and never an
+    /// admitted site.
     #[test]
-    fn plan_raw_dpc_rejects_a_full_sync_command_loudly() {
+    fn plan_raw_dpc_rejects_an_unreserved_full_sync_command_loudly() {
         let (mut backend, session) = WgpuBackend::try_new().unwrap();
         let mut words = one_load_block_words();
         words.extend([word(FULL_SYNC, 0), 0]);
 
+        // `capture` builds through `OwnedRawDpcCapture::new`, so its boundary
+        // list is empty.
         let request = session.plan_request(capture(words));
         let result = backend.plan_raw_dpc(request);
         assert!(
             result.is_err(),
-            "FullSync must be rejected, not silently admitted into the plan"
+            "an unreserved FullSync must be rejected, not silently admitted into the plan"
+        );
+    }
+
+    /// Positive: the same stream, with the boundary record a reserving
+    /// producer supplies, plans cleanly -- FullSync is no longer blanket-
+    /// rejected at the production seam.
+    ///
+    /// The boundary supplied here is exactly what
+    /// `try_dispatch_raw_dpc_via_session` supplies in production: both
+    /// interrupt states `Clear`, because reserving the DP completion slot
+    /// observes no interrupt. This test therefore also pins the nonclaim --
+    /// admission does not require, and does not produce, an `Asserted`
+    /// value.
+    #[test]
+    fn plan_raw_dpc_admits_a_reserved_full_sync_site() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let mut words = one_load_block_words();
+        words.extend([word(FULL_SYNC, 0), 0]);
+
+        let request = session.plan_request(full_sync_capture(words));
+        let planned = backend.plan_raw_dpc(request);
+        assert!(
+            planned.is_ok(),
+            "a FullSync site whose capture carries its boundary must plan cleanly: {:?}",
+            planned.err()
         );
     }
 
@@ -5084,6 +5197,7 @@ mod tests {
             capture.transaction_sequence(),
             submission.clone(),
             capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
             probe_journal,
         )
         .unwrap();
