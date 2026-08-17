@@ -376,6 +376,7 @@ mod rt64_texture_map_lru;
 mod rt64_texture_sampler;
 mod rt64_tmem_hasher;
 mod rt64_tmem_regions;
+mod rt64_upload_geometry;
 mod rt64_user_configuration;
 mod shader_manifest;
 mod state;
