@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 27 `ported`, 238 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 28 `ported`, 237 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -44,7 +44,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 
 | source | delta | port state | ported as | lines | hints | deps | milestone / workstream | source evidence | task evidence / claim | owner | card |
 |---|---|---|---|---:|---:|---:|---|---|---|---|---|
-| `include/rt64_extended_gbi.h` | `unchanged` | `not-started` | -- | 582 | 0 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-include-rt64-extended-gbi-h` |
+| `include/rt64_extended_gbi.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_extended_gbi.rs` | 582 | 0 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-include-rt64-extended-gbi-h` |
 | `src/apple/rt64_apple.h` | `unchanged` | `not-started` | -- | 7 | 0 | 0 | `M10` / `platform-cutover` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (P/high) | `rt64-port-m10-src-apple-rt64-apple-h` |
 | `src/apple/rt64_apple.mm` | `unchanged` | `not-started` | -- | 8 | 1 | 1 | `M10` / `platform-cutover` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (P/high) | `rt64-port-m10-src-apple-rt64-apple-mm` |
 | `src/common/rt64_common.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_common.rs` | 153 | 20 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-common-cpp` |
@@ -66,8 +66,8 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/common/rt64_load_types.h` | `unchanged` | `not-started` | -- | 102 | 8 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-load-types-h` |
 | `src/common/rt64_mapped_file.cpp` | `unchanged` | `not-started` | -- | 129 | 5 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-mapped-file-cpp` |
 | `src/common/rt64_mapped_file.h` | `unchanged` | `not-started` | -- | 36 | 1 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-mapped-file-h` |
-| `src/common/rt64_math.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_math.rs`, `crates/fn64-render-wgpu/src/rt64_math_matrix.rs` | 492 | 30 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-math-cpp` |
-| `src/common/rt64_math.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_math.rs`, `crates/fn64-render-wgpu/src/rt64_math_matrix.rs` | 58 | 2 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-math-h` |
+| `src/common/rt64_math.cpp` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_math.rs`, `crates/fn64-render-wgpu/src/rt64_math_decompose.rs`, `crates/fn64-render-wgpu/src/rt64_math_matrix.rs` | 492 | 30 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-math-cpp` |
+| `src/common/rt64_math.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_math.rs`, `crates/fn64-render-wgpu/src/rt64_math_decompose.rs`, `crates/fn64-render-wgpu/src/rt64_math_matrix.rs` | 58 | 2 | 1 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-math-h` |
 | `src/common/rt64_plume.h` | `unchanged` | `not-started` | -- | 5 | 0 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-common-rt64-plume-h` |
 | `src/common/rt64_profiling_timer.cpp` | `unchanged` | `not-started` | -- | 88 | 12 | 1 | `M6` / `performance-spine` | `source-digests-verified` | `not-run` / `candidate-observation` | `integration-performance` (I/high) | `rt64-port-m6-src-common-rt64-profiling-timer-cpp` |
 | `src/common/rt64_profiling_timer.h` | `unchanged` | `not-started` | -- | 35 | 1 | 1 | `M6` / `performance-spine` | `source-digests-verified` | `not-run` / `candidate-observation` | `integration-performance` (I/high) | `rt64-port-m6-src-common-rt64-profiling-timer-h` |
