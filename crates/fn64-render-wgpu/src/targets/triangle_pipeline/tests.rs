@@ -86,6 +86,12 @@ fn covering_triangle_fixture() -> TriangleFixture {
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
         blend_color: None,
+        // (Z_CMP, Z_UPD) = (set, set): the pipeline's prior sole state
+        // (`depth_pipeline_index((true, true)) == 0`, `Less`/write-always)
+        // -- this base fixture is the regression-guard default every
+        // existing depth test reuses unmodified.
+        depth_compare_enabled: true,
+        depth_update_enabled: true,
     }
 }
 
@@ -160,6 +166,85 @@ fn shade_passthrough_combine_params_reduce_to_the_shade_color() {
     assert!((mixed[0] - 0.25).abs() < 1e-6);
     assert!((mixed[1] - 0.5).abs() < 1e-6);
     assert!((mixed[2] - 0.75).abs() < 1e-6);
+}
+
+/// Exact four-row truth table (production depth-slice task card §3,
+/// `depth_pipeline_index`'s own doc table) -- every `(Z_CMP, Z_UPD)`
+/// combination maps to a distinct index 0-3, and index 0 is the pipeline's
+/// prior sole `(true, true)` state.
+#[test]
+fn depth_pipeline_index_matches_the_exact_four_row_truth_table() {
+    assert_eq!(depth_pipeline_index(true, true), 0);
+    assert_eq!(depth_pipeline_index(true, false), 1);
+    assert_eq!(depth_pipeline_index(false, true), 2);
+    assert_eq!(depth_pipeline_index(false, false), 3);
+}
+
+/// [`DEPTH_STENCIL_VARIANTS`] is the single source of truth `request()`
+/// builds pipelines from and [`depth_pipeline_index`] indexes into -- this
+/// proves the two cannot silently drift apart: each index's stored
+/// `(depth_compare, depth_write_enabled)` pair matches the task card's table
+/// exactly, keyed by the same `(Z_CMP, Z_UPD)` inputs `depth_pipeline_index`
+/// consumes.
+#[test]
+fn depth_stencil_variants_table_matches_depth_pipeline_index_for_every_combination() {
+    for (depth_compare_enabled, depth_update_enabled) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let index = depth_pipeline_index(depth_compare_enabled, depth_update_enabled);
+        let (depth_compare, depth_write_enabled) = DEPTH_STENCIL_VARIANTS[index];
+        let expected_compare = if depth_compare_enabled {
+            wgpu::CompareFunction::Less
+        } else {
+            wgpu::CompareFunction::Always
+        };
+        assert_eq!(
+            depth_compare, expected_compare,
+            "(Z_CMP={depth_compare_enabled}, Z_UPD={depth_update_enabled}) at index {index}"
+        );
+        assert_eq!(
+            depth_write_enabled, depth_update_enabled,
+            "(Z_CMP={depth_compare_enabled}, Z_UPD={depth_update_enabled}) at index {index}"
+        );
+    }
+}
+
+/// `DEPTH_STENCIL_VARIANTS` has exactly one entry per `depth_pipeline_index`
+/// output value (0-3, no duplicates, no gaps) -- guards against a future
+/// edit silently aliasing two `(Z_CMP, Z_UPD)` combinations onto the same
+/// pipeline variant.
+#[test]
+fn depth_pipeline_index_is_a_bijection_onto_the_four_variant_indices() {
+    let mut seen = [false; 4];
+    for depth_compare_enabled in [true, false] {
+        for depth_update_enabled in [true, false] {
+            let index = depth_pipeline_index(depth_compare_enabled, depth_update_enabled);
+            assert!(
+                !seen[index],
+                "index {index} produced by more than one (Z_CMP, Z_UPD) combination"
+            );
+            seen[index] = true;
+        }
+    }
+    assert_eq!(seen, [true; 4]);
+}
+
+/// `submit_admitted_triangle`'s doc claims `other_mode.depth_compare_enabled()`/
+/// `depth_update_enabled()` feed the fixture's two depth fields verbatim, no
+/// arithmetic -- this proves that claim independently of any device, for
+/// every one of the four wire combinations.
+#[test]
+fn other_mode_depth_bits_map_onto_triangle_fixture_fields_verbatim() {
+    for (low, expected_compare, expected_update) in [
+        (0x0000u32, false, false),
+        (0x0010u32, true, false),
+        (0x0020u32, false, true),
+        (0x0030u32, true, true),
+    ] {
+        let mode = crate::state::OtherMode::from_wire(0, low);
+        assert_eq!(mode.depth_compare_enabled(), expected_compare);
+        assert_eq!(mode.depth_update_enabled(), expected_update);
+    }
 }
 
 #[test]
@@ -521,6 +606,8 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
         blend_color: None,
+        depth_compare_enabled: true,
+        depth_update_enabled: true,
     };
     assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
     assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
@@ -683,6 +770,28 @@ mod host_gpu_tests {
         fixture
     }
 
+    /// Uniform-magenta variant of [`uniform_yellow_at`] at a caller-chosen
+    /// depth AND `(Z_CMP, Z_UPD)` pair -- the fixture shape the `Z_CMP`/
+    /// `Z_UPD` pipeline-variant differential (production depth-slice task
+    /// card §"Fixtures") needs: a third, visually distinct color from both
+    /// `covering_triangle_fixture`'s red/green/blue and `uniform_yellow_at`'s
+    /// yellow, so a three-draw same-target test can tell all three draws'
+    /// contributions apart by color alone.
+    fn uniform_magenta_at(
+        z: f32,
+        depth_compare_enabled: bool,
+        depth_update_enabled: bool,
+    ) -> TriangleFixture {
+        let mut fixture = covering_triangle_fixture();
+        for vertex in &mut fixture.vertices {
+            vertex.position[2] = z;
+            vertex.color = [1.0, 0.0, 1.0, 1.0];
+        }
+        fixture.depth_compare_enabled = depth_compare_enabled;
+        fixture.depth_update_enabled = depth_update_enabled;
+        fixture
+    }
+
     /// Second-triangle depth-reject case (port card §6: "at least one pass
     /// case and one reject case", "assert the real GPU depth-test outcome...
     /// matches `depth_strict_less.rs`'s oracle"). Both draws go through
@@ -782,6 +891,223 @@ mod host_gpu_tests {
             assert!(
                 (observed_depth - 0.25).abs() < 1e-3,
                 "depth at ({x},{y}) = {observed_depth}, expected ~0.25 (nearer draw must have won)"
+            );
+        }
+    }
+
+    /// Regression guard (production depth-slice task card §"Fixtures" item
+    /// 4): the default/`(Z_CMP=set, Z_UPD=set)` pipeline variant (index 0,
+    /// [`depth_pipeline_index`]) must be bit-identical to the pipeline's
+    /// prior sole state -- re-runs the exact reject/accept assertions above,
+    /// but with both fixtures' depth fields set explicitly rather than
+    /// relying on `covering_triangle_fixture`'s/`uniform_yellow_at`'s
+    /// defaults, proving the new four-variant selection path reduces to the
+    /// old single-pipeline behavior for this combination, not merely that
+    /// the default happens to match.
+    #[test]
+    fn required_host_depth_test_both_set_reduces_to_the_prior_less_write_always_pipeline() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        let mut nearer = covering_triangle_fixture(); // z=0.5, red/green/blue
+        nearer.depth_compare_enabled = true;
+        nearer.depth_update_enabled = true;
+        let mut farther = uniform_yellow_at(0.75);
+        farther.depth_compare_enabled = true;
+        farther.depth_update_enabled = true;
+
+        let output = renderer
+            .submit_triangles(&[nearer, farther])
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        // Farther draw must still be rejected: identical outcome to
+        // `required_host_depth_test_rejects_a_farther_second_triangle_in_the_same_target`.
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            let observed_color = rgba8_at(&output, x, y);
+            assert_ne!(
+                observed_color,
+                [255, 255, 0, 255],
+                "yellow leaked through at ({x},{y})"
+            );
+            let observed_depth = depth_at(&output, x, y);
+            assert!(
+                (observed_depth - 0.5).abs() < 1e-3,
+                "depth at ({x},{y}) = {observed_depth}, expected ~0.5 (farther draw must not have written)"
+            );
+        }
+    }
+
+    /// `Z_CMP` clear (production depth-slice task card §"Fixtures" item 1):
+    /// a farther second triangle (z=0.75, magenta) with `Z_CMP` clear draws
+    /// OVER a nearer already-committed first triangle (z=0.5, red/green/
+    /// blue) -- `depth_compare_enabled: false` selects the `Always`-compare
+    /// pipeline variant (index 2, [`depth_pipeline_index`]), so the real GPU
+    /// depth test never rejects regardless of the committed z=0.5, proving
+    /// the reject behavior of the `(set, set)` control case above no longer
+    /// happens once `Z_CMP` is cleared.
+    #[test]
+    fn required_host_depth_test_z_cmp_clear_lets_a_farther_second_triangle_draw_over_the_first() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        let nearer = covering_triangle_fixture(); // z=0.5, red/green/blue, (Z_CMP, Z_UPD) = (true, true)
+        let farther = uniform_magenta_at(0.75, false, true); // Z_CMP clear, Z_UPD set
+
+        let output = renderer
+            .submit_triangles(&[nearer, farther])
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            assert_close_rgba8(rgba8_at(&output, x, y), [255, 0, 255, 255], 2);
+            let observed_depth = depth_at(&output, x, y);
+            assert!(
+                (observed_depth - 0.75).abs() < 1e-3,
+                "depth at ({x},{y}) = {observed_depth}, expected ~0.75 (Z_CMP clear must have let \
+                 the farther draw win and write, since Z_UPD is set here)"
+            );
+        }
+    }
+
+    /// `Z_UPD` clear, three-draw fixture (production depth-slice task card
+    /// §"Fixtures" item 2): a nearer second triangle (z=0.25, magenta) with
+    /// `Z_UPD` clear passes its OWN depth test against the first (committed
+    /// z=0.5) and writes its color, but `depth_update_enabled: false`
+    /// selects the write-disabled pipeline variant (index 1,
+    /// [`depth_pipeline_index`]), so it must NOT overwrite the depth buffer
+    /// -- proven by a third triangle (z=0.5, yellow) drawn after it in the
+    /// SAME submission: if the second draw's depth write were wrongly
+    /// applied, the depth buffer would read ~0.25 and the third (z=0.5)
+    /// triangle would be rejected as farther; since it must not have
+    /// written, the buffer still reads the first draw's committed ~0.5, so
+    /// the third triangle's own `(Z_CMP=true)` default test against that
+    /// still-0.5 depth is `Reject` (0.5 is not `Less` than 0.5), leaving the
+    /// second (magenta) draw's color on screen, not the third (yellow)
+    /// draw's.
+    #[test]
+    fn required_host_depth_test_z_upd_clear_does_not_write_depth_for_a_third_draw() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        let first = covering_triangle_fixture(); // z=0.5, red/green/blue, (Z_CMP, Z_UPD) = (true, true)
+        let second = uniform_magenta_at(0.25, true, false); // nearer, Z_CMP set, Z_UPD clear
+        let third = uniform_yellow_at(0.5); // (Z_CMP, Z_UPD) = (true, true) default
+
+        assert_eq!(
+            strict_less_depth_test(StrictLessDepthSample::new(0.25, 0.5)),
+            StrictLessDepthOutcome::Pass
+        );
+        assert_eq!(
+            strict_less_depth_test(StrictLessDepthSample::new(0.5, 0.5)),
+            StrictLessDepthOutcome::Reject
+        );
+
+        let output = renderer
+            .submit_triangles(&[first, second, third])
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            // Second (magenta) draw's color must still be on screen: it won
+            // its own test against the first draw, and the third (yellow)
+            // draw must have been rejected against the still-unwritten
+            // ~0.5 depth, not the magenta draw's ~0.25.
+            assert_close_rgba8(rgba8_at(&output, x, y), [255, 0, 255, 255], 2);
+            assert_ne!(
+                rgba8_at(&output, x, y),
+                [255, 255, 0, 255],
+                "yellow (third draw) leaked through at ({x},{y}) -- implies Z_UPD clear wrongly \
+                 wrote depth, letting the third draw's z=0.5 pass against a stale ~0.25"
+            );
+            let observed_depth = depth_at(&output, x, y);
+            assert!(
+                (observed_depth - 0.5).abs() < 1e-3,
+                "depth at ({x},{y}) = {observed_depth}, expected ~0.5 (Z_UPD clear on the second \
+                 draw must have left the first draw's depth untouched)"
+            );
+        }
+    }
+
+    /// Both clear, combining items 1 and 2 (production depth-slice task
+    /// card §"Fixtures" item 3): a farther second triangle (z=0.75, magenta)
+    /// with BOTH `Z_CMP` and `Z_UPD` clear draws over the first (proving no
+    /// reject, matching item 1) AND does not write depth for a third
+    /// triangle drawn after it (proving no write, matching item 2) --
+    /// `depth_compare_enabled: false, depth_update_enabled: false` selects
+    /// index 3, [`depth_pipeline_index`].
+    #[test]
+    fn required_host_depth_test_both_clear_draws_over_the_first_and_does_not_write_depth() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        let first = covering_triangle_fixture(); // z=0.5, red/green/blue, (Z_CMP, Z_UPD) = (true, true)
+        let second = uniform_magenta_at(0.75, false, false); // farther, both clear
+        let third = uniform_yellow_at(0.5); // (Z_CMP, Z_UPD) = (true, true) default
+
+        let output = renderer
+            .submit_triangles(&[first, second, third])
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        for (x, y) in [(0, 0), (1, 1), (4, 1)] {
+            // The third (yellow) draw must win: it tests its own z=0.5
+            // against the still-committed ~0.5 from the first draw (Reject
+            // under strict-less since 0.5 is not < 0.5) only if the second
+            // draw's write were wrongly applied at ~0.75 or ~0.5 -- but
+            // since Z_CMP was clear on the second draw, the third draw's
+            // fixed-function Less test is unaffected either way; the
+            // decisive assertion is that depth must read ~0.5 (unwritten by
+            // the second draw), and thus the third draw at exactly the same
+            // z=0.5 is `Reject`, so the second (magenta) draw's color must
+            // be the final one on screen, not the third (yellow) draw's.
+            assert_close_rgba8(rgba8_at(&output, x, y), [255, 0, 255, 255], 2);
+            assert_ne!(
+                rgba8_at(&output, x, y),
+                [255, 255, 0, 255],
+                "yellow (third draw) leaked through at ({x},{y})"
+            );
+            let observed_depth = depth_at(&output, x, y);
+            assert!(
+                (observed_depth - 0.5).abs() < 1e-3,
+                "depth at ({x},{y}) = {observed_depth}, expected ~0.5 (both-clear second draw \
+                 must not have written depth, leaving the first draw's ~0.5 intact)"
             );
         }
     }
