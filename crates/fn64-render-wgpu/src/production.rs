@@ -2151,7 +2151,7 @@ mod tests {
             [0, 0, 0, 0],
             "pixel (2,2) is inside [2,6)x[2,6) and must be covered by the real rectangle position"
         );
-        let outside_pixel_index = (0 * width + 0) as usize * 4;
+        let outside_pixel_index = 0usize;
         let outside = [
             output.color_rgba8[outside_pixel_index],
             output.color_rgba8[outside_pixel_index + 1],
@@ -2244,7 +2244,7 @@ mod tests {
             [0, 0, 0, 0],
             "flip must not change the rectangle's covered pixel range"
         );
-        let outside_pixel_index = (0 * width + 0) as usize * 4;
+        let outside_pixel_index = 0usize;
         let outside = [
             output.color_rgba8[outside_pixel_index],
             output.color_rgba8[outside_pixel_index + 1],
