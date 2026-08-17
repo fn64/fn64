@@ -231,12 +231,24 @@
 //!   (see "New owned types" above) rather than reaching into any sibling's
 //!   private surface.
 //!
+//! ## Scope status
+//!
+//! **Complete for its stated scope.** All four named functions are ported
+//! and tested: `computeScaledSize`, `computeFixedResolutionScale`, the
+//! pillarbox/letterbox viewport+scissor derivation carved out of
+//! `copyFromChanges`, and `viewportScissorIntersection`. This module is not
+//! waiting on any other card; the list below is what the card declined,
+//! essentially all of it RHI/RenderWorker plumbing.
+//!
 //! ## Nonclaims
 //!
 //! No GPU, WGSL, or production wiring (this module is not called from
 //! anywhere yet; dead-code warnings on the unused public surface are
 //! expected and correct), and no RT64 visual/pixel/silicon parity or
-//! performance claim. Deliberately not ported from these two source files:
+//! performance claim. "Complete for its stated scope" claims the four
+//! functions and their tests, not runtime correctness against RT64 and not
+//! admission to any production path. Deliberately not ported from these two
+//! source files (scope decisions, not pending prerequisites):
 //!
 //! - Everything else in `rt64_render_target.cpp` (515 lines total): the
 //!   `RenderTarget` constructor, `clearColorTarget`/`clearDepthTarget`,

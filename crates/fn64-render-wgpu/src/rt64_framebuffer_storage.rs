@@ -222,13 +222,23 @@
 //!   division ported here is `(rdramUsed * 3) / 2`, whose divisor `2` is a
 //!   compile-time constant, never a runtime or caller-controlled value.
 //!
+//! ## Scope status
+//!
+//! **Complete for its stated scope.** Both source files are ported whole:
+//! every member of `FramebufferStorage` (the constructor, `reset`, `store`,
+//! `get`, `getRDRAM`) and the `Handle` record, with the growth policy,
+//! comparison strictness, and last-handle-wins lookup covered by this
+//! module's own tests. This module is not waiting on any other card.
+//!
 //! ## Nonclaims
 //!
 //! No GPU, RHI, or production wiring (this module is not called from
 //! anywhere yet and is not registered on any public crate surface beyond its
 //! own `mod` declaration; dead-code warnings on its unused public surface are
 //! expected and correct), and no RT64 visual/pixel/silicon parity or
-//! performance claim. `getRDRAM`'s C++ `assert` is release-mode-stripped
+//! performance claim. "Complete for its stated scope" claims the port and
+//! its tests, not runtime correctness against RT64 and not admission to any
+//! production path. `getRDRAM`'s C++ `assert` is release-mode-stripped
 //! (`NDEBUG`) bounds checking, not a production guarantee; this port mirrors
 //! that with `debug_assert!` rather than inventing a `Result`-returning or
 //! panicking-in-release API the source does not have.
