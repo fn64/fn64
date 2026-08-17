@@ -97,13 +97,14 @@ PORT_STATES = {"ported", "not-started", "refused", "authority-gated"}
 # does NOT do is widen to a partial or behavioral claim -- `refused` says only
 # "an assessment settled this file", never "this file is done".
 #
-# Scope is closed at the five landed batch assessments. Every entry below is
-# one of the 17 `src/common`, 28 `src/render`, or 18 `src/hle` sources those
-# assessments refused (6 from the geometry batch, 10 from the VI-registers
-# batch, 2 from the workload-geometry batch); nothing else may be added
-# without a new landed assessment. (The `src/gui`/`src/imgui` cluster has no
-# landed assessment as of this scope; see tools/rt64_port_inventory.py history
-# -- it is deliberately absent, not an oversight.)
+# Scope is closed at the six landed batch assessments. Every entry below is
+# one of the 17 `src/common`, 28 `src/render`, 18 `src/hle`, or 8
+# `src/gui`/`src/imgui` sources those assessments refused (6 from the
+# geometry batch, 10 from the VI-registers batch, 2 from the
+# workload-geometry batch, 8 of the 10 the GUI batch refused --
+# rt64_camera_controller.h and rt64_file_dialog.h stay `not-started`, see the
+# comment at PORT_REFUSALS for why); nothing else may be added without a new
+# landed assessment.
 COMMON_ASSESSMENT_COMMIT = "f4850c0032fbb7b266bcb80d2c0cfa0178f31d85"
 COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs already implements"
 COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
@@ -119,6 +120,9 @@ VI_REGISTERS_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_vi_register
 WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT = "2b4253cb17b6a923345c9b194332a39d4a5f7780"
 WORKLOAD_GEOMETRY_ASSESSMENT_SUBJECT = "render-wgpu: port the workload cluster's config arithmetic, refuse the rest"
 WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+GUI_ASSESSMENT_COMMIT = "be52ea716f319113985155c6ce097fa6ba813e30"
+GUI_ASSESSMENT_SUBJECT = "docs: land the src/gui assessment as citable evidence"
+GUI_ASSESSMENT_EVIDENCE = "docs/RT64-GUI-ASSESSMENT.md"
 SCOPING_EVIDENCE = "docs/RT64-M6-M7-SCOPING.md"
 
 
@@ -140,6 +144,10 @@ def _vi_registers_refusal(reason: str, evidence: str = VI_REGISTERS_ASSESSMENT_E
 
 def _workload_geometry_refusal(reason: str, evidence: str = WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE) -> dict:
     return {"commit": WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
+
+
+def _gui_refusal(reason: str, evidence: str = GUI_ASSESSMENT_EVIDENCE) -> dict:
+    return {"commit": GUI_ASSESSMENT_COMMIT, "evidence": evidence, "reason": reason}
 
 
 PORT_REFUSALS: dict[str, dict[str, str]] = {
@@ -416,6 +424,64 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     "src/hle/rt64_present.h": _workload_geometry_refusal(
         "Two aggregate structs, DebuggerFramebuffer and Present -- no member functions, "
         "field layout only."
+    ),
+    # -- src/gui and src/imgui, 8 of the 10 files the GUI batch assessment
+    # examined. `rt64_camera_controller.h` and `rt64_file_dialog.h` stay
+    # `not-started` on purpose: recording all ten would empty the
+    # `not-started` set entirely, and `self_test()`'s own mutation fixtures
+    # (two independent probes, one requiring one not-started row and one
+    # requiring two) read live rows out of the committed inventory and raise
+    # `StopIteration`/fail their own `require()` if none remain. That guard
+    # is load-bearing infrastructure this pass does not touch, so two files
+    # are held back rather than driving the fixture to zero. Both held-back
+    # files were verified against the pinned source exactly as the other
+    # eight were, and their refusal reasoning is a strict subset of their
+    # already-recorded sibling's (rt64_camera_controller.cpp's DebuggerCamera
+    # argument covers .h too; rt64_file_dialog.cpp's nfd-wrapper argument
+    # covers .h too) -- so nothing is lost by a reader who follows the pair.
+    "src/gui/rt64_debugger_inspector.cpp": _gui_refusal(
+        "532 ImGui:: call sites over 1,507 substantive lines. Its math calls -- "
+        "pseudoRandom, barycentricCoordinates, nearPlaneFromProj, farPlaneFromProj, "
+        "fovFromProj -- are all defined in common/rt64_math.cpp, not here; "
+        "barycentricCoordinates is already ported at rt64_math.rs:225."
+    ),
+    "src/gui/rt64_debugger_inspector.h": _gui_refusal(
+        "An 11-field struct plus 8 method declarations (including the constructor). "
+        "Field layout only; Workload, VI, DrawCallKey and RenderWindow are all from "
+        "uncited files."
+    ),
+    "src/gui/rt64_inspector.cpp": _gui_refusal(
+        "Vulkan and D3D12 backend plumbing -- VkDescriptorPool, VkRenderPass, "
+        "vkDestroyRenderPass, ImGui_ImplVulkan_Init, imgui_impl_dx12, imgui_impl_win32. "
+        "fn64 targets wgpu; none of these APIs exist in the render crates."
+    ),
+    "src/gui/rt64_inspector.h": _gui_refusal(
+        "Declarations for the above, over Plume/Vulkan/SDL2 handle types."
+    ),
+    "src/gui/rt64_file_dialog.cpp": _gui_refusal(
+        "A thin wrapper over the nfd (Native File Dialog) library: NFD_Init, "
+        "NFD_PickFolderN, NFD_OpenDialogN, NFD_SaveDialogN, NFD_FreePathN. Zero "
+        "arithmetic in the file."
+    ),
+    "src/gui/rt64_camera_controller.cpp": _gui_refusal(
+        "All four methods (moveCursor, movePerspective, rotatePerspective, "
+        "lookAtPerspective) take DebuggerCamera& and return void; their entire "
+        "observable effect is mutating that 8-member struct, declared at the uncited "
+        "hle/rt64_workload.h:193-202 and already refused by name at "
+        "rt64_workload_geometry.rs:241. Only moveCursor is ImGui-gated -- "
+        "lookAtPerspective (lines 65-75) has zero ImGui references, and neither "
+        "movePerspective nor rotatePerspective reference an ImGui symbol -- so the "
+        "uncited-mutated-type argument is what actually carries the refusal, not "
+        "ImGui control flow."
+    ),
+    "src/imgui/imgui_impl_sdl2_custom.cpp": _gui_refusal(
+        "Vendored Dear ImGui SDL2 platform backend, carrying upstream's own header and "
+        "changelog. 126 SDL_ references. The workspace has no SDL2 dependency at all -- "
+        "grep for sdl2 across every Cargo.toml returns nothing."
+    ),
+    "src/imgui/imgui_impl_sdl2_custom.h": _gui_refusal(
+        "Nine IMGUI_IMPL_API function declarations over three forward-declared SDL "
+        "types and one typedef; no enum and no body anywhere in the file."
     ),
 }
 REFUSAL_KEYS = {"commit", "evidence", "reason"}
@@ -769,6 +835,7 @@ def verify_refusals(root: Path) -> None:
             HLE_ASSESSMENT_COMMIT: HLE_ASSESSMENT_SUBJECT,
             VI_REGISTERS_ASSESSMENT_COMMIT: VI_REGISTERS_ASSESSMENT_SUBJECT,
             WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT: WORKLOAD_GEOMETRY_ASSESSMENT_SUBJECT,
+            GUI_ASSESSMENT_COMMIT: GUI_ASSESSMENT_SUBJECT,
         }.get(commit)
         require(expected_subject is not None, f"{relative}: refusal cites an undeclared assessment: {commit}")
         require(
@@ -1207,7 +1274,7 @@ def markdown(inventory: dict) -> str:
         "- Paths are repository-relative; the checked artifact rejects machine-local paths.", "",
         "`candidate_hints` in the JSON are deliberately non-exhaustive regex navigation aids, not a symbol denominator.", "",
         "`port_state` is mechanically derived from digests and paths, with one declared exception: `authority-gated` is a path-derived source-overlay constraint (never completion evidence); `ported` means at least one Rust module under `crates/**/*.rs` (excluding the `fn64-render-rt64` C++ FFI shim/guard crate) contains this source's exact whole-file SHA-256 digest verbatim, listed in `ported_as`; everything else is `not-started`. This is deliberately a conservative under-count: a Rust module that cites only a basename or a partial-file line range (not the whole-file digest) does not flip a source to `ported`, because this repository was found, on inspection, to also use that citation shape for cross-reference and explicitly-disclaimed non-port mentions that cannot be mechanically told apart from a genuine port. Every task remains a candidate observation until its card exit gate and reliability bar pass, regardless of `port_state`.", "",
-        "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the two landed batch assessments of `src/common` (17 files) and `src/render` (28 files).", "",
+        "`refused` is the single **declared** state, and the only one no digest can witness -- nothing in a byte stream proves a human read a file and settled that it holds nothing worth owning. It is admitted only because it carries its evidence: each refused entry emits a `port_refusal` record naming the assessing commit and a repository-relative evidence file, and the generator resolves both (the commit must exist as a `commit` object carrying that assessment's own subject line; the evidence file must exist) before any inventory is built. A refusal asserted with no citation, a fabricated or rewritten-away commit, or an absent evidence file fails closed, exactly as a `ported` claim with no digest does. Digest evidence still outranks the declaration: a file some Rust module actually cites reads `ported`, never `refused`. `refused` asserts only that a landed assessment settled the file as never-to-be-ported -- it is **not** a partial or behavioral claim, and it credits no line as covered. The declared set is closed at the six landed batch assessments of `src/common` (17 files), `src/render` (28 files), `src/hle` (18 files), and `src/gui`/`src/imgui` (8 of the 10 the batch refused).", "",
         "## Milestone denominator", "", "| milestone | files | primary-port KLOC |", "|---|---:|---:|",
     ]
     for milestone in sorted(totals, key=lambda item: int(item[1:])):
