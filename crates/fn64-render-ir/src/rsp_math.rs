@@ -2,9 +2,24 @@
 //!
 //! Source: pinned MIT RT64 `5473732a822a4423b5696e7cb18fecc425a59875`,
 //! `src/shared/rt64_rsp_viewport.h`, `rt64_rsp_fog.h`, `rt64_rsp_light.h`,
-//! `rt64_rsp_lookat.h`, `rt64_rsp_vertex_test_z.h`. Reading MIT RT64 is an
-//! allowed clean-room source under `AGENTS.md`; see `docs/DESIGN.md`
-//! "License boundary" for the wider provenance note.
+//! `rt64_rsp_lookat.h`, `rt64_rsp_vertex_test_z.h` (SHA-256 of the whole
+//! files, matching `docs/rt64-port-inventory.json`'s `sources.port.sha256`
+//! for each -- which for all five of these files is identical to
+//! `sources.oracle.sha256`, so each digest below is simultaneously that
+//! file's oracle and port digest, confirmed independently here by
+//! `shasum -a 256` against the pinned port-commit checkout):
+//! `rt64_rsp_viewport.h`
+//! `0914b36810dc8ffe9d6dd8f1ffcd05b4bb229272cf61d8e8413ec313dabc06fb`;
+//! `rt64_rsp_fog.h`
+//! `011898d7d1b91e53fa845161931ab2e5312fb1e8fc1c369766957baf4c2fe445`;
+//! `rt64_rsp_light.h`
+//! `9aca26bd4195c609ccc9ee36da31e9c6ec70969ee58698cd75f1f1493872109a`;
+//! `rt64_rsp_lookat.h`
+//! `c6415c5cdfac3da7be8716a8996dec42d52af7e799b9fce72b6ce2f1af49f762`;
+//! `rt64_rsp_vertex_test_z.h`
+//! `e5204de75da748da32ef0c9b3c23f7b71dd0b8dbdb5dcf79dada88e0b425ec00`.
+//! Reading MIT RT64 is an allowed clean-room source under `AGENTS.md`; see
+//! `docs/DESIGN.md` "License boundary" for the wider provenance note.
 //!
 //! Every struct here mirrors the upstream `interop::` CPU/GPU-shared layout
 //! (`HLSL_CPU`-gated in the source) with backend-neutral Rust types, and only
