@@ -317,6 +317,7 @@
 mod alpha_compare;
 mod blend;
 mod color_converter;
+mod color_hlsli;
 mod combiner;
 mod coverage;
 mod depth_encode;
