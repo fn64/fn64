@@ -352,19 +352,29 @@ pub const TRIANGLE_PIPELINE_FRAGMENT_DEPENDENCY_SOURCES: [&str; 2] =
 pub const TRIANGLE_PIPELINE_FRAGMENT_CANDIDATE_CONSUMERS: [&str; 1] =
     ["src-shaders-rasterpsdynamic"];
 
+/// Published committed-TMEM textured-draw card, Option B: the fragment-
+/// callable WGSL port of `tmem/read.rs`+`tmem/sample.rs`'s committed
+/// physical-TMEM addressing/filter chain. Library-only (no `@group`/
+/// `@binding` entry point of its own besides its module-scope storage/
+/// uniform bindings), concatenated into the combined fragment source ahead
+/// of this file's own `@fragment` wrapper, matching `color_combiner.wgsl`'s
+/// established pattern.
+pub const TMEM_SAMPLE_WGSL: &str = include_str!("shaders/tmem_sample.wgsl");
+
 /// The fragment shader module actually submitted to `wgpu`: `color_combiner.wgsl`'s
 /// existing library functions (reused byte-for-byte, unmodified) concatenated
-/// with this component's thin `@fragment` wrapper. WGSL has no cross-module
-/// include mechanism reachable from two separate `wgpu::ShaderSource::Wgsl`
-/// strings in this wgpu version, so the two source files are combined into
-/// one module at this seam, not at shader-module-creation time in
-/// `targets/triangle_pipeline.rs` -- keeping that file free of string
-/// concatenation logic and this manifest the single place the combined
-/// source text is assembled.
+/// with `tmem_sample.wgsl`'s TMEM addressing/filter port and this component's
+/// thin `@fragment` wrapper. WGSL has no cross-module include mechanism
+/// reachable from separate `wgpu::ShaderSource::Wgsl` strings in this wgpu
+/// version, so the three source files are combined into one module at this
+/// seam, not at shader-module-creation time in `targets/triangle_pipeline.rs`
+/// -- keeping that file free of string concatenation logic and this manifest
+/// the single place the combined source text is assembled.
 pub fn triangle_pipeline_fragment_wgsl() -> String {
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         crate::combiner::COLOR_COMBINER_WGSL,
+        TMEM_SAMPLE_WGSL,
         TRIANGLE_PIPELINE_FRAGMENT_WRAPPER_WGSL
     )
 }
@@ -385,14 +395,14 @@ pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST_ENTRY_POINT: &str =
 // and assert they still match this frozen literal -- the public manifest
 // constant itself carries the real value, not a placeholder.
 pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256: [u8; 32] = [
-    0x4e, 0xe1, 0x19, 0xe4, 0x64, 0xe5, 0xde, 0x8d, 0x96, 0x34, 0x5e, 0x69, 0x4a, 0x5a, 0x74, 0x2a,
-    0xd4, 0x0f, 0x85, 0x3e, 0xcd, 0x6a, 0xcd, 0x84, 0x6c, 0xdb, 0x39, 0x99, 0xc2, 0xdf, 0x3a, 0xb5,
+    0x10, 0xf8, 0x62, 0x7a, 0x3e, 0x58, 0x30, 0x09, 0xd7, 0xe9, 0xea, 0x82, 0xbf, 0x3f, 0xb0, 0x5a,
+    0x16, 0x26, 0x5f, 0x93, 0x07, 0xc2, 0x54, 0xcb, 0x7f, 0x46, 0xaf, 0x36, 0xf5, 0xa9, 0xc7, 0x7d,
 ];
 pub const TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256: [u8; 32] = [
-    0x24, 0x89, 0x26, 0x30, 0xb1, 0xf5, 0xb1, 0xfa, 0xeb, 0xc2, 0x48, 0x86, 0x67, 0xda, 0xd1, 0x88,
-    0x64, 0xfb, 0x51, 0xa9, 0x98, 0x0a, 0x9c, 0x2a, 0x5e, 0x88, 0x47, 0x02, 0x45, 0xec, 0x40, 0xb3,
+    0xc6, 0x03, 0xd1, 0x74, 0x96, 0x1c, 0x81, 0xd1, 0x1d, 0x19, 0x41, 0xab, 0xe0, 0xaf, 0x1a, 0xc2,
+    0x8d, 0x2a, 0x3f, 0x83, 0xd1, 0x6c, 0x7e, 0xc0, 0x6e, 0x7b, 0x88, 0x53, 0x86, 0x5e, 0x9b, 0x2c,
 ];
-pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 26_425;
+pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 49_831;
 
 pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST: RuntimeShaderComponentManifest =
     RuntimeShaderComponentManifest {

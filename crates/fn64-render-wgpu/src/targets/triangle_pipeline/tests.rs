@@ -22,6 +22,25 @@ fn identity_raster_params() -> TriangleRasterParams {
     }
 }
 
+/// The named "no committed TMEM, no tile bound" case (published
+/// committed-TMEM textured-draw card §6) -- every non-textured fixture in
+/// this file uses this: an all-zero `TmemGpuProjection` plus
+/// `TileBindingParams::unbound()`. `tmem_sample.wgsl`'s
+/// `sample_committed_rgba16_three_nearest` checks `bound` before touching
+/// TMEM bytes, so `tex_val0`/`tex_val1` come back `(0,0,0,0)` with status
+/// `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` -- irrelevant to every fixture below
+/// since they all use the SHADE-passthrough combine formula, which never
+/// reads `tex_val0`/`tex_val1`.
+fn no_tmem_binding() -> (TmemGpuProjection, TileBindingParams) {
+    (
+        TmemGpuProjection {
+            bytes: [0u8; fn64_render_ir::TMEM_BYTES as usize],
+            validity_words: [0u32; crate::TMEM_VALIDITY_WORDS],
+        },
+        TileBindingParams::unbound(),
+    )
+}
+
 // A large triangle covering the whole 8x8 target (screen-pixel corners at
 // (0,0), (8,0), (0,8)), each vertex a distinct primary color, w = 1.0
 // (matching the reference `raster_vs.rs` transform's unconditional `x *= w`
@@ -30,6 +49,7 @@ fn identity_raster_params() -> TriangleRasterParams {
 // covered pixels regardless of wgpu's actual barycentric interpolation --
 // this sidesteps needing to hand-derive per-pixel interpolated Z).
 fn covering_triangle_fixture() -> TriangleFixture {
+    let (tmem, tile_binding) = no_tmem_binding();
     TriangleFixture {
         vertices: [
             RasterVertex {
@@ -62,6 +82,8 @@ fn covering_triangle_fixture() -> TriangleFixture {
         // COMBINED(0), alpha D=SHADE(4, `alpha_input_abd`'s common table).
         combine_params: shade_passthrough_combine_params(),
         extent: EXTENT,
+        tmem,
+        tile_binding,
     }
 }
 
@@ -178,6 +200,57 @@ fn combined_fragment_wgsl_reuses_color_combiner_wgsl_byte_for_byte() {
     assert!(source.contains("fn fs_main("));
 }
 
+/// Source-shape proof for the TMEM-sample gate (SHADE-only-triangle
+/// repair): `fs_main` must call
+/// `sample_committed_rgba16_three_nearest_bound` from inside a branch keyed
+/// on `fragment_combine_params.texture_referenced`, not unconditionally at
+/// the top of the function body -- a plain
+/// `source.contains("sample_committed_rgba16_three_nearest_bound")` check
+/// would pass even for the old unconditional-call shape this task repairs,
+/// so this asserts the specific textual ordering: the `if
+/// fragment_combine_params.texture_referenced != 0u` condition appears
+/// before the sampler call, and the sampler call is not the first
+/// executable statement in `fs_main`'s body (an unconditional call sits on
+/// the line immediately after the opening brace in the pre-repair shape).
+#[test]
+fn combined_fragment_wgsl_gates_the_tmem_sample_call_on_texture_referenced() {
+    let source = crate::shader_manifest::triangle_pipeline_fragment_wgsl();
+    let fs_main_start = source
+        .find("fn fs_main(")
+        .expect("fs_main must exist in the combined source");
+    let body = &source[fs_main_start..];
+
+    let gate_index = body
+        .find("fragment_combine_params.texture_referenced != 0u")
+        .expect("fs_main must branch on texture_referenced");
+    let call_index = body
+        .find("sample_committed_rgba16_three_nearest_bound(")
+        .expect("fs_main must still call the real sampler somewhere");
+    assert!(
+        gate_index < call_index,
+        "the texture_referenced gate must appear before the sampler call, \
+         not after -- an unconditional call could still textually precede \
+         a later, dead gate check"
+    );
+
+    // The unconditional-call shape this task repairs calls the sampler as
+    // `let sample = sample_committed_rgba16_three_nearest_bound(...)`,
+    // immediately assigning its result to `sample`. The repaired shape
+    // instead declares `sample` via `var sample: TmemSampleResult;` ahead
+    // of the gate and only assigns it *inside* the `if` branch -- so the
+    // sampler call must not be a `let`-binding's direct initializer.
+    assert!(
+        !body.contains("let sample = sample_committed_rgba16_three_nearest_bound("),
+        "the sampler call must not be an unconditional `let sample = ...` \
+         binding -- it must be gated inside the texture_referenced branch"
+    );
+    assert!(
+        body.contains("var sample: TmemSampleResult;"),
+        "fs_main must declare `sample` as a mutable var so both branches \
+         (real sample vs. fixed zero) can assign it"
+    );
+}
+
 #[test]
 fn strict_less_depth_oracle_agrees_a_nearer_second_triangle_would_pass() {
     // Depth differential (port card §6): assert the oracle's pass/reject
@@ -267,6 +340,37 @@ fn raster_params_byte_layout_is_32_bytes_and_pads_two_trailing_reserved_f32() {
     assert_eq!(&bytes[24..32], &[0u8; 8]);
 }
 
+/// Byte-offset proof for `FragmentCombineParams`
+/// (`shaders/triangle_pipeline_fragment.wgsl`'s uniform struct): low/high at
+/// 0..8 (the raw `SetCombine` wire split), `texture_referenced` at 8..12
+/// (SHADE-only-triangle repair), bytes 12..16 (`reserved_zero`) always zero.
+/// Uses the SHADE-passthrough fixture (no texture reference expected) and
+/// the real-textured-differential fixture shape (texture reference
+/// expected) so this test also pins the serialized value, not just its
+/// offset.
+#[test]
+fn fragment_combine_params_byte_layout_is_16_bytes_with_low_high_and_texture_referenced_flag() {
+    let shade_only = shade_passthrough_combine_params();
+    let shade_only_bytes = fragment_combine_params_bytes(shade_only);
+    assert_eq!(shade_only_bytes.len(), COMBINE_PARAMS_BYTES as usize);
+    assert_eq!(&shade_only_bytes[0..4], &shade_only.low().to_le_bytes());
+    assert_eq!(&shade_only_bytes[4..8], &shade_only.high().to_le_bytes());
+    assert_eq!(&shade_only_bytes[8..12], &0u32.to_le_bytes());
+    assert_eq!(&shade_only_bytes[12..16], &[0u8; 4]);
+
+    // TEXEL0-passthrough shape (`production.rs`'s real textured
+    // differential fixtures): color_d=TEXEL0(1) is an unconditional D
+    // reference (color_d's second_cycle=true bit position is high[8:6],
+    // matching `shade_passthrough_combine_params`'s own doc), so
+    // `texture_referenced` must serialize as 1.
+    let textured = CombineParams::from_wire(0, 1 << 6);
+    let textured_bytes = fragment_combine_params_bytes(textured);
+    assert_eq!(&textured_bytes[0..4], &textured.low().to_le_bytes());
+    assert_eq!(&textured_bytes[4..8], &textured.high().to_le_bytes());
+    assert_eq!(&textured_bytes[8..12], &1u32.to_le_bytes());
+    assert_eq!(&textured_bytes[12..16], &[0u8; 4]);
+}
+
 /// Device-unavailable degradation path (port card §7): a real GPU adapter
 /// cannot be forced absent deterministically in this test harness (no unit
 /// test in this file simulates `TrianglePipelineDeviceOutcome::NoAdapter`
@@ -313,11 +417,14 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         },
     ];
     let raster_vertices = vertices.map(crate::neutral_vertex_to_raster_vertex);
+    let (tmem, tile_binding) = no_tmem_binding();
     let fixture = TriangleFixture {
         vertices: raster_vertices,
         raster_params: identity_raster_params(),
         combine_params: shade_passthrough_combine_params(),
         extent: EXTENT,
+        tmem,
+        tile_binding,
     };
     assert_eq!(fixture.vertices[0].position, [0.0, 0.0, 0.5, 1.0]);
     assert_eq!(fixture.vertices[1].uv, [1.0, 0.0]);
@@ -934,6 +1041,7 @@ mod host_gpu_tests {
                 ),
             };
 
+            let (tmem, tile_binding) = no_tmem_binding();
             let output = renderer
                 .submit_admitted_triangle(
                     draw.vertices,
@@ -941,6 +1049,8 @@ mod host_gpu_tests {
                     draw.combine_params,
                     identity_raster_params(),
                     EXTENT,
+                    tmem,
+                    tile_binding,
                 )
                 .unwrap()
                 .complete()

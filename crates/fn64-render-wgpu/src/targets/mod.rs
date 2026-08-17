@@ -37,7 +37,9 @@ pub use triangle_pipeline::{
     fixed_fixture_other_mode, InFlightTriangleDraw, RasterVertex, TriangleDrawOutput,
     TriangleFixture, TrianglePipelineDeviceOutcome, TrianglePipelineError,
     TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
-    UninitializedTrianglePipeline,
+    UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_INVALID_BYTE,
+    TMEM_SAMPLE_STATUS_NO_TILE_BINDING, TMEM_SAMPLE_STATUS_OK, TMEM_SAMPLE_STATUS_REVERSED_EXTENT,
+    TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

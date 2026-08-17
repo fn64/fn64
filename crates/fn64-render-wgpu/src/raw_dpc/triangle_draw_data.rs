@@ -43,6 +43,7 @@ use fn64_render::{
 };
 
 use crate::state::OtherMode;
+use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
 
 /// Field-by-field adapter from the sealed plan's decoded triangle-vertex
@@ -87,15 +88,23 @@ impl core::fmt::Display for MissingTriangleDrawState {
 
 impl std::error::Error for MissingTriangleDrawState {}
 
-/// One admitted triangle's vertices plus the `OtherMode`/`CombineParams`
-/// current at ITS OWN stream position in the sealed plan -- never a
-/// whole-plan-final value, which would let a later `SetOtherMode`/
-/// `SetCombine` retroactively change an earlier triangle's draw state.
+/// One admitted triangle's vertices plus the `OtherMode`/`CombineParams`/
+/// tile binding current at ITS OWN stream position in the sealed plan --
+/// never a whole-plan-final value, which would let a later `SetOtherMode`/
+/// `SetCombine`/`SetTile`/`SetTileSize` retroactively change an earlier
+/// triangle's draw state. `tile_binding` is
+/// [`TileBindingParams::unbound`] when tile 0 (the RDP's default bound
+/// texture tile for a standard triangle draw -- `RdpTriangleCommand`
+/// carries no tile index of its own) had no snapshotted `TileDescriptor`/
+/// `TileSize` pair at this triangle's own stream position (published
+/// committed-TMEM textured-draw card §2/§6: "missing `TileDescriptor`" is a
+/// named condition, never a silent default).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RetrievedTriangleDraw {
     pub vertices: [NeutralTriangleVertex; 3],
     pub other_mode: OtherMode,
     pub combine_params: CombineParams,
+    pub tile_binding: TileBindingParams,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -109,6 +118,20 @@ pub struct TriangleDrawStateCollector {
     draws: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
+    /// Tile 0's binding current at the walk's current stream position --
+    /// tile 0 is the RDP's default bound texture tile for a standard
+    /// triangle draw (`RdpTriangleCommand` carries no tile index of its
+    /// own). `None` until this plan's own first `SetTile{tile_index: 0,
+    /// ..}`/`SetTileSize{tile_index: 0, ..}` pair is both present;
+    /// [`TileBindingParams::unbound`] is used at snapshot time when either
+    /// half is still missing (card §6: a named, non-fatal condition here --
+    /// unlike `OtherMode`/`CombineParams`, a missing tile binding does not
+    /// fail triangle retrieval itself; the WGSL sampler's own
+    /// `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` surfaces it per-fragment
+    /// instead, since a flat-colored/non-textured triangle legitimately has
+    /// no tile bound at all).
+    current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
+    current_tile0_size: Option<fn64_render::NeutralTileSize>,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -116,6 +139,12 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
         match command {
             RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand { vertices, .. }) => {
                 let triangle_index = self.draws.len();
+                let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
+                    (Some(descriptor), Some(size)) => {
+                        TileBindingParams::from_neutral(descriptor, size)
+                    }
+                    _ => TileBindingParams::unbound(),
+                };
                 let snapshot = (|| {
                     let other_mode = self
                         .current_other_mode
@@ -127,6 +156,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         vertices: *vertices,
                         other_mode,
                         combine_params,
+                        tile_binding,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -139,6 +169,18 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 RdpStateCommand::SetCombine { combine, .. } => {
                     self.current_combine =
                         Some(CombineParams::from_wire(combine.low, combine.high));
+                }
+                RdpStateCommand::SetTile {
+                    tile_index,
+                    descriptor,
+                    ..
+                } if *tile_index == 0 => {
+                    self.current_tile0_descriptor = Some(*descriptor);
+                }
+                RdpStateCommand::SetTileSize {
+                    tile_index, size, ..
+                } if *tile_index == 0 => {
+                    self.current_tile0_size = Some(*size);
                 }
                 _ => {}
             },
