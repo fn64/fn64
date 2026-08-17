@@ -141,10 +141,14 @@
 //! This is a **second partial port** of `rt64_rsp.cpp`. `rt64_rsp_segment.rs`
 //! (ticket M5.1) already ported this same 1,314-line source file's
 //! segmented-address translation cluster (`fromSegmented`/
-//! `fromSegmentedMasked`/`fromSegmentedMaskedPD`/`maskPhysicalAddress`/
-//! `setSegment`) and explicitly enumerated `matrixCommon` (among others) as
-//! deliberately NOT ported by that module. This module ports exactly that
-//! deferred function plus its three small siblings
+//! `fromSegmentedMasked`/`fromSegmentedMaskedPD`/
+//! [`maskPhysicalAddress`](crate::rt64_rsp_segment::mask_physical_address)/
+//! `setSegment`) and explicitly enumerated
+//! [`matrixCommon`](crate::rt64_rsp_matrix_stack::matrix_common) (among
+//! others) as deliberately NOT ported *by that module*. Read that as a
+//! refusal by `rt64_rsp_segment.rs`, not as a claim the crate lacks the
+//! symbol: this module ports exactly that deferred function, plus its
+//! three small siblings
 //! (`pushProjectionMatrix`/`popProjectionMatrix`/`computeModelViewProj`);
 //! together the two modules still cover only a small fraction of
 //! `rt64_rsp.cpp` -- see "Nonclaims" below for the (large) remainder.
@@ -311,9 +315,12 @@
 //! - **`state->fromRDRAM`/segment-table lookups.** As stated above, this
 //!   module takes any already-segment-translated physical address as a
 //!   plain `u32` input parameter rather than calling into `State` or
-//!   `rt64_rsp_segment.rs`'s `SegmentTable`/`mask_physical_address` --
-//!   M5.1 owns that translation and its call sites are integration work,
-//!   out of scope here.
+//!   into `rt64_rsp_segment.rs`'s
+//!   [`SegmentTable`](crate::rt64_rsp_segment::SegmentTable)/
+//!   [`mask_physical_address`](crate::rt64_rsp_segment::mask_physical_address)
+//!   -- both exist and are `pub` there (M5.1 owns that translation); wiring
+//!   this module's callers to them is integration work, deliberately out of
+//!   scope *here*.
 //! - **Vertex/geometry/display-list orchestrators, lighting, fog, viewport,
 //!   other-mode, and every non-matrix-stack RSP state** -- entirely out of
 //!   scope for this module, matching `rt64_rsp_segment.rs`'s equivalent
