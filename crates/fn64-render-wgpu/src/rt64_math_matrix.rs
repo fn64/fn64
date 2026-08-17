@@ -1,6 +1,8 @@
 //! Literal port of RT64 `rt64_math.cpp`'s deferred matrix cluster --
 //! `extract3x3`, `rotationFrom3x3`, `matrixDifference`, `lerpMatrix`,
-//! `lerpMatrix3x3`, `lerpMatrixComponents` -- a literal port of the
+//! `lerpMatrix3x3`, `lerpMatrixComponents`, plus the transform-constructor
+//! family `matrixScale` (both overloads), `matrixTranslation` and
+//! `matrixRotationX/Y/Z` -- a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
 //! (`docs/RT64-PORT-AUTHORITY.md`), `src/common/rt64_math.h`/`.cpp`
@@ -92,6 +94,69 @@
 //!         ret[3].w = lerp(a[3].w, b[3].w, t);
 //!     }
 //!     return ret;
+//! }
+//!
+//! // lines 26-33
+//! hlslpp::float4x4 matrixScale(float scale) {
+//!     hlslpp::float4x4 scaleMatrix(0.0f);
+//!     scaleMatrix[0][0] = scale;
+//!     scaleMatrix[1][1] = scale;
+//!     scaleMatrix[2][2] = scale;
+//!     scaleMatrix[3][3] = 1.0f;
+//!     return scaleMatrix;
+//! }
+//!
+//! // lines 35-42
+//! hlslpp::float4x4 matrixScale(const hlslpp::float3& scale) {
+//!     hlslpp::float4x4 scaleMatrix(0.0f);
+//!     scaleMatrix[0][0] = scale.x;
+//!     scaleMatrix[1][1] = scale.y;
+//!     scaleMatrix[2][2] = scale.z;
+//!     scaleMatrix[3][3] = 1.0f;
+//!     return scaleMatrix;
+//! }
+//!
+//! // lines 77-81
+//! hlslpp::float4x4 matrixTranslation(const hlslpp::float3 &t) {
+//!     hlslpp::float4x4 m = hlslpp::float4x4::identity();
+//!     m[3].xyz = t;
+//!     return m;
+//! }
+//!
+//! // lines 83-92
+//! hlslpp::float3x3 matrixRotationX(float rad) {
+//!     hlslpp::float3x3 m = hlslpp::float3x3::identity();
+//!     const float rollCos = cos(rad);
+//!     const float rollSin = sin(rad);
+//!     m[0][0] = rollCos;
+//!     m[0][1] = -rollSin;
+//!     m[1][0] = rollSin;
+//!     m[1][1] = rollCos;
+//!     return m;
+//! }
+//!
+//! // lines 94-103
+//! hlslpp::float3x3 matrixRotationY(float rad) {
+//!     hlslpp::float3x3 m = hlslpp::float3x3::identity();
+//!     const float pitchCos = cos(rad);
+//!     const float pitchSin = sin(rad);
+//!     m[0][0] = pitchCos;
+//!     m[0][2] = pitchSin;
+//!     m[2][0] = -pitchSin;
+//!     m[2][2] = pitchCos;
+//!     return m;
+//! }
+//!
+//! // lines 105-114
+//! hlslpp::float3x3 matrixRotationZ(float rad) {
+//!     hlslpp::float3x3 m = hlslpp::float3x3::identity();
+//!     const float yawCos = cos(rad);
+//!     const float yawSin = sin(rad);
+//!     m[1][1] = yawCos;
+//!     m[1][2] = -yawSin;
+//!     m[2][1] = yawSin;
+//!     m[2][2] = yawCos;
+//!     return m;
 //! }
 //! ```
 //!
@@ -191,6 +256,75 @@
 //!   order does not change the *result*, but this port preserves the
 //!   source's exact statement order rather than relying on that
 //!   independence argument to justify reordering).
+//! - **`matrixRotationX`/`matrixRotationZ` are misnamed at the source, and
+//!   the names are ported verbatim.** `matrixRotationX` writes the
+//!   `[0][0],[0][1],[1][0],[1][1]` block -- the **XY** block, which is
+//!   conventionally a rotation about **Z**. `matrixRotationZ` writes the
+//!   `[1][1],[1][2],[2][1],[2][2]` block -- the **YZ** block, conventionally
+//!   a rotation about **X**. Only `matrixRotationY` (the `XZ` block) matches
+//!   its name. This port does **not** rename them to match the axis each
+//!   actually rotates about: RT64's own `CameraController::rotatePerspective`
+//!   (`rt64_camera_controller.cpp:53-63`) calls `matrixRotationY(yaw)` and
+//!   `matrixRotationZ(pitch)` by these names, so "correcting" them would
+//!   silently rewire every call site. The mismatch is documented here and
+//!   pinned by a test rather than fixed.
+//! - **`matrixRotationY`'s sign placement is mirrored relative to its two
+//!   siblings, and is preserved exactly.** `X` and `Z` both put `-sin`
+//!   *above* the diagonal and `+sin` below; `Y` puts `+sin` above
+//!   (`m[0][2]`) and `-sin` below (`m[2][0]`). This is the standard
+//!   right-handed-basis asymmetry for a Y rotation, it is what the source
+//!   literally writes, and the two forms are **not** interchangeable -- a
+//!   transposed or sign-flipped `Y` is a rotation by `-rad`, not `rad`.
+//!   Each of the three sign conventions is pinned by its own explicit test.
+//! - **`cos`/`sin` resolution and `f32` libm semantics**: `rt64_math.cpp`
+//!   includes `<cmath>` and has no `using namespace hlslpp` directive, so
+//!   the unqualified `cos(rad)`/`sin(rad)` on a `float` argument resolve to
+//!   the `float` overloads (`cosf`/`sinf`), *not* to any `hlslpp` vector
+//!   intrinsic -- these five helpers are open-coded scalar arithmetic on
+//!   `hlslpp` *containers*, not calls into `hlslpp`'s unpopulated internals,
+//!   which is why they are portable at all where the quaternion cluster's
+//!   `hlslpp::` calls were not. Rust's `f32::cos`/`f32::sin` lower to the
+//!   same platform libm. Verified on this host that both agree bit-for-bit
+//!   with an independent computation at `0`, `f32::PI/2`, `f32::PI` and
+//!   `0.5` -- but libm transcendentals are not bit-guaranteed *across*
+//!   platforms by either language, so the exact-value tests below pin the
+//!   values this host produces and are characterization, not a portability
+//!   claim.
+//! - **`cos(f32::FRAC_PI_2)` is not `0.0`.** It is `-4.371139e-8`
+//!   (`0xb33bbd2e`), because `f32::FRAC_PI_2` is not exactly `π/2`.
+//!   Likewise `sin(f32::PI)` is `-8.742278e-8` (`0xb3bbbd2e`), not `0.0`,
+//!   and is *negative*. The tests below assert these real values rather
+//!   than an idealized zero, and the `-sin` entries therefore carry the
+//!   opposite sign from the naive expectation.
+//! - **`-sin(0.0)` is `-0.0`, not `+0.0`.** The negation in the `-sin`
+//!   slots is applied to a `+0.0` at `rad == 0`, yielding a negative zero
+//!   in `m[0][1]` (X), `m[2][0]` (Y) and `m[1][2]` (Z) at the identity
+//!   angle. `-0.0 == 0.0` compares true in IEEE-754, so this is invisible
+//!   to an `assert_eq!` on the value; it is pinned explicitly by a
+//!   `to_bits()` test instead, since it is a real bit-level difference from
+//!   `hlslpp::float3x3::identity()`.
+//! - **`matrixScale` starts from `float4x4(0.0f)`, not the identity.** The
+//!   scalar and `float3` overloads both zero-initialize and then write only
+//!   four elements, so `[3][3]` is explicitly set to `1.0f` while every
+//!   other off-diagonal stays `0.0`. `matrixTranslation`, by contrast,
+//!   starts from `identity()`. This port preserves that difference rather
+//!   than unifying the two on one starting point.
+//! - **`matrixTranslation` writes row 3, not column 3.** `m[3].xyz = t`
+//!   indexes `m[3]` as a *row* under this codebase's fixed row-major
+//!   reading of `float4x4` (`rsp_math.rs:78-84`), so the translation lands
+//!   in `rows[3].{x,y,z}`. This is the row-vector convention (`v * M`), the
+//!   transpose of the column-vector convention some other engines use --
+//!   getting it backwards would transpose every camera transform, so it is
+//!   pinned by a test that distinguishes the two.
+//! - **`inverse4` is re-exported, not reimplemented.** `hlslpp::inverse` on
+//!   a `float4x4` already has exactly one implementation in this crate:
+//!   `rt64_math_decompose.rs`'s classical adjugate/cofactor `inverse4`,
+//!   landed by another card. This module widens that function's visibility
+//!   from private to `pub(crate)` -- a *visibility-only* change, with its
+//!   signature, body, arithmetic and unguarded-singular-input behavior all
+//!   untouched -- and re-exports it here as `inverse4`. The alternative,
+//!   a second ~40-line cofactor inverse under a new name, would duplicate
+//!   identical arithmetic and create two places for one formula to drift.
 //!
 //! ## Nonclaims
 //!
@@ -204,11 +338,30 @@
 //! `DecomposedTransform` (and its constructor), and `lerpTransforms`, plus
 //! their `vecCombine`/`vecScale` helpers, are a separate ticket (owned by
 //! another executor) and are deliberately NOT ported here: they need a
-//! `hlslpp::quaternion`-equivalent type and a 4x4 matrix inverse/determinant
-//! that this module does not add. `matrixScale`, `matrixTranslation`,
-//! `matrixRotationX/Y/Z`, `matrixDecomposeViewProj`, and `pseudoRandom`
-//! remain out of scope exactly as `rt64_math.rs` already stated (unchanged
-//! by this module, which does not edit `rt64_math.rs`).
+//! `hlslpp::quaternion`-equivalent type that this module does not add.
+//! `matrixDecomposeViewProj` and `pseudoRandom` remain out of scope exactly
+//! as `rt64_math.rs` already stated.
+//!
+//! **`rt64_math.rs`'s Nonclaims list is now stale** and needs a follow-up
+//! edit outside this module's exclusive paths: it still reads "Does not
+//! port `matrixScale`, `matrixTranslation`, `matrixRotationX/Y/Z`,
+//! `extract3x3`, `rotationFrom3x3`, ... (deferred -- needs new
+//! matrix-inverse/quaternion infra)", but all of those except the
+//! quaternion cluster are now ported here. The stated reason is also no
+//! longer accurate for them: none of these five needs quaternion infra, and
+//! the matrix-inverse infra they were waiting on exists and is now
+//! `pub(crate)`.
+//!
+//! This module's `matrix_scale_vec3` and `matrix_translation` intentionally
+//! duplicate, in *shape*, two private recompose-only helpers of the same
+//! names inside `rt64_math_decompose.rs`. Those are explicitly documented
+//! there as "minimal recompose-only helpers, not a claim of porting
+//! `matrixTranslation`/`matrixScale(float3)` as a reusable public API for
+//! other callers"; this module makes that public-API claim. They are not
+//! consolidated because doing so would edit another card's landed module
+//! *behaviorally* (rerouting its call sites) rather than by visibility
+//! alone -- flagged here as a known, deliberate redundancy for a later
+//! consolidation pass, not an oversight.
 
 use crate::rt64_math::Mat3;
 use fn64_render_ir::Vec3;
@@ -354,6 +507,137 @@ fn lerp_vec4(a: fn64_render_ir::Vec4, b: fn64_render_ir::Vec4, t: f32) -> fn64_r
         lerp_f32(a.z, b.z, t),
         lerp_f32(a.w, b.w, t),
     )
+}
+
+/// The row-major 4x4 identity, matching `hlslpp::float4x4::identity()` (see
+/// `rt64_math.rs`'s same assumption-with-citation for that call).
+fn mat4_identity() -> fn64_render_ir::Mat4 {
+    fn64_render_ir::Mat4::from_rows([
+        fn64_render_ir::Vec4::new(1.0, 0.0, 0.0, 0.0),
+        fn64_render_ir::Vec4::new(0.0, 1.0, 0.0, 0.0),
+        fn64_render_ir::Vec4::new(0.0, 0.0, 1.0, 0.0),
+        fn64_render_ir::Vec4::new(0.0, 0.0, 0.0, 1.0),
+    ])
+}
+
+/// `matrixScale(float)`: a uniform-scale matrix built from an all-zero
+/// `float4x4`, with `scale` on the first three diagonal entries and a literal
+/// `1.0f` at `[3][3]`. Every off-diagonal entry stays `0.0` from the
+/// zero-initialized start -- the source does **not** begin from the identity
+/// here (unlike `matrixTranslation`), so `[3][3]` is the only element written
+/// to `1.0`.
+pub fn matrix_scale(scale: f32) -> fn64_render_ir::Mat4 {
+    let mut scale_matrix =
+        fn64_render_ir::Mat4::from_rows([fn64_render_ir::Vec4::new(0.0, 0.0, 0.0, 0.0); 4]);
+    scale_matrix.rows[0].x = scale;
+    scale_matrix.rows[1].y = scale;
+    scale_matrix.rows[2].z = scale;
+    scale_matrix.rows[3].w = 1.0;
+    scale_matrix
+}
+
+/// `matrixScale(const float3&)`: the non-uniform overload of the above,
+/// taking `scale.x/y/z` for the three diagonal entries. Same zero-initialized
+/// start and same literal `1.0f` at `[3][3]`.
+pub fn matrix_scale_vec3(scale: Vec3) -> fn64_render_ir::Mat4 {
+    let mut scale_matrix =
+        fn64_render_ir::Mat4::from_rows([fn64_render_ir::Vec4::new(0.0, 0.0, 0.0, 0.0); 4]);
+    scale_matrix.rows[0].x = scale.x;
+    scale_matrix.rows[1].y = scale.y;
+    scale_matrix.rows[2].z = scale.z;
+    scale_matrix.rows[3].w = 1.0;
+    scale_matrix
+}
+
+/// `matrixTranslation`: the identity with `t` written into **row 3**'s
+/// `xyz` (`m[3].xyz = t`), leaving `[3][3]` at the identity's `1.0`. Row 3 --
+/// not column 3 -- because `Mat4` is row-major and the source indexes
+/// `m[3]` as a row (see module doc "Reuse, not new type").
+pub fn matrix_translation(t: Vec3) -> fn64_render_ir::Mat4 {
+    let mut m = mat4_identity();
+    m.rows[3].x = t.x;
+    m.rows[3].y = t.y;
+    m.rows[3].z = t.z;
+    m
+}
+
+/// `matrixRotationX`: the 3x3 identity with `cos`/`sin` written into the
+/// **`[0][0]`,`[0][1]`,`[1][0]`,`[1][1]` block** -- i.e. the XY block, which
+/// by the usual mathematical convention is a rotation about *Z*, not X.
+/// RT64's name is ported verbatim rather than corrected: `rotatePerspective`
+/// (`rt64_camera_controller.cpp:53-63`) calls these by RT64's names, so
+/// renaming them to match convention would silently break every call site.
+/// Sign convention, exactly as the source writes it: `-sin` above the
+/// diagonal at `[0][1]`, `+sin` below at `[1][0]`. `[2][2]` stays `1.0`
+/// from the identity.
+pub fn matrix_rotation_x(rad: f32) -> Mat3 {
+    let mut m = mat3_identity();
+    let roll_cos = rad.cos();
+    let roll_sin = rad.sin();
+    m.rows[0].x = roll_cos;
+    m.rows[0].y = -roll_sin;
+    m.rows[1].x = roll_sin;
+    m.rows[1].y = roll_cos;
+    m
+}
+
+/// `matrixRotationY`: the 3x3 identity with `cos`/`sin` in the
+/// **`[0][0]`,`[0][2]`,`[2][0]`,`[2][2]` block** (the XZ block -- this one
+/// *does* match the conventional Y-axis rotation). Its sign convention is
+/// **mirrored** relative to `matrix_rotation_x`/`matrix_rotation_z`:
+/// `+sin` above the diagonal at `[0][2]` and `-sin` below at `[2][0]`, the
+/// opposite placement from the other two. That asymmetry is the source's,
+/// is standard for a Y rotation in a right-handed basis, and is preserved
+/// literally -- it is *not* normalized to match its siblings. `[1][1]`
+/// stays `1.0` from the identity.
+pub fn matrix_rotation_y(rad: f32) -> Mat3 {
+    let mut m = mat3_identity();
+    let pitch_cos = rad.cos();
+    let pitch_sin = rad.sin();
+    m.rows[0].x = pitch_cos;
+    m.rows[0].z = pitch_sin;
+    m.rows[2].x = -pitch_sin;
+    m.rows[2].z = pitch_cos;
+    m
+}
+
+/// `matrixRotationZ`: the 3x3 identity with `cos`/`sin` in the
+/// **`[1][1]`,`[1][2]`,`[2][1]`,`[2][2]` block** -- the YZ block, which by
+/// the usual convention is a rotation about *X*, not Z. Same verbatim-name
+/// rationale as `matrix_rotation_x`. Sign convention: `-sin` above the
+/// diagonal at `[1][2]`, `+sin` below at `[2][1]`. `[0][0]` stays `1.0`
+/// from the identity.
+pub fn matrix_rotation_z(rad: f32) -> Mat3 {
+    let mut m = mat3_identity();
+    let yaw_cos = rad.cos();
+    let yaw_sin = rad.sin();
+    m.rows[1].y = yaw_cos;
+    m.rows[1].z = -yaw_sin;
+    m.rows[2].y = yaw_sin;
+    m.rows[2].z = yaw_cos;
+    m
+}
+
+/// The row-major 3x3 identity, matching `hlslpp::float3x3::identity()`.
+fn mat3_identity() -> Mat3 {
+    Mat3 {
+        rows: [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ],
+    }
+}
+
+/// `hlslpp::inverse(float4x4)`: re-exported from `rt64_math_decompose.rs`'s
+/// already-landed classical adjugate/cofactor inverse rather than
+/// reimplemented. RT64's camera controller terminates all three of its
+/// perspective methods in `hlslpp::inverse`
+/// (`rt64_camera_controller.cpp:50,62,74`); this crate already has exactly
+/// one 4x4 inverse, and a second would be a ~40-line duplicate of identical
+/// arithmetic under a different name. See module doc "Reuse, not new type".
+pub fn inverse4(m: fn64_render_ir::Mat4) -> fn64_render_ir::Mat4 {
+    crate::rt64_math_decompose::inverse4(m)
 }
 
 #[cfg(test)]
@@ -888,5 +1172,382 @@ mod tests {
         // linear/perspective gates inactive -> untouched b values, not NaN.
         assert_eq!(r.rows[3].x, b.rows[3].x);
         assert_eq!(r.rows[0].w, b.rows[0].w);
+    }
+
+    // --- matrix_scale / matrix_scale_vec3 ---
+
+    /// Asserts every one of the 16 elements, so a stray write anywhere is
+    /// caught rather than only the four the function intends to touch.
+    fn assert_mat4_exact(m: Mat4, expected: [[f32; 4]; 4], what: &str) {
+        for i in 0..4 {
+            let r = m.rows[i];
+            for (j, got) in [r.x, r.y, r.z, r.w].into_iter().enumerate() {
+                assert_eq!(got, expected[i][j], "{what}: element [{i}][{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_scale_writes_three_diagonals_and_a_literal_one_at_3_3() {
+        assert_mat4_exact(
+            matrix_scale(2.5),
+            [
+                [2.5, 0.0, 0.0, 0.0],
+                [0.0, 2.5, 0.0, 0.0],
+                [0.0, 0.0, 2.5, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "matrix_scale(2.5)",
+        );
+    }
+
+    /// `matrixScale` starts from `float4x4(0.0f)`, NOT the identity -- so a
+    /// scale of 0 must leave `[3][3]` at `1.0` and everything else `0.0`.
+    /// If the implementation were rewritten to start from the identity, the
+    /// three diagonal entries would be overwritten with 0 correctly but the
+    /// distinction would be invisible; this pins the zero-start by checking
+    /// the whole matrix at `scale == 0`.
+    #[test]
+    fn matrix_scale_zero_is_all_zero_except_a_one_at_3_3() {
+        assert_mat4_exact(
+            matrix_scale(0.0),
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "matrix_scale(0.0)",
+        );
+    }
+
+    /// `[3][3]` is a literal `1.0f` in the source, independent of `scale` --
+    /// it is not `scale` and not derived from it.
+    #[test]
+    fn matrix_scale_does_not_scale_the_3_3_element() {
+        assert_eq!(matrix_scale(7.0).rows[3].w, 1.0);
+        assert_eq!(matrix_scale(-3.0).rows[3].w, 1.0);
+    }
+
+    /// The three diagonal entries must take `x`, `y`, `z` in that order and
+    /// land on rows 0, 1, 2 respectively -- a permutation would survive a
+    /// uniform-scale test but not this one.
+    #[test]
+    fn matrix_scale_vec3_maps_xyz_to_the_diagonal_in_order() {
+        assert_mat4_exact(
+            matrix_scale_vec3(Vec3::new(2.0, 3.0, 5.0)),
+            [
+                [2.0, 0.0, 0.0, 0.0],
+                [0.0, 3.0, 0.0, 0.0],
+                [0.0, 0.0, 5.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "matrix_scale_vec3(2,3,5)",
+        );
+    }
+
+    #[test]
+    fn matrix_scale_vec3_with_equal_components_matches_the_scalar_overload() {
+        let uniform = matrix_scale(1.5);
+        let by_vec = matrix_scale_vec3(Vec3::new(1.5, 1.5, 1.5));
+        assert_eq!(uniform, by_vec);
+    }
+
+    // --- matrix_translation ---
+
+    #[test]
+    fn matrix_translation_writes_row_three_and_keeps_the_identity_elsewhere() {
+        assert_mat4_exact(
+            matrix_translation(Vec3::new(10.0, 20.0, 30.0)),
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [10.0, 20.0, 30.0, 1.0],
+            ],
+            "matrix_translation(10,20,30)",
+        );
+    }
+
+    /// Row-major row 3, NOT column 3. A column-vector-convention
+    /// implementation would put the translation in `rows[0].w`,
+    /// `rows[1].w`, `rows[2].w` -- the exact transpose. This asserts the
+    /// column is still the identity's, which is what distinguishes them.
+    #[test]
+    fn matrix_translation_uses_the_row_vector_convention_not_the_transpose() {
+        let m = matrix_translation(Vec3::new(4.0, 5.0, 6.0));
+        assert_eq!((m.rows[3].x, m.rows[3].y, m.rows[3].z), (4.0, 5.0, 6.0));
+        // The transposed (column) slots must be untouched zeros.
+        assert_eq!(m.rows[0].w, 0.0);
+        assert_eq!(m.rows[1].w, 0.0);
+        assert_eq!(m.rows[2].w, 0.0);
+    }
+
+    #[test]
+    fn matrix_translation_of_zero_is_exactly_the_identity() {
+        assert_eq!(matrix_translation(Vec3::new(0.0, 0.0, 0.0)), identity());
+    }
+
+    /// `[3][3]` comes from the identity and is never overwritten by `t`.
+    #[test]
+    fn matrix_translation_leaves_3_3_at_one() {
+        assert_eq!(
+            matrix_translation(Vec3::new(-1.0, -2.0, -3.0)).rows[3].w,
+            1.0
+        );
+    }
+
+    // --- rotation helpers ---
+
+    /// Asserts all nine elements of a `Mat3`, so a write to the wrong block
+    /// is caught even when the intended block is correct.
+    fn assert_mat3_exact(m: Mat3, expected: [[f32; 3]; 3], what: &str) {
+        for i in 0..3 {
+            let r = m.rows[i];
+            for (j, got) in [r.x, r.y, r.z].into_iter().enumerate() {
+                assert_eq!(got, expected[i][j], "{what}: element [{i}][{j}]");
+            }
+        }
+    }
+
+    fn mat3_ident() -> [[f32; 3]; 3] {
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+
+    // matrix_rotation_x: XY block, -sin above the diagonal.
+
+    #[test]
+    fn matrix_rotation_x_at_zero_is_the_identity_by_value() {
+        assert_mat3_exact(matrix_rotation_x(0.0), mat3_ident(), "rot_x(0)");
+    }
+
+    /// At `rad == 0` the `-sin` slot holds `-0.0`, which compares equal to
+    /// `0.0` and so is invisible to the by-value test above. Pinned at the
+    /// bit level because it is a genuine difference from `identity()`.
+    #[test]
+    fn matrix_rotation_x_at_zero_has_negative_zero_in_the_minus_sin_slot() {
+        let m = matrix_rotation_x(0.0);
+        assert_eq!(
+            m.rows[0].y.to_bits(),
+            (-0.0f32).to_bits(),
+            "m[0][1] is -0.0"
+        );
+        assert_eq!(m.rows[1].x.to_bits(), 0.0f32.to_bits(), "m[1][0] is +0.0");
+    }
+
+    /// `cos(f32::FRAC_PI_2)` is `-4.371139e-8`, not `0.0`, and `sin` is
+    /// exactly `1.0`. Values independently confirmed against a separate
+    /// computation; `-sin` therefore lands as exactly `-1.0`.
+    #[test]
+    fn matrix_rotation_x_at_half_pi_is_exact() {
+        let c = std::f32::consts::FRAC_PI_2.cos();
+        assert_eq!(c.to_bits(), 0xb33bbd2e, "cos(f32 pi/2) is not zero");
+        assert_mat3_exact(
+            matrix_rotation_x(std::f32::consts::FRAC_PI_2),
+            [[c, -1.0, 0.0], [1.0, c, 0.0], [0.0, 0.0, 1.0]],
+            "rot_x(pi/2)",
+        );
+    }
+
+    /// `sin(f32::PI)` is `-8.742278e-8` -- negative -- so the `-sin` slot
+    /// holds a small *positive* value here, the opposite of the naive
+    /// expectation.
+    #[test]
+    fn matrix_rotation_x_at_pi_is_exact() {
+        let s = std::f32::consts::PI.sin();
+        assert_eq!(s.to_bits(), 0xb3bbbd2e, "sin(f32 pi) is small and negative");
+        assert_mat3_exact(
+            matrix_rotation_x(std::f32::consts::PI),
+            [[-1.0, -s, 0.0], [s, -1.0, 0.0], [0.0, 0.0, 1.0]],
+            "rot_x(pi)",
+        );
+        assert!(matrix_rotation_x(std::f32::consts::PI).rows[0].y > 0.0);
+    }
+
+    #[test]
+    fn matrix_rotation_x_at_a_non_special_angle_is_exact() {
+        let (c, s) = (0.5f32.cos(), 0.5f32.sin());
+        assert_mat3_exact(
+            matrix_rotation_x(0.5),
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            "rot_x(0.5)",
+        );
+    }
+
+    /// The sign convention, stated explicitly: `-sin` ABOVE the diagonal at
+    /// `[0][1]`, `+sin` BELOW at `[1][0]`, and the untouched axis is Z.
+    /// A transpose or a sign flip fails this.
+    #[test]
+    fn matrix_rotation_x_sign_convention_and_block_are_pinned() {
+        let m = matrix_rotation_x(0.5);
+        let s = 0.5f32.sin();
+        assert!(
+            s > 0.0,
+            "sin(0.5) is positive, so the signs below are readable"
+        );
+        assert_eq!(m.rows[0].y, -s, "[0][1] is -sin (above the diagonal)");
+        assert_eq!(m.rows[1].x, s, "[1][0] is +sin (below the diagonal)");
+        // Named "X" but the untouched axis is Z: this is really a Z rotation.
+        assert_eq!(m.rows[2].z, 1.0, "[2][2] untouched -> rotates about Z");
+    }
+
+    // matrix_rotation_y: XZ block, +sin above the diagonal (MIRRORED).
+
+    #[test]
+    fn matrix_rotation_y_at_zero_is_the_identity_by_value() {
+        assert_mat3_exact(matrix_rotation_y(0.0), mat3_ident(), "rot_y(0)");
+    }
+
+    #[test]
+    fn matrix_rotation_y_at_half_pi_is_exact() {
+        let c = std::f32::consts::FRAC_PI_2.cos();
+        assert_mat3_exact(
+            matrix_rotation_y(std::f32::consts::FRAC_PI_2),
+            [[c, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, c]],
+            "rot_y(pi/2)",
+        );
+    }
+
+    #[test]
+    fn matrix_rotation_y_at_pi_is_exact() {
+        let s = std::f32::consts::PI.sin();
+        assert_mat3_exact(
+            matrix_rotation_y(std::f32::consts::PI),
+            [[-1.0, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, -1.0]],
+            "rot_y(pi)",
+        );
+    }
+
+    #[test]
+    fn matrix_rotation_y_at_a_non_special_angle_is_exact() {
+        let (c, s) = (0.5f32.cos(), 0.5f32.sin());
+        assert_mat3_exact(
+            matrix_rotation_y(0.5),
+            [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+            "rot_y(0.5)",
+        );
+    }
+
+    /// Y's sign convention is the MIRROR of X's and Z's: `+sin` above the
+    /// diagonal, `-sin` below. This is the trap the module doc warns about
+    /// -- a "normalized" Y matching its siblings would be a rotation by
+    /// `-rad`. Pinned against X so the asymmetry itself is asserted, not
+    /// just Y's values in isolation.
+    #[test]
+    fn matrix_rotation_y_sign_convention_is_mirrored_relative_to_x_and_z() {
+        let s = 0.5f32.sin();
+        let y = matrix_rotation_y(0.5);
+        assert_eq!(y.rows[0].z, s, "Y: [0][2] is +sin (above the diagonal)");
+        assert_eq!(y.rows[2].x, -s, "Y: [2][0] is -sin (below the diagonal)");
+        // X puts the signs the other way round.
+        let x = matrix_rotation_x(0.5);
+        assert_eq!(x.rows[0].y, -s, "X: -sin above");
+        assert_eq!(x.rows[1].x, s, "X: +sin below");
+        // Y's untouched axis is Y: this one IS named for the axis it rotates.
+        assert_eq!(y.rows[1].y, 1.0, "[1][1] untouched -> rotates about Y");
+    }
+
+    // matrix_rotation_z: YZ block, -sin above the diagonal.
+
+    #[test]
+    fn matrix_rotation_z_at_zero_is_the_identity_by_value() {
+        assert_mat3_exact(matrix_rotation_z(0.0), mat3_ident(), "rot_z(0)");
+    }
+
+    #[test]
+    fn matrix_rotation_z_at_half_pi_is_exact() {
+        let c = std::f32::consts::FRAC_PI_2.cos();
+        assert_mat3_exact(
+            matrix_rotation_z(std::f32::consts::FRAC_PI_2),
+            [[1.0, 0.0, 0.0], [0.0, c, -1.0], [0.0, 1.0, c]],
+            "rot_z(pi/2)",
+        );
+    }
+
+    #[test]
+    fn matrix_rotation_z_at_pi_is_exact() {
+        let s = std::f32::consts::PI.sin();
+        assert_mat3_exact(
+            matrix_rotation_z(std::f32::consts::PI),
+            [[1.0, 0.0, 0.0], [0.0, -1.0, -s], [0.0, s, -1.0]],
+            "rot_z(pi)",
+        );
+    }
+
+    #[test]
+    fn matrix_rotation_z_at_a_non_special_angle_is_exact() {
+        let (c, s) = (0.5f32.cos(), 0.5f32.sin());
+        assert_mat3_exact(
+            matrix_rotation_z(0.5),
+            [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+            "rot_z(0.5)",
+        );
+    }
+
+    /// Z's sign convention: `-sin` above the diagonal at `[1][2]`, `+sin`
+    /// below at `[2][1]`, matching X and opposing Y. Named "Z" but the
+    /// untouched axis is X.
+    #[test]
+    fn matrix_rotation_z_sign_convention_and_block_are_pinned() {
+        let m = matrix_rotation_z(0.5);
+        let s = 0.5f32.sin();
+        assert_eq!(m.rows[1].z, -s, "[1][2] is -sin (above the diagonal)");
+        assert_eq!(m.rows[2].y, s, "[2][1] is +sin (below the diagonal)");
+        assert_eq!(m.rows[0].x, 1.0, "[0][0] untouched -> rotates about X");
+    }
+
+    /// The three helpers touch three DISJOINT 2x2 blocks. Swapping any two
+    /// implementations, or writing to the wrong block, fails here.
+    #[test]
+    fn the_three_rotations_touch_three_disjoint_blocks() {
+        let (x, y, z) = (
+            matrix_rotation_x(0.5),
+            matrix_rotation_y(0.5),
+            matrix_rotation_z(0.5),
+        );
+        // X leaves row2/col2 alone; Y leaves row1/col1 alone; Z leaves row0/col0.
+        assert_eq!((x.rows[2].x, x.rows[2].y, x.rows[2].z), (0.0, 0.0, 1.0));
+        assert_eq!((y.rows[1].x, y.rows[1].y, y.rows[1].z), (0.0, 1.0, 0.0));
+        assert_eq!((z.rows[0].x, z.rows[0].y, z.rows[0].z), (1.0, 0.0, 0.0));
+        // And they are pairwise distinct at the same angle.
+        assert_ne!(x, y);
+        assert_ne!(y, z);
+        assert_ne!(x, z);
+    }
+
+    // --- inverse4 re-export ---
+
+    /// The re-export reaches the decompose module's landed inverse and
+    /// behaves as an inverse through THIS module's public API.
+    #[test]
+    fn inverse4_reexport_inverts_a_translation_through_the_public_api() {
+        let t = matrix_translation(Vec3::new(3.0, -4.0, 5.0));
+        let inv = inverse4(t);
+        // Inverse of a translation is the negated translation.
+        assert!((inv.rows[3].x - -3.0).abs() < 1e-5);
+        assert!((inv.rows[3].y - 4.0).abs() < 1e-5);
+        assert!((inv.rows[3].z - -5.0).abs() < 1e-5);
+        assert!((inv.rows[3].w - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn inverse4_reexport_inverts_a_uniform_scale_through_the_public_api() {
+        let inv = inverse4(matrix_scale(4.0));
+        assert!((inv.rows[0].x - 0.25).abs() < 1e-6);
+        assert!((inv.rows[1].y - 0.25).abs() < 1e-6);
+        assert!((inv.rows[2].z - 0.25).abs() < 1e-6);
+        assert!((inv.rows[3].w - 1.0).abs() < 1e-6);
+    }
+
+    /// Unguarded singular input is preserved by the re-export -- it does not
+    /// add a guard the underlying function does not have.
+    #[test]
+    fn inverse4_reexport_preserves_unguarded_singular_behavior() {
+        let inv = inverse4(matrix_scale(0.0));
+        let any_non_finite = (0..4).any(|i| {
+            let r = inv.rows[i];
+            [r.x, r.y, r.z, r.w].iter().any(|v| !v.is_finite())
+        });
+        assert!(any_non_finite, "singular input divides by zero, unguarded");
     }
 }

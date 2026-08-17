@@ -736,7 +736,13 @@ fn determinant4(m: Mat4) -> f32 {
 /// singular (zero-determinant) input divides by zero, producing `+-inf`/`NaN`
 /// entries rather than a panic or a guarded fallback, matching this
 /// codebase's unguarded-arithmetic precedent throughout `rt64_math*.rs`.
-fn inverse4(m: Mat4) -> Mat4 {
+///
+/// Visibility widened from private to `pub(crate)` (behavior, signature and
+/// body unchanged) so that `rt64_math_matrix.rs` can reuse the crate's
+/// single 4x4 inverse for RT64's `hlslpp::inverse` call sites instead of
+/// adding a second, duplicate cofactor inverse under a different name. See
+/// that module's doc comment for the full justification.
+pub(crate) fn inverse4(m: Mat4) -> Mat4 {
     let e = |i: usize, j: usize| mat4_get(m, i, j);
 
     // 3x3 minor determinant helper over an explicit row/column selection.
