@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 106 `ported`, 159 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 107 `ported`, 158 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -266,7 +266,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/shaders/Im3DPS.hlsl` | `unchanged` | `not-started` | -- | 22 | 1 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-shaders-im3dps-hlsl` |
 | `src/shaders/Im3DVS.hlsl` | `unchanged` | `not-started` | -- | 20 | 2 | 2 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-shaders-im3dvs-hlsl` |
 | `src/shaders/Library.hlsli` | `unchanged` | `not-started` | -- | 11 | 0 | 0 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shaders-library-hlsli` |
-| `src/shaders/Lights.hlsli` | `unchanged` | `not-started` | -- | 280 | 7 | 3 | `M12` / `ray-path-tracing` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m12-src-shaders-lights-hlsli` |
+| `src/shaders/Lights.hlsli` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_lights_math.rs` | 280 | 7 | 3 | `M12` / `ray-path-tracing` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m12-src-shaders-lights-hlsli` |
 | `src/shaders/LuminanceHistogramCS.hlsl` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_luminance_histogram.rs` | 55 | 3 | 1 | `M11` / `modernization` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m11-src-shaders-luminancehistogramcs-hlsl` |
 | `src/shaders/Math.hlsli` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/math_hlsli.rs` | 29 | 2 | 0 | `M8` / `feature-parity` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m8-src-shaders-math-hlsli` |
 | `src/shaders/PostBlendDitherNoisePS.hlsl` | `unchanged` | `not-started` | -- | 40 | 1 | 3 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shaders-postblenddithernoiseps-hlsl` |
