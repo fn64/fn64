@@ -15,9 +15,9 @@
 ## Workflow frontier
 
 - **COMPLETE milestones:** 0/13
-- **INTEGRATED / recorded tickets:** 20/53 — recorded ticket scope, **not a percent-to-goal**.
+- **INTEGRATED / recorded tickets:** 20/64 — recorded ticket scope, **not a percent-to-goal**.
 - **Milestones with no tickets:** `M6`, `M7`, `M9`, `M10`, `M12`
-- **Retrospective coverage:** 12/53; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`, `M8.1`, `M8.2`, `M8.3`, `M8.4`, `M8.5`, `M8.6`, `M8.7`, `M8.8`, `M8.9`, `M8.10`, `M8.11`, `M8.12`, `M8.13`, `M8.14`, `M5.1`, `M5.2`, `M5.3`, `M5.4`, `M5.5`, `M5.6`, `M5.7`, `M5.8`, `M5.9`, `M11.1`, `M11.2`, `M11.3`, `M11.4`
+- **Retrospective coverage:** 12/64; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`, `M4.4`, `M4.5`, `M4.6`, `M4.7`, `M4.8`, `M4.9`, `M4.10`, `M4.11`, `M4.12`, `M4.13`, `M4.14`, `M8.1`, `M8.2`, `M8.3`, `M8.4`, `M8.5`, `M8.6`, `M8.7`, `M8.8`, `M8.9`, `M8.10`, `M8.11`, `M8.12`, `M8.13`, `M8.14`, `M5.1`, `M5.2`, `M5.3`, `M5.4`, `M5.5`, `M5.6`, `M5.7`, `M5.8`, `M5.9`, `M11.1`, `M11.2`, `M11.3`, `M11.4`
 
 ### RUNNING (2)
 
@@ -29,9 +29,31 @@
 
 None.
 
-### READY (28)
+### READY (39)
 
 - `M2.5.2` — owner: integration lead; branch: `port/rt64-wgpu-ingestion-assessment` -> `main`; dependencies: M2.5.1=INTEGRATED; reliability: **NOT RECORDED**; next: Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
+
+- `M4.4` — owner: blender-analysis writer; branch: `port/m4-blender-analysis` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the predicate cluster as pure functions over OtherMode; unit-test each decoder against hand-built blenderInputs words and each predicate at its cycle-count boundary (0/1/2 cycles, forceBlend on and off).
+
+- `M4.5` — owner: blender-emulation-requirements writer; branch: `port/m4-blender-emulation-reqs` -> `main`; dependencies: M4.4=READY; reliability: **NOT RECORDED**; next: Port EmulationRequirements as an owned Rust struct returned by value; unit-test the simpleEmulation tree branch-by-branch and assert each Approximation pattern matches only its exact selector tuple.
+
+- `M4.6` — owner: rgba16-hdr-quantizer writer; branch: `port/m4-float4-rgba16-hdr` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port Float4ToRGBA16 with the explicit usesHDR parameter, then the two FbCommon dispatchers over it; unit-test the HDR and non-HDR cvgRange branches separately and assert the non-HDR path agrees with rgb_dither's landed integer tail.
+
+- `M4.7` — owner: fb-reinterpret kernel writer; branch: `port/m4-fb-reinterpret` -> `main`; dependencies: M4.6=READY; reliability: **NOT RECORDED**; next: Port each kernel as a pure function over an owned TMEM/TLUT slice; unit-test the four dispatch predicates plus both column-parity rules and both RGBA16toIA16 scale constants.
+
+- `M4.8` — owner: framebuffer-geometry writer; branch: `port/m4-framebuffer-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the cluster as pure functions plus a small owned Framebuffer-extent struct; unit-test the sub-word XOR-3 swap tail at 1/2/3 residual bytes and imageRowBytes across all four siz values.
+
+- `M4.9` — owner: framebuffer-storage writer; branch: `port/m4-framebuffer-storage` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the arena and handle table as an owned Rust struct; unit-test the exact capacity growth sequence across repeated stores and assert get() returns the last of several handles sharing one address.
+
+- `M4.10` — owner: framebuffer-tile geometry writer; branch: `port/m4-make-framebuffer-tile` -> `main`; dependencies: M4.8=READY; reliability: **NOT RECORDED**; next: Port the solver as a pure function returning Result over an owned tile struct; unit-test all six rejection paths plus the two sentinel-derived branches independently.
+
+- `M4.11` — owner: tmem-region tracker writer; branch: `port/m4-tmem-regions` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the region list as an owned Rust structure with the same ordering semantics; unit-test wraparound insertion, the mask-crossing recursion, and all four subtraction cases including the empty-region erase.
+
+- `M4.12` — owner: texture-map LRU writer; branch: `port/m4-texture-map-lru` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the slot table, access list and eviction sweep as an owned Rust structure over opaque handles; unit-test LIFO slot reuse, move-to-front on use, and the clamped-maxAge boundary at both ends.
+
+- `M4.13` — owner: render-target geometry writer; branch: `port/m4-render-target-geometry` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the four functions as pure math over owned scale/rect types; unit-test the pillarbox and letterbox branches separately and assert the misalignment result at several non-integer resolution scales.
+
+- `M4.14` — owner: texture-sampler address writer; branch: `port/m4-texture-sampler-address` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port the address arithmetic and the three filter blends as pure functions over caller-supplied texel samples; unit-test clamp, mirror and mask wrapping independently and pin the three-sample blend against hand-computed values at fx+fy on both sides of 1.0.
 
 - `M8.1` — owner: extended-GBI encoder writer; branch: `port/m8-extended-gbi-encode` -> `main`; dependencies: none; reliability: **NOT RECORDED**; next: Port PARAM plus the G_EX_* constant set and the gEX* encoders as pure functions returning (word0, word1) pairs; unit-test each encoder against the literal bit layout quoted from the header.
 
@@ -103,7 +125,7 @@ None.
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:5, READY:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:2, RUNNING:1 |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:2, READY:11, RUNNING:1 |
 | `M5` | `PLANNED` | GBI and deferred RSP | READY:9 |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -917,6 +939,289 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 **Blocker:** M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
 
 **Next action:** After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.
+
+### `M4.4` -- Port rt64_blender.h's CPU-side shader-SELECTION analysis: combineCycleCount, blendCycleCount, usesInput/usesCombinerAlpha, usesAlphaBlendCycle/usesAlphaBlend, usesStandardFogCycle, usesVisualizeCoverageCycle. Unwired CPU predicates; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | blender-analysis writer |
+| branch | `port/m4-blender-analysis` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_blender_analysis.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/shared/rt64_blender.h, 510 lines; take its sha256 from docs/rt64-port-inventory.json when writing the module doc.
+- NOT a duplicate of the landed blend.rs. That module ports the runtime EVALUATION path (blend_fragment/blend_a/blend_b/dual_source). This card ports the disjoint CPU ANALYSIS half RT64 uses to pick a pipeline before any fragment runs.
+- Symbol gate: blend_cycle_count, combine_cycle_count, uses_alpha_blend, uses_standard_fog_cycle and visualize_coverage have ZERO hits under crates/.
+- Reuse crate::state::OtherMode's landed cycle_type/force_blend/blender_cycle_1/blender_cycle_2 accessors. Do NOT edit state.rs -- ticket M4.2 holds it RUNNING and an edit there is an exclusivity violation.
+- Decode the P/M/A/B selectors from the raw 16-bit blenderInputs word per the header's own shifts (P: 14/12, M: 6/4, A: 10/8, B: 2/0). Second-cycle uses the LOW shift of each pair; first-cycle the high. Do not swap them.
+- usesVisualizeCoverageCycle is the direct prerequisite for FramebufferPair::earlyPresentCandidate, so this unblocks later framebuffer-pair work.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the predicate cluster as pure functions over OtherMode; unit-test each decoder against hand-built blenderInputs words and each predicate at its cycle-count boundary (0/1/2 cycles, forceBlend on and off).
+
+### `M4.5` -- Port rt64_blender.h's checkEmulationRequirements: per-cycle passthrough/numeratorOverflow/framebufferColor classification, the simpleEmulation decision tree, and the two named Approximation patterns. Unwired CPU classifier; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | blender-emulation-requirements writer |
+| branch | `port/m4-blender-emulation-reqs` -> `main` |
+| dependencies | M4.4=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_blender_emulation.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/shared/rt64_blender.h's HLSL_CPU-only EmulationRequirements block; take the file sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: EmulationRequirements, emulation_requirements and BlenderApproximation have ZERO hits under crates/.
+- Depends on M4.4 for decodeInputP/M/A/B and blendCycleCount; do not redefine those selectors or the cycle-count rule.
+- The decision tree is order-sensitive and each branch is separately reachable: cycle-0 numeratorOverflow+framebufferColor short-circuits BEFORE the two-cycle checks, so a table-driven test must cover both orderings, not just the outcome.
+- The two Approximation patterns are exact 8-selector equality patterns. AnyFramebuffer1MA_MultiplyMix deliberately does NOT constrain A0/A1 while CombinerFramebuffer1MA_SquareMix pins them to A_CC_ALPHA -- port the asymmetry literally rather than normalizing it.
+- Approximation::None is assigned only inside the two-cycle branch; a one-cycle non-simple case leaves the field at its zero-initialized default. Preserve that, do not 'fix' it.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port EmulationRequirements as an owned Rust struct returned by value; unit-test the simpleEmulation tree branch-by-branch and assert each Approximation pattern matches only its exact selector tuple.
+
+### `M4.6` -- Close rgb_dither.rs's named HDR frontier: port Float4ToRGBA16's full (float4, dither, usesHDR) signature, then FbCommon.hlsli's deferred Float4ToUINT16 and Float4ToUINT. Unwired CPU quantizers; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | rgba16-hdr-quantizer writer |
+| branch | `port/m4-float4-rgba16-hdr` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_float4_quantize.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- This closes TWO named deferrals, it is not a re-port. fbcommon.rs's Nonclaims says it 'does not port Float4ToUINT16's or Float4ToUINT's RGBA branch'; rgb_dither.rs's Frontier says 'A future HDR-target slice must port the usesHDR == true branch separately'.
+- Symbol gate: float4_to_rgba16, float4_to_uint16 and float4_to_uint have ZERO implementations under crates/ -- every hit is inside those two deferral notes.
+- Sources: src/shaders/FbCommon.hlsli (Float4ToUINT16/Float4ToUINT) and Formats.hlsli's Float4ToRGBA16; cite the FbCommon.hlsli sha256 from docs/rt64-port-inventory.json.
+- cvgRange is usesHDR ? 65535.0 : 255.0 and is applied ONLY to the alpha channel. r/g/b keep the 255.0 clamp in both branches -- do not scale them by cvgRange.
+- The alpha result is a single bit: cvgModulo = round(a*cvgRange) % 8, then a = (cvgModulo & 0x4) ? 1 : 0. Dither is added to r/g/b via min(x + dither, 255) >> 3 AFTER the clamp, never to alpha.
+- Reuse rgb_dither::quantize_post_float_rgba16_non_hdr for the non-HDR integer tail rather than re-deriving it; this module owns only the float front half plus the HDR branch. Extend that module's Frontier note to record what is now covered.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port Float4ToRGBA16 with the explicit usesHDR parameter, then the two FbCommon dispatchers over it; unit-test the HDR and non-HDR cvgRange branches separately and assert the non-HDR path agrees with rgb_dither's landed integer tail.
+
+### `M4.7` -- Port FbReinterpretCS.hlsl's four framebuffer format-reinterpretation kernels (RGBA16toCI8, ANY8toUINT8/toI8/toIA8, RGBA16toIA16) plus the format-dispatch predicate chain. Unwired CPU kernels; no GPU dispatch, no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | fb-reinterpret kernel writer |
+| branch | `port/m4-fb-reinterpret` -> `main` |
+| dependencies | M4.6=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_fb_reinterpret.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/shaders/FbReinterpretCS.hlsl, 99 lines; take its sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: rgba16_to_ci8, any8_to_i8, rgba16_to_ia16 and fb_reinterpret have ZERO hits under crates/.
+- Depends on M4.6 for Float4ToRGBA16 (RGBA16toCI8 calls it with the dither value and usesHDR). Do not re-port that quantizer here.
+- Reuse the landed random::RandomState (initRand/nextRand) and rgb_dither's DitherPatternValue rather than re-porting the PRNG; report a gap instead of copying if a needed helper is private.
+- RGBA16toIA16 is NOT a real format conversion: it encodes into a fake R10G10B10A2 (InputScale 1023.0) and decodes as a fake I16A16 (OutputScale 65535.0). Port the two DIFFERENT scale constants literally; conflating them silently changes every output.
+- RGBA16toCI8's pixelMisalignment is `1 - (outputCoord.x % 2)` -- note the inversion. ANY8toUINT8 instead picks green on an ODD column. The two parity rules point opposite ways; do not unify them.
+- The TLUT palette word is assembled big-endian across two TMEM bytes: loadTLUT(addr+1) | (loadTLUT(addr) << 8). decodedFormat is tlutFormat - 1, not tlutFormat.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port each kernel as a pure function over an owned TMEM/TLUT slice; unit-test the four dispatch predicates plus both column-parity rules and both RGBA16toIA16 scale constants.
+
+### `M4.8` -- Port rt64_framebuffer.cpp's pure geometry and RDRAM word-swap cluster: imageRowBytes, contains/overlaps, discardLastWrite, isLastWriteDifferent, clearChanged, addDitherPatterns, bestDitherPattern, FramebufferTile::valid, NativeTarget::getNativeSize, and both byte-swap loops. Unwired CPU helper; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | framebuffer-geometry writer |
+| branch | `port/m4-framebuffer-geometry` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/hle/rt64_framebuffer.cpp (202 lines) and src/hle/rt64_framebuffer.h (96 lines), plus NativeTarget::getNativeSize from src/render/rt64_native_target.cpp; take each sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: image_row_bytes, best_dither_pattern, get_native_size and FramebufferTile have ZERO hits under crates/.
+- Explicitly EXCLUDES FramebufferTile::hash -- it is XXH3_64bits over the raw struct bytes and XXH3 is a triage reject. State that exclusion in the module's Nonclaims.
+- Also excludes the RenderWorker/RHI methods (copyRenderTargetToNative, readChangeFrom*, nativeTarget.copyFrom/ToRAM); only the pure arithmetic around them is in scope.
+- The sub-word tail of copyNativeToRAM is the trap: when fewer than 4 bytes remain, RT64 does NOT byte-swap a word, it writes dstFirstWordU8[i ^ 3] = dstBytes[i] into a saved copy of the ORIGINAL first word. Port both the >= 4-byte loop and the XOR-3 tail; a single memcpy is wrong.
+- imageRowBytes is `rowWidth << siz >> 1` -- left-then-right shift order matters for siz == 0 (4-bit) and must not be rewritten as a division.
+- bestDitherPattern returns the INDEX of the max element (first max wins on ties, per std::max_element), not the count.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the cluster as pure functions plus a small owned Framebuffer-extent struct; unit-test the sub-word XOR-3 swap tail at 1/2/3 residual bytes and imageRowBytes across all four siz values.
+
+### `M4.9` -- Port FramebufferStorage: the append-only RDRAM arena with its 3/2 growth policy, plus the last-matching-handle-wins get() lookup bounded by maxFbPairIndex. Unwired CPU allocator; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `M` / `medium` / Claude Sonnet 5 |
+| owner | framebuffer-storage writer |
+| branch | `port/m4-framebuffer-storage` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/hle/rt64_framebuffer_storage.cpp (61 lines) and .h (35 lines); take both sha256 values from docs/rt64-port-inventory.json.
+- Symbol gate: FramebufferStorage, framebuffer_storage and rdram_used have ZERO hits under crates/.
+- Fully self-contained: no RHI, no hashing, no threads, no filesystem. This is the cleanest remaining M4 file.
+- Growth is `newSize = (rdramUsed * 3) / 2` computed AFTER rdramUsed was already advanced by size, and resize never shrinks. Reproduce the exact capacity sequence, not merely 'a growing vec'.
+- get() does NOT return the first match: it scans the whole handle vector and keeps the LAST entry whose fbPairIndex <= maxFbPairIndex and whose address matches exactly. Returning early on first match is a real behavior change.
+- reset() clears the handle vector and zeroes rdramUsed but deliberately RETAINS the allocated rdramData buffer. Preserve that retention.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the arena and handle table as an owned Rust struct; unit-test the exact capacity growth sequence across repeated stores and assert get() returns the last of several handles sharing one address.
+
+### `M4.10` -- Port FramebufferManager::makeFramebufferTile: the RDRAM-address-range to framebuffer-tile geometry solver, including every named rejection path. Unwired CPU geometry; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `F` / `high` / Claude Sonnet 5 |
+| owner | framebuffer-tile geometry writer |
+| branch | `port/m4-make-framebuffer-tile` -> `main` |
+| dependencies | M4.8=READY |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_framebuffer_tile.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/hle/rt64_framebuffer_manager.cpp's makeFramebufferTile (about 95 lines of the 1093-line file); take the file sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: make_framebuffer_tile and framebuffer_tile have ZERO hits under crates/.
+- Depends on M4.8 for imageRowBytes and bestDitherPattern; take the framebuffer extent as an owned input struct rather than reaching into a manager.
+- The function has SIX distinct false returns (address walked past fb end, end <= start, offset not pixel-aligned, misaligned multi-row load-block, degenerate bottom<=top, degenerate right<=left). Each needs its own fixture; collapsing them into one error loses the contract.
+- lineWidth == 0 and tileHeight == 0 are SENTINELS meaning 'derive from the framebuffer', not literal zeros -- load-block passes 0 for both. The tileHeight == 0 case additionally arms the misaligned-multi-row rejection.
+- pixelSize is `1 << siz >> 1`, which is 0 for siz == 0 (4-bit); the `offset % pixelSize` guard therefore divides by zero for 4-bit in C++. Report this as a frontier in the module doc rather than inventing a guard RT64 does not have.
+- pixelShift is 1 only for G_IM_SIZ_4b and scales the left/right coordinates but NOT the row math. Do not apply it to top/bottom.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the solver as a pure function returning Result over an owned tile struct; unit-test all six rejection paths plus the two sentinel-derived branches independently.
+
+### `M4.11` -- Port FramebufferManager's TMEM region interval tracker: insertRegionsTMEM's wraparound word splitting, discardRegionsTMEM's four-way interval subtraction with recursion, and synchronizeRegionsTMEM. Unwired CPU interval list; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `F` / `high` / Claude Sonnet 5 |
+| owner | tmem-region tracker writer |
+| branch | `port/m4-tmem-regions` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_tmem_regions.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/hle/rt64_framebuffer_manager.cpp's insertRegionsTMEM/discardRegionsTMEM/synchronizeRegionsTMEM (about 110 lines); take the file sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: RegionTMEM, region_tmem, insert_regions_tmem and discard_regions_tmem have ZERO hits under crates/. This is disjoint from ticket M4.2's physical-TMEM work, which owns byte contents, not address-range bookkeeping.
+- Do NOT write into crates/fn64-render-wgpu/src/tmem -- that directory is claimed by M4.2 (RUNNING) and M4.3 (BLOCKED). This card owns a new sibling module only.
+- insertRegionsTMEM pushes to the FRONT of the list and can emit multiple regions for one call as the wraparound cursor unwinds; RGBA32 runs the whole insertion twice, the second time offset by RDP_TMEM_WORDS >> 1. Preserve both the ordering and the double pass.
+- discardRegionsTMEM recurses when the range crosses the mask limit, and the second recursive call clamps its width with min(tmemStart, rightWords) -- an easy detail to drop, and dropping it silently over-discards.
+- The four-way subtraction has an asymmetry: the fully-contained case sets tmemEnd = tmemStart WITHOUT clearing fbTile, while all three partial cases clear fbTile first. Port that asymmetry literally.
+- The split case appends the right-hand remainder to the BACK of the list while insertion pushes to the front; the resulting order is observable and must be preserved.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the region list as an owned Rust structure with the same ordering semantics; unit-test wraparound insertion, the mask-crossing recursion, and all four subtraction cases including the empty-region erase.
+
+### `M4.12` -- Port TextureMap's slot allocator and LRU eviction policy: the LIFO free-slot reuse, the access-list move-to-front on use, and the age-clamped evict() rule. Unwired CPU cache policy; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `F` / `high` / Claude Sonnet 5 |
+| owner | texture-map LRU writer |
+| branch | `port/m4-texture-map-lru` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Source: src/render/rt64_texture_cache.cpp's TextureMap add/use/evict/clearReplacements/replace (about 190 lines of the 1791-line file); take the file sha256 from docs/rt64-port-inventory.json.
+- Symbol gate: TextureMap, texture_map, access_list and free_spaces have ZERO hits under crates/.
+- The REST of rt64_texture_cache.cpp is a triage reject (XXH3, stb_image, ddspp, zip filesystem, threads, mutexes). This card deliberately carves out the one dependency-free algorithm; state that boundary in Nonclaims. Texture handles are opaque u64/index values here, never real GPU textures.
+- The eviction rule is the substance: maxAge = clamp(lastUsedFrame - creationFrame, WORKLOAD_QUEUE_SIZE * 2, WORKLOAD_QUEUE_SIZE * 32). Note it clamps the entry's OWN lifetime, not its age -- a long-lived texture earns a longer grace period.
+- The reverse scan breaks early only when age == 0, not on the first non-evictable entry, so a fresh entry ahead of stale ones does not stop the sweep. Test that ordering explicitly.
+- Free slots are reused LIFO (back of the vector), and a reused slot's version counter increments rather than resetting. globalVersion increments on add/replace/clearReplacements but NOT on use.
+- Take WORKLOAD_QUEUE_SIZE as a named constant parameter and record its RT64 value in the doc rather than hard-coding an unexplained multiplier.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the slot table, access list and eviction sweep as an owned Rust structure over opaque handles; unit-test LIFO slot reuse, move-to-front on use, and the clamped-maxAge boundary at both ends.
+
+### `M4.13` -- Port RenderTarget's resolution geometry: computeScaledSize, computeFixedResolutionScale, the pillarbox viewport/scissor derivation, and viewportScissorIntersection. Unwired CPU geometry; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `I` / `high` / Claude Sonnet 5 |
+| owner | render-target geometry writer |
+| branch | `port/m4-render-target-geometry` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- Sources: src/render/rt64_render_target.cpp (the two statics plus copyFromChanges's pillarbox block) and src/render/rt64_framebuffer_renderer.cpp's viewportScissorIntersection; take both sha256 values from docs/rt64-port-inventory.json.
+- Symbol gate: compute_scaled_size, compute_fixed_resolution_scale and viewport_scissor_intersection have ZERO hits under crates/.
+- The rest of both files is RHI plumbing (descriptor sets, barriers, command lists) and is out of scope; say so in Nonclaims.
+- computeScaledSize uses resolutionScale.y for the NATIVE width and the height but resolutionScale.x for the EXPANDED width. Swapping x and y here is silent and wrong -- the misalignment output depends on the difference between the two widths.
+- lround is round-half-away-from-zero, which Rust's f32::round matches; f32 as i64 truncates and does not. Use the rounding form, and clamp to MaxDimension 0x4000 with a floor of 1.
+- computeFixedResolutionScale forces an EVEN width via `w += w & 1` and then recomputes the scale as a ratio -- it returns a modified scale, not a size.
+- The pillarbox branch is selected by resolutionScale.x > resolutionScale.y and swaps which axis drives targetWidth/targetHeight; the scissor then floors the origin and ceils the extent. Port floor/ceil literally rather than rounding both.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the four functions as pure math over owned scale/rect types; unit-test the pillarbox and letterbox branches separately and assert the misalignment result at several non-integer resolution scales.
+
+### `M4.14` -- Close TextureSampler.hlsli's deferred sampling cluster: clampWrapMirrorSample's texel address arithmetic and sampleTextureLevel's filter blends, including the three-sample bilinear. Unwired CPU address/blend math; no parity claim.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `READY` |
+| profile / effort / model | `F` / `high` / Claude Sonnet 5 |
+| owner | texture-sampler address writer |
+| branch | `port/m4-texture-sampler-address` -> `main` |
+| dependencies | none |
+| writable paths | `crates/fn64-render-wgpu/src/rt64_texture_sampler_address.rs` |
+| reliability | **NOT RECORDED** |
+
+**Findings:**
+
+- This closes a real named deferral. texture_lod.rs ports only computeLOD (46 of TextureSampler.hlsli's 359 lines) yet the inventory marks the whole file ported -- treat that row as coarse, exactly like rt64_math.cpp's.
+- Symbol gate: clamp_wrap_mirror, sample_texture_level and three_sample / tri0 / tri1 have ZERO hits under crates/.
+- Sources: src/shaders/TextureSampler.hlsli's clampWrapMirrorSample and sampleTextureLevel; take the file sha256 from docs/rt64-port-inventory.json.
+- Scope split: port the ADDRESS arithmetic and the BLEND arithmetic only. The actual fetch (sampleTMEM, gTextures.Load, the nine native-sampler SampleLevel arms) is a resource binding this crate does not have -- take the four texel samples as caller-supplied values.
+- HLSL lerp(x,y,s) is x + s*(y-x). Spell that form out; do not reach for a mix-shaped e1*(1-s)+e2*s expression, which is a different float computation.
+- The three-sample path is the substance: tri0 = lerp(s00,s10,fx) + (s01-s00)*fy; tri1 = lerp(s11,s01,1-fx) + (s10-s11)*(1-fy); result = lerp(tri0,tri1,step(1,fx+fy)). Note the reversed argument order in tri1 -- it is not a mirror of tri0.
+- The mirror rule needs both the masks>0 guard and the modulo(t, masks*2) >= masks test; when masks is 0 the else branch still calls modulo(t, 0). Report that divide-by-zero as a frontier rather than inventing a guard.
+- filterAverage only takes effect when both filterAverage AND all(abs(frac - 0.5) <= 1/128) hold; the doubled filterAverage test in RT64's source is redundant but harmless -- port the effective condition and note the redundancy.
+- Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.
+
+**Next action:** Port the address arithmetic and the three filter blends as pure functions over caller-supplied texel samples; unit-test clamp, mirror and mask wrapping independently and pin the three-sample blend against hand-computed values at fx+fy on both sides of 1.0.
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 
