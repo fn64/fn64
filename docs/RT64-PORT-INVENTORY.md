@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 28 `ported`, 237 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 33 `ported`, 232 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -313,11 +313,11 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/shared/rt64_render_indices.h` | `unchanged` | `not-started` | -- | 21 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-render-indices-h` |
 | `src/shared/rt64_render_params.h` | `unchanged` | `not-started` | -- | 27 | 1 | 2 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-render-params-h` |
 | `src/shared/rt64_render_target_copy.h` | `unchanged` | `not-started` | -- | 17 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-render-target-copy-h` |
-| `src/shared/rt64_rsp_fog.h` | `unchanged` | `not-started` | -- | 18 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-fog-h` |
-| `src/shared/rt64_rsp_light.h` | `unchanged` | `not-started` | -- | 67 | 6 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-light-h` |
-| `src/shared/rt64_rsp_lookat.h` | `unchanged` | `not-started` | -- | 22 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-lookat-h` |
-| `src/shared/rt64_rsp_vertex_test_z.h` | `unchanged` | `not-started` | -- | 21 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-vertex-test-z-h` |
-| `src/shared/rt64_rsp_viewport.h` | `unchanged` | `not-started` | -- | 45 | 5 | 2 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-viewport-h` |
+| `src/shared/rt64_rsp_fog.h` | `unchanged` | `ported` | `crates/fn64-render-ir/src/rsp_math.rs` | 18 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-fog-h` |
+| `src/shared/rt64_rsp_light.h` | `unchanged` | `ported` | `crates/fn64-render-ir/src/rsp_math.rs` | 67 | 6 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-light-h` |
+| `src/shared/rt64_rsp_lookat.h` | `unchanged` | `ported` | `crates/fn64-render-ir/src/rsp_math.rs` | 22 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-lookat-h` |
+| `src/shared/rt64_rsp_vertex_test_z.h` | `unchanged` | `ported` | `crates/fn64-render-ir/src/rsp_math.rs` | 21 | 1 | 1 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-vertex-test-z-h` |
+| `src/shared/rt64_rsp_viewport.h` | `unchanged` | `ported` | `crates/fn64-render-ir/src/rsp_math.rs` | 45 | 5 | 2 | `M5` / `gbi-deferred-rsp` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (I/high) | `rt64-port-m5-src-shared-rt64-rsp-viewport-h` |
 | `src/shared/rt64_texture_copy.h` | `unchanged` | `not-started` | -- | 18 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-texture-copy-h` |
 | `src/shared/rt64_video_interface.h` | `unchanged` | `not-started` | -- | 19 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-video-interface-h` |
 
