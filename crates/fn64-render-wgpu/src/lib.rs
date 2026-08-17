@@ -339,6 +339,7 @@ mod shader_manifest;
 mod state;
 mod targets;
 mod texture_gen;
+mod texture_lod;
 mod tmem;
 mod vi;
 
