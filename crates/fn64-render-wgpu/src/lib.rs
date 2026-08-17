@@ -353,6 +353,7 @@ mod rt64_gbi_f3d;
 mod rt64_gbi_f3d_variants;
 mod rt64_gbi_f3dex;
 mod rt64_gbi_f3dex2;
+mod rt64_gbi_opcodes;
 mod rt64_gbi_rdp_decode;
 mod rt64_gbi_s2dex2;
 mod rt64_hlsl_interop;
