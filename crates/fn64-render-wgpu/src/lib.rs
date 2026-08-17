@@ -356,7 +356,7 @@ pub use combiner::{
 pub use coverage::{
     apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,
     CoverageMask, CoverageModeBits, CoverageResult, CoveredAttributeSample, COVERAGE_ENTRY_POINT,
-    COVERAGE_SAMPLES, COVERAGE_WGSL,
+    COVERAGE_FRAGMENT_FN_WGSL, COVERAGE_SAMPLES, COVERAGE_WGSL,
 };
 pub use depth_mode::{
     depth_mode_decision, mode_passes, relations, DepthModeDecision, DepthRelations,

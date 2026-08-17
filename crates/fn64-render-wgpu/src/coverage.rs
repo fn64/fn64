@@ -311,5 +311,17 @@ pub const fn attribute_sample(mask: CoverageMask) -> AttributeSamplePoint {
 pub const COVERAGE_WGSL: &str = include_str!("coverage.wgsl");
 pub const COVERAGE_ENTRY_POINT: &str = "evaluate_coverage";
 
+/// Fragment-callable twin of [`COVERAGE_WGSL`]'s existing `evaluate`
+/// compute-shader logic: an ordinary WGSL function (`coverage_fragment_fn`,
+/// no `@compute`, no `@group`/`@binding`, no entry point) taking scalar
+/// arguments and returning a plain struct, concatenatable into a future
+/// `@fragment` entry point the same way `color_combiner.wgsl` already is per
+/// `shaders/triangle_pipeline_fragment.wgsl`'s header. Not wired into any
+/// draw path, bind group layout, or pipeline used elsewhere in this crate --
+/// see this module's doc comment and the sibling `coverage.wgsl`'s own
+/// header for the shared scope boundary. The existing `COVERAGE_WGSL`
+/// `@compute` entry point is untouched by this addition.
+pub const COVERAGE_FRAGMENT_FN_WGSL: &str = include_str!("coverage_fragment_fn.wgsl");
+
 #[cfg(test)]
 mod tests;

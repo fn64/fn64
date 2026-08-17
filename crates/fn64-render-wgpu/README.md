@@ -846,6 +846,118 @@ this slice owns no rasterizer to sample against. This slice cites, reads,
 and claims no RT64 source byte, no framebuffer-read GPU mechanism, no
 native/GPU-verified execution, and no parity of any kind.
 
+## 2026-08-16: Coverage, fragment-callable WGSL seam
+
+Per `/private/tmp/fn64-post-texture-next-production-card.md` (a read-only
+planning artifact, not a file committed to this repository): re-expresses
+the already-characterized, already-tested RDP `cvg_dst` accumulation
+arithmetic (`coverage_result`/`apply_coverage_alpha`, "Coverage: pure
+`cvg_dst` semantics (port-card slice 5)" above) as a plain, fragment-callable
+WGSL function, alongside the existing standalone `@compute` seam it already
+had. This card is a sibling of the alpha-compare fragment-callable slice
+immediately above it in this program's own step ordering (alpha-compare is
+step 4, coverage is step 5 of the same blender/coverage/alpha-compare/depth
+port-card ladder) — same pattern, disjoint fixture family, no dependency
+either direction.
+
+`coverage.wgsl`'s existing `evaluate` function takes a single
+`CoverageInput` struct read from a storage buffer and returns a
+`CoverageOutput` struct written to a second storage buffer, matching that
+file's `@compute @workgroup_size(64)` dispatch shape. The new sibling file,
+`coverage_fragment_fn.wgsl`, re-expresses the identical arithmetic verbatim
+as `coverage_fragment_fn` — an ordinary function taking nine scalar `u32`
+arguments (`pixel_count`, `memory_count`, `image_read_enabled`,
+`force_blend`, `antialias_enabled`, `coverage_destination`,
+`coverage_times_alpha`, `alpha_coverage_select`, `fragment_alpha`) and
+returning a plain `CoverageFragmentResult` struct, with no `@compute`,
+`@group`/`@binding`, or entry point of its own. This mirrors
+`coverage_result`/`apply_coverage_alpha`'s own Rust-side signature exactly
+(`pixel`/`memory`/mode bits in, a result struct out), rather than inventing
+a new call shape, and is callable from a future `@fragment` entry point via
+WGSL's ordinary function-concatenation build seam — the same mechanism
+`shaders/triangle_pipeline_fragment.wgsl`'s own header already documents for
+`color_combiner.wgsl`. `coverage.rs` exposes it as a new constant,
+`COVERAGE_FRAGMENT_FN_WGSL` (`include_str!`), re-exported from this crate's
+root alongside the existing `COVERAGE_WGSL`/`COVERAGE_ENTRY_POINT`
+constants. The existing `coverage.wgsl` `@compute` entry point, and every
+existing test in `coverage.rs`/`coverage/tests.rs`, are unmodified.
+
+The new function ports the **complete** four-way `cvg_dst` match
+(`Clamp`/`Wrap`/`Full`/`Save`) — there is no honest partial port of
+`evaluate`, since the reference's own `coverage_result` is one function body
+with one `match`. `Clamp`/`Wrap` are transcribed but, per the boundary
+below, not independently GPU-differentially validated by this slice.
+
+**Tests.** Naga parse/validation and textual structural guards (the exact
+`Full`/`Save` destination-assignment literals, the exact
+`coverage_alpha`/`coverage_times_alpha_value` rounding-formula expressions)
+mirror the sibling file's own existing convention. The load-bearing addition
+is a CPU-vs-WGSL differential over a frozen fixture partition matching the
+implementation card's own §4: `cvg_dst=Full` crossed with `pixel.count()` ∈
+{0,1,4,8}, `memory.count()` ∈ {0,8} (proving `memory` is ignored under
+`Full`), and every `image_read_enabled`/`force_blend`/`antialias_enabled`
+combination (`destination=Coverage::FULL` unconditionally, `wraps`/
+`blend_enabled` still asserted per `coverage_result`'s unconditional first
+three statements); `cvg_dst=Save` crossed with `pixel.count()` ∈ {0,4,8},
+`memory.count()` ∈ {0,3,8} (literal hand-supplied stand-ins for a future
+framebuffer read, not claimed to come from one) and the same mode-bit
+combinations (`destination=memory` unconditionally); and the four
+`coverage_times_alpha`/`alpha_coverage_select` composition cases applied on
+top of a `Full`-mode `destination=8`, including the sequencing-discriminator
+case (`coverage_times_alpha=true, alpha_coverage_select=true` ->
+`adjusted_coverage=6, adjusted_alpha=191` — a wrong implementation reading
+the raw `destination` instead of the already-times-alpha-adjusted coverage
+here would produce `alpha=255`, not `191`). Every fixture case is computed
+three independent ways and asserted equal: the frozen, hand-derived expected
+values; the Rust oracle (`coverage_result`/`apply_coverage_alpha`,
+`#[cfg(test)]`, no GPU); and the new WGSL function itself, executed on a
+real native adapter through a minimal `#[cfg(feature = "host-gpu-tests")]`
+compute-shim harness — a throwaway `@compute` entry point that calls
+`coverage_fragment_fn` directly per fixture case and reads its result struct
+back via a storage buffer. That harness is new test-only scaffolding; it
+does not claim the function runs inside any real fragment shader (see
+Nonclaims below). The harness ran 10 consecutive times from a clean process
+each time on this crate's certified M2.2 Metal adapter, all passing, with no
+`NoAdapter` fallback observed.
+
+**`Clamp`/`Wrap` GPU-validation boundary, stated explicitly.** The new
+function's `Clamp`/`Wrap` branches are transcribed (the function is a
+complete port of `evaluate`, not a partial one) but **not** independently
+validated against a real GPU-sourced `memory: Coverage` value by this
+slice's test suite — both modes need a real prior-frame/prior-draw coverage
+read, which is exactly the framebuffer-read problem this slice exists to
+route around (see Nonclaims below). A future slice resolving that problem
+should extend this fixture to cover `Clamp`/`Wrap` with a real GPU-sourced
+`memory` value at that time; until then, treat `Clamp`/`Wrap` as
+"implemented but GPU-unvalidated," not "missing."
+
+**Nonclaims.** This slice does not touch `targets/triangle_pipeline.rs`,
+`shaders/triangle_pipeline_{fragment,vertex}.wgsl`, or `production.rs` — no
+triangle drawn through the real production pipeline has its coverage
+computed or written by this slice, and no bind-group/uniform layout for the
+mode bits or the fragment's own rasterized `pixel` coverage count is decided
+here. Three other lanes claim (or reserve) those files concurrently as of
+this slice's freeze (varying-UV committed-TMEM texture sampling into the
+production triangle draw path, `TextureRectangle`/`TextureRectangleFlip`
+decode admission, and the alpha-compare fragment-callable seam immediately
+above); this slice is independent of all three — it touches none of their
+claimed paths and requires nothing any of them produce. The deferred
+wire-in step (adding a `CoverageModeBits`-shaped bind-group entry or uniform
+field to `triangle_pipeline_fragment.wgsl`, calling this function from
+`fs_main`, deciding how the fragment's own rasterized coverage count is
+sourced, and — the hard part — deciding the coverage-buffer write mechanism,
+since a standard `discard`-based fragment shader cannot express "write
+coverage but suppress color") becomes safe to dispatch once the contested
+lanes' own diffs are known, so this new function can be composed into them
+without reopening any lane's in-flight work — not attempted in this slice.
+Also out of scope, matching the port card: the `memory: Coverage` source
+for any mode (the framebuffer-read problem itself, named and deferred, not
+solved, here), `CoverageMask`/`attribute_sample` (the 8-sample checkerboard
+mask and its partial-coverage attribute-point policy — a separate,
+rasterizer-level, still-unwired concern), `depth_mode`/`blend`/
+`alpha_compare`'s equally-unwired or separately-owned characterized seams,
+RT64 pixel/visual parity, and any performance or throughput claim.
+
 ## T3 Phase A/B: the production raw-DPC `WgpuBackend`
 
 Separately from the M-numbered lineage above (a different migration track:
