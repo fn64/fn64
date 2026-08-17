@@ -345,6 +345,21 @@ impl TriangleRasterParams {
     }
 }
 
+/// Serializes the vertex shader's `RasterParams` uniform with `is_rect`
+/// folded into `reserved_0` (bytes 24..28) -- the seam between
+/// `TriangleFixture.is_rect` and the bytes the GPU actually receives; see
+/// `shaders/triangle_pipeline_vertex.wgsl`'s `is_rect` gate.
+fn raster_params_bytes(
+    params: TriangleRasterParams,
+    is_rect: bool,
+) -> [u8; RASTER_PARAMS_BYTES as usize] {
+    let mut bytes = params.to_bytes();
+    bytes[24..28].copy_from_slice(&u32::from(is_rect).to_le_bytes());
+    // bytes[28..32] left zero: WGSL struct pads to a 16-byte multiple (one
+    // trailing f32 reserved field), matching `RasterParams`'s `reserved_1`.
+    bytes
+}
+
 /// Small fixed render target extent (port card §3: "propose 8x8 or 16x16").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriangleTargetExtent {
@@ -400,6 +415,66 @@ pub struct TriangleFixture {
     pub antialias_enabled: bool,
     pub coverage_times_alpha: bool,
     pub alpha_coverage_select: bool,
+    /// `true` for a `TextureRectangle`/`TextureRectangleFlip`-sourced
+    /// triangle; gates the vertex shader's RDP-screen-to-NDC transform off
+    /// (see `shaders/triangle_pipeline_vertex.wgsl`'s `is_rect` gate) since
+    /// a rectangle's six vertices are already fixed NDC corners.
+    pub is_rect: bool,
+}
+
+/// Converts one admitted raw-DPC triangle draw's own arguments (vertices,
+/// `OtherMode`, combine/tile/tmem state, per-draw viewport-derived raster
+/// params) into a [`TriangleFixture`], applying the same field-by-field
+/// mapping [`TrianglePipelineRenderer::submit_admitted_triangle`] used to
+/// build its single fixture before delegating to [`Self::submit_triangle`]
+/// -- the sole conversion this crate uses both for that one-triangle path
+/// and for `production.rs`'s `draw_admitted_triangles`, which must collect
+/// one [`TriangleFixture`] per draw into a `Vec` and submit them all through
+/// one [`TrianglePipelineRenderer::submit_triangles`] call so a multi-
+/// triangle primitive (e.g. a `TextureRectangle`'s two triangles) lands in
+/// one shared render pass instead of each triangle re-clearing the target.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admitted_triangle_fixture(
+    vertices: [NeutralTriangleVertex; 3],
+    other_mode: OtherMode,
+    combine_params: CombineParams,
+    raster_params: TriangleRasterParams,
+    extent: TriangleTargetExtent,
+    tmem: TmemGpuProjection,
+    tile_binding: TileBindingParams,
+    blend_color: Option<Color4>,
+    env_color: Option<Color4>,
+    prim_color: Option<PrimColor>,
+    is_rect: bool,
+) -> TriangleFixture {
+    let alpha_compare_mode = match other_mode.alpha_compare() {
+        mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
+        unsupported @ (AlphaCompare::Reserved | AlphaCompare::Dither) => unreachable!(
+            "admitted_triangle_fixture received alpha-compare mode {unsupported:?}, which must \
+             have been rejected at retrieval time before reaching the pipeline"
+        ),
+    };
+    TriangleFixture {
+        vertices: vertices.map(neutral_vertex_to_raster_vertex),
+        raster_params,
+        combine_params,
+        extent,
+        tmem,
+        tile_binding,
+        alpha_compare_mode,
+        blend_color,
+        env_color,
+        prim_color,
+        depth_compare_enabled: other_mode.depth_compare_enabled(),
+        depth_update_enabled: other_mode.depth_update_enabled(),
+        coverage_destination: other_mode.coverage_destination(),
+        image_read_enabled: other_mode.image_read_enabled(),
+        force_blend: other_mode.force_blend(),
+        antialias_enabled: other_mode.antialias_enabled(),
+        coverage_times_alpha: other_mode.coverage_times_alpha(),
+        alpha_coverage_select: other_mode.alpha_coverage_select(),
+        is_rect,
+    }
 }
 
 /// Maps a draw's `(Z_CMP, Z_UPD)` enable bits
@@ -925,34 +1000,21 @@ impl TrianglePipelineRenderer {
         blend_color: Option<Color4>,
         env_color: Option<Color4>,
         prim_color: Option<PrimColor>,
+        is_rect: bool,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
-        let alpha_compare_mode = match other_mode.alpha_compare() {
-            mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
-            unsupported @ (AlphaCompare::Reserved | AlphaCompare::Dither) => unreachable!(
-                "submit_admitted_triangle received alpha-compare mode {unsupported:?}, which \
-                 must have been rejected at retrieval time before reaching the pipeline"
-            ),
-        };
-        let fixture = TriangleFixture {
-            vertices: vertices.map(neutral_vertex_to_raster_vertex),
-            raster_params,
+        let fixture = admitted_triangle_fixture(
+            vertices,
+            other_mode,
             combine_params,
+            raster_params,
             extent,
             tmem,
             tile_binding,
-            alpha_compare_mode,
             blend_color,
             env_color,
             prim_color,
-            depth_compare_enabled: other_mode.depth_compare_enabled(),
-            depth_update_enabled: other_mode.depth_update_enabled(),
-            coverage_destination: other_mode.coverage_destination(),
-            image_read_enabled: other_mode.image_read_enabled(),
-            force_blend: other_mode.force_blend(),
-            antialias_enabled: other_mode.antialias_enabled(),
-            coverage_times_alpha: other_mode.coverage_times_alpha(),
-            alpha_coverage_select: other_mode.alpha_coverage_select(),
-        };
+            is_rect,
+        );
         self.submit_triangle(fixture)
     }
 
@@ -1053,8 +1115,11 @@ impl TrianglePipelineRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue
-                .write_buffer(&raster_params_buffer, 0, &fixture.raster_params.to_bytes());
+            self.queue.write_buffer(
+                &raster_params_buffer,
+                0,
+                &raster_params_bytes(fixture.raster_params, fixture.is_rect),
+            );
             let combine_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("fn64-triangle-pipeline-combine-params"),
                 size: COMBINE_PARAMS_BYTES,

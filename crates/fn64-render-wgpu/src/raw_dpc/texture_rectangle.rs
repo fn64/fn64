@@ -20,9 +20,12 @@
 //! `bottom`/`width`/`height` (the bounded default-alignment quarter-pixel
 //! rounding this module ports).
 //!
-//! Nonclaims (explicitly out of this slice): no production raw-DPC
-//! admission or execution -- this module is not wired into
-//! `decode_stream`/`push_decoded_raw_dpc`; no scissor-rectangle
+//! `texture_rectangle_vertices` is called directly from
+//! `raw_dpc::production_adapter`'s `TextureRectangle` admission arm; the
+//! returned `viewport` bounds feed that caller's own per-draw
+//! `screen_scale`/`screen_offset` placement.
+//!
+//! Nonclaims (explicitly out of this slice): no scissor-rectangle
 //! intersection, no `movedFromOrigin`/`ExtendedAlignment` origin-stack
 //! offset (RT64's `drawRect` applies both before constructing its
 //! `FixedRect`; this module constructs the `FixedRect` directly from
@@ -36,6 +39,8 @@
 //! conversion has no state to attach to and does not reproduce.
 
 use core::fmt;
+
+use fn64_render::RectViewportPixels;
 
 use crate::state::CycleType;
 
@@ -234,6 +239,7 @@ impl TextureRectangleVertex {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextureRectangleVertices {
     vertices: [TextureRectangleVertex; 6],
+    pub viewport: RectViewportPixels,
 }
 
 impl TextureRectangleVertices {
@@ -440,7 +446,15 @@ pub fn texture_rectangle_vertices(
         };
     }
 
-    Some(TextureRectangleVertices { vertices })
+    Some(TextureRectangleVertices {
+        vertices,
+        viewport: RectViewportPixels {
+            left,
+            top,
+            right,
+            bottom,
+        },
+    })
 }
 
 #[cfg(test)]

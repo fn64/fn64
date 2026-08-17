@@ -26,8 +26,8 @@ pub use production::{
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
     RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
     RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, ReadyPublication,
-    ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
-    TmemTransferLayout,
+    ReadyRawDpcCommitCapsule, RectViewportPixels, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
+    TmemLoadShape, TmemTransferLayout, TriangleSource,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -1373,6 +1373,31 @@ mod production {
         pub location: RawDpcCommandLocation,
         pub raw_words: Box<[u32]>,
         pub vertices: [NeutralTriangleVertex; 3],
+        pub source: TriangleSource,
+        pub viewport: Option<RectViewportPixels>,
+    }
+
+    /// Which wire command admitted this triangle: a genuine `RawTriangle`
+    /// (0xC8-0xCF family) versus one synthesized from a `TextureRectangle`/
+    /// `TextureRectangleFlip` (0x24/0x25) two-triangle expansion. Constructed
+    /// only at the two admission sites in `production_adapter.rs` -- see
+    /// that file's `RawTriangle`/`TextureRectangle` match arms.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TriangleSource {
+        RawTriangle,
+        TextureRectangle,
+    }
+
+    /// Pixel-space `left`/`top`/`right`/`bottom` bounds of a `TextureRectangle`
+    /// draw, RT64's `FixedRect`-equivalent (`rt64_rdp.cpp:1232`). `None` on
+    /// [`RdpTriangleCommand`] for `TriangleSource::RawTriangle`; `Some` only
+    /// for `TriangleSource::TextureRectangle`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RectViewportPixels {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
     }
 
     /// One neutral, borrowed semantic view of a decoded raw-DPC command.
@@ -2631,6 +2656,8 @@ mod production {
             writer.push_triangle(RdpTriangleCommand {
                 location,
                 raw_words: words.into_boxed_slice(),
+                source: TriangleSource::RawTriangle,
+                viewport: None,
                 vertices: [NeutralTriangleVertex {
                     x: 0.0,
                     y: 0.0,

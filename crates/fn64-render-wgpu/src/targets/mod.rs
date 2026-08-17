@@ -33,6 +33,7 @@ pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
+pub(crate) use triangle_pipeline::admitted_triangle_fixture;
 pub use triangle_pipeline::{
     fixed_fixture_other_mode, InFlightTriangleDraw, RasterVertex, TriangleDrawOutput,
     TriangleFixture, TrianglePipelineDeviceOutcome, TrianglePipelineError,

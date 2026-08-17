@@ -24,7 +24,7 @@ use fn64_render::{
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcCoordinator, RawDpcExecutionView,
     RawDpcIrCapability, RawDpcPlanRequest, RawDpcSemanticCommandRef, RdpStateCommand,
     RdpTriangleCommand, ReadyRawDpcCommitCapsule, RenderBackend, RenderConfig, RenderError,
-    TmemLoadSemantics, TmemLoadShape,
+    TmemLoadSemantics, TmemLoadShape, TriangleSource,
 };
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CapturedGuestRead, CompletedWrite,
@@ -33,6 +33,7 @@ use fn64_render_ir::{
 };
 
 use crate::raw_dpc::push_decoded_raw_dpc;
+use crate::targets::admitted_triangle_fixture;
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
     AlphaCompare, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode,
@@ -211,16 +212,38 @@ impl WgpuBackend {
             .expect("create_inner must succeed before this test accessor is used")
     }
 
-    /// Draws every collected triangle, in stream order, through
-    /// `TrianglePipelineRenderer::submit_admitted_triangle`, using the
-    /// identity `TriangleRasterParams` derived once from the stored
-    /// `triangle_target_extent` (never recomputed per triangle, never
-    /// defaulted). `last_triangle_draw()` updates only after every
-    /// triangle in this call draws successfully -- a failure partway
-    /// through leaves the prior successful value in place, unchanged,
-    /// never cleared: an old-but-real result outlives a failed attempt to
-    /// replace it, matching this file's own "never a silent partial
-    /// state" convention elsewhere.
+    /// Maps every collected triangle, in stream order, into one
+    /// `TriangleFixture` each (via `targets::triangle_pipeline`'s
+    /// `admitted_triangle_fixture`, the same conversion
+    /// `submit_admitted_triangle` uses for its own single-fixture path),
+    /// using the identity `TriangleRasterParams` derived once from the
+    /// stored `triangle_target_extent` (never recomputed per triangle,
+    /// never defaulted) plus each draw's own viewport-derived
+    /// `screen_scale`/`screen_offset`. The whole batch then submits through
+    /// exactly one `TrianglePipelineRenderer::submit_triangles(&fixtures)`
+    /// call, in the same order the fixtures were collected: one shared
+    /// render pass, one `LoadOp::Clear`, no reordering or coalescing of
+    /// draws. This is required, not incidental -- `submit_triangles` clears
+    /// its color+depth target once, before the first draw in the pass, so
+    /// a multi-triangle primitive (a `TextureRectangle`/
+    /// `TextureRectangleFlip` always admits as exactly two triangles) or an
+    /// ordinary sequence of several `RawTriangle` draws in one
+    /// `execute_raw_dpc` call must land in the same pass to all survive
+    /// into `last_triangle_draw()`'s single output; submitting them one
+    /// call at a time would re-clear the target between triangles and
+    /// silently discard every draw but the last.
+    ///
+    /// A pre-submit mapping error (a missing draw's `MissingTriangleDrawState`)
+    /// is surfaced before any fixture reaches the GPU. A batch submission or
+    /// shader-status error is only detected after submission -- `complete()`
+    /// observes real GPU output -- but `self.triangle_draw_output` is still
+    /// never touched until every stage (mapping, submission, readback,
+    /// shader-status check) succeeds, so a failure anywhere in the pipeline
+    /// leaves the prior successful value in place, unchanged, never cleared:
+    /// an old-but-real result outlives a failed attempt to replace it,
+    /// matching this file's own "never a silent partial state" convention
+    /// elsewhere. Zero triangles is a successful no-op: no fixtures, no
+    /// submission, `last_triangle_draw()` untouched.
     fn draw_admitted_triangles(
         &mut self,
         triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
@@ -232,11 +255,6 @@ impl WgpuBackend {
         let extent = self
             .triangle_target_extent
             .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
-        let raster_params = TriangleRasterParams {
-            resolution: [extent.width as f32, extent.height as f32],
-            screen_scale: [1.0, 1.0],
-            screen_offset: [0.0, 0.0],
-        };
         // Published committed-TMEM textured-draw card §2: the committed
         // physical TMEM byte image this draw samples against, projected
         // once per `draw_admitted_triangles` call (not once per triangle --
@@ -245,43 +263,75 @@ impl WgpuBackend {
         // single `execute_raw_dpc` call).
         let tmem = project_committed_tmem(self.coordinator.physical());
 
-        let mut last_output = None;
+        let mut fixtures = Vec::with_capacity(triangles.len());
         for draw in triangles {
             let draw = draw.map_err(WgpuRawDpcExecutionError::MissingTriangleDrawState)?;
-            let in_flight = pipeline
-                .submit_admitted_triangle(
-                    draw.vertices,
-                    draw.other_mode,
-                    draw.combine_params,
-                    raster_params,
-                    extent,
-                    tmem,
-                    draw.tile_binding,
-                    draw.blend_color,
-                    draw.env_color,
-                    draw.prim_color,
-                )
-                .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
-            let output = in_flight
-                .complete()
-                .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
-            // Observable shader failure status (card audit repair):
-            // propagate any fragment's non-OK `tmem_sample.wgsl` status
-            // to a named Rust execution error -- never silently accepted
-            // as though the draw's texture sampling succeeded everywhere.
-            if let Some(&status) = output
-                .tmem_sample_status
-                .iter()
-                .find(|&&status| status != TMEM_SAMPLE_STATUS_OK)
-            {
-                return Err(WgpuRawDpcExecutionError::TmemSampleFailed { status });
-            }
-            last_output = Some(output);
+            // Per-triangle, not loop-invariant: a `TextureRectangle`-sourced
+            // draw's `screen_scale`/`screen_offset` come from its own
+            // `viewport` override (RT64's `convertViewportRect`,
+            // `rt64_framebuffer_renderer.cpp:1656-1658`); a `RawTriangle`
+            // keeps today's hardcoded identity, byte-identical to before
+            // this field existed.
+            let (screen_scale, screen_offset) = match draw.viewport {
+                None => ([1.0, 1.0], [0.0, 0.0]),
+                Some(viewport) => {
+                    let left = viewport.left as f32;
+                    let top = viewport.top as f32;
+                    let right = viewport.right as f32;
+                    let bottom = viewport.bottom as f32;
+                    let width = extent.width as f32;
+                    let height = extent.height as f32;
+                    (
+                        [(right - left) / width, (bottom - top) / height],
+                        [
+                            (left + (right - left) / 2.0 - width / 2.0) / (width / 2.0),
+                            (height / 2.0 - (top + (bottom - top) / 2.0)) / (height / 2.0),
+                        ],
+                    )
+                }
+            };
+            let raster_params = TriangleRasterParams {
+                resolution: [extent.width as f32, extent.height as f32],
+                screen_scale,
+                screen_offset,
+            };
+            fixtures.push(admitted_triangle_fixture(
+                draw.vertices,
+                draw.other_mode,
+                draw.combine_params,
+                raster_params,
+                extent,
+                tmem,
+                draw.tile_binding,
+                draw.blend_color,
+                draw.env_color,
+                draw.prim_color,
+                draw.source == TriangleSource::TextureRectangle,
+            ));
         }
 
-        if let Some(output) = last_output {
-            self.triangle_draw_output = Some(output);
+        if fixtures.is_empty() {
+            return Ok(());
         }
+
+        let in_flight = pipeline
+            .submit_triangles(&fixtures)
+            .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+        let output = in_flight
+            .complete()
+            .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+        // Observable shader failure status (card audit repair): propagate
+        // any fragment's non-OK `tmem_sample.wgsl` status to a named Rust
+        // execution error -- never silently accepted as though the batch's
+        // texture sampling succeeded everywhere.
+        if let Some(&status) = output
+            .tmem_sample_status
+            .iter()
+            .find(|&&status| status != TMEM_SAMPLE_STATUS_OK)
+        {
+            return Err(WgpuRawDpcExecutionError::TmemSampleFailed { status });
+        }
+        self.triangle_draw_output = Some(output);
         Ok(())
     }
 }
@@ -480,7 +530,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 }
                 _ => {}
             },
-            RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand { vertices, .. }) => {
+            RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand {
+                vertices,
+                source,
+                viewport,
+                ..
+            }) => {
                 let triangle_index = self.triangles.len();
                 let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
                     (Some(descriptor), Some(size)) => {
@@ -519,6 +574,8 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
+                        source: *source,
+                        viewport: *viewport,
                         other_mode,
                         combine_params,
                         tile_binding,
@@ -1938,6 +1995,269 @@ mod tests {
         );
     }
 
+    const TEXRECT: u8 = 0x24;
+    const TEXRECT_FLIP: u8 = 0x25;
+
+    /// One `TextureRectangle`/`TextureRectangleFlip` command's 4-word wire
+    /// payload -- same bit layout as `raw_dpc::production_adapter`'s own
+    /// `texrect_words`, but this fixture's `ulx=8, uly=8, lrx=24, lry=24`
+    /// (2.0/2.0/6.0/6.0px, `.2` fixed point) places a 4x4-pixel rectangle
+    /// entirely inside `test_render_config`'s 8x8 target, at `[2, 6) x
+    /// [2, 6)`, unlike `production_adapter.rs`'s own fixture (which targets
+    /// a much larger, offscreen-for-8x8 render target). `dsdx=dtdy=0`
+    /// (constant `uls=ult=0` texcoord for every vertex) keeps every covered
+    /// fragment's sample well inside the 2x2 tile's interior, including the
+    /// 3-nearest filter's `+1` neighbor read -- this fixture's job is to
+    /// prove the rectangle's real pixel POSITION, not to exercise a UV
+    /// gradient (`required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`
+    /// already covers gradient/interpolation correctness for a `RawTriangle`).
+    fn texrect_words(opcode: u8, tile: u32) -> [u32; 4] {
+        let ulx: u32 = 8;
+        let uly: u32 = 8;
+        let lrx: u32 = 24;
+        let lry: u32 = 24;
+        let uls: u32 = 0;
+        let ult: u32 = 0;
+        let dsdx: u32 = 0x0000;
+        let dtdy: u32 = 0x0000;
+        [
+            word(opcode, (lrx << 12) | lry),
+            (tile & 0x7) << 24 | (ulx << 12) | uly,
+            (uls << 16) | ult,
+            (dsdx << 16) | dtdy,
+        ]
+    }
+
+    /// Loads this module's frozen 2x2 RGBA16 texel fixture, commits, and
+    /// publishes it, exactly like
+    /// `required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`'s
+    /// own load-then-draw split: `project_committed_tmem` only reflects the
+    /// coordinator's ACTIVE (already-published) physical slot, never a load
+    /// still pending within the same `execute_raw_dpc` call -- so a
+    /// texture-sampling draw must be a SEPARATE, later `execute_raw_dpc`
+    /// from its own load, not batched into one command stream with it.
+    fn load_and_publish_fixture_texture(backend: &mut WgpuBackend, session: &mut RawDpcAbiSession) {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, FIXTURE_SOURCE_IMAGE_WIDTH, 0x200));
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(load_sync());
+        let source_bytes = fixture_load_block_source_bytes();
+        words.extend([word(LOAD_BLOCK, 0), 7u32 << 12]);
+
+        let (planned, _unused_deterministic_bytes) =
+            plan_with_deterministic_reads(backend, session, words);
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture's TMEM-only load stays inside the admitted subset");
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+    }
+
+    /// The real end-to-end test (texture-rectangle placement card §3): a
+    /// real decoded capture containing `SetOtherMode`/`SetCombine`/one
+    /// `TextureRectangle` (opcode `0x24`), sampling this module's already-
+    /// committed fixture texture, pushed through the actual production
+    /// entry points (`WgpuBackend::create`/`plan_raw_dpc`/
+    /// `execute_raw_dpc`), asserted against real GPU-observed pixel output
+    /// at the pixel range `[left, right) x [top, bottom)` this rectangle's
+    /// own `ulx`/`uly`/`lrx`/`lry` place it at -- genuinely wire-position-
+    /// faithful, not a fixed-corner artifact (the gap this card's own §0
+    /// closes).
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        load_and_publish_fixture_texture(&mut backend, &mut session);
+
+        // Re-declare the tile binding: tile-binding state does not persist
+        // across separate `execute_raw_dpc` calls (`PlanCollector` is fresh
+        // per plan) -- only `project_committed_tmem`'s underlying physical
+        // TMEM bytes persist, via publish.
+        let mut words = Vec::new();
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(set_other_mode(0, 0));
+        // TEXEL0-passthrough SetCombine, same idiom as
+        // `required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`.
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 1; // TEXEL0
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 1; // TEXEL0
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        words.extend(set_combine(low, high));
+        words.extend(texrect_words(TEXRECT, 0));
+
+        let planned = plan_with_no_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &[]);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        backend
+            .execute_raw_dpc(bound)
+            .expect("fixture stays inside the admitted state+rect subset");
+
+        let output = backend
+            .last_triangle_draw()
+            .expect("a successful rect-bearing execute_raw_dpc must populate last_triangle_draw");
+
+        // `texrect_words`' own fixture: [left, right) x [top, bottom) ==
+        // [2, 6) x [2, 6) in this 8x8 target. Every covered pixel samples
+        // TEXEL0 -- a real (non-uniform) texture read, so this only proves
+        // real position, not that every pixel has the same color; the
+        // uncovered corner proves the rectangle did NOT cover the whole
+        // target (a fixed-NDC-corner bug would cover all 64 pixels).
+        let width = output.extent.width;
+        let covered_pixel_index = (2 * width + 2) as usize * 4;
+        let covered = [
+            output.color_rgba8[covered_pixel_index],
+            output.color_rgba8[covered_pixel_index + 1],
+            output.color_rgba8[covered_pixel_index + 2],
+            output.color_rgba8[covered_pixel_index + 3],
+        ];
+        assert_ne!(
+            covered,
+            [0, 0, 0, 0],
+            "pixel (2,2) is inside [2,6)x[2,6) and must be covered by the real rectangle position"
+        );
+        let outside_pixel_index = (0 * width + 0) as usize * 4;
+        let outside = [
+            output.color_rgba8[outside_pixel_index],
+            output.color_rgba8[outside_pixel_index + 1],
+            output.color_rgba8[outside_pixel_index + 2],
+            output.color_rgba8[outside_pixel_index + 3],
+        ];
+        assert_eq!(
+            outside,
+            [0, 0, 0, 0],
+            "pixel (0,0) is outside [2,6)x[2,6) and must stay the Clear color -- a fixed-NDC-\
+             corner bug would cover the whole 8x8 target and fail this assertion"
+        );
+    }
+
+    /// Flip sibling of
+    /// `wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position`
+    /// (texture-rectangle placement card §3 item 3): `TextureRectangleFlip`
+    /// (opcode `0x25`) places the SAME rectangle at the SAME pixel range --
+    /// flip only transposes UV pairing (`texture_rectangle.rs`'s own
+    /// module doc), never position -- proving flip ordering survives all
+    /// the way to real pixel coverage, not just the CPU-side vertex/texcoord
+    /// unit tests `raw_dpc::texture_rectangle`/`production_adapter` already
+    /// cover.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn wgpu_backend_draws_a_real_texture_rectangle_flip_at_the_same_wire_position() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        load_and_publish_fixture_texture(&mut backend, &mut session);
+
+        // Re-declare the tile binding: see the non-flip sibling's own
+        // comment for why this is required per-plan, not durable.
+        let mut words = Vec::new();
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(set_other_mode(0, 0));
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 1; // TEXEL0
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 1; // TEXEL0
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        words.extend(set_combine(low, high));
+        words.extend(texrect_words(TEXRECT_FLIP, 0));
+
+        let planned = plan_with_no_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &[]);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        backend
+            .execute_raw_dpc(bound)
+            .expect("fixture stays inside the admitted state+rect subset");
+
+        let output = backend
+            .last_triangle_draw()
+            .expect("a successful rect-bearing execute_raw_dpc must populate last_triangle_draw");
+
+        // Same [2,6)x[2,6) placement as the non-flip sibling -- flip must
+        // not move the rectangle.
+        let width = output.extent.width;
+        let covered_pixel_index = (2 * width + 2) as usize * 4;
+        let covered = [
+            output.color_rgba8[covered_pixel_index],
+            output.color_rgba8[covered_pixel_index + 1],
+            output.color_rgba8[covered_pixel_index + 2],
+            output.color_rgba8[covered_pixel_index + 3],
+        ];
+        assert_ne!(
+            covered,
+            [0, 0, 0, 0],
+            "flip must not change the rectangle's covered pixel range"
+        );
+        let outside_pixel_index = (0 * width + 0) as usize * 4;
+        let outside = [
+            output.color_rgba8[outside_pixel_index],
+            output.color_rgba8[outside_pixel_index + 1],
+            output.color_rgba8[outside_pixel_index + 2],
+            output.color_rgba8[outside_pixel_index + 3],
+        ];
+        assert_eq!(
+            outside,
+            [0, 0, 0, 0],
+            "flip must not change the rectangle's covered pixel range"
+        );
+    }
+
     /// Published committed-TMEM textured-draw card §4: the frozen literal
     /// texel values (four fully-saturated primary/neutral colors, one per
     /// corner), corrected against this crate's own real
@@ -2463,6 +2783,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .expect("textured triangle draw must submit cleanly")
             .complete()
@@ -2683,6 +3004,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .expect("textured triangle draw must submit cleanly")
             .complete()
@@ -2775,6 +3097,8 @@ mod tests {
                 fixture_vertex(1.0),
                 fixture_vertex(2.0),
             ],
+            source: TriangleSource::RawTriangle,
+            viewport: None,
             other_mode: OtherMode::from_wire(0, 0),
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
@@ -2807,6 +3131,182 @@ mod tests {
             output_after_failure.extent, first_output_extent,
             "a failed draw_admitted_triangles call must leave the prior successful \
              last_triangle_draw() value completely untouched, never cleared"
+        );
+    }
+
+    /// One flat-shaded, non-textured, non-Z `RawTriangle` covering exactly
+    /// the left half (`x` in `[0, width/2)`) of an 8x8 target, built from
+    /// literal `NeutralTriangleVertex` positions (raw RDP screen-pixel
+    /// space, matching `shaders/triangle_pipeline_vertex.wgsl`'s own
+    /// module doc) rather than a wire-decoded fixture -- this test only
+    /// needs two draws with disjoint, independently-checkable pixel
+    /// coverage, not a real command-stream decode.
+    fn half_covering_triangle(left: f32, right: f32, shade: f32) -> RetrievedTriangleDraw {
+        RetrievedTriangleDraw {
+            vertices: [
+                fn64_render::NeutralTriangleVertex {
+                    x: left,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 1.0,
+                    color: [shade, shade, shade, 1.0],
+                    texcoord: [0.0, 0.0],
+                },
+                fn64_render::NeutralTriangleVertex {
+                    x: right,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 1.0,
+                    color: [shade, shade, shade, 1.0],
+                    texcoord: [0.0, 0.0],
+                },
+                fn64_render::NeutralTriangleVertex {
+                    x: (left + right) / 2.0,
+                    y: 8.0,
+                    z: 0.0,
+                    w: 1.0,
+                    color: [shade, shade, shade, 1.0],
+                    texcoord: [0.0, 0.0],
+                },
+            ],
+            source: TriangleSource::RawTriangle,
+            viewport: None,
+            other_mode: OtherMode::from_wire(0, 0),
+            // SHADE passthrough: `run_one_cycle` always evaluates the
+            // second-cycle bit positions (`color_combiner.wgsl`'s
+            // `run_one_cycle` hardcodes `second_cycle = true`), so this
+            // uses the same second-cycle color_d/alpha_d=SHADE encoding as
+            // `targets::triangle_pipeline::tests::shade_passthrough_combine_params`
+            // -- color_a=color_b=0 (COMBINED) makes `(A-B)*C` zero, so
+            // `(A-B)*C+D` collapses to D (SHADE), and this triangle's own
+            // per-vertex `color` is what reaches the fragment, not the
+            // all-zero default `CombineParams::from_wire(0, 0)` would
+            // otherwise produce (transparent black everywhere,
+            // indistinguishable from an uncovered/cleared pixel).
+            combine_params: CombineParams::from_wire(0, (4 << 6) | 4),
+            tile_binding: TileBindingParams::unbound(),
+            blend_color: None,
+            env_color: None,
+            prim_color: None,
+        }
+    }
+
+    /// Hostile regression for the clear-per-draw batching defect this card
+    /// fixes: two ordinary `RawTriangle`s with disjoint pixel coverage
+    /// (left half / right half of an 8x8 target), submitted together in
+    /// one `draw_admitted_triangles` call, must BOTH be visible in the
+    /// single resulting `last_triangle_draw()` output. Before this fix,
+    /// `draw_admitted_triangles` called `submit_admitted_triangle` once per
+    /// triangle, and each call's own `submit_triangles(&[fixture])`
+    /// re-cleared the shared target -- so only the second (last) triangle
+    /// would ever survive, and the first triangle's left half would read
+    /// back as the Clear color even though it drew without error. This is
+    /// the same underlying defect a `TextureRectangle`'s two-triangle
+    /// admission exposes (see
+    /// `wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position`),
+    /// isolated here for a plain two-`RawTriangle` sequence with no rect
+    /// involvement at all -- proving the fix is general to
+    /// `draw_admitted_triangles`'s batching, not specific to `is_rect`.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn two_ordinary_triangles_in_one_call_both_survive_into_one_output() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("create() must succeed on a real adapter");
+
+        let left_triangle = half_covering_triangle(0.0, 4.0, 1.0);
+        let right_triangle = half_covering_triangle(4.0, 8.0, 1.0);
+        backend
+            .draw_admitted_triangles(vec![Ok(left_triangle), Ok(right_triangle)])
+            .expect("two well-formed triangles in one call must draw successfully");
+
+        let output = backend
+            .last_triangle_draw()
+            .expect("a successful draw_admitted_triangles call must populate last_triangle_draw");
+        let width = output.extent.width;
+        let pixel = |x: u32, y: u32| {
+            let index = (y * width + x) as usize * 4;
+            [
+                output.color_rgba8[index],
+                output.color_rgba8[index + 1],
+                output.color_rgba8[index + 2],
+                output.color_rgba8[index + 3],
+            ]
+        };
+        assert_ne!(
+            pixel(1, 4),
+            [0, 0, 0, 0],
+            "the left triangle's own half must be covered -- if the second draw re-cleared \
+             the target, this pixel would still read back as the Clear color"
+        );
+        assert_ne!(
+            pixel(6, 4),
+            [0, 0, 0, 0],
+            "the right (later) triangle's own half must also be covered"
+        );
+    }
+
+    /// Same hostile shape as
+    /// `a_failed_triangle_draw_leaves_the_prior_successful_output_untouched`,
+    /// but with a real two-triangle batch preceding the invalid draw:
+    /// proves batch submission failure atomicity holds even once
+    /// `draw_admitted_triangles` collects multiple fixtures before
+    /// submitting -- an invalid THIRD draw appended to an otherwise-valid
+    /// two-triangle batch must fail the whole call and leave the prior
+    /// output completely untouched, not partially apply the first two
+    /// triangles.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn an_invalid_draw_after_two_valid_triangles_preserves_the_prior_output() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("create() must succeed on a real adapter");
+
+        let good_triangle = RetrievedTriangleDraw {
+            vertices: [
+                fixture_vertex(0.0),
+                fixture_vertex(1.0),
+                fixture_vertex(2.0),
+            ],
+            source: TriangleSource::RawTriangle,
+            viewport: None,
+            other_mode: OtherMode::from_wire(0, 0),
+            combine_params: CombineParams::from_wire(0, 0),
+            tile_binding: TileBindingParams::unbound(),
+            blend_color: None,
+            env_color: None,
+            prim_color: None,
+        };
+        backend
+            .draw_admitted_triangles(vec![Ok(good_triangle)])
+            .expect("a single valid triangle must draw successfully");
+        let prior_color = backend
+            .last_triangle_draw()
+            .expect("the first successful draw must populate last_triangle_draw")
+            .color_rgba8
+            .clone();
+
+        let batch_with_trailing_failure = vec![
+            Ok(half_covering_triangle(0.0, 4.0, 1.0)),
+            Ok(half_covering_triangle(4.0, 8.0, 1.0)),
+            Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 2 }),
+        ];
+        let result = backend.draw_admitted_triangles(batch_with_trailing_failure);
+        assert!(
+            result.is_err(),
+            "a batch whose last entry is a MissingTriangleDrawState must fail as a whole, even \
+             though the two preceding entries were individually valid"
+        );
+
+        let output_after_failure = backend
+            .last_triangle_draw()
+            .expect("the prior successful output must still be present after a later failure");
+        assert_eq!(
+            output_after_failure.color_rgba8, prior_color,
+            "a batch that fails during mapping must never submit any of its fixtures, leaving \
+             last_triangle_draw() byte-identical to the value before the failed call"
         );
     }
 
@@ -3253,6 +3753,8 @@ mod tests {
             location: fixture_location(0),
             raw_words: Box::new([]),
             vertices: core::array::from_fn(|index| fixture_vertex(seed + index as f32)),
+            source: TriangleSource::RawTriangle,
+            viewport: None,
         }
     }
 

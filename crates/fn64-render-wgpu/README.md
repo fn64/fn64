@@ -1344,10 +1344,17 @@ through the production path); and no RT64 parity or performance claim.
 `TEXTURE_RECTANGLE_COMMAND_BYTES`) is a literal, characterization-first Rust
 port of the raw RDP TextureRectangle/TextureRectangleFlip command decode
 (opcodes `0x24`/`0x25`) and RT64's deterministic rectangle-to-six-vertex
-setup. It is a standalone characterization module: it is not wired into
-`decode_stream`, `RawDpcCommandKind`, or `push_decoded_raw_dpc`, matching
-this crate's precedent of landing a pure conversion (see the triangle
-decode/vertex sections above) before its production dispatch integration.
+setup. `production_adapter.rs`'s `push_decoded_raw_dpc` now admits
+`RawDpcCommandKind::TextureRectangle` into the sealed plan: it resolves
+`texture_rectangle_vertices` against the `OtherMode` current at the
+command's own stream position (a `TextureRectangleBeforeAnyOtherMode`
+rejection if none has been established yet), rejects a degenerate/empty
+rectangle (`DegenerateTextureRectangle`) the same way `texture_rectangle_vertices`
+itself would, and splits the six returned vertices into two three-vertex
+`RdpTriangleCommand` pushes sharing one `location`/cloned `raw_words` and one
+`TriangleSource::TextureRectangle`/`viewport: Some(vertices.viewport)` pair —
+the same `Copy` `RectViewportPixels` value on both halves, since RT64
+computes `viewportRect` once per draw call, not once per triangle.
 
 Source: the permitted MIT RT64 Rust-port source pinned at commit
 `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
@@ -1421,20 +1428,38 @@ halves, unsigned-vs-signed field misinterpretation, a missing copy
 mutation, and a missing flip swap) each proven to disagree with the
 correctly-mutated oracle path.
 
-**Nonclaims.** No production raw-DPC admission or execution -- this module
-is not wired into `decode_stream`/`push_decoded_raw_dpc`, and
-`RawDpcCommandKind` does not gain a texture-rectangle variant in this
-slice. No scissor-rectangle intersection and no `movedFromOrigin`/
+**Production admission.** Once admitted, both triangle halves of a
+`TextureRectangle`/`TextureRectangleFlip` draw the same real GPU pipeline
+`RawTriangle` does: `production.rs`'s `draw_admitted_triangles` maps every
+collected draw (rectangle halves and ordinary triangles together, in stream
+order) into one `TriangleFixture` each, sets each fixture's `is_rect` flag
+from `draw.source == TriangleSource::TextureRectangle` (the vertex shader's
+`RasterParams.is_rect` gate, `shaders/triangle_pipeline_vertex.wgsl`), and
+derives each fixture's `screen_scale`/`screen_offset` from the draw's own
+`viewport` when present (RT64's `convertViewportRect`) or the identity
+placement `RawTriangle` has always used when absent. The whole batch then
+submits through exactly one `TrianglePipelineRenderer::submit_triangles`
+call — one shared render pass, one clear, no reordering — so a rectangle's
+two triangles and any other triangles in the same `execute_raw_dpc` call all
+survive into one `last_triangle_draw()` output; submitting them separately
+would re-clear the target between draws and discard all but the last. A
+pre-submit mapping error (`MissingTriangleDrawState`) surfaces before any
+fixture reaches the GPU; a batch submission or shader-status error is only
+detected after real GPU submission (`complete()` observes real output), but
+`self.triangle_draw_output` is never touched until every stage succeeds, so
+a failure anywhere leaves the prior successful value in place, unchanged.
+
+**Nonclaims.** No scissor-rectangle intersection and no `movedFromOrigin`/
 `ExtendedAlignment` origin-stack offset (RT64's `drawRect` applies both
 before constructing its `FixedRect`; this module builds the `FixedRect`
 directly from the wire/copy-mutated coordinates -- the exact bounded
 default RT64's own `FixedRect` type performs, not an invented alignment or
-scissor correction). No texture sampling or TMEM read, no rasterizer, no
-combiner/blend/depth/coverage/render-target/VI integration, and no native
-GPU, parity, or performance claim of any kind. `RDP::updateCallTexcoords`'s
-tracked-tile texcoord bookkeeping and the scissor-intersected `intU1`/
-`intV1`/`intU2`/`intV2` branch are workload/tile-tracking side effects this
-pure conversion has no state to attach to and does not reproduce.
+scissor correction). No texture sampling or TMEM read of the rectangle's own
+texel content, no VI/presentation, no full RT64 parity, and no performance
+claim of any kind. `RDP::updateCallTexcoords`'s tracked-tile texcoord
+bookkeeping and the scissor-intersected `intU1`/`intV1`/`intU2`/`intV2`
+branch are workload/tile-tracking side effects this pure conversion has no
+state to attach to and does not reproduce.
 
 ## RT64 fragment PRNG (`random`)
 
@@ -2559,9 +2584,13 @@ vertices/`OtherMode`/`CombineParams` plus caller-supplied
 `raster_params`/`extent` and forwarding into the existing `submit_triangle`
 entry point. `other_mode` is accepted but not yet consumed: this slice's
 vertex shader hardcodes `is_rect=false`/no Z-override, matching the
-GPU-pipeline card's own fixed-fixture scope.
+GPU-pipeline card's own fixed-fixture scope. (Superseded by the
+TextureRectangle/Flip admission and batching described in "Raw RDP
+TextureRectangle decode and six-vertex conversion" above: `is_rect` is no
+longer hardcoded, and `draw_admitted_triangles` now batches every draw in
+one `execute_raw_dpc` call into a single `submit_triangles` submission.)
 
-**Out of scope, held.** No multi-triangle batching, no texture
+**Out of scope, held (at this slice).** No multi-triangle batching, no texture
 sampling/blend/alpha-compare/coverage-write, no two-cycle combiner branch,
 no real draw-command-stream/frame assembly. Does not touch `combiner.rs`,
 `state.rs`, `fn64-render-reference`, any GPU/WGSL shader file, or

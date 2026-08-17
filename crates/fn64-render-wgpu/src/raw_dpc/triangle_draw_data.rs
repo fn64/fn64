@@ -39,7 +39,8 @@
 
 use fn64_render::{
     ExactRawDpcPlanVisitor, ExactValidatedRawDpcPlan, NeutralTriangleVertex,
-    RawDpcSemanticCommandRef, RdpStateCommand, RdpTriangleCommand,
+    RawDpcSemanticCommandRef, RdpStateCommand, RdpTriangleCommand, RectViewportPixels,
+    TriangleSource,
 };
 
 use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor};
@@ -115,6 +116,12 @@ impl std::error::Error for MissingTriangleDrawState {}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RetrievedTriangleDraw {
     pub vertices: [NeutralTriangleVertex; 3],
+    /// Which wire command admitted this triangle -- see
+    /// [`fn64_render::TriangleSource`].
+    pub source: TriangleSource,
+    /// Pixel-space viewport override for a `TextureRectangle`-sourced
+    /// triangle; `None` for `TriangleSource::RawTriangle`.
+    pub viewport: Option<RectViewportPixels>,
     pub other_mode: OtherMode,
     pub combine_params: CombineParams,
     pub tile_binding: TileBindingParams,
@@ -177,7 +184,12 @@ pub struct TriangleDrawStateCollector {
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
     fn command(&mut self, command: RawDpcSemanticCommandRef<'_>) {
         match command {
-            RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand { vertices, .. }) => {
+            RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand {
+                vertices,
+                source,
+                viewport,
+                ..
+            }) => {
                 let triangle_index = self.draws.len();
                 let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
                     (Some(descriptor), Some(size)) => {
@@ -217,6 +229,8 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
+                        source: *source,
+                        viewport: *viewport,
                         other_mode,
                         combine_params,
                         tile_binding,
@@ -369,6 +383,8 @@ mod tests {
             },
             raw_words: Box::new([0; 8]),
             vertices,
+            source: TriangleSource::RawTriangle,
+            viewport: None,
         }
     }
 

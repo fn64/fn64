@@ -81,8 +81,8 @@ pub use render_ir::{
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
     RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
     ReadyPublication, ReadyRawDpcCommitCapsule, RdpStateCommand, RdpStateIdentity,
-    RdpTriangleCommand, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
-    TmemLoadShape, TmemTransferLayout,
+    RdpTriangleCommand, RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
