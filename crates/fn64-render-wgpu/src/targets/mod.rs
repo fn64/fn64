@@ -22,6 +22,7 @@ use crate::{ColorImage, ImageFormat, PixelSize};
 mod fill;
 mod oracle;
 mod raster;
+mod triangle_pipeline;
 
 pub use fill::{
     decode_fill_cycle_pixel, execute_fill_rectangle, resolve_fill_pixel_rectangle,
@@ -31,6 +32,12 @@ pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgb
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
+};
+pub use triangle_pipeline::{
+    fixed_fixture_other_mode, InFlightTriangleDraw, RasterVertex, TriangleDrawOutput,
+    TriangleFixture, TrianglePipelineDeviceOutcome, TrianglePipelineError,
+    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    UninitializedTrianglePipeline,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
