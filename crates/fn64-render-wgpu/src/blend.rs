@@ -185,6 +185,19 @@ impl ResolvedBlendCycle {
             || matches!(self.m, BlendColorInput::Framebuffer)
             || matches!(self.b, BlendBInput::FramebufferAlpha)
     }
+
+    /// `true` exactly when this cycle's `B` selector is
+    /// [`BlendBInput::FramebufferAlpha`] -- the coverage-count half of the
+    /// framebuffer-memory dependency that this crate's production wiring
+    /// still does not implement (no coverage-count GPU write exists yet).
+    /// Narrower than [`Self::requires_framebuffer_sample`], which also
+    /// matches on `P`/`M == Framebuffer` (the destination-*color* half this
+    /// crate's Slice B production wiring does now support); does not change
+    /// or repurpose `requires_framebuffer_sample` itself, which remains the
+    /// correct "needs ANY memory sample" predicate.
+    pub const fn requires_framebuffer_alpha(self) -> bool {
+        matches!(self.b, BlendBInput::FramebufferAlpha)
+    }
 }
 
 /// The blender's per-fragment framebuffer sample, needed only when a

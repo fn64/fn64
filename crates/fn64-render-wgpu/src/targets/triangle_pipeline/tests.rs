@@ -457,6 +457,115 @@ fn zero_extent_fixture_is_rejected_before_any_device_work() {
     );
 }
 
+/// Row-stride correctness (fixing the independent review's Bug 1): for both
+/// of this crate's real fixture sizes (8x8 and 16x16), `padded_bytes_per_row
+/// / 4` (the value `submit_triangles` threads into
+/// `ResolvedFragmentBlendParams`'s serialized `row_stride_words` word) must
+/// differ from `extent.width` -- proving these two "row width" notions are
+/// genuinely distinct for real fixture sizes, not accidentally equal (which
+/// would hide a regression back to indexing by `extent.width`). Also asserts
+/// `fragment_blend_params_bytes` serializes the caller-supplied
+/// `row_stride_words` value, not a value it re-derives from `extent.width`
+/// itself (this function takes no `extent` parameter at all -- the row-
+/// stride fix's root cause was exactly this kind of second, independent
+/// source of "width").
+#[test]
+fn row_stride_words_differs_from_extent_width_for_both_real_fixture_sizes() {
+    for width in [8u32, 16u32] {
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row = unpadded_bytes_per_row
+            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let row_stride_words = padded_bytes_per_row / 4;
+        assert_ne!(
+            row_stride_words, width,
+            "row_stride_words must differ from extent.width={width} for this test to be \
+             meaningful"
+        );
+
+        let bytes =
+            fragment_blend_params_bytes(ResolvedFragmentBlendParams::NO_OP, row_stride_words);
+        let serialized = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        assert_eq!(
+            serialized, row_stride_words,
+            "fragment_blend_params_bytes must serialize the caller-supplied row_stride_words, \
+             not extent.width={width}"
+        );
+        assert_ne!(
+            serialized, width,
+            "the serialized row-stride word must not equal extent.width={width}"
+        );
+    }
+}
+
+/// `has_framebuffer_color` (formerly `_reserved_0`) serializes
+/// `ResolvedFragmentBlendParams::reads_framebuffer_color` as `0`/`1` at bytes
+/// 36..40.
+#[test]
+fn has_framebuffer_color_serializes_reads_framebuffer_color_at_bytes_36_to_40() {
+    let mut reading = ResolvedFragmentBlendParams::NO_OP;
+    reading.reads_framebuffer_color = true;
+    let reading_bytes = fragment_blend_params_bytes(reading, 8);
+    assert_eq!(&reading_bytes[36..40], &1u32.to_le_bytes());
+
+    let not_reading_bytes = fragment_blend_params_bytes(ResolvedFragmentBlendParams::NO_OP, 8);
+    assert_eq!(&not_reading_bytes[36..40], &0u32.to_le_bytes());
+}
+
+/// Run-splitting helper (framebuffer-blend Slice B): fixture sequences with
+/// 0, 1, and 2+ framebuffer-color-reading fixtures at start/middle/end/
+/// consecutive positions, asserting run boundaries land exactly where the
+/// ordering contract requires -- singleton runs for every
+/// framebuffer-color-reading fixture, maximal contiguous runs otherwise.
+#[test]
+fn split_fixture_runs_singles_out_every_framebuffer_color_reading_fixture() {
+    // No reading fixtures: one run covering everything.
+    assert_eq!(split_fixture_runs(&[false, false, false]), vec![(0, 3)]);
+
+    // A single reading fixture at the start: singleton run, then the rest.
+    assert_eq!(
+        split_fixture_runs(&[true, false, false]),
+        vec![(0, 1), (1, 3)]
+    );
+
+    // A single reading fixture in the middle: split before and after.
+    assert_eq!(
+        split_fixture_runs(&[false, true, false]),
+        vec![(0, 1), (1, 2), (2, 3)]
+    );
+
+    // A single reading fixture at the end.
+    assert_eq!(
+        split_fixture_runs(&[false, false, true]),
+        vec![(0, 2), (2, 3)]
+    );
+
+    // Consecutive reading fixtures: each is its own singleton run (draw N's
+    // output becomes draw N+1's destination when N+1 also reads framebuffer
+    // color, so they cannot share one snapshot).
+    assert_eq!(
+        split_fixture_runs(&[true, true, false]),
+        vec![(0, 1), (1, 2), (2, 3)]
+    );
+    assert_eq!(
+        split_fixture_runs(&[false, true, true]),
+        vec![(0, 1), (1, 2), (2, 3)]
+    );
+
+    // Every fixture reads framebuffer color: every fixture is its own run.
+    assert_eq!(
+        split_fixture_runs(&[true, true, true]),
+        vec![(0, 1), (1, 2), (2, 3)]
+    );
+
+    // Single-fixture cases.
+    assert_eq!(split_fixture_runs(&[false]), vec![(0, 1)]);
+    assert_eq!(split_fixture_runs(&[true]), vec![(0, 1)]);
+
+    // Empty input: no runs.
+    assert_eq!(split_fixture_runs(&[]), Vec::<(usize, usize)>::new());
+}
+
 #[test]
 fn triangle_vertex_byte_layout_is_40_bytes_matching_position_uv_color() {
     let vertex = RasterVertex {
@@ -1592,6 +1701,298 @@ mod host_gpu_tests {
         }
     }
 
+    /// Framebuffer-blend Slice B: the required physical-Metal nonzero-row
+    /// differential (port card "Literal characterization / oracles"). Two
+    /// triangles into the same 8x8 target: an opaque, uniform-colored first
+    /// draw (no blend) establishes a known destination color across the
+    /// whole target, including row `y >= 1` (testing only row 0 would not
+    /// catch a stride bug -- row 0 is correct by coincidence at any stride,
+    /// per the card's own "Row stride correctness" section); a second,
+    /// uniform-shaded draw whose blend cycle selects `P == Framebuffer`
+    /// reads that destination back through `framebuffer_color_snapshot` and
+    /// must match `crate::blend::blend_fragment`'s own CPU computation for
+    /// the identical selectors/inputs.
+    ///
+    /// Folds in both review-required characterization cases (per the card's
+    /// own instruction that they "must also appear... in the required
+    /// physical-Metal nonzero-y differential test's fixture set"):
+    ///
+    /// - **Review Bug A** (no-`FORCE_BL` last-cycle bypass,
+    ///   `blend.rs:421-437`): a one-cycle, `force_blend == false` fixture
+    ///   whose `P == Framebuffer` must take the bypass arm, not the general
+    ///   three-way branch -- `final_alpha == 0.0` (output alpha driven
+    ///   entirely by the destination's own alpha), distinguishing it from a
+    ///   `P != Framebuffer` sibling under the same `force_blend == false`
+    ///   condition, whose bypass arm produces `final_alpha == 1.0` instead.
+    /// - **Review Bug B** (memory alpha differs from source alpha,
+    ///   `blend.rs:488-496`): a one-cycle, `force_blend == true` fixture
+    ///   whose `M == Framebuffer` (so `final_alpha == a`, strictly between
+    ///   `0.0` and `1.0`) with a destination alpha deliberately different
+    ///   from the combiner's own source alpha -- the output alpha must equal
+    ///   the real two-term composite, not `src.a` passed through and not
+    ///   `final_alpha` itself.
+    #[test]
+    fn required_host_framebuffer_color_blend_matches_the_rust_oracle_at_nonzero_row() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+        eprintln!(
+            "fn64-triangle-pipeline-framebuffer-blend: backend={:?} adapter={:?}",
+            renderer.adapter_info().backend,
+            renderer.adapter_info().name
+        );
+
+        // Row y=4 (well past row 0) is the pixel this test actually checks
+        // for every case below -- a stride bug corrupts every row after row
+        // 0, so row 0 alone would not catch it.
+        const CHECK_XY: (u32, u32) = (2, 4);
+
+        // --- Case 1: general divide, P == Framebuffer, force_blend == true.
+        {
+            let dst_rgba8: [u8; 4] = [90, 150, 30, 210];
+            let dst = uniform_dst_fixture(dst_rgba8);
+
+            let shade_color = [0.4, 0.2, 0.6, 0.5];
+            let other_mode = crate::state::OtherMode::from_wire(0, 1 << 30); // cycle0 P=Framebuffer
+            let blend_color = crate::state::Color4::from_wire(0x14283C50);
+            let fog_color = crate::state::Color4::from_wire(0x465A6E82);
+            let mode_state = crate::blend::BlendModeState {
+                other_mode,
+                blend_color_register: blend_color.rgba8(),
+                fog_color: fog_color.rgba8(),
+            };
+            assert_eq!(mode_state.cycle_count(), 1);
+            let cycle = mode_state.cycle(0);
+            assert_eq!(cycle.p, crate::blend::BlendColorInput::Framebuffer);
+
+            let reader = uniform_framebuffer_color_blend_fixture(
+                cycle,
+                blend_color,
+                fog_color,
+                shade_color,
+                true,
+            );
+            let output = renderer
+                .submit_triangles(&[dst, reader])
+                .unwrap()
+                .complete()
+                .unwrap();
+
+            let combiner_color = cpu_combiner_reference(shade_color);
+            let src_rgba8 = [
+                (combiner_color[0] * 255.0).round() as u8,
+                (combiner_color[1] * 255.0).round() as u8,
+                (combiner_color[2] * 255.0).round() as u8,
+                (combiner_color[3] * 255.0).round() as u8,
+            ];
+            let shade_alpha_255 = (shade_color[3] * 255.0).round() as u8;
+            let memory = crate::blend::BlendFramebufferSample {
+                rgba: dst_rgba8,
+                coverage_count: 0,
+            };
+            let expected = crate::blend::blend_fragment(
+                src_rgba8,
+                Some(memory),
+                shade_alpha_255,
+                mode_state,
+                true,
+            )
+            .expect("memory is supplied; P==Framebuffer must not error");
+
+            let (x, y) = CHECK_XY;
+            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+        }
+
+        // --- Case 2 (review Bug A): no-FORCE_BL bypass, P == Framebuffer.
+        // final_alpha must be 0.0 (output alpha driven entirely by dst.a).
+        {
+            let dst_rgba8: [u8; 4] = [90, 150, 30, 210];
+            let dst = uniform_dst_fixture(dst_rgba8);
+
+            let shade_color = [0.4, 0.2, 0.6, 0.5];
+            let other_mode = crate::state::OtherMode::from_wire(0, 1 << 30); // cycle0 P=Framebuffer
+            let blend_color = crate::state::Color4::from_wire(0x14283C50);
+            let fog_color = crate::state::Color4::from_wire(0x465A6E82);
+            let mode_state = crate::blend::BlendModeState {
+                other_mode,
+                blend_color_register: blend_color.rgba8(),
+                fog_color: fog_color.rgba8(),
+            };
+            let cycle = mode_state.cycle(0);
+
+            let reader = uniform_framebuffer_color_blend_fixture(
+                cycle,
+                blend_color,
+                fog_color,
+                shade_color,
+                false, // force_blend == false: the no-FORCE_BL bypass arm
+            );
+            let output = renderer
+                .submit_triangles(&[dst, reader])
+                .unwrap()
+                .complete()
+                .unwrap();
+
+            let combiner_color = cpu_combiner_reference(shade_color);
+            let src_rgba8 = [
+                (combiner_color[0] * 255.0).round() as u8,
+                (combiner_color[1] * 255.0).round() as u8,
+                (combiner_color[2] * 255.0).round() as u8,
+                (combiner_color[3] * 255.0).round() as u8,
+            ];
+            let shade_alpha_255 = (shade_color[3] * 255.0).round() as u8;
+            let memory = crate::blend::BlendFramebufferSample {
+                rgba: dst_rgba8,
+                coverage_count: 0,
+            };
+            let expected = crate::blend::blend_fragment(
+                src_rgba8,
+                Some(memory),
+                shade_alpha_255,
+                mode_state,
+                false,
+            )
+            .expect("memory is supplied; the bypass arm must not error");
+            assert_eq!(
+                expected.rgba[3], dst_rgba8[3],
+                "bypass arm with P==Framebuffer: final_alpha==0.0 means output alpha is exactly \
+                 the destination's own alpha byte"
+            );
+
+            let (x, y) = CHECK_XY;
+            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+        }
+
+        // --- Case 3 (review Bug B): general divide, M == Framebuffer,
+        // destination alpha deliberately differs from source alpha.
+        {
+            let dst_rgba8: [u8; 4] = [90, 150, 30, 40];
+            let dst = uniform_dst_fixture(dst_rgba8);
+
+            let shade_color = [0.4, 0.2, 0.6, 200.0 / 255.0];
+            // cycle0: P=Blend(2)@30:31, A=Fog(1)@26:27, M=Framebuffer(1)@22:23,
+            // B=One(2)@18:19 -- `a` derives from a nonzero fog alpha (strictly
+            // between 0 and 1), M selects Framebuffer, so final_alpha == a.
+            let other_mode = crate::state::OtherMode::from_wire(0, 0x8440_0000);
+            let blend_color = crate::state::Color4::from_wire(0x14283C50);
+            let fog_color = crate::state::Color4::from_wire(0x465A6E82);
+            let mode_state = crate::blend::BlendModeState {
+                other_mode,
+                blend_color_register: blend_color.rgba8(),
+                fog_color: fog_color.rgba8(),
+            };
+            let cycle = mode_state.cycle(0);
+            assert_eq!(cycle.m, crate::blend::BlendColorInput::Framebuffer);
+
+            let reader = uniform_framebuffer_color_blend_fixture(
+                cycle,
+                blend_color,
+                fog_color,
+                shade_color,
+                true,
+            );
+            let output = renderer
+                .submit_triangles(&[dst, reader])
+                .unwrap()
+                .complete()
+                .unwrap();
+
+            let combiner_color = cpu_combiner_reference(shade_color);
+            let src_rgba8 = [
+                (combiner_color[0] * 255.0).round() as u8,
+                (combiner_color[1] * 255.0).round() as u8,
+                (combiner_color[2] * 255.0).round() as u8,
+                (combiner_color[3] * 255.0).round() as u8,
+            ];
+            let shade_alpha_255 = (shade_color[3] * 255.0).round() as u8;
+            let memory = crate::blend::BlendFramebufferSample {
+                rgba: dst_rgba8,
+                coverage_count: 0,
+            };
+            let expected = crate::blend::blend_fragment(
+                src_rgba8,
+                Some(memory),
+                shade_alpha_255,
+                mode_state,
+                true,
+            )
+            .expect("memory is supplied; M==Framebuffer must not error");
+            assert_ne!(
+                expected.rgba[3], src_rgba8[3],
+                "wrong implementation 1 (src.a passthrough) must not match the real composite"
+            );
+            let final_alpha_255 = (shade_color[3] * 255.0).round() as u8;
+            assert_ne!(
+                expected.rgba[3], final_alpha_255,
+                "wrong implementation 2 (final_alpha as output alpha) must not match the real \
+                 composite"
+            );
+
+            let (x, y) = CHECK_XY;
+            assert_close_rgba8(rgba8_at(&output, x, y), expected.rgba, 2);
+        }
+    }
+
+    /// Fixture builder for the framebuffer-color-blend differential's
+    /// destination draw: an opaque, uniform (non-interpolated) covering
+    /// triangle at the given exact RGBA byte color, no blend -- establishes
+    /// a known, exact destination sample for the second (reading) draw's
+    /// snapshot, at every covered pixel including row `y >= 1`.
+    fn uniform_dst_fixture(rgba8: [u8; 4]) -> TriangleFixture {
+        let mut fixture = covering_triangle_fixture();
+        let color = [
+            rgba8[0] as f32 / 255.0,
+            rgba8[1] as f32 / 255.0,
+            rgba8[2] as f32 / 255.0,
+            rgba8[3] as f32 / 255.0,
+        ];
+        for vertex in &mut fixture.vertices {
+            vertex.color = color;
+        }
+        fixture
+    }
+
+    /// Fixture builder for the framebuffer-color-blend differential's
+    /// reading draw: a uniform-flat-shaded covering triangle (same shape as
+    /// [`uniform_general_divide_blend_fixture`]) whose `blend_params` has
+    /// `reads_framebuffer_color: true` -- the destination-color-reading
+    /// admitted subset this card implements.
+    fn uniform_framebuffer_color_blend_fixture(
+        cycle: crate::blend::ResolvedBlendCycle,
+        blend_color: crate::state::Color4,
+        fog_color: crate::state::Color4,
+        shade_color: [f32; 4],
+        force_blend: bool,
+    ) -> TriangleFixture {
+        let mut fixture = covering_triangle_fixture();
+        for vertex in &mut fixture.vertices {
+            vertex.color = shade_color;
+        }
+        fixture.blend_color = Some(blend_color);
+        fixture.force_blend = force_blend;
+        fixture.blend_params = ResolvedFragmentBlendParams {
+            cycle_count: 1,
+            cycle0: cycle,
+            cycle1: crate::blend::ResolvedBlendCycle {
+                p: crate::blend::BlendColorInput::Combined,
+                a: crate::blend::BlendAlphaInput::Combined,
+                m: crate::blend::BlendColorInput::Combined,
+                b: crate::blend::BlendBInput::Zero,
+            },
+            blend_color: Some(blend_color),
+            fog_color: Some(fog_color),
+            reads_framebuffer_color: true,
+        };
+        fixture
+    }
+
     /// Fixture builder for [`required_host_general_divide_blend_draw_matches_the_rust_oracle_with_no_memory`]:
     /// a uniform-flat-shaded covering triangle (same screen geometry as
     /// [`covering_triangle_fixture`], every vertex the same color so no
@@ -1620,6 +2021,7 @@ mod host_gpu_tests {
             },
             blend_color: Some(blend_color),
             fog_color: Some(fog_color),
+            reads_framebuffer_color: false,
         };
         fixture
     }

@@ -36,12 +36,13 @@ use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
-    AlphaCompare, BlendModeState, Color4, CombineParams, HeadlessBackend, MissingTriangleDrawState,
-    OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, PrimColor,
-    RawDpcDecodeError, RdpState, RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord,
-    TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
-    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
-    UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
+    AlphaCompare, BlendColorInput, BlendModeState, Color4, CombineParams, HeadlessBackend,
+    MissingTriangleDrawState, OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction,
+    PhysicalTmemState, PrimColor, RawDpcDecodeError, RdpState, ResolvedBlendCycle,
+    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
+    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
+    TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
+    TMEM_SAMPLE_STATUS_OK,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -303,17 +304,29 @@ impl WgpuBackend {
             let cycle_count = blend_mode.cycle_count();
             let cycle0 = blend_mode.cycle(0);
             let cycle1 = blend_mode.cycle(1);
-            if (cycle_count >= 1 && cycle0.requires_framebuffer_sample())
-                || (cycle_count == 2 && cycle1.requires_framebuffer_sample())
+            let active_cycles = match cycle_count {
+                0 => [None, None],
+                1 => [Some(cycle0), None],
+                _ => [Some(cycle0), Some(cycle1)],
+            };
+            if active_cycles
+                .into_iter()
+                .flatten()
+                .any(ResolvedBlendCycle::requires_framebuffer_alpha)
             {
                 return Err(WgpuRawDpcExecutionError::BlendRequiresFramebuffer { triangle_index });
             }
+            let reads_framebuffer_color = active_cycles.into_iter().flatten().any(|cycle| {
+                matches!(cycle.p, BlendColorInput::Framebuffer)
+                    || matches!(cycle.m, BlendColorInput::Framebuffer)
+            });
             let blend_params = ResolvedFragmentBlendParams {
                 cycle_count,
                 cycle0,
                 cycle1,
                 blend_color: draw.blend_color,
                 fog_color: draw.fog_color,
+                reads_framebuffer_color,
             };
             fixtures.push(admitted_triangle_fixture(
                 draw.vertices,
@@ -745,14 +758,17 @@ pub enum WgpuRawDpcExecutionError {
         status: u32,
     },
     /// A triangle's resolved blend cycle selected
-    /// [`crate::blend::BlendColorInput::Framebuffer`] or
     /// [`crate::blend::BlendBInput::FramebufferAlpha`] on an active cycle
-    /// (`ResolvedBlendCycle::requires_framebuffer_sample`) -- this slice's
-    /// admitted subset never reads a destination color (card §3c's
-    /// memory-dependent sub-case is explicitly out of scope; see
-    /// `crates/fn64-render-wgpu/README.md`'s "production blend wiring slice
-    /// 1" section). Rejected before GPU submission, never silently rendered
-    /// opaque and never given a manufactured destination sample.
+    /// (`ResolvedBlendCycle::requires_framebuffer_alpha`) -- the
+    /// coverage-count half of the framebuffer-memory dependency, which this
+    /// crate still does not implement (no coverage-count GPU write exists
+    /// anywhere in this crate; see `crates/fn64-render-wgpu/README.md`'s
+    /// blend-wiring sections). A cycle selecting only
+    /// [`crate::blend::BlendColorInput::Framebuffer`] on `P`/`M` is no
+    /// longer rejected here -- that destination-*color* subset is admitted
+    /// and rendered via the framebuffer-color snapshot path. Rejected before
+    /// GPU submission, never silently rendered opaque and never given a
+    /// manufactured coverage count.
     BlendRequiresFramebuffer {
         triangle_index: usize,
     },
@@ -792,8 +808,8 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::BlendRequiresFramebuffer { triangle_index } => write!(
                 formatter,
                 "triangle #{triangle_index} (plan order) selected a blend-cycle input that reads \
-                 the framebuffer; this slice's admitted subset does not implement \
-                 framebuffer-dependent blending"
+                 the framebuffer alpha (coverage count); this crate does not yet implement \
+                 framebuffer-alpha-dependent blending"
             ),
         }
     }
@@ -1428,8 +1444,8 @@ mod tests {
     };
 
     use crate::{
-        ImageFormat, PixelSize, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
-        TmemWordAddress,
+        BlendBInput, BlenderCycle, ImageFormat, PixelSize, TileAddressMode, TileCoordinate,
+        TileDescriptor, TileSize, TmemWordAddress,
     };
 
     use super::*;
@@ -3926,14 +3942,18 @@ mod tests {
         );
     }
 
-    /// Production blend wiring slice 1 (card §3d): a triangle whose resolved
-    /// blend cycle selects `BlendColorInput::Framebuffer`/
-    /// `BlendBInput::FramebufferAlpha` on an active cycle must be rejected
-    /// before GPU submission with a named `BlendRequiresFramebuffer` error --
-    /// never silently rendered opaque, never given a manufactured
-    /// destination sample. Mirrors `a_failed_triangle_draw_leaves_the_prior_
-    /// successful_output_untouched`'s own `create_inner`/`RetrievedTriangleDraw`
-    /// literal fixture pattern exactly.
+    /// Framebuffer-blend admission split (Slice B): a triangle whose
+    /// resolved blend cycle selects `BlendBInput::FramebufferAlpha` on an
+    /// active cycle must still be rejected before GPU submission with a
+    /// named `BlendRequiresFramebuffer` error -- the coverage-count half of
+    /// the framebuffer-memory dependency, which this crate still does not
+    /// implement. A plain `BlendColorInput::Framebuffer` selector on `P`/`M`
+    /// alone (the destination-*color* half) is no longer this test's
+    /// fixture, since that subset is now admitted and rendered -- see
+    /// `draw_admitted_triangles_admits_a_framebuffer_color_only_blend_cycle`
+    /// below for that coverage. Mirrors `a_failed_triangle_draw_leaves_the_
+    /// prior_successful_output_untouched`'s own `create_inner`/
+    /// `RetrievedTriangleDraw` literal fixture pattern exactly.
     #[cfg(feature = "host-gpu-tests")]
     #[test]
     fn draw_admitted_triangles_rejects_a_blend_cycle_that_reads_the_framebuffer() {
@@ -3942,11 +3962,11 @@ mod tests {
             .create_inner(&test_render_config())
             .expect("create() must succeed on a real adapter");
 
-        // OneCycle (high bits 20:21 == 0, the default) with cycle 1's `P`
-        // selector (`blender_cycle_1().color_a`, low bits 30:31) = 1
-        // (Framebuffer, `BlendColorInput::from_wire`): the memory-dependent
-        // sub-case card §3c explicitly defers, not admitted by this slice.
-        let framebuffer_blend_other_mode = OtherMode::from_wire(0, 1 << 30);
+        // OneCycle (high bits 20:21 == 0, the default) with cycle 1's `B`
+        // selector (`blender_cycle_1().alpha_b`, low bits 18:19) = 1
+        // (FramebufferAlpha, `BlendBInput::from_wire`): the coverage-count
+        // sub-case this crate still does not implement.
+        let framebuffer_alpha_blend_other_mode = OtherMode::from_wire(0, 1 << 18);
         let triangle = RetrievedTriangleDraw {
             vertices: [
                 fixture_vertex(0.0),
@@ -3955,7 +3975,7 @@ mod tests {
             ],
             source: TriangleSource::RawTriangle,
             viewport: None,
-            other_mode: framebuffer_blend_other_mode,
+            other_mode: framebuffer_alpha_blend_other_mode,
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
             blend_color: None,
@@ -3965,7 +3985,9 @@ mod tests {
         };
         let error = backend
             .draw_admitted_triangles(vec![Ok(triangle)])
-            .expect_err("a framebuffer-dependent blend cycle must be rejected before submission");
+            .expect_err(
+                "a framebuffer-alpha-dependent blend cycle must be rejected before submission",
+            );
         assert!(
             matches!(
                 error,
@@ -3973,6 +3995,72 @@ mod tests {
             ),
             "unexpected error variant: {error:?}"
         );
+    }
+
+    /// `ResolvedBlendCycle::requires_framebuffer_alpha` table: `true` exactly
+    /// when `alpha_b` (`B` selector) decodes to `FramebufferAlpha` (wire
+    /// value `1`), independent of `color_a`/`color_b` (`P`/`M`) -- composed
+    /// directly against `BlendBInput::from_wire`'s own decode, no new
+    /// arithmetic oracle.
+    #[test]
+    fn requires_framebuffer_alpha_matches_only_the_b_selector() {
+        for color_a in 0u8..4 {
+            for color_b in 0u8..4 {
+                for alpha_b in 0u8..4 {
+                    let cycle = ResolvedBlendCycle::from_wire(BlenderCycle {
+                        color_a,
+                        alpha_a: 0,
+                        color_b,
+                        alpha_b,
+                    });
+                    let expected = BlendBInput::from_wire(alpha_b) == BlendBInput::FramebufferAlpha;
+                    assert_eq!(
+                        cycle.requires_framebuffer_alpha(),
+                        expected,
+                        "color_a={color_a} color_b={color_b} alpha_b={alpha_b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Admission split (Slice B): a triangle whose resolved blend cycle
+    /// selects `BlendColorInput::Framebuffer` on `P` (color only, no
+    /// `FramebufferAlpha`) is now admitted -- not rejected -- and the
+    /// resulting fixture's `blend_params.reads_framebuffer_color` is `true`.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn draw_admitted_triangles_admits_a_framebuffer_color_only_blend_cycle() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        backend
+            .create_inner(&test_render_config())
+            .expect("create() must succeed on a real adapter");
+
+        // OneCycle (high bits 20:21 == 0, the default) with cycle 1's `P`
+        // selector (`blender_cycle_1().color_a`, low bits 30:31) = 1
+        // (Framebuffer, `BlendColorInput::from_wire`), `B` selector left at
+        // its default (`0` = `OneMinusA`, not `FramebufferAlpha`) -- the
+        // destination-color-only subset this card admits.
+        let framebuffer_color_only_other_mode = OtherMode::from_wire(0, 1 << 30);
+        let triangle = RetrievedTriangleDraw {
+            vertices: [
+                fixture_vertex(0.0),
+                fixture_vertex(1.0),
+                fixture_vertex(2.0),
+            ],
+            source: TriangleSource::RawTriangle,
+            viewport: None,
+            other_mode: framebuffer_color_only_other_mode,
+            combine_params: CombineParams::from_wire(0, 0),
+            tile_binding: TileBindingParams::unbound(),
+            blend_color: None,
+            env_color: None,
+            prim_color: None,
+            fog_color: None,
+        };
+        backend
+            .draw_admitted_triangles(vec![Ok(triangle)])
+            .expect("a color-only framebuffer blend cycle must be admitted, not rejected");
     }
 
     /// Command-time capture seam (card): `SetEnvColor(A)`/`SetPrimColor(A)`
