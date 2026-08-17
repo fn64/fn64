@@ -33,27 +33,61 @@
 //! no coverage-write variation, no decal, no backface culling, no MSAA, no
 //! upscaling; smooth-shaded color only.
 //!
-//! Depth: a real `DepthStencilState` (`depth_write_enabled: true`,
-//! `depth_compare: CompareFunction::Less`) -- fixed-function GPU depth-test
+//! Depth: a real `DepthStencilState` per draw, fixed-function GPU depth-test
 //! hardware state, not fragment-shader arithmetic (port card §2b; RT64's own
-//! `RasterPS` contains no ordinary Z-compare/write). `Less` is confirmed
-//! against RT64's own PSO construction, not by `depth_strict_less.rs`'s name
-//! (that module's own doc states it cites only the public N64 Programming
-//! Manual/libultra, not RT64 -- coincidental naming, not authority):
-//! `rt64_raster_shader.cpp:317` sets `depthFunction = c.zCmp ?
-//! RenderComparisonFunction::LESS : RenderComparisonFunction::ALWAYS`, and
+//! `RasterPS` contains no ordinary Z-compare/write). `Z_CMP`/`Z_UPD`
+//! pipeline-variant depth gating (production depth-slice task card,
+//! `.claude-handoffs/production-depth-audit-review.md`): four
+//! `wgpu::RenderPipeline`s are precreated once in `request()`, identical in
+//! every respect except `depth_stencil.depth_compare`/
+//! `depth_stencil.depth_write_enabled`, and one is selected per draw from
+//! `OtherMode::depth_compare_enabled()`/`depth_update_enabled()` -- never
+//! compiled synchronously on the draw path. This mirrors RT64's own
+//! production mechanism, not an fn64 invention: RT64 precreates exactly
+//! eight raster PSOs indexed by the `zCmp`/`zUpd`/`cvgAdd` axis (2x2x2) and
+//! selects one per draw call (`docs/RT64-PUBLIC-FEATURE-INVENTORY.md:53`,
+//! "ubershader-no-pipeline-stutter", pinned
+//! `f0728a2520d5aa735886240de3fee75cc805f6d6`,
+//! `rt64_raster_shader.cpp:460`); this slice takes the `zCmp`x`zUpd` subset
+//! of that same axis (`cvgAdd`/coverage is out of scope, so 4 variants not
+//! 8), matching the source's own upfront-precreation shape rather than
+//! compiling on the draw path. The per-variant `depth_compare` selector is
+//! `Less` when `Z_CMP` is set and `Always` when clear, independently
+//! confirmed against RT64's own PSO construction (not by
+//! `depth_strict_less.rs`'s name -- that module's own doc states it cites
+//! only the public N64 Programming Manual/libultra, not RT64 -- coincidental
+//! naming, not authority): `rt64_raster_shader.cpp:317` sets `depthFunction =
+//! c.zCmp ? RenderComparisonFunction::LESS : RenderComparisonFunction::ALWAYS`,
+//! pinned `5473732a822a4423b5696e7cb18fecc425a59875`, and
 //! `RenderComparisonFunction::LESS` maps to each native backend's
-//! non-inclusive less-than compare op. Validated post-hoc against
-//! `depth_strict_less.rs`'s oracle on the read-back depth buffer as a
-//! differential check on wgpu's own depth-test hardware result, not as
-//! fragment-shader logic.
+//! non-inclusive less-than compare op. `Z_UPD` gates `depth_write_enabled`
+//! the same shape of boolean toggle as `zCmp`'s ternary above; RT64's
+//! `zUpd` bit is the sibling axis of the same cited `rt64_raster_shader.cpp`
+//! eight-PSO table (`rt64_raster_shader.cpp:460`), not separately quoted
+//! verbatim here because it is not a ternary expression the way `zCmp` is --
+//! the eight-PSO table citation is `zUpd`'s own PSO-selection authority.
+//! `(Z_CMP, Z_UPD) = (set, set)` reduces to `Less`/`true`, the prior
+//! unconditional state, so existing draws are bit-identical through the new
+//! selection path. Validated post-hoc against `depth_strict_less.rs`'s
+//! oracle on the read-back depth buffer as a differential check on wgpu's
+//! own depth-test hardware result, not as fragment-shader logic.
 //!
-//! Nonclaims (port card §7): no RT64 parity claim, no performance claim, no
+//! Nonclaims (port card §7, extended by the production depth-slice task
+//! card's nonclaims): no RT64 parity claim, no performance claim, no
 //! production/`decode_stream` wiring (fixture data only), no texture
 //! sampling/alpha-compare/blend/coverage-write/decal/backface-cull/MSAA/
 //! upscaling/`SetCombine` decode, no rasterization-algorithm claim of any
 //! kind -- coverage determination routes entirely through wgpu's own
-//! `TriangleList` primitive state and the host GPU's rasterizer.
+//! `TriangleList` primitive state and the host GPU's rasterizer. The
+//! `Z_CMP`/`Z_UPD` pipeline-variant slice additionally makes no `DepthMode`
+//! four-way dispatch claim (`mode_passes`/`depth_mode_decision`,
+//! `Opaque`/`Interpenetrating`/`Translucent`/`Decal` all get plain hardware
+//! `Less`/write-toggle only -- `other_mode.depth_mode()` is not read
+//! anywhere in this module), no memory-Z/delta-Z/coverage-wrap/encoded-Z
+//! claim, no primitive-depth-source (`SetPrimDepth`) claim, and no
+//! cross-submission or memory-resident Z-buffer claim -- the transient
+//! per-submission attachment and its `LoadOp::Load` cross-draw chaining
+//! within one submission stay exactly as before this slice.
 
 use core::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -241,6 +275,13 @@ pub struct TriangleTargetExtent {
 /// must already be `None` or `Threshold`; `Reserved`/`Dither` are rejected
 /// before a triangle ever reaches this struct (retrieval-time panic, see
 /// `raw_dpc::triangle_draw_data`/`production.rs`'s `PlanCollector`).
+/// `depth_compare_enabled`/`depth_update_enabled` (production depth-slice
+/// task card, `Z_CMP`/`Z_UPD` pipeline-variant depth gating) are
+/// `OtherMode::depth_compare_enabled()`/`depth_update_enabled()` verbatim --
+/// this draw's two bits selecting one of the four precreated
+/// `TrianglePipelineRenderer::pipelines` variants (see
+/// [`depth_pipeline_index`]), not new arithmetic. `(true, true)` reduces to
+/// the pipeline's prior sole `Less`/write-always state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TriangleFixture {
     pub vertices: [RasterVertex; 3],
@@ -251,7 +292,47 @@ pub struct TriangleFixture {
     pub tile_binding: TileBindingParams,
     pub alpha_compare_mode: AlphaCompare,
     pub blend_color: Option<Color4>,
+    pub depth_compare_enabled: bool,
+    pub depth_update_enabled: bool,
 }
+
+/// Maps a draw's `(Z_CMP, Z_UPD)` enable bits
+/// (`OtherMode::depth_compare_enabled()`/`depth_update_enabled()`) to the
+/// index of its precreated `TrianglePipelineRenderer::pipelines` variant.
+/// Exact four-row truth table (production depth-slice task card §3):
+///
+/// | `Z_CMP` | `Z_UPD` | index | `depth_compare` | `depth_write_enabled` |
+/// |---|---|---|---|---|
+/// | set | set | 0 | `Less` | `true` |
+/// | set | clear | 1 | `Less` | `false` |
+/// | clear | set | 2 | `Always` | `true` |
+/// | clear | clear | 3 | `Always` | `false` |
+///
+/// Index 0 (`(true, true)`) is the pipeline's prior sole state, so existing
+/// callers that always set both bits select the same `Less`/write-always
+/// behavior as before this slice, bit-identical.
+pub(crate) const fn depth_pipeline_index(
+    depth_compare_enabled: bool,
+    depth_update_enabled: bool,
+) -> usize {
+    match (depth_compare_enabled, depth_update_enabled) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+    }
+}
+
+/// The four `(depth_compare, depth_write_enabled)` pairs `request()` builds
+/// its precreated pipelines from, indexed identically to
+/// [`depth_pipeline_index`] -- one source of truth for both pipeline
+/// construction and draw-time selection so the two cannot drift apart.
+const DEPTH_STENCIL_VARIANTS: [(wgpu::CompareFunction, bool); 4] = [
+    (wgpu::CompareFunction::Less, true),
+    (wgpu::CompareFunction::Less, false),
+    (wgpu::CompareFunction::Always, true),
+    (wgpu::CompareFunction::Always, false),
+];
 
 pub enum TrianglePipelineDeviceOutcome {
     Ready(Box<TrianglePipelineRenderer>),
@@ -472,58 +553,67 @@ impl UninitializedTrianglePipeline {
             immediate_size: 0,
         });
 
-        let vertex_buffer_layout = RasterVertex::layout();
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fn64-triangle-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vertex_shader,
-                entry_point: Some(TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(vertex_buffer_layout)],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fragment_shader,
-                entry_point: Some(TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                // Second attachment (card audit repair: "observable shader
-                // failure status"): `fs_main`'s own `FragmentOutput::
-                // tmem_sample_status`, one `TMEM_SAMPLE_STATUS_*` code per
-                // fragment -- read back and checked by
-                // `production.rs`'s draw-completion path, never silently
-                // discarded.
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: COLOR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: STATUS_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-            }),
-            multiview_mask: None,
-            cache: None,
+        // Four precreated `Z_CMP`x`Z_UPD` pipeline variants (production
+        // depth-slice task card §3/RT64's own eight-PSO ubershader
+        // precedent, module doc above): identical vertex/fragment modules,
+        // identical `primitive`/`multisample`/`targets` state across all
+        // four, varying only `depth_stencil.depth_compare`/
+        // `depth_write_enabled` per [`DEPTH_STENCIL_VARIANTS`] -- matching
+        // RT64's own upfront-precreation shape, nothing compiled on the draw
+        // path. Index order matches [`depth_pipeline_index`] exactly.
+        let pipelines = DEPTH_STENCIL_VARIANTS.map(|(depth_compare, depth_write_enabled)| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("fn64-triangle-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex_shader,
+                    entry_point: Some(TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(RasterVertex::layout())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write_enabled),
+                    depth_compare: Some(depth_compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some(TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    // Second attachment (card audit repair: "observable shader
+                    // failure status"): `fs_main`'s own `FragmentOutput::
+                    // tmem_sample_status`, one `TMEM_SAMPLE_STATUS_*` code per
+                    // fragment -- read back and checked by
+                    // `production.rs`'s draw-completion path, never silently
+                    // discarded.
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: COLOR_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: STATUS_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
         });
 
         let _ = device.poll(wgpu::PollType::Poll);
@@ -541,7 +631,7 @@ impl UninitializedTrianglePipeline {
                 adapter_info: adapter.get_info(),
                 device,
                 queue,
-                pipeline,
+                pipelines,
                 bind_group_layout,
                 errors,
             },
@@ -598,7 +688,9 @@ pub struct TrianglePipelineRenderer {
     adapter_info: wgpu::AdapterInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
+    /// Four precreated `Z_CMP`x`Z_UPD` pipeline variants, indexed by
+    /// [`depth_pipeline_index`]; see module doc and [`DEPTH_STENCIL_VARIANTS`].
+    pipelines: [wgpu::RenderPipeline; 4],
     bind_group_layout: wgpu::BindGroupLayout,
     errors: Arc<BoundedErrorSink>,
 }
@@ -654,6 +746,14 @@ impl TrianglePipelineRenderer {
     /// inside the vertex shader itself, not here -- `vertices`' `position`
     /// stays raw RDP screen-pixel `x`/`y`/`z`/`w`, matching
     /// `triangle_pipeline_vertex.wgsl`'s own module doc.
+    ///
+    /// `other_mode.depth_compare_enabled()`/`depth_update_enabled()`
+    /// (production depth-slice task card, `Z_CMP`/`Z_UPD` pipeline-variant
+    /// depth gating) select this draw's precreated pipeline variant verbatim
+    /// -- see [`depth_pipeline_index`]. `other_mode.depth_mode()` is not
+    /// read here or anywhere in this module: every `DepthMode` value gets
+    /// exactly the plain hardware `Less`/write-toggle behavior this slice
+    /// implements, no mode-specific dispatch (nonclaims, module doc).
     #[allow(clippy::too_many_arguments)]
     pub fn submit_admitted_triangle(
         &mut self,
@@ -682,6 +782,8 @@ impl TrianglePipelineRenderer {
             tile_binding,
             alpha_compare_mode,
             blend_color,
+            depth_compare_enabled: other_mode.depth_compare_enabled(),
+            depth_update_enabled: other_mode.depth_update_enabled(),
         };
         self.submit_triangle(fixture)
     }
@@ -747,6 +849,11 @@ impl TrianglePipelineRenderer {
         struct DrawResources {
             vertex_buffer: wgpu::Buffer,
             bind_group: wgpu::BindGroup,
+            // This draw's precreated pipeline-variant index (production
+            // depth-slice task card §3), from this fixture's own
+            // `depth_compare_enabled`/`depth_update_enabled` -- selected per
+            // draw at `pass.set_pipeline`, not once for the whole pass.
+            depth_pipeline_index: usize,
             // Kept alive only because the bind group above borrows them
             // (`as_entire_binding`); never read after construction.
             _raster_params_buffer: wgpu::Buffer,
@@ -862,6 +969,10 @@ impl TrianglePipelineRenderer {
             draws.push(DrawResources {
                 vertex_buffer,
                 bind_group,
+                depth_pipeline_index: depth_pipeline_index(
+                    fixture.depth_compare_enabled,
+                    fixture.depth_update_enabled,
+                ),
                 _raster_params_buffer: raster_params_buffer,
                 _combine_params_buffer: combine_params_buffer,
                 _tmem_bytes_buffer: tmem_bytes_buffer,
@@ -979,8 +1090,8 @@ impl TrianglePipelineRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
             for resources in &draws {
+                pass.set_pipeline(&self.pipelines[resources.depth_pipeline_index]);
                 pass.set_bind_group(0, &resources.bind_group, &[]);
                 pass.set_vertex_buffer(0, resources.vertex_buffer.slice(..));
                 pass.draw(0..3, 0..1);
