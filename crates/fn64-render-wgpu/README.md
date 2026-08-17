@@ -1929,3 +1929,288 @@ but untouched here), `Dither` mode's noise-source architecture (this slice
 supplies literal noise bytes only, same as the existing Rust tests),
 `depth_mode`/`coverage`/`blend`'s equally-unwired characterized seams, RT64
 pixel/visual parity, and any performance or throughput claim.
+## 2026-08-16: Published committed-TMEM textured-triangle draw (Option B)
+
+Wires the already-characterized RDP texture-addressing/three-nearest-filter
+arithmetic (`tmem/read.rs`+`tmem/sample.rs`) into `targets/triangle_pipeline`'s
+previously flat-colored, textureless fragment shader, producing a published,
+committed-TMEM, textured triangle for the first time: the fragment shader
+runs the ported RDP addressing/filter math per fragment, for real varying UVs
+interpolated across a triangle, not a single pre-resolved constant color.
+This confirms Option B (the frozen, mandatory design per the implementation
+card's §3): the raw committed physical-TMEM byte image and its validity
+bitmap are uploaded once per commit generation as **read-only storage
+buffers** and sampled by new WGSL functions running per fragment — never a
+CPU-resolved RGBA8 image sampled through wgpu's own hardware
+`textureSample`/`textureLoad` (Option A, rejected outright: that design never
+executes the ported RDP sampling arithmetic per fragment for varying UVs).
+
+**New WGSL module.** `shaders/tmem_sample.wgsl` — a library-only file (no
+`@group`/`@binding` entry point of its own besides its module-scope
+storage/uniform bindings), concatenated ahead of
+`triangle_pipeline_fragment.wgsl`'s `@fragment` wrapper at the same Rust
+build seam `color_combiner.wgsl` already uses
+(`shader_manifest::triangle_pipeline_fragment_wgsl`). Ports, WGSL-for-Rust,
+the same functions this crate's own `tmem/read.rs`/`tmem/sample.rs` already
+characterize and test: `relative_axis_coordinate`/`address_axis_texel`
+(S10.5 clamp/wrap/mirror/mask), `address_texture_cell_wgsl` (2x2 cell
+gather plus 5-bit S/T fractions), `tmem_rgba16_texel_address`/
+`tmem_rgba16_byte_address` (tile-relative linear byte address, odd-row XOR4
+parity — applied independently per addressed byte, matching
+`tmem/read.rs`'s own `read_linear_bytes` exactly, not once on a shared base
+address), `decode_rgba16` (byte-for-byte port of
+`direct_texel_decode.wgsl`'s RGBA5551 expansion), and
+`filter_three_nearest_wgsl` (the same fixed-point formula
+`shaders/three_nearest_filter.wgsl` already carries). Scope: RGBA16 direct
+format only, matching this slice's own fixed fragment-shader call site —
+CI4/CI8/TLUT, RGBA32, IA4/IA8/IA16, I4/I8, and YUV are out of scope.
+
+**Frozen `TmemFirstRowParity::Even`** (this crate's own existing test-fixture
+default wherever a caller must supply one without a load-tile-derived value)
+for every sample this slice issues — not a claim about hardware's actual
+load/render-tile aliasing resolution, which remains genuinely unsettled (see
+the M4.3.3d passage this repeats verbatim: "the reference lane derives
+parity from the render tile's ULT while pinned RT64's raw-TMEM shader uses
+the relative row, and neither settles load/render-tile aliasing on
+hardware").
+
+**GPU-side validity-sentinel encoding** (a new, named choice this slice
+introduces, not prior art): a parallel bitmap, one bit per TMEM byte
+address, packed 32 bits per `u32` word (`tmem/gpu_projection.rs`'s
+`TmemGpuProjection`/`TMEM_VALIDITY_WORDS = 128`). Chosen over a
+reserved-sentinel-value scheme because a sentinel value would either forbid
+a real byte value from ever equalling it or require widening every stored
+byte to a larger type; a same-width parallel bitmap instead mirrors this
+crate's own CPU-side `valid: Box<[bool; TMEM_LEN]>` shadow array one-for-one
+at 1/32 the size a per-byte `u32` flag array would cost.
+
+**Bind-group extension** (`targets/triangle_pipeline.rs`): bindings 2/3
+(read-only storage buffers, `tmem_bytes: array<u32, 1024>`/
+`tmem_validity_words: array<u32, 128>`, matching this crate's own
+`direct_texel_decode.wgsl`/`three_nearest_filter.wgsl` storage-buffer
+convention, not `texture_2d`/`sampler`) and binding 4 (`TileBindingParams`
+uniform — `tmem/gpu_projection.rs`'s host-side mirror of the WGSL struct,
+field-for-field in the same declaration order, mechanically proven equal by
+`to_bytes_offsets_match_the_wgsl_tile_binding_params_declaration_order`). A
+second color attachment (`@location(1)`, `R32Uint`) carries
+`tmem_sample.wgsl`'s own `TMEM_SAMPLE_STATUS_*` code per fragment — the
+observable-shader-failure-status channel a fragment shader has to report a
+per-pixel typed failure back to the CPU; `production.rs`'s
+`draw_admitted_triangles` reads this back and turns any non-OK status into
+the new `WgpuRawDpcExecutionError::TmemSampleFailed` variant, never silently
+accepted.
+
+**Tile-binding snapshot** (`production.rs`'s `PlanCollector`, mirroring
+`raw_dpc::triangle_draw_data::TriangleDrawStateCollector`'s identical
+addition): tracks tile 0's `SetTile`/`SetTileSize` binding current at the
+walk's own stream position — tile 0 is the RDP's default bound texture tile
+for a standard triangle draw (`RdpTriangleCommand` carries no tile index of
+its own) — snapshotted onto each `RetrievedTriangleDraw` alongside the
+existing `OtherMode`/`CombineParams` walk-local tracking.
+`TileBindingParams::unbound()` (loud `bound = 0`) when no tile-0 binding was
+established at that triangle's stream position; the WGSL sampler checks
+`bound` before touching TMEM and reports
+`TMEM_SAMPLE_STATUS_NO_TILE_BINDING`, never a silent default.
+
+**Production-format rejection.** `TileBindingParams` carries the bound
+tile's `format`/`pixel_size` wire codes; `tmem_sample.wgsl`'s
+`sample_committed_rgba16_three_nearest` checks both against
+`TMEM_IMAGE_FORMAT_RGBA`/`TMEM_PIXEL_SIZE_BITS16` before any addressing math
+runs, reporting `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT` for anything else —
+never a silent fallback to treating unknown bytes as RGBA16.
+
+**Distinct failure statuses** (an audit repair from this slice's own
+verification pass): `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` (missing tile
+snapshot) and `TMEM_SAMPLE_STATUS_REVERSED_EXTENT`
+(`address_texture_cell_wgsl`'s clamped-axis `high < low` check, mirroring
+the CPU oracle's `PointAddressError::ReversedClampExtent`) are separate
+codes, not collapsed into one — a missing `TileDescriptor` and a reversed
+clamp extent are different failure causes.
+
+**Independent verification against implementation (this slice's own
+correction, not a copy of the card's prose):**
+
+- *Per-byte address masking.* The initial WGSL draft computed one shared
+  base address for an RGBA16 texel's two bytes and added an offset, which
+  disagrees with `tmem/read.rs`'s `read_linear_bytes` exactly at the 0xfff
+  TMEM-address wrap boundary (`base` and `base + 1` can straddle it, and the
+  odd-row XOR4 exchange must also apply per byte, not once to a shared
+  base). Fixed to mask (`& TMEM_ADDRESS_MASK`) and conditionally XOR each of
+  the two bytes independently, matching the CPU oracle exactly
+  (`tmem_rgba16_linear_base`/`tmem_rgba16_byte_address` in
+  `shaders/tmem_sample.wgsl`).
+- *Texel-center addressing convention.* This slice's own differential
+  fixture initially assumed a texel's own unambiguous sample point was at
+  `raw = base_texel*32 + 16` (the implementation card's own stated
+  convention). Direct verification against `filter_three_nearest`'s formula
+  showed this is wrong: `filter_three_nearest`'s corner weight is 100% at
+  `(s0,t0)` only when `sf == tf == 0`, i.e. a texel's own unambiguous
+  address is `raw = base_texel*32` — `+16` instead lands exactly halfway
+  toward the *next* texel (a genuine four-corner blend). The differential
+  fixture and its hand-derived expected colors
+  (`production.rs::tests::required_cpu_tmem_oracle_matches_hand_derived_texel_colors`)
+  use the corrected convention throughout.
+- *LoadBlock row-alignment for a narrow source image.* A 2-texel-wide
+  source image cannot produce a whole-8-byte-word row stride
+  (`tmem/read.rs`'s `linear_byte_address` requires `line_words * 8` bytes
+  per row), so the differential fixture instead uses a 4-texel-wide source
+  image (whose natural row width is exactly one TMEM word) and addresses
+  only its left 2x2 sub-region as the tile — avoiding an unrepresentable
+  fractional `line_words` value the card's literal 2-wide byte string would
+  have required.
+- *Odd-row XOR4 write/read asymmetry.* `LoadBlock`'s own transfer is always
+  one linear run (`tmem/wire.rs`'s `transfer_shape` reports `row_count = 1`
+  for every `Block` load, so its own odd-row exchange never fires), but the
+  *read* path (`tmem_rgba16_texel_address`) applies the XOR4 exchange to any
+  texel whose tile-relative row is odd, under this slice's frozen
+  `TmemFirstRowParity::Even`. The differential fixture places its row-1
+  source bytes at their post-XOR4 TMEM offsets directly, since the load
+  itself never re-orders them.
+
+**CPU-vs-WGSL differential** (`production.rs::tests`, mandatory exit gate):
+`required_cpu_tmem_oracle_matches_hand_derived_texel_colors` (CPU-only, no
+GPU, runs in every environment) drives this fixture's real production
+TMEM-load path through `WgpuBackend::plan_raw_dpc`/`execute_raw_dpc`/
+`publish_raw_dpc`, then calls `address_texture_cell`/
+`gather_committed_texture_cell`/`filter_three_nearest_committed_cell`
+directly at four exact texel-center points (verifying all four fixture
+colors independently) plus one hand-derived four-corner blend, with the
+arithmetic shown explicitly in the test's own comments, not asserted as a
+magic constant.
+`required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`
+(`host-gpu-tests`-gated) submits the same committed TMEM through the real
+fragment pipeline (`TrianglePipelineRenderer::submit_admitted_triangle`,
+reached via a `#[cfg(test)]`-only `WgpuBackend::triangle_pipeline_for_test`
+accessor) with a textured triangle whose three vertices carry genuinely
+different UVs, and asserts the GPU-observed color at two algebraically
+interpolated pixel-center sample points against the same CPU oracle chain.
+Both sides are computed independently; the GPU side additionally asserts
+every fragment's `tmem_sample_status` readback is `TMEM_SAMPLE_STATUS_OK`.
+
+**Nonclaims.** No RT64 pixel/visual/silicon parity, no guest-visible
+publication beyond this backend's own existing `last_triangle_draw()`
+diagnostic accessor, no two-cycle combiner/LOD/filter-mode-selection wiring
+(this slice hardcodes three-nearest bilerp, matching the existing
+`filter_three_nearest_committed_cell` precedent as the most-tested of the
+two filter paths), no base-renderer-behavior-matrix row promotion (the new
+WGSL addressing/filter functions inherit no independent behavioral
+authority of their own — their correctness is established solely by the
+CPU-vs-WGSL differential above), and no performance/throughput claim (the
+CPU-side upload adapter writes the full committed TMEM byte image once per
+commit generation change, a correctness/mechanism choice, not a throughput
+claim).
+
+**Repair (independent adversarial review, this session): negative-UV
+floor-vs-truncation bug in `fs_main`.** `triangle_pipeline_fragment.wgsl`'s
+`fs_main` computed `i32(uv.x)`/`i32(uv.y)` directly on the rasterizer's
+interpolated `f32` raw S10.5 coordinate before calling
+`sample_committed_rgba16_three_nearest_bound`. `i32(f32)` in WGSL truncates
+toward zero, not toward negative infinity — for any negative interpolated
+coordinate this silently disagreed with the CPU oracle's own
+`div_euclid`/`rem_euclid` floor convention (`tmem/sample.rs`'s
+`relative_axis_coordinate`, already ported faithfully in
+`tmem_sample.wgsl`'s own same-named function, which assumes its `raw_s`/
+`raw_t` integer inputs are already floored). Fixed to
+`i32(floor(uv.x))`/`i32(floor(uv.y))`. The prior differential fixture
+(`fixture_tile_descriptor`, clamp-addressed, `mask_s = mask_t = 0`) could not
+have caught this: under clamp addressing every negative `base_texel`
+collapses to column/row 0 on both the correct and buggy path, and the
+`filter_three_nearest` formula's two branches are provably identical at that
+saturated boundary — a clamp fixture cannot discriminate floor from
+truncation for negative input, only wrap/mirror addressing can (see
+`cpu_oracle_sample_with_tile`'s doc comment in `production.rs` for the full
+argument). The repaired differential adds `fixture_wrap_tile_descriptor`
+(mask=1 wrap, non-clamp, non-mirror, over the same committed 2x2 RGBA16
+texel layout) and two new discriminating assertion points:
+- `required_cpu_tmem_oracle_matches_hand_derived_texel_colors`'s own
+  `negative_coordinate` assertion (CPU-only, no GPU): raw point `(s=-1,
+  t=0)` under the wrap tile, hand-derived to `[247, 8, 0, 255]` (shown
+  arithmetic, not a magic constant) — this is the value truncation-toward-
+  zero would have gotten wrong (it would instead address `base_texel=0`,
+  producing pure red `[255, 0, 0, 255]`).
+- `required_host_negative_uv_floors_toward_negative_infinity_not_truncation`
+  (`host-gpu-tests`-gated, new test): geometry chosen so the rasterizer's
+  own per-fragment interpolation lands the actual `f32` UV at exactly `-0.5`
+  at pixel (0,0) (an exact binary value, no rounding drift), exercising the
+  real bug site — the fragment shader's own `f32`->`i32` conversion of an
+  *interpolated* value, which the CPU-only test cannot reach since it starts
+  from an already-integer coordinate. Asserts the real GPU fragment output
+  against the CPU oracle's `[247, 8, 0, 255]` at **exact** equality (zero
+  tolerance), not the ±2 channel tolerance the pre-existing positive-UV
+  differential test uses — the two candidate answers here differ by up to 8
+  in one channel, well outside that tolerance, so exact agreement is the
+  correct bar at this specific, deliberately-exact-valued point.
+
+Both new assertion points keep every pre-existing positive-UV assertion
+unchanged (`required_cpu_tmem_oracle_matches_hand_derived_texel_colors`'s
+four texel-center points and the tile-center blend;
+`required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`'s
+two positive interpolated points) — this repair is additive, not a
+replacement of prior coverage.
+
+**Reliability status, corrected.** The CPU-only half of this repair's
+differential (`required_cpu_tmem_oracle_matches_hand_derived_texel_colors`)
+has been run a handful of times in this sandbox session — nowhere near
+AGENTS.md's 10-consecutive-clean-run bar for a deterministic fix, and this
+document does not claim that bar is met. The GPU-side half
+(`required_host_negative_uv_floors_toward_negative_infinity_not_truncation`,
+like every other `host-gpu-tests` test in this crate) has not executed at
+all in this sandbox — `NoAdapter{AnyNative}`, identical to every pre-existing
+host-GPU test here, is unsupported-host evidence, not a passing or skipped
+GPU claim, and does not count toward any run total. No "10x" or other
+throughput/scale claim is made anywhere in this repair; the only "10"
+figure that applies to this work is AGENTS.md's *run-count* reliability bar,
+and it remains unmet pending a real Metal adapter.
+
+**Repair: `fs_main` sampled TMEM unconditionally, aborting SHADE-only
+triangles with no tile bound.** After the coverage/cvg_dst port, the full
+host-GPU lib gate failed at
+`production::tests::wgpu_backend_draws_a_real_admitted_triangle_matching_the_combiner_oracle`
+— a pre-existing SHADE-passthrough fixture (`combine_d=SHADE`, no
+`SetTile`/`SetTileSize` issued, so its `TileBindingParams` is
+`unbound()`). `fs_main` called
+`sample_committed_rgba16_three_nearest_bound` unconditionally, so this
+legitimately-textureless triangle hit
+`TMEM_SAMPLE_STATUS_NO_TILE_BINDING` and aborted the draw even though its
+combiner formula never reads `TEXEL0`/`TEXEL1`.
+
+**Mechanism, not a one-off guard.** `CombineParams::references_texels_in_first_cycle`
+(`combiner.rs`) is a selector-reference predicate over the real
+`SetCombine` value: true iff any first-cycle color slot (A/B/C/D) decodes
+to `ColorInput::{Texel0,Texel1,Texel0Alpha,Texel1Alpha}` or any first-cycle
+alpha slot (A/B/C/D) decodes to `AlphaInput::{Texel0,Texel1}`, via the
+crate's own existing typed decoders (`decode_color`/`decode_alpha`,
+`second_cycle = true` — matching `run_one_cycle`'s own slot-decode call).
+Slots A, B, and D are unconditional references whenever they decode to a
+texture selector — `run_one_cycle`'s `(A-B)*C+D` formula adds `D`
+unconditionally and reads `A`/`B` unconditionally to form the `(A-B)`
+term. Slot C is the one narrow exception: it is `(A-B)*C`'s own
+coefficient, and `(A-B)` is exactly zero whenever A and B decode to the
+same selector, so C only counts as a reference when A and B decode to
+*different* selectors. This is a fact about the formula's own coefficient
+structure, not an approximation of it or a guess about which fixtures
+happen to exist — every SHADE-passthrough fixture in this crate (including
+the one that triggered this repair) sets alpha A=B=`COMBINED` and alpha
+C=`TEXEL0` (`alpha_input_c`'s own table, index 1 — distinct from
+`alpha_input_abd`'s table, where index 1 is `COMBINED`) purely because C's
+coefficient is forced to zero, never because the texel value is wanted;
+treating C as an unconditional reference the same as A/B/D would report
+"texture referenced" for every one of those fixtures and reproduce this
+exact bug.
+
+**Wiring.** The predicate is host-serialized into the existing 16-byte
+`FragmentCombineParams` uniform (`targets/triangle_pipeline.rs`'s
+`fragment_combine_params_bytes`, no new binding): bytes 0..8 unchanged
+(`low`/`high`, the raw `SetCombine` wire split), bytes 8..12 the
+predicate's result as a `u32` (`texture_referenced`), bytes 12..16 left
+zero (`reserved_zero`, matching `tmem_sample.wgsl`'s own
+`TileBindingParams::reserved_zero` convention). `fs_main` only calls
+`sample_committed_rgba16_three_nearest_bound` when `texture_referenced !=
+0u`; when the gate is closed, `tex_val0`/`tex_val1` are the fixed zero
+color and the reported status is `TMEM_SAMPLE_STATUS_OK` — sampling is
+conditional on selector references, not unconditional. The gate never
+suppresses a real texture reference: both of this crate's real textured
+differentials (`production.rs`'s TEXEL0-passthrough fixtures, `color_d =
+TEXEL0`, an unconditional D reference) still evaluate to
+`texture_referenced = 1` and the real sampler still runs for them, loud
+failures included.

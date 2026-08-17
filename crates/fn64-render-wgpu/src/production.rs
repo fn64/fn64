@@ -33,12 +33,14 @@ use fn64_render_ir::{
 };
 
 use crate::raw_dpc::push_decoded_raw_dpc;
+use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
     CombineParams, HeadlessBackend, MissingTriangleDrawState, OtherMode, PhysicalTmemError,
     PhysicalTmemPacketTransaction, PhysicalTmemState, RawDpcDecodeError, RdpState,
     RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
     TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
     TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
+    TMEM_SAMPLE_STATUS_OK,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -189,6 +191,26 @@ impl WgpuBackend {
         self.triangle_draw_output.as_ref()
     }
 
+    /// Test-only escape hatch into the real `TrianglePipelineRenderer` this
+    /// backend already owns (post-`create_inner`), so the CPU-vs-WGSL
+    /// differential (published committed-TMEM textured-draw card §4/§7) can
+    /// call `submit_admitted_triangle` directly with literal
+    /// `NeutralTriangleVertex` UVs -- avoiding the separate, already-
+    /// characterized RT64 fixed-point texcoord wire-decode pipeline
+    /// (`raw_dpc::triangle_vertices::decode_texture`), which is not this
+    /// slice's own arithmetic and would only add an unrelated correctness
+    /// risk to a differential whose entire purpose is validating the WGSL
+    /// TMEM-sampling port itself. `production.rs`'s own `RetrievedTriangleDraw`-
+    /// literal test fixtures (e.g. `fixture_vertex`) already establish this
+    /// same "construct the vertex/tile-state literally, skip wire decode"
+    /// convention for host-GPU pipeline tests.
+    #[cfg(all(test, feature = "host-gpu-tests"))]
+    pub(crate) fn triangle_pipeline_for_test(&mut self) -> &mut TrianglePipelineRenderer {
+        self.triangle_pipeline
+            .as_mut()
+            .expect("create_inner must succeed before this test accessor is used")
+    }
+
     /// Draws every collected triangle, in stream order, through
     /// `TrianglePipelineRenderer::submit_admitted_triangle`, using the
     /// identity `TriangleRasterParams` derived once from the stored
@@ -215,6 +237,13 @@ impl WgpuBackend {
             screen_scale: [1.0, 1.0],
             screen_offset: [0.0, 0.0],
         };
+        // Published committed-TMEM textured-draw card §2: the committed
+        // physical TMEM byte image this draw samples against, projected
+        // once per `draw_admitted_triangles` call (not once per triangle --
+        // every triangle in one call shares the same committed-TMEM
+        // snapshot, since no TMEM commit happens between triangles within a
+        // single `execute_raw_dpc` call).
+        let tmem = project_committed_tmem(self.coordinator.physical());
 
         let mut last_output = None;
         for draw in triangles {
@@ -226,11 +255,24 @@ impl WgpuBackend {
                     draw.combine_params,
                     raster_params,
                     extent,
+                    tmem,
+                    draw.tile_binding,
                 )
                 .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
             let output = in_flight
                 .complete()
                 .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+            // Observable shader failure status (card audit repair):
+            // propagate any fragment's non-OK `tmem_sample.wgsl` status
+            // to a named Rust execution error -- never silently accepted
+            // as though the draw's texture sampling succeeded everywhere.
+            if let Some(&status) = output
+                .tmem_sample_status
+                .iter()
+                .find(|&&status| status != TMEM_SAMPLE_STATUS_OK)
+            {
+                return Err(WgpuRawDpcExecutionError::TmemSampleFailed { status });
+            }
             last_output = Some(output);
         }
 
@@ -324,6 +366,17 @@ struct PlanCollector {
     /// `SetOtherMode`/`SetCombine` command in plan order.
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
+    /// Tile 0's binding current at the walk's current stream position
+    /// (published committed-TMEM textured-draw card §2: "extend
+    /// `PlanCollector`... to snapshot the current `TmemState` tile
+    /// bindings onto each triangle"). Tile 0 is the RDP's default bound
+    /// texture tile for a standard triangle draw -- `RdpTriangleCommand`
+    /// carries no tile index of its own. Mirrors
+    /// `raw_dpc::triangle_draw_data::TriangleDrawStateCollector`'s own
+    /// identical fields exactly (this struct's own module doc already
+    /// states this file duplicates that collector's behavior).
+    current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
+    current_tile0_size: Option<fn64_render::NeutralTileSize>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -349,6 +402,8 @@ impl PlanCollector {
             next_command_index: 0,
             current_other_mode: other_mode,
             current_combine: combine,
+            current_tile0_descriptor: None,
+            current_tile0_size: None,
             triangles: Vec::new(),
         }
     }
@@ -371,10 +426,28 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     self.current_combine =
                         Some(CombineParams::from_wire(combine.low, combine.high));
                 }
+                RdpStateCommand::SetTile {
+                    tile_index,
+                    descriptor,
+                    ..
+                } if *tile_index == 0 => {
+                    self.current_tile0_descriptor = Some(*descriptor);
+                }
+                RdpStateCommand::SetTileSize {
+                    tile_index, size, ..
+                } if *tile_index == 0 => {
+                    self.current_tile0_size = Some(*size);
+                }
                 _ => {}
             },
             RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand { vertices, .. }) => {
                 let triangle_index = self.triangles.len();
+                let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
+                    (Some(descriptor), Some(size)) => {
+                        TileBindingParams::from_neutral(descriptor, size)
+                    }
+                    _ => TileBindingParams::unbound(),
+                };
                 let snapshot = (|| {
                     let other_mode = self
                         .current_other_mode
@@ -386,6 +459,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         vertices: *vertices,
                         other_mode,
                         combine_params,
+                        tile_binding,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -500,6 +574,17 @@ pub enum WgpuRawDpcExecutionError {
     /// `triangle_target_extent` are always `Some` together (§1a/§1e) or
     /// both `None`; this is the caller-contract violation of the latter.
     TriangleDrawBeforeCreate,
+    /// At least one fragment of an admitted triangle's draw reported a
+    /// non-`TMEM_SAMPLE_STATUS_OK` status through `tmem_sample.wgsl`'s
+    /// observable shader-failure-status channel (published committed-TMEM
+    /// textured-draw card, audit repair) -- a missing tile binding, a
+    /// reversed clamp extent, an invalid (never-loaded) TMEM byte in the
+    /// triangle's UV footprint, or an unsupported production format.
+    /// `status` is the first such code found, in row-major fragment order;
+    /// never silently accepted as a successful textured draw.
+    TmemSampleFailed {
+        status: u32,
+    },
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -527,6 +612,11 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::TriangleDrawBeforeCreate => formatter.write_str(
                 "a triangle-bearing plan reached execution with no successful prior \
                  RenderBackend::create call",
+            ),
+            Self::TmemSampleFailed { status } => write!(
+                formatter,
+                "a triangle draw's fragment shader reported a non-OK tmem_sample.wgsl status: \
+                 {status}"
             ),
         }
     }
@@ -1135,6 +1225,11 @@ mod tests {
         CapturedGuestRead, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
     };
 
+    use crate::{
+        ImageFormat, PixelSize, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
+        TmemWordAddress,
+    };
+
     use super::*;
 
     const LAYOUT_BYTES: u32 = 0x4000;
@@ -1142,6 +1237,7 @@ mod tests {
 
     const SET_TEXTURE_IMAGE: u8 = 0x3d;
     const SET_TILE: u8 = 0x35;
+    const SET_TILE_SIZE_OPCODE: u8 = 0x32;
     const LOAD_SYNC: u8 = 0x26;
     const LOAD_BLOCK: u8 = 0x33;
     const FULL_SYNC: u8 = 0x29;
@@ -1694,6 +1790,778 @@ mod tests {
         assert_eq!(expected_u8, triangle_color_255.map(|c| c as u8));
     }
 
+    /// Published committed-TMEM textured-draw card §4: the frozen literal
+    /// texel values (four fully-saturated primary/neutral colors, one per
+    /// corner), corrected against this crate's own real
+    /// `LoadBlock`/tile-addressing implementation for the *source image
+    /// width and byte layout*, rather than copied blind from the card's
+    /// prose. See this function's own doc below for the one correction.
+    ///
+    /// RGBA16, 2x2 TILE (the card's own frozen extent). Texel `(0,0)` = red
+    /// `0xF801` -> RGBA8 `(255,0,0,255)`; `(1,0)` = green `0x07C1` ->
+    /// `(0,255,0,255)`; `(0,1)` = blue `0x003F` -> `(0,0,255,255)`; `(1,1)`
+    /// = white `0xFFFF` -> `(255,255,255,255)`.
+    ///
+    /// **Source-image-width correction (this slice's own verification, not
+    /// a copy of the card's literal byte string):** `tmem/read.rs`'s
+    /// `linear_byte_address` computes each row's TMEM start as `row *
+    /// tile.line_words() * 8` -- always a whole-8-byte-word multiple.
+    /// `tmem/wire.rs`'s `transfer_shape` for `LoadBlock` transfers exactly
+    /// `source.total_bytes()` bytes as ONE flat linear run (`dxt=0` mode,
+    /// no row-interleave), so if the card's own literal 2-texel-wide
+    /// SOURCE IMAGE were used, row 1 (texels `(0,1)`/`(1,1)`) would land at
+    /// source/TMEM byte 4 -- not a whole-word multiple, so no `line_words`
+    /// value can make the READ side find it there (`line_words=1` looks
+    /// for row 1 at byte 8; `line_words=0` aliases every row to byte 0).
+    /// This fixture instead uses a 4-texel-wide SOURCE IMAGE (so one row is
+    /// naturally exactly one 8-byte TMEM word: `4 texels * 2 bytes = 8
+    /// bytes`), `LoadBlock`s the top 2 rows x 4 columns (8 texels, still
+    /// one linear `dxt=0` transfer, still admitted), and the 2x2 TILE's own
+    /// `SetTile`/`SetTileSize` addresses only that image's left 2x2
+    /// sub-region (columns 0-1, `mask_s`/`mask_t` left at 0 so clamp mode
+    /// bounds the tile exactly to `high.integer()-low.integer()+1 == 2`).
+    /// Columns 2-3 of each row are filler, never addressed by this tile.
+    /// `line_words=1` (one whole word/row) now correctly finds row 1 at
+    /// byte 8, matching `LoadBlock`'s own real linear placement. The three
+    /// assertion points' expected colors are computed by literally calling
+    /// this crate's own `address_texture_cell`/`gather_committed_texture_cell`/
+    /// `filter_three_nearest_committed_cell` chain against this corrected
+    /// layout -- not hand-derived arithmetic copied from the card, which is
+    /// exactly the kind of mismatch this verification step exists to catch.
+    const FIXTURE_TMEM_WORD_ADDRESS: u16 = 0;
+    const FIXTURE_LINE_WORDS: u16 = 1;
+    const FIXTURE_SOURCE_IMAGE_WIDTH: u32 = 4;
+
+    /// **Odd-row XOR4 correction (this slice's own verification against
+    /// the real read path, not assumed from the card's prose):**
+    /// `LoadBlock` writes its whole transfer as ONE linear run
+    /// (`tmem/wire.rs`'s `transfer_shape` `Block` arm always reports
+    /// `row_count = 1`, so its own `odd_row_exchange` never fires) --
+    /// hardware treats a block load as texel-address-agnostic bytes, not
+    /// discrete tile rows. But the READ side (`tmem_rgba16_texel_address`/
+    /// `tmem/read.rs`'s `linear_byte_address`+`odd_row_exchange`) DOES
+    /// apply the XOR4 swap to any texel whose TILE-relative row is odd,
+    /// under this slice's frozen `TmemFirstRowParity::Even` (card §6): row
+    /// 1 (odd) XORs its computed address by 4. Since the write never
+    /// exchanged but the read always will for row 1, this fixture's source
+    /// bytes for row-1 texels must be placed at their POST-XOR4 TMEM
+    /// offsets directly: texel (0,1) reads from address `8 XOR 4 = 12`,
+    /// texel (1,1) reads from address `10 XOR 4 = 14`. Bytes 8-11 (row 1's
+    /// un-exchanged half) are filler, never read by this tile's own two
+    /// column addresses under the exchange.
+    fn fixture_load_block_source_bytes() -> Vec<u8> {
+        vec![
+            0xf8, 0x01, // (0,0) red -- row 0 (even), no exchange
+            0x07, 0xc1, // (1,0) green -- row 0 (even), no exchange
+            0x00, 0x00, // (2,0) filler, never addressed by the 2x2 tile
+            0x00, 0x00, // (3,0) filler
+            0x00, 0x00, // byte 8-9: row-1 UN-exchanged half, never read
+            0x00, 0x00, // byte 10-11: row-1 UN-exchanged half, never read
+            0x00, 0x3f, // byte 12-13: (0,1) blue's real post-XOR4 address
+            0xff, 0xff, // byte 14-15: (1,1) white's real post-XOR4 address
+        ]
+    }
+
+    fn fixture_tile_descriptor() -> TileDescriptor {
+        TileDescriptor::from_wire(
+            ImageFormat::Rgba,
+            PixelSize::Bits16,
+            FIXTURE_LINE_WORDS,
+            TmemWordAddress::try_new(FIXTURE_TMEM_WORD_ADDRESS).unwrap(),
+            0,
+            TileAddressMode::default(),
+            0,
+            0,
+            TileAddressMode::default(),
+            0,
+            0,
+        )
+    }
+
+    fn fixture_tile_size() -> TileSize {
+        // S10.2 raw units: `TileCoordinate::integer() = raw >> 2`, so
+        // `high - low + 1 == 2` texels wide/tall needs `high.integer() ==
+        // 1` (raw `4`) with `low.integer() == 0` (raw `0`).
+        TileSize::from_wire(
+            TileCoordinate::try_new(0).unwrap(),
+            TileCoordinate::try_new(0).unwrap(),
+            TileCoordinate::try_new(4).unwrap(),
+            TileCoordinate::try_new(4).unwrap(),
+        )
+    }
+
+    /// CPU oracle side of the differential: the real
+    /// `address_texture_cell`/`gather_committed_texture_cell`/
+    /// `filter_three_nearest_committed_cell` chain, invoked directly with
+    /// no GPU involved (card §4/§7 requirement).
+    fn cpu_oracle_sample(physical: &PhysicalTmemState, raw_s: i16, raw_t: i16) -> [u8; 4] {
+        cpu_oracle_sample_with_tile(
+            physical,
+            fixture_tile_descriptor(),
+            fixture_tile_size(),
+            raw_s,
+            raw_t,
+        )
+    }
+
+    /// Same CPU oracle chain as `cpu_oracle_sample`, parameterized over the
+    /// tile descriptor/size -- used by the negative-coordinate repair test
+    /// below, which needs a wrap-addressed (not clamp-addressed) tile: under
+    /// this crate's frozen clamp fixture (`fixture_tile_descriptor`'s own
+    /// `mask_s`/`mask_t == 0`, which forces `clamps = true` unconditionally
+    /// per `address_axis_texel`), any negative `base_texel` clamps to column/
+    /// row 0 on BOTH the correct-floor and buggy-truncate paths, and the
+    /// resulting blended color is provably identical either way (the clamp
+    /// formula's two branches agree exactly at that boundary) -- so a clamp
+    /// fixture cannot discriminate floor from truncation for a negative
+    /// coordinate. A `mask=1` wrap tile (non-clamp, non-mirror) instead
+    /// addresses each axis by parity (`coordinate & 1`), so a negative
+    /// `base_texel` of differing parity under floor vs. truncation selects
+    /// genuinely different corners, not a saturated boundary.
+    fn cpu_oracle_sample_with_tile(
+        physical: &PhysicalTmemState,
+        tile: TileDescriptor,
+        size: TileSize,
+        raw_s: i16,
+        raw_t: i16,
+    ) -> [u8; 4] {
+        let request = crate::PointSampleRequest::new(
+            crate::PointSampleCoordinates::new(
+                crate::TextureCoordinateS10_5::from_raw(raw_s),
+                crate::TextureCoordinateS10_5::from_raw(raw_t),
+            ),
+            crate::TmemFirstRowParity::Even,
+        );
+        let cell = crate::gather_committed_texture_cell(
+            physical,
+            tile,
+            size,
+            request,
+            crate::TextureLutMode::Disabled,
+        )
+        .expect("fixture's assertion points stay inside the addressed footprint");
+        crate::filter_three_nearest_committed_cell(cell)
+    }
+
+    /// Wrap-mode (`mask=1`, non-clamp, non-mirror) sibling of
+    /// `fixture_tile_descriptor` over the exact same committed 2x2 RGBA16
+    /// texel layout -- see `cpu_oracle_sample_with_tile`'s doc for why
+    /// wrap (not clamp) addressing is required to discriminate floor from
+    /// truncation at a negative coordinate.
+    fn fixture_wrap_tile_descriptor() -> TileDescriptor {
+        TileDescriptor::from_wire(
+            ImageFormat::Rgba,
+            PixelSize::Bits16,
+            FIXTURE_LINE_WORDS,
+            TmemWordAddress::try_new(FIXTURE_TMEM_WORD_ADDRESS).unwrap(),
+            0,
+            TileAddressMode::from_wire(0), // t: mirror=false, clamp=false
+            1,                             // mask_t = 1 (2-texel wrap period)
+            0,
+            TileAddressMode::from_wire(0), // s: mirror=false, clamp=false
+            1,                             // mask_s = 1 (2-texel wrap period)
+            0,
+        )
+    }
+
+    /// CPU-only half of the differential (card §4/§7 requirement "(a) the
+    /// CPU oracle chain ... invoked directly in a `#[cfg(test)]` unit test
+    /// with no GPU involved"): runs this fixture's real production
+    /// TMEM-only load through `WgpuBackend::execute_raw_dpc` (no GPU
+    /// adapter required -- `execute_raw_dpc` only reaches the triangle
+    /// pipeline when a plan admits a `Triangle` command, which a TMEM-only
+    /// plan never does), then asserts hand-derivable properties of
+    /// `cpu_oracle_sample`'s output directly against
+    /// `address_texture_cell`/`gather_committed_texture_cell`/
+    /// `filter_three_nearest_committed_cell`. Exact texel-center point
+    /// `(16,16)` has no filtering ambiguity (three-nearest weighting at an
+    /// exact-center coordinate reduces to selecting that corner at full
+    /// weight) and must equal pure red -- this is the load-bearing
+    /// assertion the GPU-side differential below reuses as its own known-
+    /// good anchor.
+    #[test]
+    fn required_cpu_tmem_oracle_matches_hand_derived_texel_colors() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, FIXTURE_SOURCE_IMAGE_WIDTH, 0x200));
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(load_sync());
+        let source_bytes = fixture_load_block_source_bytes();
+        words.extend([word(LOAD_BLOCK, 0), 7u32 << 12]);
+
+        let (planned, _unused_deterministic_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture's TMEM-only load stays inside the admitted subset");
+        // `physical_tmem()` reflects the coordinator's ACTIVE physical
+        // slot, which only flips at publish (see
+        // `plan_execute_publish_completes_and_flips_active_physical_slot`'s
+        // own doc/assertion) -- `execute_raw_dpc` alone stages the
+        // candidate but does not publish it.
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+
+        // Addressing convention (this slice's own verification against
+        // `relative_axis_coordinate`/`address_axis_texel`/
+        // `filter_three_nearest`, corrected from an initial wrong
+        // assumption that raw=16 was a texel's own unambiguous center):
+        // `base_texel = raw.div_euclid(32)`, `fraction = raw.rem_euclid(32)`,
+        // and `filter_three_nearest`'s weight is 100% on corner `(s0,t0)`
+        // only when `fraction == 0` on both axes (`sf=tf=0` collapses
+        // `value = c00*32` exactly). So a texel's own unambiguous center is
+        // at raw = `base_texel * 32`, NOT `base_texel*32 + 16` -- `+16`
+        // instead lands exactly halfway toward the NEXT texel, which is
+        // this fixture's genuinely-blended "tile center" case below.
+        //
+        // Exact address of texel (0,0): red, no filtering ambiguity
+        // (sf=tf=0, base_texel=(0,0)).
+        assert_eq!(
+            cpu_oracle_sample(backend.physical_tmem(), 0, 0),
+            [255, 0, 0, 255]
+        );
+        // Exact address of texel (1,0): green (base_texel=(1,0)).
+        assert_eq!(
+            cpu_oracle_sample(backend.physical_tmem(), 32, 0),
+            [0, 255, 0, 255]
+        );
+        // Exact address of texel (0,1): blue (base_texel=(0,1)).
+        assert_eq!(
+            cpu_oracle_sample(backend.physical_tmem(), 0, 32),
+            [0, 0, 255, 255]
+        );
+        // Exact address of texel (1,1): white (base_texel=(1,1), clamped
+        // to the tile's own [0,1] dimension on each axis).
+        assert_eq!(
+            cpu_oracle_sample(backend.physical_tmem(), 32, 32),
+            [255, 255, 255, 255]
+        );
+        // Genuine four-corner blend (card's own "tile's geometric center"
+        // intent): raw=(16,16), `base_texel=(0,0)`, `sf=tf=16` (halfway
+        // toward `s1`/`t1`) -- `filter_three_nearest`'s `sf+tf<=32` branch
+        // gives `value = c00*32 + 16*(c10-c00) + 16*(c01-c00)` per channel,
+        // hand-substituted here directly from red `(255,0,0)`, green
+        // `(0,255,0)`, blue `(0,0,255)` (the `c11`/white corner does not
+        // enter this branch at all, since `sf+tf=32<=32`):
+        // R: 255*32 + 16*(0-255) + 16*(0-255) = 8160 - 4080 - 4080 = 0
+        // G: 0*32 + 16*(255-0) + 16*(0-0) = 4080 -> round((4080+16)/32) = 128
+        // B: 0*32 + 16*(0-0) + 16*(255-0) = 4080 -> 128
+        // A: 255*32 + 16*(255-255) + 16*(255-255) = 8160 -> 255
+        let tile_center = cpu_oracle_sample(backend.physical_tmem(), 16, 16);
+        assert_eq!(tile_center, [0, 128, 128, 255]);
+
+        // Negative-coordinate floor-vs-truncation repair (independent
+        // adversarial-review finding): `triangle_pipeline_fragment.wgsl`
+        // used to compute `i32(uv.x)` directly on the interpolated `f32` raw
+        // S10.5 coordinate, which truncates toward zero instead of flooring
+        // toward negative infinity -- disagreeing with this CPU oracle's
+        // (and `tmem_sample.wgsl`'s own `relative_axis_coordinate` port's)
+        // `div_euclid`/`rem_euclid` floor convention for any negative
+        // coordinate. This fixture's own clamp-addressed tile
+        // (`fixture_tile_descriptor`, `mask_s = mask_t = 0`) cannot expose
+        // that bug: `address_axis_texel` clamps unconditionally when
+        // `mask == 0`, so `base_texel = -1` (the correct floor of raw `-1`)
+        // and `base_texel = 0` (`i32`-truncated raw `0`, the wrong result if
+        // truncation were used instead of floor) both clamp `s0`/`s1` to the
+        // SAME column pair regardless -- the two address paths are
+        // mathematically indistinguishable in the final blended color at
+        // that boundary. `fixture_wrap_tile_descriptor` instead uses
+        // `mask_s = mask_t = 1` (non-clamp, non-mirror wrap addressing over
+        // the SAME committed 2x2 texel layout): a wrap-addressed axis
+        // selects by parity (`coordinate & 1`), so floor(-1) (odd) and
+        // trunc(0) (even) address genuinely different, non-collapsing
+        // corners.
+        //
+        // At raw S10.5 point (s=-1, t=0): `relative_axis_coordinate` gives
+        // `base_s = (-1).div_euclid(32) = -1`, `frac_s =
+        // (-1).rem_euclid(32) = 31`; `base_t = 0`, `frac_t = 0`. Wrap
+        // addressing (`mask=1`, period 2): `s0 = (-1) & 1 = 1`, `s1 = 0 & 1
+        // = 0`, `t0 = 0 & 1 = 0`, `t1 = 1 & 1 = 1`. Corners: `c00 =
+        // color(s0=1,t0=0)` = green `(0,255,0,255)`, `c10 =
+        // color(s1=0,t0=0)` = red `(255,0,0,255)`, `c01 =
+        // color(s0=1,t1=1)` = white `(255,255,255,255)`. `sf=31, tf=0,
+        // sf+tf=31<=32` selects `filter_three_nearest`'s first branch:
+        // `value = c00*32 + 31*(c10-c00) + 0*(c01-c00)` per channel:
+        // R: 0*32 + 31*(255-0) + 0 = 7905 -> round((7905+16)/32) = 247
+        // G: 255*32 + 31*(0-255) + 0 = 8160-7905 = 255 -> round((255+16)/32) = 8
+        // B: 0*32 + 31*(0-0) + 0 = 0 -> 0
+        // A: 255*32 + 31*(255-255) + 0 = 8160 -> 255
+        // This CPU oracle result (the ONLY correct answer, since this
+        // module's own `TextureCoordinateS10_5`/`address_axis_texel` chain
+        // has always used `div_euclid`/`rem_euclid`, never truncation) is
+        // asserted exactly below, with zero tolerance. This is the
+        // discriminating value the GPU-side differential test also samples,
+        // where the pre-repair `i32(uv.x)` bug would instead have addressed
+        // `base_texel = 0` (truncating -1.0's neighborhood toward zero) and
+        // produced pure red `(255,0,0,255)` -- a different, wrong result
+        // this exact assertion rules out.
+        let negative_coordinate = cpu_oracle_sample_with_tile(
+            backend.physical_tmem(),
+            fixture_wrap_tile_descriptor(),
+            fixture_tile_size(),
+            -1,
+            0,
+        );
+        assert_eq!(negative_coordinate, [247, 8, 0, 255]);
+    }
+
+    /// Published committed-TMEM textured-draw card §4/§7 (mandatory exit
+    /// gate): the new fragment-callable WGSL TMEM addressing/filter chain
+    /// (`shaders/tmem_sample.wgsl`, wired through
+    /// `triangle_pipeline_fragment.wgsl`'s `fs_main`) must agree with the
+    /// CPU oracle chain, both computed independently -- CPU side via
+    /// `cpu_oracle_sample` above (no GPU, see
+    /// `required_cpu_tmem_oracle_matches_hand_derived_texel_colors`), GPU
+    /// side through the real fragment pipeline on a host-GPU adapter
+    /// (`WgpuBackend::execute_raw_dpc` for the TMEM commit,
+    /// `TrianglePipelineRenderer::submit_admitted_triangle` -- reached via
+    /// the `#[cfg(test)]`-only `triangle_pipeline_for_test` accessor -- for
+    /// the textured triangle draw itself). UVs are chosen so the
+    /// rasterizer's own per-fragment interpolation (not a per-triangle
+    /// constant) produces two genuinely different sample points, each
+    /// algebraically derived below from the real vertex UVs and the actual
+    /// pixel-center sampling convention, not copied magic numbers.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+
+        // Real production TMEM-load path: SetTextureImage/SetTile(0)/
+        // SetTileSize(0)/LoadSync/LoadBlock, admitted and executed through
+        // `WgpuBackend::execute_raw_dpc` exactly like every other TMEM-load
+        // test in this module. SetTextureImage's own width is the SOURCE
+        // IMAGE'S width (4 texels, see this test's own doc above) -- not
+        // the 2x2 TILE's width, which `SetTileSize` below states
+        // separately.
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, FIXTURE_SOURCE_IMAGE_WIDTH, 0x200));
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        // SetTileSize: low_s=0, low_t=0, high_s=4 (raw S10.2; `integer() ==
+        // 1`), high_t=4 -- a 2x2-texel tile (`high.integer() -
+        // low.integer() + 1 == 2` on each axis), matching
+        // `fixture_tile_size()` exactly.
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(load_sync());
+        let source_bytes = fixture_load_block_source_bytes();
+        // LoadBlock w0: source_s=0, source_t=0 (top-left of the 4-wide
+        // source image). w1: tile=0, high_s=7 (eight texels, 0..=7
+        // inclusive, spanning both rows of the 4-wide image --
+        // `decode_load_block`'s `texels = high_s - source_s + 1 == 8`),
+        // dxt=0 (pure-linear mode: no row-interleave -- correct here
+        // because the source image's own natural row width, 4 texels * 2
+        // bytes = 8 bytes, is already exactly one TMEM word, so a flat
+        // linear copy already lands row 1 at the same word-aligned offset
+        // `line_words=1`'s read-side formula expects).
+        words.extend([word(LOAD_BLOCK, 0), 7u32 << 12]);
+
+        let (planned, _unused_deterministic_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture's TMEM-only load stays inside the admitted subset");
+        // Unlike a bare `execute_raw_dpc` discard, this test needs the
+        // TMEM write to be durably visible: `physical_tmem()` only reflects
+        // the coordinator's ACTIVE slot after publish (see
+        // `required_cpu_tmem_oracle_matches_hand_derived_texel_colors`'s own
+        // doc) -- skipping commit/seal/publish here left stale/invalid TMEM
+        // active, which is what real-Metal execution caught
+        // (`InvalidTexelByte` at the fixture's own addressed footprint).
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+
+        let tmem = project_committed_tmem(backend.physical_tmem());
+        let tile_binding = TileBindingParams::bound(fixture_tile_descriptor(), fixture_tile_size());
+
+        // Screen geometry matches `covering_triangle_fixture`'s own right
+        // triangle exactly: vertex0=(0,0), vertex1=(8,0), vertex2=(0,8),
+        // all w=1 (perspective divide is a no-op) -- so the rasterizer's
+        // barycentric UV interpolation at pixel-center `(px, py) = (x+0.5,
+        // y+0.5)` is the plain affine formula `uv = uv0 + wx*(uv1-uv0) +
+        // wy*(uv2-uv0)`, `wx = px/8`, `wy = py/8`, matching this file's own
+        // `expected_interpolated_rgba8` color-interpolation precedent
+        // (`targets/triangle_pipeline/tests.rs`) applied to UV instead of
+        // color. UV0=(16,16), UV1=(112,16), UV2=(16,112): a genuinely
+        // varying UV gradient (not constant) sweeping well past the 2x2
+        // tile's own 64-unit extent, so pixel-center interpolation lands at
+        // real, hand-computed points inside the tile -- computed
+        // algebraically below, not guessed or copied from the card.
+        let uv0 = (16.0f32, 16.0f32);
+        let uv1 = (112.0f32, 16.0f32);
+        let uv2 = (16.0f32, 112.0f32);
+        let interpolated_uv = |x: u32, y: u32| -> (i16, i16) {
+            let wx = (x as f32 + 0.5) / 8.0;
+            let wy = (y as f32 + 0.5) / 8.0;
+            let s = uv0.0 + wx * (uv1.0 - uv0.0) + wy * (uv2.0 - uv0.0);
+            let t = uv0.1 + wx * (uv1.1 - uv0.1) + wy * (uv2.1 - uv0.1);
+            (s.round() as i16, t.round() as i16)
+        };
+        // Pixel (0,0)'s center (px=py=0.5, wx=wy=0.0625): s=t=16+0.0625*96=22.
+        let pixel_a = (0u32, 0u32);
+        // Pixel (2,2)'s center (px=py=2.5, wx=wy=0.3125): s=t=16+0.3125*96=46.
+        let pixel_b = (2u32, 2u32);
+        let (a_s, a_t) = interpolated_uv(pixel_a.0, pixel_a.1);
+        let (b_s, b_t) = interpolated_uv(pixel_b.0, pixel_b.1);
+        assert_eq!((a_s, a_t), (22, 22));
+        assert_eq!((b_s, b_t), (46, 46));
+
+        let assertion_points: [(i16, i16); 2] = [(a_s, a_t), (b_s, b_t)];
+        let expected: Vec<[u8; 4]> = assertion_points
+            .iter()
+            .map(|&(s, t)| cpu_oracle_sample(backend.physical_tmem(), s, t))
+            .collect();
+
+        let vertices = [
+            fn64_render::NeutralTriangleVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv0.0, uv0.1],
+            },
+            fn64_render::NeutralTriangleVertex {
+                x: 8.0,
+                y: 0.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv1.0, uv1.1],
+            },
+            fn64_render::NeutralTriangleVertex {
+                x: 0.0,
+                y: 8.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv2.0, uv2.1],
+            },
+        ];
+        // TEXEL0 passthrough SetCombine: (A-B)*C+D with A=TEXEL0(1), B=0
+        // (COMBINED), C=ONE-equivalent... instead use the simplest faithful
+        // identity available in the common table: D=TEXEL0 with A=B=
+        // COMBINED(0) (zeroing the (A-B)*C term), matching this file's own
+        // established SHADE-passthrough idiom but selecting TEXEL0 (index 1)
+        // for D instead of SHADE (index 4).
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 1; // TEXEL0
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 1; // TEXEL0
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        let combine_params = CombineParams::from_wire(low, high);
+
+        let renderer = backend.triangle_pipeline_for_test();
+        let raster_params = TriangleRasterParams {
+            resolution: [8.0, 8.0],
+            screen_scale: [1.0, 1.0],
+            screen_offset: [0.0, 0.0],
+        };
+        let output = renderer
+            .submit_admitted_triangle(
+                vertices,
+                OtherMode::from_wire(0, 0),
+                combine_params,
+                raster_params,
+                TriangleTargetExtent {
+                    width: 8,
+                    height: 8,
+                },
+                tmem,
+                tile_binding,
+            )
+            .expect("textured triangle draw must submit cleanly")
+            .complete()
+            .expect("textured triangle draw must complete cleanly");
+
+        assert!(
+            output
+                .tmem_sample_status
+                .iter()
+                .all(|&status| status == TMEM_SAMPLE_STATUS_OK),
+            "every fragment's tmem_sample.wgsl status must be OK for this fixture"
+        );
+
+        let observed_at = |x: u32, y: u32| -> [u8; 4] {
+            let index = (y as usize * 8 + x as usize) * 4;
+            [
+                output.color_rgba8[index],
+                output.color_rgba8[index + 1],
+                output.color_rgba8[index + 2],
+                output.color_rgba8[index + 3],
+            ]
+        };
+        // Both assertion points: the real GPU fragment output at each
+        // pixel, sourced through the actual per-fragment
+        // `sample_committed_rgba16_three_nearest_bound` WGSL call, compared
+        // against the CPU oracle chain computed above at the SAME
+        // algebraically-derived interpolated UV -- the card's mandatory
+        // CPU-vs-WGSL differential (§4/§7), both sides independent.
+        assert_close_rgba8_channels(observed_at(pixel_a.0, pixel_a.1), expected[0], 2);
+        assert_close_rgba8_channels(observed_at(pixel_b.0, pixel_b.1), expected[1], 2);
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    fn assert_close_rgba8_channels(observed: [u8; 4], expected: [u8; 4], tolerance: i32) {
+        for channel in 0..4 {
+            let diff = i32::from(observed[channel]) - i32::from(expected[channel]);
+            assert!(
+                diff.abs() <= tolerance,
+                "channel {channel}: observed={observed:?} expected={expected:?} \
+                 tolerance={tolerance}"
+            );
+        }
+    }
+
+    /// Negative-coordinate floor-vs-truncation repair, GPU half (independent
+    /// adversarial-review finding; CPU half is
+    /// `required_cpu_tmem_oracle_matches_hand_derived_texel_colors`'s own
+    /// `negative_coordinate` assertion -- see that assertion's doc comment
+    /// for the full discrimination argument and the wrap-vs-clamp addressing
+    /// reasoning). `triangle_pipeline_fragment.wgsl` used to compute
+    /// `i32(uv.x)`/`i32(uv.y)` directly on the interpolated `f32` raw S10.5
+    /// coordinate -- truncating toward zero -- before calling
+    /// `sample_committed_rgba16_three_nearest_bound`. This test's geometry
+    /// makes the rasterizer's own per-fragment interpolation land exactly on
+    /// a fractional NEGATIVE raw S coordinate at pixel (0,0), so a real GPU
+    /// run exercises the actual bug site (the fragment shader's own
+    /// `f32`->`i32` conversion of an interpolated value), not just the
+    /// integer-only WGSL addressing chain downstream of it -- unlike the
+    /// CPU-only half above, which starts from an already-integer raw
+    /// coordinate and cannot observe this specific conversion-site defect by
+    /// itself.
+    ///
+    /// This fixture uses `fixture_wrap_tile_descriptor` (mask=1 wrap, not
+    /// `fixture_tile_descriptor`'s clamp) over the SAME committed 2x2 RGBA16
+    /// texel layout -- required because the clamp fixture cannot expose this
+    /// bug at all (see that function's own doc). Vertex UVs: `uv0=(-1,0)`,
+    /// `uv1=(-1,0)` (S constant across X, so the X-gradient term vanishes),
+    /// `uv2=(7,0)` (S varies across Y only). At pixel (0,0)'s center
+    /// (`wx=wy=1/16`): `s = -1 + (1/16)*(-1-(-1)) + (1/16)*(7-(-1)) = -1 +
+    /// 0 + 0.5 = -0.5` exactly (`0.0625*8 = 0.5` has an exact `f32`
+    /// representation, no rounding drift); `t = 0` exactly (T is literally
+    /// constant `0` across all three vertices -- this test isolates the
+    /// negative-S repair alone; T's own varying-UV requirement is already
+    /// covered by `required_host_textured_triangle_wgsl_sampling_matches_
+    /// the_cpu_tmem_oracle`, unmodified by this test). `floor(-0.5) = -1`
+    /// (correct) vs. `i32(-0.5) = 0` truncated toward zero (the pre-repair
+    /// bug) -- see the CPU-side assertion's doc for the full corner/
+    /// fraction arithmetic this produces under wrap addressing, and why the
+    /// two paths' final blended colors provably differ, not just their
+    /// intermediate fractions.
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn required_host_negative_uv_floors_toward_negative_infinity_not_truncation() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!(
+                    "required host GPU evidence unavailable: typed no-adapter for {no_adapter:?}"
+                );
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, FIXTURE_SOURCE_IMAGE_WIDTH, 0x200));
+        words.extend(set_tile(
+            0,
+            FIXTURE_LINE_WORDS as u32,
+            FIXTURE_TMEM_WORD_ADDRESS as u32,
+        ));
+        words.extend([word(SET_TILE_SIZE_OPCODE, 0), 4u32 << 12 | 4u32]);
+        words.extend(load_sync());
+        let source_bytes = fixture_load_block_source_bytes();
+        words.extend([word(LOAD_BLOCK, 0), 7u32 << 12]);
+
+        let (planned, _unused_deterministic_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture's TMEM-only load stays inside the admitted subset");
+        // Unlike a bare `execute_raw_dpc` discard, this test needs the
+        // TMEM write to be durably visible: `physical_tmem()` only reflects
+        // the coordinator's ACTIVE slot after publish (see
+        // `required_cpu_tmem_oracle_matches_hand_derived_texel_colors`'s own
+        // doc) -- skipping commit/seal/publish here left stale/invalid TMEM
+        // active, which is what real-Metal execution caught
+        // (`InvalidTexelByte` at the fixture's own addressed footprint).
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+
+        let tmem = project_committed_tmem(backend.physical_tmem());
+        // Wrap tile (mask=1), not the clamp fixture -- see this test's own
+        // doc for why clamp addressing cannot expose the floor-vs-truncation
+        // bug.
+        let tile_binding =
+            TileBindingParams::bound(fixture_wrap_tile_descriptor(), fixture_tile_size());
+
+        let uv0 = (-1.0f32, 0.0f32);
+        let uv1 = (-1.0f32, 0.0f32);
+        let uv2 = (7.0f32, 0.0f32);
+        // Pixel (0,0)'s center (px=py=0.5, wx=wy=0.0625): s = -1 +
+        // 0.0625*(-1-(-1)) + 0.0625*(7-(-1)) = -0.5, t = 0.
+        let (expected_s, expected_t): (i16, i16) = (-1, 0);
+        let expected = cpu_oracle_sample_with_tile(
+            backend.physical_tmem(),
+            fixture_wrap_tile_descriptor(),
+            fixture_tile_size(),
+            expected_s,
+            expected_t,
+        );
+        // Cross-check against the CPU-only test's own independently
+        // hand-derived literal, not just self-consistency with
+        // `cpu_oracle_sample_with_tile`.
+        assert_eq!(expected, [247, 8, 0, 255]);
+
+        let vertices = [
+            fn64_render::NeutralTriangleVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv0.0, uv0.1],
+            },
+            fn64_render::NeutralTriangleVertex {
+                x: 8.0,
+                y: 0.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv1.0, uv1.1],
+            },
+            fn64_render::NeutralTriangleVertex {
+                x: 0.0,
+                y: 8.0,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [uv2.0, uv2.1],
+            },
+        ];
+        // Same TEXEL0-passthrough SetCombine as the other GPU differential
+        // test.
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 1; // TEXEL0
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 1; // TEXEL0
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        let combine_params = CombineParams::from_wire(low, high);
+
+        let renderer = backend.triangle_pipeline_for_test();
+        let raster_params = TriangleRasterParams {
+            resolution: [8.0, 8.0],
+            screen_scale: [1.0, 1.0],
+            screen_offset: [0.0, 0.0],
+        };
+        let output = renderer
+            .submit_admitted_triangle(
+                vertices,
+                OtherMode::from_wire(0, 0),
+                combine_params,
+                raster_params,
+                TriangleTargetExtent {
+                    width: 8,
+                    height: 8,
+                },
+                tmem,
+                tile_binding,
+            )
+            .expect("textured triangle draw must submit cleanly")
+            .complete()
+            .expect("textured triangle draw must complete cleanly");
+
+        assert!(
+            output
+                .tmem_sample_status
+                .iter()
+                .all(|&status| status == TMEM_SAMPLE_STATUS_OK),
+            "every fragment's tmem_sample.wgsl status must be OK for this fixture"
+        );
+
+        let observed = [
+            output.color_rgba8[0],
+            output.color_rgba8[1],
+            output.color_rgba8[2],
+            output.color_rgba8[3],
+        ];
+        // Exact agreement required, not the ±2 tolerance the other GPU
+        // differential test uses: the pre-repair truncation bug's wrong
+        // answer at this exact point (`[255, 0, 0, 255]`, pure red -- see
+        // the CPU-side assertion's doc) differs from the correct floored
+        // answer (`[247, 8, 0, 255]`) by up to 8 in the green channel, well
+        // outside a ±2 tolerance, but this assertion holds GPU float
+        // interpolation to the CPU oracle's own exact integer result with
+        // zero slack -- this specific point was chosen so the interpolated
+        // `f32` UV (`-0.5`) has an exact binary representation (no rounding
+        // drift into the fixed-point filter math), so exact agreement is
+        // the correct bar here, not a concession to interpolation noise.
+        assert_eq!(observed, expected);
+    }
+
     /// `create()`'s success stores `triangle_pipeline`/`triangle_target_extent`
     /// atomically, together -- a repeated `create()` call with a changed
     /// `RenderConfig` extent updates both, never one without the other.
@@ -1755,6 +2623,7 @@ mod tests {
             ],
             other_mode: OtherMode::from_wire(0, 0),
             combine_params: CombineParams::from_wire(0, 0),
+            tile_binding: TileBindingParams::unbound(),
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)])

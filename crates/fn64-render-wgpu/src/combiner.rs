@@ -366,6 +366,134 @@ impl CombineParams {
             AlphaInputSlot::D => Self::alpha_input_abd(self.parse_alpha_d(second_cycle)),
         }
     }
+
+    /// Selector-reference predicate, not a general algebraic-necessity one:
+    /// true iff any of the four first-cycle color selectors (A/B/C/D) or
+    /// four first-cycle alpha selectors (A/B/C/D) decode to
+    /// `ColorInput::{Texel0,Texel1,Texel0Alpha,Texel1Alpha}` /
+    /// `AlphaInput::{Texel0,Texel1}`. This does NOT evaluate whether the
+    /// formula is algebraically zeroed out in general — a referenced D
+    /// selector, for instance, always counts, since `run_one_cycle`'s
+    /// `(A-B)*C+D` formula adds `D` unconditionally with no coefficient that
+    /// could zero it.
+    ///
+    /// The one deliberate, narrow exception: slot C is not a free-standing
+    /// reference, it is `(A-B)*C`'s own coefficient — `run_one_cycle`
+    /// evaluates `resolve_color_input`/`resolve_alpha_input` for C
+    /// unconditionally, but whatever it resolves to is multiplied by
+    /// `(A-B)`, which is exactly zero whenever A and B decode to the same
+    /// selector (they then resolve to the identical value, per
+    /// `resolve_color_input`/`resolve_alpha_input`'s own shared `match`).
+    /// This crate's own fixtures rely on exactly this cancellation as a
+    /// "don't care" idiom (`targets/triangle_pipeline/tests.rs`'s
+    /// `shade_passthrough_combine_params` sets alpha A=B=COMBINED and
+    /// alpha C=TEXEL0 via `alpha_input_c`'s own distinct table — see that
+    /// table's doc — purely because C's coefficient is forced to zero,
+    /// never because TEXEL0's value is wanted). Treating slot C as an
+    /// unconditional reference the same as A/B/D would report
+    /// "texture referenced" for every SHADE-only fixture in this crate that
+    /// happens to reuse that idiom, defeating the gate this predicate
+    /// exists to drive. This is a fact about `(A-B)*C+D`'s own coefficient
+    /// structure, not a guess about which fixtures happen to exist: C is
+    /// checked whenever A and B decode to *different* selectors (the only
+    /// condition under which C's value can possibly reach the output),
+    /// matching the exact cancellation `run_one_cycle`'s arithmetic
+    /// performs, not an approximation of it.
+    ///
+    /// Decodes with `second_cycle = true`, matching [`run_one_cycle`]'s own
+    /// slot-decode call (`decode_color`/`decode_alpha`'s `SECOND_CYCLE`
+    /// constant, `run_one_cycle`'s doc) — this predicate must inspect
+    /// exactly the selectors that function's own formula reads, not the
+    /// unused `second_cycle = false` bitfield slice.
+    pub const fn references_texels_in_first_cycle(self) -> bool {
+        const SECOND_CYCLE: bool = true;
+
+        let ca = self.decode_color(ColorInputSlot::A, SECOND_CYCLE);
+        let cb = self.decode_color(ColorInputSlot::B, SECOND_CYCLE);
+        let cc = self.decode_color(ColorInputSlot::C, SECOND_CYCLE);
+        let cd = self.decode_color(ColorInputSlot::D, SECOND_CYCLE);
+        let color_coefficient_nonzero = !Self::color_input_eq(ca, cb);
+        if Self::color_input_references_texel(ca)
+            || Self::color_input_references_texel(cb)
+            || (color_coefficient_nonzero && Self::color_input_references_texel(cc))
+            || Self::color_input_references_texel(cd)
+        {
+            return true;
+        }
+
+        let aa = self.decode_alpha(AlphaInputSlot::A, SECOND_CYCLE);
+        let ab = self.decode_alpha(AlphaInputSlot::B, SECOND_CYCLE);
+        let ac = self.decode_alpha(AlphaInputSlot::C, SECOND_CYCLE);
+        let ad = self.decode_alpha(AlphaInputSlot::D, SECOND_CYCLE);
+        let alpha_coefficient_nonzero = !Self::alpha_input_eq(aa, ab);
+        Self::alpha_input_references_texel(aa)
+            || Self::alpha_input_references_texel(ab)
+            || (alpha_coefficient_nonzero && Self::alpha_input_references_texel(ac))
+            || Self::alpha_input_references_texel(ad)
+    }
+
+    const fn color_input_references_texel(input: ColorInput) -> bool {
+        matches!(
+            input,
+            ColorInput::Texel0
+                | ColorInput::Texel1
+                | ColorInput::Texel0Alpha
+                | ColorInput::Texel1Alpha
+        )
+    }
+
+    const fn alpha_input_references_texel(input: AlphaInput) -> bool {
+        matches!(input, AlphaInput::Texel0 | AlphaInput::Texel1)
+    }
+
+    /// `const fn`-usable equality for the `(A-B)` cancellation check above —
+    /// `ColorInput` derives `PartialEq` but that impl is not itself callable
+    /// from a `const fn` in this crate's Rust edition, so this is a manual
+    /// discriminant match instead.
+    const fn color_input_eq(a: ColorInput, b: ColorInput) -> bool {
+        matches!(
+            (a, b),
+            (ColorInput::Combined, ColorInput::Combined)
+                | (ColorInput::Texel0, ColorInput::Texel0)
+                | (ColorInput::Texel1, ColorInput::Texel1)
+                | (ColorInput::Primitive, ColorInput::Primitive)
+                | (ColorInput::Shade, ColorInput::Shade)
+                | (ColorInput::Environment, ColorInput::Environment)
+                | (ColorInput::KeyCenter, ColorInput::KeyCenter)
+                | (ColorInput::KeyScale, ColorInput::KeyScale)
+                | (ColorInput::CombinedAlpha, ColorInput::CombinedAlpha)
+                | (ColorInput::Texel0Alpha, ColorInput::Texel0Alpha)
+                | (ColorInput::Texel1Alpha, ColorInput::Texel1Alpha)
+                | (ColorInput::PrimitiveAlpha, ColorInput::PrimitiveAlpha)
+                | (ColorInput::ShadeAlpha, ColorInput::ShadeAlpha)
+                | (ColorInput::EnvAlpha, ColorInput::EnvAlpha)
+                | (ColorInput::LodFraction, ColorInput::LodFraction)
+                | (ColorInput::PrimLodFrac, ColorInput::PrimLodFrac)
+                | (ColorInput::Noise, ColorInput::Noise)
+                | (ColorInput::K4, ColorInput::K4)
+                | (ColorInput::K5, ColorInput::K5)
+                | (ColorInput::One, ColorInput::One)
+                | (ColorInput::Zero, ColorInput::Zero)
+        )
+    }
+
+    /// `const fn`-usable equality for the `(A-B)` cancellation check above,
+    /// same rationale as [`Self::color_input_eq`].
+    const fn alpha_input_eq(a: AlphaInput, b: AlphaInput) -> bool {
+        matches!(
+            (a, b),
+            (AlphaInput::Combined, AlphaInput::Combined)
+                | (AlphaInput::Texel0, AlphaInput::Texel0)
+                | (AlphaInput::Texel1, AlphaInput::Texel1)
+                | (AlphaInput::Primitive, AlphaInput::Primitive)
+                | (AlphaInput::Shade, AlphaInput::Shade)
+                | (AlphaInput::Environment, AlphaInput::Environment)
+                | (AlphaInput::LodFraction, AlphaInput::LodFraction)
+                | (AlphaInput::PrimLodFrac, AlphaInput::PrimLodFrac)
+                | (AlphaInput::One, AlphaInput::One)
+                | (AlphaInput::Zero, AlphaInput::Zero)
+        )
+    }
 }
 
 /// Per-pixel combiner inputs. Mirrors RT64's `Inputs` struct
@@ -3179,5 +3307,328 @@ mod tests {
         // all set.
         assert_eq!(depth.z(), 0x7FFF);
         assert_eq!(depth.dz(), 0x0000);
+    }
+
+    // -- `references_texels_in_first_cycle` (SHADE-only-triangle repair):
+    // selector-reference coverage for each first-cycle color/alpha slot,
+    // plus representative non-texture selectors. Builds raw wire words
+    // directly at `run_one_cycle`'s own `SECOND_CYCLE = true` bit positions
+    // (`parse_*_a/b/c/d`'s `if second_cycle` arms, matching
+    // `targets/triangle_pipeline/tests.rs`'s `shade_passthrough_combine_params`
+    // doc): color_a low[9:5], color_b high[31:24], color_c low[4:0],
+    // color_d high[8:6]; alpha_a high[23:21], alpha_b high[5:3],
+    // alpha_c high[20:18], alpha_d high[2:0]. Every fixture below sets every
+    // OTHER slot to an index that decodes to `ColorInput::Zero`/
+    // `AlphaInput::Zero` (index 15/index 7, the out-of-range collapse each
+    // slot's own table already proves elsewhere in this file), so only the
+    // one slot under test can possibly flip the predicate -- EXCEPT the
+    // slot-C tests, which need A and B to decode to genuinely different
+    // selectors (both `ZERO_COLOR_A`/`ZERO_COLOR_B` would decode equal,
+    // zeroing `(A-B)*C`'s coefficient and always suppressing C regardless of
+    // what it decodes to -- see `references_texels_in_first_cycle`'s doc).
+
+    const ZERO_COLOR_A: u32 = 15; // color_input_a: 8-15 -> Zero
+    const ZERO_COLOR_B: u32 = 15; // color_input_b: 8-15 -> Zero
+    const ZERO_COLOR_C: u32 = 31; // color_input_c: 16-31 -> Zero
+    const ZERO_COLOR_D: u32 = 7; // color_input_d: 7 -> Zero
+    const ZERO_ALPHA_ABD: u32 = 7; // alpha_input_abd: 7 -> Zero
+    const ZERO_ALPHA_C: u32 = 7; // alpha_input_c: 7 -> Zero
+
+    fn combine_params_with_only(color: [u32; 4], alpha: [u32; 4]) -> CombineParams {
+        let [color_a, color_b, color_c, color_d] = color;
+        let [alpha_a, alpha_b, alpha_c, alpha_d] = alpha;
+        let low = (color_a << 5) | (color_c & 0x1F);
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        CombineParams::from_wire(low, high)
+    }
+
+    fn all_zero_selectors() -> CombineParams {
+        combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        )
+    }
+
+    #[test]
+    fn all_zero_selectors_do_not_reference_texels() {
+        assert!(!all_zero_selectors().references_texels_in_first_cycle());
+    }
+
+    /// Representative non-texture selectors (SHADE/PRIMITIVE/ONE) must not
+    /// flip the predicate either -- it is specifically a TEXEL0/TEXEL1/
+    /// `*_ALPHA` reference, not "any non-ZERO selector".
+    #[test]
+    fn shade_primitive_and_one_selectors_do_not_reference_texels() {
+        let shade_d = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, 4], // SHADE
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, 4], // SHADE
+        );
+        assert!(!shade_d.references_texels_in_first_cycle());
+
+        let primitive_a = combine_params_with_only(
+            [3, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D], // PRIMITIVE
+            [3, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD], // PRIMITIVE
+        );
+        assert!(!primitive_a.references_texels_in_first_cycle());
+
+        let one_a = combine_params_with_only(
+            [6, ZERO_COLOR_B, ZERO_COLOR_C, 6], // ONE (color_input_a, color_input_d)
+            [6, ZERO_ALPHA_ABD, ZERO_ALPHA_C, 6], // ONE (alpha_input_abd)
+        );
+        assert!(!one_a.references_texels_in_first_cycle());
+    }
+
+    #[test]
+    fn color_slot_a_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [1, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D], // TEXEL0
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [2, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D], // TEXEL1
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    #[test]
+    fn color_slot_b_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, 1, ZERO_COLOR_C, ZERO_COLOR_D], // TEXEL0
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, 2, ZERO_COLOR_C, ZERO_COLOR_D], // TEXEL1
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    /// Color slot C is `(A-B)*C`'s own coefficient, not a free-standing
+    /// reference (see `references_texels_in_first_cycle`'s doc) -- it only
+    /// counts when A and B decode to *different* selectors, so these
+    /// fixtures use A=ZERO, B=PRIMITIVE (any two distinct selectors) rather
+    /// than this file's usual `ZERO_COLOR_A`/`ZERO_COLOR_B` pair, which
+    /// would zero the coefficient and (correctly) suppress C. Color slot C
+    /// reaches TEXEL0_ALPHA/TEXEL1_ALPHA (indices 8/9, its own extended
+    /// table), distinct from slots A/B's plain TEXEL0/TEXEL1 -- both must be
+    /// caught.
+    #[test]
+    fn color_slot_c_texel0_texel1_and_their_alpha_variants_are_referenced_with_a_nonzero_coefficient(
+    ) {
+        const DISTINCT_COLOR_B: u32 = 3; // PRIMITIVE -- differs from ZERO_COLOR_A
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, DISTINCT_COLOR_B, 1, ZERO_COLOR_D], // TEXEL0
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, DISTINCT_COLOR_B, 2, ZERO_COLOR_D], // TEXEL1
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+
+        let texel0_alpha = combine_params_with_only(
+            [ZERO_COLOR_A, DISTINCT_COLOR_B, 8, ZERO_COLOR_D], // TEXEL0_ALPHA
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel0_alpha.references_texels_in_first_cycle());
+
+        let texel1_alpha = combine_params_with_only(
+            [ZERO_COLOR_A, DISTINCT_COLOR_B, 9, ZERO_COLOR_D], // TEXEL1_ALPHA
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel1_alpha.references_texels_in_first_cycle());
+    }
+
+    /// The cancellation itself: color slot C decoding to TEXEL0 must NOT
+    /// mark the params as texture-referencing when A and B decode to the
+    /// *same* selector (here, both ZERO) -- `(A-B)` is then exactly zero,
+    /// so C's resolved value can never reach the output regardless of what
+    /// it is. This is the exact shape `targets/triangle_pipeline/tests.rs`'s
+    /// `shade_passthrough_combine_params` and this crate's own
+    /// SHADE-passthrough production fixtures rely on for alpha slot C (see
+    /// `the_reported_shade_only_regression_fixture_does_not_reference_texels`);
+    /// this test proves the identical cancellation for color slot C.
+    #[test]
+    fn color_slot_c_texel0_is_suppressed_when_a_and_b_decode_equal() {
+        let params = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_A, 1, ZERO_COLOR_D], // B same selector as A -- (A-B) == 0; C=TEXEL0
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(!params.references_texels_in_first_cycle());
+    }
+
+    /// Color slot D's own table has no TEXEL0_ALPHA/TEXEL1_ALPHA entries
+    /// (`color_input_d`'s doc: "no NOISE/KEY_CENTER/etc. entries to begin
+    /// with"), only plain TEXEL0/TEXEL1 -- both are still selector
+    /// references and must be caught.
+    #[test]
+    fn color_slot_d_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, 1], // TEXEL0
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, 2], // TEXEL1
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD],
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    #[test]
+    fn alpha_slot_a_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [1, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD], // TEXEL0 (alpha_input_abd)
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [2, ZERO_ALPHA_ABD, ZERO_ALPHA_C, ZERO_ALPHA_ABD], // TEXEL1 (alpha_input_abd)
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    #[test]
+    fn alpha_slot_b_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [ZERO_ALPHA_ABD, 1, ZERO_ALPHA_C, ZERO_ALPHA_ABD], // TEXEL0 (alpha_input_abd)
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [ZERO_ALPHA_ABD, 2, ZERO_ALPHA_C, ZERO_ALPHA_ABD], // TEXEL1 (alpha_input_abd)
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    /// Alpha slot C's own table (`alpha_input_c`) has no TEXEL0/TEXEL1
+    /// entry at index 1/2 the way `alpha_input_abd` does -- its index 1/2
+    /// decode to TEXEL0/TEXEL1 too, but via a *different* table shape (see
+    /// `alpha_input_c`'s doc: "index 1 is TEXEL0 here, not COMBINED"). This
+    /// proves the predicate reads alpha slot C through its own decode path,
+    /// not by reusing slot A/B's table. Like color slot C, alpha slot C is
+    /// `(A-B)*C`'s coefficient (see `references_texels_in_first_cycle`'s
+    /// doc), so these fixtures use alpha A=COMBINED, B=PRIMITIVE (distinct
+    /// selectors) rather than `ZERO_ALPHA_ABD` for both, which would zero
+    /// the coefficient and suppress C.
+    #[test]
+    fn alpha_slot_c_texel0_and_texel1_are_referenced_with_a_nonzero_coefficient() {
+        const DISTINCT_ALPHA_B: u32 = 3; // PRIMITIVE (alpha_input_abd) -- differs from COMBINED
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [0, DISTINCT_ALPHA_B, 1, ZERO_ALPHA_ABD], // COMBINED, _, TEXEL0 (alpha_input_c), _
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [0, DISTINCT_ALPHA_B, 2, ZERO_ALPHA_ABD], // COMBINED, _, TEXEL1 (alpha_input_c), _
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    /// The cancellation itself, alpha's mirror of
+    /// `color_slot_c_texel0_is_suppressed_when_a_and_b_decode_equal`: alpha
+    /// slot C decoding to TEXEL0/TEXEL1 must NOT mark the params as
+    /// texture-referencing when alpha A and B decode to the same selector.
+    /// This is exactly the shape
+    /// `the_reported_shade_only_regression_fixture_does_not_reference_texels`
+    /// depends on (alpha A=B=COMBINED, alpha C=TEXEL0) -- this test isolates
+    /// just the cancellation, independent of that specific fixture's other
+    /// bits.
+    #[test]
+    fn alpha_slot_c_texel0_is_suppressed_when_a_and_b_decode_equal() {
+        let params = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [0, 0, 1, ZERO_ALPHA_ABD], // COMBINED, COMBINED (same as A, (A-B) == 0), TEXEL0 (alpha_input_c), _
+        );
+        assert!(!params.references_texels_in_first_cycle());
+    }
+
+    #[test]
+    fn alpha_slot_d_texel0_and_texel1_are_referenced() {
+        let texel0 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, 1], // TEXEL0 (alpha_input_abd)
+        );
+        assert!(texel0.references_texels_in_first_cycle());
+
+        let texel1 = combine_params_with_only(
+            [ZERO_COLOR_A, ZERO_COLOR_B, ZERO_COLOR_C, ZERO_COLOR_D],
+            [ZERO_ALPHA_ABD, ZERO_ALPHA_ABD, ZERO_ALPHA_C, 2], // TEXEL1 (alpha_input_abd)
+        );
+        assert!(texel1.references_texels_in_first_cycle());
+    }
+
+    /// The exact SHADE-only-triangle repair fixture: the failing test's own
+    /// `SetCombine` payload (`production.rs`'s
+    /// `wgpu_backend_draws_a_real_admitted_triangle_matching_the_combiner_oracle`)
+    /// -- color_d=SHADE(4), alpha_c=TEXEL0(1) in `alpha_input_c`'s table but
+    /// multiplied by zero, alpha_d=SHADE(4). Confirms this exact fixture's
+    /// `CombineParams` is judged non-texture-referencing, matching the bug
+    /// report: this triangle legitimately carries
+    /// `TileBindingParams::unbound()` and must not trigger a TMEM sample
+    /// call.
+    #[test]
+    fn the_reported_shade_only_regression_fixture_does_not_reference_texels() {
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 4;
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1;
+        let alpha_d: u32 = 4;
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        let params = CombineParams::from_wire(low, high);
+        assert!(!params.references_texels_in_first_cycle());
+    }
+
+    /// The two real textured differentials' own fixture shape
+    /// (`production.rs`'s TEXEL0-passthrough tests): color_d=TEXEL0(1),
+    /// alpha_d=TEXEL0(1) -- must remain judged texture-referencing so the
+    /// real sampler keeps running for them.
+    #[test]
+    fn the_real_textured_differential_fixture_shape_references_texels() {
+        let color_a: u32 = 0;
+        let color_b: u32 = 0;
+        let color_c: u32 = 0;
+        let color_d: u32 = 1; // TEXEL0
+        let alpha_a: u32 = 0;
+        let alpha_b: u32 = 0;
+        let alpha_c: u32 = 1; // TEXEL0 in alpha_input_c's table, x0
+        let alpha_d: u32 = 1; // TEXEL0
+        let low = (color_a << 5) | color_c;
+        let high = (color_b << 24)
+            | (color_d << 6)
+            | (alpha_a << 21)
+            | (alpha_b << 3)
+            | (alpha_c << 18)
+            | alpha_d;
+        let params = CombineParams::from_wire(low, high);
+        assert!(params.references_texels_in_first_cycle());
     }
 }

@@ -66,6 +66,10 @@ use crate::shader_manifest::{
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
 use crate::state::OtherMode;
+use crate::tmem::{
+    TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES, TMEM_BYTE_WORDS,
+    TMEM_VALIDITY_WORDS,
+};
 use crate::{neutral_vertex_to_raster_vertex, CombineParams};
 use fn64_render::NeutralTriangleVertex;
 
@@ -73,9 +77,23 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const STATUS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const RASTER_PARAMS_BYTES: u64 = 32;
 const COMBINE_PARAMS_BYTES: u64 = 16;
+const TMEM_BYTES_BUFFER_SIZE: u64 = TMEM_BYTE_WORDS as u64 * 4;
+const TMEM_VALIDITY_BUFFER_SIZE: u64 = TMEM_VALIDITY_WORDS as u64 * 4;
+
+/// Card §6's "no tile binding was snapshotted" status
+/// (`tmem_sample.wgsl`'s `TMEM_SAMPLE_STATUS_NO_TILE_BINDING`) --
+/// the observable-shader-failure-status channel's own status codes,
+/// mirrored here so `production.rs`'s readback check does not need to
+/// reach into the WGSL source to know what a non-zero status means.
+pub const TMEM_SAMPLE_STATUS_OK: u32 = 0;
+pub const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1;
+pub const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2;
+pub const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3;
+pub const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4;
 
 /// One `RasterVS`-shaped vertex: RDP screen-pixel position, UV (unused by
 /// this slice's textureless fragment shader, but present in the layout to
@@ -129,6 +147,25 @@ fn bytemuck_f32x2(values: [f32; 2]) -> [u8; 8] {
     bytes
 }
 
+/// Serializes the fragment shader's `FragmentCombineParams` uniform
+/// (`shaders/triangle_pipeline_fragment.wgsl`): `low`/`high` at bytes 0..8
+/// (the raw `SetCombine` wire split, `CombineParams::low`/`high`),
+/// `texture_referenced` at bytes 8..12 (SHADE-only-triangle repair --
+/// `CombineParams::references_texels_in_first_cycle`'s own doc), and bytes
+/// 12..16 left zero (`reserved_zero`, matching `tmem_sample.wgsl`'s
+/// `TileBindingParams::reserved_zero` convention of an explicit named pad
+/// rather than an implicit one).
+fn fragment_combine_params_bytes(
+    combine_params: CombineParams,
+) -> [u8; COMBINE_PARAMS_BYTES as usize] {
+    let mut bytes = [0u8; COMBINE_PARAMS_BYTES as usize];
+    bytes[0..4].copy_from_slice(&combine_params.low().to_le_bytes());
+    bytes[4..8].copy_from_slice(&combine_params.high().to_le_bytes());
+    let texture_referenced: u32 = combine_params.references_texels_in_first_cycle().into();
+    bytes[8..12].copy_from_slice(&texture_referenced.to_le_bytes());
+    bytes
+}
+
 /// `RasterParams.resolution`/`screenScale`/`screenOffset`, matching the
 /// vertex shader's `RasterParams` uniform (`shaders/triangle_pipeline_vertex.wgsl`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,15 +196,22 @@ pub struct TriangleTargetExtent {
 }
 
 /// One fixed-fixture triangle submission: three vertices, the raster
-/// screen-transform uniform, and the fragment stage's caller-supplied
-/// literal `CombineParams` (no `SetCombine` decode in this slice -- port
-/// card §3 step 3).
+/// screen-transform uniform, the fragment stage's caller-supplied literal
+/// `CombineParams` (no `SetCombine` decode in this slice -- port card §3
+/// step 3), and this triangle's own committed-TMEM texture-sample inputs
+/// (published committed-TMEM textured-draw card §2/§3): the byte-projected
+/// physical TMEM snapshot this draw samples against, and the bound tile's
+/// `TileBindingParams` (or [`TileBindingParams::unbound`] when the triangle
+/// carries no real tile snapshot -- e.g. the flat-colored fixed fixtures
+/// this file's own tests still construct for the non-textured cases).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TriangleFixture {
     pub vertices: [RasterVertex; 3],
     pub raster_params: TriangleRasterParams,
     pub combine_params: CombineParams,
     pub extent: TriangleTargetExtent,
+    pub tmem: TmemGpuProjection,
+    pub tile_binding: TileBindingParams,
 }
 
 pub enum TrianglePipelineDeviceOutcome {
@@ -247,6 +291,24 @@ impl UninitializedTrianglePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tmem_bytes_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-tmem-bytes"),
+            size: TMEM_BYTES_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let tmem_validity_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-tmem-validity"),
+            size: TMEM_VALIDITY_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let tile_binding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-tile-binding"),
+            size: TILE_BINDING_PARAMS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fn64-triangle-pipeline-bind-group-layout"),
             entries: &[
@@ -262,6 +324,44 @@ impl UninitializedTrianglePipeline {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Published committed-TMEM textured-draw card §2/§3
+                // (Option B, mandatory): the committed TMEM byte image and
+                // its parallel validity bitmap, read-only storage buffers
+                // (this crate's own existing `direct_texel_decode.wgsl`/
+                // `three_nearest_filter.wgsl` convention -- not
+                // `texture_2d`/`sampler`, which Option A would have used
+                // and which this card explicitly rejects), plus the bound
+                // tile's `TileBindingParams` uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -289,6 +389,18 @@ impl UninitializedTrianglePipeline {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: combine_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tmem_bytes_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tmem_validity_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile_binding_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -330,11 +442,24 @@ impl UninitializedTrianglePipeline {
                 module: &fragment_shader,
                 entry_point: Some(TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                // Second attachment (card audit repair: "observable shader
+                // failure status"): `fs_main`'s own `FragmentOutput::
+                // tmem_sample_status`, one `TMEM_SAMPLE_STATUS_*` code per
+                // fragment -- read back and checked by
+                // `production.rs`'s draw-completion path, never silently
+                // discarded.
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: COLOR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: STATUS_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             multiview_mask: None,
             cache: None,
@@ -459,6 +584,7 @@ impl TrianglePipelineRenderer {
     /// inside the vertex shader itself, not here -- `vertices`' `position`
     /// stays raw RDP screen-pixel `x`/`y`/`z`/`w`, matching
     /// `triangle_pipeline_vertex.wgsl`'s own module doc.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_admitted_triangle(
         &mut self,
         vertices: [NeutralTriangleVertex; 3],
@@ -466,6 +592,8 @@ impl TrianglePipelineRenderer {
         combine_params: CombineParams,
         raster_params: TriangleRasterParams,
         extent: TriangleTargetExtent,
+        tmem: TmemGpuProjection,
+        tile_binding: TileBindingParams,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
         let _ = other_mode;
         let fixture = TriangleFixture {
@@ -473,6 +601,8 @@ impl TrianglePipelineRenderer {
             raster_params,
             combine_params,
             extent,
+            tmem,
+            tile_binding,
         };
         self.submit_triangle(fixture)
     }
@@ -529,12 +659,12 @@ impl TrianglePipelineRenderer {
         let color_bytes = u64::from(padded_bytes_per_row) * u64::from(extent.height);
         let depth_bytes = u64::from(padded_bytes_per_row) * u64::from(extent.height);
 
-        // Each draw gets its own vertex buffer and its own raster/combine
-        // uniform buffer + bind group: mid-render-pass `queue.write_buffer`
-        // calls are not safe against a buffer already bound by an
-        // in-flight pass, so per-draw uniforms must be distinct resources
-        // written before the pass opens, not one shared buffer rewritten
-        // between draws.
+        // Each draw gets its own vertex buffer and its own raster/combine/
+        // tmem/tile-binding uniform+storage buffers + bind group:
+        // mid-render-pass `queue.write_buffer` calls are not safe against a
+        // buffer already bound by an in-flight pass, so per-draw uniforms
+        // must be distinct resources written before the pass opens, not
+        // one shared buffer rewritten between draws.
         struct DrawResources {
             vertex_buffer: wgpu::Buffer,
             bind_group: wgpu::BindGroup,
@@ -542,6 +672,9 @@ impl TrianglePipelineRenderer {
             // (`as_entire_binding`); never read after construction.
             _raster_params_buffer: wgpu::Buffer,
             _combine_params_buffer: wgpu::Buffer,
+            _tmem_bytes_buffer: wgpu::Buffer,
+            _tmem_validity_buffer: wgpu::Buffer,
+            _tile_binding_buffer: wgpu::Buffer,
         }
         let mut draws = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
@@ -571,11 +704,37 @@ impl TrianglePipelineRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let mut combine_bytes = [0u8; COMBINE_PARAMS_BYTES as usize];
-            combine_bytes[0..4].copy_from_slice(&fixture.combine_params.low().to_le_bytes());
-            combine_bytes[4..8].copy_from_slice(&fixture.combine_params.high().to_le_bytes());
+            let combine_bytes = fragment_combine_params_bytes(fixture.combine_params);
             self.queue
                 .write_buffer(&combine_params_buffer, 0, &combine_bytes);
+
+            let tmem_bytes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-tmem-bytes"),
+                size: TMEM_BYTES_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&tmem_bytes_buffer, 0, &fixture.tmem.byte_words_bytes());
+            let tmem_validity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-tmem-validity"),
+                size: TMEM_VALIDITY_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(
+                &tmem_validity_buffer,
+                0,
+                &fixture.tmem.validity_words_bytes(),
+            );
+            let tile_binding_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-tile-binding"),
+                size: TILE_BINDING_PARAMS_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&tile_binding_buffer, 0, &fixture.tile_binding.to_bytes());
 
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fn64-triangle-pipeline-bind-group"),
@@ -589,6 +748,18 @@ impl TrianglePipelineRenderer {
                         binding: 1,
                         resource: combine_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: tmem_bytes_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: tmem_validity_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: tile_binding_buffer.as_entire_binding(),
+                    },
                 ],
             });
             draws.push(DrawResources {
@@ -596,6 +767,9 @@ impl TrianglePipelineRenderer {
                 bind_group,
                 _raster_params_buffer: raster_params_buffer,
                 _combine_params_buffer: combine_params_buffer,
+                _tmem_bytes_buffer: tmem_bytes_buffer,
+                _tmem_validity_buffer: tmem_validity_buffer,
+                _tile_binding_buffer: tile_binding_buffer,
             });
         }
 
@@ -629,6 +803,21 @@ impl TrianglePipelineRenderer {
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let status_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fn64-triangle-pipeline-tmem-sample-status"),
+            size: wgpu::Extent3d {
+                width: extent.width,
+                height: extent.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: STATUS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let status_view = status_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let color_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fn64-triangle-pipeline-color-readback"),
@@ -642,6 +831,15 @@ impl TrianglePipelineRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        // `R32Uint` is 4 bytes/texel, same as color/depth -- reuses the same
+        // padded-row-stride math.
+        let status_bytes = u64::from(padded_bytes_per_row) * u64::from(extent.height);
+        let status_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-triangle-pipeline-tmem-sample-status-readback"),
+            size: status_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         let mut encoder = self
             .device
@@ -651,15 +849,26 @@ impl TrianglePipelineRenderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fn64-triangle-pipeline-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &status_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -721,6 +930,27 @@ impl TrianglePipelineRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &status_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &status_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(extent.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: extent.width,
+                height: extent.height,
+                depth_or_array_layers: 1,
+            },
+        );
         let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
         encoder.on_submitted_work_done(move || {
             let _ = callback_sender.try_send(());
@@ -733,6 +963,7 @@ impl TrianglePipelineRenderer {
             padded_bytes_per_row,
             color_readback,
             depth_readback,
+            status_readback,
             submission,
             callback_receiver,
         })
@@ -745,16 +976,24 @@ pub struct InFlightTriangleDraw<'renderer> {
     padded_bytes_per_row: u32,
     color_readback: wgpu::Buffer,
     depth_readback: wgpu::Buffer,
+    status_readback: wgpu::Buffer,
     submission: wgpu::SubmissionIndex,
     callback_receiver: mpsc::Receiver<()>,
 }
 
-/// Readback: RGBA8 color bytes (`Rgba8Unorm`) and per-pixel depth as `f32`
-/// (`Depth32Float`), row-major, `extent.width * extent.height` pixels each.
+/// Readback: RGBA8 color bytes (`Rgba8Unorm`), per-pixel depth as `f32`
+/// (`Depth32Float`), and per-pixel `tmem_sample.wgsl`
+/// `TMEM_SAMPLE_STATUS_*` codes (`R32Uint`) -- row-major, `extent.width *
+/// extent.height` pixels each. `tmem_sample_status` is the observable
+/// shader-failure-status channel (card audit repair): every fragment this
+/// draw covered wrote its own status here, so a caller can distinguish
+/// `TMEM_SAMPLE_STATUS_OK` everywhere from any fragment reporting a named
+/// sampling failure, without guessing from the color alone.
 pub struct TriangleDrawOutput {
     pub extent: TriangleTargetExtent,
     pub color_rgba8: Vec<u8>,
     pub depth_f32: Vec<f32>,
+    pub tmem_sample_status: Vec<u32>,
 }
 
 impl InFlightTriangleDraw<'_> {
@@ -772,6 +1011,7 @@ impl InFlightTriangleDraw<'_> {
 
         let color_padded = map_and_read(&self.renderer.device, &self.color_readback)?;
         let depth_padded = map_and_read(&self.renderer.device, &self.depth_readback)?;
+        let status_padded = map_and_read(&self.renderer.device, &self.status_readback)?;
 
         let error_count = self.renderer.errors.count();
         if error_count != 0 {
@@ -794,16 +1034,27 @@ impl InFlightTriangleDraw<'_> {
             unpadded_bytes_per_row,
             self.extent.height as usize,
         );
+        let status_bytes = strip_row_padding(
+            &status_padded,
+            self.padded_bytes_per_row as usize,
+            unpadded_bytes_per_row,
+            self.extent.height as usize,
+        );
 
         let mut depth_f32 = Vec::with_capacity(depth_bytes.len() / 4);
         for chunk in depth_bytes.chunks_exact(4) {
             depth_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        let mut tmem_sample_status = Vec::with_capacity(status_bytes.len() / 4);
+        for chunk in status_bytes.chunks_exact(4) {
+            tmem_sample_status.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
         Ok(TriangleDrawOutput {
             extent: self.extent,
             color_rgba8,
             depth_f32,
+            tmem_sample_status,
         })
     }
 }
