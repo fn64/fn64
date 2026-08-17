@@ -610,3 +610,245 @@ fn mismatched_backend_and_session_registration_traps_before_any_mutation() {
     );
     teardown();
 }
+
+// ---------------------------------------------------------------------
+// FillRectangle production admission: the guest-write commit branch.
+//
+// Every test below drives the REAL producer seam
+// (`dispatch_dpc_submission` -> `try_dispatch_raw_dpc_via_session`) with
+// the real `RefCell` borrow choreography, so the nonempty-writes branch is
+// exercised across the crate boundary rather than simulated.
+// ---------------------------------------------------------------------
+
+const SET_OTHER_MODE: u8 = 0x2f;
+const SET_COLOR_IMAGE: u8 = 0x3f;
+const SET_FILL_COLOR: u8 = 0x37;
+const FILL_RECTANGLE: u8 = 0x36;
+
+/// Where every fill fixture's `SetColorImage` points. 64-byte aligned (the
+/// decoder requires it) and clear of both the command stream at 0x1000 and
+/// `TEXTURE_SOURCE_ADDR`.
+const FILL_TARGET_ADDR: u32 = 0x4000;
+const FILL_TARGET_WIDTH: u32 = 16;
+const FILL_TARGET_HEIGHT: u32 = 8;
+/// RGBA16: two bytes per pixel.
+const FILL_TARGET_BYTES: usize = (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2) as usize;
+
+/// `SetOtherMode` staging Fill cycle with no Z-compare/Z-update/image-read
+/// bit -- the only shape `execute_fill_rectangle` admits.
+fn fill_cycle_other_mode() -> [u32; 2] {
+    [word(SET_OTHER_MODE, 3 << 20), 0]
+}
+
+/// `SetColorImage` staging an RGBA16 image (`format` 0, `size` 2) whose
+/// wire width field is width-1.
+fn set_color_image_rgba16() -> [u32; 2] {
+    [
+        word(SET_COLOR_IMAGE, 2 << 19 | (FILL_TARGET_WIDTH - 1)),
+        FILL_TARGET_ADDR,
+    ]
+}
+
+fn set_fill_color(value: u32) -> [u32; 2] {
+    [word(SET_FILL_COLOR, 0), value]
+}
+
+/// One `FillRectangle` at whole-pixel coordinates (wire fields are 10.2
+/// fixed point, so each is shifted left by two).
+fn fill_rectangle(x0: u32, y0: u32, x1: u32, y1: u32) -> [u32; 2] {
+    [
+        word(FILL_RECTANGLE, ((x1 << 2) << 12) | (y1 << 2)),
+        ((x0 << 2) << 12) | (y0 << 2),
+    ]
+}
+
+/// A whole-target fill: the only rectangle a *fresh* color target admits.
+/// A partial rectangle on a target with no predecessor is rejected
+/// (`PartialNewTargetInitialization`) because its untouched rows would be
+/// fabricated zeros.
+fn whole_target_fill_words() -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_color_image_rgba16());
+    words.extend(set_fill_color(0x0842_1085));
+    words.extend(fill_rectangle(
+        0,
+        0,
+        FILL_TARGET_WIDTH - 1,
+        FILL_TARGET_HEIGHT - 1,
+    ));
+    words
+}
+
+/// A partial-width, three-row fill: `x0 = 4` is nonzero, so the decoder
+/// declares three disjoint, width-strided write accesses rather than one
+/// collapsed range.
+fn partial_width_fill_words() -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_color_image_rgba16());
+    words.extend(set_fill_color(0x213c_4d59));
+    words.extend(fill_rectangle(4, 2, 14, 4));
+    words
+}
+
+/// Like `register_session_backend`, but also drives `RenderBackend::create`
+/// so the backend records a host-configured color-image height.
+///
+/// The RDP's `SetColorImage` carries no height field, so an admitted
+/// `FillRectangle` is rejected outright without this. `create` is allowed to
+/// fail on an adapterless host: `WgpuBackend::create_inner` records the
+/// configured extent *before* it requests a device, precisely so a CPU-side
+/// fill does not require a GPU.
+fn register_session_backend_for_fills(rdram_len: usize) {
+    let (mut backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    let _ = backend.create(&fn64_render::RenderConfig {
+        width: FILL_TARGET_WIDTH,
+        height: FILL_TARGET_HEIGHT,
+        tv_type: fn64_runtime::TvType::default(),
+    });
+    set_render_backend(Box::new(backend), rdram_len);
+    set_raw_dpc_session(session);
+}
+
+/// Writes `words` into `rdram` at 0x1000 and dispatches them through the
+/// real producer seam.
+fn dispatch_words(rdram: &mut [u8], words: &[u32]) {
+    let bytes = words_to_rdram_bytes(words);
+    let start = 0x1000u32;
+    let end = start + bytes.len() as u32;
+    rdram[start as usize..end as usize].copy_from_slice(&bytes);
+    let submission = admit_dram_submission(start, end);
+    unsafe {
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+    }
+}
+
+/// **T-16:** a partial-width fill routes all the way through the real
+/// session seam, taking the nonempty guest-write commit branch across the
+/// crate boundary with the real `RefCell` borrow sequence.
+///
+/// Before this task, `try_dispatch_raw_dpc_via_session` called
+/// `commit_zero_guest_writes` unconditionally, so a submission declaring
+/// three `RenderTarget` writes would have panicked with
+/// `EffectCountMismatch`. Completing without a panic is therefore itself the
+/// evidence that the branch exists and was taken.
+#[test]
+fn dram_producer_routes_a_partial_width_fill_through_the_session() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    // A fresh target admits only a whole-target rectangle; that fill also
+    // exercises the single-write branch of the same commit path.
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the whole-target fill must complete, leaving no pending fabric transaction"
+    );
+
+    dispatch_words(&mut rdram, &partial_width_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "a session-routed partial-width fill must complete, leaving no pending transaction -- \
+         reaching here at all proves the nonempty guest-write commit branch was taken, since \
+         the zero-write branch would have panicked with EffectCountMismatch"
+    );
+    teardown();
+}
+
+/// **T-17 -- the nonclaim, made executable.** Nothing in the FillRectangle
+/// admission chain writes guest RDRAM.
+///
+/// `execute_fill_rectangle` produces an owned `Vec<u8>`;
+/// `ResidentPublication::publish` writes into a backend-local `Vec`; a
+/// `CompletedWrite` is a range plus a content digest, not bytes in motion.
+/// This test snapshots the guest bytes covering the fill's own declared
+/// target range and asserts they are byte-identical after a successful
+/// dispatch.
+///
+/// A future slice that adds the RDRAM copyback MUST break this test
+/// deliberately. Silently changing it would turn a documented nonclaim into
+/// an undocumented behavior change.
+#[test]
+fn guest_rdram_is_not_modified_by_an_admitted_fill() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    // Poison the target range with a recognizable pattern, so "unchanged"
+    // is a real observation rather than "still zero".
+    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    for (offset, byte) in rdram[target.clone()].iter_mut().enumerate() {
+        *byte = (offset as u8).wrapping_mul(7).wrapping_add(0x5a);
+    }
+    let before = rdram[target.clone()].to_vec();
+
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    assert_eq!(
+        rdram[target.clone()],
+        before[..],
+        "a whole-target fill must not modify one guest RDRAM byte -- this slice publishes into \
+         a backend-local buffer and has no RDRAM copyback"
+    );
+
+    dispatch_words(&mut rdram, &partial_width_fill_words());
+    assert_eq!(
+        rdram[target.clone()],
+        before[..],
+        "a partial-width fill must not modify one guest RDRAM byte either"
+    );
+
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "both fills completed -- the bytes are unchanged because nothing writes them, not \
+         because the dispatch silently failed"
+    );
+    teardown();
+}
+
+/// **T-18:** the pre-existing TMEM-only path is undisturbed by Phase 4. A
+/// TMEM-only capture stages no guest render-target write, so it still takes
+/// the zero-write commit branch and still completes.
+#[test]
+fn tmem_only_captures_still_take_the_zero_write_branch() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    dispatch_words(&mut rdram, &one_load_block_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "a TMEM-only submission must still complete through the zero-write branch"
+    );
+    teardown();
+}
+
+/// Hostile: `FullSync` is still rejected loudly at the real producer seam
+/// now that it no longer shares a match arm with `FillRectangle`. The
+/// split-arm regression proof, at the ABI boundary rather than in the
+/// backend's own unit tests.
+#[test]
+fn a_full_sync_after_a_fill_still_traps_at_the_producer_seam() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let mut words = whole_target_fill_words();
+    words.extend([word(FULL_SYNC, 0), 0]);
+    let bytes = words_to_rdram_bytes(&words);
+    let start = 0x1000u32;
+    let end = start + bytes.len() as u32;
+    rdram[start as usize..end as usize].copy_from_slice(&bytes);
+
+    let submission = admit_dram_submission(start, end);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+    }));
+    assert!(
+        result.is_err(),
+        "admitting FillRectangle must not have admitted FullSync alongside it"
+    );
+    teardown();
+}

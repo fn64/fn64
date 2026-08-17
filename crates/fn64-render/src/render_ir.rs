@@ -25,9 +25,9 @@ pub use production::{
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
     RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, ReadyPublication,
-    ReadyRawDpcCommitCapsule, RectViewportPixels, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
-    TmemLoadShape, TmemTransferLayout, TriangleSource,
+    RdpFillRectangleCommand, RdpStateCommand, RdpStateIdentity, RdpTriangleCommand,
+    ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -448,7 +448,22 @@ mod production {
         Unsupported,
         /// Synchronous, no-FullSync, TMEM-only transactional execution -- the
         /// production-dispatch slice's frozen scope (card v10 section 1).
+        /// Retained for backends that admit no guest-visible write at all;
+        /// superseded for `fn64-render-wgpu`'s `WgpuBackend` by
+        /// [`Self::TransactionalTmemFillNoFullSync`].
         TransactionalTmemNoFullSync,
+        /// Synchronous, no-FullSync transactional execution admitting TMEM
+        /// loads **and** fill-cycle `FillRectangle` color-target writes.
+        /// Distinct from [`Self::TransactionalTmemNoFullSync`] because a
+        /// caller that reasons "this backend declares zero guest-visible
+        /// writes" from the older variant would be wrong about this one --
+        /// the distinction is the whole point, not cosmetic.
+        ///
+        /// Nonclaim: a backend reporting this admits a guest-visible
+        /// *journal* write for an admitted fill. It does **not** claim that
+        /// any guest RDRAM byte is modified -- the fill executor writes a
+        /// backend-owned buffer, and no RDRAM copyback exists in this slice.
+        TransactionalTmemFillNoFullSync,
     }
 
     /// The stage an in-flight submission's retirement was last known to
@@ -1378,6 +1393,51 @@ mod production {
         pub viewport: Option<RectViewportPixels>,
     }
 
+    /// Neutral carrier for one admitted fill-cycle `FillRectangle` (RDP
+    /// opcode 0x36). Carries the decoded wire rectangle plus the exact
+    /// ordered [`ResourceAccess`] span the decoder declared for it -- one
+    /// access for a full-image-width fill, one **per row** otherwise,
+    /// because a partial-width rectangle's rows occupy disjoint,
+    /// width-strided RDRAM ranges and one collapsed range would declare
+    /// untouched bytes as written.
+    ///
+    /// Unlike [`RdpTriangleCommand`] (which pushes zero accesses) this
+    /// command pushes N, so it carries `first_access_index`/`access_count`
+    /// exactly the way [`TmemLoadSemantics`] carries its own
+    /// destination-access span -- letting a visitor locate this fill's
+    /// accesses in the owning plan without re-deriving them.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct RdpFillRectangleCommand {
+        pub location: RawDpcCommandLocation,
+        pub raw_words: Box<[u32]>,
+        /// Raw 12-bit fixed-point wire fields, exactly as the decoder read
+        /// them -- 10 integer bits plus 2 fractional bits. Deliberately
+        /// **not** pre-divided by 4: the fill executor performs that
+        /// conversion itself and rejects a nonzero fraction rather than
+        /// truncating, so passing whole pixels here would silently discard
+        /// the evidence that rejection is built on.
+        pub upper_left_x: u16,
+        pub upper_left_y: u16,
+        pub lower_right_x: u16,
+        pub lower_right_y: u16,
+        /// The color image this fill targets, as staged by the preceding
+        /// `SetColorImage`. Duplicated onto the command (rather than left
+        /// for the visitor to track) so the execution-time color-target
+        /// identity is derived from the same value plan time used.
+        pub color_image: NeutralColorImage,
+        /// The staged `SetFillColor` wire value.
+        pub fill_color: NeutralFillColor,
+        /// Index into the owning plan's ordered access list of this
+        /// command's first `RenderTarget` write access.
+        pub first_access_index: u32,
+        /// How many consecutive accesses starting at `first_access_index`
+        /// belong to this fill. `1` for a full-width fill, the rectangle's
+        /// pixel height otherwise.
+        pub access_count: u32,
+        pub before: Option<RdpStateIdentity>,
+        pub after: RdpStateIdentity,
+    }
+
     /// Which wire command admitted this triangle: a genuine `RawTriangle`
     /// (0xC8-0xCF family) versus one synthesized from a `TextureRectangle`/
     /// `TextureRectangleFlip` (0x24/0x25) two-triangle expansion. Constructed
@@ -1422,6 +1482,10 @@ mod production {
         /// resource access and no before/after identity (see
         /// [`RdpTriangleCommand`]'s own doc for why).
         Triangle(&'plan RdpTriangleCommand),
+        /// One admitted fill-cycle `FillRectangle` -- unlike every sibling
+        /// here, this command declares N guest-visible `RenderTarget` write
+        /// accesses (see [`RdpFillRectangleCommand`]).
+        FillRectangle(&'plan RdpFillRectangleCommand),
     }
 
     /// Borrowed, nonextracting visitor over one validated plan's semantic
@@ -1461,6 +1525,7 @@ mod production {
         TmemLoad(TmemLoadSemantics),
         State(RdpStateCommand),
         Triangle(RdpTriangleCommand),
+        FillRectangle(RdpFillRectangleCommand),
     }
 
     impl OwnedSemanticCommand {
@@ -1469,6 +1534,7 @@ mod production {
                 Self::TmemLoad(semantics) => RawDpcSemanticCommandRef::TmemLoad(semantics),
                 Self::State(state) => RawDpcSemanticCommandRef::State(state),
                 Self::Triangle(triangle) => RawDpcSemanticCommandRef::Triangle(triangle),
+                Self::FillRectangle(fill) => RawDpcSemanticCommandRef::FillRectangle(fill),
             }
         }
     }
@@ -1703,6 +1769,41 @@ mod production {
             Ok(prepared)
         }
 
+        /// Complete one bound submission that produced real guest-visible
+        /// writes but no physical-state successor -- a `FillRectangle`
+        /// color-target write with no TMEM load. Identical to
+        /// [`Self::complete_execution_preserving_physical`] in every
+        /// physical-state respect (records against the *currently active*
+        /// slot index, never reads, writes, or constructs a `P`, same
+        /// `into_backend_prepared` authority/queue validation), and
+        /// identical to [`Self::complete_execution`] in accepting a
+        /// caller-supplied [`fn64_render_ir::BackendEffectReport`].
+        ///
+        /// Why accepting `effects` here is safe where
+        /// `complete_execution_preserving_physical` deliberately refuses to:
+        /// that method refuses because it must *prove* zero writes, and a
+        /// generic coordinator cannot inspect an arbitrary report to do so.
+        /// This method makes no zero-write claim at all -- the report was
+        /// already validated against the packet's own journal by
+        /// [`fn64_render_ir::BackendEffectReport::try_new`], which is the
+        /// same proof [`Self::complete_execution`] relies on. What this
+        /// method additionally does *not* claim is anything about `P`: it
+        /// never touches either slot.
+        pub fn complete_execution_preserving_physical_with_effects(
+            &mut self,
+            bound: BoundSubmittedRawDpc,
+            effects: fn64_render_ir::BackendEffectReport,
+        ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
+            self.ready = Some(ReadyPhysicalSlot {
+                queue: self.authority.authority.queue_identity(),
+                submission: prepared.submission(),
+                slot_index: self.active,
+                retirement_slot: Rc::clone(&prepared.retirement.slot),
+            });
+            Ok(prepared)
+        }
+
         /// Validate every queue/submission/ready-slot fact this coordinator
         /// privately recorded at [`Self::complete_execution`] time against
         /// `capsule`, *before* any physical publication exists as a value --
@@ -1914,48 +2015,92 @@ mod production {
         }
 
         /// Advance one backend-prepared submission whose journal declares
-        /// exactly one guest-visible `RenderTarget` write -- a
-        /// FillRectangle color-target write; this is the FillRectangle-only
-        /// counterpart to [`Self::commit_zero_guest_writes`], not a general
-        /// N-write guest-commit path -- into the sealed
-        /// [`GuestCommittedRawDpc`], moving plan, retirement, and ticket
-        /// together, exactly like `commit_zero_guest_writes`.
+        /// exactly one guest-visible `RenderTarget` write into the sealed
+        /// [`GuestCommittedRawDpc`]. A one-element convenience wrapper over
+        /// [`Self::commit_guest_render_target_writes`], retained because it
+        /// is the shape every existing caller and test already uses; it adds
+        /// no check of its own and cannot diverge from the N-write path.
         ///
         /// `write` must be the exact [`CompletedWrite`] the backend already
         /// staged and reported inside `prepared`'s own `BackendEffectReport`
         /// (checked structurally by `GuestCommitEffectReport::try_new`'s
         /// content-digest equality check -- supplying any other content,
         /// byte count, or access fails loudly, it is not merely re-trusted).
-        ///
-        /// Traps if the prepared value's queue does not match this
-        /// session's own queue, identically to `commit_zero_guest_writes`.
-        /// Before issuing the guest-commit receipt, this method first
-        /// checks `write`'s own access mode/purpose against the single
-        /// admitted shape (`AccessMode::Write`, `AccessPurpose::
-        /// RenderTarget`) -- a structural pre-check, not the sole
-        /// enforcement; `GuestCommitEffectReport::try_new`'s own
-        /// region-purpose-blind count/identity/content check (mirroring
-        /// `commit_zero_guest_writes`'s own re-checked-fact pattern) still
-        /// runs regardless and is what actually proves this write is the
-        /// one the backend staged.
         pub fn commit_single_guest_render_target_write(
             &mut self,
             prepared: BackendPreparedRawDpc,
             write: CompletedWrite,
         ) -> Result<GuestCommittedRawDpc, ValidationError> {
+            self.commit_guest_render_target_writes(prepared, vec![write])
+        }
+
+        /// Advance one backend-prepared submission whose journal declares
+        /// N guest-visible `RenderTarget` writes -- the general
+        /// FillRectangle color-target commit path, and the N-write
+        /// counterpart to [`Self::commit_zero_guest_writes`] -- into the
+        /// sealed [`GuestCommittedRawDpc`], moving plan, retirement, and
+        /// ticket together, exactly like `commit_zero_guest_writes`.
+        ///
+        /// **Why N and not one.** `fn64-render-wgpu`'s `plan_fill` pushes
+        /// one guest-write journal access *per row* for a partial-width
+        /// fill, because a partial-width rectangle's rows occupy disjoint,
+        /// width-strided RDRAM ranges. Collapsing them into a single range
+        /// would declare untouched inter-row bytes as written -- an 11x3
+        /// fill into a 320px RGBA16 image writes 66 bytes but spans 1302,
+        /// so ~95% of a collapsed claim would be false. The guest-write
+        /// journal is exactly what this commit contract verifies, so it
+        /// must not lie.
+        ///
+        /// `writes` must be the exact ordered [`CompletedWrite`] list the
+        /// backend already staged and reported inside `prepared`'s own
+        /// `BackendEffectReport`. Order is load-bearing:
+        /// `GuestCommitEffectReport::try_new` zips this list against the
+        /// packet's own `guest_write_accesses()` element for element, and
+        /// both filters preserve journal order, so a reordered list is a
+        /// loud `EffectAccessMismatch`, never a silently accepted permutation.
+        ///
+        /// An empty `writes` is a legal input and deliberately not gated
+        /// here: `validate_effects` rejects it against a nonempty journal
+        /// and accepts it against an empty one, which is exactly
+        /// [`Self::commit_zero_guest_writes`]'s behavior. A redundant gate
+        /// would be a second, independently-maintained rejection path for
+        /// the same fact.
+        ///
+        /// Traps if the prepared value's queue does not match this
+        /// session's own queue, identically to `commit_zero_guest_writes`.
+        /// Before issuing the guest-commit receipt, this method first
+        /// checks **every** element's own access mode/purpose against the
+        /// single admitted shape (`AccessMode::Write`,
+        /// `AccessPurpose::RenderTarget`) -- a structural pre-check, not the
+        /// sole enforcement; `GuestCommitEffectReport::try_new`'s own
+        /// region-purpose-blind count/identity/content check (mirroring
+        /// `commit_zero_guest_writes`'s own re-checked-fact pattern) still
+        /// runs regardless and is what actually proves these writes are the
+        /// ones the backend staged.
+        ///
+        /// Nonclaim: committing here modifies no guest RDRAM byte. A
+        /// [`CompletedWrite`] is a range plus a content digest, not bytes in
+        /// motion; the RDRAM copyback is a separate, deferred slice.
+        pub fn commit_guest_render_target_writes(
+            &mut self,
+            prepared: BackendPreparedRawDpc,
+            writes: Vec<CompletedWrite>,
+        ) -> Result<GuestCommittedRawDpc, ValidationError> {
             assert!(
                 prepared.complete.queue() == self.queue.identity(),
                 "BackendPreparedRawDpc does not belong to this session's queue"
             );
-            if write.access().mode() != AccessMode::Write
-                || write.access().purpose() != AccessPurpose::RenderTarget
-            {
-                return Err(ValidationError::GuestRenderTargetWriteShapeMismatch {
-                    mode: access_mode_name(write.access().mode()),
-                    purpose: access_purpose_name(write.access().purpose()),
-                });
+            for write in &writes {
+                if write.access().mode() != AccessMode::Write
+                    || write.access().purpose() != AccessPurpose::RenderTarget
+                {
+                    return Err(ValidationError::GuestRenderTargetWriteShapeMismatch {
+                        mode: access_mode_name(write.access().mode()),
+                        purpose: access_purpose_name(write.access().purpose()),
+                    });
+                }
             }
-            let effects = GuestCommitEffectReport::try_new(&prepared.complete, vec![write])?;
+            let effects = GuestCommitEffectReport::try_new(&prepared.complete, writes)?;
             let receipt: GuestCommitReceipt = self.guest.issue(&prepared.complete, effects)?;
             let committed = prepared.complete.commit_guest(receipt)?;
             let mut retirement = prepared.retirement;
@@ -2140,6 +2285,50 @@ mod production {
 
         pub fn push_command_decode_access(&mut self, access: ResourceAccess) {
             self.accesses.push(access);
+        }
+
+        /// Pushes one admitted fill-cycle `FillRectangle` and **every**
+        /// [`ResourceAccess`] it declares, in the exact order the decoder
+        /// produced them.
+        ///
+        /// `accesses` is a slice, not a single access, precisely because a
+        /// partial-width fill declares one access per row.
+        /// [`Self::finish`]'s access-for-access check then lines up
+        /// automatically: this method pushes exactly the same N accesses
+        /// into `self.accesses` that the decoder pushed into the journal, in
+        /// the same order, so the count check and the element-wise identity
+        /// check both pass with no per-command special-casing. There is no
+        /// "collapse to one access" path and there must never be one -- a
+        /// collapsed range would claim untouched inter-row bytes as written.
+        ///
+        /// The caller must hand over the *decoder's own* access slice rather
+        /// than re-deriving it. Two independent derivations of the same
+        /// access list is exactly the divergence `finish`'s check exists to
+        /// catch, and would turn a sealed guarantee into a runtime coin flip.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `accesses` is empty (an admitted fill that declares no
+        /// write is a decoder bug, not a no-op to be admitted quietly), or
+        /// if its length disagrees with `fill.access_count`.
+        pub fn push_fill_rectangle(
+            &mut self,
+            fill: RdpFillRectangleCommand,
+            accesses: &[ResourceAccess],
+        ) {
+            assert!(
+                !accesses.is_empty(),
+                "an admitted FillRectangle always declares at least one RenderTarget write access"
+            );
+            assert_eq!(
+                accesses.len() as u32,
+                fill.access_count,
+                "FillRectangle command's declared access_count disagrees with the access slice \
+                 being pushed for it"
+            );
+            self.accesses.extend_from_slice(accesses);
+            self.commands
+                .push(OwnedSemanticCommand::FillRectangle(fill));
         }
 
         /// Finish this writer into the sealed [`PlannedRawDpcSubmission`]. `journal`
@@ -4635,6 +4824,319 @@ mod production {
                 outcome.is_err(),
                 "a CompletedWrite proven against submission A's ticket must not be \
                  accepted against submission B's ticket, even from the same session queue"
+            );
+        }
+
+        /// `render_target_write_fixture`, widened to **three** disjoint
+        /// `RenderTarget`/`ColorFramebuffer` write accesses -- the shape a
+        /// partial-width FillRectangle produces, one access per row, whose
+        /// rows occupy disjoint width-strided RDRAM ranges.
+        ///
+        /// The three ranges are deliberately non-contiguous (0x200, 0x240,
+        /// 0x280, each 0x10 long): a contiguous trio would be
+        /// indistinguishable from one collapsed range, which is exactly the
+        /// false claim the N-write design exists to prevent.
+        #[allow(clippy::type_complexity)]
+        fn three_row_render_target_write_fixture(
+            queue: SubmissionQueue,
+            mut backend_authority: BackendCompletionAuthority,
+            guest: GuestCommitAuthority,
+            contents: [fn64_render_ir::ContentDigest; 3],
+        ) -> (
+            SubmissionQueue,
+            BackendCompletionAuthority,
+            GuestCommitAuthority,
+            BackendPreparedRawDpc,
+            [ResourceAccess; 3],
+        ) {
+            let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(0x1000).unwrap();
+            let command_range = layout.range(0x100, 0x108).unwrap();
+            let command_read = ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(0),
+                AccessMode::Read,
+                AccessPurpose::CommandDecode,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::RawCommands,
+                    range: command_range,
+                },
+            )
+            .unwrap();
+            let row_starts = [0x200u32, 0x240, 0x280];
+            let row_accesses: [ResourceAccess; 3] = core::array::from_fn(|row| {
+                let start = row_starts[row];
+                ResourceAccess::try_new(
+                    fn64_render_ir::OperationId::new(1 + row as u32),
+                    AccessMode::Write,
+                    AccessPurpose::RenderTarget,
+                    fn64_render_ir::ResourceRegion::Rdram {
+                        resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+                        range: layout.range(start, start + 0x10).unwrap(),
+                    },
+                )
+                .unwrap()
+            });
+            let journal = fn64_render_ir::ResourceJournal::try_new(
+                fn64_render_ir::ResourceJournalLimits::try_new(8, 0x200).unwrap(),
+                vec![
+                    command_read,
+                    row_accesses[0],
+                    row_accesses[1],
+                    row_accesses[2],
+                ],
+            )
+            .unwrap();
+            let stream = fn64_render_ir::RawCommandStream::Dram(
+                fn64_render_ir::DramCommandStream::try_new(vec![
+                    fn64_render_ir::DramCommandChunk::try_new(
+                        command_range,
+                        vec![0xf500_0000, 0],
+                        fn64_render_ir::TemporalBoundary::new(
+                            11,
+                            fn64_render_ir::DpInterruptState::Clear,
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            );
+            let packet = fn64_render_ir::WorkloadPacket::try_new(
+                layout,
+                fn64_render_ir::WorkloadAdmission::RawDpc {
+                    transaction_sequence: 7,
+                },
+                vec![stream],
+                journal,
+            )
+            .unwrap();
+
+            let mut queue = queue;
+            let submitted = queue
+                .submit(fn64_render_ir::DecodedTicket::new(packet))
+                .unwrap();
+            let write_effects: Vec<CompletedWrite> = (0..3)
+                .map(|row| {
+                    CompletedWrite::try_new(
+                        row_accesses[row],
+                        row_accesses[row].region().declared_bytes(),
+                        contents[row],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let report = BackendEffectReport::try_new(submitted.packet(), write_effects).unwrap();
+            let receipt = backend_authority.issue(&submitted, report).unwrap();
+            let complete = submitted.gpu_complete(receipt).unwrap();
+
+            let (dummy_retirement, _handle) =
+                SubmittedRawDpcRetirement::new_pair(complete.submission());
+            let dummy_plan = ExactValidatedRawDpcPlan {
+                source_identity: crate::RawDpcSubmissionIdentity {
+                    source: RawDpcSource::Rdram,
+                    start: 0x100,
+                    end: 0x108,
+                    command_sha256: [0; 32],
+                },
+                journal_identity: complete.packet().journal().identity(),
+                commands: Vec::new().into_boxed_slice(),
+                accesses: Vec::new().into_boxed_slice(),
+            };
+            let prepared = BackendPreparedRawDpc {
+                plan: dummy_plan,
+                complete,
+                retirement: dummy_retirement,
+            };
+            (queue, backend_authority, guest, prepared, row_accesses)
+        }
+
+        fn three_row_contents() -> [fn64_render_ir::ContentDigest; 3] {
+            [
+                fn64_render_ir::effect_content_digest(&[0xa0; 16]),
+                fn64_render_ir::effect_content_digest(&[0xa1; 16]),
+                fn64_render_ir::effect_content_digest(&[0xa2; 16]),
+            ]
+        }
+
+        fn three_row_writes(
+            accesses: [ResourceAccess; 3],
+            contents: [fn64_render_ir::ContentDigest; 3],
+        ) -> Vec<CompletedWrite> {
+            (0..3)
+                .map(|row| {
+                    CompletedWrite::try_new(
+                        accesses[row],
+                        accesses[row].region().declared_bytes(),
+                        contents[row],
+                    )
+                    .unwrap()
+                })
+                .collect()
+        }
+
+        /// T-1: the N-write proof at the IR seam. A packet declaring three
+        /// disjoint `RenderTarget` writes commits cleanly when all three
+        /// matching `CompletedWrite`s are supplied, and reaches
+        /// `GuestReceipt`. This is the shape a partial-width FillRectangle
+        /// produces and the shape the old one-write-only signature could
+        /// not express at all.
+        #[test]
+        fn commit_guest_render_target_writes_commits_three_row_writes() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let contents = three_row_contents();
+            let (queue, _backend_authority, guest, prepared, accesses) =
+                three_row_render_target_write_fixture(queue, backend_authority, guest, contents);
+
+            let mut session = matching_session_for(queue, guest);
+            let committed = session
+                .commit_guest_render_target_writes(prepared, three_row_writes(accesses, contents))
+                .unwrap();
+            assert_eq!(committed.stage(), RawDpcRetirementStage::GuestReceipt);
+        }
+
+        /// T-2: dropping one row is a loud count mismatch, not a partial
+        /// commit. A committed subset would silently claim the packet wrote
+        /// less than its own journal declares.
+        #[test]
+        fn commit_guest_render_target_writes_rejects_a_dropped_row() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let contents = three_row_contents();
+            let (queue, _backend_authority, guest, prepared, accesses) =
+                three_row_render_target_write_fixture(queue, backend_authority, guest, contents);
+
+            let mut session = matching_session_for(queue, guest);
+            let mut writes = three_row_writes(accesses, contents);
+            writes.pop();
+            assert_eq!(
+                session
+                    .commit_guest_render_target_writes(prepared, writes)
+                    .unwrap_err(),
+                ValidationError::EffectCountMismatch {
+                    field: "guest commit access",
+                    expected: 3,
+                    actual: 2,
+                }
+            );
+        }
+
+        /// T-3: supplying all three rows in the wrong order is rejected --
+        /// proving journal order is load-bearing, not incidental. Rows 0/2/1
+        /// carry the right accesses and the right digests; only their
+        /// sequence differs.
+        #[test]
+        fn commit_guest_render_target_writes_rejects_reordered_rows() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let contents = three_row_contents();
+            let (queue, _backend_authority, guest, prepared, accesses) =
+                three_row_render_target_write_fixture(queue, backend_authority, guest, contents);
+
+            let mut session = matching_session_for(queue, guest);
+            let writes = three_row_writes(accesses, contents);
+            let reordered = vec![writes[0], writes[2], writes[1]];
+            assert_eq!(
+                session
+                    .commit_guest_render_target_writes(prepared, reordered)
+                    .unwrap_err(),
+                ValidationError::EffectAccessMismatch {
+                    field: "guest commit access",
+                    index: 1,
+                }
+            );
+        }
+
+        /// T-4: the one-write convenience wrapper and a one-element N-write
+        /// call are the same operation. Asserted on the sealed
+        /// `guest_effect_identity()`, so a future divergence in either
+        /// body -- an extra check, a different report shape -- fails here
+        /// rather than silently producing two different receipts for the
+        /// same staged write.
+        #[test]
+        fn commit_single_guest_render_target_write_still_delegates() {
+            let content = fn64_render_ir::effect_content_digest(&[0xbe; 16]);
+
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+            let write = CompletedWrite::try_new(
+                guest_write,
+                guest_write.region().declared_bytes(),
+                content,
+            )
+            .unwrap();
+            let mut single_session = matching_session_for(queue, guest);
+            let via_single = single_session
+                .commit_single_guest_render_target_write(prepared, write)
+                .unwrap();
+
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let (queue, _backend_authority, guest, prepared, guest_write) =
+                render_target_write_fixture(queue, backend_authority, guest, content);
+            let write = CompletedWrite::try_new(
+                guest_write,
+                guest_write.region().declared_bytes(),
+                content,
+            )
+            .unwrap();
+            let mut plural_session = matching_session_for(queue, guest);
+            let via_plural = plural_session
+                .commit_guest_render_target_writes(prepared, vec![write])
+                .unwrap();
+
+            assert_eq!(
+                via_single.committed.guest_effect_identity(),
+                via_plural.committed.guest_effect_identity(),
+                "the single-write wrapper and a one-element N-write call must produce the \
+                 identical sealed guest-effect identity"
+            );
+        }
+
+        /// Hostile: a non-`RenderTarget` access anywhere in the list --
+        /// not merely at index 0 -- is rejected by the shape pre-check. The
+        /// old single-write method could only ever check one element, so
+        /// "every element is checked" is a genuinely new obligation the
+        /// N-write body has to meet.
+        #[test]
+        fn commit_guest_render_target_writes_rejects_a_non_render_target_write_in_any_position() {
+            let (queue, backend_authority, guest) =
+                TicketAuthoritySet::try_new().unwrap().into_roles();
+            let contents = three_row_contents();
+            let (queue, _backend_authority, guest, prepared, accesses) =
+                three_row_render_target_write_fixture(queue, backend_authority, guest, contents);
+
+            let mut session = matching_session_for(queue, guest);
+            let mut writes = three_row_writes(accesses, contents);
+            // Rewrite the LAST element's purpose, so a body that only
+            // inspected `writes[0]` would wrongly accept this call.
+            // `CopyDestination` is chosen because it is a genuinely
+            // constructible write purpose for a `ColorFramebuffer` region
+            // (unlike, say, `TmemLoadDestination`, which `ResourceAccess::
+            // try_new` refuses outright) -- so this test exercises the
+            // session's own shape pre-check, not the journal's constructor.
+            let wrong_purpose = ResourceAccess::try_new(
+                accesses[2].operation(),
+                AccessMode::Write,
+                AccessPurpose::CopyDestination,
+                accesses[2].region(),
+            )
+            .unwrap();
+            writes[2] = CompletedWrite::try_new(
+                wrong_purpose,
+                wrong_purpose.region().declared_bytes(),
+                contents[2],
+            )
+            .unwrap();
+            assert_eq!(
+                session
+                    .commit_guest_render_target_writes(prepared, writes)
+                    .unwrap_err(),
+                ValidationError::GuestRenderTargetWriteShapeMismatch {
+                    mode: "Write",
+                    purpose: "CopyDestination",
+                }
             );
         }
 
