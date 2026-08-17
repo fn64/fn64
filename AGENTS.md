@@ -116,6 +116,32 @@ it, don't read it. Every design claim states which allowed source it came from.
   ownership of a queue, the single-runnable-thread token, an rdram address
   newtype — put it there. An invariant enforced by review is a bug with a
   delay timer.
+- **One vector type per port.** A ported struct field, function parameter, or
+  return value that upstream spells `float3`/`float4` is
+  `fn64_render_ir::Vec3`/`Vec4` (`crates/fn64-render-ir/src/rsp_math.rs:42`
+  and `:72` — `Copy`, `PartialEq`, `Default`, documented as "a backend-neutral
+  N-component float vector, matching HLSL `float3`/`float4`"). This holds
+  whether the C++ spelling is `hlslpp::float3` or `interop::float3`; the two
+  denote the same component set, and a rule splitting them by namespace was
+  reverse-engineered from a stale conflict, not decided. Three exceptions,
+  each for a reason, not a preference:
+  - **The shared type carries a contract your source does not define.** Prefer
+    a local type and say so in Nonclaims. `Mat4` documents `mul` semantics
+    (`rsp_math.rs:97`); `interop::float4x4` declares no multiplication at all,
+    so `rt64_hlsl_interop.rs:819`'s `Float4x4` stays local and
+    arithmetic-free. Adopting a shared type imports every claim it makes.
+  - **The value is shader-local, not a ported type.** Loose `float3`/`float4`
+    locals inside an HLSL body, and caller-supplied already-sampled values,
+    stay bare `[f32; N]` — there is no upstream type to reuse.
+  - **Independent test oracles.** An oracle written to check a `Vec3` port
+    should not be built from `Vec3`; the different shape is what makes it
+    independent evidence rather than a transcription of the implementation.
+
+  `fn64-render-ir` has no `Vec2` and no 3x3 type. Their absence is not a
+  license to invent a competing `Float3` — it is why a local `Mat3` or a bare
+  `[f32; 2]` is correct there. Make no `repr(C)`, size, alignment, or ABI
+  claim about any of these types when you reuse one; `rt64_hlsl.h` declares an
+  alignment mismatch across its own HLSL/C++ boundary.
 - **Mechanism over patch.** If you fix an instance of a bug class, build the
   sweep that finds the rest of the class. One-off fixes to recurring shapes
   get bounced in review. Doc drift is such a class and now has its sweep:
