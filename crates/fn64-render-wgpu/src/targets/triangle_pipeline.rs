@@ -14,7 +14,9 @@
 //!
 //! Restriction set (port card §3): one fixed triangle, hardcoded
 //! vertex positions/colors/UVs in the test fixture (no `RawTriangle`
-//! decode); opaque only (`blend: None`, no fixed-function blend state --
+//! decode in this module's own fixture -- real admitted triangles decoded
+//! from wire words are accepted separately via `submit_admitted_triangle`,
+//! added by `2b3ed203`); opaque only (`blend: None`, no fixed-function blend state --
 //! this is the actual "blend is a no-op" mechanism for this slice, not an
 //! `OtherMode` bit combination. Independently verified against RT64's own
 //! PSO construction (`rt64_raster_shader.cpp:311`, pinned commit
