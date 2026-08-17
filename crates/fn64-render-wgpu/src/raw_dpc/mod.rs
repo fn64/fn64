@@ -49,6 +49,11 @@ use crate::tmem::{
 };
 
 const SET_OTHER_MODE: u8 = 0x2f;
+/// `G_SETSCISSOR` (`0xED`, as
+/// `crates/fn64-render-reference/src/gbi/wire.rs`'s `G_SETSCISSOR` already
+/// spells it); public SGI *RDP Command Summary* "Set Scissor". Admitted as
+/// tracked state only -- see [`RawDpcCommandKind::SetScissor`].
+const SET_SCISSOR: u8 = 0xed & 0x3f;
 const SET_COLOR_IMAGE: u8 = 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
@@ -188,6 +193,20 @@ pub enum RawDpcCommandKind {
         variant: u8,
     },
     SetOtherMode(OtherMode),
+    /// `G_SETSCISSOR` (`0x2d`), **tracked state only**.
+    ///
+    /// Carries the rect exactly as
+    /// [`crate::rt64_gbi_rdp_decode::decode_set_scissor`] -- the pinned
+    /// RT64 port, reused verbatim rather than re-derived -- reads it. This
+    /// variant deliberately does **not** stage into
+    /// [`RdpState`]/[`RdpStateDelta`] the way every other `Set*` kind here
+    /// does: no draw, clip, or bounds computation in this crate reads a
+    /// scissor rect today (`production.rs`'s viewport is an identity
+    /// mapping; `texture_rectangle.rs` performs no scissor intersection),
+    /// and keeping the value out of the staged state is the structural
+    /// guarantee that admitting the opcode cannot move a pixel. Applying
+    /// the rect is separate, later work.
+    SetScissor(crate::rt64_gbi_rdp_decode::SetScissorDecoded),
     SetColorImage(ColorImage),
     SetFillColor(FillColor),
     SetEnvColor(Color4),
@@ -1120,6 +1139,21 @@ fn decode_stream(
                 delta.set_fog_color(value);
                 state.apply(delta);
                 RawDpcCommandKind::SetFogColor(value)
+            }
+            SET_SCISSOR => {
+                // Reuses the pinned RT64 port verbatim. `ulx`/`uly` come
+                // from `p0(w0, 12, 12)`/`p0(w0, 0, 12)` -- both inside w0's
+                // low 24-bit payload -- so passing the full wire word here
+                // (opcode byte still in bits 24:31) reads exactly the same
+                // fields the RT64 decoder would; no masking is needed and
+                // none is applied, matching how `SET_COMBINE` below passes
+                // `w0` unmasked.
+                //
+                // No `delta.set_*`/`state.apply` call: this kind is tracked,
+                // never staged. See `RawDpcCommandKind::SetScissor`.
+                RawDpcCommandKind::SetScissor(crate::rt64_gbi_rdp_decode::decode_set_scissor(
+                    w0, w1,
+                ))
             }
             SET_PRIM_DEPTH => {
                 let value = PrimDepth::from_wire(w1);
@@ -3979,6 +4013,168 @@ mod tests {
         };
         assert_eq!(color.rgba8(), [0x01, 0x02, 0x03, 0x04]);
         assert_eq!(decoded.staged_state().fog_color(), Some(color));
+    }
+
+    // -- SetScissor (tracked state only) --------------------------------
+
+    /// Hand-derived wire words for one `SetScissor`. `w0` payload packs
+    /// `ulx << 12 | uly`; `w1` packs `mode << 24 | lrx << 12 | lry`.
+    fn set_scissor_words(
+        prefix: u8,
+        mode: u32,
+        ulx: u32,
+        uly: u32,
+        lrx: u32,
+        lry: u32,
+    ) -> Vec<u32> {
+        vec![
+            word(prefix, SET_SCISSOR, ulx << 12 | uly),
+            mode << 24 | lrx << 12 | lry,
+        ]
+    }
+
+    #[test]
+    fn set_scissor_is_admitted_rather_than_rejected_as_unsupported() {
+        // Before admission this exact stream returned
+        // `UnsupportedCommand { decoded_opcode: 0x2d, width: 8 }`.
+        let decoded = decode(set_scissor_words(0xc0, 0, 0, 0, 0, 0))
+            .expect("SetScissor must decode, not reject as UnsupportedCommand");
+        assert_eq!(decoded.commands().len(), 1);
+        assert!(matches!(
+            decoded.commands()[0].kind(),
+            RawDpcCommandKind::SetScissor(_)
+        ));
+    }
+
+    #[test]
+    fn set_scissor_opcode_constant_is_the_low_six_bits_of_g_setscissor() {
+        // `G_SETSCISSOR` is 0xED (fn64-render-reference's `gbi::wire`);
+        // the raw-DPC decoder keys on `opcode & 0x3f`.
+        assert_eq!(SET_SCISSOR, 0x2d);
+        assert_eq!(SET_SCISSOR, 0xedu8 & 0x3f);
+    }
+
+    #[test]
+    fn set_scissor_decodes_each_field_from_its_own_wire_position() {
+        // ulx = 0x123 (291), uly = 0x456 (1110) from w0's low 24 bits;
+        // mode = 2, lrx = 0x789 (1929), lry = 0xABC (2748) from w1.
+        let decoded = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(scissor.mode, 2);
+        assert_eq!(scissor.ulx, 0x123);
+        assert_eq!(scissor.uly, 0x456);
+        assert_eq!(scissor.lrx, 0x789);
+        assert_eq!(scissor.lry, 0xABC);
+    }
+
+    #[test]
+    fn set_scissor_fields_saturate_at_their_own_widths_and_never_go_negative() {
+        // Every wire bit set: the opcode byte still selects SetScissor
+        // (0xff & 0x3f == 0x3f is SetColorImage, so build the word
+        // explicitly rather than flooding w0's top byte). mode is 2 bits
+        // (max 3), each coordinate is 12 bits (max 0xFFF = 4095).
+        let words = vec![word(0xc0, SET_SCISSOR, 0x00ff_ffff), 0xffff_ffff];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(scissor.mode, 3);
+        assert_eq!(scissor.ulx, 0xFFF);
+        assert_eq!(scissor.uly, 0xFFF);
+        assert_eq!(scissor.lrx, 0xFFF);
+        assert_eq!(scissor.lry, 0xFFF);
+        // The decoder's `int32_t` typing mirrors RT64's locals; the fields
+        // are zero-extended and can never be negative.
+        for value in [scissor.ulx, scissor.uly, scissor.lrx, scissor.lry] {
+            assert!(value >= 0, "scissor coordinates are zero-extended");
+        }
+    }
+
+    #[test]
+    fn set_scissor_matches_the_pinned_rt64_decoder_bit_for_bit() {
+        // Proves this arm reuses `decode_set_scissor` rather than
+        // re-deriving the layout: a hostile pattern that fills every
+        // unrelated bit must agree with the ported decoder exactly.
+        let w0 = word(0x40, SET_SCISSOR, 0x00ab_cdef);
+        let w1 = 0x3579_2468u32;
+        let decoded = decode(vec![w0, w1]).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(
+            scissor,
+            crate::rt64_gbi_rdp_decode::decode_set_scissor(w0, w1)
+        );
+    }
+
+    /// Assert two decodes staged byte-identical RDP state.
+    ///
+    /// Compares every public [`StagedRdpState`] accessor rather than the
+    /// struct itself: `StagedRdpState` also carries the per-decode
+    /// `QueueIdentity`/`transaction_sequence` bookkeeping, which the
+    /// fixture's `decode` helper advances on each call and which has
+    /// nothing to do with the commands in the stream.
+    fn assert_same_staged_state(left: &StagedRdpState, right: &StagedRdpState) {
+        assert_eq!(left.other_mode(), right.other_mode());
+        assert_eq!(left.color_image(), right.color_image());
+        assert_eq!(left.fill_color(), right.fill_color());
+        assert_eq!(left.env_color(), right.env_color());
+        assert_eq!(left.prim_color(), right.prim_color());
+        assert_eq!(left.blend_color(), right.blend_color());
+        assert_eq!(left.fog_color(), right.fog_color());
+        assert_eq!(left.prim_depth(), right.prim_depth());
+        assert_eq!(left.combine(), right.combine());
+        assert_eq!(left.tmem(), right.tmem());
+    }
+
+    #[test]
+    fn set_scissor_stages_nothing_into_the_rdp_state() {
+        // The core no-pixel-change guarantee at the decode layer: a stream
+        // whose only command is SetScissor must leave every staged slot
+        // exactly as a stream carrying only a no-op leaves it. Nothing in
+        // `RdpState` can name a scissor, so nothing downstream can read one.
+        let noop_only = decode(vec![word(0, 0x00, 0), 0]).unwrap();
+        let scissored = decode(set_scissor_words(0, 1, 0x0a0, 0x0b0, 0x0c0, 0x0d0)).unwrap();
+        assert_same_staged_state(scissored.staged_state(), noop_only.staged_state());
+    }
+
+    #[test]
+    fn set_scissor_interleaved_between_state_commands_changes_no_staged_value() {
+        // Same guarantee against a realistic stream: dropping SetScissor
+        // commands in between real state commands must leave every staged
+        // slot exactly as the scissor-free stream produced it.
+        let prefix = 0xc0;
+        let without = decode(state_words(prefix)).unwrap();
+
+        let mut with_words = Vec::new();
+        with_words.extend(set_scissor_words(prefix, 0, 0, 0, 320 * 4, 240 * 4));
+        with_words.extend(state_words(prefix));
+        with_words.extend(set_scissor_words(prefix, 1, 16, 16, 300 * 4, 220 * 4));
+        let with = decode(with_words).unwrap();
+
+        assert_same_staged_state(with.staged_state(), without.staged_state());
+        // ...and the scissor commands are genuinely present, so the
+        // equality above is not vacuous.
+        assert_eq!(
+            with.commands().len(),
+            without.commands().len() + 2,
+            "both SetScissor commands must have been admitted"
+        );
+        // The non-scissor commands must also be unchanged, in order.
+        let with_kinds: Vec<_> = with
+            .commands()
+            .iter()
+            .map(|command| command.kind())
+            .filter(|kind| !matches!(kind, RawDpcCommandKind::SetScissor(_)))
+            .collect();
+        let without_kinds: Vec<_> = without
+            .commands()
+            .iter()
+            .map(|command| command.kind())
+            .collect();
+        assert_eq!(with_kinds, without_kinds);
     }
 
     #[test]
