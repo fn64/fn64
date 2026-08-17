@@ -15,7 +15,7 @@ python3 tools/rt64_port_inventory.py --check --oracle-dir /absolute/path/to/clea
 - Primary semantic port input: [`5473732`](https://github.com/rt64/rt64/commit/5473732a822a4423b5696e7cb18fecc425a59875) (`reviewed-not-runtime-qualified`).
 - Denominator: 276 project-owned or explicitly authority-gated host/shader files; `48.065` KLOC at the primary port pin.
 - Port delta: 0 added, 0 removed, 6 modified, 270 unchanged source files.
-- Port state: 107 `ported`, 158 `not-started`, 11 `authority-gated` (of 276).
+- Port state: 108 `ported`, 157 `not-started`, 11 `authority-gated` (of 276).
 - Source-set SHA-256: `86704d407a71722233e71938b8517d647b38b6d2ff71d1702cc7c5e5c0232c8b`.
 - Excluded: all other `src/contrib/**` and `src/tools/**`. `src/tools/texture_hasher` and its GLIDEN64/Rice lineage, GPL `src/contrib/mupen64plus-core`, and m2c are never read as port authority.
 - Paths are repository-relative; the checked artifact rejects machine-local paths.
@@ -299,7 +299,7 @@ Each row is one source-bound candidate card with its mechanically derived port s
 | `src/shared/rt64_frame_params.h` | `unchanged` | `not-started` | -- | 19 | 1 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-frame-params-h` |
 | `src/shared/rt64_framebuffer_params.h` | `unchanged` | `not-started` | -- | 19 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-framebuffer-params-h` |
 | `src/shared/rt64_gpu_tile.h` | `unchanged` | `not-started` | -- | 64 | 7 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-gpu-tile-h` |
-| `src/shared/rt64_hlsl.h` | `unchanged` | `not-started` | -- | 278 | 34 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-hlsl-h` |
+| `src/shared/rt64_hlsl.h` | `unchanged` | `ported` | `crates/fn64-render-wgpu/src/rt64_hlsl_interop.rs` | 278 | 34 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-hlsl-h` |
 | `src/shared/rt64_hlsl_json.cpp` | `unchanged` | `not-started` | -- | 28 | 2 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-hlsl-json-cpp` |
 | `src/shared/rt64_hlsl_json.h` | `unchanged` | `not-started` | -- | 18 | 0 | 1 | `M1` / `semantic-ir` | `source-digests-verified` | `not-run` / `candidate-observation` | `semantic-frontend` (F/xhigh) | `rt64-port-m1-src-shared-rt64-hlsl-json-h` |
 | `src/shared/rt64_interleaved_raster.h` | `unchanged` | `not-started` | -- | 18 | 1 | 1 | `M4` / `rdp-framebuffer` | `source-digests-verified` | `not-run` / `candidate-observation` | `gpu-render` (I/high) | `rt64-port-m4-src-shared-rt64-interleaved-raster-h` |
