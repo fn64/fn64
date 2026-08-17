@@ -865,6 +865,22 @@ impl TmemTransferWord {
         }
     }
 
+    /// Test-only escape hatch that rewrites both defined-byte masks after
+    /// construction, bypassing [`TmemTransferWord::new`]'s `debug_assert!`
+    /// invariant checks. Exists solely so `tmem::physical`'s hostile tests can
+    /// build an invariant-violating word under a debug build and assert that
+    /// the release-surviving `physical_defined_lane_mask` check rejects it.
+    /// Never compiled into a non-test build.
+    #[cfg(test)]
+    pub(crate) fn forge_masks_for_test(
+        &mut self,
+        defined_source_byte_mask: u8,
+        defined_destination_byte_mask: u8,
+    ) {
+        self.defined_source_byte_mask = defined_source_byte_mask;
+        self.defined_destination_byte_mask = defined_destination_byte_mask;
+    }
+
     pub const fn index(self) -> u16 {
         self.index
     }
