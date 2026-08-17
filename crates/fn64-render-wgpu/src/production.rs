@@ -13,11 +13,20 @@
 //! authority-scoped `execution_view` (never a bare ticket), and publishes
 //! through exactly `self.coordinator.prepare_publication(publication).commit()`.
 //!
-//! Scope, matching card v11 and the T3 ticket DAG exactly: TMEM-only,
-//! no-FullSync, no-guest-write raw-DPC execution/publication. No ABI/T4
-//! ingress, no visible presentation, no raster parity, no native GPU. This
-//! backend's `process_task`/`present` are honest, named rejections -- this
-//! slice proves the raw-DPC production seam, not general gfx-task execution.
+//! Scope: TMEM loads, admitted state/triangle commands, and fill-cycle
+//! `FillRectangle` color-target writes; no FullSync. No ABI/T4 ingress, no
+//! visible presentation, no raster parity, no native GPU. This backend's
+//! `process_task`/`present` are honest, named rejections -- this slice
+//! proves the raw-DPC production seam, not general gfx-task execution.
+//!
+//! **Guest-write nonclaim.** An admitted `FillRectangle` declares
+//! guest-visible `RenderTarget` *journal* writes and commits them through
+//! `RawDpcAbiSession::commit_guest_render_target_writes`. Nothing in that
+//! chain modifies guest RDRAM: `execute_fill_rectangle` produces an owned
+//! `Vec<u8>`, `ResidentPublication::publish` writes into a backend-local
+//! `Vec`, and a `CompletedWrite` is a range plus a content digest, not
+//! bytes in motion. The RDRAM copyback is a separate, deferred slice, and
+//! no code here may be described as "publishing to guest memory".
 
 use fn64_render::{
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome, ExactRawDpcPlanVisitor,
@@ -36,13 +45,15 @@ use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 use crate::tmem::{project_committed_tmem, TileBindingParams};
 use crate::{
-    AlphaCompare, BlendColorInput, BlendModeState, Color4, CombineParams, HeadlessBackend,
+    execute_fill_rectangle, AlphaCompare, BlendColorInput, BlendModeState, Color4,
+    ColorTargetExtent, ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CombineParams,
+    FillColor, FillExecutionError, FillRectangle, HeadlessBackend, InitializedCandidateColorTarget,
     MissingTriangleDrawState, OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction,
     PhysicalTmemState, PrimColor, RawDpcDecodeError, RdpState, ResolvedBlendCycle,
-    RetrievedTriangleDraw, TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput,
-    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
-    TriangleRasterParams, TriangleTargetExtent, UninitializedTrianglePipeline,
-    TMEM_SAMPLE_STATUS_OK,
+    RetrievedTriangleDraw, TargetError, TmemLoadSourceIdentity, TmemTransferWord,
+    TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
+    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
@@ -76,6 +87,73 @@ pub struct WgpuBackend {
     /// failed draw leaves the prior value untouched. Never an accumulated
     /// history, never a persistent framebuffer.
     triangle_draw_output: Option<TriangleDrawOutput>,
+    /// The host-configured framebuffer extent from the most recent
+    /// `RenderBackend::create` call, recorded *before* the GPU device
+    /// request rather than inside its success branch.
+    ///
+    /// This is the only color-image height source this backend has: the
+    /// RDP's `SetColorImage` carries `format`/`size`/`width`/`address` and
+    /// **no height** field (`crate::ColorImage`), so an admitted
+    /// `FillRectangle`'s `ColorTargetKey` must take its height from here.
+    /// Deliberately separate from `triangle_target_extent` (which is only
+    /// populated on GPU-device success): a `FillRectangle` is executed
+    /// entirely CPU-side and has no adapter dependency, so gating fill
+    /// admission on a real GPU would make an adapterless host silently
+    /// unable to execute a command it is fully capable of executing.
+    ///
+    /// Honest nonclaim: this is a *host-configured* height, not a
+    /// wire-decoded one. The RDP never states a color image's height, so a
+    /// stream setting an offscreen color image of a different height would
+    /// derive a `ColorTargetKey` whose range is wrong. That mismatch
+    /// surfaces loudly (`RectangleOutOfBounds` from
+    /// `CandidateColorTarget::plan_rows`, or `AliasedResidentTarget`), never
+    /// as a silently mis-sized publish.
+    configured_target_extent: Option<TriangleTargetExtent>,
+    /// `None` until the first admitted `FillRectangle` reaches
+    /// `execute_raw_dpc_inner`. Built there, from that capture's own
+    /// `PhysicalMemoryLayout` -- neither `try_new` nor `create` has a layout
+    /// to build it from (`RenderConfig` carries a pixel extent, not an RDRAM
+    /// byte size), and inventing one would be a fabricated fact. A later
+    /// capture whose layout differs is rejected loudly by
+    /// `ColorTargetRegistry::begin_candidate`'s existing
+    /// `MemoryLayoutMismatch` check, never by silently rebuilding the
+    /// registry and dropping every resident generation.
+    color_targets: Option<ColorTargetRegistry>,
+    /// Set by `execute_raw_dpc_inner` when a fill staged an
+    /// `InitializedCandidateColorTarget`; redeemed by `publish_raw_dpc`.
+    /// See [`PendingFillPublication`].
+    pending_fill_publication: Option<PendingFillPublication>,
+}
+
+/// Capacity rationale: 4 is the fixed bounded ceiling for concurrently
+/// resident color targets in this slice (a color image, a Z-adjacent second
+/// target, and two generations of churn headroom). It is a scope bound, not
+/// a measured hardware limit -- `TargetError::RegistryFull` is the loud
+/// rejection if a real stream exceeds it, never eviction.
+const COLOR_TARGET_REGISTRY_CAPACITY: usize = 4;
+
+/// One admitted color-target write, staged and validated during
+/// `execute_raw_dpc` but deliberately **not yet published** into the
+/// registry. Keyed by the submission it belongs to so `publish_raw_dpc` can
+/// prove the capsule it is about to publish is the same submission that
+/// staged this write -- never "whatever fill was staged last".
+///
+/// Why a deferred token rather than a held `ResidentPublication`: that type
+/// exclusively borrows the registry, and the guest-commit call it would have
+/// to be held across happens in `fn64-abi`, which reaches this backend only
+/// through a `RefCell<Option<Box<dyn RenderBackend>>>` in a `with` block
+/// that has already returned by then. A borrow cannot survive that; a token
+/// can.
+///
+/// The staged guest writes live here alongside the
+/// `InitializedCandidateColorTarget` so the token carries both halves of the
+/// same staged fact and they cannot drift.
+struct PendingFillPublication {
+    submission: fn64_render_ir::SubmissionIdentity,
+    initialized: InitializedCandidateColorTarget,
+    /// The exact N `CompletedWrite`s this fill contributed to the
+    /// submission's `BackendEffectReport`, in journal order.
+    guest_writes: Vec<CompletedWrite>,
 }
 
 /// Failure constructing a fresh [`WgpuBackend`]. Both sources are the T0
@@ -123,6 +201,9 @@ impl WgpuBackend {
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
+                configured_target_extent: None,
+                color_targets: None,
+                pending_fill_publication: None,
             },
             session,
         ))
@@ -139,6 +220,22 @@ impl WgpuBackend {
     /// tests; advances only through a successful `plan_raw_dpc` call.
     pub fn rdp_state(&self) -> &RdpState {
         &self.rdp_state
+    }
+
+    /// The resident color targets this backend has published, or `None` if
+    /// no admitted `FillRectangle` has ever reached execution (the registry
+    /// is built lazily, from the first admitted fill's own capture layout).
+    /// Exposed for diagnostics and tests, mirroring `physical_tmem()`'s own
+    /// convention on this struct.
+    pub fn color_targets(&self) -> Option<&ColorTargetRegistry> {
+        self.color_targets.as_ref()
+    }
+
+    /// Whether a staged-but-unpublished fill token is currently held.
+    /// Exposed for the nonmutation tests, which must be able to prove a
+    /// rejected fill left no token behind.
+    pub fn has_pending_fill_publication(&self) -> bool {
+        self.pending_fill_publication.is_some()
     }
 
     /// `RenderBackend::create`'s body: block once, synchronously, on
@@ -164,6 +261,15 @@ impl WgpuBackend {
     /// triangle draw knows what render-target size to use without `cfg`
     /// being threaded through every call.
     pub(crate) fn create_inner(&mut self, cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
+        // Recorded before the device request, unlike `triangle_target_extent`
+        // below: an admitted `FillRectangle` is executed entirely CPU-side
+        // and needs only this host-configured height, so a host with no GPU
+        // adapter must still be able to execute one. See
+        // `configured_target_extent`'s own doc for the nonclaim this carries.
+        self.configured_target_extent = Some(TriangleTargetExtent {
+            width: cfg.width,
+            height: cfg.height,
+        });
         let outcome = pollster::block_on(
             UninitializedTrianglePipeline::new(HeadlessBackend::default()).request(),
         )
@@ -493,6 +599,13 @@ struct PlanCollector {
     /// silent default, matching `TriangleDrawStateCollector`'s own
     /// documented absence handling.
     triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+    /// One entry per admitted `FillRectangle` command, in plan order,
+    /// paired with its own decode-order command index. Unlike `triangles`,
+    /// no draw-state snapshot is taken here: a fill carries its own
+    /// `color_image`/`fill_color` on the command itself (see
+    /// `RdpFillRectangleCommand`), so nothing needs to be tracked across
+    /// the walk for it.
+    fills: Vec<(u32, fn64_render::RdpFillRectangleCommand)>,
 }
 
 impl PlanCollector {
@@ -526,6 +639,7 @@ impl PlanCollector {
             current_prim_color: prim_color,
             current_fog_color: fog_color,
             triangles: Vec::new(),
+            fills: Vec::new(),
         }
     }
 }
@@ -633,6 +747,13 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 })();
                 self.triangles.push(snapshot);
             }
+            // Mandatory alongside `push_fill_rectangle`'s admission: the
+            // enum is `#[non_exhaustive]`, so a produced variant with no arm
+            // here falls into the catch-all below and panics at execute time
+            // rather than failing to compile.
+            RawDpcSemanticCommandRef::FillRectangle(fill) => {
+                self.fills.push((command_index, fill.clone()));
+            }
             other => unreachable!(
                 "RawDpcSemanticCommandRef gained a variant WgpuBackend does not know about: \
                  {other:?}"
@@ -665,6 +786,18 @@ struct ExecutionCollector<'coord> {
     plan: PlanCollector,
     reads: Vec<(u32, Vec<u8>)>,
     outcome: Option<Result<StagedOutcome, WgpuRawDpcExecutionError>>,
+    /// The lazily-built color-target registry, borrowed for the duration of
+    /// this execution so `stage_and_report` can `begin_candidate` against it
+    /// and read a resident's prior device bytes. Only *read* here: the
+    /// registry is never mutated during execution, which is exactly what
+    /// makes the publication deferral honest (see
+    /// [`PendingFillPublication`]).
+    color_targets: &'coord mut Option<ColorTargetRegistry>,
+    /// The host-configured framebuffer extent, this backend's only
+    /// color-image height source. `None` before any
+    /// `RenderBackend::create`, which rejects an admitted fill loudly with
+    /// `NoColorTargetHeight` rather than inventing a height.
+    configured_target_extent: Option<TriangleTargetExtent>,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -682,6 +815,27 @@ struct ExecutionCollector<'coord> {
 enum StagedOutcome {
     TmemLoads(BackendEffectReport, PhysicalTmemState),
     TriangleOnly,
+    /// This plan staged at least one guest-visible color-target write and
+    /// completed zero TMEM loads. Structurally distinct from both siblings:
+    /// unlike `TriangleOnly` it carries a nonempty `BackendEffectReport` (so
+    /// `complete_execution_preserving_physical`, which builds its own empty
+    /// one, is not a legal destination), and unlike `TmemLoads` it offers no
+    /// `PhysicalTmemState` successor -- a color-target write does not touch
+    /// physical TMEM at all.
+    ///
+    /// Carries the staged fill token out of `stage_and_report` so
+    /// `execute_raw_dpc_inner` can hand it to the backend only after the
+    /// coordinator accepted the completion.
+    GuestWritesOnly(BackendEffectReport, StagedFill),
+}
+
+/// One fill's execution result, staged inside `stage_and_report` and moved
+/// out through [`StagedOutcome::GuestWritesOnly`]. Becomes a
+/// [`PendingFillPublication`] once `execute_raw_dpc_inner` knows which
+/// submission it belongs to and the coordinator has accepted the completion.
+struct StagedFill {
+    initialized: InitializedCandidateColorTarget,
+    guest_writes: Vec<CompletedWrite>,
 }
 
 impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
@@ -772,6 +926,41 @@ pub enum WgpuRawDpcExecutionError {
     BlendRequiresFramebuffer {
         triangle_index: usize,
     },
+    /// An admitted `FillRectangle` reached execution with no prior
+    /// `RenderBackend::create` call, so this backend has no color-image
+    /// height at all. The RDP's `SetColorImage` carries no height field, and
+    /// inventing one would fabricate the target's identity and byte range --
+    /// rejected loudly instead.
+    NoColorTargetHeight,
+    /// The registry, candidate, or executor rejected an admitted fill.
+    Target(TargetError),
+    /// The fill executor itself rejected the rectangle -- non-Fill cycle, a
+    /// Z/framebuffer-consumer bypass hazard, a fractional edge, or missing
+    /// resident bytes.
+    FillExecution(FillExecutionError),
+    /// A recorded fill access span could not be bound back to the plan's own
+    /// ordered access list.
+    FillAccessSpan(crate::raw_dpc::FillAccessSpanError),
+    /// One of an admitted fill's declared accesses was not an RDRAM region,
+    /// so no byte range could be sliced for it. A fill access is always an
+    /// RDRAM `ColorFramebuffer` region by construction; this is the loud
+    /// rejection if the plan and the executor ever disagree.
+    FillAccessRegionKind {
+        access_index: u32,
+    },
+    /// One of an admitted fill's declared accesses named a byte range that
+    /// is not a subrange of its own color target's full extent, so no
+    /// device-byte slice corresponds to it.
+    FillAccessOutsideTarget {
+        access_index: u32,
+    },
+    /// This packet declared both TMEM loads and an admitted
+    /// `FillRectangle`. The merged `BackendEffectReport` write list would
+    /// have to interleave both sources in the plan's own journal order, and
+    /// no in-tree fixture produces such a stream today -- so rather than
+    /// ship an untested merge, this slice rejects the combination loudly.
+    /// Admitting it is a follow-on slice, not a silent reorder.
+    MixedFillAndTmemLoadPacket,
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -811,7 +1000,46 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                  the framebuffer alpha (coverage count); this crate does not yet implement \
                  framebuffer-alpha-dependent blending"
             ),
+            Self::NoColorTargetHeight => formatter.write_str(
+                "an admitted FillRectangle reached execution before any RenderBackend::create \
+                 call, so this backend has no color-image height; the RDP's SetColorImage \
+                 carries no height field and one is never invented",
+            ),
+            Self::Target(error) => write!(formatter, "color target rejected the fill: {error}"),
+            Self::FillExecution(error) => {
+                write!(formatter, "fill executor rejected the rectangle: {error}")
+            }
+            Self::FillAccessSpan(error) => {
+                write!(formatter, "fill access span did not bind: {error}")
+            }
+            Self::FillAccessRegionKind { access_index } => write!(
+                formatter,
+                "FillRectangle access #{access_index} is not an RDRAM region, so no device-byte \
+                 slice corresponds to it"
+            ),
+            Self::FillAccessOutsideTarget { access_index } => write!(
+                formatter,
+                "FillRectangle access #{access_index} names a range outside its own color \
+                 target's full extent"
+            ),
+            Self::MixedFillAndTmemLoadPacket => formatter.write_str(
+                "this packet declares both TMEM loads and an admitted FillRectangle; merging \
+                 both write sources into the plan's own journal order is a follow-on slice, \
+                 rejected loudly here rather than reordered silently",
+            ),
         }
+    }
+}
+
+impl From<TargetError> for WgpuRawDpcExecutionError {
+    fn from(error: TargetError) -> Self {
+        Self::Target(error)
+    }
+}
+
+impl From<FillExecutionError> for WgpuRawDpcExecutionError {
+    fn from(error: FillExecutionError) -> Self {
+        Self::FillExecution(error)
     }
 }
 
@@ -957,8 +1185,12 @@ impl RenderBackend for WgpuBackend {
         &[]
     }
 
+    /// Returned unconditionally, never varying with whether a fill has yet
+    /// been admitted: a capability is a statement about what this backend
+    /// *will* admit, not about what it has admitted, and a value that
+    /// changes under the caller is worse than a wider constant one.
     fn raw_dpc_ir_capability(&self) -> RawDpcIrCapability {
-        RawDpcIrCapability::TransactionalTmemNoFullSync
+        RawDpcIrCapability::TransactionalTmemFillNoFullSync
     }
 
     fn plan_raw_dpc(
@@ -978,7 +1210,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        let (prepared, triangles) = execute_raw_dpc_inner(
+        let (prepared, triangles, pending) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
             self.rdp_state.other_mode(),
@@ -987,8 +1219,18 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.env_color(),
             self.rdp_state.prim_color(),
             self.rdp_state.fog_color(),
+            &mut self.color_targets,
+            self.configured_target_extent,
         )
         .map_err(RenderError::from)?;
+
+        // Replaced, not merged: a token still held from an earlier
+        // submission was never redeemed, and carrying it forward would let
+        // a later `publish_raw_dpc` publish a fill that belongs to a
+        // submission that already retired. Dropping it leaves the registry
+        // at its prior generation, which is the correct "nothing published"
+        // outcome.
+        self.pending_fill_publication = pending;
 
         if !triangles.is_empty() {
             self.draw_admitted_triangles(triangles)
@@ -998,11 +1240,63 @@ impl RenderBackend for WgpuBackend {
         Ok(prepared)
     }
 
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<CompletedWrite> {
+        // A submission mismatch deliberately yields an EMPTY list rather
+        // than a panic or the wrong fill's writes: the caller then takes the
+        // zero-write commit branch, which fails loudly with
+        // `EffectCountMismatch` against the packet's own nonempty
+        // guest-write journal. A loud rejection, never a quiet wrong publish.
+        self.pending_fill_publication
+            .as_ref()
+            .filter(|pending| pending.submission == submission)
+            .map(|pending| pending.guest_writes.clone())
+            .unwrap_or_default()
+    }
+
     fn publish_raw_dpc(
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
     ) -> CommittedRawDpcOutcome {
-        self.coordinator.prepare_publication(publication).commit()
+        // Taken unconditionally: a stale token from an earlier submission
+        // must never survive into a later one. Its
+        // `InitializedCandidateColorTarget` is simply dropped, leaving the
+        // registry at its prior generation -- the loud-rejection policy's
+        // "nothing published" outcome, reached by construction rather than
+        // by a rollback step.
+        let pending = self.pending_fill_publication.take();
+        let submission = publication.submission();
+        // Published after `commit()`, deliberately: `ReadyPublication::commit`
+        // is the documented straight-line, infallible body, and
+        // `prepare_publication` has already asserted every queue/submission/
+        // retirement identity fact. Advancing the registry only after that
+        // means a resident generation exists only for a submission that
+        // genuinely reached `Published`. The one residual window is a panic
+        // between the two; on that path the process is already unwinding and
+        // the token has been taken, so the registry stays at its prior
+        // generation -- the correct outcome, not a leak.
+        let outcome = self.coordinator.prepare_publication(publication).commit();
+
+        if let Some(pending) = pending {
+            assert_eq!(
+                pending.submission, submission,
+                "publish_raw_dpc received a capsule for a different submission than the one \
+                 execute_raw_dpc staged a color-target write for"
+            );
+            let registry = self
+                .color_targets
+                .as_mut()
+                .expect("a staged fill publication implies the registry was built");
+            registry
+                .prepare_publication(pending.initialized)
+                .unwrap_or_else(|error| {
+                    panic!("color-target publication rejected after guest commit: {error}")
+                })
+                .publish();
+        }
+        outcome
     }
 }
 
@@ -1268,10 +1562,13 @@ fn execute_raw_dpc_inner(
     durable_env_color: Option<Color4>,
     durable_prim_color: Option<PrimColor>,
     durable_fog_color: Option<Color4>,
+    color_targets: &mut Option<ColorTargetRegistry>,
+    configured_target_extent: Option<TriangleTargetExtent>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
         Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+        Option<PendingFillPublication>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -1298,14 +1595,18 @@ fn execute_raw_dpc_inner(
         ),
         reads: Vec::new(),
         outcome: None,
+        color_targets,
+        configured_target_extent,
     };
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
 
+    let submission = bound.submission();
     let outcome = view
         .outcome
         .expect("execution_view always calls submitted_packet exactly once")?;
     let triangles = view.plan.triangles;
+    let mut pending = None;
 
     let prepared = match outcome {
         StagedOutcome::TmemLoads(effects, next_physical) => coordinator
@@ -1326,9 +1627,31 @@ fn execute_raw_dpc_inner(
         StagedOutcome::TriangleOnly => coordinator
             .complete_execution_preserving_physical(bound)
             .map_err(WgpuRawDpcExecutionError::Coordinator)?,
+        // A fill-only plan: real guest-visible writes, no physical-TMEM
+        // successor. `complete_execution_preserving_physical` is not a legal
+        // destination -- it builds its own *empty* effect report and would
+        // reject this packet's nonempty write journal -- and
+        // `complete_execution` has no `PhysicalTmemState` successor to
+        // offer, because a color-target write never touches physical TMEM.
+        //
+        // The staged token is only recorded *after* the coordinator accepts
+        // the completion: a rejected completion must leave
+        // `pending_fill_publication` untouched, so a later `publish_raw_dpc`
+        // can never redeem a fill whose submission never completed.
+        StagedOutcome::GuestWritesOnly(effects, staged) => {
+            let prepared = coordinator
+                .complete_execution_preserving_physical_with_effects(bound, effects)
+                .map_err(WgpuRawDpcExecutionError::Coordinator)?;
+            pending = Some(PendingFillPublication {
+                submission,
+                initialized: staged.initialized,
+                guest_writes: staged.guest_writes,
+            });
+            prepared
+        }
     };
 
-    Ok((prepared, triangles))
+    Ok((prepared, triangles, pending))
 }
 
 /// The pipeline `submitted_packet` runs once `&WorkloadPacket` is in scope:
@@ -1342,9 +1665,20 @@ fn execute_raw_dpc_inner(
 /// plan has zero TMEM loads but at least one admitted triangle (§1c) --
 /// still `NoCompletedLoads` when the plan has neither.
 fn stage_and_report(
-    collector: &ExecutionCollector<'_>,
+    collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
+    // Mixed TMEM-load-plus-fill packets are rejected before either source
+    // stages anything: merging both write lists into the plan's own
+    // journal-ordered write-access sequence is a follow-on slice, and
+    // shipping an untested merge would be worse than a loud, named refusal.
+    if !collector.plan.fills.is_empty() && !collector.plan.loads.is_empty() {
+        return Err(WgpuRawDpcExecutionError::MixedFillAndTmemLoadPacket);
+    }
+    if !collector.plan.fills.is_empty() {
+        return stage_fills_and_report(collector, packet);
+    }
+
     let source = TmemLoadSourceIdentity::new(
         packet.identity(),
         packet.journal().identity(),
@@ -1434,6 +1768,211 @@ fn stage_and_report(
         .map_err(WgpuRawDpcExecutionError::Physical)?;
 
     Ok(StagedOutcome::TmemLoads(effects, next_physical))
+}
+
+/// Executes every admitted `FillRectangle` this plan carried and reports
+/// the exact ordered `CompletedWrite` list they contributed, **without**
+/// mutating the color-target registry.
+///
+/// The registry is read (to find a resident predecessor's prior device
+/// bytes) and, on the first admitted fill ever, built -- but no resident is
+/// added or replaced here. Publication is deferred to `publish_raw_dpc`,
+/// behind the submission-keyed [`PendingFillPublication`] token, because
+/// the guest commit that must precede it happens in `fn64-abi` after this
+/// call has already returned and released its borrow.
+///
+/// Exactly one fill per packet is admitted in this slice: a second fill
+/// would need its own candidate against a registry the first has not
+/// published into yet, so its `predecessor` would be stale by construction.
+/// That is a loud rejection, not a silent overwrite.
+///
+/// Nonclaim: nothing here writes guest RDRAM. `execute_fill_rectangle`
+/// produces an owned `Vec<u8>`, and the `CompletedWrite`s are ranges plus
+/// content digests, not bytes in motion.
+fn stage_fills_and_report(
+    collector: &mut ExecutionCollector<'_>,
+    packet: &WorkloadPacket,
+) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
+    if collector.plan.fills.len() > 1 {
+        return Err(WgpuRawDpcExecutionError::MixedFillAndTmemLoadPacket);
+    }
+    let (_, fill) = collector.plan.fills[0].clone();
+
+    // The `OtherMode` current at this fill's own stream position, tracked by
+    // `PlanCollector`'s walk exactly the way a triangle's is. `plan_fill`
+    // already refused to admit a fill without a staged fill-cycle
+    // `OtherMode`, so `None` here would mean the plan and the walk
+    // disagree -- rejected loudly, never defaulted to wire zero (which
+    // decodes as Fill cycle with no hazard bits and would silently execute
+    // a rectangle the RDP never asked for).
+    let Some(other_mode) = collector.plan.current_other_mode else {
+        return Err(WgpuRawDpcExecutionError::FillExecution(
+            FillExecutionError::NotFillCycle,
+        ));
+    };
+
+    let Some(extent) = collector.configured_target_extent else {
+        return Err(WgpuRawDpcExecutionError::NoColorTargetHeight);
+    };
+
+    let format = ColorTargetFormat::try_from_rdp(
+        image_format(fill.color_image.format),
+        pixel_size(fill.color_image.size),
+    )?;
+    let key = ColorTargetKey::try_new(
+        fill.color_image.address,
+        ColorTargetExtent::try_new(fill.color_image.width, extent.height)?,
+        format,
+    )?;
+
+    // Built lazily, from this capture's own layout: neither `try_new` nor
+    // `create` has one to build it from, and inventing one would be a
+    // fabricated fact. A later capture whose layout differs is rejected by
+    // `begin_candidate`'s own `MemoryLayoutMismatch` check below, never by
+    // silently rebuilding and dropping every resident generation.
+    if collector.color_targets.is_none() {
+        *collector.color_targets = Some(ColorTargetRegistry::try_new(
+            packet.memory_layout(),
+            COLOR_TARGET_REGISTRY_CAPACITY,
+        )?);
+    }
+    let registry = collector
+        .color_targets
+        .as_mut()
+        .expect("just populated above");
+
+    let candidate = registry.begin_candidate(key)?;
+    let resident_bytes = registry
+        .residents()
+        .iter()
+        .find(|resident| resident.key() == key)
+        .map(|resident| resident.device_bytes().device_bytes());
+
+    let completed = execute_fill_rectangle(
+        &candidate,
+        other_mode,
+        FillColor::from_wire(fill.fill_color.value),
+        FillRectangle::from_wire_fields(
+            fill.upper_left_x,
+            fill.upper_left_y,
+            fill.lower_right_x,
+            fill.lower_right_y,
+        ),
+        resident_bytes,
+    )?;
+
+    let accesses = fill_accesses(&collector.plan.accesses, &fill)?;
+    let guest_writes = fill_completed_writes(key, completed.device_bytes(), accesses)?;
+    let initialized = candidate.admit_completed_initialization(completed)?;
+
+    let effects = BackendEffectReport::try_new(packet, guest_writes.clone())
+        .map_err(WgpuRawDpcExecutionError::Effect)?;
+
+    Ok(StagedOutcome::GuestWritesOnly(
+        effects,
+        StagedFill {
+            initialized,
+            guest_writes,
+        },
+    ))
+}
+
+/// This fill's own declared access run, located by the
+/// `first_access_index`/`access_count` span the decoder recorded when it
+/// pushed them -- never re-derived from the rectangle's geometry, which
+/// would be a second independent derivation of the same fact.
+fn fill_accesses<'plan>(
+    accesses: &'plan [ResourceAccess],
+    fill: &fn64_render::RdpFillRectangleCommand,
+) -> Result<&'plan [ResourceAccess], WgpuRawDpcExecutionError> {
+    let start = fill.first_access_index as usize;
+    let end = start.checked_add(fill.access_count as usize).ok_or(
+        WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+            access_index: fill.first_access_index,
+        },
+    )?;
+    accesses
+        .get(start..end)
+        .filter(|slice| !slice.is_empty())
+        .ok_or(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+            access_index: fill.first_access_index,
+        })
+}
+
+/// Derives the exact ordered `CompletedWrite` list for one admitted
+/// FillRectangle, one per `ResourceAccess` the decoder declared for it.
+///
+/// Each write's `byte_count` is its own access's
+/// `region().declared_bytes()` and its `content` digest covers exactly those
+/// bytes, sliced out of the full-extent `DeviceColorBytes` the executor
+/// produced. Deliberately **not** one digest over the whole buffer: a
+/// `CompletedWrite` claims "these declared_bytes at this range now hold
+/// content with this digest", and hashing bytes outside the declared range
+/// would make the claim unfalsifiable for the range it names while silently
+/// importing untouched inter-row bytes into the hash of a range that does
+/// not contain them.
+///
+/// The full-extent buffer is the *source*; each per-row access's own
+/// declared span is the *unit*. Those are two different invariants -- the
+/// registry needs a complete byte buffer for the resident generation, the
+/// journal needs exactly the bytes the fill claims -- and this function is
+/// where they are correctly decoupled.
+fn fill_completed_writes(
+    key: ColorTargetKey,
+    device_bytes: &crate::DeviceColorBytes,
+    accesses: &[ResourceAccess],
+) -> Result<Vec<CompletedWrite>, WgpuRawDpcExecutionError> {
+    let base = key.address().get();
+    let buffer = device_bytes.device_bytes();
+    accesses
+        .iter()
+        .map(|access| {
+            let range = match access.region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => range,
+                _ => {
+                    return Err(WgpuRawDpcExecutionError::FillAccessRegionKind {
+                        access_index: access.operation().get(),
+                    })
+                }
+            };
+            // Physical -> buffer-relative. The access range is a subrange of
+            // the target's own range by construction (both derive from the
+            // same `SetColorImage` address/width), but that is re-checked
+            // here rather than assumed.
+            let start = range.start().get().checked_sub(base).ok_or(
+                WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                    access_index: access.operation().get(),
+                },
+            )? as usize;
+            let len = range.len() as usize;
+            let slice = start
+                .checked_add(len)
+                .and_then(|end| buffer.get(start..end))
+                .ok_or(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                    access_index: access.operation().get(),
+                })?;
+            CompletedWrite::try_from_bytes(*access, slice).map_err(WgpuRawDpcExecutionError::Effect)
+        })
+        .collect()
+}
+
+fn image_format(format: fn64_render::NeutralImageFormat) -> crate::ImageFormat {
+    match format {
+        fn64_render::NeutralImageFormat::Rgba => crate::ImageFormat::Rgba,
+        fn64_render::NeutralImageFormat::Yuv => crate::ImageFormat::Yuv,
+        fn64_render::NeutralImageFormat::ColorIndex => crate::ImageFormat::ColorIndex,
+        fn64_render::NeutralImageFormat::IntensityAlpha => crate::ImageFormat::IntensityAlpha,
+        fn64_render::NeutralImageFormat::Intensity => crate::ImageFormat::Intensity,
+    }
+}
+
+fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
+    match size {
+        fn64_render::NeutralPixelSize::Bits4 => crate::PixelSize::Bits4,
+        fn64_render::NeutralPixelSize::Bits8 => crate::PixelSize::Bits8,
+        fn64_render::NeutralPixelSize::Bits16 => crate::PixelSize::Bits16,
+        fn64_render::NeutralPixelSize::Bits32 => crate::PixelSize::Bits32,
+    }
 }
 
 #[cfg(test)]
@@ -3389,16 +3928,23 @@ mod tests {
         );
     }
 
-    /// Positive: `raw_dpc_ir_capability` reports the real v11 TMEM-only
-    /// capability, not the trait's `Unsupported` default -- a caller must
-    /// be able to tell this backend apart from a non-raw-DPC-capable one
-    /// without attempting a submission.
+    /// Positive: `raw_dpc_ir_capability` reports the real TMEM-plus-fill
+    /// capability, not the trait's `Unsupported` default and not the older
+    /// TMEM-only value -- a caller must be able to tell this backend apart
+    /// both from a non-raw-DPC-capable one and from one that admits no
+    /// guest-visible write at all, without attempting a submission.
     #[test]
-    fn raw_dpc_ir_capability_reports_transactional_tmem_no_full_sync() {
+    fn raw_dpc_ir_capability_reports_transactional_tmem_fill_no_full_sync() {
         let (backend, _session) = WgpuBackend::try_new().unwrap();
         assert_eq!(
             backend.raw_dpc_ir_capability(),
-            RawDpcIrCapability::TransactionalTmemNoFullSync
+            RawDpcIrCapability::TransactionalTmemFillNoFullSync
+        );
+        assert_ne!(
+            backend.raw_dpc_ir_capability(),
+            RawDpcIrCapability::TransactionalTmemNoFullSync,
+            "the older TMEM-only value would tell a caller this backend declares zero \
+             guest-visible writes, which is no longer true"
         );
     }
 
@@ -3430,7 +3976,7 @@ mod tests {
     /// every ABI XBUS producer (MMIO XBUS, RSP XBUS) would have panicked on
     /// its first `plan_raw_dpc` call the moment a T4 session was
     /// registered, despite `WgpuBackend`'s own capability advertising
-    /// `TransactionalTmemNoFullSync` with no source-kind carve-out.
+    /// a raw-DPC capability with no source-kind carve-out.
     #[test]
     fn plan_raw_dpc_accepts_a_genuinely_xbus_sourced_capture() {
         let (mut backend, session) = WgpuBackend::try_new().unwrap();
@@ -3541,22 +4087,75 @@ mod tests {
     /// exposes no bare `commit`/`CommittedRawDpcOutcome`-returning method
     /// (enforced by T0's own colocated source-shape sweep in
     /// `fn64-render`). This test asserts the source-level shape on the
-    /// `fn64-render-wgpu` side: `publish_raw_dpc`'s body contains no
-    /// intermediate step between obtaining the capsule and calling
-    /// `commit()` -- no fabric-only path exists that could reach
-    /// `Published` without also flipping this backend's own physical slot.
+    /// `fn64-render-wgpu` side: `publish_raw_dpc`'s body reaches
+    /// `Published` through exactly that one unaltered expression -- no
+    /// fabric-only path exists that could reach `Published` without also
+    /// flipping this backend's own physical slot.
+    ///
+    /// The body is no longer a single statement: the deferred color-target
+    /// publication takes its submission-keyed token before the commit and
+    /// redeems it after. That addition is deliberately held to the same
+    /// invariant, and this test now proves both halves of it -- the
+    /// terminal expression is still character-for-character intact, and
+    /// the token `take` that precedes it does not touch the capsule, the
+    /// coordinator, or the fabric.
     #[test]
     fn publish_raw_dpc_source_is_exactly_prepare_publication_then_commit() {
         let source = include_str!("production.rs");
         let body_start = source
             .find("fn publish_raw_dpc(")
             .expect("publish_raw_dpc must exist in this file");
-        let body = &source[body_start..body_start + 400];
+        let body_end = source[body_start..]
+            .find("\n    }\n")
+            .expect("publish_raw_dpc must have a closing brace")
+            + body_start;
+        let body = &source[body_start..body_end];
+
         assert!(
             body.contains("self.coordinator.prepare_publication(publication).commit()"),
-            "publish_raw_dpc's body must be exactly \
+            "publish_raw_dpc must still reach Published through exactly \
              `self.coordinator.prepare_publication(publication).commit()` -- \
              one non-Result, callback-free terminal path"
+        );
+        assert_eq!(
+            body.matches("prepare_publication(publication)").count(),
+            1,
+            "publish_raw_dpc must call the coordinator's prepare_publication exactly once"
+        );
+        assert_eq!(
+            body.matches(".commit()").count(),
+            1,
+            "publish_raw_dpc must reach exactly one terminal commit"
+        );
+
+        // Nothing between obtaining the capsule and committing it may read
+        // or alter the capsule, the coordinator, or the fabric. The only
+        // statements permitted before the commit are the submission-keyed
+        // token take and the capsule's own submission read -- neither of
+        // which can change what is published.
+        let before_commit = &body[..body
+            .find("self.coordinator.prepare_publication(publication).commit()")
+            .expect("checked above")];
+        let executable_before: Vec<&str> = before_commit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .filter(|line| {
+                !line.starts_with("fn publish_raw_dpc(")
+                    && !line.starts_with("&mut self,")
+                    && !line.starts_with("publication:")
+                    && !line.starts_with(") ->")
+            })
+            .collect();
+        assert_eq!(
+            executable_before,
+            vec![
+                "let pending = self.pending_fill_publication.take();",
+                "let submission = publication.submission();",
+                "let outcome =",
+            ],
+            "no step other than the submission-keyed fill token take and the capsule's own \
+             submission read may run before publish_raw_dpc's terminal commit"
         );
     }
 
@@ -4305,6 +4904,733 @@ mod tests {
             height: 8,
             tv_type: fn64_runtime::TvType::default(),
         }
+    }
+
+    /// The color-image height every fill fixture in this module configures.
+    const FILL_TARGET_HEIGHT: u32 = 8;
+
+    /// The color-image width every fill fixture in this module stages.
+    const FILL_TARGET_WIDTH: u32 = 16;
+
+    /// The physical address every fill fixture's `SetColorImage` names.
+    /// Chosen clear of `COMMAND_START` (0x1000) so the target's byte range
+    /// never overlaps the command stream, and inside `LAYOUT_BYTES`
+    /// (0x4000) so `plan_fill`'s installed-RDRAM check passes.
+    const FILL_TARGET_ADDRESS: u32 = 0x2000;
+
+    const SET_COLOR_IMAGE: u8 = 0x3f;
+    const SET_FILL_COLOR: u8 = 0x37;
+    const FILL_RECTANGLE: u8 = 0x36;
+
+    /// Records the host-configured framebuffer extent without requiring a
+    /// GPU adapter.
+    ///
+    /// `create_inner` stores `configured_target_extent` *before* it requests
+    /// a device (see its own comment), precisely so an admitted
+    /// `FillRectangle` -- a CPU-side executor with no adapter dependency --
+    /// can execute on an adapterless host. A `NoAdapter` result is therefore
+    /// expected and ignored here; any *other* create failure still panics,
+    /// because that would mean the extent was not recorded for the reason
+    /// this helper assumes.
+    fn configure_fill_target_height(backend: &mut WgpuBackend) {
+        match backend.create_inner(&fn64_render::RenderConfig {
+            width: FILL_TARGET_WIDTH,
+            height: FILL_TARGET_HEIGHT,
+            tv_type: fn64_runtime::TvType::default(),
+        }) {
+            Ok(()) | Err(WgpuCreateError::NoAdapter(_)) => {}
+            Err(other) => panic!("create_inner failed for an unexpected reason: {other}"),
+        }
+        assert!(
+            backend.configured_target_extent.is_some(),
+            "create_inner must record the host-configured extent even with no GPU adapter"
+        );
+    }
+
+    /// `SetOtherMode` staging Fill cycle (`cycle_type == 3`) with no
+    /// Z-compare/Z-update/image-read bit set -- the only `OtherMode`
+    /// `execute_fill_rectangle` admits (`require_safe_fill_cycle_bypass`).
+    fn fill_cycle_other_mode(low: u32) -> [u32; 2] {
+        [word(SET_OTHER_MODE, 3 << 20), low]
+    }
+
+    /// `SetColorImage` staging an RGBA16 image of `FILL_TARGET_WIDTH` at
+    /// `FILL_TARGET_ADDRESS`. Wire `format` is 0 (`Rgba`), wire `size` is 2
+    /// (`Bits16`), and the wire `width` field is width-1 (the decoder adds
+    /// one back). `FILL_TARGET_ADDRESS` is 64-byte aligned, which
+    /// `SetColorImage`'s own decode requires.
+    fn set_color_image_rgba16() -> [u32; 2] {
+        [
+            word(SET_COLOR_IMAGE, 2 << 19 | (FILL_TARGET_WIDTH - 1)),
+            FILL_TARGET_ADDRESS,
+        ]
+    }
+
+    fn set_fill_color(value: u32) -> [u32; 2] {
+        [word(SET_FILL_COLOR, 0), value]
+    }
+
+    /// One `FillRectangle` at whole-pixel coordinates. The wire fields are
+    /// 10.2 fixed point, so each coordinate is shifted left by 2.
+    fn fill_rectangle(x0: u32, y0: u32, x1: u32, y1: u32) -> [u32; 2] {
+        [
+            word(FILL_RECTANGLE, ((x1 << 2) << 12) | (y1 << 2)),
+            ((x0 << 2) << 12) | (y0 << 2),
+        ]
+    }
+
+    /// The headline fixture: a partial-width, three-row fill.
+    ///
+    /// `x0 = 4` is deliberately nonzero, so `plan_fill` takes its per-row
+    /// branch (`x0 == 0 && x1 + 1 == width` is false) and declares **three**
+    /// disjoint, width-strided write accesses rather than one collapsed
+    /// range. 11 pixels wide (x 4..=14) x 3 rows (y 2..=4) in an RGBA16
+    /// image: 22 bytes per row, 66 bytes total, spanning 22 + 2*32 = 86
+    /// bytes -- so a single collapsed range would falsely claim 20 untouched
+    /// inter-row bytes as written.
+    fn partial_width_fill_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x213c_4d59));
+        words.extend(fill_rectangle(4, 2, 14, 4));
+        words
+    }
+
+    /// Same target and rectangle height, but spanning the image's full
+    /// width -- so `plan_fill` takes its `planned_rows == 1` branch and
+    /// declares exactly one contiguous access.
+    fn full_width_fill_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x213c_4d59));
+        words.extend(fill_rectangle(0, 2, FILL_TARGET_WIDTH - 1, 4));
+        words
+    }
+
+    /// A whole-target fill: every pixel of the 16x8 image.
+    ///
+    /// Required as the *first* fill against a fresh color target.
+    /// `CandidateColorTarget::admit_completed_initialization` rejects a
+    /// partial rectangle on a target with no predecessor
+    /// (`PartialNewTargetInitialization`), because a brand-new target has no
+    /// prior device-byte content for the untouched rows and admitting one
+    /// would publish fabricated zeros as if they were real content. Filling
+    /// the whole target first establishes generation 1 honestly; a
+    /// subsequent partial fill then patches into that real buffer.
+    ///
+    /// This is also the real-world order: a title clears its framebuffer
+    /// before filling sub-rectangles into it.
+    fn whole_target_fill_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x0842_1085));
+        words.extend(fill_rectangle(
+            0,
+            0,
+            FILL_TARGET_WIDTH - 1,
+            FILL_TARGET_HEIGHT - 1,
+        ));
+        words
+    }
+
+    /// Runs one fill capture all the way through plan -> execute -> commit
+    /// -> seal -> publish, returning the staged writes it committed.
+    fn publish_one_fill(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> Vec<CompletedWrite> {
+        let request = session.plan_request(capture(words));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("fixture plans cleanly");
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("fixture executes cleanly");
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged.clone())
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        staged
+    }
+
+    /// The ordered `RenderTarget` write accesses one word stream's decode
+    /// declares in its own resource journal.
+    ///
+    /// Read from `crate::decode_raw_dpc`'s resource plan -- the same list
+    /// `plan_fill` pushed and the same list `ExactRawDpcPlanWriter::finish`
+    /// proves the sealed plan equals one for one. `PlannedRawDpcSubmission`
+    /// exposes no journal accessor of its own, so this re-decodes the same
+    /// capture rather than reaching into a sealed value.
+    fn declared_render_target_writes(words: Vec<u32>) -> Vec<(u32, u32)> {
+        let capture = capture(words);
+        let layout = capture.memory_layout();
+        let submission = capture.submission().clone();
+        let probe_journal = single_source_probe_journal(&submission, layout).unwrap();
+        let decoded = finalize_with_zero_reads(
+            layout,
+            capture.transaction_sequence(),
+            submission.clone(),
+            capture.cmd_end(),
+            probe_journal,
+        )
+        .unwrap();
+        let ticket = submit_locally(decoded).unwrap();
+        let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            other => panic!("probe decode must report the real access list, got {other:?}"),
+        };
+        accesses
+            .iter()
+            .filter(|access| {
+                access.mode() == AccessMode::Write
+                    && access.purpose() == AccessPurpose::RenderTarget
+            })
+            .map(|access| match access.region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                    (range.start().get(), range.len())
+                }
+                other => panic!("a fill access is always an RDRAM region, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Drives plan -> execute for a fill fixture, which declares zero
+    /// `TmemLoadSource` reads.
+    fn plan_and_execute_fill(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> (
+        fn64_render_ir::SubmissionIdentity,
+        Result<BackendPreparedRawDpc, RenderError>,
+    ) {
+        let planned = plan_with_no_reads(backend, session, words);
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        (submission, backend.execute_raw_dpc(bound))
+    }
+
+    /// **T-7 -- the headline admission test.** A partial-width, three-row
+    /// fill plans, executes, and reports exactly three staged guest writes,
+    /// with publication genuinely deferred.
+    ///
+    /// Every assertion here is one the pre-admission code could not have
+    /// satisfied: `plan_raw_dpc` used to reject `FillRectangle` outright
+    /// with `UnadmittedRawDpcCommand`, the journal used to declare zero
+    /// `RenderTarget` writes, and no staged-write transport existed at all.
+    ///
+    /// The deferral assertion is the load-bearing one: it proves the
+    /// deferred-token design actually defers. If `execute_raw_dpc` published
+    /// eagerly, the guest commit that must precede publication would be
+    /// running *after* the registry already advanced.
+    ///
+    /// The whole-target fill that runs first is not incidental setup: a
+    /// partial rectangle cannot initialize a *fresh* target at all
+    /// (`PartialNewTargetInitialization` -- the untouched rows would be
+    /// fabricated zeros), so establishing a real generation 1 is the only
+    /// honest way to reach the partial-fill path.
+    #[test]
+    fn execute_raw_dpc_admits_a_partial_width_fill_end_to_end() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        assert_eq!(
+            declared_render_target_writes(partial_width_fill_words()).len(),
+            3,
+            "a partial-width 11x3 fill declares one RenderTarget write access PER ROW -- a \
+             single collapsed range would claim untouched inter-row bytes as written"
+        );
+
+        // Establish a real resident generation the partial fill can patch.
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        let generation_before = backend.color_targets().unwrap().residents()[0]
+            .generation()
+            .get();
+
+        let request = session.plan_request(capture(partial_width_fill_words()));
+        let planned = backend.plan_raw_dpc(request).expect(
+            "an admitted partial-width fill must plan cleanly, not be rejected as an \
+             UnadmittedRawDpcCommand",
+        );
+
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("an admitted fill must execute cleanly");
+
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert_eq!(
+            staged.len(),
+            3,
+            "the backend must transport exactly the three CompletedWrites its journal declares"
+        );
+        // 11 pixels x 2 bytes per RGBA16 pixel = 22 bytes per row.
+        for (row, write) in staged.iter().enumerate() {
+            assert_eq!(
+                write.byte_count(),
+                22,
+                "row {row}'s write must cover only its own 22 bytes"
+            );
+        }
+        assert_eq!(
+            staged.iter().map(|write| write.byte_count()).sum::<u32>(),
+            66,
+            "the three rows total 66 real bytes, never the 86 a collapsed range would span"
+        );
+
+        let registry = backend
+            .color_targets()
+            .expect("the first admitted fill builds the registry");
+        assert_eq!(
+            registry.residents()[0].generation().get(),
+            generation_before,
+            "publication must be deferred until publish_raw_dpc -- an advanced generation here \
+             would mean the registry moved before the guest commit that must precede it"
+        );
+        assert!(
+            backend.has_pending_fill_publication(),
+            "the staged fill is held as a submission-keyed token, not published"
+        );
+
+        drop(prepared);
+    }
+
+    /// **T-6:** the full-width branch stays in lockstep with the per-row
+    /// branch. Same target and same three rows, but `x0 == 0 && x1 + 1 ==
+    /// width`, so `plan_fill` collapses to exactly one access -- which is
+    /// legitimate here precisely because a full-width run IS contiguous.
+    #[test]
+    fn execute_raw_dpc_collapses_a_full_width_fill_to_one_write() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        assert_eq!(
+            declared_render_target_writes(full_width_fill_words()).len(),
+            1,
+            "a full-width fill's rows ARE contiguous, so one access is the honest declaration"
+        );
+
+        // Full-width but only three rows tall, so it is still a partial
+        // rectangle for admission purposes -- establish a real generation
+        // first, as `PartialNewTargetInitialization` requires.
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let request = session.plan_request(capture(full_width_fill_words()));
+        let planned = backend.plan_raw_dpc(request).unwrap();
+
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc(bound).unwrap();
+
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].byte_count(),
+            3 * FILL_TARGET_WIDTH * 2,
+            "one access covering three full 16-pixel RGBA16 rows is 96 bytes"
+        );
+
+        drop(prepared);
+    }
+
+    /// **T-5:** each row's content digest covers exactly its own 22 bytes,
+    /// sliced from the full-extent device buffer -- never a digest over the
+    /// whole 256-byte target, and never over the 86-byte span the three rows
+    /// collectively occupy.
+    ///
+    /// Recomputed independently here from `effect_content_digest` over the
+    /// resident's own published bytes, so a change that started hashing a
+    /// wider slice would fail rather than merely producing a different
+    /// opaque value.
+    #[test]
+    fn each_fill_row_write_hashes_only_its_own_bytes() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let row_ranges = declared_render_target_writes(partial_width_fill_words());
+        assert_eq!(row_ranges.len(), 3);
+        // The three rows are strided by the image's own row pitch (16
+        // pixels x 2 bytes), not packed end to end -- which is exactly why
+        // they cannot be collapsed.
+        assert_eq!(row_ranges[1].0 - row_ranges[0].0, FILL_TARGET_WIDTH * 2);
+        assert_eq!(row_ranges[2].0 - row_ranges[1].0, FILL_TARGET_WIDTH * 2);
+
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        // Publish the partial fill so the full-extent device bytes it
+        // produced are readable, then verify every staged digest against a
+        // slice recomputed from them.
+        let staged = publish_one_fill(&mut backend, &mut session, partial_width_fill_words());
+        assert_eq!(staged.len(), 3);
+
+        let registry = backend.color_targets().unwrap();
+        let resident = &registry.residents()[0];
+        let buffer = resident.device_bytes().device_bytes();
+        assert_eq!(
+            buffer.len() as u32,
+            FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2,
+            "the resident's device bytes cover the whole target, unlike any single write"
+        );
+
+        let base = resident.key().address().get();
+        for (row, (start, len)) in row_ranges.iter().enumerate() {
+            let offset = (start - base) as usize;
+            let slice = &buffer[offset..offset + *len as usize];
+            assert_eq!(
+                staged[row].content(),
+                fn64_render_ir::effect_content_digest(slice),
+                "row {row}'s digest must cover exactly its own {len} bytes"
+            );
+            assert_ne!(
+                staged[row].content(),
+                fn64_render_ir::effect_content_digest(buffer),
+                "row {row}'s digest must NOT be a digest of the whole target buffer"
+            );
+        }
+    }
+
+    /// **T-10:** each full plan -> execute -> commit -> seal -> publish
+    /// cycle advances the resident generation by exactly one -- proving
+    /// publication is neither skipped nor doubled.
+    ///
+    /// Generation 1 is the whole-target fill (the only rectangle a fresh
+    /// target admits); generations 2 and 3 are partial fills patching into
+    /// it.
+    #[test]
+    fn publish_raw_dpc_advances_the_resident_generation_exactly_once() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        assert_eq!(
+            backend.color_targets().unwrap().residents()[0]
+                .generation()
+                .get(),
+            1
+        );
+
+        for expected_generation in 2..=3u64 {
+            let staged = publish_one_fill(&mut backend, &mut session, partial_width_fill_words());
+            assert_eq!(staged.len(), 3);
+
+            let registry = backend.color_targets().unwrap();
+            assert_eq!(
+                registry.residents().len(),
+                1,
+                "every fill targets the same color image, so there is exactly one resident"
+            );
+            assert_eq!(
+                registry.residents()[0].generation().get(),
+                expected_generation,
+                "each published fill advances the resident generation by exactly one"
+            );
+            assert!(
+                !backend.has_pending_fill_publication(),
+                "the token must be consumed by publication, never left behind"
+            );
+        }
+    }
+
+    /// **T-9 -- the nonmutation test.** A fill rejected at *execution* time,
+    /// after `begin_candidate` has already succeeded, must leave the
+    /// registry byte-identical and leave no staged token behind.
+    ///
+    /// `Z_CMP` (`OtherMode.low & 0x0010`) is the deliberate lever: it passes
+    /// every plan-time gate (`plan_fill` checks cycle type, not the
+    /// Z/framebuffer hazard bits) and is rejected by
+    /// `require_safe_fill_cycle_bypass` inside `execute_fill_rectangle` --
+    /// i.e. precisely inside the window the deferred-token design creates,
+    /// after a candidate exists and before anything is published.
+    #[test]
+    fn a_rejected_fill_leaves_the_registry_and_physical_slot_untouched() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        // First, establish a real resident generation to be preserved.
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let snapshot_generation = backend.color_targets().unwrap().residents()[0]
+            .generation()
+            .get();
+        let snapshot_bytes = backend.color_targets().unwrap().residents()[0]
+            .device_bytes()
+            .device_bytes()
+            .to_vec();
+        let snapshot_physical = backend.physical_tmem().identity();
+        assert_eq!(snapshot_generation, 1);
+
+        // Now a second capture whose fill is rejected at execution time.
+        let mut hostile = Vec::new();
+        hostile.extend(fill_cycle_other_mode(0x0010)); // Z_CMP set
+        hostile.extend(set_color_image_rgba16());
+        hostile.extend(set_fill_color(0x213c_4d59));
+        hostile.extend(fill_rectangle(4, 2, 14, 4));
+
+        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, hostile);
+        assert!(
+            result.is_err(),
+            "a Z_CMP fill-cycle bypass must be rejected loudly at execution, never executed"
+        );
+
+        let registry = backend.color_targets().unwrap();
+        assert_eq!(registry.residents().len(), 1);
+        assert_eq!(
+            registry.residents()[0].generation().get(),
+            snapshot_generation,
+            "a rejected fill must not advance the resident generation"
+        );
+        assert_eq!(
+            registry.residents()[0].device_bytes().device_bytes(),
+            snapshot_bytes.as_slice(),
+            "a rejected fill must leave the resident's device bytes byte-identical"
+        );
+        assert_eq!(
+            backend.physical_tmem().identity(),
+            snapshot_physical,
+            "a fill never touches physical TMEM, rejected or not"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a rejected fill must leave no staged token for a later publish to redeem"
+        );
+    }
+
+    /// **T-11:** dropping the sealed capsule instead of publishing leaves
+    /// the registry at its prior generation -- the cancellation path, which
+    /// the deferred token makes reachable for color targets too.
+    #[test]
+    fn dropping_the_capsule_before_publish_leaves_the_registry_untouched() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        let generation_before = backend.color_targets().unwrap().residents()[0]
+            .generation()
+            .get();
+
+        let request = session.plan_request(capture(partial_width_fill_words()));
+        let planned = backend.plan_raw_dpc(request).unwrap();
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc(bound).unwrap();
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged)
+            .unwrap();
+
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        assert!(
+            backend.has_pending_fill_publication(),
+            "the token is held between execute and publish -- that window is the design"
+        );
+        drop(capsule);
+
+        assert_eq!(
+            backend
+                .color_targets()
+                .expect("the registry was built during execution")
+                .residents()[0]
+                .generation()
+                .get(),
+            generation_before,
+            "a dropped capsule publishes nothing, so the registry stays at its prior generation"
+        );
+    }
+
+    /// **T-13:** the split-arm regression proof. `FullSync` must still be
+    /// rejected loudly now that it no longer shares a match arm with
+    /// `FillRectangle`.
+    #[test]
+    fn plan_raw_dpc_still_rejects_a_full_sync_command_after_the_arm_split() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let mut words = partial_width_fill_words();
+        words.extend([word(FULL_SYNC, 0), 0]);
+
+        let request = session.plan_request(capture(words));
+        assert!(
+            backend.plan_raw_dpc(request).is_err(),
+            "admitting FillRectangle must not have admitted FullSync alongside it"
+        );
+    }
+
+    /// **T-14:** admitting fills did not become "admit all fills". A
+    /// `FillRectangle` under Copy cycle (`cycle_type == 2`) is still
+    /// rejected at plan time.
+    #[test]
+    fn plan_raw_dpc_rejects_a_copy_cycle_fill_rectangle() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let mut words = Vec::new();
+        words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x213c_4d59));
+        words.extend(fill_rectangle(4, 2, 14, 4));
+
+        let request = session.plan_request(capture(words));
+        assert!(
+            backend.plan_raw_dpc(request).is_err(),
+            "only fill-cycle FillRectangles are admitted"
+        );
+    }
+
+    /// **T-15:** `plan_fill`'s fractional-edge gate must survive the
+    /// admission change. A coordinate with nonzero low two bits is a
+    /// quarter-pixel edge this slice does not execute.
+    #[test]
+    fn plan_raw_dpc_rejects_a_fractional_edge_fill_rectangle() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x213c_4d59));
+        // Same rectangle as the headline fixture, but with y1's
+        // quarter-pixel fraction set.
+        words.extend([
+            word(FILL_RECTANGLE, ((14u32 << 2) << 12) | (4u32 << 2) | 1),
+            ((4u32 << 2) << 12) | (2u32 << 2),
+        ]);
+
+        let request = session.plan_request(capture(words));
+        assert!(
+            backend.plan_raw_dpc(request).is_err(),
+            "a fractional edge must be rejected, never truncated to whole pixels"
+        );
+    }
+
+    /// Hostile: a mixed TMEM-load-plus-fill packet is rejected loudly at
+    /// execution rather than silently reordering two write sources into one
+    /// effect report. This slice does not implement the journal-order merge;
+    /// the refusal is named, not implicit.
+    #[test]
+    fn execute_raw_dpc_rejects_a_mixed_tmem_and_fill_packet() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let mut words = one_load_block_words();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(0x213c_4d59));
+        words.extend(fill_rectangle(4, 2, 14, 4));
+
+        let (planned, source_bytes) = plan_with_deterministic_reads(&mut backend, &session, words);
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        assert!(
+            backend.execute_raw_dpc(bound).is_err(),
+            "a mixed TMEM+fill packet must be rejected, never merged in an unverified order"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a rejected mixed packet must stage nothing"
+        );
+    }
+
+    /// Hostile: a submission mismatch yields an EMPTY staged-write list, not
+    /// another submission's writes. That empty list then drives the caller
+    /// into the zero-write commit branch, which fails loudly against the
+    /// packet's own nonempty guest-write journal -- a loud rejection rather
+    /// than a quiet wrong publish.
+    #[test]
+    fn staged_guest_render_target_writes_returns_empty_for_a_foreign_submission() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let request = session.plan_request(capture(partial_width_fill_words()));
+        let planned = backend.plan_raw_dpc(request).unwrap();
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc(bound).unwrap();
+
+        assert_eq!(
+            backend.staged_guest_render_target_writes(submission).len(),
+            3
+        );
+
+        // A different submission's identity, taken from a second plan on the
+        // same session.
+        let other_request = session.plan_request(capture(full_width_fill_words()));
+        let other_planned = backend.plan_raw_dpc(other_request).unwrap();
+        let other_bound = session
+            .finalize_and_submit(other_planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let other_submission = other_bound.submission();
+        assert_ne!(other_submission, submission);
+        assert!(
+            backend
+                .staged_guest_render_target_writes(other_submission)
+                .is_empty(),
+            "a submission this backend staged no write for must report an empty list, never \
+             another submission's writes"
+        );
+
+        drop(prepared);
+        drop(other_bound);
+    }
+
+    /// Regression: a TMEM-only submission still reports no staged guest
+    /// writes at all, so the existing zero-write commit path is undisturbed.
+    #[test]
+    fn tmem_only_submissions_stage_no_guest_render_target_writes() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, one_load_block_words());
+        let guest_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc(bound).unwrap();
+
+        assert!(
+            backend
+                .staged_guest_render_target_writes(submission)
+                .is_empty(),
+            "a TMEM-only submission stages no color-target write"
+        );
+        assert!(backend.color_targets().is_none());
+        session.commit_zero_guest_writes(prepared).unwrap();
+    }
+
+    /// Hostile: an admitted fill reaching execution with no prior `create`
+    /// call is rejected loudly. The RDP's `SetColorImage` carries no height
+    /// field, so this backend has no honest way to size the color target --
+    /// and inventing one would fabricate the target's identity and range.
+    #[test]
+    fn a_fill_before_any_create_is_rejected_rather_than_given_an_invented_height() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        // Deliberately NO configure_fill_target_height call.
+        let (_, result) =
+            plan_and_execute_fill(&mut backend, &mut session, partial_width_fill_words());
+        assert!(
+            result.is_err(),
+            "with no host-configured height, an admitted fill must be rejected, not sized by \
+             a fabricated default"
+        );
+        assert!(!backend.has_pending_fill_publication());
     }
 
     /// Positive: `RenderBackend::create` is a no-op on `WgpuBackend`'s
