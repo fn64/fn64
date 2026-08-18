@@ -36,6 +36,12 @@ assert").
 > **The "366 of 366 decoded" figure is therefore withdrawn.** `LoadTLUT` is
 > decoded and refused, so the admitted count is at most six commands, not
 > 366. §5's burndown claim is corrected in place.
+>
+> **§1d supersedes this in turn.** The destination-descriptor check was
+> measured against public libultra `gbi.h` and found **wrong**; it has been
+> removed. Entry 0 now clears planning entirely and refuses at the coverage
+> panic quoted immediately below — which restores the original headline's
+> *refusal site*, though not its "366 of 366 admitted" wording (see §1d).
 
 The withdrawn original claim, kept because §1a's correction is written
 against it:
@@ -152,6 +158,68 @@ reading, and neither is sufficient alone:
 
 The refusal has **no test of its own** (`grep` for its message string returns
 only the site). That is a gap this card records and did not fill.
+
+### 1d. Resolved: the destination-descriptor check was wrong, and is removed
+
+§1b left the question open pending external authority. That authority was
+obtained, and it refutes the check.
+
+**Evidence — public libultra `gbi.h`, the macro bodies themselves.** The
+guard's own comment claimed "the macro always programs a 16-bit-per-entry
+palette image". That is true of the *source image* and false of the
+*destination tile descriptor*. `gDPLoadTLUT_pal16(pkt, pal, dram)` expands to:
+
+```c
+gDPSetTextureImage(pkt, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, dram);
+gDPTileSync(pkt);
+gDPSetTile(pkt, 0, 0, 0, (256+(((pal)&0xf)*16)),
+        G_TX_LOADTILE, 0 , 0, 0, 0, 0, 0, 0);
+gDPLoadSync(pkt);
+gDPLoadTLUTCmd(pkt, G_TX_LOADTILE, 15);
+gDPPipeSync(pkt)
+```
+
+`gDPSetTile`'s parameter order is `(pkt, fmt, siz, line, tmem, tile, ...)`
+(`sm64-decomp/include/PR/gbi.h:3401`), so the second `0` is **`siz`**, and
+`G_IM_SIZ_4b == 0` (`:410`). The canonical destination `siz` for a TLUT load
+is therefore 4-bit, **never** 16-bit — the exact value the check refused.
+`gDPLoadTLUT_pal256` (`:4283`) and the generic `gDPLoadTLUT` (`:4331`)
+program the same `siz == 0`.
+
+The macro is byte-identical in four independent SDK copies on this machine,
+which is why it is read as the SDK's text rather than one project's
+transcription: `sm64-decomp/include/PR/gbi.h:4229`,
+`mm-decomp/include/PR/gbi.h:4655`, `kirby64-decomp/include/PR/gbi.h:4239`,
+`oot-decomp/include/ultra64/gbi.h:4657`. Read under AGENTS.md's
+"public libultra manuals" allowance — header text, not any project's code.
+
+**Why the field is unconstrained rather than newly constrained to 4-bit.**
+The load tile describes a TMEM region for a quadricated palette write, not
+the palette's pixel format, and no code consumes the field for this kind:
+`transfer_shape`'s `Tlut` arm sizes from `entries` and `image.size()`, and
+`project_tmem_transfer_word`'s `Tlut` arm reads only `descriptor.tmem()` and
+`line_words()`. After the change `descriptor.size()` has **zero** readers in
+`tmem/wire.rs`. Constraining it to `Bits4` would refuse a shape the hardware
+has no reason to reject and that nothing in this module can mis-size; that
+mutant is tested and rejected below.
+
+**The sibling check at `:372` is correct and is retained.** The macro really
+does always emit `G_IM_SIZ_16b` for the *source* `SetTextureImage`, and the
+transfer shape is sized from it.
+
+**How the bug survived review.** The `set_tile` test helper
+(`raw_dpc/mod.rs:2225`) hardcodes `2 << 19` — `siz == 2` — so every
+pre-existing `LoadTLUT` fixture shared the guard's mistaken assumption and
+none could reach the canonical shape. The refusal had no test of its own.
+
+**The test the refusal lacked**, added at `raw_dpc/mod.rs`:
+`load_tlut_accepts_the_canonical_macro_four_bit_destination_descriptor`
+builds the `SetTile` word directly rather than through the helper, asserts
+all four destination sizes decode with an identical transfer shape (16
+entries, 32 source bytes), and asserts the source check still refuses
+non-16-bit `SetTextureImage`. Three mutants, three kills: restoring the
+original `Bits16` guard fails it; deleting the `:372` source check fails it;
+narrowing the destination to `Bits4`-only fails it.
 
 ### 1c. The GPU triangle draw is not redundant for texrects
 
@@ -373,23 +441,30 @@ What is not proven, and is the whole distance remaining: **not one pixel of
 WM2000 has been rendered.** No fill reached its color image, no texel was
 sampled, nothing was published.
 
-The next blocker, with its size — **this is a different, smaller blocker than
-this section originally named**:
+**The `LoadTLUT` blocker is closed** (§1d). It was measured against public
+libultra `gbi.h`, found wrong, and removed; the canonical
+`gDPLoadTLUT_pal16` destination `siz` is `G_IM_SIZ_4b == 0`, never 16-bit.
+Entry 0's 366 commands now all decode and plan, so **the "366 of 366
+decoded" figure is restored** — but as an observed acceptance this time,
+not the inference §1 withdrew. Measured, not quoted: workspace 8279→8280
+passed / 13 skipped (the one new test), debug and release profile, dead-code
+count unchanged at 1217 (re-measured both sides, not carried from a brief).
 
-**`LoadTLUT` with a 4-bit destination tile descriptor** (`tmem/wire.rs:377`).
-All seven of the packet's `LoadTLUT`s are the canonical `gDPLoadTLUT_pal16`
-shape (§1b). **Size: one check, pending evidence — not architectural.** The
-field it tests is read nowhere else in the file, and this repo's own
-reference decoder already accepts the shape, so the likely resolution is that
-the check is over-strict. But "likely" is not measured: it needs the libultra
-manual section or hardware evidence, plus the test the refusal currently
-lacks. Deciding it by reading the code that fails would be the reasoning this
-project forbids.
+**A new frontier appeared behind it, in entries 1–3 only.** Those entries now
+refuse at `assert_eq!(source_accesses.len(), 1,
+"v11's admitted TMEM source plan is exactly one journal access wide")`
+(`raw_dpc/production_adapter.rs:1227`). This is a documented v11 adapter
+scope limit — the decoder's own `source_accesses` admits up to
+`MAX_RESOURCE_ACCESSES` ranges — not a decoder defect. It was previously
+masked by the `LoadTLUT` refusal and is recorded here as newly visible, not
+newly introduced. It is an `assert_eq!` rather than a named refusal, so like
+the coverage panic a caller cannot match on it.
 
-**Behind it, unchanged and still architectural:**
+**Now the first blocker for entry 0, and still architectural:**
 `CoverageDestination::Clamp`/`Wrap` with `image_read_enabled` set, at
-`triangle_pipeline.rs:280`. Reaching it required bypassing the `LoadTLUT`
-guard (§1b), so it is the *second* blocker, not the first. Its size
+`triangle_pipeline.rs:280`. It is reached on the real packet without any
+guard bypass now (10 consecutive runs, identical), so it is no longer the
+*second* blocker but the standing one. Its size
 assessment stands: the pipeline has no framebuffer-read mechanism, its site
 names it "node 2, a separate unresolved architectural decision", and it needs
 a mechanism rather than a widened constant. Note that §1c's finding does not
@@ -400,14 +475,17 @@ Two smaller things remain on the path:
 
 - The coverage refusal is a `panic!` rather than a named error variant, so it
   cannot be matched or counted by a caller the way the decode refusals can.
-- The `LoadTLUT` destination check has no test (§1b).
+- ~~The `LoadTLUT` destination check has no test~~ — closed, §1d.
 
-**Nonclaims.** No frame is rendered. No pixel is asserted. No refusal was
-weakened, none was fixed, and no routing was changed — §1c explains why the
-change this card was dispatched to make would have weakened one. The
-`descriptor.size()` probe in §1b was reverted; the worktree is byte-clean
-against `58fcb964`. Whether the `LoadTLUT` check is correct is **not**
-decided here. Everything measured is entry 0 of one window of one title and
+**Nonclaims.** No frame is rendered. No pixel is asserted. No routing was
+changed — §1c explains why the change that card was dispatched to make would
+have weakened a refusal. One refusal **was** removed (§1d), on external
+header evidence and with three mutation kills, not on inference; the
+neighbouring source-image check was retained and is pinned by the same test.
+Removing it admits `LoadTLUT` to *planning* only — it makes no claim that the
+TLUT is correctly written to TMEM, since nothing executes past the coverage
+panic. The v11 access-count frontier in entries 1–3 is reported as newly
+visible, not diagnosed or fixed. Everything measured is entry 0 of one window of one title and
 says nothing about gameplay, which the `0x1CC` MMIO abort still bounds this
 capture short of. The four captured entries are all triangle-free early
 frames; the 152 of 218 frames the census measured as carrying triangles were
