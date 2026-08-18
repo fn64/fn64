@@ -1463,6 +1463,14 @@ fn neutral_load_epoch(epoch: fn64_render::TmemLoadEpoch) -> TmemLoadEpoch {
     TmemLoadEpoch::new(core::num::NonZeroU64::new(epoch.get()).expect("neutral epoch is nonzero"))
 }
 
+/// A real minted transaction identity, for `read`'s `#[cfg(test)]`
+/// proposal-identity helper. Same mint as a live transaction's, so a test
+/// identity is indistinguishable from one a real transaction would carry.
+#[cfg(test)]
+pub(super) fn next_transaction_identity_for_test() -> PhysicalTmemTransactionIdentity {
+    mint_transaction_identity().expect("the test mint is not exhausted")
+}
+
 fn mint_transaction_identity() -> Result<PhysicalTmemTransactionIdentity, PhysicalTmemError> {
     NEXT_PHYSICAL_TMEM_TRANSACTION_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
