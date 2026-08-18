@@ -71,6 +71,7 @@ pub use physical::{
     PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
     PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
+pub(crate) use physical::{PendingTmemPrefixImage, TmemPrefixSnapshot};
 #[cfg(test)]
 pub(crate) use read::proposed_identity_for_test;
 pub use read::{
