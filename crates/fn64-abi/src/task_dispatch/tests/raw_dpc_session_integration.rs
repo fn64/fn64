@@ -830,52 +830,310 @@ fn dram_producer_routes_a_partial_width_fill_through_the_session() {
     teardown();
 }
 
-/// **T-17 -- the nonclaim, made executable.** Nothing in the FillRectangle
-/// admission chain writes guest RDRAM.
+/// Poison `rdram`'s whole fill-target range with a recognizable,
+/// offset-dependent pattern, and return the poisoned image.
 ///
-/// `execute_fill_rectangle` produces an owned `Vec<u8>`;
-/// `ResidentPublication::publish` writes into a backend-local `Vec`; a
-/// `CompletedWrite` is a range plus a content digest, not bytes in motion.
-/// This test snapshots the guest bytes covering the fill's own declared
-/// target range and asserts they are byte-identical after a successful
-/// dispatch.
-///
-/// A future slice that adds the RDRAM copyback MUST break this test
-/// deliberately. Silently changing it would turn a documented nonclaim into
-/// an undocumented behavior change.
-#[test]
-fn guest_rdram_is_not_modified_by_an_admitted_fill() {
-    crate::load_rom(Vec::new());
-    let mut rdram = rdram_with_texture_source();
-    register_session_backend_for_fills(rdram.len());
-
-    // Poison the target range with a recognizable pattern, so "unchanged"
-    // is a real observation rather than "still zero".
+/// Offset-dependent, not a constant byte: a copy that wrote the right span
+/// with the wrong *contents* would still be caught, and a surviving byte can
+/// be attributed to its own offset. The multiplier is odd so the pattern has
+/// period 256 rather than aliasing with the 2-byte pixel stride.
+fn poison_fill_target(rdram: &mut [u8]) -> Vec<u8> {
     let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
     for (offset, byte) in rdram[target.clone()].iter_mut().enumerate() {
         *byte = (offset as u8).wrapping_mul(7).wrapping_add(0x5a);
     }
-    let before = rdram[target.clone()].to_vec();
+    rdram[target].to_vec()
+}
+
+/// The hand-derived RGBA16 image a whole-target fill of `fill_color`
+/// produces, built from the RDP's even/odd column rule rather than captured
+/// from a run.
+fn expected_whole_target_image(fill_color: u32) -> Vec<u8> {
+    (0..FILL_TARGET_HEIGHT)
+        .flat_map(|_| {
+            (0..FILL_TARGET_WIDTH)
+                .flat_map(|x| expected_fill_halfword(fill_color, x).to_be_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect()
+}
+
+/// **T-17's successor. The nonclaim is retired: an admitted fill now DOES
+/// write guest RDRAM.**
+///
+/// T-17 (`guest_rdram_is_not_modified_by_an_admitted_fill`) asserted the
+/// opposite, and it was true when written: `execute_fill_rectangle` produced
+/// an owned `Vec<u8>`, `ResidentPublication::publish` wrote into a
+/// backend-local `Vec`, and a `CompletedWrite` was a range plus a content
+/// digest with no bytes in motion. Its own doc required that a future slice
+/// adding the RDRAM copyback break it DELIBERATELY rather than silently
+/// edit it, so this test replaces it under a new name asserting the new
+/// behavior, and this paragraph is the record of the supersession.
+///
+/// What changed is only the transport, not the verification: the copy lives
+/// in `rsp_commit.rs`'s `copy_committed_guest_writes`, runs strictly AFTER
+/// `commit_guest_render_target_writes` returned `Ok`, and re-derives each
+/// committed `ContentDigest` from the bytes before writing any of them.
+/// `CompletedWrite` still carries no bytes.
+///
+/// The expectation is hand-derived from `SET_FILL_COLOR`'s own word and the
+/// RGBA16 even/odd column rule, never captured from the code under test.
+#[test]
+fn an_admitted_whole_target_fill_writes_its_image_into_guest_rdram() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    let poisoned = poison_fill_target(&mut rdram);
+    let expected = expected_whole_target_image(FILL_COLOR);
+    assert_ne!(
+        expected, poisoned,
+        "the poison must differ from the expected image, or 'the bytes changed' would be \
+         unfalsifiable"
+    );
 
     dispatch_words(&mut rdram, &whole_target_fill_words());
-    assert_eq!(
-        rdram[target.clone()],
-        before[..],
-        "a whole-target fill must not modify one guest RDRAM byte -- this slice publishes into \
-         a backend-local buffer and has no RDRAM copyback"
-    );
-
-    dispatch_words(&mut rdram, &partial_width_fill_words());
-    assert_eq!(
-        rdram[target.clone()],
-        before[..],
-        "a partial-width fill must not modify one guest RDRAM byte either"
-    );
-
     assert!(
         with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
-        "both fills completed -- the bytes are unchanged because nothing writes them, not \
-         because the dispatch silently failed"
+        "the fill must complete -- the bytes below changed because the copyback ran, not \
+         because the dispatch failed halfway"
+    );
+
+    assert_eq!(
+        rdram[target],
+        expected[..],
+        "every guest byte of the target must now equal the hand-derived RDP fill-cycle image"
+    );
+
+    // The two packed halfwords really are distinct in guest memory, so the
+    // assertion above discriminated column parity rather than passing on a
+    // uniform image any parity rule would produce.
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        &rdram[base..base + 2],
+        &0x0842u16.to_be_bytes(),
+        "even column, in guest RDRAM"
+    );
+    assert_eq!(
+        &rdram[base + 2..base + 4],
+        &0x1085u16.to_be_bytes(),
+        "odd column, in guest RDRAM"
+    );
+    teardown();
+}
+
+/// The over-wide-copy test. A partial-width fill declares N **disjoint**
+/// per-row RDRAM ranges, strided by the color image's width, and the
+/// copyback must write those N spans and nothing between them.
+///
+/// Measured, not assumed: `fn64-render-wgpu`'s `raw_dpc::plan_fill`
+/// collapses a fill to ONE access only when `x0 == 0 && x1 + 1 == width`.
+/// `fill_rectangle(4, 2, 14, 4)` satisfies neither, so it declares three
+/// accesses -- one per scanline. A copy that collapsed them into a single
+/// `[first_start, last_end)` span would cover 3 * 16 - 5 = 43 pixels instead
+/// of 3 * 11 = 33, claiming ~30% more bytes than the fill wrote and
+/// clobbering the poison at columns 0..4 and 15 of rows 2..=4.
+///
+/// Those surviving poison bytes are the assertion that catches it: they are
+/// checked against the ORIGINAL poison, not against a whole-target
+/// expectation, so nothing but an exactly-sized copy can pass.
+#[test]
+fn an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows() {
+    const FILL_COLOR: u32 = 0x213c_4d59;
+    // Mirrors `partial_width_fill_words`'s own `fill_rectangle(4, 2, 14, 4)`.
+    const X0: u32 = 4;
+    const X1: u32 = 14;
+    const Y0: u32 = 2;
+    const Y1: u32 = 4;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    // A fresh target admits only a whole-target rectangle, so the partial
+    // fill needs a resident predecessor. Poison AFTER it, so the bytes the
+    // partial fill must leave alone are the poison and not the first fill's
+    // image -- the first fill's own copyback is the sibling test's claim,
+    // and reusing it here would make "untouched" ambiguous between the two.
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    let poisoned = poison_fill_target(&mut rdram);
+
+    dispatch_words(&mut rdram, &partial_width_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the partial fill must complete"
+    );
+
+    // Hand-derived: the poison everywhere, overwritten ONLY inside the
+    // claimed rectangle, at TARGET-relative column parity
+    // (`decode_fill_cycle_pixel`'s `x` is the target column, not the
+    // rectangle-relative one).
+    let mut expected = poisoned.clone();
+    for y in Y0..=Y1 {
+        for x in X0..=X1 {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            expected[offset..offset + 2]
+                .copy_from_slice(&expected_fill_halfword(FILL_COLOR, x).to_be_bytes());
+        }
+    }
+
+    let base = FILL_TARGET_ADDR as usize;
+    let target = base..base + FILL_TARGET_BYTES;
+    assert_eq!(
+        rdram[target],
+        expected[..],
+        "the partial fill must write exactly its three disjoint rows and leave every other \
+         guest byte at its poisoned value"
+    );
+
+    // The discriminators, named individually so a failure says which shape
+    // of over-copy happened rather than just 'bytes differ'.
+    //
+    // Row 1 is entirely above the rectangle: a row-off-by-one that started
+    // at y0 - 1 would clobber it.
+    let row1 = base + (FILL_TARGET_WIDTH * 2) as usize;
+    assert_eq!(
+        &rdram[row1..row1 + (FILL_TARGET_WIDTH * 2) as usize],
+        &poisoned[(FILL_TARGET_WIDTH * 2) as usize..(FILL_TARGET_WIDTH * 4) as usize],
+        "row 1 is above the rectangle and must be entirely poison"
+    );
+    // Row 5 is entirely below it: a row-off-by-one that ran to y1 + 1 would
+    // clobber this instead.
+    let row5 = base + (FILL_TARGET_WIDTH * 2 * 5) as usize;
+    assert_eq!(
+        &rdram[row5..row5 + (FILL_TARGET_WIDTH * 2) as usize],
+        &poisoned[(FILL_TARGET_WIDTH * 2 * 5) as usize..(FILL_TARGET_WIDTH * 2 * 6) as usize],
+        "row 5 is below the rectangle and must be entirely poison"
+    );
+    // Columns 0..4 of row 2 are left of x0, and column 15 is right of x1.
+    // Both lie INSIDE a collapsed [first_start, last_end) span, so they are
+    // exactly what a width-collapsed copy destroys.
+    let row2 = base + (FILL_TARGET_WIDTH * 2 * 2) as usize;
+    assert_eq!(
+        &rdram[row2..row2 + (X0 * 2) as usize],
+        &poisoned
+            [(FILL_TARGET_WIDTH * 2 * 2) as usize..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize],
+        "columns 0..4 of row 2 are left of x0 and must still be poison -- a collapsed \
+         single-range copy would have overwritten them"
+    );
+    let row2_last = row2 + ((FILL_TARGET_WIDTH - 1) * 2) as usize;
+    assert_eq!(
+        &rdram[row2_last..row2_last + 2],
+        &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + (FILL_TARGET_WIDTH - 1) * 2) as usize
+            ..(FILL_TARGET_WIDTH * 2 * 2 + FILL_TARGET_WIDTH * 2) as usize],
+        "column 15 of row 2 is right of x1 and must still be poison"
+    );
+    // And the rectangle itself really was written, so 'everything is poison'
+    // cannot pass this test.
+    let inside = row2 + (X0 * 2) as usize;
+    assert_eq!(
+        &rdram[inside..inside + 2],
+        &expected_fill_halfword(FILL_COLOR, X0).to_be_bytes(),
+        "the rectangle's own first pixel must carry the second fill's color"
+    );
+    assert_ne!(
+        &rdram[inside..inside + 2],
+        &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize
+            ..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2 + 2) as usize],
+        "that pixel must differ from the poison, or the whole test is vacuous"
+    );
+    teardown();
+}
+
+/// The odd-origin case, in guest RDRAM. RGBA16 fill decoding has period 2,
+/// so an even-origin-only fixture lets a rectangle-relative vs.
+/// target-relative column confusion survive -- exactly the mutant
+/// `a_dispatched_odd_origin_fill_decodes_at_target_relative_columns`
+/// documents surviving the x0 = 0 and x0 = 4 fixtures.
+///
+/// `odd_origin_fill_words`'s x0 = 5 has odd parity, so the two decodings
+/// disagree at every pixel in the rectangle. This test makes that
+/// discrimination hold at the RDRAM copyback too, not only in the
+/// backend-local buffer the sibling test reads.
+#[test]
+fn an_admitted_odd_origin_fill_writes_target_relative_columns_into_guest_rdram() {
+    const FILL_COLOR: u32 = 0x213c_4d59;
+    // Mirrors `odd_origin_fill_words`'s own `fill_rectangle(5, 1, 11, 3)`.
+    const X0: u32 = 5;
+    const X1: u32 = 11;
+    const Y0: u32 = 1;
+    const Y1: u32 = 3;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    let poisoned = poison_fill_target(&mut rdram);
+
+    dispatch_words(&mut rdram, &odd_origin_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the odd-origin fill must complete"
+    );
+
+    let mut expected = poisoned.clone();
+    for y in Y0..=Y1 {
+        for x in X0..=X1 {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            expected[offset..offset + 2]
+                .copy_from_slice(&expected_fill_halfword(FILL_COLOR, x).to_be_bytes());
+        }
+    }
+
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        expected[..],
+        "an odd-origin fill must write target-relative column parity into guest RDRAM"
+    );
+
+    // The parity discrimination, made explicit: x0 = 5 is odd, so the
+    // rectangle's first pixel takes the LOW halfword. A rectangle-relative
+    // decoding would have treated it as column 0 and written the HIGH one.
+    let first = base + ((Y0 * FILL_TARGET_WIDTH + X0) * 2) as usize;
+    assert_eq!(
+        &rdram[first..first + 2],
+        &(FILL_COLOR as u16).to_be_bytes(),
+        "target column 5 is odd, so the low packed halfword must land here"
+    );
+    assert_ne!(
+        (FILL_COLOR >> 16) as u16,
+        FILL_COLOR as u16,
+        "the fill color's two halfwords must differ, or the parity assertion is vacuous"
+    );
+    teardown();
+}
+
+/// A TMEM-only submission takes the zero-write branch, so the copyback must
+/// not run at all -- the nonclaim that SURVIVES the T-17 supersession.
+///
+/// `copy_committed_guest_writes` is called only when the committed write
+/// list is nonempty. This proves that gate empirically rather than by
+/// reading the `if`: a TMEM-only dispatch over poisoned target bytes must
+/// leave every one of them alone.
+#[test]
+fn a_tmem_only_submission_writes_no_guest_target_byte() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let poisoned = poison_fill_target(&mut rdram);
+    dispatch_words(&mut rdram, &one_load_block_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the TMEM-only submission must complete"
+    );
+
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        poisoned[..],
+        "a TMEM-only submission stages no guest render-target write, so the copyback must \
+         not run and not one target byte may change"
     );
     teardown();
 }
@@ -1051,6 +1309,20 @@ impl fn64_render::RenderBackend for ObservingBackend {
         self.inner
             .borrow_mut()
             .staged_guest_render_target_writes(submission)
+    }
+
+    // Forwarded like every other method. Omitting it does NOT silently
+    // degrade: the trait default returns an empty byte list, and
+    // `copy_committed_guest_writes` then fails loudly with a
+    // committed-writes/payload count mismatch -- which is how this method's
+    // absence was found in the first place, rather than by review.
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        self.inner
+            .borrow_mut()
+            .committed_guest_render_target_bytes(submission)
     }
 
     fn publish_raw_dpc(
@@ -1426,5 +1698,177 @@ fn a_dispatched_odd_origin_fill_decodes_at_target_relative_columns() {
     );
 
     drop(handle);
+    teardown();
+}
+
+// ---------------------------------------------------------------------
+// The copyback's ORDERING, made observable.
+//
+// "The copy happens after the commit, never before" is unfalsifiable on a
+// fixture whose commit always succeeds: both orderings produce identical
+// RDRAM. Moving the copy above `commit_guest_render_target_writes` survived
+// every test above for exactly that reason -- a mutation finding, not a
+// review one.
+//
+// The discriminator is a submission whose commit REJECTS. A backend that
+// over-reports its staged write list (the same list duplicated) is caught by
+// `GuestCommitEffectReport::try_new` against the packet's own guest-write
+// journal, and `try_dispatch_raw_dpc_via_session` panics on that rejection
+// rather than swallowing it. Under the correct ordering no guest byte has
+// been written when that panic unwinds; under the reversed one the copy has
+// already run. The poison is therefore the proof.
+// ---------------------------------------------------------------------
+
+/// Delegates everything to a real `WgpuBackend`, except that it reports each
+/// staged guest write TWICE.
+///
+/// The duplicated list is what the commit sees, so the commit rejects. The
+/// byte transport is left honest and un-duplicated: this fixture is about
+/// the copy's position relative to a failing commit, not about a
+/// bytes/ranges disagreement (which `M5`/the digest check already covers).
+struct OverReportingBackend {
+    inner: std::rc::Rc<std::cell::RefCell<fn64_render_wgpu::WgpuBackend>>,
+}
+
+impl fn64_render::RenderBackend for OverReportingBackend {
+    fn create(&mut self, cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().create(cfg)
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        self.inner.borrow_mut().observe_non_rdp_write16(write)
+    }
+
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        self.inner
+            .borrow_mut()
+            .process_task(rdram, rsp_memory, task, output_addr)
+    }
+
+    fn present(
+        &mut self,
+        request: fn64_render::PresentRequest<'_>,
+    ) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().present(request)
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        self.inner.borrow_mut().resize(w, h);
+    }
+
+    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+        &[]
+    }
+
+    fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
+        self.inner.borrow().raw_dpc_ir_capability()
+    }
+
+    fn plan_raw_dpc(
+        &mut self,
+        request: fn64_render::RawDpcPlanRequest,
+    ) -> Result<fn64_render::PlannedRawDpcSubmission, fn64_render::RenderError> {
+        self.inner.borrow_mut().plan_raw_dpc(request)
+    }
+
+    fn execute_raw_dpc(
+        &mut self,
+        bound: fn64_render::BoundSubmittedRawDpc,
+    ) -> Result<fn64_render::BackendPreparedRawDpc, fn64_render::RenderError> {
+        self.inner.borrow_mut().execute_raw_dpc(bound)
+    }
+
+    /// The single lie: each staged write is reported twice.
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<fn64_render::ir::CompletedWrite> {
+        let honest = self
+            .inner
+            .borrow_mut()
+            .staged_guest_render_target_writes(submission);
+        honest.iter().chain(honest.iter()).copied().collect()
+    }
+
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        let honest = self
+            .inner
+            .borrow_mut()
+            .committed_guest_render_target_bytes(submission);
+        honest.iter().chain(honest.iter()).cloned().collect()
+    }
+
+    fn publish_raw_dpc(
+        &mut self,
+        publication: fn64_render::ReadyRawDpcCommitCapsule<'_>,
+    ) -> fn64_render::CommittedRawDpcOutcome {
+        self.inner.borrow_mut().publish_raw_dpc(publication)
+    }
+}
+
+/// A submission whose guest commit REJECTS must leave guest RDRAM untouched.
+///
+/// This is the ordering proof for `copy_committed_guest_writes`: it runs
+/// strictly after `commit_guest_render_target_writes` returns `Ok`, so a
+/// commit that panics means no byte was copied. Reversing the two -- copying
+/// first, committing second -- makes this test fail, which is the whole
+/// reason it exists.
+///
+/// Nonclaim: this asserts ordering, not recovery. The dispatch panics either
+/// way; what differs is whether guest memory was already modified when it
+/// did.
+#[test]
+fn a_rejected_guest_commit_leaves_guest_rdram_untouched() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+
+    let (mut backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    let _ = backend.create(&fn64_render::RenderConfig {
+        width: FILL_TARGET_WIDTH,
+        height: FILL_TARGET_HEIGHT,
+        tv_type: fn64_runtime::TvType::default(),
+    });
+    let inner = std::rc::Rc::new(std::cell::RefCell::new(backend));
+    set_render_backend(
+        Box::new(OverReportingBackend {
+            inner: std::rc::Rc::clone(&inner),
+        }),
+        rdram.len(),
+    );
+    set_raw_dpc_session(session);
+
+    let poisoned = poison_fill_target(&mut rdram);
+
+    // The dispatch must panic: the duplicated write list fails against the
+    // packet's own guest-write journal, and that rejection is not caught.
+    let words = whole_target_fill_words();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_words(&mut rdram, &words);
+    }));
+    assert!(
+        outcome.is_err(),
+        "an over-reported guest-write list must be rejected loudly by the commit, not accepted"
+    );
+
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        poisoned[..],
+        "the commit rejected, so the copyback must never have run -- every target byte must \
+         still be poison. A copy placed BEFORE the commit fails here."
+    );
     teardown();
 }

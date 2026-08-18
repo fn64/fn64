@@ -1955,6 +1955,37 @@ pub trait RenderBackend {
         Vec::new()
     }
 
+    /// The exact bytes behind each `CompletedWrite`
+    /// [`Self::staged_guest_render_target_writes`] reported for `submission`,
+    /// in the identical order, for a caller that has ALREADY committed that
+    /// list. This is the RDRAM-copyback transport, and it is deliberately a
+    /// second method rather than bytes added to `CompletedWrite`: that type
+    /// is `Copy`, shared across every backend, and its premise is that a
+    /// backend proves *what* it wrote without shipping the bytes through the
+    /// verification path. Widening it would break that premise everywhere.
+    ///
+    /// Element `i` must be exactly `writes[i].byte_count()` bytes whose
+    /// [`ir_effect_content_digest`] equals `writes[i].content()`. The caller
+    /// re-derives that digest before copying anything, so a backend returning
+    /// the wrong bytes for a correctly-committed range is caught loudly at
+    /// the copy site rather than silently corrupting guest memory. The digest
+    /// in the committed write is the authority; these bytes are the payload
+    /// it already vouched for.
+    ///
+    /// An empty list means this backend has no bytes for `submission` --
+    /// either it staged none, or the token has already been consumed. A
+    /// caller that committed a nonempty write list and then receives an empty
+    /// byte list must treat that as a defect, not as "nothing to copy".
+    ///
+    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        let _ = submission;
+        Vec::new()
+    }
+
     /// Jointly publish `publication`'s fabric commit, this backend's own
     /// already-prepared physical state, and the `Published` terminal
     /// outcome. The default panics -- see the module-level comment above for
