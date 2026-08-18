@@ -11,6 +11,38 @@
 //! conservative admitted subset; partial/unequal sample-lane behavior remains
 //! deferred to hardware measurement. RT64 is not physical-memory authority
 //! for this reader.
+//!
+//! ## Committed and proposed byte sources
+//!
+//! Every read here is expressed against [`TmemByteSource`] -- the exact
+//! three-method surface the reader ever touched on `PhysicalTmemState`
+//! (`identity`/`generation`, collapsed into one `snapshot()`, plus
+//! `valid_byte`). Two sources implement it and they are **not**
+//! interchangeable identities:
+//!
+//! - [`PhysicalTmemState`] answers with a
+//!   [`TmemSnapshotIdentity::Committed`] naming its own durable
+//!   `(state, generation)` pair.
+//! - [`super::PendingTmemImage`] -- the post-image of a sealed but
+//!   unpublished [`super::PendingTmemTransaction`] -- answers with a
+//!   [`TmemSnapshotIdentity::Proposed`] naming that transaction's
+//!   `proposal_identity` and its binding.
+//!
+//! That split is the whole reason a pending read is admissible at all. A
+//! pending post-image has no durable `(state, generation)` of its own:
+//! `binding.state` still names the *base* state and
+//! `binding.next_generation` names a generation that does not exist yet and
+//! never will if publication is rejected. Answering a pending read with
+//! that pair would mint a `PhysicalTmemSnapshotIdentity` for a snapshot
+//! nothing ever published -- a forged receipt, indistinguishable downstream
+//! from a real one. `TmemSnapshotIdentity` makes the two cases distinct
+//! *types* of answer instead, so no consumer can silently accept a proposal
+//! where it required a publication.
+//!
+//! The decode, addressing, validity, XOR4, RGBA32-bank, and TLUT logic is
+//! shared verbatim between the two: there is exactly one
+//! [`read_texel`] and the committed entry point
+//! [`read_committed_texel`] is a thin monomorphization of it.
 
 use core::fmt;
 
@@ -19,9 +51,11 @@ use crate::{ImageFormat, PixelSize, TextureLutMode};
 use super::{
     decode_direct_texel, decode_tlut_entry, resolve_indexed_texel, unpack_ci4_texel, Ci4Palette,
     Ci4PaletteError, Ci4UnpackError, DecodedTexel, DirectTexelDecodeError,
-    IndexedTexelResolveError, PhysicalTmemState, PhysicalTmemStateIdentity, RawTexel,
-    RawTexelError, ResolvedIndexedTexel, TexelColumnParity, TileDescriptor, TlutEntryDecodeError,
+    IndexedTexelResolveError, PhysicalTmemState, PhysicalTmemStateIdentity,
+    PhysicalTmemTransactionIdentity, RawTexel, RawTexelError, ResolvedIndexedTexel,
+    TexelColumnParity, TileDescriptor, TlutEntryDecodeError,
 };
+use fn64_render_ir::ContentDigest;
 
 const TMEM_ADDRESS_MASK: u64 = 0x0fff;
 const TMEM_LOW_HALF_MASK: u64 = 0x07ff;
@@ -91,15 +125,146 @@ impl PhysicalTmemSnapshotIdentity {
     }
 }
 
-/// One decoded color bound to the durable physical-TMEM snapshot it read.
+/// Identity of a proposed, not-yet-published physical-TMEM post-image.
+///
+/// Deliberately **not** a `PhysicalTmemSnapshotIdentity`. A pending
+/// transaction's post-image is not a durable state: it carries the *base*
+/// state's identity and a `next_generation` that no `PhysicalTmemState`
+/// holds yet. Naming it with the durable snapshot type would let a
+/// proposal's receipt compare equal to a publication's, which is exactly
+/// the confusion the committed/pending split exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProposedTmemImageIdentity {
+    proposal: ContentDigest,
+    base_state: PhysicalTmemStateIdentity,
+    transaction: PhysicalTmemTransactionIdentity,
+    next_generation: u64,
+}
+
+impl ProposedTmemImageIdentity {
+    pub(super) const fn new(
+        proposal: ContentDigest,
+        base_state: PhysicalTmemStateIdentity,
+        transaction: PhysicalTmemTransactionIdentity,
+        next_generation: u64,
+    ) -> Self {
+        Self {
+            proposal,
+            base_state,
+            transaction,
+            next_generation,
+        }
+    }
+
+    /// The sealed transaction's own `proposal_identity` content digest --
+    /// the same value `validate_proposal` recomputes and `publish`
+    /// re-checks, so a proposal receipt cannot outlive a mutation of the
+    /// proposal it names.
+    pub const fn proposal(self) -> ContentDigest {
+        self.proposal
+    }
+
+    /// The state this transaction staged *from*. Not the state a
+    /// publication would produce -- that state does not exist yet.
+    pub const fn base_state(self) -> PhysicalTmemStateIdentity {
+        self.base_state
+    }
+
+    pub const fn transaction(self) -> PhysicalTmemTransactionIdentity {
+        self.transaction
+    }
+
+    /// The generation a successful publication *would* reach. Carried for
+    /// diagnosis only; it names nothing observable until publication.
+    pub const fn next_generation(self) -> u64 {
+        self.next_generation
+    }
+}
+
+/// Which kind of physical-TMEM image one read observed.
+///
+/// The two variants are the whole committed/pending distinction, reified.
+/// A consumer that requires durable state matches `Committed` and rejects
+/// `Proposed` by name; a consumer executing inside the staging window
+/// accepts `Proposed` and records the proposal it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TmemSnapshotIdentity {
+    Committed(PhysicalTmemSnapshotIdentity),
+    Proposed(ProposedTmemImageIdentity),
+}
+
+impl TmemSnapshotIdentity {
+    /// The durable snapshot this read observed, or `None` when it observed
+    /// a proposal instead. Deliberately an `Option` rather than a
+    /// synthesized snapshot: there is no durable snapshot to return for a
+    /// proposal, and manufacturing one is the forgery this type prevents.
+    pub const fn committed(self) -> Option<PhysicalTmemSnapshotIdentity> {
+        match self {
+            Self::Committed(snapshot) => Some(snapshot),
+            Self::Proposed(_) => None,
+        }
+    }
+
+    pub const fn proposed(self) -> Option<ProposedTmemImageIdentity> {
+        match self {
+            Self::Proposed(identity) => Some(identity),
+            Self::Committed(_) => None,
+        }
+    }
+
+    pub const fn is_committed(self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+}
+
+/// The complete surface [`read_texel`] observes on a physical-TMEM image.
+///
+/// Exactly the three things the reader ever asked `PhysicalTmemState` for,
+/// no more: its snapshot identity, and one byte's validity-gated value.
+/// Keeping the surface this narrow is what makes a pending post-image a
+/// legal source without relaxing anything -- a pending image answers
+/// `valid_byte` from the same `bytes`/`valid` arrays a publication would
+/// install, so the two agree byte-for-byte by construction, and differ only
+/// in what they claim about *durability*.
+pub trait TmemByteSource {
+    /// This image's identity. Committed for durable state, proposed for a
+    /// sealed-but-unpublished transaction post-image.
+    fn snapshot(&self) -> TmemSnapshotIdentity;
+
+    /// Returns a byte only when its latest complete-word touch defined it.
+    /// Out-of-range and invalid storage are both unobservable, identically
+    /// for both sources.
+    fn valid_byte(&self, address: u16) -> Option<u8>;
+}
+
+impl TmemByteSource for PhysicalTmemState {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Committed(PhysicalTmemSnapshotIdentity::new(
+            self.identity(),
+            self.generation(),
+        ))
+    }
+
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        PhysicalTmemState::valid_byte(self, address)
+    }
+}
+
+/// One decoded color bound to the physical-TMEM image it read.
+///
+/// Named `DecodedPhysicalTexel` unchanged, but its `snapshot` is now a
+/// [`TmemSnapshotIdentity`]: a caller that previously read
+/// `texel.snapshot()` and required a durable pair now reads
+/// `texel.snapshot().committed()` and handles the proposal case, rather
+/// than being handed a fabricated durable pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedPhysicalTexel {
-    snapshot: PhysicalTmemSnapshotIdentity,
+    snapshot: TmemSnapshotIdentity,
     texel: DecodedTexel,
 }
 
 impl DecodedPhysicalTexel {
-    pub const fn snapshot(self) -> PhysicalTmemSnapshotIdentity {
+    pub const fn snapshot(self) -> TmemSnapshotIdentity {
         self.snapshot
     }
 
@@ -236,9 +401,28 @@ pub fn read_committed_texel(
     addressed: AddressedTmemTexel,
     lut_mode: TextureLutMode,
 ) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
+    read_texel(state, tile, addressed, lut_mode)
+}
+
+/// The one texel reader, over any [`TmemByteSource`].
+///
+/// [`read_committed_texel`] above is this function at
+/// `S = PhysicalTmemState`, and a pending post-image read is this function
+/// at `S = super::PendingTmemImage`. There is deliberately no second copy
+/// of the addressing, validity, XOR4, RGBA32-bank, or TLUT logic: a
+/// pending read that disagreed with a committed read of the same bytes
+/// would be a defect no test comparing the two could distinguish from a
+/// deliberate difference, so the two cases are made incapable of
+/// disagreeing rather than checked for agreement.
+pub fn read_texel<S: TmemByteSource + ?Sized>(
+    state: &S,
+    tile: TileDescriptor,
+    addressed: AddressedTmemTexel,
+    lut_mode: TextureLutMode,
+) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
     let kind = preflight(tile, lut_mode)?;
     validate_address_scope(tile, addressed, lut_mode, kind)?;
-    let snapshot = PhysicalTmemSnapshotIdentity::new(state.identity(), state.generation());
+    let snapshot = state.snapshot();
     let texel = match kind {
         ReadKind::Direct => {
             let raw = read_raw_texel(state, tile, addressed)?;
@@ -293,8 +477,8 @@ fn validate_address_scope(
     Ok(())
 }
 
-fn read_raw_texel(
-    state: &PhysicalTmemState,
+fn read_raw_texel<S: TmemByteSource + ?Sized>(
+    state: &S,
     tile: TileDescriptor,
     addressed: AddressedTmemTexel,
 ) -> Result<RawTexel, PhysicalTexelReadError> {
@@ -323,7 +507,7 @@ fn read_raw_texel(
         )
         .map_err(Into::into),
         PixelSize::Bits16 => {
-            let bytes = read_linear_bytes::<2>(state, tile, addressed)?;
+            let bytes = read_linear_bytes::<2, S>(state, tile, addressed)?;
             RawTexel::try_new(PixelSize::Bits16, u32::from(u16::from_be_bytes(bytes)))
                 .map_err(Into::into)
         }
@@ -340,8 +524,8 @@ fn read_raw_texel(
     }
 }
 
-fn read_linear_bytes<const N: usize>(
-    state: &PhysicalTmemState,
+fn read_linear_bytes<const N: usize, S: TmemByteSource + ?Sized>(
+    state: &S,
     tile: TileDescriptor,
     addressed: AddressedTmemTexel,
 ) -> Result<[u8; N], PhysicalTexelReadError> {
@@ -356,14 +540,17 @@ fn read_linear_bytes<const N: usize>(
     Ok(bytes)
 }
 
-fn read_valid_byte(state: &PhysicalTmemState, address: u16) -> Result<u8, PhysicalTexelReadError> {
+fn read_valid_byte<S: TmemByteSource + ?Sized>(
+    state: &S,
+    address: u16,
+) -> Result<u8, PhysicalTexelReadError> {
     state
         .valid_byte(address)
         .ok_or(PhysicalTexelReadError::InvalidTexelByte { address })
 }
 
-fn read_canonical_tlut_entry(
-    state: &PhysicalTmemState,
+fn read_canonical_tlut_entry<S: TmemByteSource + ?Sized>(
+    state: &S,
     byte_address: u16,
 ) -> Result<RawTexel, PhysicalTexelReadError> {
     let mut bytes = [0; 8];

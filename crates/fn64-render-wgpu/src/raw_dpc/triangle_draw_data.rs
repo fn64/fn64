@@ -400,6 +400,7 @@ mod tests {
             vertices,
             source: TriangleSource::RawTriangle,
             viewport: None,
+            texrect_accesses: None,
         }
     }
 

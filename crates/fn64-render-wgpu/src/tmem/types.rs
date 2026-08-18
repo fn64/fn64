@@ -142,6 +142,14 @@ pub struct TileAddressMode {
 }
 
 impl TileAddressMode {
+    /// Builds the mode from already-decoded mirror/clamp flags, for callers
+    /// holding `fn64_render`'s neutral `NeutralTileAddressMode` mirror
+    /// rather than the raw two-bit wire field. Same two flags,
+    /// already separated by the decoder -- not a second decode.
+    pub const fn from_mirror_clamp(mirror: bool, clamp: bool) -> Self {
+        Self { mirror, clamp }
+    }
+
     pub(crate) const fn from_wire(value: u8) -> Self {
         Self {
             mirror: value & 1 != 0,
@@ -174,6 +182,34 @@ pub struct TileDescriptor {
 }
 
 impl TileDescriptor {
+    /// Builds a descriptor from already-decoded parts, for callers holding
+    /// `fn64_render`'s neutral `NeutralTileDescriptor` mirror rather than
+    /// the raw wire words.
+    ///
+    /// Identical field set and identical argument order to
+    /// [`Self::from_wire`] -- deliberately the same shape, so the two
+    /// cannot drift into describing different tiles. `from_wire` stays
+    /// crate-private (it is the decoder's own seam); this one is public
+    /// because the neutral mirrors cross a crate boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_neutral_parts(
+        format: ImageFormat,
+        size: PixelSize,
+        line_words: u16,
+        tmem: TmemWordAddress,
+        palette: u8,
+        t: TileAddressMode,
+        mask_t: u8,
+        shift_t: u8,
+        s: TileAddressMode,
+        mask_s: u8,
+        shift_s: u8,
+    ) -> Self {
+        Self::from_wire(
+            format, size, line_words, tmem, palette, t, mask_t, shift_t, s, mask_s, shift_s,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn from_wire(
         format: ImageFormat,
@@ -257,6 +293,17 @@ pub struct TileSize {
 }
 
 impl TileSize {
+    /// Neutral-mirror counterpart to [`Self::from_wire`]; see
+    /// [`TileDescriptor::from_neutral_parts`] for why this pair exists.
+    pub const fn from_coordinates(
+        low_s: TileCoordinate,
+        low_t: TileCoordinate,
+        high_s: TileCoordinate,
+        high_t: TileCoordinate,
+    ) -> Self {
+        Self::from_wire(low_s, low_t, high_s, high_t)
+    }
+
     pub(crate) const fn from_wire(
         low_s: TileCoordinate,
         low_t: TileCoordinate,
