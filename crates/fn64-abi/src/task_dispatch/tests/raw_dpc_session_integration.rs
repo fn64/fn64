@@ -945,3 +945,486 @@ fn a_fill_followed_by_a_full_sync_admits_both_independently() {
     );
     teardown();
 }
+
+// ---------------------------------------------------------------------
+// What the production seam actually PRODUCES, in pixels.
+//
+// Every sibling test above asserts that a dispatch *completed* -- no
+// pending fabric transaction, the right commit branch taken, guest RDRAM
+// untouched. None of them asserts the resident color-target content the
+// fill published, because `set_render_backend` takes a
+// `Box<dyn RenderBackend>` and `fn64-abi` never downcasts it
+// (`lifecycle.rs`'s `apply_render_runtime_settings` doc: "The backend
+// remains owned here; callers do not downcast it", and DECOUPLING.md's
+// backend-agnostic rule). So "the dispatch succeeded" and "the dispatch
+// produced the right bytes" were, until this test, two different claims
+// with only the first one proven.
+//
+// The observation seam is a delegating backend holding a shared handle to
+// the real `WgpuBackend`, registered in its place. It adds no behavior:
+// every method forwards. That keeps the production plan/execute/publish
+// conveyor and the paired `RawDpcAbiSession` authority exactly as they
+// are -- the session is still the one `WgpuBackend::try_new` split off,
+// so `RawDpcBackendAuthority::begin_plan`'s paired-queue assertion still
+// gates this path -- while leaving the test a second reference through
+// which to read `color_targets()` after dispatch returns.
+// ---------------------------------------------------------------------
+
+/// A `RenderBackend` that is exactly its inner `WgpuBackend`, reached
+/// through a shared handle so a test can still observe the backend after
+/// `set_render_backend` has taken ownership of the box.
+///
+/// Delegation is total and unconditional: there is no interception, no
+/// recording, and no fallback arm. Anything this type could add would make
+/// the thing under test something other than `WgpuBackend`.
+struct ObservingBackend {
+    inner: std::rc::Rc<std::cell::RefCell<fn64_render_wgpu::WgpuBackend>>,
+}
+
+impl fn64_render::RenderBackend for ObservingBackend {
+    fn create(&mut self, cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().create(cfg)
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        self.inner.borrow_mut().observe_non_rdp_write16(write)
+    }
+
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        self.inner
+            .borrow_mut()
+            .process_task(rdram, rsp_memory, task, output_addr)
+    }
+
+    fn present(
+        &mut self,
+        request: fn64_render::PresentRequest<'_>,
+    ) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().present(request)
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        self.inner.borrow_mut().resize(w, h);
+    }
+
+    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+        // The inner backend's own answer is the empty slice
+        // (`production.rs`'s `supported_ucodes`), which is `'static` and so
+        // can be returned through this borrow-free signature. A backend
+        // returning a non-'static slice could not be wrapped this way; that
+        // limitation is this seam's, not the production path's, and no
+        // raw-DPC dispatch consults this method.
+        &[]
+    }
+
+    fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
+        self.inner.borrow().raw_dpc_ir_capability()
+    }
+
+    fn plan_raw_dpc(
+        &mut self,
+        request: fn64_render::RawDpcPlanRequest,
+    ) -> Result<fn64_render::PlannedRawDpcSubmission, fn64_render::RenderError> {
+        self.inner.borrow_mut().plan_raw_dpc(request)
+    }
+
+    fn execute_raw_dpc(
+        &mut self,
+        bound: fn64_render::BoundSubmittedRawDpc,
+    ) -> Result<fn64_render::BackendPreparedRawDpc, fn64_render::RenderError> {
+        self.inner.borrow_mut().execute_raw_dpc(bound)
+    }
+
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<fn64_render::ir::CompletedWrite> {
+        self.inner
+            .borrow_mut()
+            .staged_guest_render_target_writes(submission)
+    }
+
+    fn publish_raw_dpc(
+        &mut self,
+        publication: fn64_render::ReadyRawDpcCommitCapsule<'_>,
+    ) -> fn64_render::CommittedRawDpcOutcome {
+        self.inner.borrow_mut().publish_raw_dpc(publication)
+    }
+}
+
+/// Register an `ObservingBackend` over a real `WgpuBackend`, configured for
+/// fills exactly as `register_session_backend_for_fills` configures its
+/// own. Returns the shared handle the test reads published content through.
+fn register_observed_session_backend_for_fills(
+    rdram_len: usize,
+) -> std::rc::Rc<std::cell::RefCell<fn64_render_wgpu::WgpuBackend>> {
+    let (mut backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    // Allowed to fail on an adapterless host, exactly as
+    // `register_session_backend_for_fills` documents: `create_inner`
+    // records the configured extent BEFORE it requests a device, and the
+    // fill path this test measures is entirely CPU-side.
+    let _ = backend.create(&fn64_render::RenderConfig {
+        width: FILL_TARGET_WIDTH,
+        height: FILL_TARGET_HEIGHT,
+        tv_type: fn64_runtime::TvType::default(),
+    });
+    let inner = std::rc::Rc::new(std::cell::RefCell::new(backend));
+    set_render_backend(
+        Box::new(ObservingBackend {
+            inner: std::rc::Rc::clone(&inner),
+        }),
+        rdram_len,
+    );
+    set_raw_dpc_session(session);
+    inner
+}
+
+/// The RGBA16 halfword an RDP fill-cycle writes at target column `x`, hand-
+/// derived from the fill-color word rather than read back from the port.
+///
+/// Two independent derivations, reconciled by the caller (§3.2 of
+/// `docs/RT64-PORT-CARD-BRIEF.md`: never assert a derived value one way
+/// only). This is derivation 1 -- the direct RDP semantics:
+///
+/// A `SetFillColor` word holds TWO packed RGBA5551 halfwords when the color
+/// image is 16-bit. The RDP emits the HIGH halfword at even target columns
+/// and the LOW halfword at odd ones (`decode_fill_cycle_pixel`'s "period 2"
+/// for RGBA16). The halfword is then stored big-endian.
+///
+/// The port takes a detour this derivation does not: it expands each 5-bit
+/// channel to 8 bits (`expand_five`: `v << 3 | v >> 2`), then repacks by
+/// truncating back (`>> 3`). That round trip is the IDENTITY on 5 bits --
+/// `((v << 3 | v >> 2) >> 3) == v` for all v in 0..32, because the low two
+/// bits `v >> 2` occupy positions below the `>> 3` truncation. The 1-bit
+/// alpha does the same through 0/255 and `>> 7`. So the emitted halfword is
+/// the source halfword unchanged, and this function need not model the
+/// expansion at all. `expanded_round_trip_is_the_identity_on_five_bits`
+/// below proves that exhaustively rather than by assertion.
+fn expected_fill_halfword(fill_color: u32, x: u32) -> u16 {
+    if x % 2 == 0 {
+        (fill_color >> 16) as u16
+    } else {
+        fill_color as u16
+    }
+}
+
+/// Derivation 2, independent of `expected_fill_halfword`: model the port's
+/// own expand-then-truncate path literally, channel by channel, and let the
+/// test reconcile the two. If either derivation is wrong they disagree, and
+/// the disagreement is the finding -- §3.2's discipline, and the same shape
+/// that caught `08c10916`'s one-nibble mask error by construction.
+fn expected_fill_halfword_via_expansion(fill_color: u32, x: u32) -> u16 {
+    let halfword = if x % 2 == 0 {
+        (fill_color >> 16) as u16
+    } else {
+        fill_color as u16
+    };
+    let expand_five = |value: u8| -> u8 { (value << 3) | (value >> 2) };
+    let red = expand_five(((halfword >> 11) & 0x1f) as u8);
+    let green = expand_five(((halfword >> 6) & 0x1f) as u8);
+    let blue = expand_five(((halfword >> 1) & 0x1f) as u8);
+    let alpha: u8 = if halfword & 1 != 0 { 255 } else { 0 };
+    (u16::from(red >> 3) << 11)
+        | (u16::from(green >> 3) << 6)
+        | (u16::from(blue >> 3) << 1)
+        | u16::from(alpha >> 7)
+}
+
+/// The exhaustive proof `expected_fill_halfword`'s doc leans on: the port's
+/// 5-bit expand-then-truncate round trip is the identity, so the simple
+/// derivation and the expansion-modelling one cannot diverge for any input.
+///
+/// Proven over all 2^16 halfwords at both column parities -- not spot-
+/// checked. §3.4's lesson: an arbitrary witness would have supported
+/// collapsing these two helpers into one, which is exactly what must not
+/// happen.
+#[test]
+fn expanded_round_trip_is_the_identity_on_five_bits() {
+    for raw in 0..=u16::MAX {
+        let fill_color = (u32::from(raw) << 16) | u32::from(raw);
+        for x in [0u32, 1] {
+            assert_eq!(
+                expected_fill_halfword(fill_color, x),
+                expected_fill_halfword_via_expansion(fill_color, x),
+                "the two independent derivations must agree for halfword {raw:#06x} at x={x}"
+            );
+        }
+    }
+}
+
+/// **The measurement this module was missing.** A whole-target
+/// `FillRectangle` driven through the real `dispatch_dpc_submission`
+/// producer seam, with a real `WgpuBackend` registered as the live
+/// `RenderBackend`, publishes a resident color target whose every byte
+/// matches a hand-derived RDP fill-cycle expectation.
+///
+/// The expectation is built from `SET_FILL_COLOR`'s own word and the RGBA16
+/// even/odd column rule, not captured from a run. `FILL_COLOR` is chosen so
+/// its two packed halfwords DIFFER (`0x0842` vs `0x1085`): a port that
+/// ignored column parity, or that used the wrong half, would produce a
+/// uniform image and fail here. A single-halfword fill color could not
+/// distinguish those cases.
+#[test]
+fn a_dispatched_fill_publishes_the_hand_derived_rgba16_target_content() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    // No target is resident before the dispatch: whatever this test reads
+    // afterwards was produced by the dispatch, not left over from setup.
+    assert!(
+        backend.borrow().color_targets().is_none(),
+        "no color target may exist before the first admitted fill"
+    );
+
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the fill must publish, leaving no pending fabric transaction"
+    );
+
+    let expected: Vec<u8> = (0..FILL_TARGET_HEIGHT)
+        .flat_map(|_| {
+            (0..FILL_TARGET_WIDTH)
+                .flat_map(|x| expected_fill_halfword(FILL_COLOR, x).to_be_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    assert_eq!(
+        expected.len(),
+        FILL_TARGET_BYTES,
+        "the hand-derived image must cover the whole 16x8 RGBA16 target"
+    );
+
+    let handle = backend.borrow();
+    let registry = handle
+        .color_targets()
+        .expect("an admitted whole-target fill must have built the color-target registry");
+    let residents = registry.residents();
+    assert_eq!(
+        residents.len(),
+        1,
+        "exactly one color target -- the fill's own SetColorImage address -- may be resident"
+    );
+    let resident = &residents[0];
+    assert_eq!(
+        resident.key().address().get(),
+        FILL_TARGET_ADDR,
+        "the resident must be keyed to the SetColorImage address the command stream named"
+    );
+    assert_eq!(
+        resident.generation(),
+        fn64_render_wgpu::TargetGeneration::FIRST,
+        "a first publication must be generation FIRST, not an advanced one"
+    );
+    assert_eq!(
+        resident.device_bytes().device_bytes(),
+        expected.as_slice(),
+        "every published byte must equal the hand-derived RDP fill-cycle image"
+    );
+
+    // The two halfwords really are distinct in the output, so the assertion
+    // above discriminated column parity rather than passing on a uniform
+    // image that any parity rule would produce.
+    assert_eq!(&expected[0..2], &0x0842u16.to_be_bytes(), "even column");
+    assert_eq!(&expected[2..4], &0x1085u16.to_be_bytes(), "odd column");
+
+    drop(handle);
+    teardown();
+}
+
+/// The second half of the same measurement: a partial-width fill over an
+/// already-resident target advances the generation and rewrites EXACTLY the
+/// rectangle it claimed, leaving every byte outside it at the previous
+/// generation's content.
+///
+/// The rectangle is `x` in 4..=14, `y` in 2..=4 -- deliberately not row- or
+/// column-aligned to the target, so a port that collapsed three strided row
+/// accesses into one contiguous range would overwrite the untouched
+/// columns and fail here.
+#[test]
+fn a_dispatched_partial_fill_rewrites_exactly_its_own_rectangle() {
+    const FIRST_FILL_COLOR: u32 = 0x0842_1085;
+    const SECOND_FILL_COLOR: u32 = 0x213c_4d59;
+    // Mirrors `partial_width_fill_words`'s own `fill_rectangle(4, 2, 14, 4)`.
+    const X0: u32 = 4;
+    const X1: u32 = 14;
+    const Y0: u32 = 2;
+    const Y1: u32 = 4;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    dispatch_words(&mut rdram, &partial_width_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "both fills must publish, leaving no pending fabric transaction"
+    );
+
+    // Hand-derived: start from the whole-target image, then overwrite only
+    // the claimed rectangle's pixels with the second fill's color, using
+    // the same TARGET-relative (not rectangle-relative) column parity the
+    // RDP applies -- `decode_fill_cycle_pixel`'s `x` is the target column.
+    let mut expected: Vec<u8> = (0..FILL_TARGET_HEIGHT)
+        .flat_map(|_| {
+            (0..FILL_TARGET_WIDTH)
+                .flat_map(|x| expected_fill_halfword(FIRST_FILL_COLOR, x).to_be_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    for y in Y0..=Y1 {
+        for x in X0..=X1 {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            expected[offset..offset + 2]
+                .copy_from_slice(&expected_fill_halfword(SECOND_FILL_COLOR, x).to_be_bytes());
+        }
+    }
+
+    let handle = backend.borrow();
+    let residents = handle
+        .color_targets()
+        .expect("the registry must exist after two admitted fills")
+        .residents();
+    assert_eq!(residents.len(), 1, "both fills target the same address");
+    let resident = &residents[0];
+    assert_eq!(
+        resident.generation().get(),
+        fn64_render_wgpu::TargetGeneration::FIRST.get() + 1,
+        "a second publication to the same key must advance exactly one generation"
+    );
+    assert_eq!(
+        resident.device_bytes().device_bytes(),
+        expected.as_slice(),
+        "the partial fill must rewrite exactly its rectangle and preserve every other byte"
+    );
+
+    // Row 1 is entirely outside the rectangle and must still carry the
+    // first fill's image -- the discriminator against a collapsed range.
+    let row1 = (FILL_TARGET_WIDTH * 2) as usize;
+    assert_eq!(
+        &resident.device_bytes().device_bytes()[row1..row1 + 4],
+        &expected[row1..row1 + 4],
+        "row 1 is outside the rectangle and must be untouched"
+    );
+    // Column 0 of row 2 is inside the rectangle's rows but left of x0, so a
+    // width-collapsed write would have clobbered it.
+    let row2 = (FILL_TARGET_WIDTH * 2 * 2) as usize;
+    assert_eq!(
+        &resident.device_bytes().device_bytes()[row2..row2 + 2],
+        &expected_fill_halfword(FIRST_FILL_COLOR, 0).to_be_bytes(),
+        "column 0 of row 2 is left of the rectangle and must keep the first fill's pixel"
+    );
+
+    drop(handle);
+    teardown();
+}
+
+/// A fill whose left edge is at an ODD target column, which the two tests
+/// above cannot reach.
+///
+/// This exists because a mutation exposed a hole in their reach, not because
+/// it looked thorough. Replacing `execute_fill_rectangle`'s
+/// `target_x0 = row.first_pixel() % extent.width()` with a literal `0` --
+/// i.e. decoding the fill color at RECTANGLE-relative rather than
+/// TARGET-relative columns, the exact confusion `decode_fill_cycle_pixel`'s
+/// doc warns about ("target-relative, not rectangle-relative") -- survived
+/// both of them. It survived because their rectangles start at x0 = 0 and
+/// x0 = 4, and RGBA16 fill-cycle decoding has period 2: 0 and 4 have the
+/// same parity, so the correct and mutated column indices select the same
+/// halfword at every pixel. The mutant was equivalent for those fixtures
+/// only, never in general.
+///
+/// x0 = 5 has odd parity, so target-relative and rectangle-relative
+/// decoding disagree at every pixel in the rectangle, and the mutant dies.
+fn odd_origin_fill_words() -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_color_image_rgba16());
+    words.extend(set_fill_color(0x213c_4d59));
+    words.extend(fill_rectangle(5, 1, 11, 3));
+    words
+}
+
+#[test]
+fn a_dispatched_odd_origin_fill_decodes_at_target_relative_columns() {
+    const FIRST_FILL_COLOR: u32 = 0x0842_1085;
+    const SECOND_FILL_COLOR: u32 = 0x213c_4d59;
+    // Mirrors `odd_origin_fill_words`'s own `fill_rectangle(5, 1, 11, 3)`.
+    const X0: u32 = 5;
+    const X1: u32 = 11;
+    const Y0: u32 = 1;
+    const Y1: u32 = 3;
+
+    assert_eq!(X0 % 2, 1, "the whole point of this fixture is an odd x0");
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    dispatch_words(&mut rdram, &odd_origin_fill_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "both fills must publish, leaving no pending fabric transaction"
+    );
+
+    let mut expected: Vec<u8> = (0..FILL_TARGET_HEIGHT)
+        .flat_map(|_| {
+            (0..FILL_TARGET_WIDTH)
+                .flat_map(|x| expected_fill_halfword(FIRST_FILL_COLOR, x).to_be_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    for y in Y0..=Y1 {
+        for x in X0..=X1 {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            expected[offset..offset + 2]
+                .copy_from_slice(&expected_fill_halfword(SECOND_FILL_COLOR, x).to_be_bytes());
+        }
+    }
+
+    let handle = backend.borrow();
+    let residents = handle
+        .color_targets()
+        .expect("the registry must exist after two admitted fills")
+        .residents();
+    let published = residents[0].device_bytes().device_bytes();
+    assert_eq!(
+        published,
+        expected.as_slice(),
+        "an odd-origin fill must decode its fill color at TARGET-relative columns"
+    );
+
+    // The discriminator, stated positively: the rectangle's FIRST pixel sits
+    // at an odd target column, so it must carry the LOW halfword of the fill
+    // color. Rectangle-relative decoding would have called it column 0 and
+    // written the HIGH halfword there.
+    let first = ((Y0 * FILL_TARGET_WIDTH + X0) * 2) as usize;
+    assert_eq!(
+        &published[first..first + 2],
+        &(SECOND_FILL_COLOR as u16).to_be_bytes(),
+        "the rectangle's first pixel is at an odd target column and takes the low halfword"
+    );
+    assert_ne!(
+        &published[first..first + 2],
+        &((SECOND_FILL_COLOR >> 16) as u16).to_be_bytes(),
+        "the two halfwords must differ here, or this assertion could not discriminate"
+    );
+
+    drop(handle);
+    teardown();
+}
