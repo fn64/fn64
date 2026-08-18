@@ -133,6 +133,12 @@ fn main() {
         });
         println!("cargo:rustc-cfg=fn64_cpu_runtime");
         println!("cargo:rustc-cfg=fn64_game_linked");
+        // Build-time provenance for the startup stack banner (src/stack.rs).
+        // A run's lane comes from the cfg above, but "which game" is only
+        // knowable HERE: nothing in the linked binary records what was fed to
+        // this script. Baking it in costs one env var and lets a symptom
+        // report carry its own cell.
+        emit_stack_provenance(&host_lookup.display().to_string());
         return;
     }
 
@@ -231,6 +237,7 @@ fn main() {
 
     // The game symbols are now linkable: turn on the boot/window path.
     println!("cargo:rustc-cfg=fn64_game_linked");
+    emit_stack_provenance(&recompiled_dir.display().to_string());
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
@@ -240,6 +247,21 @@ fn main() {
         bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
+}
+
+/// Bake the build's game provenance into the binary for `src/stack.rs`'s
+/// startup banner: WHERE the linked bodies came from, and WHICH ROM this build
+/// validated. Both are build-time facts that no runtime read can recover --
+/// `RECOMPILED_DIR` may be unset, changed, or point somewhere else by the time
+/// the binary runs, while the bodies compiled into it do not change.
+///
+/// `option_env!` on the reader side means a content-free build simply has
+/// neither, which is the honest answer there.
+fn emit_stack_provenance(game_source: &str) {
+    println!("cargo:rustc-env=FN64_SHELL_GAME_SOURCE={game_source}");
+    if let Ok(rom) = env::var("ROM") {
+        println!("cargo:rustc-env=FN64_SHELL_BUILD_ROM={rom}");
+    }
 }
 
 fn required_env(name: &str, hint: &str) -> PathBuf {
