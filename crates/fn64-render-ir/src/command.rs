@@ -810,9 +810,27 @@ fn stream_debug(
         .finish()
 }
 
+/// This crate's own copy of the RDP command-width table.
+///
+/// Duplicated, not shared, and the duplication is structural rather than an
+/// oversight: `fn64_render::raw_rdp_command_width` is the fuller-documented
+/// owner, but `fn64-render` depends on `fn64-render-ir` and not the other
+/// way round, so this crate cannot import it. The two must stay in step.
+/// `fn64-render-wgpu`'s
+/// `rt64_rdp_state::tests::the_two_command_width_tables_agree_wherever_both_are_defined`
+/// cross-checks against a third (RT64's), and
+/// `the_ir_and_render_width_tables_agree` below pins this pair specifically.
+///
+/// `0x1f` is carved out of the otherwise-rejected `0x10..=0x23` block on
+/// measured evidence: WM2000 writes it to terminate every graphics
+/// submission (`docs/RT64-WM2000-CENSUS.md` §3). Widened as one id, not the
+/// block, so the region keeps working as a mis-synchronization detector --
+/// see `fn64_render::raw_rdp_command_width`'s `RDP_STREAM_TERMINATOR_NOOP`
+/// for the full argument, which is not restated here.
 fn raw_rdp_command_width(command: u8) -> Option<u32> {
     Some(match command & 0x3f {
         0x00..=0x07 => 8,
+        0x1f => 8,
         0x08 => 32,
         0x09 => 48,
         0x0a => 96,
@@ -837,6 +855,53 @@ mod tests {
             .iter()
             .flat_map(|opcode| [u32::from(*opcode) << 24, 0])
             .collect()
+    }
+
+    /// The width table's accepted domain, pinned exactly.
+    ///
+    /// This crate cannot import `fn64_render::raw_rdp_command_width` (the
+    /// dependency runs the other way), so the two copies cannot be compared
+    /// directly here. What this test can do -- and does -- is make the shape
+    /// of *this* copy explicit, so a change on either side shows up as a
+    /// failing assertion rather than as a silent divergence discovered by a
+    /// game that stops decoding.
+    ///
+    /// The `0x1f` carve-out is asserted alongside its immediate neighbours
+    /// deliberately: "0x1f is accepted" alone would also hold if the whole
+    /// `0x10..=0x23` block had been widened, which is exactly the change the
+    /// narrow carve-out exists to avoid.
+    #[test]
+    fn the_width_table_accepts_exactly_its_documented_domain() {
+        // The measured carve-out, under every wire prefix.
+        for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+            assert_eq!(
+                raw_rdp_command_width(prefix | 0x1f),
+                Some(8),
+                "WM2000's measured stream terminator must be accepted"
+            );
+        }
+        // The rest of the deliberately-rejected block still rejects.
+        for command in 0x10u8..=0x23 {
+            if command == 0x1f {
+                continue;
+            }
+            assert_eq!(
+                raw_rdp_command_width(command),
+                None,
+                "command {command:#04x} must stay rejected; the carve-out is one id wide"
+            );
+        }
+        // Spot-check the surrounding regions so a mangled range boundary is
+        // caught rather than assumed intact.
+        assert_eq!(raw_rdp_command_width(0x00), Some(8));
+        assert_eq!(raw_rdp_command_width(0x07), Some(8));
+        assert_eq!(raw_rdp_command_width(0x08), Some(32));
+        assert_eq!(raw_rdp_command_width(0x24), Some(16));
+        assert_eq!(raw_rdp_command_width(0x25), Some(16));
+        assert_eq!(raw_rdp_command_width(0x26), Some(8));
+        assert_eq!(raw_rdp_command_width(0x27), Some(8));
+        assert_eq!(raw_rdp_command_width(0x28), Some(8));
+        assert_eq!(raw_rdp_command_width(0x3f), Some(8));
     }
 
     #[test]
