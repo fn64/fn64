@@ -1037,6 +1037,17 @@ pub fn push_decoded_raw_dpc(
                 // plain `Box<[u32]>` field shape -- a rectangle's wire words
                 // are a handful of `u32`s, so this is not a hot-path
                 // allocation concern.
+                // The rectangle's destination writes come first, so
+                // `writer.accesses` stays in the decoder's own order: the
+                // decoder pushed these at the point it decoded this command,
+                // and `ExactRawDpcPlanWriter::finish` compares the two lists
+                // position by position. The slice is the decoder's own,
+                // never re-derived here -- the same contract
+                // `push_fill_rectangle`'s doc states.
+                let texrect_accesses = resource_plan
+                    .bind_texture_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                writer.push_texture_rectangle_accesses(texrect_accesses);
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.clone().into_boxed_slice(),
