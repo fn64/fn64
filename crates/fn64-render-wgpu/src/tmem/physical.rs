@@ -1867,31 +1867,67 @@ fn validate_gpu(
     Ok(())
 }
 
-/// Every proposed write must appear in `reported` at the same position with
-/// identical content -- no reorder, no substitution, no extra or missing
-/// write. `BackendEffectReport` exposes no queue/submission/workload
-/// identity to cross-check here; its own `try_new` already proved `reported`
-/// is exactly the write set its packet's journal declares.
+/// Every proposed write must appear in `reported` **in the same relative
+/// order** with identical content -- no reorder, no substitution, no missing
+/// or duplicated proposed write. `BackendEffectReport` exposes no
+/// queue/submission/workload identity to cross-check here; its own `try_new`
+/// already proved `reported` is exactly the write set its packet's journal
+/// declares, in that journal's own order.
+///
+/// **Order-preserving subsequence, not whole-list equality.** This method's
+/// own doc header already promised that "other declared backend writes may
+/// appear around the TMEM writes"; until the mixed fill+TMEM card, this
+/// function contradicted that promise with a positional `zip` over equal
+/// lengths, and no in-tree caller produced a mixed report to expose the
+/// contradiction. A packet interleaving an admitted `FillRectangle`'s
+/// `RenderTarget` writes with this transaction's `TmemLoadDestination`
+/// writes reports both, in the journal's own order; only the TMEM subset is
+/// this transaction's to vouch for, and the fill's writes are neither
+/// proposed here nor absent from the report.
+///
+/// This is exactly the walk `validate_gpu` above already performs against
+/// `GpuCompleteTicket::backend_writes` for the same proposed list -- the two
+/// now agree on what "the report contains my proposed writes" means, where
+/// before they disagreed by the strictness of one `zip`.
+///
+/// Relaxing the length equality does NOT relax the rejection: a report built
+/// for a genuinely different transaction still fails, now by name
+/// (`missing proposed write`) rather than by count. Nothing that was
+/// rejected becomes accepted -- a superset in journal order is admitted, an
+/// omission, a reorder, a substitution and a duplicate are each still a
+/// named error.
 fn validate_backend_effects(
     reported: &[CompletedWrite],
     proposed: &[CompletedWrite],
 ) -> Result<(), PhysicalTmemError> {
-    if reported.len() != proposed.len() {
+    if reported.len() < proposed.len() {
         return Err(PhysicalTmemError::BackendEffectMismatch {
             field: "write count",
         });
     }
-    for (actual, expected) in reported.iter().zip(proposed) {
-        if actual.access() != expected.access() {
-            return Err(PhysicalTmemError::BackendEffectMismatch {
-                field: "write access",
-            });
-        }
-        if actual != expected {
+    let mut cursor = 0;
+    for expected in proposed.iter().copied() {
+        let matching = reported[cursor..]
+            .iter()
+            .position(|actual| actual.access() == expected.access())
+            .map(|offset| cursor + offset)
+            .ok_or(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write",
+            })?;
+        if reported[matching] != expected {
             return Err(PhysicalTmemError::BackendEffectMismatch {
                 field: "write content",
             });
         }
+        if reported[matching + 1..]
+            .iter()
+            .any(|actual| actual.access() == expected.access())
+        {
+            return Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "duplicate proposed access",
+            });
+        }
+        cursor = matching + 1;
     }
     Ok(())
 }
@@ -3037,6 +3073,123 @@ mod tests {
             })
         ));
         assert_eq!(state.generation(), 0);
+    }
+
+    /// The relaxation `validate_backend_effects` took for the mixed
+    /// fill+TMEM card, tested directly at the function -- because no
+    /// legitimately-constructed `BackendEffectReport` can express these
+    /// shapes (`try_new` validates against the packet's own journal first),
+    /// and the mixed-packet path that exercises the relaxation lives two
+    /// crates up.
+    ///
+    /// The relaxation is: `reported` may be a strict SUPERSET of `proposed`,
+    /// in the journal's own order, so a composed packet's interleaved
+    /// `RenderTarget` writes do not read as this transaction's omission.
+    /// Every other divergence must still be a named rejection -- these
+    /// cases are what proves the weakening was surgical rather than a hole.
+    ///
+    /// Each case was confirmed to be a real kill: removing the
+    /// `missing proposed write` arm left the whole 4990-test suite green
+    /// before this test existed (a measured mutation survivor), which is
+    /// why it is pinned here.
+    #[test]
+    fn backend_effects_admit_a_superset_in_order_and_reject_everything_else() {
+        fn tmem_write(operation: u32, start: u32, domain: &[u8]) -> CompletedWrite {
+            CompletedWrite::try_new(
+                ResourceAccess::try_new(
+                    OperationId::new(operation),
+                    AccessMode::Write,
+                    AccessPurpose::TmemLoadDestination,
+                    ResourceRegion::Tmem(TmemRange::try_new(start, start + 8).unwrap()),
+                )
+                .unwrap(),
+                8,
+                ContentDigest::hash(domain, &[]),
+            )
+            .unwrap()
+        }
+        fn render_target_write(operation: u32) -> CompletedWrite {
+            let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+            CompletedWrite::try_new(
+                ResourceAccess::try_new(
+                    OperationId::new(operation),
+                    AccessMode::Write,
+                    AccessPurpose::RenderTarget,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        range: layout.range(0x2000, 0x2010).unwrap(),
+                    },
+                )
+                .unwrap(),
+                16,
+                ContentDigest::hash(b"fill-bytes", &[]),
+            )
+            .unwrap()
+        }
+
+        let first = tmem_write(1, 0, b"first");
+        let second = tmem_write(3, 8, b"second");
+        let proposed = vec![first, second];
+        let fill = render_target_write(2);
+
+        // Exactly the proposed list: accepted, as before the relaxation.
+        assert!(validate_backend_effects(&proposed, &proposed).is_ok());
+
+        // The relaxation itself: a fill's write INTERLEAVED between the two
+        // TMEM writes, in journal order. This is the shape a composed
+        // fill+TMEM packet reports, and the whole point of the change.
+        assert!(
+            validate_backend_effects(&[first, fill, second], &proposed).is_ok(),
+            "a superset carrying another source's write between two proposed ones, in order, \
+             must be admitted -- this is exactly the composed fill+TMEM report"
+        );
+        // And with the fill's write before and after the pair.
+        assert!(validate_backend_effects(&[fill, first, second], &proposed).is_ok());
+        assert!(validate_backend_effects(&[first, second, fill], &proposed).is_ok());
+
+        // A MISSING proposed write is still rejected by name. This is the
+        // arm whose removal survived the suite before this test existed.
+        assert!(matches!(
+            validate_backend_effects(&[first, fill], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write"
+            })
+        ));
+        assert!(matches!(
+            validate_backend_effects(&[fill], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write count"
+            })
+        ));
+
+        // A REORDER of two proposed writes is still rejected. The walk is
+        // order-preserving: once `second` is matched, `first` can no longer
+        // be found ahead of the cursor.
+        assert!(matches!(
+            validate_backend_effects(&[second, first], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write"
+            })
+        ));
+
+        // WRONG CONTENT at a matched access is still rejected.
+        let second_wrong = tmem_write(3, 8, b"tampered");
+        assert!(matches!(
+            validate_backend_effects(&[first, second_wrong], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write content"
+            })
+        ));
+
+        // A DUPLICATE of a proposed access is still rejected -- the same
+        // TMEM range written twice is not a superset, it is ambiguity about
+        // which write this transaction vouched for.
+        assert!(matches!(
+            validate_backend_effects(&[first, second, second], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "duplicate proposed access"
+            })
+        ));
     }
 
     #[test]
