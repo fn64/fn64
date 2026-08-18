@@ -7437,4 +7437,228 @@ mod tests {
              -- the TMEM half staged before the fill half failed, and staging is not publishing"
         );
     }
+
+    // --- TextureRectangle composition frontier (this card's measurement) ---
+
+    /// One `TextureRectangle` command's 4-word wire payload, mirroring
+    /// `raw_dpc::production_adapter::tests::texrect_words` exactly (that
+    /// helper is private to its own module's tests, so this is a local,
+    /// identical copy -- the same convention `triangle_base_edge_words`
+    /// above already follows).
+    ///
+    /// Deliberately sized to land inside the 16x8 `FILL_TARGET_*` image
+    /// this module's fill fixtures use, rather than reusing the sibling's
+    /// 48x48 rectangle: a rectangle larger than the target would confound
+    /// "declares no write" with "declares a write outside the target".
+    fn texrect_words_in_target(tile: u32) -> [u32; 4] {
+        // 10.2 fixed point, matching `fill_rectangle` above: x 4..=11,
+        // y 2..=4, wholly inside the 16x8 RGBA16 target.
+        let ulx: u32 = 4 << 2;
+        let uly: u32 = 2 << 2;
+        let lrx: u32 = 11 << 2;
+        let lry: u32 = 4 << 2;
+        let dsdx: u32 = 0x0100;
+        let dtdy: u32 = 0x0100;
+        [
+            word(0x24, (lrx << 12) | lry),
+            (tile & 0x7) << 24 | (ulx << 12) | uly,
+            0,
+            (dsdx << 16) | dtdy,
+        ]
+    }
+
+    /// A TMEM load, then a `TextureRectangle` sampling the tile it loaded --
+    /// the WM2000-title-screen shape this card was dispatched to admit.
+    fn tmem_then_texrect_words() -> Vec<u32> {
+        let mut words = one_load_block_words();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(texrect_words_in_target(7));
+        words
+    }
+
+    /// The composed shape: whole-target fill, a TMEM load, then a
+    /// `TextureRectangle` sampling it.
+    fn fill_tmem_and_texrect_words() -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        words.extend(one_load_block_words());
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(texrect_words_in_target(7));
+        words
+    }
+
+    /// The number of `TriangleSource::TextureRectangle` triangles this
+    /// stream admits, measured through the same plan walk execution uses --
+    /// not re-derived from the wire words, which would be a second
+    /// independent model of the same fact.
+    fn admitted_texture_rectangle_triangles(words: Vec<u32>) -> usize {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &mut session, words);
+        let read_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, read_capture).unwrap();
+
+        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None);
+        let mut color_targets = None;
+        let configured_target_extent = backend.configured_target_extent;
+        let coordinator = &backend.coordinator;
+        let mut view = ExecutionCollector {
+            plan: PlanCollector::seeded(None, None, None, None, None, None),
+            reads: Vec::new(),
+            outcome: None,
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            physical: coordinator.physical(),
+            color_targets: &mut color_targets,
+            configured_target_extent,
+        };
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+        view.plan
+            .triangles
+            .iter()
+            .filter(|draw| {
+                draw.as_ref()
+                    .map(|draw| draw.source == TriangleSource::TextureRectangle)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Positive control for the two tests below: these fixtures really do
+    /// carry an admitted `TextureRectangle`, admitted as exactly two
+    /// `TriangleSource::TextureRectangle` triangles.
+    ///
+    /// Without this, "appending a texrect changes no declared write" and
+    /// "fill + texrect is refused" would both still pass against a fixture
+    /// whose texrect had silently vanished from the stream -- measured, not
+    /// hypothesised: deleting the `texrect_words_in_target` line from
+    /// `fill_tmem_and_texrect_words` left both of those tests green until
+    /// this control existed (mutant D in this card's report).
+    #[test]
+    fn the_texrect_fixtures_really_do_admit_a_texture_rectangle() {
+        assert_eq!(
+            admitted_texture_rectangle_triangles(one_load_block_words()),
+            0,
+            "the TMEM-only control must admit no texture-rectangle triangles"
+        );
+        for (label, words) in [
+            ("tmem_then_texrect", tmem_then_texrect_words()),
+            ("fill_tmem_and_texrect", fill_tmem_and_texrect_words()),
+        ] {
+            assert_eq!(
+                admitted_texture_rectangle_triangles(words),
+                2,
+                "{label} must admit exactly two TextureRectangle-sourced triangles -- one \
+                 rectangle is two triangles, and zero would mean the fixture lost its texrect"
+            );
+        }
+    }
+
+    /// **The structural question this card was dispatched to answer, measured
+    /// rather than reasoned: a `TextureRectangle` declares NO journal write
+    /// access at all.**
+    ///
+    /// The card's premise was that a texrect, unlike a triangle, "writes the
+    /// color image -- so it should have a declared access to compose onto".
+    /// It does not. `raw_dpc::production_adapter`'s `TextureRectangle` arm
+    /// admits the command as exactly two `push_triangle` calls
+    /// (`TriangleSource::TextureRectangle`), and `push_triangle` binds no
+    /// resource access; the only two access producers in the whole decoder
+    /// are `bind_fill_rectangle` and `bind_tmem_transfer`
+    /// (`raw_dpc::mod`'s `push_access` has exactly those two callers).
+    ///
+    /// So a texrect is, to the journal, indistinguishable from a triangle:
+    /// there is no declared write to compose onto, and
+    /// `merged_fill_and_tmem_writes`' journal-derived order -- which is the
+    /// whole mechanism the fill+TMEM composition rests on -- has nothing to
+    /// place. This is measured here so the next card starts from the fact
+    /// rather than the premise.
+    #[test]
+    fn a_texture_rectangle_declares_no_journal_write_access() {
+        // A TMEM load alone declares its TMEM destination write.
+        let tmem_only = declared_write_purposes(one_load_block_words());
+        assert!(
+            !tmem_only.is_empty(),
+            "the TMEM-only control must declare at least one write, or this test cannot \
+             discriminate 'texrect declares nothing' from 'the probe sees nothing'"
+        );
+        assert!(
+            tmem_only
+                .iter()
+                .all(|(_, purpose)| *purpose == AccessPurpose::TmemLoadDestination),
+            "the TMEM-only control must declare only TMEM destination writes, got {tmem_only:?}"
+        );
+
+        // The SAME stream with a texture rectangle appended declares exactly
+        // the same writes -- the texrect contributed none.
+        let with_texrect = declared_write_purposes(tmem_then_texrect_words());
+        assert_eq!(
+            with_texrect, tmem_only,
+            "appending a TextureRectangle must not change the declared write list -- if this \
+             ever fails, a texrect has gained a journal write access and the composition this \
+             card was dispatched to build becomes tractable"
+        );
+
+        // And a fill's write is still the ONLY RenderTarget write in a
+        // fill+TMEM+texrect stream: the texrect adds nothing to compose.
+        let composed = declared_write_purposes(fill_tmem_and_texrect_words());
+        let render_target_writes = composed
+            .iter()
+            .filter(|(_, purpose)| *purpose == AccessPurpose::RenderTarget)
+            .count();
+        let fill_only_render_target_writes = declared_write_purposes(whole_target_fill_words())
+            .iter()
+            .filter(|(_, purpose)| *purpose == AccessPurpose::RenderTarget)
+            .count();
+        assert_eq!(
+            render_target_writes, fill_only_render_target_writes,
+            "a texrect must contribute zero RenderTarget writes -- the fill's own count is the \
+             whole of the composed stream's"
+        );
+    }
+
+    /// The consequence, pinned as a loud refusal: a fill composed with a
+    /// `TextureRectangle` is refused by the SAME named
+    /// `MixedFillAndTrianglePacket` variant a fill+triangle packet is,
+    /// because a texrect *is* two triangles by the time `stage_and_report`
+    /// sees it.
+    ///
+    /// This is the precise blocker for a WM2000 title-screen frame. Frame 0
+    /// of WM2000 is 60 `G_TEXRECT` + 60 `G_FILLRECT` and zero triangles
+    /// (`docs/RT64-WM2000-CENSUS.md`), so every one of its packets that
+    /// carries both is refused here. The refusal is correct -- there is no
+    /// journal order to compose off -- and it is what must change before a
+    /// title-screen frame can execute.
+    #[test]
+    fn a_fill_composed_with_a_texture_rectangle_is_refused_by_name() {
+        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+
+        let mut fill_and_texrect = whole_target_fill_words();
+        fill_and_texrect.extend(set_other_mode(0, 0));
+        fill_and_texrect.extend(set_combine(0, 0));
+        fill_and_texrect.extend(texrect_words_in_target(7));
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_texrect);
+        let error = result.expect_err(
+            "fill + texrect must be refused -- a texrect declares no journal write, so there \
+             is no declared order to compose it onto the fill with",
+        );
+        assert!(
+            error.to_string().contains(&refused),
+            "the refusal must be the named MixedFillAndTrianglePacket variant, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused fill+texrect composition must leave no redeemable fill token behind"
+        );
+        assert!(
+            backend.color_targets().is_none(),
+            "the refusal must fire before the fill executor ever built the registry"
+        );
+    }
 }
