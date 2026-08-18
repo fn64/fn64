@@ -211,8 +211,16 @@ pub struct Row {
 pub fn rows() -> Vec<Row> {
     let mut out = Vec::new();
     for (lane, table, namer) in [
-        ("GBI", &GBI_COUNTS, gbi_name as fn(u8) -> Option<&'static str>),
-        ("RDP", &RDP_COUNTS, raw_rdp_lane_name as fn(u8) -> Option<&'static str>),
+        (
+            "GBI",
+            &GBI_COUNTS,
+            gbi_name as fn(u8) -> Option<&'static str>,
+        ),
+        (
+            "RDP",
+            &RDP_COUNTS,
+            raw_rdp_lane_name as fn(u8) -> Option<&'static str>,
+        ),
     ] {
         let mut lane_rows: Vec<Row> = (0u16..256)
             .filter_map(|byte| {
@@ -262,8 +270,16 @@ fn report_inner(announce: bool) {
         "# fn64 GBI/RDP opcode census\n# decode_entries\t{}\n",
         decode_entries()
     ));
-    let gbi_total: u64 = rows.iter().filter(|r| r.lane == "GBI").map(|r| r.count).sum();
-    let rdp_total: u64 = rows.iter().filter(|r| r.lane == "RDP").map(|r| r.count).sum();
+    let gbi_total: u64 = rows
+        .iter()
+        .filter(|r| r.lane == "GBI")
+        .map(|r| r.count)
+        .sum();
+    let rdp_total: u64 = rows
+        .iter()
+        .filter(|r| r.lane == "RDP")
+        .map(|r| r.count)
+        .sum();
     text.push_str(&format!(
         "# gbi_lane_commands\t{gbi_total}\n# rdp_lane_commands\t{rdp_total}\n"
     ));
@@ -346,7 +362,10 @@ pub mod texrect {
                 return false;
             }
             if !INIT.swap(true, Ordering::Relaxed) {
-                ENABLED.store(crate::debug_flag("FN64_GBI_TEXRECT_CENSUS"), Ordering::Relaxed);
+                ENABLED.store(
+                    crate::debug_flag("FN64_GBI_TEXRECT_CENSUS"),
+                    Ordering::Relaxed,
+                );
             }
             ENABLED.load(Ordering::Relaxed)
         }
@@ -738,7 +757,278 @@ pub mod texrect {
                 classify(&mode, CycleType::OneCycle),
                 CombinerClass::TexelPassthrough
             );
-            assert_eq!(classify(&mode, CycleType::TwoCycle), CombinerClass::RealWork);
+            assert_eq!(
+                classify(&mode, CycleType::TwoCycle),
+                CombinerClass::RealWork
+            );
+        }
+    }
+}
+
+/// Raw RDP command-word dump for a chosen decode entry.
+///
+/// The opcode histogram above records *which* commands a decode entry
+/// issued and the [`texrect`] probe records their cycle/combiner metadata,
+/// but neither carries the command words themselves. A backend cannot be
+/// fed a histogram. This module records the exact `(w0, w1)` pairs
+/// `decode_stream_impl` dispatched on, so a real packet the game issued can
+/// be replayed through a different backend rather than approximated by a
+/// synthetic stand-in.
+///
+/// The words recorded are the ones the decoder dispatched on, taken at the
+/// same site [`note`] counts from and from the same `(w0, w1)` bindings, so
+/// a histogram row and a dumped word pair cannot disagree about what was
+/// decoded. On the raw-RDP lane those are the wire words unmodified
+/// (`decode_stream_impl` passes `(wire_w0, wire_w1)` straight through when
+/// `raw_rdp`); on the GBI lane they are post-normalization, which is what
+/// dispatch saw.
+///
+/// Armed by `FN64_GBI_PACKET_DUMP`, independently of [`on`], and bounded by
+/// construction: `FN64_GBI_PACKET_DUMP_ENTRIES` names the decode entries to
+/// capture (comma-separated, zero-based, matching the per-entry delta
+/// indices the opcode census reports). Unset means entry 0 only. Nothing
+/// outside that set is stored, so the dump does not grow with the run --
+/// the reason the [`texrect`] probe needs its own separate knob does not
+/// apply here.
+///
+/// `FN64_GBI_PACKET_DUMP_OUT` names the sink; otherwise the dump goes to
+/// stderr.
+pub mod packet {
+    use super::{AtomicU64, Ordering};
+
+    #[cfg(not(test))]
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(not(test))]
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    #[cfg(not(test))]
+    static INIT: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the packet dump is armed. Always off under `cfg(test)`, for
+    /// the same reason [`super::on`] is: a unit test must not observe an
+    /// ambient `FN64_*` knob.
+    pub fn on() -> bool {
+        #[cfg(test)]
+        {
+            false
+        }
+        #[cfg(not(test))]
+        {
+            if crate::speculative_observations_suppressed() {
+                return false;
+            }
+            if !INIT.swap(true, Ordering::Relaxed) {
+                ENABLED.store(crate::debug_flag("FN64_GBI_PACKET_DUMP"), Ordering::Relaxed);
+            }
+            ENABLED.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Parse the entry-selection list. Comma-separated zero-based decode
+    /// entry indices; an empty or unset value selects entry 0 alone.
+    ///
+    /// Parsing is total: a malformed element is a hard error rather than a
+    /// silently dropped selection, because a dump that quietly captured a
+    /// different entry than the operator asked for would be worse than no
+    /// dump -- every downstream claim names the entry.
+    pub fn parse_entry_selection(raw: &str) -> Vec<u64> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return vec![0];
+        }
+        trimmed
+            .split(',')
+            .map(|field| {
+                field.trim().parse::<u64>().unwrap_or_else(|e| {
+                    panic!(
+                        "FN64_GBI_PACKET_DUMP_ENTRIES element {field:?} is not a decode entry \
+                         index: {e}"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(not(test))]
+    static SELECTION: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+
+    fn selected_entries() -> &'static [u64] {
+        #[cfg(test)]
+        {
+            &[]
+        }
+        #[cfg(not(test))]
+        {
+            SELECTION.get_or_init(|| {
+                parse_entry_selection(
+                    &std::env::var("FN64_GBI_PACKET_DUMP_ENTRIES").unwrap_or_default(),
+                )
+            })
+        }
+    }
+
+    /// One dumped command: the decode entry it belongs to, the lane, the
+    /// RDRAM address the word pair was read from, and the pair itself.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Command {
+        pub entry: u64,
+        pub raw_rdp: bool,
+        pub pc: usize,
+        pub w0: u32,
+        pub w1: u32,
+    }
+
+    static ROWS: std::sync::Mutex<Vec<Command>> = std::sync::Mutex::new(Vec::new());
+    /// Commands the dump was offered, counted whether or not the row vector
+    /// took them, so a poisoned lock cannot silently shrink the denominator.
+    static OFFERED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one dispatched command's word pair, if its decode entry is
+    /// selected.
+    ///
+    /// `w0`/`w1` must be the same bindings `decode_stream_impl` dispatched
+    /// on -- not a re-read of RDRAM -- so the dumped bytes and the counted
+    /// opcode are two views of one value rather than two reads that could
+    /// diverge.
+    pub fn note(pc: usize, w0: u32, w1: u32, raw_rdp: bool) {
+        if !on() {
+            return;
+        }
+        let entry = super::decode_entries().saturating_sub(1);
+        if !selected_entries().contains(&entry) {
+            return;
+        }
+        OFFERED.fetch_add(1, Ordering::Relaxed);
+        let row = Command {
+            entry,
+            raw_rdp,
+            pc,
+            w0,
+            w1,
+        };
+        if let Ok(mut guard) = ROWS.lock() {
+            guard.push(row);
+        }
+    }
+
+    /// Record a variable-width command's continuation words.
+    ///
+    /// [`note`] fires at the dispatch site, which sees only the leading
+    /// `(w0, w1)` pair -- but `G_TEXRECT` is 16 bytes, and its second pair
+    /// carries the S/T origin and the per-pixel gradients. A dump missing
+    /// them would replay as a rectangle with fabricated texture
+    /// coordinates, which is a synthetic stand-in wearing a real packet's
+    /// opcode. Called from the arm that decodes the continuation, with the
+    /// same words that arm decoded.
+    ///
+    /// The continuation is appended as its own row at `pc + 8`, so the
+    /// dumped rows reconstruct the wire byte stream in address order with
+    /// no gaps -- the property a replay depends on and that the reader can
+    /// check from the `pc` column alone.
+    pub fn note_continuation(pc: usize, w2: u32, w3: u32, raw_rdp: bool) {
+        note(pc, w2, w3, raw_rdp);
+    }
+
+    pub fn rows() -> Vec<Command> {
+        ROWS.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn offered() -> u64 {
+        OFFERED.load(Ordering::Relaxed)
+    }
+
+    /// Render the dump as TSV: a summary comment block, then one row per
+    /// command in dispatch order.
+    ///
+    /// The word pair is the payload; `pc` and the entry index are what make
+    /// a row auditable against the opcode census, which reports per-entry
+    /// deltas over the same entry numbering.
+    pub fn render() -> String {
+        let rows = rows();
+        let mut text = String::new();
+        text.push_str("# fn64 raw RDP command-word dump\n");
+        text.push_str(&format!("# commands_offered\t{}\n", offered()));
+        text.push_str(&format!("# commands_recorded\t{}\n", rows.len()));
+        let selection: Vec<String> = selected_entries().iter().map(u64::to_string).collect();
+        text.push_str(&format!("# entries_selected\t{}\n", selection.join(",")));
+        for entry in selected_entries() {
+            let count = rows.iter().filter(|r| r.entry == *entry).count();
+            text.push_str(&format!("# entry\t{entry}\t{count}\n"));
+        }
+        text.push_str("entry\tlane\tpc\tw0\tw1\n");
+        for row in &rows {
+            text.push_str(&format!(
+                "{}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\n",
+                row.entry,
+                if row.raw_rdp { "RDP" } else { "GBI" },
+                row.pc,
+                row.w0,
+                row.w1
+            ));
+        }
+        text
+    }
+
+    /// Emit [`render`] to `FN64_GBI_PACKET_DUMP_OUT`, or to stderr when that
+    /// names no path. A no-op when the dump is off.
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        let text = render();
+        match std::env::var("FN64_GBI_PACKET_DUMP_OUT") {
+            Ok(path) if !path.is_empty() => {
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("[FN64_GBI_PACKET_DUMP] failed to write {path}: {e}");
+                    eprint!("{text}");
+                }
+            }
+            _ => eprint!("{text}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The default selection is entry 0 alone, and it is reached by an
+        /// unset var and by an empty one alike -- an operator who exports
+        /// the knob to the empty string gets the documented default rather
+        /// than an empty selection that captures nothing.
+        #[test]
+        fn an_absent_or_empty_selection_means_entry_zero() {
+            assert_eq!(parse_entry_selection(""), vec![0]);
+            assert_eq!(parse_entry_selection("   "), vec![0]);
+        }
+
+        /// A list is parsed in the order written, duplicates and all: the
+        /// dump's `# entry` summary lines are emitted per selection element,
+        /// so reordering them would reorder the report.
+        #[test]
+        fn a_selection_list_parses_in_order() {
+            assert_eq!(parse_entry_selection("0,1,2"), vec![0, 1, 2]);
+            assert_eq!(parse_entry_selection(" 7 , 3 "), vec![7, 3]);
+            assert_eq!(parse_entry_selection("5"), vec![5]);
+        }
+
+        /// A malformed element aborts rather than being dropped. A dropped
+        /// element would silently capture a different entry set than the
+        /// operator named, and every claim downstream names the entry.
+        #[test]
+        #[should_panic(expected = "is not a decode entry index")]
+        fn a_malformed_selection_element_is_a_hard_error() {
+            parse_entry_selection("0,notanumber");
+        }
+
+        /// The probe is inert under `cfg(test)`, so no unit test in this
+        /// crate can be perturbed by an ambient `FN64_GBI_PACKET_DUMP` in
+        /// the developer's environment.
+        #[test]
+        fn the_probe_is_off_under_cfg_test() {
+            assert!(!on());
+            note(0x1000, 0xdead_beef, 0xfeed_face, true);
+            assert_eq!(offered(), 0);
+            assert!(rows().is_empty());
         }
     }
 }
