@@ -77,9 +77,37 @@ no `fn64-render-wgpu` dependency. `FN64_RENDER`
 > producer that converts WM2000's display lists into raw DPC command streams.
 > Neither exists.
 
-### 1a. `present` is not the blocker
+### 1a. `present` is not the blocker for *pixels* — but it IS a hard blocker for *selecting the backend*
 
-Worth stating because it is easy to mis-scope. The shell does not call
+**Corrected 2026-08-17 by measurement.** The paragraph below is right that the
+shell's own window blit never calls `RenderBackend::present`, and that the
+contract a backend must satisfy is the RDRAM copyback. It was wrong to conclude
+from that that `present` can be left refusing: it missed a second, independent
+caller inside `fn64-abi`.
+
+`crates/fn64-abi/src/pi/timing.rs:703` drains every VI retrace into
+`task_dispatch::present_render_backend`
+(`crates/fn64-abi/src/task_dispatch/setup.rs:501`) — its only call site — which
+invokes `RenderBackend::present` through `with_render_backend`
+(`setup.rs:297`). That helper turns any backend error into a `panic!`
+(`setup.rs:325`), by design: "Missing registration and named backend errors are
+one loud failure class". `present` is a required trait method with no default
+(`crates/fn64-render/src/lib.rs:1730`), and `WgpuBackend::present`
+(`crates/fn64-render-wgpu/src/production.rs:1227`) is a named refusal.
+
+Composed, a shell that registered a `WgpuBackend` would abort on its **first VI
+field**, before any rendering question arises. Measured, not inferred, by
+`a_registered_wgpu_backend_panics_on_the_first_vi_present`
+(`crates/fn64-abi/src/task_dispatch/tests/raw_dpc_session_integration.rs`),
+which drives the real `present_render_backend` and asserts on the exact panic
+text: `present_render_backend: render-wgpu backend error: WgpuBackend
+implements only the T3 production raw-DPC seam; presentation is out of scope`.
+
+This is why §5's step 1 does not ship as written — see the note there.
+
+The original observation, still correct as far as it goes:
+
+The shell does not call
 `RenderBackend::present` to get pixels on screen. `Shell::present`
 (`crates/fn64-shell/src/main.rs:574`) reads the VI framebuffer straight out of
 guest RDRAM — `fn64_abi::current_vi_framebuffer()` at `main.rs:579`, the RDRAM
@@ -337,6 +365,15 @@ Concretely, the shortest honest path to that milestone is:
 
 1. Add `fn64-render-wgpu` to `crates/fn64-shell/Cargo.toml` and a
    `FN64_RENDER=wgpu` arm at `crates/fn64-shell/src/main.rs:374-404`.
+   **Blocked, measured 2026-08-17 — do not ship this step first.** The arm is
+   trivial to write, but selecting it aborts the shell on the first VI field
+   for the reason recorded in §1a. `WgpuBackend::present` must stop refusing
+   before a `FN64_RENDER=wgpu` arm can be offered at all; until then the arm
+   would be selectable and immediately fatal. Registration itself is *not* the
+   obstacle: the two-call shell-shaped setup (`set_render_backend` then
+   `set_raw_dpc_session`) does reach the raw-DPC conveyor, proved by
+   `shell_shaped_registration_reaches_the_raw_dpc_session_seam` in the same
+   test module.
 2. Implement a minimal `process_task` on `WgpuBackend` that handles only the
    background-clear prefix of WM2000's display list and copies back to
    `rdram[output_addr..]` (items 1 and 2 of §4, in their narrowest form).
