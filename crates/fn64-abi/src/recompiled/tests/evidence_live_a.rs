@@ -100,6 +100,116 @@ use fn64_cpu_runtime::CodeSpan;
         assert!(message.contains("entry-observation schema"));
     }
 
+    /// The default is complete history, and it must stay complete: the block
+    /// lane's equivalent knob defaults to `None` for the same reason
+    /// (certification evidence needs every entry). This pins the default so a
+    /// bound cannot be introduced silently as a "fix".
+    #[test]
+    fn function_destination_history_is_complete_by_default() {
+        with_host(|host| *host = crate::HostState::default());
+        let identity = ProgramArtifactIdentity::new([0xC4; 32]);
+        set_entry_lookup_with_execution_observation(
+            evidence_lookup,
+            0x100,
+            identity,
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+        );
+
+        for index in 0..64u32 {
+            fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
+                0x8000_0000 + index,
+                "entry",
+            ));
+        }
+
+        assert_eq!(copy_function_execution_destinations().len(), 64);
+    }
+
+    /// A bound retains the MOST RECENT entries and drops the oldest, matching
+    /// `set_block_host_boundary_history_limit`. Asserting the retained vrams
+    /// (not just the length) is what separates "bounded" from "stopped
+    /// recording after N".
+    #[test]
+    fn function_destination_history_limit_retains_the_newest_entries() {
+        with_host(|host| *host = crate::HostState::default());
+        let identity = ProgramArtifactIdentity::new([0xC5; 32]);
+        set_entry_lookup_with_execution_observation(
+            evidence_lookup,
+            0x100,
+            identity,
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+        );
+        set_function_execution_destination_history_limit(std::num::NonZeroUsize::new(4));
+
+        for index in 0..64u32 {
+            fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
+                0x8000_0000 + index,
+                "entry",
+            ));
+        }
+
+        let retained = copy_function_execution_destinations();
+        assert_eq!(retained.len(), 4);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.function.vram)
+                .collect::<Vec<_>>(),
+            vec![0x8000_003C, 0x8000_003D, 0x8000_003E, 0x8000_003F],
+        );
+        set_function_execution_destination_history_limit(None);
+    }
+
+    /// Shrinking the bound trims what is already retained, rather than only
+    /// applying to entries recorded afterwards.
+    #[test]
+    fn function_destination_history_limit_trims_existing_entries() {
+        with_host(|host| *host = crate::HostState::default());
+        let identity = ProgramArtifactIdentity::new([0xC6; 32]);
+        set_entry_lookup_with_execution_observation(
+            evidence_lookup,
+            0x100,
+            identity,
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+        );
+        for index in 0..16u32 {
+            fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
+                0x8000_0000 + index,
+                "entry",
+            ));
+        }
+        assert_eq!(copy_function_execution_destinations().len(), 16);
+
+        set_function_execution_destination_history_limit(std::num::NonZeroUsize::new(3));
+
+        assert_eq!(copy_function_execution_destinations().len(), 3);
+        set_function_execution_destination_history_limit(None);
+    }
+
+    /// Suppression records nothing at all and clears what was retained. The
+    /// paired re-enable proves the switch is not one-way.
+    #[test]
+    fn function_destination_history_can_be_suppressed_and_re_enabled() {
+        with_host(|host| *host = crate::HostState::default());
+        let identity = ProgramArtifactIdentity::new([0xC7; 32]);
+        set_entry_lookup_with_execution_observation(
+            evidence_lookup,
+            0x100,
+            identity,
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+        );
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(0x8000_1000, "a"));
+
+        set_function_execution_destination_history_enabled(false);
+        assert!(copy_function_execution_destinations().is_empty());
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(0x8000_2000, "b"));
+        assert!(copy_function_execution_destinations().is_empty());
+
+        set_function_execution_destination_history_enabled(true);
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(0x8000_3000, "c"));
+        assert_eq!(copy_function_execution_destinations().len(), 1);
+    }
+
 
     #[test]
     fn block_lane_evidence_sorts_regions_and_excludes_builder_pointers() {
