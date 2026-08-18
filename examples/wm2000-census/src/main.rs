@@ -41,6 +41,10 @@
 //! - `FN64_GBI_CENSUS_OUT=<path>` -- write the census TSV there.
 //! - `FN64_GBI_TEXRECT_CENSUS=1` -- arm the per-`G_TEXRECT` cycle-mode probe.
 //! - `FN64_GBI_TEXRECT_CENSUS_OUT=<path>` -- write that probe's TSV there.
+//! - `FN64_GBI_PACKET_DUMP=1` -- arm the raw RDP command-word dump.
+//! - `FN64_GBI_PACKET_DUMP_ENTRIES=<list>` -- comma-separated zero-based
+//!   decode entries to dump (default: entry 0 alone).
+//! - `FN64_GBI_PACKET_DUMP_OUT=<path>` -- write the dump's TSV there.
 
 use std::io::Write;
 
@@ -83,7 +87,6 @@ unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u
     );
     0
 }
-
 
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
@@ -330,9 +333,9 @@ fn main() {
     // without editing the source. Same "must be a positive integer" stance as
     // the FN64_* knobs in fn64-abi.
     let max_steps = match std::env::var("WM2000_MAX_STEPS") {
-        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
-            panic!("WM2000_MAX_STEPS must be a positive integer, got {raw:?}")
-        }),
+        Ok(raw) => raw
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("WM2000_MAX_STEPS must be a positive integer, got {raw:?}")),
         Err(_) => MAX_STEPS,
     };
     // How many consecutive "nothing was runnable, and advancing the
@@ -379,6 +382,11 @@ fn main() {
             // cycle-mode probe: it has no end-of-run report either, because
             // the run does not reach one.
             fn64_render_reference::gbi::census::texrect::report();
+            // And to the packet dump, for the same reason. Its selection is
+            // bounded by decode entry, so unlike the two censuses above it
+            // stops growing once the selected entries are past -- but it
+            // still has to be written before the abort to be written at all.
+            fn64_render_reference::gbi::census::packet::report();
         }
         if steps.is_multiple_of(LOG_EVERY) {
             println!(
@@ -453,7 +461,10 @@ fn main() {
 
     let (gfx_count, audio_count) = fn64_abi::task_counts();
     println!("[wm2000-census] === BOOT SUMMARY ===");
-    println!("[wm2000-census] virtual ticks run: {}", fn64_abi::sim_time());
+    println!(
+        "[wm2000-census] virtual ticks run: {}",
+        fn64_abi::sim_time()
+    );
     println!(
         "[wm2000-census] thread 0 dead: {}",
         fn64_abi::is_thread_dead(0)
