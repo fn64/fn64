@@ -2295,9 +2295,13 @@ mod tests {
     /// Shaped from the census's own per-frame profile (§3): every frame
     /// issues `SyncPipe` many times, `SyncTile` occasionally, a
     /// `FillRectangle`, and exactly one terminator last. Deliberately NOT a
-    /// mixed fill+TMEM packet: the census records `MixedFillAndTmemLoadPacket`
-    /// as a hard refusal at 218/218 frames (`production.rs`), which is its
-    /// own card and must not be smuggled in under this one.
+    /// mixed fill+TMEM packet -- this test is about DECODE, and keeping the
+    /// two concerns apart is what makes a failure here point at the decoder.
+    /// The fill+TMEM composition the census recorded as a hard refusal at
+    /// 218/218 frames is now admitted at execution
+    /// (`production::StagedOutcome::MixedFillAndTmemLoads`), and is proven
+    /// by that module's own tests plus `fn64-abi`'s
+    /// `raw_dpc_session_integration` end-to-end pair.
     ///
     /// The command count is asserted exactly, and the terminator's position
     /// with it: a decoder that treated `0x1f` as a `break` would return 9
