@@ -575,7 +575,13 @@ mod game {
                 pad: PadState::new(),
                 config: InputConfig::load(),
                 gamepads: Gamepads::new(),
-                overlay: Overlay::new(),
+                overlay: {
+                    let mut overlay = Overlay::new();
+                    // FN64_HUD=1 brings the HUD up with the window, so a scripted
+                    // or headless run does not have to synthesize an F3.
+                    overlay.hud = crate::stack::hud_starts_open();
+                    overlay
+                },
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
                 fb_width: FB_WIDTH,
@@ -1290,7 +1296,8 @@ mod game {
         // hint.
         println!(
             "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into ./{}/, override with \
-             {}=<dir>) · F3 stack/fps HUD · F11 fullscreen · Esc exit",
+             {}=<dir>) · F3 stack/fps HUD (FN64_HUD=1 starts it open) · F11 fullscreen · \
+             Esc exit",
             crate::screenshot::resolve_dir(None).display(),
             crate::screenshot::DIR_ENV
         );
