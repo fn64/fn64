@@ -257,6 +257,10 @@ mod game {
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
+        /// Pumps in the current heartbeat window whose interval exceeded one
+        /// 60 Hz field. Counted rather than derived: the percentile summary
+        /// cannot report *how many* frames breached, only where the ranks fell.
+        frame_intervals_over_budget: usize,
         pump_times: TimingWindow,
         present_times: TimingWindow,
         pump_steps_total: u64,
@@ -469,7 +473,9 @@ mod game {
             fn64_abi::set_render_backend(render_backend, rdram.len());
             if let Some(session) = raw_dpc_session {
                 fn64_abi::set_raw_dpc_session(session);
-                println!("[fn64-shell] raw-DPC session registered (wgpu plan/execute/publish seam)");
+                println!(
+                    "[fn64-shell] raw-DPC session registered (wgpu plan/execute/publish seam)"
+                );
             }
             println!("[fn64-shell] render backend registered ({active_renderer}, 320x240)");
 
@@ -542,6 +548,7 @@ mod game {
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
+                frame_intervals_over_budget: 0,
                 pump_times: TimingWindow::default(),
                 present_times: TimingWindow::default(),
                 pump_steps_total: 0,
@@ -784,6 +791,21 @@ mod game {
                         .take_stats()
                         .expect("heartbeat must follow at least one present");
                     let window_hz = 1000.0 / interval.median_ms;
+                    // Choppy and slow are different failures and the median
+                    // cannot tell them apart: a run whose p50 sits exactly on
+                    // the 16.67 ms deadline while its p95 is double it is
+                    // JITTER, not uniform slowness, and the fraction of pumps
+                    // that breach the deadline is the statistic that says
+                    // which. `over_budget` is that fraction; p99/max above are
+                    // already computed by `TimingStats` and were being
+                    // discarded.
+                    let over_budget = self.frame_intervals_over_budget;
+                    let over_budget_pct = if interval.samples > 0 {
+                        100.0 * over_budget as f64 / interval.samples as f64
+                    } else {
+                        0.0
+                    };
+                    self.frame_intervals_over_budget = 0;
                     let average_steps =
                         self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
                     let audio_health = fn64_abi::audio_stream_health();
@@ -818,8 +840,10 @@ mod game {
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                          retrace_hz={cadence} cumulative, window_hz={window_hz:.1}; \
-                         timing_ms median/p95: interval={:.2}/{:.2} pump={:.2}/{:.2} \
-                         present={:.2}/{:.2} (n={}); pump_steps avg/max={average_steps:.1}/{}; audio: \
+                         timing_ms median/p95/p99/max: interval={:.2}/{:.2}/{:.2}/{:.2} \
+                         pump={:.2}/{:.2}/{:.2}/{:.2} present={:.2}/{:.2}/{:.2}/{:.2} (n={}); \
+                         over_budget={over_budget}/{} ({over_budget_pct:.1}% of pumps > 16.67ms); \
+                         pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
                          callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
                          (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
@@ -829,10 +853,17 @@ mod game {
                          guest/stream_hz={audio_rates:?}",
                         interval.median_ms,
                         interval.p95_ms,
+                        interval.p99_ms,
+                        interval.max_ms,
                         pump.median_ms,
                         pump.p95_ms,
+                        pump.p99_ms,
+                        pump.max_ms,
                         present.median_ms,
                         present.p95_ms,
+                        present.p99_ms,
+                        present.max_ms,
+                        interval.samples,
                         interval.samples,
                         self.pump_steps_max,
                         audio.ai_buffers,
@@ -1068,7 +1099,11 @@ mod game {
             let now_t = std::time::Instant::now();
             if now_t >= self.next_frame_deadline {
                 if let Some(previous) = self.last_pump_started.replace(now_t) {
-                    self.frame_intervals.record(now_t.duration_since(previous));
+                    let elapsed = now_t.duration_since(previous);
+                    if elapsed > FRAME {
+                        self.frame_intervals_over_budget += 1;
+                    }
+                    self.frame_intervals.record(elapsed);
                 }
                 let outcome = self.pump_one_frame();
                 self.pump_times.record(now_t.elapsed());
