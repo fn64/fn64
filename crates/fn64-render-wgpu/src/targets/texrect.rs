@@ -45,13 +45,41 @@
 //! [`crate::TextureCoordinateS10_5`] and a float round-trip would introduce
 //! a rounding lane the reader's own fixed-point addressing does not have.
 //!
+//! ## The one-cycle color combiner
+//!
+//! Copy cycle blits the sampled texel; **one-cycle routes it through the
+//! color combiner** ([`crate::combiner::run_one_cycle`]) as `Texel0`, with
+//! `Primitive` and `Environment` supplied from the `G_SETPRIMCOLOR`/
+//! `G_SETENVCOLOR` registers current at the texrect's own stream position.
+//! That evaluator is not new here and is not a second copy: it is the same
+//! public function the triangle pipeline's own WGSL is checked against
+//! (`production.rs`'s real-`WgpuBackend` agreement test), reached through
+//! [`crate::combiner::combiner_inputs_from_fragment_registers`] so both
+//! consumers normalize the constant registers by one assembly.
+//!
+//! Measured, not assumed: WWF WrestleMania 2000's boot-through-attract
+//! window issues 2,520 texrects, **all one-cycle and none Copy**, running
+//! exactly two combiner programs between them, reading only `Texel0`,
+//! `Primitive`, `Environment`, `Zero` and `One`
+//! (`docs/RT64-WM2000-CYCLE-MODES.md` §§1-2). Every other selector --
+//! `Shade`, `Texel1`, `Combined`, the LOD fractions, noise, the chroma key
+//! -- is refused **by name** at [`TexrectShading::try_new`], before any
+//! pixel is produced, so a title that needs one gets a loud error rather
+//! than pixels combined against a zero this executor invented.
+//!
 //! ## Nonclaims
 //!
-//! - **No color combiner.** The sampled texel's RGBA8888 is written to the
-//!   destination directly. One-cycle/two-cycle combiner evaluation, blending,
-//!   alpha compare, dither, and coverage are all outside this executor and
-//!   are refused by name rather than silently approximated
-//!   ([`TexrectExecutionError::UnsupportedCycleType`]).
+//! - **No two-cycle, no Fill cycle.** Both refused by name
+//!   ([`TexrectExecutionError::UnsupportedCycleType`]); two-cycle needs the
+//!   `Combined` carry and a second texel, neither of which this executor
+//!   supplies. Measured absent from the window above.
+//! - **No blending, alpha compare, dither, or coverage.** The combiner's
+//!   output is written to the destination; the blender is a separate stage
+//!   this executor does not run. `run_one_cycle`'s `alphaCompareValue`
+//!   out-parameter is deliberately discarded for that reason.
+//! - **No Shade.** This executor has no vertex-interpolated color to
+//!   supply, so a program reading `Shade` is refused rather than combined
+//!   against zero.
 //! - **No filtering.** Point sampling only. Three-nearest/bilerp exists in
 //!   [`crate::filter_three_nearest_committed_cell`] and is not selected here.
 //! - **No GPU work.** This produces the same [`DeviceColorBytes`] domain the
@@ -80,19 +108,21 @@
 //!
 //! ## Admitted domain
 //!
-//! Copy cycle only; one rectangle per packet; a non-negative, non-empty,
-//! in-target pixel extent; point sampling; texcoords that recover integer
-//! S10.5 endpoints. Everything outside that is a named
+//! Copy cycle and one-cycle; one rectangle per packet; a non-negative,
+//! non-empty, in-target pixel extent; point sampling; texcoords that
+//! recover integer S10.5 endpoints; and, in one-cycle, a combiner program
+//! reading only `Texel0`/`Primitive`/`Environment`/`One`/`Zero` with every
+//! register it reads actually set. Everything outside that is a named
 //! [`TexrectExecutionError`], never an approximation.
 //!
 //! ## Scope status
 //!
-//! DONE for the composed `fill + LoadBlock + texrect` shape this module was
-//! written for, proven end to end into guest RDRAM. One-cycle and two-cycle
-//! texrects are **deliberately not ported** (a scope boundary this slice
-//! chose, not work this module waits on): they need the color combiner
-//! evaluated per fragment, which is a separate executor with its own
-//! evidence.
+//! DONE for the composed `fill + LoadBlock + texrect` shape in **both**
+//! Copy and one-cycle, proven end to end into guest RDRAM for both measured
+//! WM2000 programs. Two-cycle texrects are **deliberately not ported** (a
+//! scope boundary this slice chose, not work this module waits on): zero
+//! occurrences in the measured window, and they need the cross-cycle
+//! `Combined` carry and a second texel.
 //!
 //! ## Open questions
 //!
@@ -103,6 +133,11 @@
 //! for every tile whose first row is even (all this crate's fixtures) and
 //! is a frontier for a tile loaded at an odd row parity.
 
+use crate::combiner::{
+    combiner_inputs_from_fragment_registers, run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput,
+    ColorInputSlot, CombineParams, CombinerInputs,
+};
+use crate::state::{Color4, PrimColor};
 use crate::targets::oracle::DeviceColorBytes;
 use crate::targets::{
     CandidateColorTarget, ColorTargetFormat, ColorTargetKey, CompletedColorTargetWrite,
@@ -266,13 +301,34 @@ impl core::fmt::Display for TexrectAxis {
 /// satisfy. `PartialEq` is what the error genuinely supports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TexrectExecutionError {
-    /// This executor writes the sampled texel straight to the destination,
-    /// so it claims only the cycle types where that is the RDP's own
-    /// behavior. One-cycle and two-cycle run the texel through the color
-    /// combiner, which this slice does not evaluate -- refused by name
-    /// rather than silently drawing an uncombined texel.
+    /// Copy cycle blits the texel; one-cycle runs it through the color
+    /// combiner. Both are executed. Two-cycle needs the `Combined` carry
+    /// and a second texel, and Fill cycle samples no texture at all --
+    /// both refused by name rather than approximated. Measured: WM2000's
+    /// boot-through-attract window issues 2,520 texrects, all one-cycle,
+    /// none two-cycle or Fill (`docs/RT64-WM2000-CYCLE-MODES.md` §1).
     UnsupportedCycleType {
         cycle_type: CycleType,
+    },
+    /// A one-cycle program selected a color input this executor does not
+    /// evaluate. Named rather than substituted: `Shade` combined against a
+    /// zero this executor invented would draw plausible-looking wrong
+    /// pixels, which is the failure mode this refusal exists to prevent.
+    UnsupportedColorInput {
+        slot: ColorInputSlot,
+        input: ColorInput,
+    },
+    /// [`Self::UnsupportedColorInput`]'s alpha counterpart.
+    UnsupportedAlphaInput {
+        slot: AlphaInputSlot,
+        input: AlphaInput,
+    },
+    /// The program reads a constant color register whose wire command has
+    /// not run at this texrect's own stream position. Never defaulted to
+    /// black: an unset register is a stream this executor has not seen,
+    /// not a register that happens to be zero.
+    UnsetConstantRegister {
+        register: TexrectConstantRegister,
     },
     /// A texrect declares no journal write when its destination is not
     /// provable at decode time; reaching the executor with no declared row
@@ -323,8 +379,23 @@ impl core::fmt::Display for TexrectExecutionError {
         match self {
             Self::UnsupportedCycleType { cycle_type } => write!(
                 formatter,
-                "execute_texture_rectangle does not evaluate the color combiner, so it admits \
-                 only Copy cycle; got {cycle_type:?}"
+                "execute_texture_rectangle admits Copy cycle (direct blit) and OneCycle \
+                 (combiner-evaluated); got {cycle_type:?}"
+            ),
+            Self::UnsupportedColorInput { slot, input } => write!(
+                formatter,
+                "execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO \
+                 color inputs; one-cycle slot {slot:?} selects {input:?}"
+            ),
+            Self::UnsupportedAlphaInput { slot, input } => write!(
+                formatter,
+                "execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO \
+                 alpha inputs; one-cycle slot {slot:?} selects {input:?}"
+            ),
+            Self::UnsetConstantRegister { register } => write!(
+                formatter,
+                "the one-cycle combiner program reads the {register} register, but no {register} \
+                 command has run at this texrect's own stream position"
             ),
             Self::NoDeclaredRows => formatter.write_str(
                 "execute_texture_rectangle was given no declared destination rows; a texrect \
@@ -469,6 +540,201 @@ fn neutral_pixel_size(size: fn64_render::NeutralPixelSize) -> PixelSize {
     }
 }
 
+/// The one-cycle shading state a texrect's fragments are combined with:
+/// the `SetCombine` program current at the texrect's own stream position,
+/// plus the two constant color registers the measured programs read.
+///
+/// Constructed by [`Self::try_new`], which refuses -- by name, before any
+/// pixel is written -- every combiner selector this executor does not
+/// evaluate. `Primitive` and `Environment` are `Option` because the
+/// registers are genuinely unset until their own wire command runs, and a
+/// program that reads an unset register is a named refusal rather than a
+/// silently-black default.
+///
+/// Not a `CombinerInputs` itself: that struct is per-pixel (its `tex_val0`
+/// changes on every texel), whereas this is the per-rectangle half. The
+/// per-pixel half is assembled inside the sampling loop from this plus the
+/// sampled texel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexrectShading {
+    combine: CombineParams,
+    env_color: Option<Color4>,
+    prim_color: Option<PrimColor>,
+}
+
+/// Every color selector this executor evaluates. Measured against WM2000's
+/// entire boot-through-attract window (`docs/RT64-WM2000-CYCLE-MODES.md`
+/// §2): its 2,520 texrects run exactly two programs, and between them they
+/// read only these five. Everything else is refused by name so a future
+/// title gets a loud error instead of wrong pixels -- `Shade` in
+/// particular, which this executor has no vertex-interpolated color to
+/// supply and would otherwise silently combine against zero.
+const ADMITTED_COLOR_INPUTS: [ColorInput; 5] = [
+    ColorInput::Texel0,
+    ColorInput::Primitive,
+    ColorInput::Environment,
+    ColorInput::One,
+    ColorInput::Zero,
+];
+
+/// [`ADMITTED_COLOR_INPUTS`]' alpha counterpart, same measurement and same
+/// rationale.
+const ADMITTED_ALPHA_INPUTS: [AlphaInput; 5] = [
+    AlphaInput::Texel0,
+    AlphaInput::Primitive,
+    AlphaInput::Environment,
+    AlphaInput::One,
+    AlphaInput::Zero,
+];
+
+impl TexrectShading {
+    /// Validates that `combine`'s one-cycle program reads only selectors
+    /// this executor evaluates, and that every constant register it does
+    /// read is actually set.
+    ///
+    /// `second_cycle = true` throughout, matching [`run_one_cycle`]'s own
+    /// hardcoded `SECOND_CYCLE` constant: RT64's one-cycle mode reads the
+    /// *second-cycle* bitfield slice, so validating the first-cycle slice
+    /// would check a program that never runs. This function and
+    /// `run_one_cycle` must agree on which slice they read or the gate
+    /// would admit one program and evaluate another.
+    pub fn new(
+        combine: CombineParams,
+        env_color: Option<Color4>,
+        prim_color: Option<PrimColor>,
+    ) -> Self {
+        Self {
+            combine,
+            env_color,
+            prim_color,
+        }
+    }
+
+    /// Validates that `combine`'s one-cycle program reads only selectors
+    /// this executor evaluates, and that every constant register it does
+    /// read is actually set.
+    ///
+    /// Called by the executor **only in one-cycle**. Copy cycle consults no
+    /// combiner program on real hardware, so gating a Copy rectangle on the
+    /// program that happens to be latched would refuse rectangles the RDP
+    /// draws -- measured, not reasoned: the existing composed Copy fixture
+    /// latches `SetCombine(0, 0)`, whose slot A decodes to `COMBINED`, and
+    /// validating it unconditionally refused a packet that had executed
+    /// correctly for the whole life of the Copy path.
+    pub fn validate_one_cycle(self) -> Result<Self, TexrectExecutionError> {
+        let Self {
+            combine,
+            env_color,
+            prim_color,
+        } = self;
+        const SECOND_CYCLE: bool = true;
+        let mut reads_env = false;
+        let mut reads_prim = false;
+        for slot in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ] {
+            let input = combine.decode_color(slot, SECOND_CYCLE);
+            if !ADMITTED_COLOR_INPUTS.iter().any(|admitted| {
+                core::mem::discriminant(admitted) == core::mem::discriminant(&input)
+            }) {
+                return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
+            }
+            reads_env |= matches!(input, ColorInput::Environment);
+            reads_prim |= matches!(input, ColorInput::Primitive);
+        }
+        for slot in [
+            AlphaInputSlot::A,
+            AlphaInputSlot::B,
+            AlphaInputSlot::C,
+            AlphaInputSlot::D,
+        ] {
+            let input = combine.decode_alpha(slot, SECOND_CYCLE);
+            if !ADMITTED_ALPHA_INPUTS.iter().any(|admitted| {
+                core::mem::discriminant(admitted) == core::mem::discriminant(&input)
+            }) {
+                return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
+            }
+            reads_env |= matches!(input, AlphaInput::Environment);
+            reads_prim |= matches!(input, AlphaInput::Primitive);
+        }
+        if reads_env && env_color.is_none() {
+            return Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Environment,
+            });
+        }
+        if reads_prim && prim_color.is_none() {
+            return Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Primitive,
+            });
+        }
+        Ok(Self {
+            combine,
+            env_color,
+            prim_color,
+        })
+    }
+
+    pub const fn combine(self) -> CombineParams {
+        self.combine
+    }
+
+    /// The per-rectangle half of [`CombinerInputs`], with `tex_val0` still
+    /// zeroed -- the sampling loop overwrites it per texel.
+    ///
+    /// Built through [`combiner_inputs_from_fragment_registers`], the
+    /// crate's existing `RasterPS.hlsl` transcription, rather than by
+    /// assigning `env_color`/`prim_color` here: routing both the triangle
+    /// pipeline and this executor through one assembly is what makes them
+    /// incapable of disagreeing about the normalization
+    /// ([`Color4::normalized`]'s `/ 255.0`) or about `prim_lod_frac`.
+    ///
+    /// The unset case substitutes `Color4::from_wire(0)`, which is
+    /// unreachable for any register the program actually reads --
+    /// [`Self::try_new`] refused that combination already. It is a total
+    /// function's answer for a register nothing consults, not a default
+    /// that could reach a pixel.
+    fn base_inputs(self) -> CombinerInputs {
+        combiner_inputs_from_fragment_registers(
+            CombinerInputs {
+                tex_val0: [0.0; 4],
+                tex_val1: [0.0; 4],
+                prim_color: [0.0; 4],
+                shade_color: [0.0; 4],
+                env_color: [0.0; 4],
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            },
+            self.env_color.unwrap_or(Color4::from_wire(0)),
+            self.prim_color.unwrap_or(PrimColor::from_wire(0, 0)),
+        )
+    }
+}
+
+/// Which constant color register a [`TexrectExecutionError::UnsetConstantRegister`]
+/// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TexrectConstantRegister {
+    Primitive,
+    Environment,
+}
+
+impl core::fmt::Display for TexrectConstantRegister {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Primitive => formatter.write_str("G_SETPRIMCOLOR"),
+            Self::Environment => formatter.write_str("G_SETENVCOLOR"),
+        }
+    }
+}
+
 /// Executes one admitted `TextureRectangle` against `candidate`, sampling
 /// every texel from `tmem` -- which is a
 /// [`PendingTmemImage`], the post-image of the **same packet's** own TMEM
@@ -500,19 +766,27 @@ pub fn execute_texture_rectangle(
     tile: TexrectTileBinding,
     tmem: &PendingTmemImage<'_>,
     lut_mode: TextureLutMode,
+    shading: TexrectShading,
     resident_bytes: &[u8],
     already_initialized: Option<TargetRectangle>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     // Copy cycle blits the texel to the destination with no combiner, which
-    // is exactly what this executor does. One/two-cycle would need the
-    // color combiner evaluated; Fill cycle does not sample a texture at all.
-    // Refused by name rather than drawing an uncombined texel and calling it
-    // a rendered frame.
-    if !matches!(other_mode.cycle_type(), CycleType::Copy) {
-        return Err(TexrectExecutionError::UnsupportedCycleType {
-            cycle_type: other_mode.cycle_type(),
-        });
-    }
+    // is what the RDP itself does in that mode. One-cycle runs the texel
+    // through the color combiner per fragment, which `run_one_cycle`
+    // evaluates below. Two-cycle needs the `Combined` carry and a second
+    // texel; Fill cycle samples no texture at all. Both refused by name
+    // rather than drawing an approximation and calling it a rendered frame.
+    let combined = admitted_cycle_evaluates_combiner(other_mode.cycle_type())?;
+    // Selector admission runs before any pixel is produced, so an
+    // unevaluatable program refuses with an untouched target rather than a
+    // half-drawn one. Skipped in Copy cycle, where the RDP consults no
+    // combiner program at all and gating on one would refuse a rectangle
+    // the hardware draws.
+    let base_inputs = if combined {
+        Some(shading.validate_one_cycle()?.base_inputs())
+    } else {
+        None
+    };
 
     let key = candidate.key();
     let format = key.format();
@@ -567,7 +841,26 @@ pub fn execute_texture_rectangle(
                     row,
                     source,
                 })?;
-            let rgba = decoded.texel().rgba8888();
+            let rgba = match base_inputs {
+                // Copy cycle: the sampled texel's own RGBA8888, unchanged.
+                None => decoded.texel().rgba8888(),
+                // One cycle: `(A-B)*C+D` for color and alpha independently,
+                // then RT64's final `wrapClamp` -- all inside
+                // `run_one_cycle`, which is the triangle pipeline's own
+                // evaluator, not a second copy of the arithmetic. The
+                // texel enters as `tex_val0` normalized by `/ 255.0`,
+                // matching `RasterPS.hlsl`'s already-normalized sample, and
+                // the `[0.0, 1.0]` result is returned to bytes by
+                // `* 255.0` then round-half-away-from-zero (`f32::round`),
+                // the same quantization `production.rs`'s existing
+                // WGSL-agreement test uses. Rounding happens strictly
+                // after `wrap_clamp`: clamping a rounded value and
+                // rounding a clamped one differ at the boundary, and RT64
+                // clamps in float before any quantization.
+                Some(base) => {
+                    combine_one_texel(shading.combine(), base, decoded.texel().rgba8888())
+                }
+            };
             let pixel_x = draw.left() + column;
             let pixel_y = draw.top() + row;
             let offset =
@@ -619,6 +912,71 @@ fn union_rectangle(
         .expect("a union of two in-bounds rectangles is in bounds")
 }
 
+/// This executor's cycle-type admission, as one decision: `Ok(true)` when
+/// the mode evaluates the color combiner, `Ok(false)` when it blits the
+/// texel unchanged, and a named refusal otherwise.
+///
+/// Copy cycle blits, which is the RDP's own behavior in that mode.
+/// One-cycle runs `(A-B)*C+D` per fragment. Two-cycle needs the `Combined`
+/// cross-cycle carry and a second texel, neither of which this executor
+/// supplies; Fill cycle samples no texture at all. Measured: WM2000's
+/// boot-through-attract window issues 2,520 texrects, **all one-cycle**,
+/// none two-cycle and none Fill (`docs/RT64-WM2000-CYCLE-MODES.md` §1).
+///
+/// A named function rather than an inline match so the decision is
+/// reachable from a unit test -- reaching `execute_texture_rectangle`
+/// itself requires a live pending TMEM transaction. Measured, not
+/// stylistic: while this match was inline, widening it to admit two-cycle
+/// left the entire suite green.
+fn admitted_cycle_evaluates_combiner(cycle_type: CycleType) -> Result<bool, TexrectExecutionError> {
+    match cycle_type {
+        CycleType::Copy => Ok(false),
+        CycleType::OneCycle => Ok(true),
+        CycleType::TwoCycle | CycleType::Fill => {
+            Err(TexrectExecutionError::UnsupportedCycleType { cycle_type })
+        }
+    }
+}
+
+/// Combines one sampled texel through the one-cycle color combiner.
+///
+/// The texel enters as `Texel0` normalized by `/ 255.0`, matching
+/// `RasterPS.hlsl`'s already-normalized sample, and the `[0.0, 1.0]` result
+/// returns to bytes by `* 255.0` then [`f32::round`]
+/// (round-half-away-from-zero).
+///
+/// **Order is load bearing and is not an implementation detail.** RT64's
+/// `wrapClamp` runs in float inside [`run_one_cycle`], strictly before any
+/// quantization here; clamping a rounded value and rounding a clamped one
+/// differ at the boundary. Likewise rounding rather than truncating is a
+/// real choice with an observable witness -- see
+/// `the_quantization_rounds_rather_than_truncating`, which records the
+/// mutation that survived until it existed.
+///
+/// A named function rather than an inline block inside the pixel loop so a
+/// mutation to this arithmetic is reachable from a unit test. Measured, not
+/// stylistic: while the arithmetic was inline, replacing `round()` with a
+/// truncating cast left the entire suite green, because every unit test
+/// reached the arithmetic through the test module's own copy of it.
+///
+/// `alphaCompareValue`, [`run_one_cycle`]'s second return, is deliberately
+/// discarded: alpha compare is a separate stage this executor does not run
+/// (see this module's Nonclaims).
+fn combine_one_texel(combine: CombineParams, base: CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+    let [red, green, blue, alpha] = texel;
+    let inputs = CombinerInputs {
+        tex_val0: [
+            f32::from(red) / 255.0,
+            f32::from(green) / 255.0,
+            f32::from(blue) / 255.0,
+            f32::from(alpha) / 255.0,
+        ],
+        ..base
+    };
+    let (combined_color, _alpha_compare) = run_one_cycle(combine, inputs);
+    combined_color.map(|channel| (channel * 255.0).round() as u8)
+}
+
 /// Packs one decoded RGBA8888 texel into the target's own pixel format.
 ///
 /// Mirrors `targets::fill`'s private `write_pixel` exactly -- deliberately
@@ -639,6 +997,779 @@ fn write_pixel(format: ColorTargetFormat, dest: &mut [u8], rgba: [u8; 4]) {
         }
         ColorTargetFormat::Rgba32 => {
             dest.copy_from_slice(&[red, green, blue, alpha]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod one_cycle_tests {
+    use super::*;
+
+    /// The two combiner programs `docs/RT64-WM2000-CYCLE-MODES.md` §2
+    /// measured across all 2,520 of WM2000's texrects, packed into their
+    /// `SetCombine` wire words.
+    ///
+    /// The packing is hand-derived from `CombineParams`' own
+    /// `parse_color_*`/`parse_alpha_*` **second-cycle** bit positions
+    /// (`combiner.rs:189-250`), which is the slice one-cycle mode reads:
+    /// color A `low >> 5 & 0xF`, B `high >> 24 & 0xF`, C `low & 0x1F`,
+    /// D `high >> 6 & 0x7`; alpha A `high >> 21 & 0x7`, B `high >> 3 & 0x7`,
+    /// C `high >> 18 & 0x7`, D `high & 0x7`. Every field occupies disjoint
+    /// bits in its word, which `wire_programs_decode_to_the_measured_selectors`
+    /// below asserts by decoding rather than by inspection.
+    fn pack_second_cycle(color: [u32; 4], alpha: [u32; 4]) -> CombineParams {
+        let [ca, cb, cc, cd] = color;
+        let [aa, ab, ac, ad] = alpha;
+        let low = (ca << 5) | cc;
+        let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+        CombineParams::from_wire(low, high)
+    }
+
+    /// Program 1 (2,100 of 2,520 texrects): RGB
+    /// `(Environment - Texel0) * Primitive + Texel0`, Alpha
+    /// `(Texel0 - Zero) * Primitive + Zero`.
+    ///
+    /// Indices: `Environment = 5` and `Texel0 = 1` from the shared
+    /// `colorInputCommon` table, `Primitive = 3` likewise; alpha `Zero` is
+    /// index 7 in both `alphaInputABD` and `alphaInputC`.
+    fn env_lerp_program() -> CombineParams {
+        pack_second_cycle([5, 1, 3, 1], [1, 7, 3, 7])
+    }
+
+    /// Program 2 (420 of 2,520): RGB and Alpha both
+    /// `(Zero - Zero) * Zero + Primitive`.
+    ///
+    /// Each slot's `Zero` index is that slot's OWN out-of-table value, not
+    /// a shared constant -- `IDX_COLOR_ZERO_A = 8`, `_B = 8`, `_C = 16`
+    /// (its field is 5 bits wide), alpha `Zero = 7`. Using one index for
+    /// all four would decode to `NOISE`/`K4`/`K5` in the slots whose
+    /// tables define index 7.
+    fn flat_primitive_program() -> CombineParams {
+        pack_second_cycle([8, 8, 16, 3], [7, 7, 7, 3])
+    }
+
+    const ENV_WIRE: u32 = 0xFF00_80FF;
+    const PRIM_WIRE: u32 = 0x80FF_4080;
+    /// `SetPrimColor`'s `w0`: `lod_frac` in bits 0:7, `lod_min` in 8:12.
+    /// Neither program reads either, so the value is deliberately non-zero
+    /// -- if `prim_lod_frac` ever leaked into a channel, this catches it.
+    const PRIM_LOD_W0: u32 = 0x0540;
+
+    fn measured_shading(combine: CombineParams) -> TexrectShading {
+        TexrectShading::new(
+            combine,
+            Some(Color4::from_wire(ENV_WIRE)),
+            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+        )
+        .validate_one_cycle()
+        .expect("both measured programs read only admitted selectors")
+    }
+
+    /// Calls [`combine_one_texel`] -- **the executor's own** per-texel
+    /// function, not a copy of it.
+    ///
+    /// This was a duplicate in the first draft, on the reasoning that a
+    /// shared helper makes agreement structural rather than tested. That
+    /// reasoning was wrong in the direction that matters: the duplicate put
+    /// the executor's real arithmetic out of every unit test's reach, and a
+    /// truncation mutant inside it survived the whole suite. Sharing the
+    /// function is what makes these tests able to kill it. What proves the
+    /// executor actually *calls* it is the composed and end-to-end tests,
+    /// which is the right place for that claim.
+    fn combine_texel(shading: TexrectShading, texel: [u8; 4]) -> [u8; 4] {
+        combine_one_texel(shading.combine(), shading.base_inputs(), texel)
+    }
+
+    /// **Positive control for every assertion below**: the two wire words
+    /// really do decode to the measured programs.
+    ///
+    /// Without this, a packing slip would silently substitute a different
+    /// program and every hand-derived expectation below would be checking
+    /// arithmetic nobody measured. Asserted through
+    /// `CombineParams::decode_color`/`decode_alpha` at `second_cycle =
+    /// true`, the exact call `TexrectShading::try_new` and `run_one_cycle`
+    /// both make.
+    #[test]
+    fn wire_programs_decode_to_the_measured_selectors() {
+        let lerp = env_lerp_program();
+        assert_eq!(
+            [
+                lerp.decode_color(ColorInputSlot::A, true),
+                lerp.decode_color(ColorInputSlot::B, true),
+                lerp.decode_color(ColorInputSlot::C, true),
+                lerp.decode_color(ColorInputSlot::D, true),
+            ],
+            [
+                ColorInput::Environment,
+                ColorInput::Texel0,
+                ColorInput::Primitive,
+                ColorInput::Texel0,
+            ],
+            "program 1's RGB must be (Environment - Texel0) * Primitive + Texel0"
+        );
+        assert_eq!(
+            [
+                lerp.decode_alpha(AlphaInputSlot::A, true),
+                lerp.decode_alpha(AlphaInputSlot::B, true),
+                lerp.decode_alpha(AlphaInputSlot::C, true),
+                lerp.decode_alpha(AlphaInputSlot::D, true),
+            ],
+            [
+                AlphaInput::Texel0,
+                AlphaInput::Zero,
+                AlphaInput::Primitive,
+                AlphaInput::Zero,
+            ],
+            "program 1's alpha must be (Texel0 - Zero) * Primitive + Zero"
+        );
+
+        let flat = flat_primitive_program();
+        assert_eq!(
+            [
+                flat.decode_color(ColorInputSlot::A, true),
+                flat.decode_color(ColorInputSlot::B, true),
+                flat.decode_color(ColorInputSlot::C, true),
+                flat.decode_color(ColorInputSlot::D, true),
+            ],
+            [
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Primitive,
+            ],
+            "program 2's RGB must be (Zero - Zero) * Zero + Primitive"
+        );
+        assert_eq!(
+            [
+                flat.decode_alpha(AlphaInputSlot::A, true),
+                flat.decode_alpha(AlphaInputSlot::B, true),
+                flat.decode_alpha(AlphaInputSlot::C, true),
+                flat.decode_alpha(AlphaInputSlot::D, true),
+            ],
+            [
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Primitive,
+            ],
+            "program 2's alpha must be (Zero - Zero) * Zero + Primitive"
+        );
+        // The two programs must not be the same wire value, or every
+        // "different program, different pixel" assertion is vacuous.
+        assert_ne!(
+            (lerp.low(), lerp.high()),
+            (flat.low(), flat.high()),
+            "the two measured programs must be distinct wire words"
+        );
+    }
+
+    /// **Program 1's arithmetic, hand-derived per channel and reconciled
+    /// against a second derivation of the same value.**
+    ///
+    /// Inputs: texel `(0x18, 0x40, 0xC8, 0xFF)`, env `0xFF0080FF` ->
+    /// `(255, 0, 128, 255)`, prim `0x80FF4080` -> `(128, 255, 64, 128)`.
+    ///
+    /// Derivation 1, per channel, in the `(A - B) * C + D` order RT64
+    /// evaluates (`run_one_cycle`'s own expression, not an algebraically
+    /// rearranged one -- `A*C - B*C + D` is equal in exact arithmetic and
+    /// NOT bit-identical in f32):
+    ///
+    /// ```text
+    /// R: (255/255 - 24/255) * (128/255) + 24/255
+    /// G: (  0/255 - 64/255) * (255/255) + 64/255
+    /// B: (128/255 - 200/255) * ( 64/255) + 200/255
+    /// A: (255/255 -       0) * (128/255) +       0
+    /// ```
+    ///
+    /// Derivation 2, independent of the first: G's `C` is exactly `1.0`, so
+    /// G reduces algebraically to `A - B + B = A = 0`. B's operand
+    /// `(128 - 200)/255` is negative, so B must fall BELOW its `D` addend
+    /// of `200/255 ~ 0.784` -- `0.713` does. A's `B` and `D` are both
+    /// `Zero`, so alpha reduces to `texel.a * prim.a = 1.0 * 128/255 =
+    /// 0.502`, and `0.502 * 255` rounds to exactly `128` -- the primitive
+    /// alpha byte returned unchanged, which is the sharpest possible check
+    /// that the `* 255.0` quantization is not off by one.
+    ///
+    /// The green channel is the load-bearing one: it is `0` only because
+    /// the `+ Texel0` addend cancels the `- Texel0` subtrahend at `C = 1`.
+    /// Dropping the `D` addend gives `-64/255`, which `wrap_clamp` pins to
+    /// `0` -- so green ALONE cannot catch a dropped addend, and red and
+    /// blue are what do.
+    #[test]
+    fn program_one_env_lerp_produces_hand_derived_bytes() {
+        let shading = measured_shading(env_lerp_program());
+        let observed = combine_texel(shading, [0x18, 0x40, 0xC8, 0xFF]);
+        assert_eq!(
+            observed,
+            [140, 0, 182, 128],
+            "program 1 must produce the hand-derived RGBA8888"
+        );
+
+        // Derivation 2, recomputed here in the target precision (f32, not
+        // f64) so a Python-style f64 model cannot hide a rounding lane.
+        let n = |byte: u8| f32::from(byte) / 255.0;
+        let red = (n(0xFF) - n(0x18)) * n(0x80) + n(0x18);
+        let green = (n(0x00) - n(0x40)) * n(0xFF) + n(0x40);
+        let blue = (n(0x80) - n(0xC8)) * n(0x40) + n(0xC8);
+        let alpha = (n(0xFF) - 0.0) * n(0x80) + 0.0;
+        assert_eq!(
+            [red, green, blue, alpha].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
+            observed,
+            "the second, independently written derivation must reconcile with the first"
+        );
+        // Green really is exactly zero, not merely small -- the `C = 1`
+        // cancellation, pinned.
+        assert_eq!(
+            green, 0.0,
+            "green's C is exactly ONE, so A - B + B cancels to A = 0"
+        );
+        // And alpha really is the primitive alpha byte round-tripped.
+        assert_eq!(
+            observed[3], 0x80,
+            "alpha is texel.a * prim.a with texel.a = 1.0"
+        );
+    }
+
+    /// **Program 2's arithmetic: `(Zero - Zero) * Zero + Primitive` is
+    /// exactly the primitive color, every channel, texel-independent.**
+    ///
+    /// Hand-derived twice. Derivation 1: `(0 - 0) * 0 = 0`, so the result
+    /// is the `D` addend, which is `Primitive` in all four channels ->
+    /// `0x80FF4080` -> `(128, 255, 64, 128)`. Derivation 2, independent:
+    /// the byte values must be `Color4::normalized`'s `/ 255.0` followed by
+    /// `* 255.0` and `round`, which is the identity on every byte because
+    /// `f32` represents `b / 255.0 * 255.0` exactly enough that no byte
+    /// moves -- asserted for the full `0..=255` sweep below rather than for
+    /// these four values alone.
+    ///
+    /// The texel-independence is asserted, not assumed: the same program
+    /// against three unrelated texels must give one answer. That is what
+    /// distinguishes "the combiner ran program 2" from "the combiner was
+    /// bypassed and wrote the texel", which is mutant (a).
+    #[test]
+    fn program_two_flat_primitive_ignores_the_texel_entirely() {
+        let shading = measured_shading(flat_primitive_program());
+        let expected = [0x80, 0xFF, 0x40, 0x80];
+        for texel in [
+            [0x00, 0x00, 0x00, 0x00],
+            [0x18, 0x40, 0xC8, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        ] {
+            assert_eq!(
+                combine_texel(shading, texel),
+                expected,
+                "program 2 must be the primitive color regardless of texel {texel:?}"
+            );
+        }
+        // Derivation 2's round-trip claim, swept exhaustively rather than
+        // spot-checked: `b / 255.0 * 255.0` rounds back to `b` for every
+        // byte, so "the primitive color unchanged" is a real claim about
+        // the quantization and not an accident of these four values.
+        for byte in 0u8..=255 {
+            let round_tripped = ((f32::from(byte) / 255.0) * 255.0).round() as u8;
+            assert_eq!(
+                round_tripped, byte,
+                "byte {byte} must survive the normalize/quantize pair"
+            );
+        }
+    }
+
+    /// **The two programs disagree on the same texel** -- so a test that
+    /// applied the wrong program to the wrong entries (mutant (e)) cannot
+    /// pass, and neither can one that ignores the program entirely.
+    #[test]
+    fn the_two_measured_programs_disagree_on_one_texel() {
+        let texel = [0x18, 0x40, 0xC8, 0xFF];
+        assert_ne!(
+            combine_texel(measured_shading(env_lerp_program()), texel),
+            combine_texel(measured_shading(flat_primitive_program()), texel),
+            "the env-lerp and flat-primitive programs must produce different pixels for the \
+             same texel, or applying one where the other belongs is undetectable"
+        );
+        // And neither equals the raw texel, so bypassing the combiner
+        // (mutant (a)) is detectable by either program.
+        for (label, shading) in [
+            ("env-lerp", measured_shading(env_lerp_program())),
+            ("flat-primitive", measured_shading(flat_primitive_program())),
+        ] {
+            assert_ne!(
+                combine_texel(shading, texel),
+                texel,
+                "{label} must not reproduce the raw texel, or bypassing the combiner is \
+                 indistinguishable from running it"
+            );
+        }
+    }
+
+    /// **Primitive and Environment are not interchangeable** -- mutant (b).
+    ///
+    /// Swapping the two registers must change program 1's output. Asserted
+    /// by evaluating the same program with the two wire words exchanged,
+    /// which is exactly what a swapped plumbing would do at the call site.
+    #[test]
+    fn swapping_primitive_and_environment_changes_the_pixel() {
+        let texel = [0x18, 0x40, 0xC8, 0xFF];
+        let straight = combine_texel(measured_shading(env_lerp_program()), texel);
+        let swapped = TexrectShading::new(
+            env_lerp_program(),
+            Some(Color4::from_wire(PRIM_WIRE)),
+            Some(PrimColor::from_wire(PRIM_LOD_W0, ENV_WIRE)),
+        )
+        .validate_one_cycle()
+        .expect("the swapped registers are still admitted selectors");
+        assert_ne!(
+            combine_texel(swapped, texel),
+            straight,
+            "exchanging the Primitive and Environment wire words must change program 1's \
+             output, or the two are plumbed interchangeably"
+        );
+    }
+
+    /// **Dropping the `+ Texel0` addend changes the pixel** -- mutant (c),
+    /// expressed as the program that differs by exactly that term.
+    ///
+    /// `(Environment - Texel0) * Primitive + Zero` is program 1 with `D`
+    /// changed from `Texel0` to `Zero`; its output must differ, and on the
+    /// red and blue channels specifically (green's `C = 1` makes the
+    /// clamped result `0` either way -- documented in
+    /// `program_one_env_lerp_produces_hand_derived_bytes`).
+    #[test]
+    fn dropping_the_texel_addend_changes_the_pixel() {
+        let texel = [0x18, 0x40, 0xC8, 0xFF];
+        let with_addend = combine_texel(measured_shading(env_lerp_program()), texel);
+        // `colorInputD`'s ZERO index is 7 -- its 3-bit table's only
+        // out-of-range value.
+        let without = pack_second_cycle([5, 1, 3, 7], [1, 7, 3, 7]);
+        let observed = combine_texel(measured_shading(without), texel);
+        assert_ne!(
+            observed, with_addend,
+            "the `+ Texel0` addend must be load bearing"
+        );
+        assert_ne!(
+            observed[0], with_addend[0],
+            "red must differ without the addend"
+        );
+        assert_ne!(
+            observed[2], with_addend[2],
+            "blue must differ without the addend"
+        );
+    }
+
+    /// **Clamping happens in float, before quantization, and the wrap step
+    /// runs before the clamp** -- mutant (d).
+    ///
+    /// Color slot C's table has no `ONE` entry at all (`colorInputC` maps
+    /// index 6 to `KEY_SCALE`), so an over-range color result is reached
+    /// through a `PRIMITIVE` register set to `0xFFFFFFFF` instead -- a real
+    /// register at exactly `1.0`, not a synthetic constant.
+    ///
+    /// **The over-range case.** `(One - Zero) * Primitive(1.0) + One`
+    /// evaluates to `2.0`. `wrap_clamp` sees `2.0 >= 1.5 + 1/255`, subtracts
+    /// the `2.0 + 2/255` range to get `~-0.008`, and the final
+    /// `clamp(0, 1)` pins that to **`0.0` -> byte 0**. A naive
+    /// clamp-without-wrap would give `1.0` -> byte 255, and a
+    /// quantize-then-clamp order would compute `2.0 * 255 = 510` and
+    /// saturate to 255 as well. So byte `0` separates RT64's actual
+    /// wrap-then-clamp-then-quantize order from BOTH of the plausible
+    /// wrong orders, by the full channel range.
+    ///
+    /// Hand-derived twice: (1) `2.0 - (1.5 + 1/255 - (-0.5 - 1/255)) =
+    /// 2.0 - 2.00784 = -0.00784`, clamped to `0.0`; (2) the wrap range is
+    /// exactly `2 + 2/255`, and `2.0` is `2/255` below it, so the wrapped
+    /// value is `-2/255 ~ -0.00784`. Same. Both are computed in `f32`
+    /// below, not in `f64`.
+    ///
+    /// **The negative case.** `(Zero - One) * Primitive(1.0) + Zero` is
+    /// `-1.0`; the wrap step fires (`-1.0 <= -0.5 - 1/255`), adding the
+    /// range to give `~1.008`, clamped to `1.0` -> byte **255**. A
+    /// quantize-first order would saturate `-255.0` to byte `0`. Again the
+    /// two orders disagree by the full range.
+    #[test]
+    fn wrap_clamp_runs_before_quantization() {
+        let one_register = PrimColor::from_wire(0, 0xFFFF_FFFF);
+        // Color: A = ONE (index 6 in `colorInputA`), B = ZERO (8),
+        // C = PRIMITIVE (3), D = ONE (6 in `colorInputD`).
+        // Alpha: A = ONE (6), B = ZERO (7), C = PRIMITIVE (3), D = ONE (6).
+        let over = pack_second_cycle([6, 8, 3, 6], [6, 7, 3, 6]);
+        let shading = TexrectShading::new(over, None, Some(one_register))
+            .validate_one_cycle()
+            .expect("ONE/ZERO/PRIMITIVE are all admitted selectors");
+        assert_eq!(
+            combine_texel(shading, [0x18, 0x40, 0xC8, 0xFF]),
+            [0, 0, 0, 0],
+            "(One - Zero) * Primitive(1.0) + One is 2.0; wrap_clamp wraps it to ~-0.008 and              clamps to 0.0 -> byte 0. A clamp-only or a quantize-first order gives 255."
+        );
+
+        // Derivation 2, in f32: the wrap range and the wrapped value.
+        let rounding = 1.0f32 / 255.0;
+        let low = -0.5f32 - rounding;
+        let high = 1.5f32 + rounding;
+        let wrapped = 2.0f32 - (high - low);
+        assert!(
+            wrapped < 0.0,
+            "2.0 must wrap BELOW zero, which is what makes the clamped answer 0 and not 1:              got {wrapped}"
+        );
+        assert_eq!(
+            (wrapped.clamp(0.0, 1.0) * 255.0).round() as u8,
+            0,
+            "the independently computed wrap must reconcile with the observed byte"
+        );
+
+        // The negative case, the other direction.
+        // Color: A = ZERO (8), B = ONE (6 in `colorInputB`? no -- B's 6 is
+        // KEY_CENTER), so the subtrahend ONE comes from B index... none.
+        // Reached instead through B = PRIMITIVE (3) at 1.0.
+        let negative = pack_second_cycle([8, 3, 3, 7], [7, 3, 3, 7]);
+        let shading = TexrectShading::new(negative, None, Some(one_register))
+            .validate_one_cycle()
+            .expect("ZERO/PRIMITIVE are admitted selectors");
+        assert_eq!(
+            combine_texel(shading, [0x18, 0x40, 0xC8, 0xFF]),
+            [255, 255, 255, 255],
+            "(Zero - Primitive(1.0)) * Primitive(1.0) + Zero is -1.0; wrap_clamp wraps it to              ~1.008 and clamps to 1.0 -> byte 255. A quantize-first order saturates to 0."
+        );
+        let wrapped_negative = -1.0f32 + (high - low);
+        assert!(
+            wrapped_negative > 1.0,
+            "-1.0 must wrap ABOVE one, which is what makes the clamped answer 255 and not 0:              got {wrapped_negative}"
+        );
+    }
+
+    /// **The executor evaluates the LATCHED program, not a fixed one** --
+    /// mutant (e), and this test exists because that mutant SURVIVED its
+    /// first draft.
+    ///
+    /// Replacing `shading.combine()` inside the pixel loop with a hardcoded
+    /// flat-primitive program left the whole suite green. The reason is a
+    /// reach gap, not an equivalence: the only *executed* one-cycle fixture
+    /// runs the flat-primitive program itself (the env-lerp one is blocked
+    /// by the GPU-path defect
+    /// `a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_tmem_projection`
+    /// pins), so substituting that exact program for the latched one is a
+    /// no-op there, and every other assertion reached the arithmetic
+    /// through the test helper.
+    ///
+    /// This test closes it at the executor's own function: the same texel
+    /// and the same registers, through [`combine_one_texel`], must give
+    /// different bytes for the two measured programs. A hardcoded program
+    /// makes them equal.
+    #[test]
+    fn combine_one_texel_consults_the_program_it_is_given() {
+        let texel = [0x18, 0x40, 0xC8, 0xFF];
+        let base = measured_shading(env_lerp_program()).base_inputs();
+        let lerp = combine_one_texel(env_lerp_program(), base, texel);
+        let flat = combine_one_texel(flat_primitive_program(), base, texel);
+        assert_ne!(
+            lerp, flat,
+            "the same texel and the same registers must combine differently under the two \
+             measured programs, or the executor is not consulting the program it is handed"
+        );
+        // And each is the value its own program's hand derivation gives, so
+        // "they differ" is not satisfied by two equally wrong answers.
+        assert_eq!(
+            lerp,
+            [140, 0, 182, 128],
+            "the env-lerp program's hand-derived bytes"
+        );
+        assert_eq!(
+            flat,
+            [0x80, 0xFF, 0x40, 0x80],
+            "the flat program's primitive colour"
+        );
+    }
+
+    /// **The quantization is round-half-away-from-zero, not truncation** --
+    /// mutant (d), and this test exists because the first draft's mutant
+    /// SURVIVED.
+    ///
+    /// # Why it survived, and what that revealed
+    ///
+    /// Replacing `(channel * 255.0).round() as u8` with a truncating
+    /// `(channel * 255.0) as u8` left the whole suite green. Two reasons,
+    /// both real:
+    ///
+    /// 1. Every other assertion in this module reached the arithmetic
+    ///    through this module's own `combine_texel` helper, which duplicates
+    ///    the quantization rather than calling the executor -- so a mutation
+    ///    inside the executor's pixel loop was out of the helper's reach.
+    /// 2. The executed fixtures write an **RGBA16** target, whose
+    ///    `write_pixel` truncates each colour channel by `>> 3`. That
+    ///    absorbs a one-count difference in the 8-bit intermediate unless
+    ///    the two values straddle a multiple of 8. For the env-lerp
+    ///    program's own bytes they do not: `139.95` truncates to `139` and
+    ///    rounds to `140`, and `139 >> 3 == 140 >> 3 == 17`.
+    ///
+    /// # The witness, found by search rather than guessed
+    ///
+    /// `(Environment(0) - Texel0(16)) * Primitive(128) + Texel0(16)`
+    /// evaluates to `7.96862745...` in f32 after `* 255.0`. Truncation
+    /// gives `7`; round-half-away-from-zero gives `8`. `7 >> 3 == 0` and
+    /// `8 >> 3 == 1`, so the two **do** straddle a multiple of eight and
+    /// the difference survives the RGBA16 pack.
+    ///
+    /// A spot-check on the env-lerp program's own bytes would have
+    /// supported the truncating form. This is the same lesson
+    /// `RT64-PORT-CARD-BRIEF.md` §3.4 records: the witness had to be
+    /// searched for, not assumed.
+    ///
+    /// Hand-derived twice: (1) `(0 - 16/255) * (128/255) + 16/255 =
+    /// (16/255)(1 - 128/255) = (16 * 127) / 255^2 = 2032/65025 =
+    /// 0.031249...`, times 255 is `7.9686...`; (2) computed in `f32` below
+    /// and asserted to land strictly between 7 and 8, which is what makes
+    /// the two roundings differ at all.
+    #[test]
+    fn the_quantization_rounds_rather_than_truncating() {
+        let program = pack_second_cycle([5, 1, 3, 1], [1, 7, 3, 7]);
+        let shading = TexrectShading::new(
+            program,
+            Some(Color4::from_wire(0x0000_0000)),
+            Some(PrimColor::from_wire(0, 0x8080_8080)),
+        )
+        .validate_one_cycle()
+        .expect("the env-lerp program reads only admitted selectors");
+        let combined = combine_texel(shading, [0x10, 0x10, 0x10, 0x10]);
+        assert_eq!(
+            combined[0], 8,
+            "7.9686 must round to 8, not truncate to 7 -- RT64 clamps in float and the byte is \
+             the rounded value"
+        );
+
+        // Derivation 2, in the target precision: the pre-quantization value
+        // really does lie strictly between 7 and 8, which is the only
+        // condition under which the two roundings can disagree.
+        let n = |byte: u8| f32::from(byte) / 255.0;
+        let raw = (n(0x00) - n(0x10)) * n(0x80) + n(0x10);
+        let scaled = raw * 255.0;
+        assert!(
+            scaled > 7.0 && scaled < 8.0,
+            "the witness must straddle the two roundings: got {scaled}"
+        );
+        assert_eq!(scaled.round() as u8, 8);
+        assert_eq!(
+            scaled as u8, 7,
+            "truncation gives 7, which is the mutant's answer"
+        );
+
+        // **And the difference survives the RGBA16 pack**, which is what
+        // makes it observable in a composed image rather than only in the
+        // 8-bit intermediate. This is the half the first draft missed.
+        assert_ne!(
+            8u16 >> 3,
+            7u16 >> 3,
+            "the two roundings must straddle a multiple of eight, or the RGBA16 target's `>> 3` \
+             absorbs the difference and no composed test can ever see it"
+        );
+    }
+
+    /// **`Shade` is refused by name**, not combined against an invented
+    /// zero. Measured absent from all 2,520 WM2000 texrects, and this
+    /// executor has no vertex-interpolated color to supply.
+    #[test]
+    fn a_shade_reading_program_is_refused_by_name() {
+        // Color A index 4 is SHADE in the shared common table.
+        let shade_in_color = pack_second_cycle([4, 8, 16, 7], [7, 7, 7, 7]);
+        assert_eq!(
+            TexrectShading::new(shade_in_color, None, None).validate_one_cycle(),
+            Err(TexrectExecutionError::UnsupportedColorInput {
+                slot: ColorInputSlot::A,
+                input: ColorInput::Shade,
+            }),
+            "a program reading SHADE in a color slot must be refused, naming the slot and the \
+             selector"
+        );
+        // And the alpha side, which has its own table.
+        let shade_in_alpha = pack_second_cycle([8, 8, 16, 7], [4, 7, 7, 7]);
+        assert_eq!(
+            TexrectShading::new(shade_in_alpha, None, None).validate_one_cycle(),
+            Err(TexrectExecutionError::UnsupportedAlphaInput {
+                slot: AlphaInputSlot::A,
+                input: AlphaInput::Shade,
+            }),
+            "a program reading SHADE in an alpha slot must be refused too"
+        );
+        // The message names the selector, so a future title's log says what
+        // is missing rather than only that something is.
+        let message = TexrectShading::new(shade_in_color, None, None)
+            .validate_one_cycle()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("Shade"),
+            "the refusal must name the selector: {message}"
+        );
+    }
+
+    /// The other unmeasured selectors are refused too, each by name -- not
+    /// only `Shade`. Swept over every selector the wire can express in
+    /// color slot A and alpha slot A, so a selector added to `ColorInput`
+    /// later cannot be silently admitted.
+    #[test]
+    fn every_unmeasured_selector_is_refused() {
+        for index in 0u32..16 {
+            let params = pack_second_cycle([index, 8, 16, 7], [7, 7, 7, 7]);
+            let input = params.decode_color(ColorInputSlot::A, true);
+            let admitted = ADMITTED_COLOR_INPUTS
+                .iter()
+                .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
+            let result = TexrectShading::new(
+                params,
+                Some(Color4::from_wire(ENV_WIRE)),
+                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            )
+            .validate_one_cycle();
+            if admitted {
+                assert!(
+                    result.is_ok(),
+                    "color index {index} ({input:?}) must be admitted"
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    Err(TexrectExecutionError::UnsupportedColorInput {
+                        slot: ColorInputSlot::A,
+                        input,
+                    }),
+                    "color index {index} decodes to {input:?}, which must be refused by name"
+                );
+            }
+        }
+        for index in 0u32..8 {
+            let params = pack_second_cycle([8, 8, 16, 7], [index, 7, 7, 7]);
+            let input = params.decode_alpha(AlphaInputSlot::A, true);
+            let admitted = ADMITTED_ALPHA_INPUTS
+                .iter()
+                .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
+            let result = TexrectShading::new(
+                params,
+                Some(Color4::from_wire(ENV_WIRE)),
+                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            )
+            .validate_one_cycle();
+            if admitted {
+                assert!(
+                    result.is_ok(),
+                    "alpha index {index} ({input:?}) must be admitted"
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    Err(TexrectExecutionError::UnsupportedAlphaInput {
+                        slot: AlphaInputSlot::A,
+                        input,
+                    }),
+                    "alpha index {index} decodes to {input:?}, which must be refused by name"
+                );
+            }
+        }
+    }
+
+    /// **A program reading an unset constant register is refused**, and
+    /// only when it actually reads it.
+    #[test]
+    fn an_unset_constant_register_is_refused_only_when_the_program_reads_it() {
+        assert_eq!(
+            TexrectShading::new(
+                env_lerp_program(),
+                None,
+                Some(PrimColor::from_wire(0, PRIM_WIRE))
+            )
+            .validate_one_cycle(),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Environment,
+            }),
+            "program 1 reads ENVIRONMENT, so an unset env register must be refused"
+        );
+        assert_eq!(
+            TexrectShading::new(env_lerp_program(), Some(Color4::from_wire(ENV_WIRE)), None)
+                .validate_one_cycle(),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Primitive,
+            }),
+            "program 1 reads PRIMITIVE, so an unset prim register must be refused"
+        );
+        // Program 2 reads PRIMITIVE but never ENVIRONMENT, so an unset env
+        // register must NOT refuse it -- the gate is per-register-actually-
+        // read, not a blanket requirement.
+        assert!(
+            TexrectShading::new(
+                flat_primitive_program(),
+                None,
+                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE))
+            )
+            .validate_one_cycle()
+            .is_ok(),
+            "program 2 never reads ENVIRONMENT, so its absence must not refuse the rectangle"
+        );
+        // A ZERO-only program reads neither.
+        let neither = pack_second_cycle([8, 8, 16, 7], [7, 7, 7, 7]);
+        assert!(
+            TexrectShading::new(neither, None, None)
+                .validate_one_cycle()
+                .is_ok(),
+            "a program reading neither constant register must not require either"
+        );
+    }
+
+    /// **Two-cycle and Fill are refused at the EXECUTOR, not only in the
+    /// error type's prose** -- mutant (f), and this test exists because
+    /// that mutant SURVIVED its first draft.
+    ///
+    /// Widening the executor's cycle match to admit `TwoCycle` alongside
+    /// `OneCycle` left the whole suite green: the sibling test below
+    /// asserts only the error's *message*, which a widened gate never
+    /// constructs, and no fixture executes a two-cycle texrect.
+    ///
+    /// Reaching `execute_texture_rectangle` needs a live pending TMEM
+    /// transaction, which no unit test can build. What this test pins
+    /// instead is the decision the executor makes, extracted as
+    /// [`admitted_cycle_evaluates_combiner`] -- the same match, called by
+    /// the executor, so widening it here is caught. Exhaustive over all
+    /// four `CycleType` variants, so a fifth added later cannot be
+    /// silently admitted either.
+    #[test]
+    fn the_executor_admits_exactly_copy_and_one_cycle() {
+        assert_eq!(
+            admitted_cycle_evaluates_combiner(CycleType::Copy),
+            Ok(false),
+            "Copy is admitted and evaluates NO combiner"
+        );
+        assert_eq!(
+            admitted_cycle_evaluates_combiner(CycleType::OneCycle),
+            Ok(true),
+            "OneCycle is admitted and DOES evaluate the combiner"
+        );
+        for refused in [CycleType::TwoCycle, CycleType::Fill] {
+            assert_eq!(
+                admitted_cycle_evaluates_combiner(refused),
+                Err(TexrectExecutionError::UnsupportedCycleType {
+                    cycle_type: refused
+                }),
+                "{refused:?} must be refused by name at the executor's own gate"
+            );
+        }
+    }
+
+    /// **Two-cycle and Fill remain refused by name** -- the admission
+    /// widened by exactly one mode, not into a blanket acceptance.
+    ///
+    /// Checked at the enum rather than through the executor because
+    /// reaching the executor needs a live pending TMEM transaction, which
+    /// the end-to-end tests supply; what is pinned here is that the mode
+    /// set this module claims is `{Copy, OneCycle}` and its complement is
+    /// named.
+    #[test]
+    fn the_admitted_cycle_set_is_exactly_copy_and_one_cycle() {
+        for cycle_type in [CycleType::TwoCycle, CycleType::Fill] {
+            let error = TexrectExecutionError::UnsupportedCycleType { cycle_type };
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("{cycle_type:?}")),
+                "the refusal must name the mode it refused: {message}"
+            );
+            assert!(
+                message.contains("Copy") && message.contains("OneCycle"),
+                "the refusal must state which modes ARE admitted: {message}"
+            );
         }
     }
 }
