@@ -31,5 +31,11 @@ wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "met
 pollster = "0.3.0"
 
 [dev-dependencies]
+# Test-only, and deliberately so: `fn64-render-reference` is the established
+# comparison oracle for VI scanout, and `vi_scanout::tests`'s differential
+# runs both backends over one RDRAM image and one register word. It depends
+# only on `fn64-render` and `fn64-runtime`, which this crate already has, so
+# it introduces no cycle and does not enter the production graph.
+fn64-render-reference = { path = "../fn64-render-reference" }
 naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
 sha2 = "0.10"
