@@ -35,11 +35,11 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use fn64_recomp::{load_config, Function, RecompConfig, Section};
 use fn64_cpu_runtime::{decode, Instruction};
 use fn64_cpu_runtime_codegen::{
     emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
 };
+use fn64_recomp::{load_config, Function, InstructionPatch, RecompConfig, Section};
 
 fn main() -> std::process::ExitCode {
     let args = match Args::parse() {
@@ -276,6 +276,7 @@ const RECOMPILED_PART_COUNT: usize = 64;
 const GENERATED_USE: &str = "use fn64_cpu_runtime::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n";
 
 fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Report {
+    assert_every_instruction_patch_is_reachable(cfg);
     // The bootstrap config's stub scan treats every BREAK as privileged. MIPS
     // compilers also emit two rigid BREAK shapes after integer DIV/DIVU for
     // divide-by-zero and INT_MIN/-1. Recognize the complete guard sequences,
@@ -289,7 +290,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                 if !cfg.patches.stubs.iter().any(|name| name == &func.name) {
                     return None;
                 }
-                let words = read_func_words(rom, section, func)?;
+                let words = read_func_words(rom, section, func, &cfg.patches.instructions)?;
                 let instrs: Vec<_> = words.into_iter().map(decode).collect();
                 compiler_div_guards_only(&instrs).then_some(func.name.as_str())
             })
@@ -314,7 +315,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
             }
             let forced = force_recompile.contains(f.name.as_str())
                 || auto_div_guards.contains(f.name.as_str());
-            let words = read_func_words(rom, s, f)?;
+            let words = read_func_words(rom, s, f, &cfg.patches.instructions)?;
             let mut decoded = words.iter().map(|&word| decode(word));
             decoded
                 .all(|instr| {
@@ -355,7 +356,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                 results.push(FuncResult::simple(func, section, Outcome::Ignored));
                 continue;
             }
-            let words = match read_func_words(rom, section, func) {
+            let words = match read_func_words(rom, section, func, &cfg.patches.instructions) {
                 Some(w) => w,
                 None => {
                     results.push(FuncResult::simple(func, section, Outcome::RomRange));
@@ -893,9 +894,26 @@ fn outcome_label(o: Outcome) -> &'static str {
 }
 
 /// Slice a function's instruction words out of the ROM (big-endian → host
-/// `u32`). Mirrors `RsRecompiler::read_func_words`, but here it is a
+/// `u32`), then apply every `[[patches.instruction]]` that targets this
+/// function. Mirrors `RsRecompiler::read_func_words`, but here it is a
 /// classification input, not a hard error.
-fn read_func_words(rom: &[u8], section: &Section, func: &Function) -> Option<Vec<u32>> {
+///
+/// Patch application belongs here, at the single point all three callers
+/// (the div-guard prescan, the symbol table, and the emitter) read words
+/// through, so a patched word cannot classify one way and emit another.
+///
+/// `[patches].instructions` was parsed into the typed config and then read by
+/// nothing: WM2000's one entry rewrites `func_800004D0`'s idle-loop `j` at
+/// `0x800005AC` into the self-branch `0x1000FFFF`, which the emitter turns
+/// into `pause_self()`. Unapplied, the emitted body is a tight non-yielding
+/// `loop` and cooperative scheduling never resumes another thread — measured
+/// on WM2000: 100% of samples inside `func_800004D0`, no VI swap ever.
+fn read_func_words(
+    rom: &[u8],
+    section: &Section,
+    func: &Function,
+    patches: &[InstructionPatch],
+) -> Option<Vec<u32>> {
     let vram_delta = func.vram.checked_sub(section.vram)?;
     let start = (section.rom as usize).checked_add(vram_delta as usize)?;
     let len = (func.size as usize) & !0x3;
@@ -903,12 +921,48 @@ fn read_func_words(rom: &[u8], section: &Section, func: &Function) -> Option<Vec
     if end > rom.len() {
         return None;
     }
-    Some(
-        rom[start..end]
-            .chunks_exact(4)
-            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    let mut words: Vec<u32> = rom[start..end]
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for patch in patches.iter().filter(|p| p.func == func.name) {
+        let offset = patch
+            .vram
+            .checked_sub(func.vram)
+            .filter(|delta| delta % 4 == 0)
+            .map(|delta| delta as usize / 4)
+            .filter(|index| *index < words.len())
+            .unwrap_or_else(|| {
+                panic!(
+                    "instruction patch for {} targets vram {:#010x}, which is not a word inside \
+                     that function ({:#010x}..{:#010x})",
+                    patch.func,
+                    patch.vram,
+                    func.vram,
+                    func.vram + func.size,
+                )
+            });
+        words[offset] = patch.value;
+    }
+    Some(words)
+}
+
+/// Refuse a config whose `[[patches.instruction]]` names a function this run
+/// never reads words for — a patch that silently applies to nothing is the
+/// same class of defect as the unapplied-patch bug itself.
+fn assert_every_instruction_patch_is_reachable(cfg: &RecompConfig) {
+    for patch in &cfg.patches.instructions {
+        let found = cfg
+            .sections
+            .iter()
+            .flat_map(|section| section.functions.iter())
+            .any(|func| func.name == patch.func);
+        assert!(
+            found,
+            "instruction patch names function {:?}, which is in no configured section",
+            patch.func
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1139,5 +1193,110 @@ mod tests {
         assert!(report.module.contains("pub fn guarded_div"));
         assert!(report.module.contains("panic!(\"break (code"));
         assert!(report.results[0].outcome == Outcome::Clean);
+    }
+
+    /// The idle-spin config shape, reduced to its two words: a backward `j`
+    /// that is not a self-branch, plus its delay-slot nop. Unpatched, the
+    /// emitter renders an ordinary `pc = ...; continue` — a tight loop that
+    /// never yields to the cooperative scheduler. `[[patches.instruction]]`
+    /// rewrites the `j` into the self-branch `0x1000FFFF`, which the emitter
+    /// special-cases into `pause_self()`.
+    ///
+    /// WM2000 is the live case: `func_800004D0`'s tail drops to priority 0 and
+    /// spins here, and with the patch unapplied 100% of samples sat inside
+    /// that function with no VI swap ever committed.
+    fn idle_spin_config(patches: Vec<InstructionPatch>) -> (RecompConfig, Vec<u8>) {
+        // 0x80000000: nop
+        // 0x80000004: nop
+        // 0x80000008: j 0x80000000  -- backward, NOT a self-branch
+        // 0x8000000C: nop
+        // This mirrors WM2000's `L_800005A4: jal ...; j L_800005A4` shape: the
+        // jump target is an EARLIER word, so the self-branch rule does not fire
+        // and the patch is the only thing that can make this yield.
+        let words = [0x0000_0000u32, 0x0000_0000, 0x0800_0000, 0x0000_0000];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "code".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "idle_spin".to_string(),
+                    vram: 0x8000_0000,
+                    size: rom.len() as u32,
+                }],
+            }],
+            patches: Patches {
+                instructions: patches,
+                ..Patches::default()
+            },
+        };
+        (cfg, rom)
+    }
+
+    #[test]
+    fn instruction_patch_rewrites_the_word_the_emitter_reads() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "idle_spin".to_string(),
+            vram: 0x8000_0008,
+            value: 0x1000_FFFF,
+        }]);
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        assert!(
+            report.module.contains("pause_self()"),
+            "a self-branch patch must reach the emitter as a cooperative yield; module was:\n{}",
+            report.module
+        );
+    }
+
+    /// The mutation that matters: drop the patch and the same config must
+    /// emit the non-yielding loop instead. Without this pairing, a test that
+    /// only asserts the patched form would still pass if `read_func_words`
+    /// ignored patches and the emitter happened to yield for another reason.
+    #[test]
+    fn without_the_patch_the_same_config_emits_no_yield() {
+        let (cfg, rom) = idle_spin_config(Vec::new());
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        assert!(
+            !report.module.contains("pause_self()"),
+            "unpatched, this body is a plain backward jump and must NOT yield"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is in no configured section")]
+    fn instruction_patch_naming_an_absent_function_is_refused() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "not_in_any_section".to_string(),
+            vram: 0x8000_0000,
+            value: 0x1000_FFFF,
+        }]);
+
+        let _ = run(&cfg, &rom, &HashSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a word inside that function")]
+    fn instruction_patch_outside_its_function_is_refused() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "idle_spin".to_string(),
+            vram: 0x8000_0100,
+            value: 0x1000_FFFF,
+        }]);
+
+        let _ = run(&cfg, &rom, &HashSet::new());
     }
 }
