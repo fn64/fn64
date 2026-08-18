@@ -398,10 +398,50 @@ mod game {
             let requested_renderer = std::env::var("FN64_RENDER")
                 .unwrap_or_else(|_| "reference".to_string())
                 .to_ascii_lowercase();
+            // `wgpu` additionally yields the ABI-side half of `WgpuBackend`'s
+            // role split. `set_raw_dpc_session`'s own doc names "a shell or
+            // test harness, never `fn64-abi` itself" as the caller that must
+            // register it: without it `try_dispatch_raw_dpc_via_session`
+            // (`rsp_commit.rs`) early-returns `None` and the raw-DPC seam this
+            // backend implements is never reached. Order against
+            // `set_render_backend` is immaterial -- `set_render_backend_with_policy`
+            // never touches `RAW_DPC_SESSION` -- so the doc's "first or in the
+            // same setup step" is a pairing-provenance rule, honored here by
+            // taking both halves from one `try_new`.
+            let mut raw_dpc_session: Option<fn64_render::RawDpcAbiSession> = None;
             let (render_backend, active_renderer): (
                 Box<dyn fn64_render::RenderBackend>,
                 &'static str,
-            ) = if requested_renderer == "rt64" {
+            ) = if requested_renderer == "wgpu" {
+                match fn64_render_wgpu::WgpuBackend::try_new() {
+                    Ok((mut backend, session)) => {
+                        match backend.create(&fn64_render::RenderConfig::for_tv(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                            tv_type,
+                        )) {
+                            Ok(()) => {
+                                raw_dpc_session = Some(session);
+                                (Box::new(backend), "wgpu")
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[fn64-shell] WARNING: WgpuBackend create failed ({error}); \
+                                     falling back to the ReferenceBackend oracle"
+                                );
+                                (create_reference(), "reference-fallback")
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
+                             falling back to the ReferenceBackend oracle"
+                        );
+                        (create_reference(), "reference-fallback")
+                    }
+                }
+            } else if requested_renderer == "rt64" {
                 let mut backend = fn64_render_rt64::Rt64Backend::new();
                 match backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
@@ -427,6 +467,10 @@ mod game {
                 (create_reference(), "reference")
             };
             fn64_abi::set_render_backend(render_backend, rdram.len());
+            if let Some(session) = raw_dpc_session {
+                fn64_abi::set_raw_dpc_session(session);
+                println!("[fn64-shell] raw-DPC session registered (wgpu plan/execute/publish seam)");
+            }
             println!("[fn64-shell] render backend registered ({active_renderer}, 320x240)");
 
             // Audio OUTPUT path: a live cpal output stream. This is the
