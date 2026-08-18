@@ -1456,6 +1456,25 @@ fn flat_primitive_combine_words() -> [u32; 2] {
     [word(SET_COMBINE, low & 0x00ff_ffff), high]
 }
 
+/// WM2000's env-lerp program, as `SetCombine` wire words: RGB
+/// `(Environment - Texel0) * Primitive + Texel0`, alpha
+/// `(Texel0 - Zero) * Primitive + Zero`.
+///
+/// **2,100 of WM2000's 2,520 texrects run exactly this** -- 83% of the
+/// title screen's rectangles, against `flat_primitive_combine_words`' 420
+/// (`docs/RT64-WM2000-CYCLE-MODES.md`). Re-derived from the field layout
+/// here rather than imported from `fn64-render-wgpu`'s test module, the
+/// same independence convention `flat_primitive_combine_words` follows:
+/// colour A `low >> 5 & 0xF` = ENVIRONMENT(5), B `high >> 24 & 0xF` =
+/// TEXEL0(1), C `low & 0x1F` = PRIMITIVE(3), D `high >> 6 & 0x7` =
+/// TEXEL0(1); alpha A `high >> 21 & 0x7` = TEXEL0(1), B `high >> 3 & 0x7` =
+/// ZERO(7), C `high >> 18 & 0x7` = PRIMITIVE(3), D `high & 0x7` = ZERO(7).
+fn env_lerp_combine_words() -> [u32; 2] {
+    let low = (5u32 << 5) | 3;
+    let high = (1u32 << 24) | (1 << 6) | (1 << 21) | (7 << 3) | (3 << 18) | 7;
+    [word(SET_COMBINE, low & 0x00ff_ffff), high]
+}
+
 const ONE_CYCLE_PRIM_WIRE: u32 = 0x80FF_4080;
 /// Deliberately staged although the flat-primitive program never reads
 /// `ENVIRONMENT`: a leak from this register into a colour channel would be
@@ -1484,6 +1503,30 @@ const ONE_CYCLE_ENV_WIRE: u32 = 0xFF00_80FF;
 /// evaluation runs per pixel. `fn64-render-wgpu`'s
 /// `a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_tmem_projection`
 /// pins the blocked half by name.
+/// `fill_load_and_one_cycle_texrect_words` with the **env-lerp** program in
+/// place of the flat-primitive one, and nothing else changed.
+///
+/// A deliberate sibling rather than a parameter on the existing fixture:
+/// the two differ in exactly one command, so a behavioural difference
+/// between them isolates to the combiner program -- and specifically to
+/// whether it references `TEXEL0`, which is the whole subject of the test
+/// below.
+fn fill_load_and_env_lerp_texrect_words() -> Vec<u32> {
+    let mut words = whole_target_fill_words();
+    words.extend(composed_tmem_load_words());
+    words.extend([word(SET_OTHER_MODE, 0), 0]);
+    words.extend(env_lerp_combine_words());
+    words.extend([word(SET_ENV_COLOR, 0), ONE_CYCLE_ENV_WIRE]);
+    words.extend([word(SET_PRIM_COLOR, 0x05 << 8 | 0x40), ONE_CYCLE_PRIM_WIRE]);
+    words.extend([
+        word(TEXRECT, ((11u32 << 2) << 12) | (4u32 << 2)),
+        7 << 24 | ((4u32 << 2) << 12) | (2u32 << 2),
+        0,
+        (0x0400u32 << 16) | 0x0400,
+    ]);
+    words
+}
+
 fn fill_load_and_one_cycle_texrect_words() -> Vec<u32> {
     let mut words = whole_target_fill_words();
     // The tip's own load run, reused rather than re-inlined: a second copy
@@ -3900,4 +3943,142 @@ fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
     );
     drop(backend);
     teardown();
+}
+
+/// **The proof neither lane could produce alone: a one-cycle texrect whose
+/// combine references `TEXEL0` reaches guest RDRAM through the real
+/// `dispatch_dpc_submission` seam, carrying real combined pixels.**
+///
+/// This is 2,100 of WM2000's 2,520 rectangles -- 83% of the title screen
+/// (`docs/RT64-WM2000-CYCLE-MODES.md`) -- and it needed two independent
+/// fixes to become assertable:
+///
+/// 1. **One-cycle admission.** Before it, `execute_texture_rectangle`
+///    refused any cycle but Copy, so this packet died at
+///    `UnsupportedCycleType` before any texel was read.
+/// 2. **The pending TMEM projection.** Before it,
+///    `draw_admitted_triangles` projected the already-**published** slot,
+///    which cannot contain this packet's own `LoadBlock` -- publication runs
+///    strictly after execution -- so the GPU triangle path reported
+///    `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
+///
+/// Its sibling `a_one_cycle_texrect_reaches_guest_rdram_carrying_combiner_
+/// output` proves the same conveyor for the flat-primitive program, which
+/// reads **no** texel. That difference is load-bearing and is why this test
+/// exists separately: a texel-free combine lets the GPU fragment shader
+/// short-circuit before it samples TMEM at all, so the flat-primitive test
+/// passed even with the projection defect present -- measured, by reverting
+/// the projection on this tip and watching it stay green. **The control
+/// passing was never evidence the GPU sampled correctly; it was evidence it
+/// never sampled at all.**
+///
+/// # What is asserted
+///
+/// Guest RDRAM, in **logical** byte order through `read_fill_target_logical`
+/// and `copy_committed_guest_writes`' `^3` lane mapping -- the difference
+/// between "the backend computed pixels" and "the guest can see them".
+///
+/// The rectangle is the one-cycle footprint the sibling test hand-derives
+/// twice (x 4..=10, y 2..=3; one-cycle applies neither Copy's `lrx |= 3`
+/// nor fill/copy's `ulx &= !3`), so it is not re-derived here. What is
+/// asserted is that outside it the fill survives, inside it the bytes are
+/// neither the poison nor the fill, and -- the claim only a real texel fetch
+/// can satisfy -- that the output **varies across the rectangle**. The
+/// flat-primitive sibling's output is constant by construction; an env-lerp
+/// output that came out constant would mean the projection carried empty or
+/// stale bytes, which is exactly the defect, and would satisfy every other
+/// assertion here.
+#[test]
+fn a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram() {
+    // **Positive control, before anything executes.** This crate cannot
+    // reach `CombineParams`, so the assertion is on the wire words the
+    // fixture actually emits, decoded by the same bit positions
+    // `CombineParams::parse_color_*` uses at `second_cycle = true`. Without
+    // it, a fixture whose combine silently stopped referencing TEXEL0 would
+    // pass this whole test while proving nothing -- measured on the previous
+    // lane: zeroing both combine words left every assertion below green.
+    let [combine_low, combine_high] = env_lerp_combine_words();
+    assert_eq!(
+        (combine_high >> 24) & 0xF,
+        1,
+        "combine slot B must select TEXEL0, or the fragment shader short-circuits before \
+         sampling TMEM and this test proves nothing about the projection"
+    );
+    assert_eq!(
+        (combine_high >> 6) & 0x7,
+        1,
+        "combine slot D must select TEXEL0"
+    );
+    assert_eq!(
+        (combine_low >> 5) & 0xF,
+        5,
+        "combine slot A must select ENVIRONMENT -- this test's claim is about WM2000's env-lerp \
+         program specifically, not merely something that touches a texel"
+    );
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let poisoned = poison_fill_target(&mut rdram);
+    dispatch_words(&mut rdram, &fill_load_and_env_lerp_texrect_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the env-lerp composed packet must complete"
+    );
+    let observed = read_fill_target_logical(&rdram);
+    assert_ne!(
+        observed, poisoned,
+        "the env-lerp packet must change guest bytes -- every byte still carrying the poison is \
+         exactly what the published-slot projection produced, because the GPU draw failed with \
+         TMEM_SAMPLE_STATUS_INVALID_BYTE and nothing was committed"
+    );
+
+    // The hand-derived one-cycle rectangle, same as the sibling's.
+    const X0: u32 = 4;
+    const Y0: u32 = 2;
+    const W: u32 = 7;
+    const H: u32 = 2;
+
+    let mut inside: Vec<u16> = Vec::new();
+    for y in 0..FILL_TARGET_HEIGHT {
+        for x in 0..FILL_TARGET_WIDTH {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            let actual = u16::from_be_bytes([observed[offset], observed[offset + 1]]);
+            let fill = expected_fill_halfword(0x0842_1085, x);
+            if x >= X0 && x < X0 + W && y >= Y0 && y < Y0 + H {
+                assert_ne!(
+                    actual, fill,
+                    "pixel ({x}, {y}) is inside the texrect, so it must not still be the fill \
+                     value -- a texrect that drew nothing would leave the fill underneath and \
+                     satisfy every other assertion here"
+                );
+                inside.push(actual);
+            } else {
+                assert_eq!(
+                    actual, fill,
+                    "pixel ({x}, {y}) is outside the texrect and must carry the fill's own value"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        inside.len() as u32,
+        W * H,
+        "the texrect must have covered exactly its hand-derived {W}x{H} rectangle"
+    );
+
+    // **The claim that separates this from the flat-primitive sibling, and
+    // the one that could only be made once the projection was fixed.** The
+    // env-lerp program reads TEXEL0, and the rectangle spans several texels
+    // in both S and T, so its output must vary. A stale or empty projection
+    // would produce a constant image -- every pixel `Environment` scaled by
+    // `Primitive` -- and pass every assertion above.
+    let distinct: std::collections::BTreeSet<u16> = inside.iter().copied().collect();
+    assert!(
+        distinct.len() >= 2,
+        "the env-lerp output must VARY across the rectangle, because it reads a texel and the \
+         rectangle spans several -- a constant image means the projection carried empty or \
+         stale bytes rather than this packet's own load: got {distinct:?}"
+    );
 }
