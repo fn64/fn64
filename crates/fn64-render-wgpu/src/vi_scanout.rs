@@ -244,10 +244,35 @@ fn source_rows(registers: ViScanoutRegisters, output_height: u32) -> u64 {
 /// Ordering is deliberate: the reserved pixel type is checked first because
 /// it is a malformed register image rather than an unimplemented filter, and
 /// `ViPixelType::Reserved` has no byte width to bound-check against.
+///
+/// A **blanked** field is then admitted unconditionally, before any filter
+/// test. This is not a fallback that masks a refusal -- it is the ordering
+/// the filters' own domain requires. Every remaining refusal names a filter
+/// that transforms *scanned-out pixels*: silhouette AA and dither
+/// restoration read per-pixel coverage, divot medians three post-filter
+/// samples, resampling interpolates between adjacent source samples, and
+/// gamma maps sampled components. A blanked field scans out no source at
+/// all -- `SourceGeometry::derive` returns `Ok(None)` for it and the field
+/// is black at the programmed rectangle -- so there are no pixels for any
+/// of those filters to transform, and no output this module could get
+/// wrong. Refusing here would report an unimplemented filter for a field
+/// whose contents that filter cannot influence.
+///
+/// This mirrors `fn64-render-reference`'s `scanout`
+/// (`crates/fn64-render-reference/src/vi.rs:37-44`), which likewise returns
+/// the cleared field on `blanked || pixel_type == Blank` *before* consulting
+/// `silhouette_aa_enabled`, `dither_filter`, `divot`, or `gamma`. The two
+/// backends agree on a blanked field precisely because both order it this
+/// way; measured on the real WM2000 ROM, its first present latches
+/// `AaResampleAlways` **with `ViPixelType::Blank`**, which the reference
+/// blanks and this module previously refused.
 fn admitted_filters(vi: ViPresentation) -> Result<(), ViScanoutRefusal> {
     let filters = vi.scanout.filters();
     if filters.pixel_type == ViPixelType::Reserved {
         return Err(ViScanoutRefusal::ReservedPixelType);
+    }
+    if vi.blanked || filters.pixel_type == ViPixelType::Blank {
+        return Ok(());
     }
     if vi.fade.is_some() {
         return Err(ViScanoutRefusal::Fade);
