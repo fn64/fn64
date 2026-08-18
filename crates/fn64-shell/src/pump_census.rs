@@ -89,6 +89,13 @@ pub struct PumpSample {
     pub audio_lle_calls: u64,
     pub vi_present_ns: u64,
     pub vi_present_calls: u64,
+    /// Presentations that ran INSIDE `run_one_step`, and are therefore
+    /// counted a SECOND time inside `executor_ns`. Ungated and expected zero:
+    /// `counter_tree` declares `vi_present_ns` a root precisely because
+    /// presentation runs on the harness's `advance_virtual_time` arm. A
+    /// nonzero value refutes that for those pumps, and the two roots may not
+    /// be added for them -- which is why this is read rather than assumed.
+    pub vi_present_in_executor_calls: u64,
 
     // ---- FN64_EXECUTOR_SPLIT
     pub exec_resume_ns: u64,
@@ -148,6 +155,7 @@ struct PhaseSnapshot {
     audio_lle_calls: u64,
     vi_present_ns: u64,
     vi_present_calls: u64,
+    vi_present_in_executor_calls: u64,
     exec_resume_ns: u64,
     exec_mirror_ns: u64,
     exec_devtime_ns: u64,
@@ -184,6 +192,7 @@ impl Totals {
                 audio_lle_calls: p.audio_lle_calls,
                 vi_present_ns: p.vi_present_ns,
                 vi_present_calls: p.vi_present_calls,
+                vi_present_in_executor_calls: p.vi_present_in_executor_calls,
                 exec_resume_ns: p.exec_resume_ns,
                 exec_mirror_ns: p.exec_mirror_ns,
                 exec_devtime_ns: p.exec_devtime_ns,
@@ -226,6 +235,9 @@ impl Totals {
             audio_lle_calls: a.audio_lle_calls.saturating_sub(b.audio_lle_calls),
             vi_present_ns: a.vi_present_ns.saturating_sub(b.vi_present_ns),
             vi_present_calls: a.vi_present_calls.saturating_sub(b.vi_present_calls),
+            vi_present_in_executor_calls: a
+                .vi_present_in_executor_calls
+                .saturating_sub(b.vi_present_in_executor_calls),
             exec_resume_ns: a.exec_resume_ns.saturating_sub(b.exec_resume_ns),
             exec_mirror_ns: a.exec_mirror_ns.saturating_sub(b.exec_mirror_ns),
             exec_devtime_ns: a.exec_devtime_ns.saturating_sub(b.exec_devtime_ns),
@@ -655,20 +667,45 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         ));
     }
 
-    // THE TAIL. Defined as the wall time slow pumps spend ABOVE the budget:
-    // the excess that actually misses deadlines, not the whole cost of a slow
-    // pump (a slow pump would have cost one budget's worth anyway). Every
-    // attribution fraction below is taken against this denominator, stated
-    // here so no row is read against the wrong one (rule 32).
-    let tail_ms: f64 = slow
+    // THE TAIL, and WHICH tail. Two denominators, both printed, because a
+    // share is meaningless without the one it was taken against (rule 32) and
+    // the first draft of this report used the wrong one:
+    //
+    // - `excess_ms`  = slow-pump wall MINUS the fast-population mean, summed.
+    //   This is the quantity the per-phase rows decompose: every row below is
+    //   "what this phase costs in a slow pump beyond what it costs in a fast
+    //   one", so its denominator must be the same difference at the top level.
+    //   The rows sum to it by construction, which is what makes the shares
+    //   add to ~100% and lets a residual be read as unattributed.
+    // - `over_budget_ms` = slow-pump wall above the 16.667 ms field budget.
+    //   This is the quantity that actually MISSES DEADLINES. It is the smaller
+    //   and more conservative figure whenever fast pumps finish early, and it
+    //   is the one to quote when asking "how much must fall to hold 60 Hz".
+    //
+    // They are not interchangeable. Taking phase excesses against the
+    // over-budget figure produced shares summing to 1200% in this
+    // instrument's first real output -- an arithmetic tell that the
+    // denominator was wrong, not that twelve phases each owned the tail.
+    let excess_ms: f64 = slow
+        .iter()
+        .map(|s| ms(s.wall_ns) - pop_fast.wall_mean_ms)
+        .sum::<f64>();
+    let over_budget_ms: f64 = slow
         .iter()
         .map(|s| ms(s.wall_ns) - FIELD_BUDGET_MS)
         .sum::<f64>();
+    let tail_ms = excess_ms;
     out.push_str(&format!(
-        "[pump-census] TAIL (slow-pump wall above budget) = {tail_ms:.1} ms over {} slow pumps \
-         ({:.3} ms/slow pump)\n",
+        "[pump-census] TAIL, two denominators over {} slow pumps:\n\
+         [pump-census]   excess over the fast-population mean ({:.3} ms) = {excess_ms:.1} ms \
+         ({:.3} ms/slow pump)  <-- the rows below decompose THIS\n\
+         [pump-census]   excess over the {:.3} ms field budget       = {over_budget_ms:.1} ms \
+         ({:.3} ms/slow pump)  <-- the part that misses deadlines\n",
         pop_slow.pumps,
-        if pop_slow.pumps > 0 { tail_ms / pop_slow.pumps as f64 } else { 0.0 }
+        pop_fast.wall_mean_ms,
+        if pop_slow.pumps > 0 { excess_ms / pop_slow.pumps as f64 } else { 0.0 },
+        FIELD_BUDGET_MS,
+        if pop_slow.pumps > 0 { over_budget_ms / pop_slow.pumps as f64 } else { 0.0 },
     ));
 
     let t_all = totals_for(&all);
@@ -697,17 +734,52 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
     }
     // The outer closure this instrument uniquely can check: attributed phases
     // against the independently-measured wall time of the pumps containing
-    // them. `executor_ns` and `vi_present_ns` are the two roots.
-    for (t, p, label) in [(&t_fast, &pop_fast, "fast"), (&t_slow, &pop_slow, "slow")] {
-        let roots = ms(lookup(t, "executor_ns")) + ms(lookup(t, "vi_present_ns"));
-        let residual = p.wall_total_ms - roots;
+    // them. `executor_ns` and `vi_present_ns` are the two roots -- but only
+    // while presentation stays OUTSIDE the executor, which `counter_tree`
+    // declares and `vi_present_in_executor_calls` exists to test rather than
+    // assume. On a pump where a presentation ran inside `run_one_step` the
+    // two roots OVERLAP, so adding them double-counts that presentation and
+    // the closure goes negative. That is a measured fact about the pump, not
+    // a broken instrument, so the two cases are reported separately: a
+    // negative residual among the CLEAN pumps means the rows are wrong, while
+    // overlapping pumps are excluded and counted.
+    for (population, p, label) in [(&fast, &pop_fast, "fast"), (&slow, &pop_slow, "slow")] {
+        let (clean, overlapped): (Vec<&PumpSample>, Vec<&PumpSample>) = population
+            .iter()
+            .partition(|s| s.vi_present_in_executor_calls == 0);
+        let clean_wall: f64 = clean.iter().map(|s| ms(s.wall_ns)).sum();
+        let clean_roots: f64 = clean
+            .iter()
+            .map(|s| ms(s.executor_ns) + ms(s.vi_present_ns))
+            .sum();
+        let residual = clean_wall - clean_roots;
         out.push_str(&format!(
-            "[pump-census] [{label}] closure: roots(executor+vi_present)={roots:.1}ms vs \
-             pump wall={:.1}ms -> unattributed residual {residual:.1}ms ({:.1}%){}\n",
-            p.wall_total_ms,
-            if p.wall_total_ms > 0.0 { 100.0 * residual / p.wall_total_ms } else { 0.0 },
-            if residual < 0.0 { "  <-- NEGATIVE: the split does NOT close, treat rows as broken" } else { "" }
+            "[pump-census] [{label}] closure over the {} pumps whose presentation stayed \
+             OUTSIDE the executor: roots(executor+vi_present)={clean_roots:.1}ms vs pump \
+             wall={clean_wall:.1}ms -> unattributed residual {residual:.1}ms ({:.1}%){}\n",
+            clean.len(),
+            if clean_wall > 0.0 { 100.0 * residual / clean_wall } else { 0.0 },
+            if residual < -0.005 * clean_wall.max(1.0) {
+                "  <-- NEGATIVE beyond tolerance: the split does NOT close, treat rows as broken"
+            } else {
+                ""
+            }
         ));
+        if !overlapped.is_empty() {
+            let ov_wall: f64 = overlapped.iter().map(|s| ms(s.wall_ns)).sum();
+            let ov_present: f64 = overlapped.iter().map(|s| ms(s.vi_present_ns)).sum();
+            out.push_str(&format!(
+                "[pump-census] [{label}] EXCLUDED from that closure: {} of {} pumps ran a \
+                 presentation INSIDE the executor ({:.1}% of the population, {:.1}ms wall, \
+                 {:.1}ms of vi_present double-counted inside executor_ns). Their \
+                 `vi_present_ns` row is NOT additive with `executor_ns`.\n",
+                overlapped.len(),
+                p.pumps,
+                100.0 * overlapped.len() as f64 / p.pumps.max(1) as f64,
+                ov_wall,
+                ov_present,
+            ));
+        }
     }
 
     // ---- the ranked attribution.
@@ -754,6 +826,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         ("audio_tasks", |s| s.audio_tasks),
         ("audio_lle_calls", |s| s.audio_lle_calls),
         ("vi_present_calls", |s| s.vi_present_calls),
+        ("vi_present_IN_executor", |s| s.vi_present_in_executor_calls),
         ("vi_swaps", |s| u64::from(s.swapped)),
         ("rsp_entries", |s| s.rsp_entries),
         ("rsp_steps_gfx", |s| s.rsp_steps_gfx),
@@ -958,9 +1031,12 @@ mod tests {
         let samples = vec![sample(16.0), sample(16.6), sample(16.7), sample(40.0)];
         let text = render_report(&samples, "test", 0);
         assert!(text.contains("pumps=4 over_budget=2 (50.0%)"), "{text}");
-        // The tail is the EXCESS above budget, not the whole slow-pump cost:
-        // (16.7-16.667) + (40-16.667) = 23.37.
-        assert!(text.contains("TAIL (slow-pump wall above budget) = 23.4 ms"), "{text}");
+        // Both denominators, and they must differ: the fast mean is 16.3 ms,
+        // so excess-over-fast is (16.7-16.3)+(40-16.3) = 24.1, while
+        // excess-over-budget is (16.7-16.667)+(40-16.667) = 23.4. Quoting one
+        // where the other was meant is the error this pair exists to prevent.
+        assert!(text.contains("excess over the fast-population mean (16.300 ms) = 24.1 ms"), "{text}");
+        assert!(text.contains("excess over the 16.667 ms field budget       = 23.4 ms"), "{text}");
     }
 
     /// A zero from an unarmed gate must never be rendered as "this phase is
