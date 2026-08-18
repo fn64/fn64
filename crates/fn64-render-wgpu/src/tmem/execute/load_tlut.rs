@@ -1225,4 +1225,26 @@ mod tests {
             assert_eq!(snapshot(&state), before);
         }
     }
+
+    /// **Pins a measured surviving mutant.** `validate_transfer_shape`'s two
+    /// `TransferMismatch` checks (`:322-331`) were both deleted and the whole
+    /// workspace stayed green -- 8319/8319 passed, 13 skipped -- so neither
+    /// check has a test constructing its trigger. That is the same shape as
+    /// the `LoadTLUT` destination-descriptor guard that shipped a defect: a
+    /// refusal that no fixture can reach, on the very command WM2000 issues
+    /// 1,808 times (`docs/RT64-WM2000-CENSUS.md` §3).
+    ///
+    /// Ignored, not failing: this is a coverage audit
+    /// (`docs/RT64-COVERAGE-AUDIT.md`), not a fix card. Writing the real
+    /// trigger needs a `BoundTmemTransfer` whose word count disagrees with
+    /// its plan's, which the decoder's own admission currently makes
+    /// unconstructible from public API -- and *that* is the finding: the
+    /// checks may be unreachable-by-construction rather than merely
+    /// untested, and nothing in the crate distinguishes the two today.
+    #[test]
+    #[ignore = "coverage-audit marker: documents a surviving mutant, see docs/RT64-COVERAGE-AUDIT.md"]
+    fn validate_transfer_shape_mismatch_checks_have_no_test_constructing_their_trigger() {
+        // Both `TransferMismatch` arms are reachable in source but no
+        // fixture reaches them. Deleting both is invisible to the suite.
+    }
 }
