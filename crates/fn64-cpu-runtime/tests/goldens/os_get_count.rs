@@ -16,7 +16,7 @@ pub fn os_get_count(ctx: &mut RecompContext, mem: &mut Rdram) {
         0x80004D5C => {
             // 0x80004D5C: Nop
             // nop
-            pc = 0x80004D60;
+            lookup(0x80004D60)(ctx, mem); return;
         }
         _ => unreachable!("jumped to unmapped vram {:#X}", pc),
     } }
