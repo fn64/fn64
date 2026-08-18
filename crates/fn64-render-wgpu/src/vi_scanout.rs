@@ -576,12 +576,14 @@ pub(crate) fn scan_out_guest_rdram(
         for pixel in rgba8.chunks_exact_mut(4) {
             pixel[3] = 255;
         }
-        return Ok(PresentedField {
+        let field = PresentedField {
             width,
             height,
             rgba8,
             presentation: vi,
-        });
+        };
+        report_field(&field, vi.scanout.filters());
+        return Ok(field);
     };
 
     geometry.validate(memory.len())?;
@@ -601,12 +603,53 @@ pub(crate) fn scan_out_guest_rdram(
         replicate(&plane, x, y, output_width, output_height)
     };
 
-    Ok(PresentedField {
+    let field = PresentedField {
         width: output_width,
         height: output_height,
         rgba8,
         presentation: vi,
-    })
+    };
+    report_field(&field, filters);
+    Ok(field)
+}
+
+/// Emit one line per presented field under `FN64_VI_FIELD_DIGEST`.
+///
+/// This exists because the shell's own window blit does **not** go through
+/// this module -- `fn64-shell`'s `present()` reads guest RDRAM directly with
+/// `rgba5551_to_rgba8888`, so an F2 screenshot shows that path's output and
+/// is not evidence about this one. Without this line, "the filters ran on
+/// the real ROM" would be an inference from the absence of a refusal rather
+/// than an observation of the pixels.
+///
+/// The digest is FNV-1a over the presented bytes. It is a comparison key
+/// for "did this field change / is it uniform", never a correctness claim.
+fn report_field(field: &PresentedField, filters: ViFilterControl) {
+    if std::env::var_os("FN64_VI_FIELD_DIGEST").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ORDINAL: AtomicU64 = AtomicU64::new(0);
+    let ordinal = ORDINAL.fetch_add(1, Ordering::Relaxed);
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for byte in &field.rgba8 {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let first = field.rgba8.first_chunk::<4>().copied().unwrap_or([0; 4]);
+    let uniform = field
+        .rgba8
+        .chunks_exact(4)
+        .all(|pixel| pixel == first.as_slice());
+    eprintln!(
+        "[fn64-vi-scanout] field {ordinal}: {}x{} pixel_type={:?} aa={:?} dither_filter={} \
+         uniform={uniform} first={first:?} digest={digest:#018x}",
+        field.width,
+        field.height,
+        filters.pixel_type,
+        filters.antialias_mode,
+        filters.dither_filter
+    );
 }
 
 /// The source rectangle expanded to eight-bit RGBA, held whole so a
