@@ -35,8 +35,8 @@ pub use raster::{
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
 pub use texrect::{
-    execute_texture_rectangle, TexrectAxis, TexrectConstantRegister, TexrectDraw,
-    TexrectExecutionError, TexrectShading, TexrectTileBinding,
+    execute_texture_rectangle, TexrectAxis, TexrectBlendRegisters, TexrectConstantRegister,
+    TexrectDraw, TexrectExecutionError, TexrectShading, TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 pub use triangle_pipeline::{
