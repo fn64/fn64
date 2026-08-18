@@ -28,6 +28,11 @@ fn64-boot-harness = { path = "../fn64-boot-harness" }
 fn64-render = { path = "../fn64-render" }
 fn64-render-reference = { path = "../fn64-render-reference" }
 fn64-render-rt64 = { path = "../fn64-render-rt64" }
+# The pure-Rust wgpu backend (FN64_RENDER=wgpu). Selectable, not the
+# default: its admitted set is the T3 raw-DPC seam (TMEM loads, admitted
+# state/triangle commands, fill-cycle FillRectangle) plus VI scanout, and
+# everything outside it is a named refusal, not a fallback.
+fn64-render-wgpu = { path = "../fn64-render-wgpu" }
 # cpal-backed AudioBackend lives here; we register it via
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.
 fn64-audio = { path = "../fn64-audio" }
