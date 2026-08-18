@@ -1814,3 +1814,201 @@ use super::*;
         let expected: [u8; 32] = Sha256::digest(&payload).into();
         assert_eq!(identity.sha256, expected);
     }
+
+    // --- DPC submission coalescing -------------------------------------
+    //
+    // `coalesce_dp_submissions` is the one site that decides where a
+    // hardware command stream begins and ends. Everything downstream
+    // (`request_dpc_submission`, `OwnedRawDpcSubmission::from_*`) trusts
+    // its `start..end` to describe exactly the words it hands over.
+
+    fn xbus(start: u32, end: u32, fill: u8) -> fn64_audio::rsp::runtime::RspDpSubmission {
+        fn64_audio::rsp::runtime::RspDpSubmission::from_xbus_bytes(
+            start,
+            end,
+            vec![fill; (end - start) as usize],
+        )
+    }
+
+    fn rdram_words(start: u32, end: u32, fill: u32) -> fn64_audio::rsp::runtime::RspDpSubmission {
+        fn64_audio::rsp::runtime::RspDpSubmission::from_rdram_words(
+            start,
+            end,
+            vec![fill; ((end - start) / 4) as usize],
+        )
+    }
+
+    /// The straddle case `7ef65d54` was written for: F3DEX xbus extends its
+    /// run 8 bytes per END write, and a 16-byte command spans two of them.
+    /// Contiguous XBUS submissions must still merge into one stream, or the
+    /// decoder traps on a truncation hardware stalls through.
+    #[test]
+    fn contiguous_xbus_submissions_merge_into_one_stream() {
+        let runs = coalesce_dp_submissions(vec![
+            xbus(0x0ba8, 0x0bb0, 0xa1),
+            xbus(0x0bb0, 0x0bb8, 0xa2),
+            xbus(0x0bb8, 0x0bc0, 0xa3),
+        ]);
+        assert_eq!(runs.len(), 1, "one contiguous XBUS run is one stream");
+        assert_eq!((runs[0].start, runs[0].end), (0x0ba8, 0x0bc0));
+        assert!(runs[0].xbus);
+        assert_eq!(runs[0].words.len(), 6);
+        assert_eq!(
+            runs[0].words,
+            [
+                0xa1a1_a1a1,
+                0xa1a1_a1a1,
+                0xa2a2_a2a2,
+                0xa2a2_a2a2,
+                0xa3a3_a3a3,
+                0xa3a3_a3a3
+            ],
+            "the merged stream is every submission's bytes, in submission order"
+        );
+    }
+
+    /// The measured WM2000 defect, in miniature. The graphics ucode fills a
+    /// DMEM command ring and wraps back to its base; the wrap is a new START,
+    /// so it opens a new stream. Coalescing through it accumulated all the
+    /// bytes under the first range's `start..end` and the capture refused the
+    /// result as `XbusPayloadLength { expected: 752, actual: 3400 }`.
+    ///
+    /// Mutation control: deleting `&& submission.start == end` from the XBUS
+    /// arm of `coalesce_dp_submissions` makes this one run of 3 words over
+    /// `[0x0f10, 0x0bb0)`, which the run's own length assertion rejects.
+    #[test]
+    fn an_xbus_ring_wrap_opens_a_new_stream() {
+        let runs = coalesce_dp_submissions(vec![
+            xbus(0x0f08, 0x0f10, 0xb1),
+            xbus(0x0f10, 0x0f18, 0xb2),
+            // ring wrap: END jumped backwards to the ring base
+            xbus(0x0ba8, 0x0bb0, 0xb3),
+        ]);
+        assert_eq!(runs.len(), 2, "the ring wrap breaks the run");
+        assert_eq!((runs[0].start, runs[0].end), (0x0f08, 0x0f18));
+        assert_eq!(runs[0].words.len(), 4);
+        assert_eq!((runs[1].start, runs[1].end), (0x0ba8, 0x0bb0));
+        assert_eq!(runs[1].words.len(), 2);
+        for run in &runs {
+            assert_eq!(
+                (run.end - run.start) as usize,
+                run.words.len() * 4,
+                "every emitted run describes exactly its own bytes"
+            );
+        }
+    }
+
+    /// Positive control for the fixture above: the wrapped submission list is
+    /// genuinely non-contiguous, so the ring-wrap test is exercising the new
+    /// adjacency test and not passing for an unrelated reason.
+    #[test]
+    fn the_ring_wrap_fixture_is_actually_non_contiguous() {
+        let submissions = vec![
+            xbus(0x0f08, 0x0f10, 0xb1),
+            xbus(0x0f10, 0x0f18, 0xb2),
+            xbus(0x0ba8, 0x0bb0, 0xb3),
+        ];
+        assert!(submissions.iter().all(|submission| submission.is_xbus()));
+        assert_eq!(submissions[1].end - submissions[2].start, 0x370);
+        assert_ne!(
+            submissions[1].end, submissions[2].start,
+            "the fixture must contain a discontinuity for the adjacency test to catch"
+        );
+        let total: u32 = submissions
+            .iter()
+            .map(|submission| submission.end - submission.start)
+            .sum();
+        assert_eq!(total, 24, "three 8-byte submissions carry 24 bytes");
+        // The span a predicate-only coalescer would report -- first `start`
+        // to last `end` -- runs backwards across the wrap, so it cannot equal
+        // the payload it would be attached to under any interpretation.
+        assert!(
+            submissions[2].end < submissions[0].start,
+            "the wrapped run's reported span is reversed, not merely short"
+        );
+    }
+
+    /// Whichever source, the rule is one rule. This is the RDRAM half of the
+    /// same behavior, kept beside the XBUS half so a future asymmetry has to
+    /// break a test that states both.
+    #[test]
+    fn a_non_adjacent_rdram_range_opens_a_new_stream() {
+        let runs = coalesce_dp_submissions(vec![
+            rdram_words(0x100, 0x108, 0x11),
+            rdram_words(0x108, 0x110, 0x22),
+            rdram_words(0x200, 0x208, 0x33),
+        ]);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].start, runs[0].end), (0x100, 0x110));
+        assert_eq!((runs[1].start, runs[1].end), (0x200, 0x208));
+        assert!(runs.iter().all(|run| !run.xbus));
+    }
+
+    /// A source change is a stream break even at an adjacent address: the two
+    /// arms retain incompatible representations (DMEM bytes vs canonical
+    /// words) and `DpcSubmissionSource` routes them differently.
+    #[test]
+    fn a_source_change_breaks_a_run_at_an_adjacent_address() {
+        let runs = coalesce_dp_submissions(vec![
+            xbus(0x100, 0x108, 0xc1),
+            rdram_words(0x108, 0x110, 0x44),
+            xbus(0x110, 0x118, 0xc2),
+        ]);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs.iter().map(|run| run.xbus).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+    }
+
+    /// Every emitted run satisfies the invariant the capture layer enforces,
+    /// over an interleaved list that exercises both arms and both break
+    /// reasons at once.
+    #[test]
+    fn every_coalesced_run_describes_exactly_its_own_bytes() {
+        let runs = coalesce_dp_submissions(vec![
+            xbus(0x0e00, 0x0e08, 0x01),
+            xbus(0x0e08, 0x0e18, 0x02),
+            xbus(0x0ba8, 0x0bb0, 0x03),
+            rdram_words(0x2000, 0x2010, 0x55),
+            rdram_words(0x2010, 0x2018, 0x66),
+            rdram_words(0x3000, 0x3008, 0x77),
+            xbus(0x0bb0, 0x0bb8, 0x04),
+        ]);
+        assert_eq!(runs.len(), 5);
+        for run in &runs {
+            assert_eq!(
+                u64::from(run.end - run.start),
+                run.words.len() as u64 * 4,
+                "run [{:#010x}, {:#010x}) xbus={} carries {} words",
+                run.start,
+                run.end,
+                run.xbus,
+                run.words.len()
+            );
+        }
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.start, run.end))
+                .collect::<Vec<_>>(),
+            [
+                (0x0e00, 0x0e18),
+                (0x0ba8, 0x0bb0),
+                (0x2000, 0x2018),
+                (0x3000, 0x3008),
+                (0x0bb0, 0x0bb8),
+            ]
+        );
+    }
+
+    /// A single submission is a run of one, and an empty task emits nothing.
+    #[test]
+    fn degenerate_submission_lists_coalesce_without_special_cases() {
+        assert!(coalesce_dp_submissions(Vec::new()).is_empty());
+        let runs = coalesce_dp_submissions(vec![xbus(0x0ba8, 0x0bb0, 0xd1)]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].start, runs[0].end, runs[0].words.len()),
+            (0x0ba8, 0x0bb0, 2)
+        );
+    }
