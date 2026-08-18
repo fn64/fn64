@@ -52,8 +52,8 @@
 //! establish the U2.10 scale/offset split.
 
 use fn64_render::{
-    vi_public_filters::restore_rgba16_component_bounded_v1, RenderError, ViPixelType,
-    ViPresentation, ViResampleControl, ViScaleAxis, ViScanoutRegisters,
+    vi_public_filters::restore_rgba16_component_bounded_v1, RenderError, ViFilterControl,
+    ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis, ViScanoutRegisters,
 };
 
 /// A VI feature this scanout genuinely does not implement, named
@@ -229,10 +229,32 @@ fn source_index(output_index: u32, axis: ViScaleAxis, source_extent: u64) -> u64
     index.min(source_extent - 1)
 }
 
-/// Rows of source the programmed vertical coordinates actually touch, so the
-/// footprint check covers exactly what will be read and no halo this module
-/// does not sample.
-fn source_rows(registers: ViScanoutRegisters, output_height: u32) -> u64 {
+/// Rows of source the programmed vertical coordinates actually touch,
+/// **plus exactly the halo the enabled filters read past them**, so the
+/// footprint check covers what will be read and nothing more.
+///
+/// Three terms, each derived from a specific reader:
+///
+/// - `last_center + 1` -- the coordinate generator itself. The last output
+///   row maps to source row `last_center`, and rows are counted from zero.
+/// - `+ 1` when resampling is enabled ([`resample_bilinear`]) -- bilinear
+///   interpolation reads `AxisSample::lower` **and** `upper = lower + 1`, so
+///   the row below the last centre is a real read. Without this term the
+///   last output row silently degrades to `HeldLast` and stops
+///   interpolating, which is a wrong image rather than a refused one.
+/// - `+ 1` when dither restoration is enabled ([`SourcePlane::restore_dither`])
+///   -- its 3x3 neighbourhood reads one row below each restored pixel.
+///
+/// The two halos are `max`'d rather than summed: both name the single row
+/// immediately below the last centre, and neither reads further.
+///
+/// This is the same decomposition `fn64-render-reference`'s
+/// `vi_source_geometry_with_bottom_halo` performs
+/// (`crates/fn64-render-reference/src/backend/vi_source.rs:86-104`), reached
+/// here from the readers rather than transcribed: a differential against
+/// that backend is what exposed the missing terms, on the last output row
+/// only, which is exactly where a missing bottom halo shows.
+fn source_rows(registers: ViScanoutRegisters, output_height: u32, filters: ViFilterControl) -> u64 {
     let resample = registers.resample();
     let last_output = u64::from(output_height - 1);
     let last = u64::from(resample.y.offset_u2_10())
@@ -242,7 +264,13 @@ fn source_rows(registers: ViScanoutRegisters, output_height: u32) -> u64 {
                 .expect("VI vertical coordinate product overflow"),
         )
         .expect("VI vertical coordinate sum overflow");
-    (last >> ViScaleAxis::FRACTION_BITS) + 1
+    let last_center = last >> ViScaleAxis::FRACTION_BITS;
+    let resample_extra = u64::from(filters.antialias_mode.resampling_enabled());
+    let restoration_halo = u64::from(filters.dither_filter);
+    last_center
+        .checked_add(resample_extra.max(restoration_halo))
+        .and_then(|value| value.checked_add(1))
+        .expect("VI source row count overflow")
 }
 
 /// Reject every filter this scanout does not implement, by name, before any
@@ -384,7 +412,7 @@ impl SourceGeometry {
             Self {
                 origin,
                 stride_pixels,
-                rows: source_rows(registers, output_height),
+                rows: source_rows(registers, output_height, filters),
                 bytes_per_pixel,
                 pixel_type,
             },

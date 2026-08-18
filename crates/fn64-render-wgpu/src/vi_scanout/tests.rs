@@ -868,3 +868,624 @@ fn a_reserved_pixel_type_still_refuses_ahead_of_the_blank_admission() {
         other => panic!("expected the reserved-pixel-type refusal, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// VI dither restoration (STATUS bit 16) and resampling (AA modes 0/1/2).
+//
+// Measured on the real WM2000 ROM under `FN64_RENDER=wgpu`: fields 0-19 are
+// blanked, and field 20 -- the first with content -- latches
+// `status = 0x00013202`. Decoded that is RGBA16 (bits 0-1 = 2), AA mode 2
+// (`ResampleOnly`), `dither_filter` set (bit 16), and `gamma`,
+// `gamma_dither`, `divot`, `fade`, `repeat_line` all clear. Those two
+// filters are the whole of what this ROM asks for, and the whole of what
+// the section below implements. The other six stay refusing by name.
+// ---------------------------------------------------------------------
+
+/// WM2000's measured STATUS word, rebuilt from the ported `rt64_vi.h` field
+/// extents and reconciled against the literal the live run printed. Two
+/// independent derivations of one quantity (§3.2): if a field offset were
+/// wrong, the two spellings would disagree here rather than in a pixel.
+fn wm2000_measured_status() -> u32 {
+    let derived = (2 << status::TYPE.offset)
+        | (2 << status::AA_MODE.offset)
+        | (3 << status::PIXEL_ADVANCE.offset)
+        | (1 << status::DITHER_FILTER.offset);
+    // Rebuilt from the ported `rt64_vi.h` field extents, reconciled against
+    // the literal the live WM2000 run printed. `PIXEL_ADVANCE = 3` is part
+    // of the measured word and is included so this is the real register
+    // image, not a filter-only subset -- it selects no scanout filter and
+    // this module does not consume it.
+    assert_eq!(
+        derived, 0x0001_3202,
+        "the rebuilt WM2000 STATUS word must equal the one the live run printed"
+    );
+    assert_eq!(
+        fn64_render::ViFilterControl::from_status(derived),
+        fn64_render::ViFilterControl {
+            pixel_type: ViPixelType::Rgba16,
+            antialias_mode: fn64_render::ViAaMode::ResampleOnly,
+            gamma: false,
+            gamma_dither: false,
+            divot: false,
+            dither_filter: true,
+        },
+        "WM2000's measured field latches exactly dither restoration and resampling"
+    );
+    derived
+}
+
+/// The measured word is the one the running ROM actually programmed. Pinned
+/// as a literal so a later refactor of the field extents cannot quietly
+/// redefine what "WM2000 latches" means.
+#[test]
+fn the_wm2000_measured_status_word_selects_exactly_two_filters() {
+    assert_eq!(wm2000_measured_status(), 0x0001_3202);
+    let filters = fn64_render::ViFilterControl::from_status(0x0001_3202);
+    assert!(filters.dither_filter, "bit 16 is set in the measured word");
+    assert!(
+        filters.antialias_mode.resampling_enabled(),
+        "AA mode 2 resamples"
+    );
+    assert!(
+        !filters.antialias_mode.silhouette_aa_enabled(),
+        "AA mode 2 is NOT a silhouette-AA mode; mode 0/1 would be"
+    );
+    assert!(!filters.gamma && !filters.gamma_dither && !filters.divot);
+}
+
+/// Coverage is the RGBA16 low bit, exactly as `fn64-render-reference`'s
+/// `load_vi_source` derives it on a hidden-sidecar miss. Hand-derived from
+/// that composition, not captured:
+///
+/// ```text
+/// bits   = if pixel & 1 == 0 { 0 } else { 3 }
+/// stored = ((pixel & 1) << 2) | bits      -> 0b000 or 0b111
+/// count  = (stored & 7) + 1               -> 1 or 8
+/// ```
+#[test]
+fn rgba16_coverage_is_the_low_bit_expanded_the_reference_way() {
+    let mut rdram = fresh_rdram();
+    write_rgba16(&mut rdram, 0x400, pack_rgba5551(1, 2, 3, 0));
+    write_rgba16(&mut rdram, 0x402, pack_rgba5551(1, 2, 3, 1));
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: 0x400,
+        stride_pixels: 2,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    assert_eq!(
+        geometry.coverage(&memory, 0, 0),
+        1,
+        "a clear low bit is minimum coverage"
+    );
+    assert_eq!(
+        geometry.coverage(&memory, 1, 0),
+        8,
+        "a set low bit is full coverage, which is what dither restoration filters"
+    );
+}
+
+/// Hand-derived restoration of one interior pixel.
+///
+/// A 3x3 RGBA16 plane, every alpha bit set so every pixel is full-coverage.
+/// The red five-bit values are
+///
+/// ```text
+///   4  9  4
+///   9  8  9      center = 8, neighbors = [4,9,4,9,9,4,9,4]
+///   4  9  4
+/// ```
+///
+/// US 5,699,079's restoration is `(center << 3)` plus one per greater
+/// neighbor and minus one per lesser: `64 + 4 - 4 = 64`. Derived a second
+/// way, the four 9s contribute `+4` and the four 4s `-4`, which cancel, so
+/// the center is unchanged at `8 << 3 = 64`. Both spellings agree (§3.3).
+///
+/// The blue channel uses `2 2 2 / 2 5 2 / 2 2 2`: all eight neighbors are
+/// lesser, so `40 - 8 = 32`.
+#[test]
+fn dither_restoration_matches_the_hand_derived_signed_neighbor_sum() {
+    let mut rdram = fresh_rdram();
+    let red = [[4u8, 9, 4], [9, 8, 9], [4, 9, 4]];
+    let blue = [[2u8, 2, 2], [2, 5, 2], [2, 2, 2]];
+    for row in 0..3usize {
+        for column in 0..3usize {
+            write_rgba16(
+                &mut rdram,
+                0x400 + ((row * 3 + column) as u32) * 2,
+                pack_rgba5551(red[row][column], 0, blue[row][column], 1),
+            );
+        }
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: 0x400,
+        stride_pixels: 3,
+        rows: 3,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let mut plane = SourcePlane::load(geometry, &memory);
+    assert_eq!(
+        plane.component(1, 1, 0),
+        expand_five_bit(8),
+        "before restoration the centre is the plain five-bit expansion"
+    );
+    plane.restore_dither();
+    assert_eq!(
+        plane.component(1, 1, 0),
+        64,
+        "four greater and four lesser neighbours cancel: (8 << 3) + 4 - 4"
+    );
+    assert_eq!(
+        plane.component(1, 1, 2),
+        32,
+        "eight lesser neighbours: (5 << 3) - 8"
+    );
+}
+
+/// Restoration reads a pre-filter snapshot. Filtering in place would feed an
+/// already-restored neighbour back in, making the result depend on scan
+/// order; this fixture is asymmetric left-to-right so that would show.
+#[test]
+fn dither_restoration_reads_unrestored_neighbors_only() {
+    let mut rdram = fresh_rdram();
+    let red = [0u8, 31, 0, 31, 0];
+    for (index, value) in red.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            0x400 + (index as u32) * 2,
+            pack_rgba5551(*value, 0, 0, 1),
+        );
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: 0x400,
+        stride_pixels: 5,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let mut plane = SourcePlane::load(geometry, &memory);
+    plane.restore_dither();
+    // Pixel 1 (value 31) has neighbours 0 and 0 in the source: both lesser,
+    // so (31 << 3) - 2 = 246. Had pixel 0 been restored first (0 with a
+    // greater neighbour -> 1), pixel 1 would still see 0 only if the
+    // snapshot is honoured.
+    assert_eq!(plane.component(1, 0, 0), 246);
+    assert_eq!(
+        plane.component(0, 0, 0),
+        1,
+        "(0 << 3) + 1 for its single greater neighbour"
+    );
+}
+
+/// Only full-coverage pixels are restored. A clear low bit means coverage 1,
+/// which this backend passes through untouched -- the same `continue` the
+/// reference takes when silhouette AA is off.
+#[test]
+fn dither_restoration_skips_partial_coverage_pixels() {
+    let mut rdram = fresh_rdram();
+    // Centre has a CLEAR low bit; its neighbours are all set and all lesser.
+    for index in 0..3u32 {
+        write_rgba16(&mut rdram, 0x400 + index * 2, pack_rgba5551(2, 0, 0, 1));
+    }
+    write_rgba16(&mut rdram, 0x402, pack_rgba5551(20, 0, 0, 0));
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: 0x400,
+        stride_pixels: 3,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let mut plane = SourcePlane::load(geometry, &memory);
+    plane.restore_dither();
+    assert_eq!(
+        plane.component(1, 0, 0),
+        expand_five_bit(20),
+        "a partial-coverage pixel keeps its plain expansion, unrestored"
+    );
+}
+
+/// Bilinear interpolation at the exact half-step, hand-derived.
+///
+/// Two source columns with red 0 and 31 -> expanded 0 and 255. A U0.10
+/// fraction of 512 weights them 512/1024 each:
+/// `(0*512 + 255*512 + 512) / 1024 = (130560 + 512) / 1024 = 128`.
+/// Derived a second way: the midpoint of 0 and 255 is 127.5, and the
+/// `+ ONE/2` bias rounds half up to 128. Both agree (§3.3).
+#[test]
+fn bilinear_interpolation_at_the_half_step_is_the_hand_derived_midpoint() {
+    assert_eq!(interpolate_u2_10(0, 255, 512), 128);
+    assert_eq!((0 * 512 + 255 * 512 + 512) / 1024, 128);
+    // Endpoints are exact: weight 0 is pure lower, and the generator never
+    // emits weight 1024 (that is the next integer position).
+    assert_eq!(interpolate_u2_10(17, 200, 0), 17);
+    assert_eq!(interpolate_u2_10(17, 200, 1023), 200);
+}
+
+/// `AxisSample::from_output(..).lower` must equal `source_index` for every
+/// output position, on both the interpolating and the held-edge side. The
+/// two are independent derivations of the same nearest index (§3.2); this is
+/// what lets `replicate` supersede the original sampling without changing a
+/// single pixel.
+#[test]
+fn replication_agrees_with_source_index_on_every_output_column() {
+    for step in [256u16, 512, 1024, 1536, 2048, 3000] {
+        for offset in [0u16, 1, 511, 1023] {
+            let axis = ViScaleAxis::from_register((u32::from(offset) << 16) | u32::from(step));
+            for extent in [1usize, 2, 5, 64] {
+                for output in 0..40u32 {
+                    assert_eq!(
+                        AxisSample::from_output(output, axis, extent).lower as u64,
+                        source_index(output, axis, extent as u64),
+                        "step={step} offset={offset} extent={extent} output={output}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The high edge holds the last sample and forces the weight to zero, so a
+/// clamped position repeats rather than extrapolating past the source.
+#[test]
+fn the_resampling_high_edge_holds_the_last_sample_with_zero_weight() {
+    let axis = ViScaleAxis::from_register(u32::from(ViScaleAxis::ONE));
+    let sample = AxisSample::from_output(9, axis, 4);
+    assert_eq!(sample.lower, 3);
+    assert_eq!(sample.upper, 3);
+    assert_eq!(sample.fraction_u0_10, 0);
+}
+
+/// A unit-scale resample is the identity: every position lands exactly on a
+/// source sample with weight zero, so interpolation cannot perturb it. This
+/// is the positive control proving the resampling path RUNS -- it is on the
+/// AA-mode-2 branch, not the replicate one.
+#[test]
+fn unit_scale_resampling_is_the_identity_and_still_takes_the_resample_branch() {
+    let mut rdram = fresh_rdram();
+    let values = [1u8, 7, 19, 31];
+    for (index, value) in values.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            0x400 + (index as u32) * 2,
+            pack_rgba5551(*value, 0, 0, 0),
+        );
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    // AA mode 2 with dither restoration OFF, so only resampling runs.
+    let status_word = (2 << status::TYPE.offset) | (2 << status::AA_MODE.offset);
+    let registers = live_registers(
+        status_word,
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let field = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect("AA mode 2 must scan out, not refuse");
+    assert!(
+        fn64_render::ViFilterControl::from_status(status_word)
+            .antialias_mode
+            .resampling_enabled(),
+        "positive control: this fixture really is on the resampling branch"
+    );
+    for (index, value) in values.iter().enumerate() {
+        assert_eq!(
+            field.pixel(index as u32, 0).unwrap()[0],
+            expand_five_bit(*value),
+            "unit scale must reproduce source column {index} exactly"
+        );
+    }
+}
+
+/// A half-step horizontal resample interpolates between neighbours. Source
+/// red values 0 and 31 expand to 0 and 255; output column 1 sits at fraction
+/// 512 and must be the hand-derived 128, which nearest-neighbour replication
+/// could never produce. This is the mutation-style positive control for
+/// bilinear: replace `resample_bilinear` with `replicate` and this fails.
+#[test]
+fn a_half_step_resample_interpolates_where_replication_would_not() {
+    let mut rdram = fresh_rdram();
+    write_rgba16(&mut rdram, 0x400, pack_rgba5551(0, 0, 0, 0));
+    write_rgba16(&mut rdram, 0x402, pack_rgba5551(31, 0, 0, 0));
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: 0x400,
+        stride_pixels: 2,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let plane = SourcePlane::load(geometry, &memory);
+    let half = ViScaleAxis::from_register(512);
+    let unit = ViScaleAxis::from_register(u32::from(ViScaleAxis::ONE));
+    let resampled = resample_bilinear(&plane, half, unit, 3, 1);
+    assert_eq!(resampled[0], 0, "output 0 is source 0");
+    assert_eq!(
+        resampled[4], 128,
+        "output 1 sits at fraction 512 between 0 and 255"
+    );
+    let replicated = replicate(&plane, half, unit, 3, 1);
+    assert_eq!(
+        replicated[4], 0,
+        "replication holds the lower sample -- the two branches genuinely differ"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The reference differential.
+//
+// `fn64-render-reference` implements both filters and is this project's
+// established comparison oracle. These tests run BOTH backends over one
+// RDRAM image and one register word and require the presented pixels to
+// agree, which is far stronger evidence than either backend's own unit
+// expectations.
+//
+// The oracle is driven through its public `RenderBackend` impl with a
+// freshly `create`d instance, whose `rdram_hidden_bits` map `create` clears
+// (`crates/fn64-render-reference/src/backend/render_backend.rs`). That cold
+// map is exactly the state this backend is permanently in, so the two are
+// being compared on equal footing rather than one being handed state the
+// other cannot have. See `SourcePlane::coverage` for the deviation that
+// remains when the reference's map is warm.
+// ---------------------------------------------------------------------
+
+/// Present one field through the reference backend over the same physical
+/// RDRAM and the same register image.
+fn reference_field(
+    rdram: &[u8],
+    vi: ViPresentation,
+    width: u32,
+    height: u32,
+) -> fn64_render_reference::raster::Framebuffer {
+    use fn64_render::RenderBackend;
+    let mut backend = fn64_render_reference::ReferenceBackend::new();
+    backend
+        .create(&fn64_render::RenderConfig {
+            width,
+            height,
+            tv_type: fn64_runtime::TvType::Ntsc,
+        })
+        .expect("reference backend create");
+    backend
+        .present(fn64_render::PresentRequest::live(
+            vi,
+            fn64_runtime::PhysicalRdramRead::from_storage(rdram),
+        ))
+        .expect("reference backend present");
+    backend
+        .presented_framebuffer()
+        .expect("reference backend presented no field")
+        .clone()
+}
+
+/// Assert the two backends produce the same RGB for every output pixel.
+fn assert_agrees_with_reference(rdram: &[u8], registers: ViScanoutRegisters) {
+    let vi = presentation(registers);
+    let window = registers
+        .active_window()
+        .expect("fixture must program an active window");
+    let (width, height) = (window.output_width(), window.output_height());
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(rdram);
+    let ours = scan_out_guest_rdram(vi, &memory).expect("wgpu scanout must not refuse");
+    let theirs = reference_field(rdram, vi, width, height);
+    assert_eq!(
+        (ours.width, ours.height),
+        (theirs.width, theirs.height),
+        "the two backends disagree on the presented geometry"
+    );
+    let mut mismatches = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let ours_px = ours.pixel(x, y).unwrap();
+            let base = ((y * width + x) * 4) as usize;
+            let theirs_px = &theirs.pixels[base..base + 3];
+            if ours_px[..3] != *theirs_px {
+                mismatches.push((
+                    x,
+                    y,
+                    [ours_px[0], ours_px[1], ours_px[2]],
+                    theirs_px.to_vec(),
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "wgpu and the reference oracle disagree on {} of {} pixels; first few: {:?}",
+        mismatches.len(),
+        width * height,
+        &mismatches[..mismatches.len().min(6)]
+    );
+}
+
+/// Build an RGBA16 source with a deterministic but non-uniform pattern, so a
+/// filter that no-ops and a filter that runs cannot look alike.
+fn patterned_rgba16(rdram: &mut [u8], origin: u32, stride: u32, rows: u32) {
+    for row in 0..rows {
+        for column in 0..stride {
+            let key = row * 7 + column * 3;
+            let r5 = (key % 32) as u8;
+            let g5 = ((key * 5 + 11) % 32) as u8;
+            let b5 = ((key * 11 + 3) % 32) as u8;
+            // Alternate coverage so both the restored and the pass-through
+            // path are exercised in one image.
+            let a1 = u8::from((row + column) % 3 != 0);
+            write_rgba16(
+                rdram,
+                origin + (row * stride + column) * 2,
+                pack_rgba5551(r5, g5, b5, a1),
+            );
+        }
+    }
+}
+
+/// **The headline differential.** WM2000's measured STATUS word, both of its
+/// filters live at once, compared pixel-for-pixel against the reference
+/// oracle over the same RDRAM.
+#[test]
+fn the_wm2000_filter_pair_agrees_with_the_reference_oracle() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 12, 8);
+    let registers = live_registers(
+        wm2000_measured_status(),
+        0x1000,
+        12,
+        0,
+        12,
+        0,
+        16,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    assert_agrees_with_reference(&rdram, registers);
+}
+
+/// The same pair under a fractional *horizontal* scale, so the resampler is
+/// genuinely interpolating rather than landing on integer positions. The
+/// vertical step stays integral here; a fractional vertical step composed
+/// with restoration is the one measured disagreement, pinned separately in
+/// `the_restoration_bottom_halo_disagreement_is_confined_to_the_last_output_row`.
+#[test]
+fn the_wm2000_filter_pair_agrees_with_the_reference_oracle_under_fractional_scale() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 16, 10);
+    for x_scale in [512u32, 683, 1536] {
+        let registers = live_registers(
+            wm2000_measured_status(),
+            0x1000,
+            16,
+            0,
+            10,
+            0,
+            12,
+            x_scale,
+            u32::from(ViScaleAxis::ONE),
+        );
+        assert_agrees_with_reference(&rdram, registers);
+    }
+}
+
+/// **A measured, unresolved disagreement, pinned rather than tuned away.**
+///
+/// Under a fractional *vertical* scale with dither restoration enabled, the
+/// two backends differ on the final output row only, by one or two units per
+/// channel. Isolated below: restoration alone agrees everywhere, and
+/// resampling alone agrees everywhere; only the two composed under a
+/// fractional vertical step disagree, and only on the last row.
+///
+/// The cause is a genuine semantic fork this card is not authorised to
+/// settle. Both backends load `last_center + 1` as the bottom halo row, but
+/// that row is the *last* row of each plane, so its own 3x3 restoration
+/// window is missing the row below it that an unbounded source would have
+/// supplied. Each backend therefore restores its halo row against a
+/// truncated neighbourhood, and the vertical interpolator then blends that
+/// differently-truncated value into the final output row. Neither result is
+/// derivable from public VI documentation, which does not specify the
+/// filter's behaviour at the bottom of the scanned region.
+///
+/// This test asserts the disagreement *exists and is confined*, so that a
+/// later change that silently widens it fails here. It deliberately does not
+/// assert either backend is correct. Per this card's brief, the reference is
+/// corroboration and not validation -- it shares fn64's lineage -- so a
+/// disagreement is recorded, not resolved by tuning one side to the other.
+#[test]
+fn the_restoration_bottom_halo_disagreement_is_confined_to_the_last_output_row() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 16, 10);
+    let registers = live_registers(
+        wm2000_measured_status(),
+        0x1000,
+        16,
+        0,
+        10,
+        0,
+        12,
+        683,
+        1365,
+    );
+    let vi = presentation(registers);
+    let window = registers.active_window().unwrap();
+    let (width, height) = (window.output_width(), window.output_height());
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let ours = scan_out_guest_rdram(vi, &memory).unwrap();
+    let theirs = reference_field(&rdram, vi, width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let ours_px = ours.pixel(x, y).unwrap();
+            let base = ((y * width + x) * 4) as usize;
+            let theirs_px = &theirs.pixels[base..base + 3];
+            if y + 1 < height {
+                assert_eq!(
+                    ours_px[..3],
+                    *theirs_px,
+                    "rows above the last must agree exactly, at ({x}, {y})"
+                );
+            } else {
+                for channel in 0..3 {
+                    let delta = i16::from(ours_px[channel]) - i16::from(theirs_px[channel]);
+                    assert!(
+                        delta.abs() <= 2,
+                        "the last-row disagreement must stay within two units, got {delta} at \
+                         ({x}, {y}) channel {channel}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Restoration on its own agrees with the oracle everywhere, including the
+/// last row. This is what confines the disagreement above to the composition
+/// rather than to the restoration filter itself.
+#[test]
+fn restoration_without_resampling_agrees_with_the_reference_oracle() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 16, 10);
+    // RGBA16 + AA mode 3 (replicate, no resampling) + dither restoration.
+    let status_word = (2 << status::TYPE.offset)
+        | (3 << status::AA_MODE.offset)
+        | (1 << status::DITHER_FILTER.offset);
+    let registers = live_registers(status_word, 0x1000, 16, 0, 10, 0, 12, 683, 1365);
+    assert_agrees_with_reference(&rdram, registers);
+}
+
+/// Resampling alone (AA mode 2, bit 16 clear) also agrees, isolating the
+/// resampler from the restoration filter.
+#[test]
+fn resampling_without_restoration_agrees_with_the_reference_oracle() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 14, 9);
+    let status_word = (2 << status::TYPE.offset) | (2 << status::AA_MODE.offset);
+    let registers = live_registers(status_word, 0x1000, 14, 0, 11, 0, 14, 700, 900);
+    assert_agrees_with_reference(&rdram, registers);
+}
+
+/// Replication (AA mode 3) still agrees, proving the refactor from the
+/// original single-pass sampler onto `AxisSample` changed no pixel.
+#[test]
+fn replication_still_agrees_with_the_reference_oracle() {
+    let mut rdram = fresh_rdram();
+    patterned_rgba16(&mut rdram, 0x1000, 14, 9);
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        0x1000,
+        14,
+        0,
+        11,
+        0,
+        14,
+        700,
+        900,
+    );
+    assert_agrees_with_reference(&rdram, registers);
+}
