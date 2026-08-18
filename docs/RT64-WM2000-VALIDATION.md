@@ -7,11 +7,13 @@ that **no pixel was validated against anything**, and that a uniform `0xffff`
 majority "is equally consistent with a texel decode that saturates".
 
 This card took that measurement at `87925f36` and found a 99.38%
-disagreement caused by one missing pipeline stage. It has since been
-**revised at `3817911f`**: the port now runs that stage, the diff is
-re-measured, and §3's original diagnosis of *why* the oracle produced two
-values is recorded as disproved and replaced. Every number here comes from a
-run on this machine.
+disagreement caused by one missing pipeline stage. It was **revised at
+`3817911f`**: the port now runs that stage, the diff is re-measured, and
+§3's original diagnosis of *why* the oracle produced two values is recorded
+as disproved and replaced. It is **revised again here**: §1.1 closes the
+comparison by controlling the one unmatchable term and reaches **0 differing
+pixels**, and §4.2 diagnoses for the first time why entries 1-3 never ran.
+Every number here comes from a run on this machine.
 
 Companion docs: [`RT64-WM2000-REPLAY.md`](RT64-WM2000-REPLAY.md),
 [`RT64-WM2000-CENSUS.md`](RT64-WM2000-CENSUS.md),
@@ -20,10 +22,18 @@ assert").
 
 ---
 
-## 1. Headline: the blender now runs, and the residual is the oracle's dither
+## 1. Headline: with the one unmatchable term controlled, the two implementations agree exactly
 
-**100,235 of 115,200 pixels differ — 87.01%**, down from 114,481 (99.38%)
-before the port ran the blender.
+**0 of 115,200 pixels differ** when `alpha_dither` is set to `Disabled` in
+the shared word stream both backends decode. That is the validation result
+this card exists to produce, and §1.1 states precisely what it does and does
+not establish.
+
+As captured — with `alpha_dither = Noise` — **100,235 of 115,200 pixels
+differ (87.01%)**, down from 114,481 (99.38%) before the port ran the
+blender. Every one of those 100,235 is a pixel where the oracle's *invented*
+noise sequence rounded the blended alpha into the next five-bit bucket; §1.1
+removes that single term and the disagreement goes to zero.
 
 | | Port (`fn64-render-wgpu`) | Oracle (`fn64-render-reference`) |
 |---|---|---|
@@ -51,8 +61,73 @@ the port's output does not move at all.
 
 Reproducing that stream would transcribe an invented sequence, not implement
 a documented stage. **Zero differing pixels is therefore not the right
-target for this packet**, and a port that reached it would have copied the
-oracle rather than agreed with it.
+target for the packet as captured**, and a port that reached it would have
+copied the oracle rather than agreed with it.
+
+---
+
+### 1.1 Closing the gap: control the unmatchable term instead of transcribing it
+
+The blocker was one *mode*, not one stage. `AlphaDither`
+(`crates/fn64-render-wgpu/src/state.rs:147`) has four modes — `Pattern`,
+`InversePattern`, `Noise`, `Disabled` — and **only `Noise` is unmatchable**.
+So rather than copy the oracle's stream, this card holds that variable
+fixed and compares everything else.
+
+**The method, and why it is control rather than doctoring.**
+`wm2000_packet_with_alpha_dither` rewrites other-mode high bits 4:5 in every
+one of entry 0's 92 `SetOtherMode` commands, producing a new word stream
+that differs from the capture in exactly those two bits per command and
+nowhere else (asserted, not assumed: the helper checks every word is
+unchanged outside the field). **That single rewritten stream is then handed
+to BOTH implementations** — `wm2000_port_image` and
+`wm2000_reference_image` receive the same `CapturedPacket`, unmodified.
+Neither implementation was changed, and neither side sees a stream the other
+does not. There is one word buffer and both backends decode it; that is what
+structurally prevents this from being a tuning of one side.
+
+**The result.**
+
+| `alpha_dither` | wire encoding | port | oracle | differing pixels |
+|---|---|---|---|---|
+| `Noise` (as captured) | 2 | `0xdef7` × 114,481 + `0x0001` × 719 | `0xe739` × 100,235 / `0xdef7` × 14,246 / `0x0001` × 719 | **100,235** |
+| `Disabled` | 3 | `0xdef7` × 114,481 + `0x0001` × 719 | `0xdef7` × 114,481 + `0x0001` × 719 | **0** |
+| `Pattern` | 0 | *refused by name* | — | **not compared** |
+| `InversePattern` | 1 | *refused by name* | — | **not compared** |
+
+**`Pattern` yields no number, and the refusal is the finding.** `Pattern`
+and `InversePattern` both resolve to an ordered tile, substituting `Bayer`
+when RGB dither is `Disabled` — which is exactly what this packet latches
+(other-mode high `0xef00acef`, bits 6:7 == 3; the substitution arm is
+`targets/texrect.rs:1407`, which covers both ordered modes jointly). The
+port refuses `Bayer` by name:
+
+> `G_MDSFT_ALPHADITHER selects the ordered Bayer dither tile, whose
+> threshold and arithmetic this crate's RT64 and reference ports disagree
+> about; no evidence in this repo settles which is the RDP's`
+
+That refusal protects a real, already-pinned disagreement (8 of 16 cells,
+`rgb_dither.rs`'s own
+`bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`).
+Producing a `Pattern` pixel count would have required weakening it, so no
+count is reported. **`Disabled` is the only reachable deterministic mode for
+this packet, and it is the one that carries the validation.**
+
+**The expectation was hand-derived, not captured.** The texrects' combiner
+is flat `Primitive` with prim alpha `0xdf` = 223 (§3), blended over a zero
+destination, so the composite is `255 × 223/255 = 223`, whose five-bit
+channel is `223 >> 3 = 27` → `0xdef7`. With dither disabled *both* sides
+must produce exactly that, and both do; the 719 fill pixels stay `0x0001`.
+The two histograms are asserted independently, so a defect moving both sides
+the same way could not pass as agreement.
+
+**What this validates.** The port's blender, combiner, tile addressing,
+texel-fetch path as this packet exercises it, coverage handling and
+framebuffer write-back agree **byte-for-byte** with a genuinely independent
+CPU rasterizer over WM2000's real captured frame-0 bytes. What it does not
+validate is listed in §7 and unchanged: this packet's combiner reads no
+texel, so texture sampling is still untested, and the noise term itself
+remains unestablished on either side.
 
 ---
 
@@ -214,6 +289,70 @@ measurement, and is recorded as such.
 
 ---
 
+## 4.2 Entries 1-3: diagnosed, and the refusal protects something real
+
+Entries 1-3 had never been compared. They stop before any pixel, at
+`crates/fn64-render-wgpu/src/raw_dpc/production_adapter.rs:1224`:
+
+```
+assert_eq!(source_accesses.len(), 1,
+           "v11's admitted TMEM source plan is exactly one journal access wide")
+```
+
+measured `left: 49`, `right: 1`. **Diagnosed here for the first time, and
+NOT widened** — the assert is a truthful guard on a real invariant, not an
+arbitrary scope limit.
+
+**Where 49 comes from.** Entry 0 uses only `LoadBlock` and `LoadTLUT`, both
+of which read one contiguous RDRAM range. Entries 1-3 additionally use
+**`LoadTile`** (25 of them), which entry 0 never does. A `LoadTile` reads a
+2D sub-rectangle row by row, and each row is a separate, discontiguous
+RDRAM range — one journal access each. Hand-derived from the wire
+coordinates of the first one (`uls=0 ult=0 lrs=128 lrt=192`, 10.2 fixed
+point): T runs 0..=48, which is **49 rows, so 49 source accesses**. The
+decoder is correct to produce them; `tmem/wire.rs:305-317` builds exactly
+one source range per row, bounded by `MAX_RESOURCE_ACCESSES`.
+
+**What the assert protects: journal-order determinism and publication
+identity.** Two independent mechanisms, both real:
+
+1. **`finish` compares position by position.**
+   `ExactRawDpcPlanWriter::push_tmem_load` pushes exactly **two** accesses,
+   `source` then `destination` (`fn64-render/src/render_ir.rs:2483-2487`),
+   while the decoder's journal orders them *all sources, then all
+   destinations* — `first_destination_access = first_access_index +
+   source.access_count()` (`tmem/wire.rs:544`). With 49 sources the writer
+   would emit `[src0, dst0, …]` where the journal has `[src0, src1, …]`:
+   both short and misordered. `finish` rejects exactly this
+   (`render_ir.rs`'s own `finish_rejects_a_journal_missing_an_access…`,
+   `…_with_an_extra_access…`, `…_a_reordered_journal_even_with_the_same_access_set`).
+2. **`source_access_count` is part of a published content digest.** It is
+   hardcoded `1` on the neutral production path
+   (`tmem/physical.rs:1425`), cross-checked against the decoder-derived
+   `plan.source().access_count()` (`:1340`) by a field-by-field equivalence
+   check that names `"source access count"` on mismatch (`:1540`), and fed
+   into `proposal_identity`'s projection bytes (`:1829`). Widening it
+   changes a publication identity, not just an adapter local.
+
+**Measured, not reasoned.** Removing only the assert (experiment, reverted)
+does not produce pixels — it produces the next honest refusal:
+
+> `raw-DPC plan seal failed: raw-DPC plan writer accumulated access count
+> is 1575; exact journal requires 2790`
+
+The 1,215-access gap hand-derives exactly from the wire: entry 1's 25
+`LoadTile`s split 10 at 49 rows and 15 at 50 rows, so the dropped accesses
+are `10 × 48 + 15 × 49 = 1215`. Two independent instruments — the runtime's
+own count and a hand walk of the captured coordinates — agree to the access.
+
+**Verdict: this is a genuine invariant and it stays.** Reaching entries 1-3
+is a real port task (teach the writer and the neutral `TmemLoadSemantics`
+to carry an N-access source run, and re-derive the affected publication
+digest), not an assert to relax. Their pixel diffs are therefore **not
+measured**, and this card reports that rather than a number.
+
+---
+
 ## 5. Commands
 
 Capture (unchanged, see [`RT64-WM2000-REPLAY.md`](RT64-WM2000-REPLAY.md) §2).
@@ -240,6 +379,9 @@ The comparison and its probes live beside the existing replay test in
 | `wm2000_frame_zero_texture_data_sensitivity_probe` | both sides vs. the CI4 texture data |
 | `wm2000_frame_zero_combiner_constant_probe` | how each side moves under rewritten `SetEnvColor`/`SetPrimColor` |
 | `wm2000_frame_zero_primitive_color_response_sweep` | that the port *does* honour `SetPrimColor` |
+| `wm2000_frame_zero_agrees_exactly_when_alpha_dither_is_disabled` | **§1.1's headline: 0 differing pixels with the unmatchable term controlled** |
+| `wm2000_frame_zero_pattern_alpha_dither_is_refused_by_name_not_compared` | that `Pattern` routes to the refused Bayer tile, so it yields no count |
+| `the_noise_free_comparison_detects_a_single_perturbed_pixel` | that the *controlled* comparison can fail |
 | `the_wm2000_image_comparator_detects_a_single_perturbed_pixel` | the comparator can fail |
 | `a_trimmed_wm2000_packet_fails_the_census_identity_control` | a stand-in is rejected |
 
@@ -263,7 +405,20 @@ which is a harness artifact and not a port finding.
 ## 6. Verification
 
 - **10 consecutive identical comparison runs.** All ten report the same
-  three histogram lines and the same 100,235-pixel diff.
+  three histogram lines and the same 100,235-pixel diff as captured, and
+  all ten report **0 differing pixels** under §1.1's `Disabled` control.
+- **§1.1's comparison is mutation-tested: 5 mutants, 4 killed, 1 proven
+  equivalent.**
+  - *Killed*: making the mode rewrite a no-op (all 3 controlled tests);
+    rewriting only the first `SetOtherMode` so the texrects' own latch is
+    untouched (all 3); setting the control to `Noise` instead of `Disabled`
+    (1); inverting the comparator's `!=` to `==` (1).
+  - *Equivalent, with proof*: perturbing the oracle side instead of the port
+    side. Byte inequality is symmetric, so the two forms are the same test;
+    it is recorded as equivalent rather than counted as a kill.
+  - *Positive control on the fixture*: a trimmed fixture is rejected by the
+    366-command census assertion before any comparison runs, so the zero
+    cannot come from a degenerate stand-in.
 - **Mutation-tested, 16 mutants, 15 kills, 1 proven equivalent** (8 on the
   blender, 8 on §8's stages).
   - *Killed*: skip the blend stage (3 tests); swap the blend source and
@@ -309,8 +464,12 @@ which is a harness artifact and not a port finding.
 - **Workspace**: 8,294 passed / 13 skipped before, **8,307 after the
   blender** and **8,319 after §8's three stages** (twenty-five new tests
   in total). Measured in this worktree at `3817911f`, not quoted.
+  §1.1/§4.2 add three more: **8,319 before and 8,322 after**, measured in a
+  worktree at `1020f1d0` before any change and again after, not quoted.
 - **Release profile** (`RUSTFLAGS="-C debug-assertions=off"`): 8,294 before
-  and 8,319 after, identical to debug in both directions. The test *set* is
+  and 8,319 after, identical to debug in both directions; §1.1/§4.2's run
+  measures **8,322 in release, identical to debug**, and the workspace is
+  green both with and without the packet fixture in the environment. The test *set* is
   also identical across profiles (`cargo nextest list`, 2,626 lines each,
   diff empty apart from the build-time line), so no count here is
   profile-dependent.
@@ -323,33 +482,81 @@ which is a harness artifact and not a port finding.
   `never constructed`, unchanged before and after, both measured with
   `cargo check --workspace --all-targets` — the baseline in a separate
   clean worktree. The circulating 1,201 did not reproduce under either
-  recipe.
-- **Host-GPU tests.** `wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position`
-  is red under `--features host-gpu-tests` on the clean `3817911f`
-  worktree **and** on this one — pre-existing, verified rather than
-  inherited. A `flip_wire_position` test matches no test name in this
-  checkout; all 34 tests matching `/flip/` pass, so that half of the
-  briefed red pair is reported as not found rather than assumed.
+  recipe. **Re-measured independently at `1020f1d0`: the same 1,060 /
+  1,218**, so the circulating 1,041 and 1,218 figures resolve to this pair
+  and 1,201 remains unreproduced.
+- **Host-GPU tests, and a prior lane's finding corrected.**
+  `wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position` is
+  red under `--features host-gpu-tests` on a clean baseline worktree at
+  `1020f1d0` **and** on this one — pre-existing, verified rather than
+  inherited. **The earlier "`flip_wire_position` matches no test in this
+  checkout" is withdrawn**: the bare string does not appear, but the test it
+  referred to does, under the fuller name
+  `wgpu_backend_draws_a_real_texture_rectangle_flip_at_the_same_wire_position`,
+  and it is **also red** — pre-existing at `1020f1d0` by the same clean-
+  worktree check. Both halves of the briefed red pair are therefore real;
+  the earlier report was a name-matching artifact, not a measurement.
 
 ---
 
 ## 7. Verdict: does WM2000's frame 0 render correctly through the Rust port?
 
-**Not proven, and closer than it was — with the remaining gap named and
-shown to be outside the port's reach.**
+### 7.1 The scoreboard, per entry
 
-The blender was the whole of the mechanically-attributable disagreement, and
-it now runs: 114,481 → 100,235 differing pixels, with the 14,246-pixel
-agreement gained being exactly the subset where the oracle's dither happened
-not to fire. What is left is one stage whose reference implementation
-declares itself non-silicon, so agreeing with it would be copying rather
-than validating.
+| Entry | Executes? | Differing pixels, as captured | Differing pixels, `alpha_dither = Disabled` |
+|---|---|---|---|
+| **0** | **yes**, all 366 commands | **100,235** of 115,200 (87.01%) | **0** of 115,200 |
+| 1 | **no** — refused in the adapter (§4.2) | not reached | not reached |
+| 2 | **no** — same refusal | not reached | not reached |
+| 3 | **no** — same refusal | same | not reached |
 
-**What would settle it** is not more port work on this packet. It is either
-(a) hardware or an independent emulator to establish the RDP's actual noise
-sequence, or (b) a packet that does not latch `alpha_dither = Noise`, where
-the blender's output is checkable against the oracle without a dither term
-in the way. Entry 0 is not such a packet, and this card does not have one.
+Entries 1-3 all carry `LoadTile`, which entry 0 does not, and stop at the
+one-source-access invariant §4.2 diagnoses. That refusal is real and was
+not weakened, so their columns stay empty rather than being filled with a
+number obtained by relaxing a guard.
+
+### 7.2 The verdict
+
+**For entry 0, yes — with one named term excluded, and that exclusion is
+controlled rather than assumed.**
+
+Fed WM2000's real captured frame-0 bytes, the Rust port and a genuinely
+independent CPU rasterizer publish **byte-identical** 115,200-pixel images
+once `alpha_dither` is set to `Disabled` in the single word stream they both
+decode. Zero pixels differ. That is a stronger result than this card could
+previously state, and it is the result the 100,235 residual was hiding: the
+residual was never the port's, and now it is shown to be *only* the invented
+term, because removing that term removes the entire disagreement.
+
+**What is now validated** (entry 0, and only entry 0): the blender's
+`M = Framebuffer` arm, the flat-`Primitive` combiner, tile addressing, the
+fill path, coverage handling, and framebuffer write-back — all
+byte-for-byte against an independent implementation.
+
+**What is still NOT validated**, unchanged and restated so the zero is not
+over-read:
+
+- **Texture sampling.** Entry 0's combiner has no texel term (§4.1), so
+  nothing here exercises the TMEM/TLUT sampler.
+- **The noise dither itself.** Neither side is established as correct; the
+  quantity is an unpublished hardware sequence, and this card excludes it
+  rather than settling it.
+- **Alpha compare and the coverage-alpha interaction.** Inert for this
+  packet (§8) — their evidence is characterization plus mutation testing,
+  not this differential.
+- **RGB dither.** Deliberately not ported; the two ports disagree on both
+  table and arithmetic (§8).
+- **Ordered alpha dither.** Refused by name for this packet's
+  `Bayer` substitution (§1.1).
+- **Entries 1-3, triangles, and every other title.** Entry 0 is
+  triangle-free; the census measured 152 of 218 frames as carrying
+  triangles.
+- **Hardware.** No comparison against an N64 was made, on any stage.
+
+**What would settle the rest**: (a) hardware or an independent emulator for
+the RDP's actual noise sequence and the Bayer tile; (b) a packet whose
+combiner reads a texel, to validate the sampler; and (c) the N-source-access
+port work §4.2 scopes, to reach entries 1-3.
 
 What this does and does not cover: **one entry, one frame, one title's
 boot/logo window**. Entry 0 is triangle-free and its texrect program reads
@@ -364,7 +571,10 @@ carrying triangles. Entries 1–3 were not compared.
 
 A follow-on commit wired **alpha compare, alpha dither and coverage** into
 the same executor, so three of the four stages its header declared absent
-now run. The pixel diff **did not move**: still 100,235.
+now run. The pixel diff **did not move**: still 100,235 as captured. §1.1's
+controlled comparison does not change that either — it removes the alpha
+dither term rather than exercising it, so the three stages below remain
+unvalidated by this differential for exactly the reasons stated here.
 
 That is the expected result, and it is the reason this section exists rather
 than a claim of broader validation. Measured across **all four captured
@@ -421,7 +631,11 @@ agree.
 ---
 
 **Nonclaims.** The oracle was not adjusted, and neither implementation was
-tuned toward the other. No hardware comparison was made and no claim of
+tuned toward the other. **§1.1's controlled comparison rewrites two bits of
+the packet's own other-mode word and feeds the identical rewritten stream to
+both implementations** — one word buffer, both backends decoding it — so it
+is a held variable, not a tuned side; the zero it reports is a result for
+that controlled input and is not claimed for the packet as captured. No hardware comparison was made and no claim of
 hardware correctness is made for either side, on any stage. **RGB dither is
 not implemented** and is declared so in the executor's header; alpha
 compare, alpha dither and coverage are implemented but **not validated by
