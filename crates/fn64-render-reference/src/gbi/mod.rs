@@ -67,6 +67,10 @@ mod entries;
 mod stream;
 mod geometry;
 
+/// Env-gated (`FN64_GBI_CENSUS`) per-opcode command census. Zero cost when
+/// unset; see the module doc for the lane split and output contract.
+pub mod census;
+
 /// TEMP instrumentation (env `FN64_DUMP_PROJ=1`): true only while dumping the
 /// projection/vertex data for the FIRST substantial gameplay frame, then it
 /// self-disables so the log is one frame, not the whole boot. Gated entirely
