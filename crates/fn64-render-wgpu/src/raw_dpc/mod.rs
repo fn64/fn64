@@ -58,6 +58,25 @@ const SET_COLOR_IMAGE: u8 = 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 const FULL_SYNC: u8 = 0x29;
+/// `G_RDPPIPESYNC` (`0xe7`, `crates/fn64-render-reference/src/gbi/wire.rs`'s
+/// `G_RDPPIPESYNC`); public SGI *RDP Command Summary* "Sync Pipe". WM2000's
+/// most-issued rejected command: 20,800 occurrences, 14.6% of its whole
+/// stream (`docs/RT64-WM2000-CENSUS.md` §3).
+const SYNC_PIPE: u8 = 0xe7 & 0x3f;
+/// `G_RDPTILESYNC` (`0xe8`); public SGI *RDP Command Summary* "Sync Tile".
+/// 1,808 occurrences in the same census.
+const SYNC_TILE: u8 = 0xe8 & 0x3f;
+/// The id WM2000 writes to end a submission (`0xdf`, the GBI's `G_ENDDL`,
+/// masked to its command bits). Not an assigned RDP command: it is carved
+/// out of the otherwise-rejected `0x10..=0x23` block by
+/// `fn64_render::raw_rdp_command_width`'s `RDP_STREAM_TERMINATOR_NOOP`,
+/// whose doc carries the measurement and the narrow-widening argument.
+///
+/// This decoder is length-delimited, so it needs to tolerate a terminator,
+/// never to act on one -- hence `NoOp` rather than an early `break`. A
+/// `break` here would silently discard every command after the first
+/// terminator in a coalesced stream.
+const STREAM_TERMINATOR: u8 = 0xdf & 0x3f;
 /// `G_TEXRECT` (`texrectLLE`, opcode `0x24`); public SGI *RDP Command
 /// Summary* "Texture Rectangle".
 const TEXRECT: u8 = 0x24;
@@ -1065,6 +1084,33 @@ fn decode_stream(
         let opcode = wire_opcode & 0x3f;
         let kind = match opcode {
             0x00..=0x07 => RawDpcCommandKind::NoOp { variant: opcode },
+            // The three ids WM2000 issues that this decoder used to abort on.
+            // All three are admitted as `NoOp`, which is admitted and
+            // discarded (`production_adapter`'s `NoOp` arm) and stages no
+            // `RdpState`/`RdpStateDelta` -- so admitting them cannot move a
+            // pixel, exactly the property that makes this safe to do without
+            // designing a semantic.
+            //
+            // Measured, not assumed: 20,800 `SyncPipe` + 1,808 `SyncTile` +
+            // 219 terminators, across 218/218 frames
+            // (`docs/RT64-WM2000-CENSUS.md` §3). Each rejection aborted the
+            // WHOLE stream rather than one command, so these three ids alone
+            // held 0% of frames at zero decoded.
+            //
+            // `SyncPipe`/`SyncTile` are real RDP commands whose effect is
+            // pipeline sequencing, not rasterization; `ReferenceBackend`
+            // already groups them with `SyncLoad` as a no-op arm
+            // (`fn64-render-reference`'s `gbi/stream.rs`), and this follows
+            // that precedent rather than inventing a second reading.
+            //
+            // Nonclaim, and the reason these are `NoOp` rather than named
+            // kinds: discarding a sync is correct only because this backend
+            // has no pipeline to sequence. It is not a claim that RDP
+            // synchronization is semantically empty. A backend that later
+            // models pipeline hazards must revisit this arm, not inherit it.
+            SYNC_PIPE | SYNC_TILE | STREAM_TERMINATOR => {
+                RawDpcCommandKind::NoOp { variant: opcode }
+            }
             SET_OTHER_MODE => {
                 let value = OtherMode::from_wire(w0 & 0x00ff_ffff, w1);
                 delta.set_other_mode(value);
@@ -2194,6 +2240,206 @@ mod tests {
             );
         }
         assert_eq!(decoded.state_delta(), &RdpStateDelta::default());
+    }
+
+    // ------------------------------------------------------------------
+    // WM2000's three blocking opcodes: SyncPipe (0x27), SyncTile (0x28), and
+    // the 0x1f stream terminator.
+    //
+    // Measured motivation, not speculative coverage: the census
+    // (`docs/RT64-WM2000-CENSUS.md` §3) counted 20,800 + 1,808 + 219
+    // occurrences across 218/218 frames of a real WM2000 run. Each was a
+    // whole-stream abort, so these three ids alone held every frame at zero
+    // decoded commands.
+    // ------------------------------------------------------------------
+
+    /// All three newly-admitted ids decode as `NoOp` under all four wire
+    /// prefixes, and none of them stages any RDP state.
+    ///
+    /// The `state_delta` assertion is the load-bearing half. "It decodes" is
+    /// necessary but not sufficient: admitting an opcode that quietly staged
+    /// state would move pixels, and the whole argument for admitting these
+    /// three without designing a semantic is that `NoOp` cannot.
+    #[test]
+    fn the_three_wm2000_blocking_ids_decode_as_state_free_noops() {
+        for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+            for id in [SYNC_PIPE, SYNC_TILE, STREAM_TERMINATOR] {
+                // Nonzero payloads: the RDP assigns no field to any of these
+                // three, so a decoder that read one would be inventing it.
+                let words = vec![word(prefix, id, 0x005a_5a5a), 0xa5a5_a5a5];
+                let submitted = submit(packet(7, words, &[]));
+                let decoded =
+                    decode_raw_dpc(submitted, &RdpState::default()).unwrap_or_else(|error| {
+                        panic!("id {id:#04x} under prefix {prefix:#04x} must decode: {error}")
+                    });
+                assert_eq!(decoded.commands().len(), 1);
+                assert_eq!(
+                    decoded.commands()[0].kind(),
+                    RawDpcCommandKind::NoOp { variant: id },
+                    "id {id:#04x} must decode as a NoOp carrying its own variant"
+                );
+                assert_eq!(
+                    decoded.state_delta(),
+                    &RdpStateDelta::default(),
+                    "id {id:#04x} must stage no RDP state; admitting it must not be able to \
+                     move a pixel"
+                );
+            }
+        }
+    }
+
+    /// **The measurement this slice exists for.** A WM2000-shaped command
+    /// sequence -- fill state, a fill, the sync ops it really interleaves,
+    /// and its `0x1f` terminator -- decodes end to end instead of aborting.
+    ///
+    /// Shaped from the census's own per-frame profile (§3): every frame
+    /// issues `SyncPipe` many times, `SyncTile` occasionally, a
+    /// `FillRectangle`, and exactly one terminator last. Deliberately NOT a
+    /// mixed fill+TMEM packet: the census records `MixedFillAndTmemLoadPacket`
+    /// as a hard refusal at 218/218 frames (`production.rs`), which is its
+    /// own card and must not be smuggled in under this one.
+    ///
+    /// The command count is asserted exactly, and the terminator's position
+    /// with it: a decoder that treated `0x1f` as a `break` would return 9
+    /// commands rather than 10 and would silently drop everything after the
+    /// first terminator in a coalesced stream.
+    #[test]
+    fn a_wm2000_shaped_stream_decodes_end_to_end_rather_than_aborting() {
+        let mut words = Vec::new();
+        // Frame setup, then the syncs WM2000 actually interleaves.
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend(state_words(0));
+        words.extend([word(0, SYNC_TILE, 0), 0]);
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend([word(0, FILL_RECTANGLE, 4 << 12 | 4), 0]);
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend([word(0, FULL_SYNC, 0), 0]);
+        // The terminator the game writes to end every submission.
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+
+        let submitted = submit(packet(7, words, &[(0, 16)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default())
+            .expect("a WM2000-shaped stream must decode end to end");
+
+        // 4 syncs + 3 state + 1 fill + 1 FullSync + 1 terminator.
+        assert_eq!(
+            decoded.commands().len(),
+            10,
+            "every command must be decoded, including the ones after the terminator's \
+             predecessors -- a `break` on 0x1f would come up short"
+        );
+        assert_eq!(
+            decoded.commands().last().unwrap().kind(),
+            RawDpcCommandKind::NoOp {
+                variant: STREAM_TERMINATOR
+            },
+            "the terminator must be the last decoded command, not the end of decoding"
+        );
+        assert!(
+            decoded
+                .commands()
+                .iter()
+                .any(|command| matches!(command.kind(), RawDpcCommandKind::FillRectangle(_))),
+            "the fill must survive the syncs around it"
+        );
+        // The fill's own state really was staged, so "it decoded" is not
+        // passing on an empty stream.
+        assert_eq!(
+            decoded.staged_state().fill_color().unwrap().rgba32(),
+            [0x21, 0x3c, 0x4d, 0x59],
+            "the fill color from state_words must be staged"
+        );
+    }
+
+    /// A terminator mid-stream does not truncate the commands after it.
+    ///
+    /// This is the specific defect a `break`-based reading of `0x1f` would
+    /// introduce, and it is invisible to a fixture whose terminator is last.
+    /// Coalesced submissions really do carry more than one.
+    #[test]
+    fn a_mid_stream_terminator_does_not_truncate_what_follows() {
+        let mut words = Vec::new();
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+        words.extend(state_words(0));
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+        words.extend([word(0, FILL_RECTANGLE, 4 << 12 | 4), 0]);
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+
+        let submitted = submit(packet(7, words, &[(0, 16)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default())
+            .expect("terminators must not abort the stream");
+        assert_eq!(
+            decoded.commands().len(),
+            7,
+            "three terminators plus three state commands plus the fill -- a decoder that \
+             stopped at the first terminator would report 1"
+        );
+        assert!(
+            decoded
+                .commands()
+                .iter()
+                .any(|command| matches!(command.kind(), RawDpcCommandKind::FillRectangle(_))),
+            "the fill sits after two terminators and must still be decoded"
+        );
+    }
+
+    /// Admitting three ids must not have widened the door for a fourth.
+    ///
+    /// The two neighbour classes are refused at *different layers*, and the
+    /// test asserts each where it actually happens rather than forcing both
+    /// through one path:
+    ///
+    /// - `0x1e`/`0x20` bracket the terminator inside the still-rejected
+    ///   `0x10..=0x23` block. They never reach this decoder at all --
+    ///   `WorkloadPacket` construction validates command widths through
+    ///   `fn64-render-ir`'s own copy of the table and refuses first, with
+    ///   `ValidationError::UnknownRdpOpcode`. Discovered by writing this
+    ///   test against `decode_raw_dpc` and watching the packet builder panic
+    ///   instead; asserting at the decoder would have been asserting against
+    ///   a layer that never sees the input.
+    /// - `0x2a`/`0x2b`/`0x2c` (`SetKeyGB`, `SetKeyR`, `SetConvert`) are real
+    ///   RDP commands with an admitted width but no decode arm, which the
+    ///   census measured at zero occurrences and says explicitly not to
+    ///   build. They reach the match's catch-all and name themselves.
+    #[test]
+    fn the_neighbouring_ids_are_still_refused() {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let one_command_stream = |id: u8| {
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                layout.range(COMMAND_START, COMMAND_START + 8).unwrap(),
+                vec![word(0, id, 0), 0],
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .expect("chunk construction validates length, not opcodes")])
+        };
+        for id in [0x1eu8, 0x20] {
+            let error = one_command_stream(id)
+                .expect_err("an id with no admitted width must be refused before decode");
+            assert!(
+                matches!(error, ValidationError::UnknownRdpOpcode { .. }),
+                "id {id:#04x} must still have no admitted width; the carve-out was one id \
+                 wide. Got {error:?}"
+            );
+        }
+        // The same construction with the carved-out id succeeds, so the two
+        // assertions above are discriminating rather than rejecting
+        // everything put in front of them.
+        one_command_stream(STREAM_TERMINATOR)
+            .expect("the measured terminator must be accepted where its neighbours are not");
+
+        for id in [0x2au8, 0x2b, 0x2c] {
+            let submitted = submit(packet(7, vec![word(0, id, 0), 0], &[]));
+            let error = decode_raw_dpc(submitted, &RdpState::default())
+                .expect_err("an unadmitted command must be refused");
+            let RawDpcDecodeError::UnsupportedCommand { decoded_opcode, .. } = error else {
+                panic!("id {id:#04x} must be refused as UnsupportedCommand, got {error:?}");
+            };
+            assert_eq!(
+                decoded_opcode, id,
+                "the refusal must name the offending opcode"
+            );
+        }
     }
 
     #[test]
