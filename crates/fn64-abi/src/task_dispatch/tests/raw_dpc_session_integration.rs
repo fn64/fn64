@@ -5129,31 +5129,41 @@ fn wm2000_frame_zero_combiner_constant_probe() {
     }
 }
 
-/// **The isolated disagreement, pinned: the port does not run the blender.**
+/// **The blender, run: the residual is the oracle's own noise dither.**
 ///
 /// Measured, not inferred. The 60 texrects latch
 /// `SetCombine 0xfcffffff / 0xfffdf6fb`, which decodes to
 /// `(Zero - Zero) * Zero + Primitive` -- a flat `Primitive` program that
 /// reads no texel at all. That is why both sides proved invariant to the
-/// TLUT and to the CI4 texture data: neither is consulted by this packet's
-/// texrect program, and the port's palette invariance is therefore NOT a
-/// sampling defect.
+/// TLUT and to the CI4 texture data.
 ///
 /// The latched `SetPrimColor` is `0xffffffdf` -- RGB 255,255,255, alpha
-/// `0xdf` = 223. The port writes the combiner output straight to the
-/// destination (its own module doc, `targets/texrect.rs:76-77`: "No
-/// blending, alpha compare, dither, or coverage"), giving 255 -> 5-bit 31
-/// -> `0xffff`. The oracle runs the blender under the latched
-/// `FORCE_BL`/`IM_RD`/`AA_EN` other-mode low word `0x005041c8`, giving
-/// `255 * 223/255 + dst * (1 - 223/255)`: 223 -> 5-bit 27 (`0xdef7`) over
-/// a zero destination, and 224 -> 5-bit 28 (`0xe739`) over the `0x0001`
-/// fill. Both oracle values are reproduced by that arithmetic exactly.
+/// `0xdf` = 223 -- and the latched other-mode low word `0x005041c8` gives
+/// blender cycle 1 `P = Combined, A = Combined, M = Framebuffer,
+/// B = 1 - A` with `FORCE_BL` and `IM_RD` set. The destination is
+/// **zero everywhere**: the 60 fills are Fill-cycle with fill colour
+/// `0x00010001`, whose `decode_16` is RGB `[0, 0, 0]`. So the composite is
+/// `255 * 223/255 + 0` = 223 -> 5-bit 27 -> `0xdef7`, and the port now
+/// publishes exactly that on all 114,481 texrect pixels.
 ///
-/// This test pins the two sides' measured outputs. It fails the moment
-/// either implementation changes, which is the point: the disagreement is
-/// a real one and must not drift silently.
+/// **The oracle's second value is dither, not geometry.** Other-mode high
+/// `0x0000acef` selects `alpha_dither = Noise` (bits 4:5 == 2) with RGB
+/// dither Disabled. The oracle perturbs the combined alpha before blending
+/// (`raster/draw.rs:606-612`), so `223 & 7 == 7` rounds up to 5-bit 28
+/// (alpha 231 -> `0xe739`) unless the 3-bit noise threshold is exactly 7,
+/// which happens on about 1 pixel in 8. Predicted 7/8 : 1/8 of 114,481 is
+/// 100,171 : 14,310; measured is 100,235 : 14,246, the expected
+/// fluctuation of a pseudo-random stream over that many samples.
+///
+/// That stream is **not derivable from the packet**. The oracle's own
+/// source says so: its SplitMix64 policy is "deliberately not described as
+/// the silicon sequence" and does not "pretend to be the RDP's unknown
+/// polynomial" (`fn64-render-reference/src/raster/mod.rs:85-119`). The
+/// companion `wm2000_frame_zero_oracle_split_is_a_property_of_its_noise_seed`
+/// proves it by control: changing only the oracle's seed moves the split
+/// while the port's output does not move at all.
 #[test]
-fn wm2000_frame_zero_port_omits_the_blender_the_oracle_runs() {
+fn wm2000_frame_zero_blender_runs_and_the_residual_is_oracle_dither() {
     let Some(packet) = load_captured_packet() else {
         eprintln!("[blend] {WM2000_PACKET_ENV} unset -- NOT RUN.");
         return;
@@ -5167,13 +5177,13 @@ fn wm2000_frame_zero_port_omits_the_blender_the_oracle_runs() {
 
     assert_eq!(
         rgba16_histogram(&port),
-        vec![(0xffff, 114_481), (0x0001, 719)],
-        "the port writes the flat Primitive combiner output unblended"
+        vec![(0xdef7, 114_481), (0x0001, 719)],
+        "the port blends the flat Primitive output at alpha 223/255 over a zero destination"
     );
     assert_eq!(
         rgba16_histogram(&oracle),
         vec![(0xe739, 100_235), (0xdef7, 14_246), (0x0001, 719)],
-        "the oracle blends white at alpha 223/255 over the destination"
+        "the oracle blends the same fragment under its own noise alpha dither"
     );
 
     let differing = port
@@ -5182,18 +5192,123 @@ fn wm2000_frame_zero_port_omits_the_blender_the_oracle_runs() {
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(
-        differing, 114_481,
-        "exactly the texrect pixels differ; the 719 fill pixels agree byte-for-byte"
+        differing, 100_235,
+        "every remaining difference is a pixel the oracle's noise dither rounded up; the          719 fill pixels and the 14,246 undithered texrect pixels agree byte-for-byte"
     );
 
+    // The 719 fill pixels still agree, asserted separately from the count
+    // above so a regression that broke the fill and gained the same number
+    // of texrect agreements could not cancel out.
+    let fill_agreements = port
+        .chunks_exact(2)
+        .zip(oracle.chunks_exact(2))
+        .filter(|(a, b)| a == b && u16::from_be_bytes([a[0], a[1]]) == 0x0001)
+        .count();
+    assert_eq!(fill_agreements, 719, "the fill path must not regress");
+
     // The blend arithmetic, derived here rather than read off either
-    // implementation: white at alpha 223/255 over destination 0 and over
-    // the fill's 5-bit 0 with LSB set.
-    let alpha = 223.0f32 / 255.0;
-    let over_zero = (255.0 * alpha) as u32 >> 3;
-    assert_eq!(over_zero, 27, "0xdef7's 5-bit red channel is 27");
-    let over_fill = (255.0 * alpha + 8.0 * (1.0 - alpha)).round() as u32 >> 3;
-    assert_eq!(over_fill, 28, "0xe739's 5-bit red channel is 28");
+    // implementation: white at alpha 223/255 over a zero destination, and
+    // the same fragment after the oracle's noise dither rounds its alpha
+    // to the next five-bit bucket.
+    let undithered = (255.0f32 * (223.0 / 255.0)).round() as u32;
+    assert_eq!(undithered >> 3, 27, "0xdef7's 5-bit channel is 27");
+    // `apply_alpha_dither`'s own arithmetic: `(alpha >> 3) + ((alpha & 7) >
+    // threshold)`, re-expanded by `(five << 3) | (five >> 2)`.
+    let dithered_five = (223u32 >> 3) + u32::from((223u32 & 7) > 6);
+    let dithered_alpha = (dithered_five << 3) | (dithered_five >> 2);
+    let dithered = (255.0f32 * (dithered_alpha as f32 / 255.0)).round() as u32;
+    assert_eq!(dithered_five, 28);
+    assert_eq!(dithered >> 3, 28, "0xe739's 5-bit channel is 28");
+}
+
+/// **The control that makes the residual a finding rather than a defect.**
+///
+/// The oracle's two-value split is a property of its own pseudo-random
+/// noise seed, not of WM2000's packet. Replaying the identical bytes with
+/// different seeds moves the split; nothing in the packet changed, and the
+/// port's output does not move at all.
+///
+/// Without this control, "the port emits one value where the oracle emits
+/// two" reads as a missing port stage. With it, the missing stage is named
+/// as one whose reference implementation declares itself non-silicon.
+#[test]
+fn wm2000_frame_zero_oracle_split_is_a_property_of_its_noise_seed() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[seed] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+
+    let mut splits = Vec::new();
+    for seed in [1u64, 2, 0xdead_beef] {
+        let image = wm2000_reference_image_seeded(&packet, &commands, seed)
+            .expect("the oracle executes this packet at any seed");
+        let dithered_up = image
+            .chunks_exact(2)
+            .filter(|p| u16::from_be_bytes([p[0], p[1]]) == 0xe739)
+            .count();
+        eprintln!("[seed] {seed:#x} -> {dithered_up} pixels dithered up");
+        splits.push(dithered_up);
+    }
+    let default_split = 100_235usize;
+    assert!(
+        splits.iter().any(|&count| count != default_split),
+        "if no seed moved the split it would not be seed-derived; measured {splits:?} against          the default seed's {default_split}"
+    );
+    // Every seed still lands near the 7/8 the dither arithmetic predicts,
+    // which is what makes them the same mechanism rather than noise in the
+    // measurement.
+    let predicted = 114_481 * 7 / 8;
+    for &count in &splits {
+        assert!(
+            count.abs_diff(predicted) < 1_000,
+            "seed-varied split {count} must stay near the predicted {predicted}"
+        );
+    }
+}
+
+/// As `wm2000_reference_image_perturbed`, with the oracle's pseudo-random
+/// noise seed set explicitly. Only the oracle's own public
+/// `with_noise_seed` builder is used; no guest byte and neither
+/// implementation is modified.
+fn wm2000_reference_image_seeded(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+    seed: u64,
+) -> Result<Vec<u8>, String> {
+    use fn64_render::RenderBackend as _;
+
+    let (target_width, target_height) = replay_target_extent(commands);
+    let color_image_addr = wm2000_color_image_addr(commands);
+    let target_bytes = (target_width * target_height * 2) as usize;
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    let bytes = words_to_rdram_bytes(&packet.words);
+    let start = 0x1000u32;
+    let loaded_end = start + bytes.len() as u32;
+    rdram[start as usize..loaded_end as usize].copy_from_slice(&bytes);
+    let end = commands
+        .last()
+        .filter(|&&(_, cmd6, _, _)| cmd6 == 0x1f)
+        .map_or(loaded_end, |&(offset, _, _, _)| start + offset as u32);
+
+    let mut backend = fn64_render_reference::ReferenceBackend::new().with_noise_seed(seed);
+    backend
+        .create(&fn64_render::RenderConfig {
+            width: target_width,
+            height: target_height,
+            tv_type: fn64_runtime::TvType::default(),
+        })
+        .map_err(|e| format!("reference create() refused: {e:?}"))?;
+    backend
+        .process_rdp_commands(&mut rdram, start, end, 0, true)
+        .map_err(|e| format!("reference returned an error: {e:?}"))?;
+
+    let mut published = vec![0u8; target_bytes];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &mut published,
+    );
+    Ok(published)
 }
 
 /// **Does either side respond to `SetPrimColor` at all?**

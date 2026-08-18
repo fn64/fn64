@@ -3048,6 +3048,12 @@ fn execute_scheduled_texrect(
         draw_state.env_color,
         draw_state.prim_color,
     );
+    // The blender's two color registers, taken from the SAME
+    // `RetrievedTriangleDraw` snapshot the combiner's registers above came
+    // from -- i.e. the values current at THIS texrect's own stream
+    // position, not the walk's running final value.
+    let blend_registers =
+        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color);
     let completed = crate::targets::execute_texture_rectangle(
         candidate,
         other_mode,
@@ -3056,6 +3062,7 @@ fn execute_scheduled_texrect(
         &image,
         lut_mode,
         shading,
+        blend_registers,
         resident_bytes,
         already_initialized,
     )?;
