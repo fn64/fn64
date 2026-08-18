@@ -984,7 +984,6 @@ fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
     let mut rdram = rdram_with_texture_source();
     register_session_backend_for_fills(rdram.len());
 
-    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
     let poisoned = poison_fill_target(&mut rdram);
 
     // Positive control, in this same test: the fill ALONE does change these
@@ -992,8 +991,8 @@ fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
     // nothing" could equally mean the harness never wrote anything.
     dispatch_words(&mut rdram, &whole_target_fill_words());
     assert_ne!(
-        rdram[target.clone()],
-        poisoned[..],
+        read_fill_target_logical(&rdram),
+        poisoned,
         "the fill alone must change guest bytes through this seam, or the composed case below \
          proves nothing about refusal"
     );
@@ -1025,9 +1024,23 @@ fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
         "the refusal must be the named mixed-packet rejection, got: {message}"
     );
 
+    // Read back through the lane authority, not by indexing storage. Both
+    // sides of this comparison are then logical guest bytes: `poison_fill_
+    // target` writes through `write_logical_bytes` and returns the logical
+    // image, so a raw `rdram[..]` slice would compare a logical expectation
+    // against physical storage and see the `^3` permutation as a difference.
+    //
+    // Supersession, per `3d64e9bf`'s convention: this assertion indexed
+    // `rdram` raw when written, and was correct then -- it branched from
+    // `92affbee`, before `43d595c2` lane-mapped the copyback, when the raw
+    // copy made storage coincidentally equal to logical order. `3d64e9bf`
+    // moved the four composition tests onto `read_fill_target_logical` for
+    // exactly this reason; this test branched alongside them and needed the
+    // same move. No literal changed: the poison was always the logical
+    // image, and it still is.
     assert_eq!(
-        rdram[target],
-        poisoned[..],
+        read_fill_target_logical(&rdram),
+        poisoned,
         "a refused fill+texrect packet must change no guest byte -- every one must still carry \
          the poison. A partial write here would mean the fill half published while the texrect \
          half silently vanished, which is exactly the 'plausible pixels without a proven texel \
