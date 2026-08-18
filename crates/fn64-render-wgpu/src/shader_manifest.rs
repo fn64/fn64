@@ -1547,7 +1547,9 @@ mod tests {
         )?;
         let profile = DirectTexelDecodeDeviceProfile;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            backends: crate::device::adapter_selection::backends_for_request(
+                wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            ),
             flags: wgpu::InstanceFlags::VALIDATION,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
@@ -1562,6 +1564,7 @@ mod tests {
             .map_err(|error| {
                 DirectTexelDecodeNativeError::NativeAdapterUnavailable(error.to_string())
             })?;
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         let validated = profile
             .validate_adapter(adapter.features(), &adapter.limits())
             .map_err(DirectTexelDecodeNativeError::Profile)?;
