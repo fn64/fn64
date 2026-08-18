@@ -73,12 +73,19 @@ static LOOKUP_TABLE: &[(u32, RecompFunc)] = &[
     (0x80003000, tail_caller as RecompFunc),
 ];
 
+// Vrams claimed by more than one overlay bank: resolved against guest residency.
+static BANKED_LOOKUP_TABLE: &[(u32, &[(usize, &'static str, RecompFunc)])] = &[
+];
+
 pub fn lookup(vram: u32) -> RecompFunc {
     if let Some(func) = resolve_host_function(vram) {
         return func;
     }
     match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
         Ok(index) => LOOKUP_TABLE[index].1,
-        Err(_) => fn64_cpu_runtime::trap_unsupported(format!("lookup: no recompiled function or host shim at vram {vram:#010X}")),
+        Err(_) => match BANKED_LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
+            Ok(index) => fn64_cpu_runtime::resolve_banked_function(vram, BANKED_LOOKUP_TABLE[index].1),
+            Err(_) => fn64_cpu_runtime::trap_unsupported(format!("lookup: no recompiled function or host shim at vram {vram:#010X}")),
+        },
     }
 }
