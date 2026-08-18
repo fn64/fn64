@@ -102,12 +102,36 @@ fn main() {
     game::run();
 }
 
-/// OoT's host-first rs-lane lookup table, shared verbatim with the headless
-/// harness (game-profile data beside the OoT harness, not duplicated here —
-/// see that file's module doc).
+/// The linked title's host-first rs-lane lookup table.
+///
+/// The rs lane resolves host functions **by address**, so this table is
+/// game-profile data and lives beside its own harness, never in this
+/// game-agnostic crate. `build.rs` locates it from the `RECOMP_RS_HOST_LOOKUP`
+/// environment variable and copies it into `OUT_DIR/host_lookup.rs`, which the
+/// `#[path]` below names. Pointing that variable at a different harness's
+/// `host_lookup.rs` links a different title.
+///
+/// This replaced a hardcoded `#[path]` include of
+/// `../../../examples/oot-boot/src/host_lookup.rs`, which (a) pinned the shell
+/// to OoT and (b) named a file that no longer exists in this repo, so
+/// `FN64_RECOMP=rs` could not compile here for any title at all.
+///
+/// The staging step is what makes this work: `#[path]` accepts only a plain
+/// literal (no `env!`, no `concat!`), and the table file opens with `//!` inner
+/// doc comments that are legal only at the top of a *file* module. So build.rs
+/// strips that leading block and writes the rest to a fixed `OUT_DIR` path,
+/// which `include!` can name through `env!`.
+/// Crate-root alias for the linked emitted crate. The shared per-title
+/// `host_lookup.rs` refers to `crate::recompiled` so it does not have to
+/// hardcode a harness-specific dependency name (`wm2000-boot` calls it
+/// `wm2000_recompiled`; this shell calls it `game-recompiled`).
 #[cfg(fn64_cpu_runtime)]
-#[path = "../../../examples/oot-boot/src/host_lookup.rs"]
-mod host_lookup;
+pub(crate) use game_recompiled as recompiled;
+
+#[cfg(fn64_cpu_runtime)]
+mod host_lookup {
+    include!(concat!(env!("OUT_DIR"), "/host_lookup.rs"));
+}
 
 /// Everything that requires the linked game symbols lives here, gated on the
 /// `fn64_game_linked` cfg `build.rs` sets only when it compiled the
@@ -123,7 +147,7 @@ mod game {
     use std::sync::Arc;
 
     #[cfg(fn64_cpu_runtime)]
-    use oot_recompiled as recompiled;
+    use crate::recompiled;
 
     use pixels::{Pixels, SurfaceTexture};
     use winit::application::ApplicationHandler;
@@ -422,7 +446,7 @@ mod game {
                     crate::host_lookup::recompiled_or_host_lookup,
                 ));
                 println!(
-                    "[fn64-shell] FN64_RECOMP=rs: linked oot-recompiled crate + host-first \
+                    "[fn64-shell] FN64_RECOMP=rs: linked game-recompiled crate + host-first \
                      recompiled adapters active"
                 );
                 // SAFETY: `rdram` is owned by the returned Shell, which lives
@@ -433,7 +457,13 @@ mod game {
                         rdram_ptr,
                         rdram.len(),
                         recompiled::lookup,
-                        recompiled::entrypoint,
+                        // recompile_rom emits no `entrypoint` symbol (the
+                        // previous reference here was stale and could not
+                        // compile). Section 0 of the emitted geometry table is
+                        // the entry section, so its ram_addr IS the configured
+                        // entrypoint, title-neutrally. `lookup` traps by name
+                        // if that vram carries no body.
+                        recompiled::lookup(recompiled::RECOMPILED_SECTION_GEOMETRY[0].1),
                         0,
                         10,
                     );
