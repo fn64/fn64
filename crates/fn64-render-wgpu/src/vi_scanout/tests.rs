@@ -715,3 +715,160 @@ fn a_backend_only_presentation_names_the_missing_register_image() {
         "got: {reason}"
     );
 }
+
+/// The exact STATUS word measured on the real WM2000 ROM's first present:
+/// pixel type 0 (`Blank`) with AA mode 0 (`AaResampleAlways`).
+///
+/// Hand-derived from `ViFilterControl::from_status`' documented bit layout,
+/// not captured from this module's output: type occupies bits 0..=1 and the
+/// AA selector bits 8..=9, so a blanked field requesting AA-always is
+/// `(0 << 0) | (0 << 8) == 0x0000`.
+fn wm2000_blank_aa_always_status() -> u32 {
+    let derived = (0 << status::TYPE.offset) | (0 << status::AA_MODE.offset);
+    assert_eq!(derived, 0x0000);
+    let filters = fn64_render::ViFilterControl::from_status(derived);
+    assert_eq!(filters.pixel_type, ViPixelType::Blank);
+    assert_eq!(
+        filters.antialias_mode,
+        fn64_render::ViAaMode::AaResampleAlways
+    );
+    assert!(
+        filters.antialias_mode.silhouette_aa_enabled(),
+        "positive control: this fixture must genuinely latch a silhouette AA mode, \
+         otherwise the blanked-field test below would pass vacuously"
+    );
+    derived
+}
+
+/// A blanked field that *also* selects silhouette AA is black, not a
+/// refusal.
+///
+/// This is the WM2000 case. A blanked field scans out no source pixels, so
+/// the coverage filter has nothing to transform and cannot make the output
+/// wrong. `fn64-render-reference`'s `scanout` returns the cleared field on
+/// `pixel_type == Blank` before it consults `silhouette_aa_enabled`; this
+/// asserts the wgpu backend agrees rather than refusing a filter that
+/// cannot apply.
+#[test]
+fn a_blanked_field_selecting_silhouette_aa_is_black_not_a_refusal() {
+    let rdram = fresh_rdram();
+    let registers = live_registers(
+        wm2000_blank_aa_always_status(),
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect("a blanked field must present black, not refuse an inapplicable filter");
+    assert_eq!((field.width, field.height), (4, 2));
+    assert!(
+        field
+            .rgba8
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]),
+        "a blanked field is opaque black at the programmed rectangle"
+    );
+}
+
+/// The blanked admission is scoped to blanked fields only: an *unblanked*
+/// field selecting silhouette AA still refuses by name.
+///
+/// This is the guard that the ordering fix did not weaken the refusal. The
+/// only difference from the test above is the pixel type.
+#[test]
+fn an_unblanked_field_selecting_silhouette_aa_still_refuses_by_name() {
+    let rdram = fresh_rdram();
+    let status = (2 << status::TYPE.offset) | (0 << status::AA_MODE.offset);
+    let filters = fn64_render::ViFilterControl::from_status(status);
+    assert_eq!(filters.pixel_type, ViPixelType::Rgba16);
+    assert!(filters.antialias_mode.silhouette_aa_enabled());
+    let registers = live_registers(
+        status,
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let error = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect_err("an RGBA16 field selecting silhouette AA must still refuse");
+    match error {
+        RenderError::Backend { backend, reason } => {
+            assert_eq!(backend, "render-wgpu-vi-scanout");
+            assert_eq!(reason, ViScanoutRefusal::SilhouetteAntialias.reason());
+        }
+        other => panic!("expected the named silhouette refusal, got {other:?}"),
+    }
+}
+
+/// `vi.blanked` (osViBlack) reaches the same admission as STATUS type 0,
+/// even when a filter this module does not implement is also selected.
+#[test]
+fn os_vi_black_with_an_unimplemented_filter_is_black_not_a_refusal() {
+    let rdram = fresh_rdram();
+    let status = (2 << status::TYPE.offset) | (0 << status::AA_MODE.offset);
+    let registers = live_registers(
+        status,
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let mut vi = presentation(registers);
+    vi.blanked = true;
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(vi, &memory)
+        .expect("osViBlack must present black regardless of the latched filter selection");
+    assert!(field
+        .rgba8
+        .chunks_exact(4)
+        .all(|pixel| pixel == [0, 0, 0, 255]));
+}
+
+/// A blanked field still refuses the *reserved* pixel type, which is a
+/// malformed register image rather than an inapplicable filter.
+#[test]
+fn a_reserved_pixel_type_still_refuses_ahead_of_the_blank_admission() {
+    let rdram = fresh_rdram();
+    let status = 1 << status::TYPE.offset;
+    assert_eq!(
+        fn64_render::ViFilterControl::from_status(status).pixel_type,
+        ViPixelType::Reserved
+    );
+    let registers = live_registers(
+        status,
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let mut vi = presentation(registers);
+    vi.blanked = true;
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let error = scan_out_guest_rdram(vi, &memory)
+        .expect_err("reserved pixel type 1 is malformed and refuses even when blanked");
+    match error {
+        RenderError::Backend { reason, .. } => {
+            assert_eq!(reason, ViScanoutRefusal::ReservedPixelType.reason());
+        }
+        other => panic!("expected the reserved-pixel-type refusal, got {other:?}"),
+    }
+}
