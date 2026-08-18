@@ -131,6 +131,21 @@ pub fn banner(active_renderer: Option<&str>) -> String {
     out
 }
 
+/// Whether the HUD should already be up when the window opens.
+///
+/// `FN64_HUD=1`. Off by default: the HUD is the *convenience* half of this
+/// module and a clean window is the right default for playing, while the
+/// startup banner -- which is unconditional -- is what actually fixes "I do
+/// not know what I am running". This exists so a headless or scripted run can
+/// bring the HUD up without synthesizing a keypress, which is also how it gets
+/// captured in a screenshot.
+pub fn hud_starts_open() -> bool {
+    matches!(
+        std::env::var("FN64_HUD").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 /// What `FN64_RENDER` asks for, normalized the same way `boot()` normalizes
 /// it. A REQUEST, never an outcome: `boot()` may fall back.
 pub fn requested_renderer() -> String {
@@ -438,6 +453,31 @@ mod tests {
             text.contains("REQUESTED via FN64_RENDER"),
             "a pre-boot banner must not present a request as an outcome, got:\n{text}"
         );
+    }
+
+    /// `FN64_HUD` is read once at boot, so this only pins the accepted
+    /// spellings and the default. Serialized against the process environment
+    /// by keeping every case in one test.
+    #[test]
+    fn the_hud_opens_at_startup_only_when_explicitly_asked() {
+        // SAFETY: single-threaded within this test; no other test reads
+        // FN64_HUD, and the value is restored before returning.
+        let restore = std::env::var("FN64_HUD").ok();
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("on", true),
+            ("0", false),
+            ("", false),
+        ] {
+            std::env::set_var("FN64_HUD", value);
+            assert_eq!(hud_starts_open(), expected, "FN64_HUD={value:?}");
+        }
+        std::env::remove_var("FN64_HUD");
+        assert!(!hud_starts_open(), "unset means off -- a clean window");
+        if let Some(value) = restore {
+            std::env::set_var("FN64_HUD", value);
+        }
     }
 
     #[test]
