@@ -19,7 +19,7 @@ Companion docs: [`RT64-WM2000-VALIDATION.md`](RT64-WM2000-VALIDATION.md),
 
 | Axis | Values | Selected by |
 |---|---|---|
-| **Recompiler** | N64Recomp **C lane** / fn64's own **rs lane** (`fn64-cpu-runtime`) | `FN64_RECOMP=rs` vs `RECOMPILED_DIR` (`crates/fn64-shell/build.rs:53`) |
+| **Recompiler** | fn64's own **rs lane** (`fn64-cpu-runtime`) is the standard for new work; the N64Recomp **C lane** is retained as a pinned comparison artifact, not a live dependency | `FN64_RECOMP=rs` vs `RECOMPILED_DIR` (`crates/fn64-shell/build.rs`) |
 | **Renderer** | `fn64-render-reference` / `fn64-render-rt64` / `fn64-render-wgpu` | `FN64_RENDER` (shell), or direct construction in tests |
 | **Profile** | debug / release (`-C debug-assertions=off`) | `RUSTFLAGS` |
 | **GPU** | real adapter / none | host, plus `--features host-gpu-tests` |
@@ -28,13 +28,22 @@ Companion docs: [`RT64-WM2000-VALIDATION.md`](RT64-WM2000-VALIDATION.md),
 The naive cross-product is 2x3x2x2 = 24 before titles. **Most cells are not
 configurations anyone can run**, so occupancy matters more than completeness.
 
+**The recompiler axis is not two live values.** By owner decision the rs lane is
+the standard for all new work; the C lane stays only as a stored capture the
+one-time wire-level regression gate consults. That gate is not runnable for
+WM2000 yet — the rs lane produces no stream to compare (row 3 below), so the
+C-lane capture remains the only WM2000 artifact and every existing WM2000
+number in `docs/` is still C-lane. Collapsing the axis on paper does not
+retroactively move those measurements onto the shipping lane.
+
 ## 2. Occupancy — measured, unmeasured, or not-a-configuration
 
 | Cell | State | Evidence |
 |---|---|---|
 | C lane x all three renderers, WM2000 frame 0 | **MEASURED** | 0 differing pixels of 115,200, all three pairs, `alpha_dither` controlled to `Disabled` on all sides. `RT64-WM2000-THREE-WAY.md` |
 | C lane x reference, extended window | **MEASURED** | 4,454 VI swaps / 5,792 decode entries / 5,406,193 RDP commands / 230,240 texrects |
-| **rs lane x anything** | **UNMEASURED** | The census harness has no `FN64_RECOMP` branch. This is the lane we ship. |
+| **rs lane x boot, WM2000** | **MEASURED — DOES NOT BOOT** | Harness now exists and runs; traps deterministically at `lookup: no recompiled function or host shim at vram 0x80022540` (`osDriveRomInit`). 25 config stubs are reachable call targets. `RT64-WM2000-RECOMP-LANES.md` §6 |
+| **rs lane x any renderer, WM2000** | **UNMEASURED — blocked upstream** | No rs-lane frame is produced, so no renderer comparison is reachable. Not a renderer finding. |
 | `fn64-render-wgpu` in a shipping binary | **NOT WIRED** | No `FN64_RENDER=wgpu` arm; `present` gated it until recently |
 | GPU-gated wgpu tests, no adapter | **ABSENT, not skipped** | 50 `#[cfg(feature = "host-gpu-tests")]` gates across 12 files |
 | debug vs release | **MEASURED** | Every card runs both; 4 `should_panic` tests invert under `-C debug-assertions=off` |
