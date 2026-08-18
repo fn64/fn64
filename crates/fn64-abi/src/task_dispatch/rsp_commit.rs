@@ -946,9 +946,16 @@ struct SessionRawDpcSource {
 /// Neither rejection is caught: both `.unwrap_or_else(|error| panic!(...))`
 /// through, matching AGENTS.md's loud-trap rule.
 ///
-/// Nonclaim: taking the nonempty branch modifies no guest RDRAM byte. The
-/// writes are ranges plus content digests describing a backend-local buffer;
-/// no RDRAM copyback exists on this path.
+/// Taking the nonempty branch DOES modify guest RDRAM, through
+/// `copy_committed_guest_writes` and only after the commit above returned
+/// `Ok`. This supersedes the earlier nonclaim on this function ("taking the
+/// nonempty branch modifies no guest RDRAM byte"), which was true until the
+/// copyback landed.
+///
+/// Nonclaim, unchanged: the zero-write branch modifies nothing, and
+/// `CompletedWrite` still carries no bytes -- the payload travels through
+/// `RenderBackend::committed_guest_render_target_bytes`, a separate method,
+/// and is checked against the committed digest before it is written.
 /// A submission this backend cannot admit is a hard stop, not a silent
 /// fallback to the legacy path: falling back would let a T4-registered
 /// session quietly downgrade capture fidelity for exactly the submissions
@@ -1147,6 +1154,8 @@ fn try_dispatch_raw_dpc_via_session(
         backend.staged_guest_render_target_writes(prepared.submission())
     });
 
+    let submission_identity = prepared.submission();
+    let commit_writes = staged_writes.clone();
     let committed = RAW_DPC_SESSION.with(|cell| {
         let mut session = cell.borrow_mut();
         let session = session
@@ -1162,6 +1171,31 @@ fn try_dispatch_raw_dpc_via_session(
                 .unwrap_or_else(|error| panic!("commit_guest_render_target_writes: {error}"))
         }
     });
+
+    // The RDRAM copyback, and the ONLY place this path writes a guest byte.
+    //
+    // Strictly after the commit above, never speculatively: reaching this
+    // line means `commit_guest_render_target_writes` already re-validated
+    // every element's access mode/purpose and then, through
+    // `GuestCommitEffectReport::try_new`, its count, order, identity, and
+    // content digest against the packet's own guest-write journal. The
+    // journal -- not the backend -- is therefore the authority for which
+    // ranges may be written, and a backend that reported a fabricated list
+    // panicked above rather than reaching here.
+    //
+    // Supersedes the T-17 nonclaim ("nothing in the FillRectangle admission
+    // chain writes guest RDRAM"), deliberately and with its test replaced by
+    // ones asserting the new behavior --
+    // `tests::raw_dpc_session_integration`'s
+    // `an_admitted_whole_target_fill_writes_its_image_into_guest_rdram`,
+    // `an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows`,
+    // and `an_admitted_odd_origin_fill_writes_target_relative_columns_into_guest_rdram`.
+    // `a_rejected_guest_commit_leaves_guest_rdram_untouched` pins the
+    // after-the-commit ordering this `if` depends on, and
+    // `a_tmem_only_submission_writes_no_guest_target_byte` pins the gate.
+    if !commit_writes.is_empty() {
+        copy_committed_guest_writes(real, submission_identity, &commit_writes);
+    }
 
     // Mirrors the legacy path's own `transaction.validate_atomic_completion()`
     // call (see `dispatch_dpc_submission`'s `Rdram` arm and
@@ -1227,6 +1261,110 @@ fn try_dispatch_raw_dpc_via_session(
         fn64_render::DpFullSyncStatus::Reached
     };
     Some((full_sync, observation))
+}
+
+/// Copy one already-committed submission's guest render-target writes into
+/// live RDRAM, and nothing else.
+///
+/// Called only from `try_dispatch_raw_dpc_via_session`, and only after
+/// `commit_guest_render_target_writes` returned `Ok`. `writes` is that exact
+/// committed list, so every range here has already been validated against
+/// the packet's own guest-write journal by
+/// `GuestCommitEffectReport::try_new`.
+///
+/// **The copy is self-checking.** Each write's committed `ContentDigest` is
+/// re-derived from the bytes the backend hands over, in the same
+/// `ir_effect_content_digest` domain, and a mismatch panics BEFORE any byte
+/// is written. A backend whose byte transport disagrees with the digest it
+/// already committed is a defect that must be loud, not one that silently
+/// scribbles a wrong rectangle into guest memory. The digest is the
+/// authority; the bytes are the payload it vouched for.
+///
+/// **Exactly the committed ranges, no more.** Each `CompletedWrite` is
+/// copied at its own `ResourceRegion::Rdram` range and nowhere else. A
+/// partial-width fill declares N *disjoint* per-row ranges strided by the
+/// color image's width (`fn64-render-wgpu`'s `raw_dpc::plan_fill` collapses
+/// to a single range only when the rectangle spans the full image width), so
+/// this loop writes N separate spans and never the gaps between them.
+/// Collapsing them into one span would claim far more bytes than the fill
+/// wrote.
+///
+/// Writes go through `track_rdp_renderer_mutation` for the same reason the
+/// legacy `dispatch_captured_raw_rdp` path does: a guest-visible renderer
+/// write must reach the write-barrier journal, not bypass it.
+fn copy_committed_guest_writes(
+    real: &mut [u8],
+    submission: fn64_render::ir::SubmissionIdentity,
+    writes: &[fn64_render::ir::CompletedWrite],
+) {
+    let payloads = RENDER_BACKEND.with(|cell| {
+        let mut backend = cell.borrow_mut();
+        let backend = backend
+            .as_mut()
+            .expect("copy_committed_guest_writes: no render backend registered");
+        backend.committed_guest_render_target_bytes(submission)
+    });
+
+    assert_eq!(
+        payloads.len(),
+        writes.len(),
+        "the backend committed {} guest render-target write(s) but produced bytes for {} -- \
+         a committed write with no bytes behind it is a backend defect, never a reason to \
+         copy a partial rectangle",
+        writes.len(),
+        payloads.len()
+    );
+
+    // Every payload is validated against its own committed write BEFORE the
+    // first byte is copied, so a mismatch in the last write cannot leave the
+    // earlier ones already applied.
+    //
+    // The digest assertion below is deliberately kept even though deleting
+    // it leaves every test's FINAL RDRAM state unchanged -- measured, by
+    // mutation, not assumed. Corrupting one halfword in the backend's byte
+    // transport (`committed_guest_render_target_bytes`) trips this assertion
+    // and no guest byte is written. Delete the assertion and the same
+    // corruption reaches guest memory, where it is caught only afterwards by
+    // a test's own pixel comparison. The two mutants are equivalent in
+    // outcome and NOT equivalent in blast radius: one is a loud trap before
+    // the write, the other is silent guest-memory corruption that happens to
+    // be observed downstream. AGENTS.md's loud-trap rule decides that
+    // tie -- this is the guard, not a redundant check.
+    for (index, (write, bytes)) in writes.iter().zip(payloads.iter()).enumerate() {
+        assert_eq!(
+            bytes.len() as u32,
+            write.byte_count(),
+            "committed guest write #{index} declares {} byte(s) but its payload is {}",
+            write.byte_count(),
+            bytes.len()
+        );
+        assert_eq!(
+            fn64_render::ir_effect_content_digest(bytes),
+            write.content(),
+            "committed guest write #{index}'s payload does not hash to the ContentDigest the \
+             backend already committed for it"
+        );
+    }
+
+    for (write, bytes) in writes.iter().zip(payloads.iter()) {
+        let fn64_render::ir::ResourceRegion::Rdram { range, .. } = write.access().region() else {
+            panic!(
+                "a committed guest render-target write must name an RDRAM region; \
+                 commit_guest_render_target_writes admitted a write that does not"
+            );
+        };
+        let start = range.start().get() as usize;
+        let end = range.end() as usize;
+        let destination = real.get_mut(start..end).unwrap_or_else(|| {
+            panic!(
+                "committed guest write range [{start:#x}, {end:#x}) is outside the registered \
+                 RDRAM allocation"
+            )
+        });
+        track_rdp_renderer_mutation(destination, |destination| {
+            destination.copy_from_slice(bytes);
+        });
+    }
 }
 
 /// Own the ABI side of an explicitly scheduled raw-DPC renderer transaction.
