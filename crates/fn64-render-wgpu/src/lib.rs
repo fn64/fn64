@@ -404,6 +404,7 @@ mod texture_gen;
 mod texture_lod;
 mod tmem;
 mod vi;
+mod vi_scanout;
 
 pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
@@ -466,6 +467,7 @@ pub use native_contract::{
     NATIVE_FILL_WORKLOAD_SHA256,
 };
 pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
+pub use vi_scanout::PresentedField;
 pub use random::{RandomState, RANDOM_ENTRY_POINT, RANDOM_WGSL};
 pub use raster_vs::{
     raster_vs, RasterVsParams, RasterVsPosition, Resolution, ScreenTransform,
