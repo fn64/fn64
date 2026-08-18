@@ -717,12 +717,21 @@ mod tests {
         // The full cross-check, and the one structural difference between
         // the two owners, pinned rather than left implicit.
         //
-        // `fn64_render::raw_rdp_command_width` returns None for 0x10..=0x23,
-        // which it documents as deliberately-unaccepted "documented No
-        // Operation" ids. RT64's table has no None: it returns 1 word for
-        // every id it does not recognise. So the tables agree on every id
-        // where fn64's is defined, and fn64's is strictly the narrower
-        // domain.
+        // `fn64_render::raw_rdp_command_width` returns None for 0x10..=0x23
+        // EXCEPT 0x1f, which it documents as deliberately-unaccepted
+        // "documented No Operation" ids. RT64's table has no None: it returns
+        // 1 word for every id it does not recognise. So the tables agree on
+        // every id where fn64's is defined, and fn64's is strictly the
+        // narrower domain.
+        //
+        // 0x1f was carved out of that block on measured evidence -- WM2000
+        // writes it to terminate every submission
+        // (`docs/RT64-WM2000-CENSUS.md` §3) -- and the carve-out moved the
+        // two tables CLOSER together, not further apart: RT64 already read
+        // 0x1f as one command word, so fn64 adopting width 8 is agreement
+        // where there was previously only fn64's abstention. That is why
+        // this test's arithmetic shifts by exactly one id and its
+        // per-id assertion needed no change at all.
         let mut both_defined = 0u32;
         let mut fn64_undefined = 0u32;
         for id in 0u8..=0x3f {
@@ -742,11 +751,12 @@ mod tests {
                 }
             }
         }
-        // 0x10..=0x23 is 20 ids; the other 44 of the 64 are defined by both.
-        assert_eq!(fn64_undefined, 0x24 - 0x10);
-        assert_eq!(fn64_undefined, 20);
-        assert_eq!(both_defined, 64 - 20);
-        assert_eq!(both_defined, 44);
+        // 0x10..=0x23 is 20 ids, less the one measured carve-out (0x1f)
+        // leaves 19 undefined; the other 45 of the 64 are defined by both.
+        assert_eq!(fn64_undefined, (0x24 - 0x10) - 1);
+        assert_eq!(fn64_undefined, 19);
+        assert_eq!(both_defined, 64 - 19);
+        assert_eq!(both_defined, 45);
     }
 
     // ------------------------------------------------------------------
