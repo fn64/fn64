@@ -12,7 +12,33 @@ assert").
 
 ---
 
-## 1. Headline: the packet decodes completely, and is refused during execution
+## 1. Headline: the packet is refused during PLANNING, at `LoadTLUT`
+
+> **§1 and §1b supersede the withdrawn claim below.** A re-measurement on
+> `58fcb964` found this section's original headline — "all 366 commands
+> decode and plan successfully, then refuse at GPU submission" — to be
+> **wrong for the packet this document describes**. What the corrected
+> capture actually does is refuse *during planning*, at the seventh
+> command's `LoadTLUT`, by name:
+>
+> ```
+> plan_raw_dpc: render-wgpu/raw-dpc-plan backend error: raw-DPC plan probe
+> decode failed: ... stream byte offset 0x2e0 wire opcode 0xf0:
+> state-invalid command: LoadTLUT public macro requires a 16-bit
+> destination tile descriptor
+> ```
+>
+> `crates/fn64-render-wgpu/src/tmem/wire.rs:377`. Reproduced three
+> consecutive times, identical each run. The coverage refusal quoted below
+> is real but sits *behind* this one: it is reached only when the
+> destination-descriptor check is bypassed (§1b).
+>
+> **The "366 of 366 decoded" figure is therefore withdrawn.** `LoadTLUT` is
+> decoded and refused, so the admitted count is at most six commands, not
+> 366. §5's burndown claim is corrected in place.
+
+The withdrawn original claim, kept because §1a's correction is written
+against it:
 
 **All 366 commands of WM2000's frame 0 decode and plan successfully.** The
 packet is then refused at GPU submission, by name:
@@ -73,6 +99,97 @@ error rather than a plausible packet, which is how the mistake was found.
 The episode is recorded rather than quietly fixed because it is the exact
 failure mode this card was told to guard against: a packet that *looks* real,
 decodes far enough to produce a number, and is not the game's bytes.
+
+### 1b. The re-measurement, and which fixture is the real one
+
+The correction in §1 was found by replaying the capture again on a clean
+`58fcb964` worktree. Two dumps exist on this machine and only one is the
+packet this document describes:
+
+| Dump | entry-0 rows | entry-0 wire bytes | Replay outcome |
+|---|---|---|---|
+| First (withdrawn, §1a) | 366 | 2,928 | Fails the test's own contiguity check |
+| Corrected | 426 | **3,408** | Refused at `LoadTLUT` (§1) |
+
+426 is the arithmetic §1a predicts: 366 commands with 60 variable-width
+`G_TEXRECT`s contributing a second row each. **3,408 is §2's own stated wire-
+byte figure**, and the corrected dump is byte-identical to the `entry0.bin`
+blob captured alongside it — so the fixture that produces the `LoadTLUT`
+refusal is the one this document was written about, not a third capture.
+Two independent runs of the corrected capture are byte-identical, holding
+§2's determinism bar.
+
+**What the packet programs, hand-derived from its own words.** All seven
+`LoadTLUT`s are identical in shape: tile 7, 16 entries, TMEM 256, preceded by
+a `SetTile` with `siz=0` (4-bit) against a `SetTextureImage` with `siz=2`
+(16-bit). That is the canonical libultra `gDPLoadTLUT_pal16` shape — a
+16-entry palette for a 4-bit CI texture. §5's original text predicted exactly
+this divergence and recorded that the check "did not fire on the correct
+capture"; **that prediction was right about the shape and wrong about the
+firing.** It fires on every one of the seven.
+
+**What is behind the check, measured not reasoned.** Deleting the four-line
+`descriptor.size()` guard as a throwaway probe (reverted; the worktree is
+byte-clean against `58fcb964`) moves the refusal to
+`triangle_pipeline.rs:280` — the coverage refusal §1 originally reported.
+So the two refusals are ordered, not alternative, and the original headline
+described the state reachable only with this guard bypassed.
+
+**No claim is made that the guard is wrong**, and it was not changed. Two
+pieces of evidence say it deserves a hardware-sourced answer rather than a
+reading, and neither is sufficient alone:
+
+- `descriptor.size()` is read at exactly **one** place in `tmem/wire.rs` —
+  line 377, the refusal itself. `transfer_shape`'s `Tlut` arm (`:676-697`)
+  sizes the transfer from `entries` and `image.size()`; the destination
+  projection `project_tmem_transfer_word` (`tmem/types.rs:520`) reads only
+  `descriptor.tmem()`. Nothing downstream consumes the field the check
+  requires.
+- This repository's *other* decoder already accepts the shape:
+  `decode_ci4_pal16_load_uses_palette_local_indices`
+  (`crates/fn64-render-reference/src/gbi/tests/group5.rs:67`) loads a
+  16-entry pal16 TLUT for a `G_IM_SIZ_4B` texture.
+
+The refusal has **no test of its own** (`grep` for its message string returns
+only the site). That is a gap this card records and did not fill.
+
+### 1c. The GPU triangle draw is not redundant for texrects
+
+This card was dispatched to test whether WM2000's texrects could stop being
+routed through the triangle pipeline, on the observation that
+`targets/texrect.rs` is a self-contained CPU executor. **The observation is
+correct and the conclusion drawn from it is not.** The routing change was
+not made.
+
+True: a texrect's GPU-rasterized *pixels* are guest-unobservable.
+`draw_admitted_triangles` stores its readback only into
+`triangle_draw_output` (`production.rs:541`), whose sole reader is the
+`last_triangle_draw()` diagnostic accessor (`:331`) — called from `#[cfg(test)]`
+code only, with no non-test reader anywhere in the workspace. `present()`
+(`:1632`) refuses to treat it as a framebuffer by name. Every guest-visible
+pixel comes from the CPU path, published through `pending_fill_publication`
+→ `staged_guest_render_target_writes` (`:1799`, `:1804`), and
+`targets/texrect.rs` contains zero references to the triangle pipeline.
+
+False, and the reason the change must not be made: the draw's **`Result` is a
+gate on that publication.** The `?` at `production.rs:1779` returns before
+`self.pending_fill_publication = pending;` at `:1799`, so a failed draw
+discards pixels the CPU executor had already computed. This is deliberate,
+documented at `:1785-1788`, and pinned by a source-shape test
+(`a_failed_triangle_draw_leaves_no_redeemable_fill_token`, `:7049`, asserting
+the textual ordering at `:7112-7125`). The `TmemSampleFailed` check
+(`:533-540`) reads the GPU readback *before* it is stored, and is a real
+second sampler over the same projection that the CPU path does not duplicate
+— `raw_dpc_session_integration.rs:4030-4034` records a measured texrect where
+that gate is what kept guest RDRAM at its poison.
+
+Removing the call for texrects would therefore make packets *succeed* that
+currently fail — an adapterless host's `TriangleDrawBeforeCreate` (`:392`)
+would stop blocking a submission — which is a weakened refusal, not a
+routing change. The defensible claim is narrower than the card's premise:
+**the GPU draw contributes no guest-visible pixels for a texrect and is
+retained as a validation gate.** Reclassifying it as vestigial is
+unsupported.
 
 ---
 
@@ -176,6 +293,10 @@ harness cannot be the thing that caps the replay.
 
 All four captured entries were replayed. **All four produce the identical
 refusal**, at the same site. This is one systematic frontier, not a scatter.
+That conclusion survives §1's correction, re-measured: on the corrected
+capture all four entries refuse with `LoadTLUT public macro requires a
+16-bit destination tile descriptor` at wire opcode `0xf0`, not with the
+coverage refusal originally recorded here.
 
 ---
 
@@ -212,17 +333,21 @@ property a refusal must have.
 - **No pixel values.** Nothing renders, so there is nothing to check the
   fill's even/odd RGBA16 column rule or the combiner's output against. The
   hand-derived-extent and combiner-output assertions this card's brief
-  contemplated are unreachable while the coverage refusal stands; they are
+  contemplated are unreachable while the refusal stands; they are
   written for the synthetic fixtures elsewhere in the same file and would
-  transfer directly once a real packet gets past it.
+  transfer directly once a real packet gets past it. (Per §1 the standing
+  refusal is `LoadTLUT`, not coverage; the assertions are unreachable behind
+  either.)
 - **No frame.** See §5.
 - **The target extent derivation is not pinned.** Mutating the
   `SetColorImage` width — dropping the wire field's `+1`, and even forcing
-  the width to 1 — does not change the outcome, because the coverage refusal
+  the width to 1 — does not change the outcome, because the refusal
   fires before any fill is sized. The derivation is kept because it is
   correct and because it stops the harness becoming the frontier the moment
   that refusal moves, but it is a proven-equivalent mutant today and is
-  disclosed as one rather than defended.
+  disclosed as one rather than defended. §1's correction moves the refusal
+  earlier still (to planning), which widens this equivalence rather than
+  narrowing it.
 
 ---
 
@@ -231,48 +356,59 @@ property a refusal must have.
 **Not close, and closer than the last measurement could see.** Both halves
 are real.
 
-What is now proven that was not before: WM2000's actual bytes reach
-`WgpuBackend` and its decoder admits **all of them**. The opcode-admission
-question the census could only classify against source — its own §8 says so
-plainly: "the ADMITTED column is classification against that decoder's
-source, not an observed acceptance" — is now an observation. For this packet
-it is 366 of 366. The census's §7 items 1 and 2 (`SyncPipe`/`SyncTile`/`0x1f`)
-have landed, and the composition refusals that §4a measured at 100% of frames
-no longer fire on it.
+What is proven that was not before: WM2000's actual bytes reach
+`WgpuBackend` through the production seam, and the refusals they meet are
+named ones at documented frontiers rather than defects in the executor's
+arithmetic. The census's §7 items 1 and 2 (`SyncPipe`/`SyncTile`/`0x1f`) have
+landed, and the composition refusals that §4a measured at 100% of frames no
+longer fire on this packet.
+
+**The "366 of 366 admitted" figure is withdrawn** (§1). The packet is refused
+at its seventh command, so the observed admitted count is at most six. The
+census's §8 caveat — "the ADMITTED column is classification against that
+decoder's source, not an observed acceptance" — therefore still stands
+unconverted for the remaining 360.
 
 What is not proven, and is the whole distance remaining: **not one pixel of
 WM2000 has been rendered.** No fill reached its color image, no texel was
-sampled, nothing was published. The packet gets through decode and stops at
-the first thing that tries to draw.
+sampled, nothing was published.
 
-The next blocker, with its size:
+The next blocker, with its size — **this is a different, smaller blocker than
+this section originally named**:
 
-**`CoverageDestination::Clamp`/`Wrap` with `image_read_enabled` set.** Every
-WM2000 texrect in this packet latches it. The refusal is deliberate and its
-site documents why: the pipeline has no framebuffer-read mechanism, so it
-cannot supply a real `memory: Coverage` value, and substituting one silently
-is the failure `AGENTS.md` forbids. **Size: architectural, not a match arm.**
-The site names it "node 2, a separate unresolved architectural decision" —
-it needs a framebuffer-read path, which is a mechanism this backend does not
-have, not a constant to widen. It is not one line and this card did not
-attempt it.
+**`LoadTLUT` with a 4-bit destination tile descriptor** (`tmem/wire.rs:377`).
+All seven of the packet's `LoadTLUT`s are the canonical `gDPLoadTLUT_pal16`
+shape (§1b). **Size: one check, pending evidence — not architectural.** The
+field it tests is read nowhere else in the file, and this repo's own
+reference decoder already accepts the shape, so the likely resolution is that
+the check is over-strict. But "likely" is not measured: it needs the libultra
+manual section or hardware evidence, plus the test the refusal currently
+lacks. Deciding it by reading the code that fails would be the reasoning this
+project forbids.
 
-Two smaller things are visible behind it and are not claims about what
-happens after, only about what is on the path:
+**Behind it, unchanged and still architectural:**
+`CoverageDestination::Clamp`/`Wrap` with `image_read_enabled` set, at
+`triangle_pipeline.rs:280`. Reaching it required bypassing the `LoadTLUT`
+guard (§1b), so it is the *second* blocker, not the first. Its size
+assessment stands: the pipeline has no framebuffer-read mechanism, its site
+names it "node 2, a separate unresolved architectural decision", and it needs
+a mechanism rather than a widened constant. Note that §1c's finding does not
+shrink it — the texrect route to that panic cannot simply be removed, because
+the draw is a publication gate.
 
-- The refusal is a `panic!` rather than a named error variant, so it cannot
-  be matched or counted by a caller the way the decode refusals can.
-- WM2000's `LoadTLUT` destination tiles are programmed `size=0` (4-bit) with
-  a 16-bit source image, against a check that requires a 16-bit destination
-  descriptor (`tmem/wire.rs:377`). That check did not fire on the correct
-  capture, so **no claim is made that it is wrong** — but it is a real
-  divergence between what this title programs and what the check expects, and
-  it is the kind of thing that will need hardware evidence rather than a
-  reading of the libultra macro if it ever does fire.
+Two smaller things remain on the path:
 
-**Nonclaims.** No frame is rendered. No pixel is asserted. The 366-of-366
-decode figure is for entry 0 of one window of one title and says nothing
-about gameplay, which the `0x1CC` MMIO abort still bounds this capture short
-of. No refusal was weakened and none was fixed. The four captured entries are
-all triangle-free early frames; the 152 of 218 frames the census measured as
-carrying triangles were not replayed.
+- The coverage refusal is a `panic!` rather than a named error variant, so it
+  cannot be matched or counted by a caller the way the decode refusals can.
+- The `LoadTLUT` destination check has no test (§1b).
+
+**Nonclaims.** No frame is rendered. No pixel is asserted. No refusal was
+weakened, none was fixed, and no routing was changed — §1c explains why the
+change this card was dispatched to make would have weakened one. The
+`descriptor.size()` probe in §1b was reverted; the worktree is byte-clean
+against `58fcb964`. Whether the `LoadTLUT` check is correct is **not**
+decided here. Everything measured is entry 0 of one window of one title and
+says nothing about gameplay, which the `0x1CC` MMIO abort still bounds this
+capture short of. The four captured entries are all triangle-free early
+frames; the 152 of 218 frames the census measured as carrying triangles were
+not replayed.
