@@ -120,6 +120,164 @@ fn generated_function_definitions(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// One generated section-local function: a `RECOMP_FUNC` body that N64Recomp
+/// emitted but did NOT list in any `recomp_overlays.inl` `FuncEntry` table.
+///
+/// N64Recomp names these `static_<section_index>_<link_vram>` because the
+/// original symbol had file-local (`static`) linkage in the game's own
+/// objects, so it is never an indirect-call target and needs no dispatch-table
+/// row. They are still real recompiled bodies reached by direct C-to-C calls,
+/// and `instrument_generated_function_entries` injects the execution observer
+/// into them exactly as it does for table-listed bodies. Without a matching
+/// registration the very first one entered aborts in
+/// `fn64_c_recompiled_function_enter` with "was not registered in the
+/// generated section table".
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SectionLocalFunction {
+    /// Generated symbol, e.g. `static_4_8011FFA4`. Externally linkable: the
+    /// generated `funcs.h` declares it, so the registration TU can take its
+    /// address.
+    pub name: String,
+    /// Owning `SectionTableEntry.index`, parsed from the name.
+    pub section_index: u32,
+    /// Static link VRAM, parsed from the name.
+    pub link_vram: u32,
+}
+
+/// Discover every `static_<section>_<vram>` body defined in generated sources.
+///
+/// The name is the ONLY carrier of the owning section and link address --
+/// these bodies are absent from `recomp_overlays.inl` by construction, so
+/// nothing else in the corpus states where they live. Parsing is therefore
+/// strict: a name that does not split into a decimal section index and an
+/// 8-hex-digit VRAM is left out rather than guessed at, and the caller
+/// reconciles the discovered set against the section table's geometry before
+/// registering anything.
+fn section_local_function_definitions(source: &str) -> BTreeSet<SectionLocalFunction> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("RECOMP_FUNC void ")?;
+            let name = rest.split_once('(')?.0.trim();
+            let suffix = name.strip_prefix("static_")?;
+            let (section, vram) = suffix.split_once('_')?;
+            if section.is_empty() || !section.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            if vram.len() != 8 || !vram.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(SectionLocalFunction {
+                name: name.to_owned(),
+                section_index: section.parse().ok()?,
+                link_vram: u32::from_str_radix(vram, 16).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// `(index, ram_addr, size)` for every row of the generated `section_table[]`.
+///
+/// Read from the same `recomp_overlays.inl` the C bridge walks, so the
+/// geometry a section-local registration is checked against is the geometry
+/// the runtime actually registers -- not a second, independently drifting
+/// transcription.
+fn section_table_geometry(inl_source: &str) -> BTreeMap<u32, (u32, u32)> {
+    let mut geometry = BTreeMap::new();
+    for line in inl_source.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("{ .rom_addr = ") else {
+            continue;
+        };
+        let field = |name: &str| -> Option<u32> {
+            let start = rest.find(name)? + name.len();
+            let tail = &rest[start..];
+            let end = tail
+                .find(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X')
+                .unwrap_or(tail.len());
+            let literal = tail[..end].trim();
+            let hex = literal
+                .strip_prefix("0x")
+                .or_else(|| literal.strip_prefix("0X"));
+            match hex {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => literal.parse().ok(),
+            }
+        };
+        let (Some(ram_addr), Some(size), Some(index)) =
+            (field(".ram_addr = "), field(".size = "), field(".index = "))
+        else {
+            continue;
+        };
+        geometry.insert(index, (ram_addr, size));
+    }
+    geometry
+}
+
+/// Emit the C++ translation unit that registers the discovered section-local
+/// functions with the runtime, and return it plus the reconciled set.
+///
+/// Every discovered function is checked against the generated section table
+/// twice, from two independent facts, and BOTH must hold or the build fails:
+/// its parsed `section_index` must name a real row, and its parsed `link_vram`
+/// must fall inside that row's `[ram_addr, ram_addr + size)`. A name that
+/// disagrees with the table is a parse this code got wrong (or a corpus whose
+/// naming convention changed), and registering it would bind an execution
+/// observation to the wrong section -- silently mislabelling every downstream
+/// measurement. Refuse by name instead, per `AGENTS.md`'s loud-trap rule.
+///
+/// The emitted TU calls the same `fn64_register_section_local_func` the Rust
+/// harness exports for the section bridge, so registration flows through one
+/// path rather than two.
+fn section_local_registration_unit(
+    functions: &BTreeSet<SectionLocalFunction>,
+    geometry: &BTreeMap<u32, (u32, u32)>,
+) -> String {
+    let mut unit = String::new();
+    unit.push_str(
+        "/* Generated by fn64-boot-harness/build_support.rs -- do not edit.\n \
+         * Registers N64Recomp's section-local (`static_<section>_<vram>`) bodies,\n \
+         * which carry the execution observer but appear in no `FuncEntry` table. */\n",
+    );
+    unit.push_str("#include <stdint.h>\n#include <stddef.h>\n");
+    unit.push_str("#include \"recomp.h\"\n#include \"funcs.h\"\n\n");
+    unit.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+    unit.push_str(
+        "extern void fn64_register_section_local_func(\n    \
+         uint32_t section_index,\n    uint32_t link_vram,\n    recomp_func_t* func\n);\n\n",
+    );
+    unit.push_str("void fn64_bridge_register_section_local_funcs(void) {\n");
+    for function in functions {
+        let (ram_addr, size) = geometry.get(&function.section_index).unwrap_or_else(|| {
+            panic!(
+                "generated section-local function {} names section {}, which the generated \
+                 section_table[] does not declare -- refusing to register it against a section \
+                 that does not exist",
+                function.name, function.section_index
+            )
+        });
+        let end = u64::from(*ram_addr) + u64::from(*size);
+        assert!(
+            u64::from(function.link_vram) >= u64::from(*ram_addr)
+                && u64::from(function.link_vram) < end,
+            "generated section-local function {} parses to link vram {:#010x}, outside its own \
+             section {}'s range [{:#010x}, {:#010x}) -- refusing to register a function at a \
+             section it does not belong to",
+            function.name,
+            function.link_vram,
+            function.section_index,
+            ram_addr,
+            end
+        );
+        unit.push_str(&format!(
+            "    fn64_register_section_local_func({}u, {:#010x}u, {});\n",
+            function.section_index, function.link_vram, function.name
+        ));
+    }
+    unit.push_str("}\n\n#ifdef __cplusplus\n}\n#endif\n");
+    unit
+}
+
 fn instrument_generated_function_entries(source: &str) -> (String, usize) {
     let mut output = String::with_capacity(source.len());
     let mut instrumented = 0;
@@ -573,6 +731,7 @@ fn prepare_recompiled_cxx_sources_inner(
 
     let mut declared_names = recomp_names_followed_by_paren(&funcs_header);
     let mut called_names = BTreeSet::new();
+    let mut section_local: BTreeSet<SectionLocalFunction> = BTreeSet::new();
     let sources: Vec<_> = source_paths
         .into_iter()
         .map(|source_path| {
@@ -584,6 +743,7 @@ fn prepare_recompiled_cxx_sources_inner(
             });
             declared_names.extend(generated_function_definitions(&source));
             called_names.extend(recomp_names_followed_by_paren(&source));
+            section_local.extend(section_local_function_definitions(&source));
             (source_path, source)
         })
         .collect();
@@ -640,6 +800,44 @@ fn prepare_recompiled_cxx_sources_inner(
         );
         prepared_paths.push(prepared_path);
     }
+
+    // Section-local bodies carry the execution observer but appear in no
+    // `FuncEntry` table, so they need their own registration TU. The geometry
+    // they are reconciled against is read from the same generated
+    // `recomp_overlays.inl` the C bridge walks.
+    // Emitted unconditionally: the harness links
+    // `fn64_bridge_register_section_local_funcs` whatever the corpus contains,
+    // so a corpus with no section-local bodies gets an empty registrar rather
+    // than an unresolved symbol.
+    let section_local_count = section_local.len();
+    let geometry = if section_local_count > 0 {
+        let table_path = recompiled_dir.join("recomp_overlays.inl");
+        let tables = std::fs::read_to_string(&table_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read generated section tables {}: {error}",
+                table_path.display()
+            )
+        });
+        let geometry = section_table_geometry(&tables);
+        assert!(
+            !geometry.is_empty(),
+            "generated section tables at {} declare no sections, but {section_local_count} \
+             section-local functions were found -- refusing to register them unreconciled",
+            table_path.display()
+        );
+        geometry
+    } else {
+        BTreeMap::new()
+    };
+    let unit = section_local_registration_unit(&section_local, &geometry);
+    let unit_path = prepared_dir.join("fn64_section_local_registration.cpp");
+    std::fs::write(&unit_path, unit).unwrap_or_else(|error| {
+        panic!(
+            "failed to write section-local registration unit {}: {error}",
+            unit_path.display()
+        )
+    });
+    prepared_paths.push(unit_path);
 
     (
         prepared_paths,
@@ -986,6 +1184,83 @@ mod tests {
     }
 
     #[test]
+    fn discovers_section_local_bodies_and_ignores_table_listed_ones() {
+        let source = concat!(
+            "RECOMP_FUNC void func_8011EA20(uint8_t* rdram, recomp_context* ctx) {\n",
+            "RECOMP_FUNC void static_4_8011FFA4(uint8_t* rdram, recomp_context* ctx) {\n",
+            "RECOMP_FUNC void static_5_8013EAD0(uint8_t* rdram, recomp_context* ctx) {\n",
+            // Malformed names are skipped, never guessed at: the name is the
+            // only carrier of section and address for these bodies.
+            "RECOMP_FUNC void static_x_8011FFA4(uint8_t* rdram, recomp_context* ctx) {\n",
+            "RECOMP_FUNC void static_4_80(uint8_t* rdram, recomp_context* ctx) {\n",
+            "RECOMP_FUNC void static_4_ZZZZZZZZ(uint8_t* rdram, recomp_context* ctx) {\n",
+        );
+
+        let found = section_local_function_definitions(source);
+
+        assert_eq!(
+            found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["static_4_8011FFA4", "static_5_8013EAD0"]
+        );
+        let first = found.iter().next().unwrap();
+        assert_eq!(first.section_index, 4);
+        assert_eq!(first.link_vram, 0x8011_FFA4);
+    }
+
+    #[test]
+    fn reads_section_geometry_from_the_generated_table() {
+        let inl = concat!(
+            "static SectionTableEntry section_table[] = {\n",
+            "    { .rom_addr = 0x00073390, .ram_addr = 0x8011C900, .size = 0x00005DF0, \
+             .funcs = a, .num_funcs = 1, .relocs = nullptr, .num_relocs = 0, .index = 3 },\n",
+            "    { .rom_addr = 0x000809D0, .ram_addr = 0x8011C900, .size = 0x00044B60, \
+             .funcs = b, .num_funcs = 1, .relocs = nullptr, .num_relocs = 0, .index = 4 },\n",
+            "};\n",
+        );
+
+        let geometry = section_table_geometry(inl);
+
+        // Both spellings of the same fact are asserted: the literal, and the
+        // end address derived from base + size. Sections 3 and 4 genuinely
+        // share one link base -- that overlap is the overlay-bank shape, and
+        // it must survive parsing rather than be deduplicated away.
+        assert_eq!(geometry.get(&3), Some(&(0x8011_C900, 0x5DF0)));
+        assert_eq!(geometry.get(&4), Some(&(0x8011_C900, 0x0004_4B60)));
+        assert_eq!(geometry[&3].0 + geometry[&3].1, 0x8012_26F0);
+        assert_eq!(geometry.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside its own section")]
+    fn refuses_a_section_local_function_outside_its_named_section() {
+        let functions = [SectionLocalFunction {
+            name: "static_3_80200000".to_owned(),
+            section_index: 3,
+            link_vram: 0x8020_0000,
+        }]
+        .into_iter()
+        .collect();
+        let geometry = [(3u32, (0x8011_C900u32, 0x5DF0u32))].into_iter().collect();
+
+        let _ = section_local_registration_unit(&functions, &geometry);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare")]
+    fn refuses_a_section_local_function_naming_an_absent_section() {
+        let functions = [SectionLocalFunction {
+            name: "static_9_8011D000".to_owned(),
+            section_index: 9,
+            link_vram: 0x8011_D000,
+        }]
+        .into_iter()
+        .collect();
+        let geometry = [(3u32, (0x8011_C900u32, 0x5DF0u32))].into_iter().collect();
+
+        let _ = section_local_registration_unit(&functions, &geometry);
+    }
+
+    #[test]
     fn prepares_cpp_files_without_modifying_the_input_tree() {
         let root = std::env::temp_dir().join(format!("fn64-build-support-{}", std::process::id()));
         let input = root.join("input");
@@ -1000,7 +1275,10 @@ mod tests {
 
         assert_eq!(rewrite_count, 1);
         assert_eq!(missing_prototype_count, 0);
-        assert_eq!(paths.len(), 1);
+        // One prepared translation unit per input, plus the section-local
+        // registration unit, which is emitted unconditionally so the harness
+        // always links `fn64_bridge_register_section_local_funcs`.
+        assert_eq!(paths.len(), 2);
         assert_eq!(
             std::fs::read_to_string(input.join("funcs_1.c")).unwrap(),
             original
@@ -1009,6 +1287,10 @@ mod tests {
             std::fs::read_to_string(&paths[0]).unwrap(),
             "gpr jr_addend_80000000;\njr_addend_80000000 = ctx->r2;\n"
         );
+        // This corpus declares no section-local bodies, so the registrar is
+        // present but empty -- an empty registrar, never a missing symbol.
+        let registration = std::fs::read_to_string(&paths[1]).unwrap();
+        assert!(registration.contains("void fn64_bridge_register_section_local_funcs(void) {\n}\n"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
