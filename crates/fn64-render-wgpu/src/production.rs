@@ -600,6 +600,21 @@ struct PlanCollector {
     /// states this file duplicates that collector's behavior).
     current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
     current_tile0_size: Option<fn64_render::NeutralTileSize>,
+    /// Every tile's `SetTile`/`SetTileSize` current at the walk's current
+    /// stream position, indexed by the RDP's own 0..=7 tile index.
+    ///
+    /// The two `current_tile0_*` fields above are deliberately kept: they
+    /// mirror `TriangleDrawStateCollector` field-for-field and feed
+    /// `RetrievedTriangleDraw::tile_binding`, whose GPU uniform shape this
+    /// file must not change. This array is the additional fact a texture
+    /// rectangle needs and tile 0 alone cannot supply -- a texrect names
+    /// its tile in its own wire word, and WM2000's do not name tile 0.
+    /// Tracking only tile 0 would have made every non-zero-tile texrect an
+    /// `UnboundTile` refusal.
+    current_tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
     /// `G_SETBLENDCOLOR` current at the walk's current stream position --
     /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
     /// time (`Self::seeded`), then updated on every `SetBlendColor` command
@@ -635,7 +650,20 @@ struct PlanCollector {
     /// `color_image`/`fill_color` on the command itself (see
     /// `RdpFillRectangleCommand`), so nothing needs to be tracked across
     /// the walk for it.
-    fills: Vec<(u32, fn64_render::RdpFillRectangleCommand)>,
+    /// One entry per admitted `FillRectangle`, in plan order: its
+    /// decode-order command index, the command, and the `OtherMode`
+    /// current at **its own** stream position.
+    ///
+    /// The `OtherMode` snapshot is not redundant with
+    /// `current_other_mode`. That field is the walk's running value, which
+    /// by the end of the plan holds whatever the *last* `SetOtherMode` set
+    /// -- and a real stream sets Fill cycle for the fill and then Copy
+    /// cycle for a following texture rectangle, so reading the running
+    /// value at execute time rejects the fill with `NotFillCycle` for a
+    /// mode it never ran under. Snapshotting per command is the same rule
+    /// `triangles` already follows and states in its own doc: "never a
+    /// single whole-plan-final value".
+    fills: Vec<(u32, fn64_render::RdpFillRectangleCommand, Option<OtherMode>)>,
     /// One entry per admitted `FullSync` site, in plan order, paired with
     /// its own decode-order command index.
     ///
@@ -645,6 +673,43 @@ struct PlanCollector {
     /// able to account for every command it carried instead of silently
     /// losing one.
     full_sync_sites: Vec<(u32, fn64_render::RdpFullSyncSite)>,
+    /// One entry per admitted triangle, in plan order and index-parallel
+    /// with `triangles`: the **neutral** `SetTile`/`SetTileSize` pair
+    /// current at that triangle's own stream position, or `None` when
+    /// either was unstaged.
+    ///
+    /// Parallel to, not a replacement for, `RetrievedTriangleDraw`'s own
+    /// `tile_binding`. That field is a [`TileBindingParams`] -- a GPU
+    /// uniform layout, which has no `palette` field because the shader
+    /// path does not select a CI4 palette. The CPU texel reader's indexed
+    /// path does need it, so the complete neutral pair is retained here
+    /// rather than widening the uniform struct with a field the GPU
+    /// binding would never read.
+    ///
+    /// Kept as a separate vector rather than a new field on
+    /// `RetrievedTriangleDraw` because that struct is
+    /// `raw_dpc::triangle_draw_data`'s, shared with
+    /// `TriangleDrawStateCollector`, and this is a `production.rs`-local
+    /// need.
+    triangle_neutral_tiles: Vec<
+        [(
+            Option<fn64_render::NeutralTileDescriptor>,
+            Option<fn64_render::NeutralTileSize>,
+        ); 8],
+    >,
+    /// One entry per admitted `TextureRectangle` **wire command**, in plan
+    /// order: the declared `RenderTarget` write-access span the decoder
+    /// recorded for it (`None` when it declared no write), and the index
+    /// into `triangles` of the first of the two triangles it was admitted
+    /// as.
+    ///
+    /// A texrect is admitted as two `TriangleSource::TextureRectangle`
+    /// triangles (`production_adapter`'s own split) and **both halves carry
+    /// the identical span**, so counting texrects means counting distinct
+    /// originating commands, not triangles -- adjacent pairs are collapsed
+    /// here. Counting triangles instead would double every texrect and
+    /// reject a single legal one as two.
+    texrect_commands: Vec<(Option<fn64_render::TriangleAccessSpan>, usize, u8, u32)>,
 }
 
 impl PlanCollector {
@@ -673,6 +738,7 @@ impl PlanCollector {
             current_combine: combine,
             current_tile0_descriptor: None,
             current_tile0_size: None,
+            current_tiles: [(None, None); 8],
             current_blend_color: blend_color,
             current_env_color: env_color,
             current_prim_color: prim_color,
@@ -680,6 +746,8 @@ impl PlanCollector {
             triangles: Vec::new(),
             fills: Vec::new(),
             full_sync_sites: Vec::new(),
+            triangle_neutral_tiles: Vec::new(),
+            texrect_commands: Vec::new(),
         }
     }
 }
@@ -720,13 +788,23 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     tile_index,
                     descriptor,
                     ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_descriptor = Some(*descriptor);
+                } => {
+                    if *tile_index == 0 {
+                        self.current_tile0_descriptor = Some(*descriptor);
+                    }
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.0 = Some(*descriptor);
+                    }
                 }
                 RdpStateCommand::SetTileSize {
                     tile_index, size, ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_size = Some(*size);
+                } => {
+                    if *tile_index == 0 {
+                        self.current_tile0_size = Some(*size);
+                    }
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.1 = Some(*size);
+                    }
                 }
                 _ => {}
             },
@@ -734,6 +812,8 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 vertices,
                 source,
                 viewport,
+                texrect_accesses,
+                raw_words,
                 ..
             }) => {
                 let triangle_index = self.triangles.len();
@@ -786,13 +866,50 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     })
                 })();
                 self.triangles.push(snapshot);
+                // The whole tile table as of this command's own stream
+                // position, not just tile 0's entry: a texture rectangle
+                // names its own tile in its wire word and this file cannot
+                // know which until it reads that word at execute time.
+                self.triangle_neutral_tiles.push(self.current_tiles);
+                // One texture rectangle is admitted as TWO
+                // `TriangleSource::TextureRectangle` triangles sharing one
+                // originating wire command, and the adapter pushes them
+                // back to back with identical `location`. Recording only
+                // the first of each adjacent pair recovers the count of
+                // *commands*, which is what the declared-write span is
+                // keyed on -- counting triangles would double every
+                // texrect and reject a single legal one as "two".
+                if *source == TriangleSource::TextureRectangle {
+                    let previous_was_first_half = self
+                        .texrect_commands
+                        .last()
+                        .is_some_and(|(_, first, _, _)| *first + 1 == triangle_index);
+                    if !previous_was_first_half {
+                        // The tile index is wire word 1 bits 26:24, the
+                        // same field `texrect_words_in_target` writes and
+                        // `RawTextureRectangle` decodes. Read from the
+                        // command's own retained `raw_words` rather than
+                        // re-decoded from a second source.
+                        let tile_index = raw_words
+                            .get(1)
+                            .map(|word| ((word >> 24) & 0x7) as u8)
+                            .unwrap_or(0);
+                        self.texrect_commands.push((
+                            *texrect_accesses,
+                            triangle_index,
+                            tile_index,
+                            command_index,
+                        ));
+                    }
+                }
             }
             // Mandatory alongside `push_fill_rectangle`'s admission: the
             // enum is `#[non_exhaustive]`, so a produced variant with no arm
             // here falls into the catch-all below and panics at execute time
             // rather than failing to compile.
             RawDpcSemanticCommandRef::FillRectangle(fill) => {
-                self.fills.push((command_index, fill.clone()));
+                self.fills
+                    .push((command_index, fill.clone(), self.current_other_mode));
             }
             // Mandatory alongside `push_full_sync_site`'s admission, for the
             // same `#[non_exhaustive]` reason as the arm above.
@@ -1075,6 +1192,69 @@ pub enum WgpuRawDpcExecutionError {
     /// the journal at all and no defined composition onto the fill's
     /// CPU-side buffer.
     MixedFillAndTrianglePacket,
+    /// A `TextureRectangle` reached the executor but its own
+    /// `SetTile`/`SetTileSize` were never staged at its stream position, so
+    /// there is no tile descriptor to sample through. Never defaulted to a
+    /// zeroed tile, which would silently sample TMEM word zero and produce
+    /// plausible pixels with no proven texel fetch.
+    TexrectUnboundTile {
+        triangle_index: usize,
+    },
+    /// A `TextureRectangle` reached the executor without a
+    /// `RectViewportPixels`. Only a `TriangleSource::TextureRectangle`
+    /// triangle carries one, and only that source reaches this path, so
+    /// its absence means the plan and the decoder disagree.
+    TexrectMissingViewport {
+        triangle_index: usize,
+    },
+    /// This packet composes a `TextureRectangle` with TMEM loads, but the
+    /// texrect declared no journal write access (no staged `SetColorImage`,
+    /// an unsupported color format, a fractional or reversed rectangle, or
+    /// flip -- see `raw_dpc::mod`'s `plan_texture_rectangle`). Executing it
+    /// anyway would write bytes the journal never declared, which
+    /// `merged_fill_and_tmem_writes` would then reject less specifically as
+    /// `MergedWriteUndeclared`. Named here instead.
+    TexrectDeclaredNoWrite {
+        triangle_index: usize,
+    },
+    /// A composed packet carried both a `TextureRectangle` and a
+    /// `RawTriangle`. The texrect composes onto the CPU-side color buffer
+    /// through its own declared journal writes; a raw triangle declares no
+    /// write access at all and rasters into a disjoint GPU attachment. The
+    /// pair has no defined ordering, exactly as `MixedFillAndTrianglePacket`
+    /// states for fill+triangle -- refused rather than half-executed.
+    MixedTexrectAndRawTrianglePacket,
+    /// A packet declared more than one `TextureRectangle`. Each texrect
+    /// needs the prior one's output as its own resident bytes, and this
+    /// slice threads exactly one. A second is a loud refusal, never a
+    /// silent overwrite.
+    MultipleTexrectsInOnePacket {
+        texrect_count: usize,
+    },
+    /// A `TextureRectangle` was admitted in a packet with no TMEM load, so
+    /// there is no pending post-image for it to sample. Census-measured,
+    /// this shape does not occur in WM2000 (0 of 219 decode entries carry a
+    /// texrect without a load in the same entry); it is refused by name
+    /// rather than silently sampling stale committed state.
+    /// A `TextureRectangle` appears earlier in the command stream than a
+    /// TMEM load in the same packet. The pending post-image is sealed once
+    /// per packet from every load in it, so executing the texrect would let
+    /// it observe texels a later command loaded -- answering a question
+    /// about the past with the future's data.
+    TexrectBeforeItsOwnLoad {
+        texrect_command: u32,
+        load_command: u32,
+    },
+    /// A pending TMEM post-image reported a `Committed` snapshot identity.
+    /// A proposal has no durable `(state, generation)` pair to name, so a
+    /// committed receipt for one is a forgery; see the check site for why
+    /// this is verified rather than trusted to the type system.
+    PendingTmemImageClaimedCommitted {
+        triangle_index: usize,
+    },
+    TexrectWithoutTmemLoad,
+    TexrectExecution(crate::targets::TexrectExecutionError),
+    TextureLutMode(crate::TextureLutModeError),
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -1158,6 +1338,56 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                  with no defined composition or ordering between them, so the combination is \
                  rejected loudly here rather than half-executed silently",
             ),
+            Self::TexrectUnboundTile { triangle_index } => write!(
+                formatter,
+                "texture-rectangle triangle #{triangle_index} (plan order) has no SetTile/\
+                 SetTileSize staged at its own stream position, so there is no tile descriptor \
+                 to sample TMEM through"
+            ),
+            Self::TexrectMissingViewport { triangle_index } => write!(
+                formatter,
+                "texture-rectangle triangle #{triangle_index} (plan order) carries no \
+                 RectViewportPixels; only the decoder produces one and every texrect-sourced \
+                 triangle must have it"
+            ),
+            Self::TexrectDeclaredNoWrite { triangle_index } => write!(
+                formatter,
+                "texture-rectangle triangle #{triangle_index} (plan order) declared no journal \
+                 write access, so executing it would write bytes this packet never declared"
+            ),
+            Self::MixedTexrectAndRawTrianglePacket => formatter.write_str(
+                "this packet declares both an admitted TextureRectangle and an admitted \
+                 RawTriangle; the texrect composes onto the CPU-side color buffer through its \
+                 own declared journal writes while a raw triangle declares no write access at \
+                 all, so the two have no defined ordering and the combination is refused",
+            ),
+            Self::MultipleTexrectsInOnePacket { texrect_count } => write!(
+                formatter,
+                "this packet declares {texrect_count} TextureRectangles; each needs the prior \
+                 one's output as its resident bytes and this slice threads exactly one"
+            ),
+            Self::TexrectBeforeItsOwnLoad {
+                texrect_command,
+                load_command,
+            } => write!(
+                formatter,
+                "raw-DPC command #{texrect_command} is a TextureRectangle appearing before the \
+                 TMEM load at command #{load_command} in the same packet; the pending TMEM \
+                 post-image is sealed once per packet, so executing the texrect would let it \
+                 observe texels a later command loaded"
+            ),
+            Self::PendingTmemImageClaimedCommitted { triangle_index } => write!(
+                formatter,
+                "the pending TMEM post-image sampled by texture-rectangle triangle \
+                 #{triangle_index} reported a Committed snapshot identity; a sealed but \
+                 unpublished transaction has no durable (state, generation) pair to name"
+            ),
+            Self::TexrectWithoutTmemLoad => formatter.write_str(
+                "this packet declares a TextureRectangle but completed no TMEM load, so there \
+                 is no pending TMEM post-image for it to sample",
+            ),
+            Self::TexrectExecution(error) => write!(formatter, "{error}"),
+            Self::TextureLutMode(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1171,6 +1401,12 @@ impl From<TargetError> for WgpuRawDpcExecutionError {
 impl From<FillExecutionError> for WgpuRawDpcExecutionError {
     fn from(error: FillExecutionError) -> Self {
         Self::FillExecution(error)
+    }
+}
+
+impl From<crate::targets::TexrectExecutionError> for WgpuRawDpcExecutionError {
+    fn from(error: crate::targets::TexrectExecutionError) -> Self {
+        Self::TexrectExecution(error)
     }
 }
 
@@ -2045,8 +2281,76 @@ fn stage_and_report(
     // journal order to read the composition off: a triangle raster
     // declares no write access at all. Composing them is a follow-on
     // slice; refusing by name is the honest answer until then.
-    if !collector.plan.fills.is_empty() && !collector.plan.triangles.is_empty() {
+    // A texture rectangle is admitted as two triangles, so "has triangles"
+    // no longer implies "has a raster with no declared write". Partition
+    // first: a texrect DOES declare its own journal `ColorFramebuffer`
+    // writes (`raw_dpc::mod`'s `plan_texture_rectangle`), which is exactly
+    // the thing a raw triangle lacks and exactly what makes composition
+    // derivable rather than invented. The refusal below therefore narrows
+    // to the case that still has no declared order: a fill next to a RAW
+    // triangle.
+    let raw_triangle_count = collector
+        .plan
+        .triangles
+        .iter()
+        .filter(|draw| {
+            draw.as_ref()
+                .map(|draw| draw.source == TriangleSource::RawTriangle)
+                .unwrap_or(false)
+        })
+        .count();
+    let texrect_count = collector.plan.texrect_commands.len();
+    if !collector.plan.fills.is_empty() && raw_triangle_count > 0 {
         return Err(WgpuRawDpcExecutionError::MixedFillAndTrianglePacket);
+    }
+    // A texrect composes onto the CPU-side color buffer; a raw triangle
+    // rasters into a disjoint GPU attachment. Same absence of a defined
+    // ordering as fill+triangle, named separately so the diagnosis names
+    // the pair that actually collided.
+    if texrect_count > 0 && raw_triangle_count > 0 {
+        return Err(WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket);
+    }
+    if texrect_count > 1 {
+        return Err(WgpuRawDpcExecutionError::MultipleTexrectsInOnePacket { texrect_count });
+    }
+    // Census-measured: 0 of WM2000's 219 decode entries carry a texrect
+    // without a TMEM load in the same entry, so there is no shape here to
+    // serve by silently sampling stale committed state.
+    if texrect_count > 0 && collector.plan.loads.is_empty() {
+        return Err(WgpuRawDpcExecutionError::TexrectWithoutTmemLoad);
+    }
+    // **Within-packet ordering is semantics, and this is where it is
+    // enforced.**
+    //
+    // The pending post-image is sealed ONCE per packet, from every load in
+    // it, before any texrect executes -- `into_pending` runs after the load
+    // loop above. So a texrect that appears BEFORE a load in the command
+    // stream would, without this gate, still observe that load's texels:
+    // the executor would answer a question about the past with the future's
+    // data. Measured, not hypothesised -- with the gate removed, a stream
+    // whose texrect precedes its `LoadBlock` executed and produced
+    // byte-identical texrect rows to the correctly-ordered stream (the same
+    // three `CompletedWrite` content digests). That is the defect this
+    // refuses.
+    //
+    // The refusal is the honest answer rather than "sample a partial
+    // post-image": there is no per-load post-image to sample. Serving one
+    // would mean re-sealing the transaction at every command boundary,
+    // which is a different transaction shape, not a smaller change. A
+    // packet whose texrect genuinely precedes its load is refused by name
+    // until that shape exists.
+    if let Some(&(_, _, _, texrect_command)) = collector.plan.texrect_commands.first() {
+        if let Some((load_command, _)) = collector
+            .plan
+            .loads
+            .iter()
+            .find(|(load_command, _)| *load_command > texrect_command)
+        {
+            return Err(WgpuRawDpcExecutionError::TexrectBeforeItsOwnLoad {
+                texrect_command,
+                load_command: *load_command,
+            });
+        }
     }
     // A fill with no TMEM load keeps its own dedicated path: it has no
     // physical successor to offer, so it must not reach `complete_execution`.
@@ -2155,6 +2459,66 @@ fn stage_and_report(
         Some(stage_fill(collector, packet)?)
     };
 
+    // The texrect half, staged last -- after the whole TMEM transaction is
+    // sealed (so `pending.pending_image()` exists at all) and after the
+    // fill (whose output is this texrect's `resident_bytes`, so a texrect
+    // over a fill sees the filled pixels underneath it). Both orderings
+    // are the packet's own, not this function's: the TMEM load must
+    // precede the sample because the sample reads the load's post-image,
+    // and the fill must precede the texrect because the texrect patches a
+    // sub-rectangle into the fill's full-extent buffer.
+    let staged_texrect = if collector.plan.texrect_commands.is_empty() {
+        None
+    } else {
+        Some(stage_texrect(collector, &pending, staged_fill.as_ref())?)
+    };
+
+    let staged_fill = match (staged_fill, staged_texrect) {
+        (fill, None) => fill,
+        // The texrect's own staged token *replaces* the fill's: both
+        // executors produce a full-extent `DeviceColorBytes` for the same
+        // candidate generation, and the texrect's was built by patching the
+        // fill's output, so it already contains the fill. Keeping both
+        // would publish two initializations of one generation. The fill's
+        // declared `CompletedWrite`s are retained separately (below), since
+        // the journal declares both runs and both must be reported.
+        (fill, Some(texrect)) => {
+            let fill_writes = fill.map(|fill| fill.guest_writes).unwrap_or_default();
+            // BOTH runs go into the staged token's `guest_writes`, in
+            // journal order (fill first, then texrect -- the decoder pushed
+            // them in that order and `merged_fill_and_tmem_writes` below
+            // re-derives the same order from the journal independently).
+            //
+            // This is not bookkeeping: `committed_guest_render_target_bytes`
+            // slices the published buffer by exactly this list to produce
+            // the bytes `fn64-abi` copies into guest RDRAM. A texrect whose
+            // writes were reported in the effect report but omitted here
+            // would be authorized and then never copied -- the declared
+            // range would keep the fill's pixels, and the texel fetch would
+            // have no guest-observable effect at all.
+            //
+            // **The fill's digests are recomputed against the composed
+            // buffer, not carried over from its own.** The fill's
+            // whole-target range and the texrect's rows OVERLAP: a
+            // `CompletedWrite` claims "these bytes at this range now hold
+            // content with this digest", and after the texrect patched the
+            // shared buffer the fill's range no longer holds what the fill
+            // alone produced. Carrying the stale digest is not a cosmetic
+            // mismatch -- `rsp_commit`'s `copy_committed_guest_writes`
+            // re-derives each digest from the bytes before writing any of
+            // them and asserts equality, so a stale one aborts the whole
+            // copy. Measured: it did, naming write #0.
+            let composed = texrect.initialized.device_bytes().device_bytes();
+            let base = texrect.initialized.key().address().get();
+            let mut guest_writes = recompute_writes_against(base, composed, &fill_writes)?;
+            guest_writes.extend(texrect.guest_writes);
+            Some(StagedFill {
+                initialized: texrect.initialized,
+                guest_writes,
+            })
+        }
+    };
+
     let Some(staged_fill) = staged_fill else {
         let effects = BackendEffectReport::try_new(packet, tmem_writes)
             .map_err(WgpuRawDpcExecutionError::Effect)?;
@@ -2164,6 +2528,13 @@ fn stage_and_report(
         return Ok(StagedOutcome::TmemLoads(effects, next_physical));
     };
 
+    // All three sources' writes go into one claim pool. The journal still
+    // decides the order, position by position, exactly as before -- adding
+    // a third source changed what is available to claim, not who chooses.
+    // `staged_fill.guest_writes` carries BOTH the fill's and the texrect's
+    // runs (see the match above), so one list is offered to the merge --
+    // chaining the texrect's again would offer each of its writes twice and
+    // let a journal declaring one claim a duplicate.
     let merged = merged_fill_and_tmem_writes(packet, &staged_fill.guest_writes, &tmem_writes)?;
     let effects =
         BackendEffectReport::try_new(packet, merged).map_err(WgpuRawDpcExecutionError::Effect)?;
@@ -2302,7 +2673,7 @@ fn stage_fill(
             fill_count: collector.plan.fills.len(),
         });
     }
-    let (_, fill) = collector.plan.fills[0].clone();
+    let (_, fill, fill_other_mode) = collector.plan.fills[0].clone();
 
     // The `OtherMode` current at this fill's own stream position, tracked by
     // `PlanCollector`'s walk exactly the way a triangle's is. `plan_fill`
@@ -2311,7 +2682,11 @@ fn stage_fill(
     // disagree -- rejected loudly, never defaulted to wire zero (which
     // decodes as Fill cycle with no hazard bits and would silently execute
     // a rectangle the RDP never asked for).
-    let Some(other_mode) = collector.plan.current_other_mode else {
+    // This fill's OWN `OtherMode`, snapshotted at its stream position --
+    // not the walk's running value, which a later `SetOtherMode` (a
+    // following texture rectangle switching to Copy cycle, say) would have
+    // already overwritten with a mode the fill never ran under.
+    let Some(other_mode) = fill_other_mode else {
         return Err(WgpuRawDpcExecutionError::FillExecution(
             FillExecutionError::NotFillCycle,
         ));
@@ -2375,6 +2750,284 @@ fn stage_fill(
         initialized,
         guest_writes,
     })
+}
+
+/// Re-derives each write's content digest from `buffer`, keeping its access
+/// unchanged.
+///
+/// Needed only where two executors write one buffer at overlapping ranges.
+/// A `CompletedWrite` is a claim about what a range holds *now*; the fill
+/// staged its claim before the texrect patched the same bytes, so the
+/// fill's claim is stale the moment the texrect runs. Recomputing is not a
+/// weakening of the claim -- it is what makes it true again, and
+/// `rsp_commit`'s own re-derivation still checks it independently at the
+/// guest-commit seam.
+///
+/// The access is never rebuilt, only the digest: the range this write names
+/// is the journal's fact and must not be re-derived here.
+fn recompute_writes_against(
+    base: u32,
+    buffer: &[u8],
+    writes: &[CompletedWrite],
+) -> Result<Vec<CompletedWrite>, WgpuRawDpcExecutionError> {
+    writes
+        .iter()
+        .map(|write| {
+            let fn64_render_ir::ResourceRegion::Rdram { range, .. } = write.access().region()
+            else {
+                return Err(WgpuRawDpcExecutionError::FillAccessRegionKind {
+                    access_index: write.access().operation().get(),
+                });
+            };
+            let start = range.start().get().checked_sub(base).ok_or(
+                WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                    access_index: write.access().operation().get(),
+                },
+            )? as usize;
+            let slice = start
+                .checked_add(range.len() as usize)
+                .and_then(|end| buffer.get(start..end))
+                .ok_or(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                    access_index: write.access().operation().get(),
+                })?;
+            CompletedWrite::try_from_bytes(write.access(), slice)
+                .map_err(WgpuRawDpcExecutionError::Effect)
+        })
+        .collect()
+}
+
+/// One texrect's execution result, mirroring [`StagedFill`]'s shape.
+struct StagedTexrect {
+    initialized: InitializedCandidateColorTarget,
+    guest_writes: Vec<CompletedWrite>,
+}
+
+/// Executes this packet's single admitted `TextureRectangle` against the
+/// color target, sampling every texel from the **pending** TMEM post-image
+/// `pending` carries -- i.e. from this same packet's own loads.
+///
+/// This is the composition this whole slice exists for. The blocker it
+/// closes was structural, not accidental: `sample_committed_point` needs a
+/// durable `PhysicalTmemState`, and for a packet's own loads that state
+/// exists only after `into_physical_successor`, which runs *after* staging.
+/// `PendingTmemTransaction::pending_image` is the read path that resolves
+/// it, and its own doc states the three invariants it preserves while doing
+/// so (no publication, no forged snapshot identity, no effect-report
+/// participation).
+///
+/// `staged_fill` is this packet's fill half when it has one. Its
+/// full-extent device bytes are the texrect's `resident_bytes`, so a
+/// texrect drawn over a fill composes onto the filled pixels instead of
+/// over a zeroed or stale buffer. With no fill, the registry's own resident
+/// bytes are used, and their absence is a named refusal rather than an
+/// assumed-zero buffer.
+///
+/// Every geometric fact is taken from the decoder, never re-derived: the
+/// pixel extent from the `RectViewportPixels` `texture_rectangle_vertices`
+/// produced, and the declared write run from the span the decoder recorded
+/// when it pushed those accesses.
+fn stage_texrect(
+    collector: &mut ExecutionCollector<'_>,
+    pending: &crate::tmem::PendingTmemTransaction,
+    staged_fill: Option<&StagedFill>,
+) -> Result<StagedTexrect, WgpuRawDpcExecutionError> {
+    let (span, triangle_index, tile_index, _) = collector.plan.texrect_commands[0];
+    // A texrect that declared no write must not execute: it would write
+    // bytes the journal never declared, which `merged_fill_and_tmem_writes`
+    // would then reject as `MergedWriteUndeclared` -- a correct but less
+    // specific diagnosis than naming the real cause here.
+    let span = span.ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?;
+
+    let draw_state = collector.plan.triangles[triangle_index]
+        .as_ref()
+        .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
+    let viewport = draw_state
+        .viewport
+        .ok_or(WgpuRawDpcExecutionError::TexrectMissingViewport { triangle_index })?;
+    let other_mode = draw_state.other_mode;
+
+    // The complete neutral tile pair, not the GPU `TileBindingParams`,
+    // because the CPU reader's indexed path needs `palette` and that
+    // uniform layout has no such field. Absent means no `SetTile`/
+    // `SetTileSize` was staged at this texrect's own stream position --
+    // refused by name, never defaulted to a zeroed tile that would
+    // silently sample TMEM word zero.
+    let (Some(descriptor), Some(size)) =
+        collector.plan.triangle_neutral_tiles[triangle_index][usize::from(tile_index)]
+    else {
+        return Err(WgpuRawDpcExecutionError::TexrectUnboundTile { triangle_index });
+    };
+    let tile = crate::targets::TexrectTileBinding::try_from_neutral(descriptor, size)
+        .map_err(|_| WgpuRawDpcExecutionError::TexrectUnboundTile { triangle_index })?;
+
+    // The two opposite texcoord corners `texture_rectangle_vertices`
+    // produced. Its six-vertex texcoord order is
+    // `[u1v1, u2v1, u1v2, u2v2, u2v1, u1v2]` (the unflipped arm of its own
+    // `triTcFloats` push order), and `production_adapter` splits those six
+    // into triangles `0,1,2` and `3,4,5`. So the upper-left pair `(u1, v1)`
+    // is vertex 0 = first triangle's index 0, and the lower-right pair
+    // `(u2, v2)` is vertex **3** = the SECOND triangle's index **0**.
+    //
+    // Not index 2 of the second triangle: that is vertex 5, whose texcoord
+    // is `(u1, v2)` -- the lower-LEFT corner. Measured, not reasoned:
+    // reading index 2 gave an S span of 0 (`lr = [0.0, 0.75]`), every pixel
+    // in a row sampled texel 0, and the committed-TMEM oracle disagreed at
+    // the first pixel of row 1.
+    let upper_left = draw_state.vertices[0].texcoord;
+    let second = collector.plan.triangles[triangle_index + 1]
+        .as_ref()
+        .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
+    let lower_right = second.vertices[0].texcoord;
+    let draw = crate::targets::TexrectDraw::try_from_viewport_and_texcoords(
+        viewport,
+        upper_left,
+        lower_right,
+    )?;
+
+    // Locate the declared run by the decoder's own recorded span.
+    let start = span.first_access_index as usize;
+    let end = start
+        .checked_add(span.access_count as usize)
+        .ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?;
+    let accesses = collector
+        .plan
+        .accesses
+        .get(start..end)
+        .filter(|slice| !slice.is_empty())
+        .ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?
+        .to_vec();
+
+    let key = key_of_declared_render_target(&accesses, collector, triangle_index)?;
+    let registry = collector
+        .color_targets
+        .as_mut()
+        .ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?;
+    let candidate = registry.begin_candidate(key)?;
+
+    // The pixels underneath. The fill's own output when this packet has
+    // one -- that is what makes fill-then-texrect compose rather than one
+    // overwriting the other -- otherwise the registry's resident bytes.
+    let resident_owned;
+    let already_initialized = staged_fill.map(|fill| fill.initialized.initialized_rectangle());
+    let resident_bytes: &[u8] = match staged_fill {
+        Some(fill) => fill.initialized.device_bytes().device_bytes(),
+        None => {
+            resident_owned = registry
+                .residents()
+                .iter()
+                .find(|resident| resident.key() == key)
+                .map(|resident| resident.device_bytes().device_bytes().to_vec())
+                .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+            &resident_owned
+        }
+    };
+
+    // The reserved TLUT encoding is a named refusal in `OtherMode`'s own
+    // decoder, propagated rather than coerced to Disabled -- which would
+    // silently sample a direct-format texel out of an indexed tile.
+    let lut_mode = other_mode
+        .texture_lut_mode()
+        .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+    // **The committed/pending distinction, asserted where it is crossed.**
+    //
+    // A pending post-image must answer `TmemSnapshotIdentity::Proposed`,
+    // never `Committed`. `PhysicalTmemSnapshotIdentity` names a durable
+    // `(state, generation)` pair, and a pending transaction has none:
+    // `binding.state` is the BASE state's identity and
+    // `binding.next_generation` names a generation that will not exist if
+    // publication is rejected. Minting a committed snapshot from that pair
+    // would make a proposal's receipt compare equal to a publication's --
+    // a forged receipt, indistinguishable downstream from a real one.
+    //
+    // Checked here rather than trusted, because the type system cannot:
+    // both variants inhabit one enum, so a wrong `snapshot()` impl
+    // compiles. Measured: forging `Committed` in `PendingTmemImage`'s impl
+    // passed the entire 5021-test suite before this check existed.
+    let image = pending.pending_image();
+    let snapshot = crate::TmemByteSource::snapshot(&image);
+    if snapshot.is_committed() {
+        return Err(WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index });
+    }
+    let completed = crate::targets::execute_texture_rectangle(
+        &candidate,
+        other_mode,
+        draw,
+        tile,
+        &image,
+        lut_mode,
+        resident_bytes,
+        // The fill's own claimed rectangle, when this packet has a fill:
+        // its bytes are what the texrect patched into, so the composed
+        // completion proves their union. `None` with no fill -- a resident
+        // target's coverage is the registry's fact, not this executor's to
+        // restate.
+        already_initialized,
+    )?;
+    let guest_writes = fill_completed_writes(key, completed.device_bytes(), &accesses)?;
+    let initialized = candidate.admit_completed_initialization(completed)?;
+    Ok(StagedTexrect {
+        initialized,
+        guest_writes,
+    })
+}
+
+/// The color-target key the texrect's own declared writes name.
+///
+/// Derived from this packet's staged `SetColorImage` exactly the way
+/// `stage_fill` derives the fill's, so the two cannot name different
+/// targets for one image -- and cross-checked against the declared access
+/// run's own start address, which the decoder computed independently from
+/// the same image.
+fn key_of_declared_render_target(
+    accesses: &[ResourceAccess],
+    collector: &ExecutionCollector<'_>,
+    triangle_index: usize,
+) -> Result<ColorTargetKey, WgpuRawDpcExecutionError> {
+    // Derived from the packet's own staged `SetColorImage`, reached through
+    // the fill command that carries it. A texrect's `NeutralColorImage` is
+    // not on the triangle (a triangle carries no image), and this slice
+    // admits a texrect only alongside a fill, which does carry it -- so
+    // this is the one place the image is available, and using it keeps the
+    // two executors on one key derivation.
+    let (_, fill, _) = collector
+        .plan
+        .fills
+        .first()
+        .ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?;
+    let extent = collector
+        .configured_target_extent
+        .ok_or(WgpuRawDpcExecutionError::NoColorTargetHeight)?;
+    let format = ColorTargetFormat::try_from_rdp(
+        image_format(fill.color_image.format),
+        pixel_size(fill.color_image.size),
+    )?;
+    let key = ColorTargetKey::try_new(
+        fill.color_image.address,
+        ColorTargetExtent::try_new(fill.color_image.width, extent.height)?,
+        format,
+    )?;
+    // Cross-check, not an assumption: every declared access must fall
+    // inside the key's own range. The decoder computed those ranges from
+    // the same `SetColorImage` by an independent path
+    // (`plan_render_target_rows`), so agreement here is real evidence the
+    // two derivations match, and disagreement is a loud refusal rather
+    // than a write landing outside the target the registry tracks.
+    let target = key.range();
+    for access in accesses {
+        let inside = match access.region() {
+            fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                range.start().get() >= target.start().get()
+                    && range.start().get() + range.len() <= target.start().get() + target.len()
+            }
+            _ => false,
+        };
+        if !inside {
+            return Err(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                access_index: access.operation().get(),
+            });
+        }
+    }
+    Ok(key)
 }
 
 /// This fill's own declared access run, located by the
@@ -2561,6 +3214,22 @@ mod tests {
 
     fn set_tile(tile: u32, line: u32, tmem: u32) -> [u32; 2] {
         [word(SET_TILE, 2 << 19 | line << 9 | tmem), tile << 24]
+    }
+
+    /// One `SetTileSize` command's two wire words.
+    ///
+    /// Field placement is `tmem::wire`'s own `tile_size` decode read
+    /// backwards: **low** S/T live in w0 (bits 23:12 and 11:0), **high**
+    /// S/T in w1 (same two positions), and the tile index in w1 bits 26:24.
+    /// All four are raw 10.2 fixed-point fields. Getting this pair the
+    /// wrong way round is not a silent error -- it produced a
+    /// `ReversedClampExtent` refusal naming `low 0x01c, high 0x000`, which
+    /// is how the swap was caught.
+    fn set_tile_size_words(tile: u32, high_s: u32, high_t: u32) -> [u32; 2] {
+        [
+            word(SET_TILE_SIZE_OPCODE, 0),
+            tile << 24 | high_s << 12 | high_t,
+        ]
     }
 
     fn load_sync() -> [u32; 2] {
@@ -5001,6 +5670,7 @@ mod tests {
             vertices: core::array::from_fn(|index| fixture_vertex(seed + index as f32)),
             source: TriangleSource::RawTriangle,
             viewport: None,
+            texrect_accesses: None,
         }
     }
 
@@ -7509,6 +8179,25 @@ mod tests {
         ]
     }
 
+    /// `texrect_words_in_target`'s stepping sibling: identical rectangle,
+    /// but `dsdx`/`dtdy` of `0x0400` (one texel per pixel in S5.10) instead
+    /// of `0x0100`.
+    ///
+    /// The step matters and was determined by measurement. Copy mode
+    /// halves the S step twice (`dsdx >>= 2`), so
+    /// `lrs = (0 + 0x100 * (8 << 2)) >> 7 = 64` in S10.5 -- **2 texels
+    /// across the 8-pixel row**. `dtdy` is not shifted, so
+    /// `lrt = (0 + 0x400 * (3 << 2)) >> 7 = 96` -- **3 texels over the 3
+    /// rows**, one per row. At `0x0100` the S span is half a texel and
+    /// every pixel in a row samples the same texel, which makes an
+    /// "S is actually read" assertion unsatisfiable; the sibling keeps
+    /// `0x0100` because its own tests never sample.
+    fn texrect_words_in_target_stepping(tile: u32) -> [u32; 4] {
+        let mut words = texrect_words_in_target(tile);
+        words[3] = (0x0400u32 << 16) | 0x0400;
+        words
+    }
+
     /// A TMEM load, then a `TextureRectangle` sampling the tile it loaded --
     /// the WM2000-title-screen shape this card was dispatched to admit.
     fn tmem_then_texrect_words() -> Vec<u32> {
@@ -7754,45 +8443,631 @@ mod tests {
         );
     }
 
-    /// The consequence, pinned as a loud refusal: a fill composed with a
-    /// `TextureRectangle` is refused by the SAME named
-    /// `MixedFillAndTrianglePacket` variant a fill+triangle packet is,
-    /// because a texrect *is* two triangles by the time `stage_and_report`
-    /// sees it.
+    /// The WM2000-title-screen-shaped stream this card exists to admit: a
+    /// whole-target `FillRectangle` in Fill cycle, a `LoadBlock` filling
+    /// tile 7, then a `TextureRectangle` in **Copy** cycle sampling that
+    /// tile.
     ///
-    /// This is the precise blocker for a WM2000 title-screen frame. Frame 0
-    /// of WM2000 is 60 `G_TEXRECT` + 60 `G_FILLRECT` and zero triangles
-    /// (`docs/RT64-WM2000-CENSUS.md`), so every one of its packets that
-    /// carries both is refused here. The refusal is correct -- there is no
-    /// journal order to compose off -- and it is what must change before a
-    /// title-screen frame can execute.
-    #[test]
-    fn a_fill_composed_with_a_texture_rectangle_is_refused_by_name() {
-        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+    /// The cycle-type switch between the two halves is not incidental: a
+    /// fill is only admitted in Fill cycle and this texrect executor is
+    /// only admitted in Copy cycle (it evaluates no color combiner), so a
+    /// real stream must set each. `fill_tmem_and_texrect_words` above keeps
+    /// its single `set_other_mode(0, 0)` and is used only by the
+    /// declared-write and admission tests, which never execute.
+    fn fill_load_and_copy_texrect_words() -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        // A wider, UNSKEWED LoadBlock than `one_load_block_words`': 24
+        // texels (`uls=0, lrs=23`) with `dxt = 0`, so TMEM bytes 0..48 are
+        // contiguously valid -- three complete rows at this tile's
+        // `line_words = 2` (16 bytes = 8 RGBA16 texels per row).
+        //
+        // Both changes were forced by measurement. `one_load_block_words`'
+        // 8-texel load fills row 0 only, and `dxt = 0x800` skews so hard
+        // that its 8 texels land in bytes 0..8 and 24..32 with a hole
+        // between -- a texrect whose T advances one texel per row hits the
+        // hole and is refused as `physical TMEM texel byte 0x014 is
+        // invalid`. That refusal is how these values were determined.
+        words.extend(set_texture_image(0, 2, 8, 0x200));
+        words.extend(set_tile(7, 2, 0));
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+        // High S/T of 7 texels, in the 10.2 wire encoding (`<< 2`); low
+        // S/T are the field's own zero. Mirrors
+        // `raw_dpc::production_adapter::tests::set_tile_size` exactly (that
+        // helper is private to its own module's tests), same local-copy
+        // convention as `set_other_mode` above.
+        words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        // Copy cycle (2), so the texrect executor admits it.
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(texrect_words_in_target_stepping(7));
+        words
+    }
 
+    /// The `SET_FILL_COLOR` word `whole_target_fill_words` stages.
+    ///
+    /// Named here rather than repeated as a literal so the fill-half
+    /// expectation and the fixture cannot drift apart.
+    const COMPOSED_FILL_COLOR: u32 = 0x0842_1085;
+
+    /// The RGBA16 halfword a fill of `fill_color` writes at column `x`.
+    ///
+    /// The RDP's fill cycle writes the 32-bit fill color as two halfwords
+    /// per 32-bit word, so an RGBA16 target takes the HIGH halfword on even
+    /// columns and the LOW halfword on odd ones. Mirrors
+    /// `fn64-abi`'s `raw_dpc_session_integration::expected_fill_halfword`
+    /// exactly (that helper is private to its own test module, so this is a
+    /// local, identical copy -- the same convention `set_other_mode` above
+    /// already follows).
+    fn expected_fill_halfword(fill_color: u32, x: u32) -> u16 {
+        if x % 2 == 0 {
+            (fill_color >> 16) as u16
+        } else {
+            fill_color as u16
+        }
+    }
+
+    /// The typed tile the composed fixture's texrect samples through,
+    /// rebuilt from the SAME wire fields `set_tile`/`set_tile_size_words`
+    /// wrote.
+    ///
+    /// Deliberately constructed from the fixture's own literals rather than
+    /// read back out of the plan: an oracle built from the code under
+    /// test's own state snapshot would agree with it by construction. The
+    /// fields are `set_tile(7, 2, 0)` -- RGBA (format 0), Bits16 (size code
+    /// 2), 2 line words, TMEM word 0, palette 0, both address modes clear
+    /// (wrap), masks and shifts zero -- and
+    /// `set_tile_size_words(7, 7 << 2, 7 << 2)` -- low S/T zero, high S/T
+    /// 7 texels in 10.2.
+    fn composed_fixture_tile() -> crate::TexrectTileBinding {
+        crate::TexrectTileBinding::try_from_neutral(
+            fn64_render::NeutralTileDescriptor {
+                format: fn64_render::NeutralImageFormat::Rgba,
+                size: fn64_render::NeutralPixelSize::Bits16,
+                line_words: 2,
+                tmem_word_address: 0,
+                palette: 0,
+                s_mode: fn64_render::NeutralTileAddressMode {
+                    mirror: false,
+                    clamp: false,
+                },
+                mask_s: 0,
+                shift_s: 0,
+                t_mode: fn64_render::NeutralTileAddressMode {
+                    mirror: false,
+                    clamp: false,
+                },
+                mask_t: 0,
+                shift_t: 0,
+            },
+            fn64_render::NeutralTileSize {
+                low_s: 0,
+                low_t: 0,
+                high_s: 7 << 2,
+                high_t: 7 << 2,
+            },
+        )
+        .expect("the fixture's tile fields are all inside their public field widths")
+    }
+
+    /// The composed fixture's texrect draw, rebuilt from RT64's own
+    /// `texture_rectangle_vertices` on the fixture's raw wire words.
+    ///
+    /// This is the oracle's S/T stepping source. It goes through
+    /// `texture_rectangle_vertices` -- the same ported geometry the decoder
+    /// and the executor both use -- because the alternative is a third
+    /// independent model of copy-mode `dsdx >>= 2` and `lrx |= 3`, whose
+    /// disagreements would be its own bugs rather than findings. What the
+    /// oracle keeps independent is the TMEM image it reads (committed, not
+    /// pending) and the reader entry point (`sample_committed_point`, not
+    /// `sample_point` over a post-image).
+    fn composed_fixture_draw() -> crate::TexrectDraw {
+        let words = texrect_words_in_target_stepping(7);
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let raw = crate::RawTextureRectangle::decode(0x24, &bytes)
+            .expect("the fixture's texrect words decode");
+        let vertices = crate::texture_rectangle_vertices(raw, crate::CycleType::Copy)
+            .expect("the fixture's rectangle is non-empty in copy cycle");
+        crate::TexrectDraw::try_from_viewport_and_texcoords(
+            vertices.viewport,
+            // Vertex 0 is `(u1, v1)` and vertex **3** is `(u2, v2)` -- the
+            // two opposite corners in `texture_rectangle_vertices`' own
+            // six-vertex texcoord order. Vertex 5 is `(u1, v2)`, the
+            // lower-LEFT corner, and using it collapses the S span to zero.
+            vertices.vertex(0).texcoord(),
+            vertices.vertex(3).texcoord(),
+        )
+        .expect("the fixture's texcoords recover integer S10.5 endpoints")
+    }
+
+    /// The rectangle this fixture's texrect covers, derived **twice** and
+    /// reconciled, in Copy cycle.
+    ///
+    /// Derivation 1, RT64's own path (`texture_rectangle_vertices`): the
+    /// wire fields are `ulx=4<<2=16, uly=2<<2=8, lrx=11<<2=44, lry=4<<2=16`.
+    /// Copy cycle applies `lrx |= 3` and `lry |= 3` -> `47, 19`, then
+    /// fill/copy UL round-down `ulx &= !3` / `uly &= !3` leaves `16, 8`
+    /// unchanged (both already multiples of 4). `FixedRect::left/top/right/
+    /// bottom(ceil=true)` is `(coord + 3) >> 2` on all four: `(16+3)>>2=4`,
+    /// `(8+3)>>2=2`, `(47+3)>>2=12`, `(19+3)>>2=5`. Half-open, so the
+    /// covered pixels are **x 4..=11, y 2..=4** -- 8 wide, 3 tall.
+    ///
+    /// Derivation 2, independent: `ceil(coord / 4)` on the four
+    /// copy-mutated values `16, 8, 47, 19` gives `4, 2, 12, 5`. Same.
+    ///
+    /// The naive reading of the wire corners -- "x 4..=11, y 2..=4 because
+    /// the fields say 4 and 11 and 2 and 4" -- happens to give the same
+    /// x-range here by coincidence and the WRONG y-range (it would give 3
+    /// rows only if you also guessed the copy-mode `|= 3`). Under
+    /// **one-cycle** the identical wire words give 7x2, not 8x3, which is
+    /// why the extent must come from the ported geometry and not the wire
+    /// fields: the same command means different footprints in different
+    /// cycle types.
+    const TEXRECT_X0: u32 = 4;
+    const TEXRECT_Y0: u32 = 2;
+    const TEXRECT_WIDTH: u32 = 8;
+    const TEXRECT_HEIGHT: u32 = 3;
+
+    /// The exact declared `ColorFramebuffer` ranges
+    /// `fill_load_and_copy_texrect_words` produces, hand-derived from the
+    /// extent above and asserted before any content is.
+    ///
+    /// The fill is the whole 16x8 RGBA16 target at `FILL_TARGET_ADDRESS`,
+    /// full-image-width, so it collapses to one contiguous access of
+    /// `16*8*2 = 256` bytes. The texrect is 8 pixels wide in a 16-wide
+    /// image -- **partial** width -- so it declares one access per covered
+    /// row: row y starts at `FILL_TARGET_ADDRESS + (y*16 + 4)*2` and runs
+    /// `8*2 = 16` bytes. Rows 2, 3, 4 are therefore `0x2048..0x2058`,
+    /// `0x2068..0x2078`, `0x2088..0x2098` -- disjoint and strided by
+    /// `0x20 = 16*2`, the image width in bytes. Collapsing them into one
+    /// range would claim the untouched bytes between rows as written.
+    #[test]
+    fn the_composed_texrect_fixture_declares_the_hand_derived_rows() {
+        let ranges = declared_render_target_ranges(fill_load_and_copy_texrect_words());
+        let mut expected = vec![(FILL_TARGET_ADDRESS, FILL_TARGET_ADDRESS + 16 * 8 * 2)];
+        for row in TEXRECT_Y0..TEXRECT_Y0 + TEXRECT_HEIGHT {
+            let start = FILL_TARGET_ADDRESS + (row * FILL_TARGET_WIDTH + TEXRECT_X0) * 2;
+            expected.push((start, start + TEXRECT_WIDTH * 2));
+        }
+        assert_eq!(
+            ranges, expected,
+            "the composed fixture must declare the fill's whole target followed by the \
+             texrect's {TEXRECT_HEIGHT} disjoint hand-derived rows, in journal order"
+        );
+        // Independent literal cross-check of the same three rows, so an
+        // arithmetic slip in the loop above cannot agree with itself.
+        assert_eq!(
+            &ranges[1..],
+            &[(0x2048, 0x2058), (0x2068, 0x2078), (0x2088, 0x2098)],
+            "the texrect's three rows, as literals"
+        );
+    }
+
+    /// Positive control: this fixture really does carry an admitted
+    /// `TextureRectangle`, admitted as exactly two triangles.
+    ///
+    /// Without it, every assertion below could pass against a fixture whose
+    /// texrect had silently vanished -- the exact mutant that survived a
+    /// prior lane's first draft, and the reason
+    /// `the_texrect_fixtures_really_do_admit_a_texture_rectangle` exists for
+    /// the sibling fixtures.
+    #[test]
+    fn the_composed_copy_cycle_fixture_really_does_admit_a_texture_rectangle() {
+        assert_eq!(
+            admitted_texture_rectangle_triangles(fill_load_and_copy_texrect_words()),
+            2,
+            "fill_load_and_copy_texrect_words must admit exactly two TextureRectangle-sourced \
+             triangles -- one rectangle is two triangles, and zero would mean the fixture lost \
+             its texrect and every content assertion below is vacuous"
+        );
+        // And the control in the other direction: the same stream WITHOUT
+        // the texrect words admits none.
+        let mut without = whole_target_fill_words();
+        without.extend(one_load_block_words());
+        without.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        assert_eq!(
+            admitted_texture_rectangle_triangles(without),
+            0,
+            "the same stream without the texrect words must admit none"
+        );
+    }
+
+    /// **The card's central claim, proven: `fill + LoadBlock + texrect`
+    /// composes, and the texrect's pixels are real texels fetched from the
+    /// TMEM its OWN packet loaded.**
+    ///
+    /// Plan -> execute -> commit -> publish, then read the published
+    /// full-extent buffer and assert both halves.
+    ///
+    /// The expectation is hand-derived two independent ways and reconciled,
+    /// never captured:
+    ///
+    /// 1. **The fill half.** Every pixel OUTSIDE the texrect rectangle must
+    ///    equal the whole-target fill's own value, derived from
+    ///    `SET_FILL_COLOR`'s wire word by the RGBA16 even/odd column rule --
+    ///    the same derivation the fill-only tests use, reused here so the
+    ///    two cannot disagree about what a filled pixel is.
+    /// 2. **The texrect half.** Every pixel INSIDE it must equal the texel
+    ///    the reader returns for that pixel's own S/T -- computed here by
+    ///    reading the **committed** TMEM state after publication, through
+    ///    `sample_committed_point`, which is a different entry point and a
+    ///    different image (durable state, not the pending post-image the
+    ///    executor read). Agreement between them is the evidence: the
+    ///    pending read and the committed read of the same transaction's
+    ///    bytes must produce identical texels, and the executor used the
+    ///    pending one.
+    ///
+    /// Derivation 2 deliberately does NOT re-implement the texel decode.
+    /// Re-deriving RGBA16 unpacking, XOR4 odd-row placement and LoadBlock
+    /// DXT skewing by hand here would be a second, worse model of
+    /// `tmem/read.rs`, and its disagreements would be its own bugs. What is
+    /// independent -- and what actually needed proving -- is that the
+    /// executor read the RIGHT texel for each pixel from the RIGHT image,
+    /// which comparing against a committed read at the same coordinates
+    /// establishes exactly.
+    #[test]
+    fn a_fill_a_tmem_load_and_a_texrect_compose_into_one_published_image() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        publish_composed(
+            &mut backend,
+            &mut session,
+            fill_load_and_copy_texrect_words(),
+        );
+
+        let resident = backend
+            .color_targets()
+            .expect("a composed packet must have built the color-target registry")
+            .residents()
+            .first()
+            .expect("the composed packet must have published exactly one resident")
+            .device_bytes()
+            .device_bytes()
+            .to_vec();
+        assert_eq!(
+            resident.len() as u32,
+            FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2,
+            "the published buffer must be the target's full extent"
+        );
+
+        // Derivation 2's oracle: the SAME tile, sampled from the now-
+        // COMMITTED physical TMEM through `sample_committed_point`. A
+        // different function over a different image than the executor used.
+        let committed = backend.physical_tmem();
+        let tile = composed_fixture_tile();
+        let mut sampled_any_texel = false;
+
+        for y in 0..FILL_TARGET_HEIGHT {
+            for x in 0..FILL_TARGET_WIDTH {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                let inside = x >= TEXRECT_X0
+                    && x < TEXRECT_X0 + TEXRECT_WIDTH
+                    && y >= TEXRECT_Y0
+                    && y < TEXRECT_Y0 + TEXRECT_HEIGHT;
+                if !inside {
+                    assert_eq!(
+                        actual,
+                        expected_fill_halfword(COMPOSED_FILL_COLOR, x),
+                        "pixel ({x}, {y}) is outside the texrect, so it must still carry the \
+                         fill's own value"
+                    );
+                    continue;
+                }
+                let draw = composed_fixture_draw();
+                let s = draw.s_at(x - TEXRECT_X0);
+                let t = draw.t_at(y - TEXRECT_Y0);
+                let request = crate::PointSampleRequest::new(
+                    crate::PointSampleCoordinates::new(
+                        crate::TextureCoordinateS10_5::from_raw(s),
+                        crate::TextureCoordinateS10_5::from_raw(t),
+                    ),
+                    crate::TmemFirstRowParity::Even,
+                );
+                let texel = crate::sample_committed_point(
+                    committed,
+                    tile.descriptor(),
+                    tile.size(),
+                    request,
+                    crate::TextureLutMode::Disabled,
+                )
+                .expect("the committed oracle must be able to sample the same texel");
+                assert!(
+                    texel.snapshot().is_committed(),
+                    "the ORACLE reads durable state, so its snapshot must be Committed -- if \
+                     this is Proposed the oracle is not independent of the executor"
+                );
+                let [red, green, blue, alpha] = texel.texel().rgba8888();
+                let expected = (u16::from(red >> 3) << 11)
+                    | (u16::from(green >> 3) << 6)
+                    | (u16::from(blue >> 3) << 1)
+                    | u16::from(alpha >> 7);
+                assert_eq!(
+                    actual, expected,
+                    "pixel ({x}, {y}) is inside the texrect, so it must carry the texel the \
+                     committed oracle reads at S={s} T={t} -- the executor sampled the SAME \
+                     bytes through the pending post-image"
+                );
+                sampled_any_texel = true;
+            }
+        }
+        assert!(
+            sampled_any_texel,
+            "the loop must have compared at least one texel, or the texrect half is untested"
+        );
+
+        // The texel content must not be indistinguishable from the fill's:
+        // if every sampled texel happened to equal the fill color, every
+        // assertion above would pass with no texel fetch at all.
+        let inside_offset = (((TEXRECT_Y0 * FILL_TARGET_WIDTH) + TEXRECT_X0) * 2) as usize;
+        let inside_value =
+            u16::from_be_bytes([resident[inside_offset], resident[inside_offset + 1]]);
+        assert_ne!(
+            inside_value,
+            expected_fill_halfword(COMPOSED_FILL_COLOR, TEXRECT_X0),
+            "the texrect's first pixel must DIFFER from the fill value underneath it, or the \
+             whole comparison above is satisfied by a texrect that drew nothing"
+        );
+    }
+
+    /// **The committed/pending distinction, tested rather than assumed: a
+    /// pending post-image read reports `Proposed`, a durable read reports
+    /// `Committed`, and the two carry different identity types.**
+    ///
+    /// This is what the whole `TmemSnapshotIdentity` split exists for. A
+    /// pending transaction has no durable `(state, generation)` pair --
+    /// `binding.state` is the BASE state's identity and
+    /// `binding.next_generation` names a generation that will not exist if
+    /// publication is rejected -- so answering a pending read with a
+    /// `PhysicalTmemSnapshotIdentity` would mint a receipt for a snapshot
+    /// nothing ever published, indistinguishable downstream from a real one.
+    ///
+    /// Measured, not assumed: forging `Committed` inside
+    /// `PendingTmemImage`'s own `snapshot()` impl passed the entire
+    /// 5021-test suite before this test and `stage_texrect`'s matching
+    /// runtime check existed (mutant K in this card's report). Both landed
+    /// for that reason, and the runtime check is a check rather than a type
+    /// guarantee because both variants inhabit one enum: a wrong impl
+    /// compiles.
+    ///
+    /// The pending image is reached through the composed execution path,
+    /// which is the only route to a real sealed transaction in this file --
+    /// the type is move-only and `submitted_packet` is the one callback
+    /// where the `WorkloadPacket` it needs is in scope.
+    #[test]
+    fn a_pending_tmem_read_reports_a_proposal_and_a_committed_read_reports_a_snapshot() {
+        // The pending side, observed from inside execution: `stage_texrect`
+        // asserts `!snapshot.is_committed()` on the live post-image and
+        // refuses `PendingTmemImageClaimedCommitted` otherwise, so a
+        // successful composed execution IS the pending-side assertion.
+        // Running it here rather than only relying on the composed test
+        // keeps the claim attached to the property being made.
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_composed(
+            &mut backend,
+            &mut session,
+            fill_load_and_copy_texrect_words(),
+        );
+        assert!(
+            result.is_ok(),
+            "the composed packet must execute, which requires its pending post-image to have \
+             reported a Proposed snapshot: {result:?}"
+        );
+
+        // The durable side, for the contrast that makes the claim mean
+        // something: the SAME reader over durable state reports Committed,
+        // with the state's own real identity and generation.
+        let committed = backend.physical_tmem();
+        let durable = crate::TmemByteSource::snapshot(committed);
+        assert!(
+            durable.is_committed(),
+            "a read of durable PhysicalTmemState must report Committed, got {durable:?}"
+        );
+        let snapshot = durable
+            .committed()
+            .expect("a Committed identity must expose its snapshot");
+        assert_eq!(snapshot.state(), committed.identity());
+        assert_eq!(snapshot.generation(), committed.generation());
+        assert!(
+            durable.proposed().is_none(),
+            "a Committed identity must not also present itself as a proposal"
+        );
+
+        // A fresh durable state reports a DIFFERENT identity, so the
+        // assertion above is pinning a real value rather than a constant.
+        let other = PhysicalTmemState::try_new().unwrap();
+        assert_ne!(
+            crate::TmemByteSource::snapshot(&other)
+                .committed()
+                .expect("durable")
+                .state(),
+            snapshot.state(),
+            "two distinct durable states must report distinct identities"
+        );
+    }
+
+    /// **Invariant 2, proven: ordering within a packet is semantics, and
+    /// the reverse order observably differs.**
+    ///
+    /// Forward (`LoadBlock` then texrect) executes and produces texels.
+    /// Reversed (texrect then `LoadBlock`) is refused by name. Same
+    /// commands, same wire words, same fill -- only the order changed.
+    ///
+    /// # This test found a real defect, and records it
+    ///
+    /// The first draft of this test asserted only that the reversed order
+    /// "must not execute", and it **failed**: the reversed stream executed
+    /// cleanly and produced texrect rows with byte-identical
+    /// `CompletedWrite` content digests to the forward stream's. The cause
+    /// is structural, not a slip: `stage_and_report` runs its load loop to
+    /// completion and seals ONE pending post-image before any texrect
+    /// executes, so a texrect's position in the command stream had no
+    /// effect on what it saw. Ordering was not semantics; it was ignored.
+    ///
+    /// `TexrectBeforeItsOwnLoad` is the fix, and refusal is the honest
+    /// shape of it: there is no per-load post-image to hand a texrect that
+    /// precedes a load, so the alternatives were "refuse" or "re-seal the
+    /// transaction at every command boundary", and the latter is a
+    /// different transaction design rather than a smaller change.
+    ///
+    /// The identical-digest observation is what makes the refusal load
+    /// bearing rather than defensive -- without the gate the two orders are
+    /// genuinely indistinguishable in their output, which is precisely the
+    /// invariant violation.
+    #[test]
+    fn a_texrect_before_its_load_observably_differs_from_one_after_it() {
+        // Forward order: fill, load, texrect. Executes.
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, forward) = plan_and_execute_composed(
+            &mut backend,
+            &mut session,
+            fill_load_and_copy_texrect_words(),
+        );
+        assert!(
+            forward.is_ok(),
+            "the forward order (load, then texrect) must execute: {forward:?}"
+        );
+
+        // Reversed: the texrect comes BEFORE the load. Same commands, same
+        // wire words, only the order changed.
+        let mut reversed = whole_target_fill_words();
+        reversed.extend(set_texture_image(0, 2, 8, 0x200));
+        reversed.extend(set_tile(7, 2, 0));
+        reversed.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        reversed.extend(set_other_mode(2, 0));
+        reversed.extend(set_combine(0, 0));
+        reversed.extend(texrect_words_in_target_stepping(7));
+        reversed.extend(load_sync());
+        reversed.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+
+        // Control: the reversed stream really does still carry both an
+        // admitted texrect and an admitted load. Without this, "the
+        // reversed order is refused" could mean the reordering broke the
+        // decode instead of tripping the ordering gate.
+        assert_eq!(
+            admitted_texture_rectangle_triangles(reversed.clone()),
+            2,
+            "the reversed stream must still admit its texture rectangle, or its refusal below \
+             proves nothing about ordering"
+        );
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, backward) = plan_and_execute_composed(&mut backend, &mut session, reversed);
+        let error = backward
+            .expect_err("a texrect placed before its own load must not execute")
+            .to_string();
+        assert!(
+            error.contains("appearing before the TMEM load"),
+            "the refusal must be the named TexrectBeforeItsOwnLoad variant, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused reversed packet must leave no redeemable fill token"
+        );
+        assert!(
+            backend.color_targets().is_none(),
+            "the ordering refusal must fire before either executor built the registry"
+        );
+    }
+
+    /// **The inversion of this card's starting measurement, recorded.**
+    ///
+    /// At `be6ed65c` this test was named
+    /// `a_fill_composed_with_a_texture_rectangle_is_refused_by_name` and
+    /// asserted `MixedFillAndTrianglePacket`, on the reasoning that "a
+    /// texrect *is* two triangles by the time `stage_and_report` sees it".
+    /// That reasoning is now wrong in its premise: a texrect declares its
+    /// own journal `ColorFramebuffer` writes where a raw triangle declares
+    /// none, so there IS a declared order to compose it onto the fill with,
+    /// and `stage_and_report` partitions on the source rather than
+    /// refusing every triangle-bearing packet.
+    ///
+    /// What survives is the narrower, still-true refusal this test now
+    /// pins: **fill + texrect with no TMEM load** is refused, because there
+    /// is no pending post-image for the texrect to sample. Census-measured,
+    /// that shape does not occur (0 of WM2000's 219 decode entries carry a
+    /// texrect without a load in the same entry), which is why refusing it
+    /// costs nothing real -- and refusing it by name is what keeps a
+    /// texrect from silently sampling a previous packet's committed TMEM.
+    ///
+    /// The fill+**raw triangle** refusal is unchanged and still named
+    /// `MixedFillAndTrianglePacket`; it is asserted separately below.
+    #[test]
+    fn a_fill_composed_with_a_texture_rectangle_and_no_tmem_load_is_refused_by_name() {
         let mut fill_and_texrect = whole_target_fill_words();
-        fill_and_texrect.extend(set_other_mode(0, 0));
+        fill_and_texrect.extend(set_other_mode(2, 0));
         fill_and_texrect.extend(set_combine(0, 0));
         fill_and_texrect.extend(texrect_words_in_target(7));
+
+        // Positive control: this stream really does carry the texrect.
+        // Measured through the journal rather than the plan walk, because
+        // `admitted_texture_rectangle_triangles` needs a TMEM read to
+        // capture and this fixture deliberately has no TMEM load at all.
+        // Two `RenderTarget` ranges beyond the fill's own single
+        // whole-target one means the texrect declared its own rows; the
+        // extent is the one-cycle 7x2 derivation (this fixture's
+        // `set_other_mode(2, 0)` is Copy, so 8x3 -- three rows).
+        let ranges = declared_render_target_ranges(fill_and_texrect.clone());
+        assert_eq!(
+            ranges.len(),
+            1 + TEXRECT_HEIGHT as usize,
+            "the fixture must declare the fill's range plus the texrect's {TEXRECT_HEIGHT}              rows, or the refusal below is vacuous -- got {ranges:?}"
+        );
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
         let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_texrect);
         let error = result.expect_err(
-            "fill + texrect must be refused -- a texrect declares no journal write, so there \
-             is no declared order to compose it onto the fill with",
+            "fill + texrect with no TMEM load must be refused -- there is no pending TMEM \
+             post-image for the texrect to sample",
         );
+        assert!(
+            error
+                .to_string()
+                .contains(&WgpuRawDpcExecutionError::TexrectWithoutTmemLoad.to_string()),
+            "the refusal must be the named TexrectWithoutTmemLoad variant, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused composition must leave no redeemable fill token behind"
+        );
+        assert!(
+            backend.color_targets().is_none(),
+            "the refusal must fire before the fill executor ever built the registry"
+        );
+    }
+
+    /// The fill + **raw triangle** refusal, unchanged: still
+    /// `MixedFillAndTrianglePacket`, and still for its original reason -- a
+    /// raw triangle declares no journal write access at all, so there is no
+    /// declared order to compose it onto the fill with.
+    ///
+    /// Kept as its own test after the texrect case split away from it,
+    /// because the two now have materially different causes and a single
+    /// test asserting one variant for both would hide a regression in
+    /// either.
+    #[test]
+    fn a_fill_composed_with_a_raw_triangle_is_still_refused_by_name() {
+        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+        let mut fill_and_triangle = whole_target_fill_words();
+        fill_and_triangle.extend(set_other_mode(0, 0));
+        fill_and_triangle.extend(set_combine(0, 0));
+        fill_and_triangle.extend(triangle_base_edge_words(7, 2, 0));
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
+        let error = result.expect_err("fill + raw triangle must still be refused");
         assert!(
             error.to_string().contains(&refused),
             "the refusal must be the named MixedFillAndTrianglePacket variant, got: {error}"
         );
         assert!(
             !backend.has_pending_fill_publication(),
-            "a refused fill+texrect composition must leave no redeemable fill token behind"
-        );
-        assert!(
-            backend.color_targets().is_none(),
-            "the refusal must fire before the fill executor ever built the registry"
+            "a refused fill+triangle composition must leave no redeemable fill token behind"
         );
     }
 }

@@ -22,6 +22,7 @@ use crate::{ColorImage, ImageFormat, PixelSize};
 mod fill;
 mod oracle;
 mod raster;
+mod texrect;
 mod triangle_pipeline;
 
 pub use fill::{
@@ -32,6 +33,9 @@ pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgb
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
+};
+pub use texrect::{
+    execute_texture_rectangle, TexrectAxis, TexrectDraw, TexrectExecutionError, TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 pub use triangle_pipeline::{
@@ -436,6 +440,7 @@ impl CandidateColorTarget {
                 rows: completed.rectangle.height,
                 generation: completed.generation,
             },
+            rectangle: completed.rectangle,
             device_bytes: completed.device_bytes,
         })
     }
@@ -528,6 +533,14 @@ impl InitializedRegionProof {
 pub struct InitializedCandidateColorTarget {
     candidate: CandidateColorTarget,
     proof: InitializedRegionProof,
+    /// The exact rectangle the admitted completion claimed.
+    ///
+    /// Retained alongside `proof`, which keeps only the row count:
+    /// composing a second write onto this generation's bytes needs to know
+    /// *where* the proven region is, not just how tall it is.
+    /// `InitializedRegionProof` is a published shape this file does not
+    /// widen for one caller.
+    rectangle: TargetRectangle,
     device_bytes: DeviceColorBytes,
 }
 
@@ -579,6 +592,12 @@ impl InitializedCandidateColorTarget {
 
     pub const fn initialized_region(&self) -> InitializedRegionProof {
         self.proof
+    }
+
+    /// The rectangle the admitted completion claimed -- what this
+    /// generation's bytes are proven to cover.
+    pub const fn initialized_rectangle(&self) -> TargetRectangle {
+        self.rectangle
     }
 
     pub const fn device_bytes(&self) -> &DeviceColorBytes {
