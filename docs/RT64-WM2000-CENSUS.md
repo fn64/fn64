@@ -15,6 +15,35 @@ assert").
 
 ---
 
+> **CORRECTION (2026-08-18, commit `8fbef998`) — §1's inference is REFUTED by
+> measurement. Both counts below are correct; the conclusion drawn from them is
+> not.**
+>
+> **WM2000 does hand the system a GBI display list.** Dumped from the real ROM
+> at `dispatch_gfx_task_chunk`: `task_type=1` (M_GFXTASK), `data_ptr=0x38ce30`,
+> `data_size=1008`, a well-formed **F3DEX2 list of 126 commands terminating in
+> `G_ENDDL`** — 60 `G_FILLRECT`, 13 `G_MOVEWORD`, 11 `G_DL`, 10 each
+> `G_MOVEMEM`/`G_SETPRIMCOLOR`/`G_SETENVCOLOR`, plus `SETOTHERMODE_H/L`,
+> `GEOMETRYMODE`, `SETCIMG`, `SETFILLCOLOR`, sync ops and `G_TEXTURE`.
+>
+> **Why `gbi_lane_commands` reads 0 anyway:** WM2000's live IMEM hashes to
+> `c50d2949c23baae24e706e8e1a5abf2dd315d00aff4cfdd567a03fe81807d1be`, which is
+> in no `GeometryUcodeCatalog`. `require_text` returns `RequiresLle`,
+> `process_task` returns `NeedsLle`, and **the GBI decoder is never entered.**
+> `fn64-abi` then runs the microcode on the RSP interpreter, whose RDP writes
+> return through XBUS as the 142,606 raw-DPC commands counted below. This also
+> resolves §8's open UNKNOWN about 106 tasks not reaching a top-level decode
+> entry.
+>
+> **A dumping trap worth recording:** the first dump used raw `from_be_bytes`
+> over the swizzled physical slice and looked like garbage. Reading through
+> `RdramView`'s logical lane mapping is essential.
+>
+> Consequence: "no display-list front end is needed for this title" was the
+> right *action* for the wrong *reason*. Both `ReferenceBackend` and
+> `Rt64Backend` gate on the ucode and defer to LLE; `WgpuBackend` now does the
+> same rather than erroring.
+
 ## 1. Headline: WM2000 is 100% raw-DPC, and 84% of it is already admitted
 
 Three findings, each of which corrects the standing scoping picture.
