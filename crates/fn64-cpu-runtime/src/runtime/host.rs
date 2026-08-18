@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// Number of bytes of rdram the N64 exposes (8 MiB with the Expansion Pak,
 /// which is what recompiled titles assume). The checked accessors bound every
 /// access against this.
@@ -125,6 +124,19 @@ impl HostFunctionCatalogV1 {
 pub type HostLookup = fn(u32) -> Option<RecompFunc>;
 /// Cooperative-yield hook for the N64Recomp `pause_self` self-loop rule.
 pub type HostPause = fn();
+/// Residency query for one registered overlay section index.
+///
+/// Bank-switched ROM overlays share a VRAM window: WM2000's `bank1_text` and
+/// `bank4_text` both link at `0x800E1B90`, and `bank2_text`/`bank3_text` both
+/// at `0x8011C900`. A flat `vram -> fn` table cannot express which bank is
+/// currently PI-swapped in, so the emitted dispatcher asks the host, whose
+/// `SectionRegistry` already tracks residency from the guest's own DMA.
+///
+/// `true` means that section index is currently resident. An unregistered or
+/// unknown index answers `false`; the dispatcher turns "no resident claimant"
+/// and "more than one resident claimant" alike into a named trap rather than
+/// choosing a bank.
+pub type HostSectionResident = fn(usize) -> bool;
 /// Optional raw word-MMIO read. `None` means the address is ordinary memory.
 pub type MmioRead = fn(u64) -> Option<u32>;
 /// Optional raw word-MMIO write. `true` means the device consumed the write.
@@ -260,6 +272,9 @@ thread_local! {
     static HOST_PAUSE: std::cell::Cell<Option<HostPause>> = const {
         std::cell::Cell::new(None)
     };
+    static HOST_SECTION_RESIDENT: std::cell::Cell<Option<HostSectionResident>> = const {
+        std::cell::Cell::new(None)
+    };
     static MMIO_READ: std::cell::Cell<Option<MmioRead>> = const {
         std::cell::Cell::new(None)
     };
@@ -306,6 +321,81 @@ pub fn set_host_lookup(resolver: Option<HostLookup>) -> Option<HostLookup> {
 /// Install the host's cooperative-yield adapter for translated self-loops.
 pub fn set_host_pause(pause: Option<HostPause>) -> Option<HostPause> {
     HOST_PAUSE.with(|slot| slot.replace(pause))
+}
+
+/// Install (or clear) the overlay-residency query the emitted dispatcher uses
+/// to disambiguate a VRAM claimed by more than one bank. Returns the previous
+/// query.
+pub fn set_host_section_resident(
+    resident: Option<HostSectionResident>,
+) -> Option<HostSectionResident> {
+    HOST_SECTION_RESIDENT.with(|slot| slot.replace(resident))
+}
+
+/// Whether the host reports overlay section `index` as currently resident.
+///
+/// With no query installed this is `false` for every index, so a host that
+/// never wired residency traps on a contested vram instead of guessing.
+#[inline]
+pub fn host_section_resident(index: usize) -> bool {
+    HOST_SECTION_RESIDENT.with(|slot| slot.get().is_some_and(|query| query(index)))
+}
+
+/// Resolve a VRAM claimed by two or more overlay banks to the body belonging
+/// to the bank the guest currently has resident.
+///
+/// `claimants` is `(section_index, name, func)` for every bank claiming this
+/// vram, in ascending section order. Exactly one resident claimant resolves;
+/// zero and two-or-more are both named traps. There is no "first claimant"
+/// default: running the wrong bank produces plausible-looking wrong behavior,
+/// which is the failure mode `AGENTS.md`'s loud-trap rule exists to prevent.
+pub fn resolve_banked_function(
+    vram: u32,
+    claimants: &[(usize, &'static str, RecompFunc)],
+) -> RecompFunc {
+    let mut resident = claimants
+        .iter()
+        .filter(|&&(section, _, _)| host_section_resident(section));
+    match (resident.next(), resident.next()) {
+        (Some(&(_, _, func)), None) => func,
+        (None, _) => {
+            let names = describe_claimants(claimants);
+            trap_unsupported(format!(
+                "lookup: vram {vram:#010X} is claimed by {} overlay banks and none is resident \
+                 ({names}) -- the guest has not PI-swapped in the bank that owns this address, \
+                 so no body can be dispatched. Per AGENTS.md this is a loud trap, never a \
+                 first-claimant guess: running the wrong bank would branch to a plausible \
+                 wrong body.",
+                claimants.len()
+            ))
+        }
+        (Some(_), Some(_)) => {
+            let names = describe_claimants(claimants);
+            let resident_names = describe_claimants(
+                &claimants
+                    .iter()
+                    .filter(|&&(section, _, _)| host_section_resident(section))
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
+            trap_unsupported(format!(
+                "lookup: vram {vram:#010X} is claimed by {} overlay banks and MORE THAN ONE is \
+                 resident (resident: {resident_names}; all claimants: {names}) -- two banks \
+                 cannot occupy the same VRAM window simultaneously, so the residency the host \
+                 reports is inconsistent with bank-switch semantics. Fix the residency source \
+                 rather than picking a claimant here.",
+                claimants.len()
+            ))
+        }
+    }
+}
+
+fn describe_claimants(claimants: &[(usize, &'static str, RecompFunc)]) -> String {
+    claimants
+        .iter()
+        .map(|(section, name, _)| format!("section {section} `{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Install the raw word-MMIO boundary used by emitted `lw`/`sw` operations.

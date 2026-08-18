@@ -16,7 +16,11 @@
 //!    every function in every section of the config. A vram claimed by more
 //!    than one distinct name is *ambiguous* and deliberately left unresolved
 //!    (emitted indirect), exactly like N64Recomp's multi-match `Ambiguous`
-//!    case — we never silently pick one.
+//!    case — we never silently pick one. Its claimants are retained with
+//!    their section indices so the emitted dispatcher can still reach them
+//!    (see `BANKED_LOOKUP_TABLE` in [`emit_lookup_dispatcher`]): overlay banks
+//!    genuinely share a VRAM window, and dropping those bodies entirely would
+//!    make them undispatchable rather than merely un-direct-callable.
 //! 2. As a [`CallResolver`], it turns a `JAL`/`J` target vram into either a
 //!    [`CallTarget::Direct`] (unique symbol) or [`CallTarget::Indirect`]
 //!    (unknown or ambiguous), which the emitter renders as a direct
@@ -49,6 +53,17 @@ pub struct SymbolTable {
     /// Vrams seen more than once with conflicting names; kept so a direct call
     /// is never emitted for them (they fall through to indirect lookup).
     ambiguous: std::collections::HashSet<u32>,
+    /// Every claimant of an ambiguous vram, keyed by vram: `(section, name)`
+    /// for each distinct body that links at that address.
+    ///
+    /// Bank-switched overlays genuinely share a VRAM window (WM2000's
+    /// `bank1_text` and `bank4_text` both link at `0x800E1B90`), so dropping
+    /// the collided vrams from `by_vram` is right for *direct* calls but
+    /// would make the bodies undispatchable if the information were also
+    /// discarded here. Retaining the claimants is what lets
+    /// [`emit_lookup_dispatcher`] resolve them at runtime against the bank
+    /// the guest actually has resident.
+    claimants: HashMap<u32, Vec<(usize, String)>>,
 }
 
 impl SymbolTable {
@@ -62,10 +77,44 @@ impl SymbolTable {
         I: IntoIterator<Item = (S, u32)>,
         S: Into<String>,
     {
+        // Section 0 for every entry: a caller with no section information
+        // cannot describe a bank collision, so every claimant is attributed to
+        // one nominal section and bank-aware dispatch is unavailable. Callers
+        // that know their sections use `from_section_entries`.
+        SymbolTable::from_section_entries(
+            entries
+                .into_iter()
+                .map(|(name, vram)| (0usize, name.into(), vram)),
+        )
+    }
+
+    /// Build a symbol table from `(section_index, name, vram)` entries.
+    ///
+    /// Identical to [`SymbolTable::from_entries`] for the unique and
+    /// same-name-twice cases. The difference is what happens on a genuine
+    /// collision: the vram still leaves `by_vram` (no direct call is ever
+    /// emitted for it), but every distinct claimant is retained with the
+    /// section that owns it, so the runtime dispatcher can resolve the
+    /// address against the bank the guest currently has PI-swapped in.
+    ///
+    /// `section_index` must be the section's registration index -- the same
+    /// numbering `RECOMPILED_SECTION_GEOMETRY` is emitted in and that the
+    /// host's `SectionRegistry` assigns -- because that index is the only
+    /// thing tying an emitted claimant back to a residency bit.
+    pub fn from_section_entries<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, S, u32)>,
+        S: Into<String>,
+    {
         let mut by_vram: HashMap<u32, String> = HashMap::new();
         let mut ambiguous = std::collections::HashSet::new();
-        for (name, vram) in entries {
+        let mut claimants: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
+        for (section, name, vram) in entries {
             let name = name.into();
+            let seen = claimants.entry(vram).or_default();
+            if !seen.iter().any(|(s, n)| *s == section && *n == name) {
+                seen.push((section, name.clone()));
+            }
             match by_vram.get(&vram) {
                 Some(existing) if *existing == name => {}
                 Some(_) => {
@@ -79,18 +128,58 @@ impl SymbolTable {
                 }
             }
         }
-        SymbolTable { by_vram, ambiguous }
+        // Only collisions need claimant records; uniquely-owned vrams resolve
+        // through the flat table and would only bloat the emitted source.
+        claimants.retain(|vram, _| ambiguous.contains(vram));
+        for entries in claimants.values_mut() {
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
+        SymbolTable {
+            by_vram,
+            ambiguous,
+            claimants,
+        }
+    }
+
+    /// Every `(vram, claimants)` pair for a vram claimed by more than one
+    /// differently-named body, in ascending vram order, each claimant list in
+    /// ascending section order.
+    ///
+    /// These are exactly the bodies a flat `vram -> fn` table cannot express.
+    /// Reported by the gap report and emitted as the banked dispatch table.
+    pub fn ambiguous_claimants(&self) -> Vec<(u32, Vec<(usize, &str)>)> {
+        let mut rows = self
+            .claimants
+            .iter()
+            .map(|(&vram, entries)| {
+                (
+                    vram,
+                    entries
+                        .iter()
+                        .map(|(section, name)| (*section, name.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|(vram, _)| *vram);
+        rows
+    }
+
+    /// Number of distinct bodies that are only reachable through bank-aware
+    /// dispatch (the sum of every ambiguous vram's claimant count).
+    pub fn banked_body_count(&self) -> usize {
+        self.claimants.values().map(Vec::len).sum()
     }
 
     /// Build from a [`fn64_recomp::RecompConfig`]: every function in every
     /// section contributes its `(name, vram)` pair.
     pub fn from_config(cfg: &fn64_recomp::RecompConfig) -> Self {
-        let entries = cfg
-            .sections
-            .iter()
-            .flat_map(|s| s.functions.iter())
-            .map(|f| (f.name.clone(), f.vram));
-        SymbolTable::from_entries(entries)
+        let entries = cfg.sections.iter().enumerate().flat_map(|(index, s)| {
+            s.functions
+                .iter()
+                .map(move |f| (index, f.name.clone(), f.vram))
+        });
+        SymbolTable::from_section_entries(entries)
     }
 
     /// The name owning `vram`, if it is a unique function entry.
@@ -156,6 +245,13 @@ pub struct ModuleFunc<'a> {
 /// those vrams from `symbols`, which makes both direct `JAL`s and computed
 /// `JALR`s converge on the same host seam instead of a recompiled panic body.
 ///
+/// A vram claimed by two or more overlay banks cannot live in the flat table,
+/// so it is emitted into a second sorted table, `BANKED_LOOKUP_TABLE`, that
+/// keeps every claimant with the section index owning it.
+/// `fn64_cpu_runtime::resolve_banked_function` resolves it against the bank
+/// the guest actually has resident; zero or multiple resident claimants are
+/// both named traps, never a first-claimant default.
+///
 /// Unknown vrams trap with the exact address. There is no default function,
 /// pointer cast, `transmute`, or `unsafe` block.
 pub fn emit_lookup_dispatcher(symbols: &SymbolTable) -> String {
@@ -166,13 +262,38 @@ pub fn emit_lookup_dispatcher(symbols: &SymbolTable) -> String {
         out.push_str(&format!("    ({vram:#010X}, {name} as RecompFunc),\n"));
     }
     out.push_str("];\n\n");
+
+    // Bank-switched overlays share a VRAM window, so these vrams cannot live
+    // in the flat table: two differently-named bodies claim one address and
+    // only the resident bank's is correct. Each row carries every claimant
+    // with the section index that owns it; `resolve_banked_function` picks the
+    // resident one and traps when residency does not name exactly one.
+    let banked = symbols.ambiguous_claimants();
+    out.push_str(
+        "// Vrams claimed by more than one overlay bank: resolved against guest residency.\n",
+    );
+    out.push_str(
+        "static BANKED_LOOKUP_TABLE: &[(u32, &[(usize, &'static str, RecompFunc)])] = &[\n",
+    );
+    for (vram, claimants) in &banked {
+        out.push_str(&format!("    ({vram:#010X}, &["));
+        for (section, name) in claimants {
+            out.push_str(&format!("({section}, \"{name}\", {name} as RecompFunc), "));
+        }
+        out.push_str("]),\n");
+    }
+    out.push_str("];\n\n");
+
     out.push_str("pub fn lookup(vram: u32) -> RecompFunc {\n");
     out.push_str("    if let Some(func) = resolve_host_function(vram) {\n");
     out.push_str("        return func;\n");
     out.push_str("    }\n");
     out.push_str("    match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {\n");
     out.push_str("        Ok(index) => LOOKUP_TABLE[index].1,\n");
-    out.push_str("        Err(_) => fn64_cpu_runtime::trap_unsupported(format!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\")),\n");
+    out.push_str("        Err(_) => match BANKED_LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {\n");
+    out.push_str("            Ok(index) => fn64_cpu_runtime::resolve_banked_function(vram, BANKED_LOOKUP_TABLE[index].1),\n");
+    out.push_str("            Err(_) => fn64_cpu_runtime::trap_unsupported(format!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\")),\n");
+    out.push_str("        },\n");
     out.push_str("    }\n");
     out.push_str("}\n");
     out
@@ -222,6 +343,66 @@ mod tests {
         assert_eq!(t.name_of(0x8000_0100), None);
         assert_eq!(t.resolve(0x8000_0100), CallTarget::Indirect);
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn collided_vram_keeps_every_claimant_with_its_section() {
+        // Two banks at one vram (WM2000's 0x800E1B90 shape), plus an
+        // uncontested address to prove only collisions are retained.
+        let t = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90_bank4_text", 0x800E_1B90u32),
+            (1usize, "resident_only", 0x8000_0450u32),
+        ]);
+        assert!(t.is_ambiguous(0x800E_1B90));
+        assert_eq!(t.name_of(0x800E_1B90), None);
+        assert_eq!(
+            t.ambiguous_claimants(),
+            vec![(
+                0x800E_1B90,
+                vec![(2, "func_800E1B90"), (5, "func_800E1B90_bank4_text"),]
+            )]
+        );
+        assert_eq!(t.banked_body_count(), 2);
+        // Uncontested vrams stay in the flat table and out of the claimants.
+        assert_eq!(t.name_of(0x8000_0450), Some("resident_only"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn same_name_in_two_sections_is_not_a_collision() {
+        // A name reported twice for one vram is idempotent regardless of the
+        // section it came from: that is one body, not two banks.
+        let t = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90", 0x800E_1B90u32),
+        ]);
+        assert!(!t.is_ambiguous(0x800E_1B90));
+        assert_eq!(t.name_of(0x800E_1B90), Some("func_800E1B90"));
+        assert!(t.ambiguous_claimants().is_empty());
+        assert_eq!(t.banked_body_count(), 0);
+    }
+
+    #[test]
+    fn banked_table_is_sorted_and_binary_searchable() {
+        // The emitted dispatcher binary-searches BANKED_LOOKUP_TABLE, so its
+        // rows must be vram-ascending and its claimants section-ascending —
+        // both independent of the HashMap iteration order they came from.
+        let t = SymbolTable::from_section_entries([
+            (5usize, "high_b", 0x8011_C900u32),
+            (3usize, "high_a", 0x8011_C900u32),
+            (5usize, "low_b", 0x800E_1B90u32),
+            (2usize, "low_a", 0x800E_1B90u32),
+        ]);
+        let rows = t.ambiguous_claimants();
+        assert_eq!(
+            rows,
+            vec![
+                (0x800E_1B90, vec![(2, "low_a"), (5, "low_b")]),
+                (0x8011_C900, vec![(3, "high_a"), (5, "high_b")]),
+            ]
+        );
+        assert_eq!(t.banked_body_count(), 4);
     }
 
     #[test]
