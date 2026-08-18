@@ -325,6 +325,13 @@ the assertion did not exist then.
 now bounds the window at 383 VI fields. Fixing it would extend the census
 into gameplay, which is the one thing this doc cannot speak to.
 
+> **Superseded.** `0x1CC` is not an MMIO read and names no register: it is a
+> KUSEG near-null address reached through a frame pointer corrupted by a lost
+> shared-epilogue fall-through. Diagnosis, fix and the re-measured window
+> (383 → 1,056 VI fields, 219 → 2,219 decode entries) are in
+> [`RT64-WM2000-0X1CC-DIAGNOSIS.md`](RT64-WM2000-0X1CC-DIAGNOSIS.md). The
+> counts in this doc remain valid for the shorter window they describe.
+
 ---
 
 ## 7. Ranked: what to implement next
