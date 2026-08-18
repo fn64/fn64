@@ -642,6 +642,21 @@ impl SectionRegistry {
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
+
+    /// Static link base of a registered section, or `None` if `index` names no
+    /// registered section. Read by section-local function registration, which
+    /// must turn a link VRAM into a section-relative offset against the very
+    /// geometry the generated table registered, never a second transcription.
+    pub fn section_ram_addr(&self, index: SectionIndex) -> Option<u32> {
+        self.sections.get(index).map(|section| section.ram_addr)
+    }
+
+    /// Byte length of a registered section, or `None` if `index` names no
+    /// registered section. Paired with [`Self::section_ram_addr`] to bound a
+    /// section-local function's link VRAM against its own section.
+    pub fn section_size(&self, index: SectionIndex) -> Option<u32> {
+        self.sections.get(index).map(|section| section.size)
+    }
 }
 
 #[cfg(test)]

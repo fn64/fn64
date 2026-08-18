@@ -331,6 +331,14 @@ into gameplay, which is the one thing this doc cannot speak to.
 > (383 → 1,056 VI fields, 219 → 2,219 decode entries) are in
 > [`RT64-WM2000-0X1CC-DIAGNOSIS.md`](RT64-WM2000-0X1CC-DIAGNOSIS.md). The
 > counts in this doc remain valid for the shorter window they describe.
+>
+> **Superseded again.** That doc's successor named overlay-bank swapping as the
+> next blocker; it is not. Bank swapping already follows the guest's own DMA,
+> and the abort was N64Recomp's 40 section-local (`static_<section>_<vram>`)
+> bodies, which carry the entry observer but appear in no `FuncEntry` table.
+> The window is now 4,454 VI fields / 5,792 decode entries — still attract
+> mode, not gameplay — and the wall has moved into the reference renderer. See
+> [`RT64-WM2000-SECTION-LOCAL.md`](RT64-WM2000-SECTION-LOCAL.md).
 
 ---
 
