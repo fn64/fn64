@@ -1105,8 +1105,8 @@ mod tests {
             let expected =
                 decode_direct_texel(format, RawTexel::try_new(size, raw).unwrap()).unwrap();
             assert_eq!(actual.texel(), expected);
-            assert_eq!(actual.snapshot().state(), state.identity());
-            assert_eq!(actual.snapshot().generation(), 2);
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), 2);
         }
 
         let rgba32 = read_committed_texel(
@@ -1182,8 +1182,8 @@ mod tests {
         assert_eq!(even.texel().rgba8888(), [0x0c; 4]);
         assert_eq!(odd.texel().rgba8888(), [0x08; 4]);
         assert_eq!(even.snapshot(), odd.snapshot());
-        assert_eq!(even.snapshot().state(), state.identity());
-        assert_eq!(even.snapshot().generation(), before.generation);
+        assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
 
         let even_cell = gather_committed_texture_cell(
             &state,
@@ -1286,8 +1286,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(actual.texel().rgba8888(), expected);
-            assert_eq!(actual.snapshot().state(), state.identity());
-            assert_eq!(actual.snapshot().generation(), before.generation);
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
 
         let rgba32 = sample_committed_point(
@@ -1299,8 +1299,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rgba32.texel().rgba8888(), [32, 33, 34, 35]);
-        assert_eq!(rgba32.snapshot().state(), state.identity());
-        assert_eq!(rgba32.snapshot().generation(), before.generation);
+        assert_eq!(rgba32.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(rgba32.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         assert_eq!(observe_durable(&state), before);
     }
 
@@ -1328,8 +1328,8 @@ mod tests {
             ]
         );
         for texel in cell.texels() {
-            assert_eq!(texel.snapshot().state(), rgba16.identity());
-            assert_eq!(texel.snapshot().generation(), before.generation);
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), rgba16.identity());
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
         assert_eq!(observe_durable(&rgba16), before);
 
@@ -1358,8 +1358,8 @@ mod tests {
             ]
         );
         for texel in cell.texels() {
-            assert_eq!(texel.snapshot().state(), rgba32.identity());
-            assert_eq!(texel.snapshot().generation(), before.generation);
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), rgba32.identity());
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
         assert_eq!(observe_durable(&rgba32), before);
     }
@@ -1563,8 +1563,8 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(actual.texel(), expected);
-                assert_eq!(actual.snapshot().state(), state.identity());
-                assert_eq!(actual.snapshot().generation(), 1);
+                assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+                assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), 1);
             }
         }
 
@@ -1606,8 +1606,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ci4.texel().rgba8888(), [0, 0, 0, 255]);
-        assert_eq!(ci4.snapshot().state(), state.identity());
-        assert_eq!(ci4.snapshot().generation(), before.generation);
+        assert_eq!(ci4.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(ci4.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
 
         let ci8 = sample_committed_point(
             &state,
