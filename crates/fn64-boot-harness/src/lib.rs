@@ -50,20 +50,16 @@ pub use generated_runner_build::{
     parse_generated_runner_host_abi_runtime_report_v1, parse_generated_runner_pi_runtime_report_v1,
     parse_generated_runner_rdp_renderer_runtime_report_v1,
     parse_generated_runner_rsp_runtime_report_v1, parse_generated_runner_si_runtime_report_v1,
-    parse_generated_runner_sp_runtime_report_v1,
-    run_generated_runner_bootstrap_runtime_series_v1,
-    run_generated_runner_cpu_runtime_series_v1,
-    run_generated_runner_host_abi_runtime_series_v1,
-    run_generated_runner_pi_runtime_series_v1,
-    run_generated_runner_rdp_renderer_runtime_series_v1,
-    run_generated_runner_rsp_runtime_series_v1,
-    run_generated_runner_si_runtime_series_v1,
+    parse_generated_runner_sp_runtime_report_v1, run_generated_runner_bootstrap_runtime_series_v1,
+    run_generated_runner_cpu_runtime_series_v1, run_generated_runner_host_abi_runtime_series_v1,
+    run_generated_runner_pi_runtime_series_v1, run_generated_runner_rdp_renderer_runtime_series_v1,
+    run_generated_runner_rsp_runtime_series_v1, run_generated_runner_si_runtime_series_v1,
     run_generated_runner_sp_runtime_series_v1, BootstrapAttributedWriteV1,
     BootstrapMutationBatchV1, BootstrapWriterChannelV1, BootstrapWriterRuntimePrerequisiteV1,
     BootstrapWriterWatchedRangeV1, CpuWriterRuntimePrerequisiteV1, CpuWriterWatchedRangeV1,
-    GeneratedRunnerAdapterRoleV1, GeneratedRunnerBootstrapRuntimeReportV1,
+    ExecutableImageGroupV1, GeneratedRunnerAdapterRoleV1, GeneratedRunnerBootstrapRuntimeReportV1,
     GeneratedRunnerBootstrapRuntimeSeriesEvidenceV1, GeneratedRunnerBuildError,
-    GeneratedRunnerBuildEvidenceV1, GeneratedRunnerBuildIdentityV1,
+    GeneratedRunnerBuildEvidenceV1, GeneratedRunnerBuildIdentityV1, GeneratedRunnerBuildInputsV1,
     GeneratedRunnerCpuRuntimeReportV1, GeneratedRunnerCpuRuntimeSeriesEvidenceV1,
     GeneratedRunnerHostAbiRuntimeReportV1, GeneratedRunnerHostAbiRuntimeSeriesEvidenceV1,
     GeneratedRunnerLinkedIdentityV1, GeneratedRunnerPiRuntimeReportV1,
@@ -82,7 +78,6 @@ pub use generated_runner_build::{
     VerifiedGeneratedRunnerPiRuntimeSeriesV1, VerifiedGeneratedRunnerRdpRendererRuntimeSeriesV1,
     VerifiedGeneratedRunnerRspRuntimeSeriesV1, VerifiedGeneratedRunnerSiRuntimeSeriesV1,
     VerifiedGeneratedRunnerSpRuntimeSeriesV1, VerifiedGeneratedRunnerWriterAuditBundleV1,
-    ExecutableImageGroupV1, GeneratedRunnerBuildInputsV1,
     GENERATED_RUNNER_BOOTSTRAP_RUNTIME_ARGUMENT_V1,
     GENERATED_RUNNER_BOOTSTRAP_RUNTIME_NONCE_ENV_V1,
     GENERATED_RUNNER_BOOTSTRAP_RUNTIME_REPORT_PREFIX_V1,
@@ -1465,6 +1460,7 @@ pub fn seed_resident_sections(rdram: &mut [u8], rom: &[u8], sections: &[(u32, u3
 extern "C" {
     fn fn64_bridge_register_all_sections();
     fn fn64_bridge_num_sections() -> usize;
+    fn fn64_bridge_register_section_local_funcs();
     fn recomp_entrypoint(rdram: *mut u8, ctx: *mut fn64_abi::RecompContext);
 }
 
@@ -1486,6 +1482,7 @@ pub struct RegisteredSection {
 pub struct SectionRegistration {
     reported_count: usize,
     sections: Vec<RegisteredSection>,
+    section_local_count: usize,
 }
 
 #[cfg(feature = "c-bridge")]
@@ -1498,6 +1495,12 @@ impl SectionRegistration {
     /// Registered sections, ordered by their generated table index.
     pub fn sections(&self) -> &[RegisteredSection] {
         &self.sections
+    }
+
+    /// Section-local (`static_<section>_<vram>`) bodies registered for
+    /// execution evidence. Zero for a corpus N64Recomp emitted without any.
+    pub fn section_local_count(&self) -> usize {
+        self.section_local_count
     }
 
     /// Runtime registry index corresponding to a generated table index.
@@ -1550,6 +1553,32 @@ extern "C" fn fn64_register_func(
     });
 }
 
+/// Count of section-local registrations received from the generated unit.
+#[cfg(feature = "c-bridge")]
+thread_local! {
+    static SECTION_LOCAL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Receive one section-local (`static_<section>_<vram>`) function from the
+/// build-generated registration unit.
+///
+/// These bodies carry the execution observer but appear in no `FuncEntry`
+/// table, so this is the only registration they get. See
+/// `fn64_abi::register_section_local_function` for why they are registered for
+/// execution evidence only and never published to `get_function`.
+#[cfg(feature = "c-bridge")]
+#[no_mangle]
+extern "C" fn fn64_register_section_local_func(
+    section_index: u32,
+    link_vram: u32,
+    func: fn64_abi::RecompFunc,
+) {
+    // SAFETY: the pointer names a file-scope generated `RECOMP_FUNC`
+    // definition, valid for the process lifetime.
+    unsafe { fn64_abi::register_section_local_function(section_index, link_vram, func) };
+    SECTION_LOCAL_COUNT.with(|count| count.set(count.get() + 1));
+}
+
 /// Walk the linked generated section table and register every section with
 /// `fn64-abi` in generated-index order.
 ///
@@ -1589,9 +1618,18 @@ pub fn register_linked_sections() -> SectionRegistration {
             .collect()
     });
 
+    // Section-local bodies are registered only AFTER their owning sections, so
+    // the link-vram-to-offset conversion can read the registered geometry.
+    SECTION_LOCAL_COUNT.with(|count| count.set(0));
+    // SAFETY: defined by the build-generated registration unit compiled
+    // alongside the bridge; it invokes the callback above synchronously.
+    unsafe { fn64_bridge_register_section_local_funcs() };
+    let section_local_count = SECTION_LOCAL_COUNT.with(|count| count.get());
+
     SectionRegistration {
         reported_count,
         sections,
+        section_local_count,
     }
 }
 
