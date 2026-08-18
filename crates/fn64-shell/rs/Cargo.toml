@@ -1,7 +1,7 @@
 # The rs-lane configuration of fn64-shell: the SAME src/main.rs and build.rs,
-# but the game arrives as the emitted `oot-recompiled` typed-Rust crate
+# but the game arrives as the emitted `game-recompiled` typed-Rust crate
 # instead of compiled RecompiledFuncs C. A standalone workspace (like
-# examples/oot-boot/rs) because `oot-recompiled` is out-of-tree game-derived
+# a title's own rs manifest) because `game-recompiled` is out-of-tree game-derived
 # material that must never enter the main workspace graph.
 #
 # Build (the recompiled symlink is refreshed from RECOMP_RS_DIR first, same
@@ -50,4 +50,9 @@ fn64-render-rt64 = { path = "../../fn64-render-rt64" }
 fn64-audio = { path = "../../fn64-audio" }
 # Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo
 # `path` cannot interpolate env vars) -- same bridge as oot-boot/rs.
-oot-recompiled = { path = "recompiled" }
+# `package = "oot-recompiled"` because recompile_rom hardcodes that crate name
+# in every manifest it emits (crates/fn64-cpu-runtime-codegen/src/bin/
+# recompile_rom.rs), regardless of which ROM it consumed -- the name is NOT
+# evidence about which title is linked. Cargo's dependency rename gives the
+# shell a title-neutral local name without editing the emitted manifest.
+game-recompiled = { path = "recompiled", package = "oot-recompiled" }
