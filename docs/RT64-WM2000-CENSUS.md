@@ -44,6 +44,23 @@ assert").
 > `Rt64Backend` gate on the ucode and defer to LLE; `WgpuBackend` now does the
 > same rather than erroring.
 
+> **⚠ WINDOW WARNING — read before quoting any number in this document.**
+> Every count here describes a **219-decode-entry window** that has since been
+> superseded **twice** (383 → 1,056 → 4,454 VI fields; 219 → 2,219 → 5,792
+> entries; see the supersession notes near the end). **The counts are correct
+> for their window. They are not statements about WM2000.**
+>
+> **This has already caused one real defect.** A `TexrectWithoutTmemLoad`
+> refusal was added to `fn64-render-wgpu` on the strength of "0 of 219 decode
+> entries carry a texrect without a load in the same entry". The count was
+> right; the window was not. The real ROM's **packet 4 carries 46 texrects and
+> 0 loads**, and the refusal aborted the run. It also caused two
+> `host-gpu-tests` fixtures to be misdiagnosed as stale when they had been
+> right all along. Both were fixed in `124debdd`.
+>
+> **Rule:** an absence measured in this window is *"not seen in boot/logo/
+> attract"*, never *"does not occur"*. Do not turn one into a refusal.
+
 ## 1. Headline: WM2000 is 100% raw-DPC, and 84% of it is already admitted
 
 Three findings, each of which corrects the standing scoping picture.
