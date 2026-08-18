@@ -76,6 +76,107 @@ pub(crate) fn commit_rsp_memory_state(
     });
 }
 
+/// One hardware command stream assembled from consecutive DPC submissions.
+///
+/// `start..end` is the source range the stream was fetched from, and its
+/// length always equals the payload's, for both sources. Downstream capture
+/// (`OwnedRawDpcSubmission::from_xbus_payload`,
+/// `OwnedRawDpcSubmission::from_rdram_words`) rejects any run where it does
+/// not.
+pub(crate) struct CoalescedDpRun {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) xbus: bool,
+    pub(crate) words: Vec<u32>,
+}
+
+/// Group consecutive DPC submissions into hardware command streams.
+///
+/// Consecutive END extensions against a single unmoved START are one stream:
+/// F3DEX xbus 2.08 extends a run 8 bytes per END write, so a 16-byte command
+/// straddles two submissions and per-submission decode would trap on a
+/// truncation hardware simply stalls through (`7ef65d54`).
+///
+/// **Adjacency governs both sources, and for the same reason.** A submission
+/// continues the open run only when its `start` equals the run's current
+/// `end`; anything else is a new START and therefore a new stream. XBUS was
+/// briefly exempted from that test on the theory that a DMEM-sourced range
+/// means something weaker than a physical one. It does not: the producer
+/// (`fn64_audio::rsp::runtime`'s CP0 `DP_END` handler) derives XBUS bytes from
+/// exactly `start & 0x0fff .. end & 0x0fff`, so an XBUS range names its bytes
+/// as precisely as an RDRAM range names its words. Measured on WM2000's first
+/// graphics task: 365 XBUS submissions form four address-contiguous runs over
+/// a DMEM ring at `[0x0ba8, 0x0f20)`, wrapping to the ring base three times.
+/// Coalescing across a wrap concatenated all 3400 bytes while `start..end`
+/// still described only 752 of them, and the capture correctly refused it
+/// (`XbusPayloadLength { expected: 752, actual: 3400 }`). Each of the four runs
+/// decodes cleanly on its own against the RDP width table
+/// (`fn64_render_ir`'s `raw_rdp_command_width`), so the ring wrap is a real
+/// stream boundary and not a straddle the coalescer must bridge.
+pub(crate) fn coalesce_dp_submissions(
+    submissions: Vec<fn64_audio::rsp::runtime::RspDpSubmission>,
+) -> Vec<CoalescedDpRun> {
+    let mut runs = Vec::new();
+    let mut pending = submissions.into_iter().peekable();
+    while let Some(first) = pending.next() {
+        let (start, mut end, source) = first.into_parts();
+        let (xbus, words) = match source {
+            RspDpCommandSource::XbusBytes(mut stream) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| submission.is_xbus() && submission.start == end)
+                {
+                    let next = pending.next().expect("peeked XBUS submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::XbusBytes(bytes) = next_source else {
+                        unreachable!("XBUS predicate and owned command source diverged")
+                    };
+                    stream.extend_from_slice(&bytes);
+                    end = next_end;
+                }
+                let words = stream
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
+                    .collect::<Vec<_>>();
+                (true, words)
+            }
+            RspDpCommandSource::RdramWords(mut words) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
+                {
+                    let next = pending.next().expect("peeked RDRAM submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::RdramWords(next_words) = next_source else {
+                        unreachable!("RDRAM predicate and owned command source diverged")
+                    };
+                    words.extend(next_words);
+                    end = next_end;
+                }
+                (false, words)
+            }
+        };
+        // The invariant every downstream capture depends on, checked at the
+        // one site that can violate it rather than at the four that observe
+        // it. A coalescing bug shows up here, naming the run, instead of as
+        // a length mismatch several layers away.
+        assert_eq!(
+            u64::from(end).checked_sub(u64::from(start)),
+            Some(words.len() as u64 * 4),
+            "coalesced DPC run [{start:#010x}, {end:#010x}) (xbus={xbus}) does not describe its \
+             own {} command bytes",
+            words.len() * 4
+        );
+        runs.push(CoalescedDpRun {
+            start,
+            end,
+            xbus,
+            words,
+        });
+    }
+    runs
+}
+
 /// Run the persistent RSP state from its admitted PC through BREAK, resolving
 /// every IMEM overlay generation and forwarding DPC work to the renderer.
 /// This is the universal clean-room path for custom/unknown task types.
@@ -290,48 +391,13 @@ pub(crate) unsafe fn dispatch_lle_task(
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
     let trace_limit = rsp_trace_dpc_words_limit();
-    // Consecutive END extensions are one hardware command stream. A 16-byte
-    // command can straddle two 8-byte END writes, so decoding each submission
-    // separately creates a false truncated-command trap.
-    let mut pending = dp_submissions.into_iter().peekable();
-    while let Some(first) = pending.next() {
-        let (start, mut end, source) = first.into_parts();
-        let (xbus, words) = match source {
-            RspDpCommandSource::XbusBytes(mut stream) => {
-                while pending
-                    .peek()
-                    .is_some_and(|submission| submission.is_xbus())
-                {
-                    let next = pending.next().expect("peeked XBUS submission disappeared");
-                    let (_, next_end, next_source) = next.into_parts();
-                    let RspDpCommandSource::XbusBytes(bytes) = next_source else {
-                        unreachable!("XBUS predicate and owned command source diverged")
-                    };
-                    stream.extend_from_slice(&bytes);
-                    end = next_end;
-                }
-                let words = stream
-                    .chunks_exact(4)
-                    .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
-                    .collect::<Vec<_>>();
-                (true, words)
-            }
-            RspDpCommandSource::RdramWords(mut words) => {
-                while pending
-                    .peek()
-                    .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
-                {
-                    let next = pending.next().expect("peeked RDRAM submission disappeared");
-                    let (_, next_end, next_source) = next.into_parts();
-                    let RspDpCommandSource::RdramWords(next_words) = next_source else {
-                        unreachable!("RDRAM predicate and owned command source diverged")
-                    };
-                    words.extend(next_words);
-                    end = next_end;
-                }
-                (false, words)
-            }
-        };
+    for CoalescedDpRun {
+        start,
+        end,
+        xbus,
+        words,
+    } in coalesce_dp_submissions(dp_submissions)
+    {
         if let Some(limit) = trace_limit {
             let traced = &words[..words.len().min(limit)];
             eprintln!(
