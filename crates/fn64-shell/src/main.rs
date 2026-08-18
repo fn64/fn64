@@ -509,6 +509,12 @@ mod game {
                 fn64_cpu_runtime::set_host_lookup(Some(
                     crate::host_lookup::recompiled_or_host_lookup,
                 ));
+                // Overlay banks share a VRAM window, so the emitted
+                // dispatcher cannot resolve a collided vram from its table
+                // alone. This is the seam it asks; the registry behind it is
+                // already maintained from the guest's own PI DMA
+                // (`fn64_abi::note_dma_overlay_load`).
+                fn64_cpu_runtime::set_host_section_resident(Some(fn64_abi::is_section_loaded));
                 println!(
                     "[fn64-shell] FN64_RECOMP=rs: linked game-recompiled crate + host-first \
                      recompiled adapters active"
