@@ -4082,3 +4082,421 @@ fn a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram() {
          stale bytes rather than this packet's own load: got {distinct:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// A REAL WM2000 packet, replayed through `WgpuBackend`.
+//
+// Everything above this line is a synthetic fixture: hand-assembled word
+// pairs chosen to exercise one seam. This section replays command words
+// **WWF WrestleMania 2000 (NWXE) actually issued**, captured by
+// `fn64_render_reference::gbi::census::packet` (armed by
+// `FN64_GBI_PACKET_DUMP`) from a real recompiled boot, and fed through the
+// same `dispatch_dpc_submission` producer entry the synthetic tests use.
+//
+// The packet is NOT committed. `README.md`'s "no game content ships in this
+// repo" rule covers recompiled-game output, and a game's own RDP command
+// words are exactly that. The fixture is read from an out-of-tree path named
+// by `FN64_WM2000_PACKET_TSV`; with the variable unset the test reports what
+// it did not run and returns, and with it set to an unreadable or malformed
+// path it fails by name rather than skipping quietly.
+// ---------------------------------------------------------------------
+
+/// The out-of-tree packet-dump TSV this replay reads.
+///
+/// Produced by `examples/wm2000-census` with `FN64_GBI_PACKET_DUMP=1`; see
+/// `docs/RT64-WM2000-REPLAY.md` for the exact command.
+const WM2000_PACKET_ENV: &str = "FN64_WM2000_PACKET_TSV";
+
+/// Which decode entry to replay out of the dump. Unset means entry 0 --
+/// WM2000's frame 0, the census-measured triangle-free 366-command shape.
+const WM2000_PACKET_ENTRY_ENV: &str = "FN64_WM2000_PACKET_ENTRY";
+
+/// One decode entry's command words, reconstructed from a packet dump.
+struct CapturedPacket {
+    entry: u64,
+    /// The dumped rows' word pairs, concatenated in dispatch order. The
+    /// dump records a row per 8 wire bytes (a variable-width `G_TEXRECT`
+    /// contributes two rows), so this is the wire word stream itself.
+    words: Vec<u32>,
+    /// The RDRAM address the first word was read from in the captured run.
+    /// Not where the replay puts it -- it is the evidence that the rows
+    /// reconstruct a contiguous stream, checked below.
+    source_pc: usize,
+}
+
+/// Parse a packet-dump TSV and reconstruct one decode entry's word stream.
+///
+/// Every failure is named. A dump that parses to a plausible-but-wrong word
+/// stream is the one outcome this must not produce, because the whole value
+/// of the replay is that the words are real, so the reconstruction is
+/// checked for contiguity rather than assumed: consecutive rows must be
+/// exactly 8 RDRAM bytes apart, which is what makes the concatenated pairs
+/// the wire stream rather than a lossy sample of it.
+fn parse_packet_dump(text: &str, entry: u64) -> CapturedPacket {
+    let mut rows: Vec<(usize, u32, u32)> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("entry\t") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            5,
+            "{WM2000_PACKET_ENV} line {} has {} tab-separated fields, expected 5 \
+             (entry/lane/pc/w0/w1)",
+            index + 1,
+            fields.len()
+        );
+        let parse_hex = |field: &str, name: &str| -> u64 {
+            let stripped = field.strip_prefix("0x").unwrap_or_else(|| {
+                panic!(
+                    "{WM2000_PACKET_ENV} line {} field {name} is {field:?}, expected a 0x-prefixed \
+                     hex literal",
+                    index + 1
+                )
+            });
+            u64::from_str_radix(stripped, 16).unwrap_or_else(|e| {
+                panic!(
+                    "{WM2000_PACKET_ENV} line {} field {name} is {field:?}: {e}",
+                    index + 1
+                )
+            })
+        };
+        let row_entry: u64 = fields[0].parse().unwrap_or_else(|e| {
+            panic!(
+                "{WM2000_PACKET_ENV} line {} entry field is {:?}: {e}",
+                index + 1,
+                fields[0]
+            )
+        });
+        if row_entry != entry {
+            continue;
+        }
+        assert_eq!(
+            fields[1],
+            "RDP",
+            "{WM2000_PACKET_ENV} line {} is on the {} lane; this replay drives the raw-RDP lane, \
+             which is the only one WM2000 uses (docs/RT64-WM2000-CENSUS.md §1: gbi_lane_commands 0)",
+            index + 1,
+            fields[1]
+        );
+        let pc = parse_hex(fields[2], "pc") as usize;
+        let w0 = parse_hex(fields[3], "w0") as u32;
+        let w1 = parse_hex(fields[4], "w1") as u32;
+        rows.push((pc, w0, w1));
+    }
+    assert!(
+        !rows.is_empty(),
+        "{WM2000_PACKET_ENV} carries no rows for decode entry {entry}; capture it with \
+         FN64_GBI_PACKET_DUMP_ENTRIES={entry}"
+    );
+    // The contiguity check that makes the concatenation legitimate.
+    for pair in rows.windows(2) {
+        assert_eq!(
+            pair[1].0,
+            pair[0].0 + 8,
+            "packet-dump rows for entry {entry} are not contiguous: {:#010x} is followed by \
+             {:#010x}, an 8-byte stride apart is what makes the concatenated word pairs the wire \
+             stream rather than a sample of it",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+    let source_pc = rows[0].0;
+    let words = rows
+        .iter()
+        .flat_map(|&(_, w0, w1)| [w0, w1])
+        .collect::<Vec<u32>>();
+    CapturedPacket {
+        entry,
+        words,
+        source_pc,
+    }
+}
+
+/// Load the captured packet named by the environment, or `None` when the
+/// variable is unset.
+///
+/// Set-but-unreadable is a hard error, not a skip: an operator who named a
+/// fixture and got a silent pass would read this test's green as evidence
+/// the replay ran.
+fn load_captured_packet() -> Option<CapturedPacket> {
+    let path = std::env::var_os(WM2000_PACKET_ENV)?;
+    let entry: u64 = match std::env::var(WM2000_PACKET_ENTRY_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|e| {
+            panic!("{WM2000_PACKET_ENTRY_ENV} is {raw:?}, expected a decode entry index: {e}")
+        }),
+        _ => 0,
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{WM2000_PACKET_ENV} names {:?}, which could not be read: {e}",
+            std::path::Path::new(&path)
+        )
+    });
+    Some(parse_packet_dump(&text, entry))
+}
+
+/// Walk a raw-RDP word stream into `(byte_offset, cmd6, w0, w1)` commands.
+///
+/// Independent of the decoder under test, and deliberately minimal: it
+/// knows only that a raw-RDP command is 8 bytes except `G_TEXRECT`
+/// (`0x24`)/`G_TEXRECTFLIP` (`0x25`), which are 16. That is enough to count
+/// commands and locate a refusal's index, and it must NOT grow into a
+/// second decoder -- the point is to be derivable by hand from the dump.
+fn walk_raw_rdp_commands(words: &[u32]) -> Vec<(usize, u8, u32, u32)> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index + 1 < words.len() {
+        let w0 = words[index];
+        let w1 = words[index + 1];
+        let cmd6 = ((w0 >> 24) & 0x3f) as u8;
+        out.push((index * 4, cmd6, w0, w1));
+        index += if matches!(cmd6, 0x24 | 0x25) { 4 } else { 2 };
+    }
+    out
+}
+
+/// The color-target extent to configure, read from the packet itself.
+///
+/// Width comes from the packet's own `SetColorImage` (`0x3f`) width field,
+/// which is width-1 on the wire. Height is taken from the `SetScissor`
+/// (`0x2d`) lower-right Y, whose wire field is 10.2 fixed point -- the only
+/// height the packet states at all, since `SetColorImage` carries none.
+///
+/// Deriving both from the packet rather than hardcoding them is what keeps
+/// the harness from silently capping the replay: a too-small extent refuses
+/// a fill that the port would otherwise have admitted, and that refusal
+/// would be the test's own, not the port's.
+///
+/// **Not currently observable, and disclosed rather than dressed up.**
+/// Mutating the width (dropping the wire field's `+1`, and even forcing it
+/// to 1) does not change today's outcome, because the coverage refusal
+/// fires before any fill is sized against this extent. The derivation is
+/// kept because it is correct and because it is what stops the harness
+/// becoming the frontier the moment that refusal moves -- but no assertion
+/// here pins it today, and claiming otherwise would be the "both ways from
+/// the same source" mistake this file's other helpers were written to
+/// avoid.
+fn replay_target_extent(commands: &[(usize, u8, u32, u32)]) -> (u32, u32) {
+    let width = commands
+        .iter()
+        .find(|&&(_, cmd6, _, _)| cmd6 == 0x3f)
+        .map(|&(_, _, w0, _)| (w0 & 0x0fff) + 1)
+        .expect("the packet must set a color image before anything can be drawn into one");
+    let height = commands
+        .iter()
+        .find(|&&(_, cmd6, _, _)| cmd6 == 0x2d)
+        .map(|&(_, _, _, w1)| (w1 & 0x0fff) >> 2)
+        .expect("the packet must set a scissor, which is the only height it states");
+    (width, height)
+}
+
+/// **The measurement this whole card exists to take: what happens when a
+/// REAL WM2000 packet reaches `WgpuBackend` through the production
+/// `dispatch_dpc_submission` seam.**
+///
+/// Every other test in this file assembles its own words. This one replays
+/// WWF WrestleMania 2000's own, captured from a real recompiled boot.
+/// Whether it executes or is refused **by name** is the finding either way;
+/// a refusal here is the first honest burndown number the port has, because
+/// it is measured against the game's actual bytes rather than against a
+/// fixture built to fit the executor.
+///
+/// # What is asserted, and what is deliberately not
+///
+/// This test does not assert that the packet executes. It asserts what the
+/// packet IS -- the properties the census independently measured, checked
+/// against the fixture so a synthetic stand-in cannot masquerade as the
+/// capture -- and then reports the outcome. Pinning "executes" or "is
+/// refused with X" would make this test a ratchet on a frontier that is
+/// expected to move; pinning the packet's identity makes it a ratchet on
+/// the fixture being real, which is the property that must not regress.
+///
+/// The census facts checked (`docs/RT64-WM2000-CENSUS.md` §5,
+/// `docs/RT64-WM2000-CYCLE-MODES.md` §3) are entry 0's: 366 commands, 19
+/// distinct opcodes, 60 `G_FILLRECT` and 60 `G_TEXRECT`, and zero
+/// triangles. They were measured by a different instrument (the opcode
+/// histogram) than the one that produced this fixture (the word dump), so
+/// their agreement is two independent counters on one packet, not one
+/// counter read twice.
+#[test]
+fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!(
+            "[replay] {WM2000_PACKET_ENV} unset -- NOT RUN. This test replays a captured WM2000 \
+             packet, which is game-derived and therefore out of tree. See \
+             docs/RT64-WM2000-REPLAY.md for the capture command."
+        );
+        return;
+    };
+
+    let commands = walk_raw_rdp_commands(&packet.words);
+
+    // **The positive control.** These are the properties the opcode census
+    // measured for WM2000's entry 0 by a different instrument. A synthetic
+    // stand-in -- any of this file's hand-assembled fixtures, or a trimmed
+    // version of this one -- fails them. This is the assertion that makes
+    // the rest of the test about a real packet rather than about whatever
+    // bytes the environment happened to name.
+    if packet.entry == 0 {
+        assert_eq!(
+            commands.len(),
+            366,
+            "WM2000's decode entry 0 is 366 commands (docs/RT64-WM2000-CENSUS.md §5); a fixture \
+             of any other length is not that packet"
+        );
+        let mut histogram = std::collections::BTreeMap::<u8, usize>::new();
+        for &(_, cmd6, _, _) in &commands {
+            *histogram.entry(cmd6).or_default() += 1;
+        }
+        assert_eq!(
+            histogram.len(),
+            19,
+            "entry 0 issues 19 distinct opcodes (census §5), got {histogram:?}"
+        );
+        assert_eq!(
+            histogram.get(&0x36).copied().unwrap_or(0),
+            60,
+            "entry 0 issues 60 G_FILLRECT (census §5)"
+        );
+        assert_eq!(
+            histogram.get(&0x24).copied().unwrap_or(0),
+            60,
+            "entry 0 issues 60 G_TEXRECT (census §5)"
+        );
+        let triangles: usize = (0x08u8..=0x0f)
+            .map(|id| histogram.get(&id).copied().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            triangles, 0,
+            "entry 0 issues zero triangles (census §5); a packet with triangles is a later frame"
+        );
+        // The one operand fact, from the OTHER probe again: every WM2000
+        // texrect is one-cycle, other-mode high `0x0000acef`
+        // (docs/RT64-WM2000-CYCLE-MODES.md §1). Read here off the packet's
+        // own `SetOtherMode` words rather than from that probe's output, so
+        // the two agree by measurement rather than by transcription.
+        let final_other_mode_high = commands
+            .iter()
+            .filter(|&&(_, cmd6, _, _)| cmd6 == 0x2f)
+            .map(|&(_, _, w0, _)| w0 & 0x00ff_ffff)
+            .next_back()
+            .expect("entry 0 issues G_RDPSETOTHERMODE");
+        assert_eq!(
+            final_other_mode_high & (0b11 << 20),
+            0,
+            "WM2000's latched cycle type is one-cycle: G_MDSFT_CYCLETYPE (bits 21:20) of the \
+             final SetOtherMode high word {final_other_mode_high:#08x} must be 0 \
+             (docs/RT64-WM2000-CYCLE-MODES.md §1)"
+        );
+    }
+
+    // The replay itself, through the real production seam.
+    crate::load_rom(Vec::new());
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    // The color-target extent is read from the PACKET, not chosen: the RDP's
+    // `SetColorImage` carries a width but no height, so a host-configured
+    // height is required before any fill is admitted (see
+    // `register_session_backend_for_fills`' own note). Taking the width from
+    // the packet's own `SetColorImage` keeps the harness from being the
+    // thing that decides how far the replay gets -- a 16x8 fixture extent
+    // refuses WM2000's 480-wide rows on the first fill, which would report a
+    // harness limit as if it were a port frontier.
+    let (target_width, target_height) = replay_target_extent(&commands);
+    {
+        let (mut backend, session) = fn64_render_wgpu::WgpuBackend::try_new()
+            .expect("WgpuBackend::try_new is infallible here");
+        let _ = backend.create(&fn64_render::RenderConfig {
+            width: target_width,
+            height: target_height,
+            tv_type: fn64_runtime::TvType::default(),
+        });
+        set_render_backend(Box::new(backend), rdram.len());
+        set_raw_dpc_session(session);
+    }
+
+    // The fill target, poisoned before the replay so any byte the packet
+    // publishes is distinguishable from an untouched allocation.
+    let color_image_addr = commands
+        .iter()
+        .find(|&&(_, cmd6, _, _)| cmd6 == 0x3f)
+        .map(|&(_, _, _, w1)| w1)
+        .expect("the packet must set a color image");
+    let target_bytes = (target_width * target_height * 2) as usize;
+    let poison: Vec<u8> = (0..target_bytes)
+        .map(|offset| (offset as u8).wrapping_mul(7).wrapping_add(0x5a))
+        .collect();
+    fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &poison,
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_words(&mut rdram, &packet.words);
+    }));
+
+    let mut published = vec![0u8; target_bytes];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &mut published,
+    );
+
+    match outcome {
+        Ok(()) => {
+            eprintln!(
+                "[replay] entry {} ({} commands, captured from RDRAM {:#010x}) EXECUTED through \
+                 WgpuBackend with no refusal.",
+                packet.entry,
+                commands.len(),
+                packet.source_pc
+            );
+            assert_ne!(
+                published, poison,
+                "a packet that executed with no refusal must have published something into its \
+                 own color image -- every byte still poisoned means the whole packet was a no-op"
+            );
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>")
+                .to_owned();
+            eprintln!(
+                "[replay] entry {} ({} commands, captured from RDRAM {:#010x}) was REFUSED: {}",
+                packet.entry,
+                commands.len(),
+                packet.source_pc,
+                message
+            );
+            // **What a refusal must guarantee: no partial publication.** A
+            // refused packet that had already written half its fills into
+            // guest RDRAM would be the "plausible pixels without a proven
+            // draw" outcome this whole line of work must not produce, and
+            // it would make every downstream frame a lie about which
+            // commands ran.
+            assert_eq!(
+                published, poison,
+                "a refused packet must leave guest RDRAM byte-for-byte poisoned -- a partial \
+                 write means some commands published while the rest were refused"
+            );
+            // A refusal is a delivered measurement, but only if it is a
+            // NAMED one. An unwrap on a None, an index panic, or an
+            // arithmetic overflow reaching here would mean the packet found
+            // a defect rather than a frontier, and that is a different
+            // finding that must not be reported as a burndown number.
+            assert!(
+                !message.contains("index out of bounds")
+                    && !message.contains("attempt to subtract with overflow")
+                    && !message.contains("attempt to add with overflow")
+                    && !message.contains("called `Option::unwrap()` on a `None` value"),
+                "a real packet must be refused by NAME, not by a panic in the executor's own \
+                 arithmetic -- this message is a defect, not a frontier: {message}"
+            );
+        }
+    }
+    teardown();
+}
