@@ -577,7 +577,7 @@ fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
     let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
     let base = rgba16_replicate_status();
 
-    let cases: [(u32, bool, bool, ViScanoutRefusal); 8] = [
+    let cases: [(u32, bool, bool, ViScanoutRefusal); 7] = [
         // AA mode 0: silhouette AA (and resampling; AA is checked first).
         (
             base & !(3 << 8),
@@ -592,18 +592,15 @@ fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
             false,
             ViScanoutRefusal::SilhouetteAntialias,
         ),
-        // AA mode 2: resample only, no silhouette AA.
+        // AA mode 2 (resample only) and dither restoration over RGBA16 are
+        // WM2000's measured pair and are both implemented, so neither
+        // appears here. Bit 16 over RGBA32 has no five-bit dither to
+        // restore and stays refused.
         (
-            (base & !(3 << 8)) | (2 << 8),
+            (base & !3) | 3 | (1 << 16),
             false,
             false,
-            ViScanoutRefusal::BilinearResampling,
-        ),
-        (
-            base | (1 << 16),
-            false,
-            false,
-            ViScanoutRefusal::DitherRestoration,
+            ViScanoutRefusal::DitherRestorationNonRgba16,
         ),
         (base | (1 << 4), false, false, ViScanoutRefusal::Divot),
         (base | (1 << 3), false, false, ViScanoutRefusal::Gamma),
@@ -677,11 +674,10 @@ fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
 fn refusal_reasons_are_distinct_and_never_generic() {
     let all = [
         ViScanoutRefusal::SilhouetteAntialias,
-        ViScanoutRefusal::DitherRestoration,
+        ViScanoutRefusal::DitherRestorationNonRgba16,
         ViScanoutRefusal::Divot,
         ViScanoutRefusal::Gamma,
         ViScanoutRefusal::GammaDither,
-        ViScanoutRefusal::BilinearResampling,
         ViScanoutRefusal::Fade,
         ViScanoutRefusal::RepeatLine,
         ViScanoutRefusal::ReservedPixelType,
