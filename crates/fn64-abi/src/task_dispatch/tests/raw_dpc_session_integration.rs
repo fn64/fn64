@@ -792,6 +792,36 @@ fn fill_then_texrect_words() -> Vec<u32> {
     words
 }
 
+/// [`fill_load_and_copy_texrect_words`] **with its `LoadBlock` removed, and
+/// nothing else changed.**
+///
+/// Every other command is identical: the same fill, the same
+/// `SetTile`/`SetTileSize` binding tile 7, the same Copy-cycle
+/// `SetOtherMode`/`SetCombine`, the same rectangle. Only the load is gone,
+/// so the texrect reaches the sampler with the same tile and geometry the
+/// executable fixture uses -- and finds TMEM never written.
+///
+/// The one-command difference is the point. It isolates "were these texels
+/// ever loaded" from every other reason a packet can fail, so a refusal
+/// here names the texel fetch rather than a missing register the fixture
+/// forgot to stage. Its sibling executing successfully with the load
+/// present is what makes the pair evidence rather than one red test.
+fn fill_and_copy_texrect_without_load_words() -> Vec<u32> {
+    let mut words = whole_target_fill_words();
+    words.extend(set_texture_image(0, 2, 8, TEXTURE_SOURCE_ADDR));
+    words.extend(set_tile(7, 2, 0));
+    words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+    words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    words.extend([
+        word(TEXRECT, ((11u32 << 2) << 12) | (4u32 << 2)),
+        7 << 24 | ((4u32 << 2) << 12) | (2u32 << 2),
+        0,
+        (0x0400u32 << 16) | 0x0400,
+    ]);
+    words
+}
+
 /// The **executable** WM2000-title-screen shape: a whole-target fill in
 /// Fill cycle, a `LoadBlock` filling tile 7, then a `TextureRectangle` in
 /// **Copy** cycle sampling that tile.
@@ -1725,19 +1755,28 @@ fn a_one_cycle_texrect_reaches_guest_rdram_carrying_combiner_output() {
     teardown();
 }
 
-/// A fill composed with a `TextureRectangle` and **no TMEM load** is still
-/// refused by name, and guest RDRAM is left byte-for-byte untouched.
+/// A fill composed with a `TextureRectangle` whose texels were never
+/// written changes **no guest byte**, at the real ABI seam.
 ///
-/// The narrowed survivor of the refusal the test above superseded. There is
-/// no pending TMEM post-image for such a texrect to sample, and
-/// census-measured that shape does not occur (0 of WM2000's 219 decode
-/// entries carry a texrect without a load in the same entry), so refusing
-/// it costs nothing real -- while admitting it would mean silently sampling
-/// a previous packet's committed TMEM.
+/// **This test's premise was narrowed once and has now been narrowed
+/// again.** It first asserted `MixedFillAndTrianglePacket`, then
+/// `TexrectWithoutTmemLoad` -- the latter on a census reading "0 of WM2000's
+/// 219 decode entries carry a texrect without a load in the same entry".
+/// The count was right and the window was not: that census covered 219
+/// entries of boot/attract and its own doc supersedes it twice (to 5,792
+/// entries). Measured on the real ROM, WM2000's fourth packet is 46
+/// texrects with zero loads, so the shape is real and a load-free texrect
+/// legitimately samples durable committed TMEM.
 ///
-/// The total absence of any write is the property worth pinning: a texrect
-/// publishing plausible pixels without a proven texel fetch is the one
-/// outcome this whole line of work must not produce.
+/// **What must not change is the property, and this test now pins the
+/// property directly rather than the variant name that used to imply it:**
+/// a texrect publishing plausible pixels without a proven texel fetch is
+/// the one outcome this whole line of work must not produce. Here TMEM was
+/// never written, so every texel is an invalid byte, the reader refuses,
+/// and guest RDRAM keeps its poison byte for byte. Asserting the refusal's
+/// *name* would have made this test a restatement of the rule; asserting
+/// the guest bytes makes it a check on the outcome, which survives the
+/// rule changing under it.
 #[test]
 fn a_fill_composed_with_a_texrect_and_no_tmem_load_changes_no_guest_byte() {
     crate::load_rom(Vec::new());
@@ -1761,22 +1800,34 @@ fn a_fill_composed_with_a_texrect_and_no_tmem_load_changes_no_guest_byte() {
     // the ABI seam (`rsp_commit`'s `execute_raw_dpc` unwrap), not as a
     // returned error.
     let poisoned = poison_fill_target(&mut rdram);
-    let words = fill_then_texrect_words();
+    let words = fill_and_copy_texrect_without_load_words();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dispatch_words(&mut rdram, &words);
     }));
     let payload = outcome.expect_err(
-        "a fill composed with a texture rectangle and no TMEM load must be refused -- there is \
-         no pending TMEM post-image for the texrect to sample",
+        "a texrect whose texels were never written must be refused -- every texel it asks for \
+         is an invalid TMEM byte",
     );
     let message = payload
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("");
+    // The refusal must come from the TEXEL FETCH, not from the packet's
+    // shape. The shape gate is gone -- a load-free texrect is a real WM2000
+    // packet -- so a "completed no TMEM load" message here would mean the
+    // deleted rule came back, and this test would be passing for a reason
+    // the measurement disproved.
     assert!(
-        message.contains("completed no TMEM load"),
-        "the refusal must be the named TexrectWithoutTmemLoad rejection, got: {message}"
+        !message.contains("completed no TMEM load"),
+        "the packet SHAPE must not be the refusal any more; a load-free texrect is a real \
+         WM2000 packet. Got: {message}"
+    );
+    assert!(
+        message.contains("invalid") || message.contains("Invalid"),
+        "the refusal must name the invalid TMEM byte the sampler actually hit, which is what \
+         makes 'no guest byte changed' a statement about a real fetch failing rather than \
+         about a packet never running: {message}"
     );
 
     assert_eq!(

@@ -217,6 +217,30 @@ impl TmemSnapshotIdentity {
     }
 }
 
+/// A real `Proposed` snapshot identity, for a test that must hand a
+/// [`TmemByteSource`] an identity it could not otherwise construct.
+///
+/// Every constructor on the way to one is module-private -- deliberately,
+/// so a proposal's receipt cannot be forged from outside `tmem`. That
+/// privacy is also what makes `production.rs`'s
+/// `CommittedTmemImageClaimedProposed` refusal untestable from there, which
+/// is what this exists for. `#[cfg(test)]`, so no non-test caller can reach
+/// it and the privacy holds where it matters.
+///
+/// Built from this module's own real types, not a stand-in: a test using it
+/// exercises the same `is_committed()` discrimination a live proposal does.
+#[cfg(test)]
+pub(crate) fn proposed_identity_for_test() -> TmemSnapshotIdentity {
+    TmemSnapshotIdentity::Proposed(ProposedTmemImageIdentity {
+        proposal: ContentDigest::from_bytes([0x5a; 32]),
+        base_state: super::PhysicalTmemState::try_new()
+            .expect("a fresh physical state allocates")
+            .identity(),
+        transaction: super::physical::next_transaction_identity_for_test(),
+        next_generation: 1,
+    })
+}
+
 /// The complete surface [`read_texel`] observes on a physical-TMEM image.
 ///
 /// Exactly the three things the reader ever asked `PhysicalTmemState` for,

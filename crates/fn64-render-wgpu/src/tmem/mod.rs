@@ -71,6 +71,8 @@ pub use physical::{
     PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
     PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
+#[cfg(test)]
+pub(crate) use read::proposed_identity_for_test;
 pub use read::{
     read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
     PhysicalTexelReadError, PhysicalTmemSnapshotIdentity, ProposedTmemImageIdentity,
