@@ -61,6 +61,11 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+/// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
+/// inside a slow pump that is not inside a fast one -- the decomposition the
+/// heartbeat's distribution cannot supply.
+#[allow(dead_code)]
+mod pump_census;
 #[allow(dead_code)]
 mod screenshot;
 #[allow(dead_code)]
@@ -268,6 +273,15 @@ mod game {
         pump_step_samples: u64,
         last_audio_underrun_sample_slots: u64,
         last_audio_late_callbacks: u64,
+        /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
+        /// unarmed it is one `bool` load per pump and nothing else.
+        pump_census: crate::pump_census::PumpCensus,
+        /// The backend `boot()` actually registered, carried so the census
+        /// can name it on its first line. A graphics figure without its
+        /// renderer beside it is not a result, and reading it back from
+        /// `FN64_RENDER` would report the REQUEST rather than the fallback
+        /// that may have replaced it.
+        active_renderer: &'static str,
     }
 
     /// How many executor steps to run per window pump before yielding back to
@@ -556,6 +570,8 @@ mod game {
                 pump_step_samples: 0,
                 last_audio_underrun_sample_slots: 0,
                 last_audio_late_callbacks: 0,
+                pump_census: crate::pump_census::PumpCensus::new(),
+                active_renderer,
             }
         }
 
@@ -1105,8 +1121,27 @@ mod game {
                     }
                     self.frame_intervals.record(elapsed);
                 }
+                // Bracket the pump, not its internals: the phase counters
+                // `pump_census` reads are running totals `run_one_step`
+                // already maintains, so differencing them across the pump
+                // adds no clock to the hot loop (perf-method rule 17 -- a
+                // predicted instrumentation cost was once wrong by 56x, so
+                // the instrument that adds no timer is the one to prefer).
+                self.pump_census.before_pump();
                 let outcome = self.pump_one_frame();
-                self.pump_times.record(now_t.elapsed());
+                let pump_wall = now_t.elapsed();
+                self.pump_times.record(pump_wall);
+                if self
+                    .pump_census
+                    .after_pump(pump_wall, outcome.steps, outcome.swapped)
+                {
+                    // Bounded run: a windowed benchmark that needs a human to
+                    // close the window cannot be repeated identically, and
+                    // "any timing claim needs repeated runs" is the bar.
+                    self.pump_census.report_once(self.active_renderer);
+                    event_loop.exit();
+                    return;
+                }
                 self.pump_steps_total = self.pump_steps_total.saturating_add(outcome.steps);
                 self.pump_steps_max = self.pump_steps_max.max(outcome.steps);
                 self.pump_step_samples += 1;
@@ -1163,6 +1198,9 @@ mod game {
         if let Err(e) = event_loop.run_app(&mut shell) {
             eprintln!("[fn64-shell] event loop error: {e}");
         }
+        // Idempotent: the bounded-run path already printed if it fired, and a
+        // report printed twice reads as two runs.
+        shell.pump_census.report_once(shell.active_renderer);
         println!("[fn64-shell] exited cleanly.");
         prepare_clean_exit();
     }

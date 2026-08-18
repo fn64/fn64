@@ -598,6 +598,24 @@ pub fn task_counts() -> (u64, u64) {
     with_executor(|exec| (exec.task_log().gfx_count(), exec.task_log().audio_count()))
 }
 
+/// RSP-interpreter and raw-DPC running totals, as
+/// `(rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls)`.
+///
+/// The same four counters `frame_census` samples at each VI field boundary,
+/// re-exported because an out-of-crate harness measuring a different UNIT of
+/// latency needs them at its own boundaries. `fn64-shell` samples per pump:
+/// one pump is not one field, so the field census cannot answer what a slow
+/// pump contains.
+///
+/// Four relaxed atomic loads, read unconditionally. When
+/// `FN64_DPC_COPY_CENSUS` is unset every counter reads zero, which is the
+/// true answer -- nothing was counted. A caller must report that as NOT ARMED
+/// rather than as "the RSP interpreter did no work", which is the
+/// check-that-cannot-fail error the census gates exist to keep visible.
+pub fn dpc_census_running_totals() -> (u64, u64, u64, u64) {
+    crate::dpc_copy_census::running_totals()
+}
+
 /// Always-on monotonic guest-resume epoch. Release evidence uses this instead
 /// of optional trace length to prove no coroutine ran after a VI boundary.
 pub fn executor_resume_epoch() -> u64 {
