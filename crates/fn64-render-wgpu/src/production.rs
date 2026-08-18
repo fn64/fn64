@@ -1965,7 +1965,31 @@ impl RenderBackend for WgpuBackend {
 /// this mirrors T1's own test harness's two-pass probe: decode once against
 /// a throwaway single-source journal, read the real access list back off
 /// `RawDpcDecodeError::JournalMismatch::expected` when the probe
-/// (correctly) disagrees, then decode again for real. Every `SubmittedTicket`
+/// (correctly) disagrees, then decode again for real.
+///
+/// **Both passes decode against `durable_state`, and that is load-bearing.**
+/// The journal a capture declares is not a function of its bytes alone: a
+/// `FillRectangle`/`TextureRectangle` reads its destination back off
+/// `RdpState::color_image()`, which an *earlier* submission's
+/// `SetColorImage` may have staged. `plan_texture_rectangle` treats a
+/// missing color image as "declares no write" (`return Ok(())`) rather than
+/// as an error, so a probe decoded against `RdpState::default()` silently
+/// returns a *shorter* access list than the real pass -- and the real pass
+/// then fails `JournalMismatch` against the journal the probe just built.
+/// That is not a hypothetical: it is exactly what WM2000's attract loop hit
+/// under `FN64_RENDER=wgpu`, where the title stages its color image once and
+/// then submits texrect-only XBUS runs against it (`expected 65 accesses,
+/// found 9` on the third coalesced run -- the first whose durable state is
+/// non-default, hence the first where the two passes could disagree at all).
+/// The probe is a *shape* probe, and the shape is state-dependent, so the
+/// probe must observe the same state the real decode will. The probe's
+/// throwaway-ness is entirely about its journal and its zero-filled read
+/// bytes; it was never about its RDP state.
+///
+/// Decoding the probe against durable state is side-effect-free:
+/// `decode_raw_dpc` takes `&RdpState` and forks it (`fork_for_decode`), so
+/// neither pass can mutate the caller's state, and only the real pass's
+/// `state_delta` is ever applied. Every `SubmittedTicket`
 /// minted here is through a throwaway, locally owned `TicketAuthoritySet` --
 /// `crate::decode_raw_dpc` only needs one that is internally consistent
 /// with the capture it decodes, never the "real" production queue (that
@@ -1996,7 +2020,7 @@ fn plan_raw_dpc_inner(
     let probe_ticket = submit_locally(probe_decoded)
         .map_err(|error| format!("raw-DPC plan probe submission failed: {error}"))?;
 
-    let journal = match crate::decode_raw_dpc(probe_ticket, &RdpState::default()) {
+    let journal = match crate::decode_raw_dpc(probe_ticket, durable_state) {
         Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => {
             let accesses = expected.into_vec();
             let declared = accesses
@@ -5617,22 +5641,35 @@ mod tests {
 
     /// State continuity, source-shape half: the TMEM-only admitted subset
     /// has no command that behaviorally *depends* on carried-over
-    /// `RdpState` (the one command that reads `state.color_image()` back,
-    /// `FillRectangle`, is out of v11's admitted TMEM-only scope), so a
-    /// black-box test cannot distinguish "state is threaded through" from
-    /// "state is discarded but happens to look populated" purely by
-    /// observing `plan_raw_dpc`'s success/failure. This test instead pins
-    /// down the source-level fact that makes state threading real: the
-    /// *real* (non-probe) decode call inside `plan_raw_dpc_inner` passes
-    /// `durable_state` -- the caller-supplied `&RdpState`, not a fresh
-    /// `RdpState::default()` -- exactly once, mirroring
+    /// `RdpState`, so a black-box test cannot distinguish "state is threaded
+    /// through" from "state is discarded but happens to look populated"
+    /// purely by observing `plan_raw_dpc`'s success/failure. This test
+    /// instead pins down the source-level fact that makes state threading
+    /// real: **both** decode calls inside `plan_raw_dpc_inner` -- the probe
+    /// and the real pass -- pass `durable_state`, the caller-supplied
+    /// `&RdpState`, and no `RdpState::default()` appears anywhere in the
+    /// function. It mirrors
     /// `publish_raw_dpc_source_is_exactly_prepare_publication_then_commit`'s
-    /// source-shape idiom. The companion behavioral test below
-    /// (`plan_raw_dpc_carries_durable_rdp_state_across_submissions`) proves
-    /// the field actually accumulates; this one proves decoding actually
-    /// consults it instead of a hardcoded default.
+    /// source-shape idiom.
+    ///
+    /// This test previously asserted the *opposite* for the probe --
+    /// `RdpState::default()` exactly once, "only the throwaway single-source
+    /// probe decode is allowed to use it" -- on the stated premise that "the
+    /// one command that reads `state.color_image()` back, `FillRectangle`,
+    /// is out of v11's admitted TMEM-only scope". That premise expired when
+    /// `plan_texture_rectangle` began reading `color_image()` too, and the
+    /// stale assertion was pinning the WM2000 `FN64_RENDER=wgpu` blocker in
+    /// place: a probe blind to durable state derives a shorter access list
+    /// than the real pass, and the real pass then fails `JournalMismatch`
+    /// against the journal the probe built. See `plan_raw_dpc_inner`'s own
+    /// doc. The companion behavioral tests
+    /// (`plan_raw_dpc_carries_durable_rdp_state_across_submissions` and
+    /// `plan_raw_dpc_plans_a_texrect_against_a_color_image_an_earlier_submission_staged`)
+    /// prove the state accumulates and that the two passes agree once it
+    /// does; this one proves decoding actually consults it instead of a
+    /// hardcoded default.
     #[test]
-    fn plan_raw_dpc_inner_decodes_the_real_pass_against_durable_state_not_default() {
+    fn plan_raw_dpc_inner_decodes_both_passes_against_durable_state_not_default() {
         let source = include_str!("production.rs");
         let body_start = source
             .find("fn plan_raw_dpc_inner(")
@@ -5642,20 +5679,27 @@ mod tests {
             .map(|offset| body_start + 1 + offset)
             .unwrap_or(source.len());
         let body = &source[body_start..next_fn];
-        let real_decode_uses_durable_state =
-            body.contains("crate::decode_raw_dpc(ticket, durable_state)");
         assert!(
-            real_decode_uses_durable_state,
+            body.contains("crate::decode_raw_dpc(ticket, durable_state)"),
             "plan_raw_dpc_inner's real (non-probe) decode call must pass `durable_state`, \
              not a fresh `RdpState::default()` -- otherwise no submission's state ever \
              carries forward to the next"
         );
+        assert!(
+            body.contains("crate::decode_raw_dpc(probe_ticket, durable_state)"),
+            "plan_raw_dpc_inner's probe decode must pass `durable_state` too. The probe \
+             derives the journal the real pass is then checked against, and a journal is a \
+             function of durable state as well as of the capture's bytes (a texrect reads \
+             its destination off `RdpState::color_image()`, which an earlier submission may \
+             have staged). A probe blind to that state declares a shorter access list than \
+             the real pass and the real pass then fails JournalMismatch against it"
+        );
         let default_state_appearances = body.matches("RdpState::default()").count();
         assert_eq!(
-            default_state_appearances, 1,
-            "RdpState::default() must appear exactly once in plan_raw_dpc_inner -- only the \
-             throwaway single-source probe decode is allowed to use it; the real decode must \
-             use durable_state"
+            default_state_appearances, 0,
+            "RdpState::default() must not appear in plan_raw_dpc_inner at all -- both the \
+             probe and the real decode must observe the caller's durable state, or the two \
+             passes can disagree about how many accesses the capture declares"
         );
     }
 
@@ -5709,6 +5753,124 @@ mod tests {
              past the first submission's ({epoch_after_first:?}) -- if durable state had reset \
              to default between submissions, both would report the same first epoch"
         );
+    }
+
+    /// Regression, cross-submission planning: a texrect whose destination
+    /// `SetColorImage` was staged by an **earlier** submission must plan
+    /// with the same declared `ColorFramebuffer` write run the real decode
+    /// derives -- not the empty run the probe derives against a fresh
+    /// `RdpState::default()`.
+    ///
+    /// This is the WM2000 `FN64_RENDER=wgpu` blocker in miniature. The
+    /// title's attract loop stages its color image once and then keeps
+    /// submitting texrect-only XBUS runs against it, so the *third*
+    /// coalesced run is the first whose durable state is non-default and
+    /// therefore the first where `plan_raw_dpc_inner`'s two passes can
+    /// disagree. `plan_texture_rectangle`'s `let Some(image) =
+    /// state.color_image() else { return Ok(()) }` makes that disagreement
+    /// silent-but-fatal: the probe declares zero `RenderTarget` accesses,
+    /// the real decode declares one per covered row, and
+    /// `ExactRawDpcPlanWriter::finish` refuses the mismatch by name.
+    ///
+    /// Submissions one and two only exist to populate durable state; the
+    /// assertion is entirely about submission three, which carries no
+    /// `SetColorImage` of its own.
+    #[test]
+    fn plan_raw_dpc_plans_a_texrect_against_a_color_image_an_earlier_submission_staged() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        // Submission one: stage the color image (and a whole-target fill,
+        // which `admit_completed_initialization` requires before any
+        // partial write into a fresh target).
+        let request_one = session.plan_request(capture(whole_target_fill_words()));
+        backend
+            .plan_raw_dpc(request_one)
+            .expect("the color-image-staging submission plans cleanly");
+
+        // Submission two: a TMEM load, so durable state is non-default in
+        // more than one field by the time submission three plans.
+        let request_two = session.plan_request(capture(one_load_block_words()));
+        backend
+            .plan_raw_dpc(request_two)
+            .expect("the TMEM-load submission plans cleanly");
+
+        assert!(
+            backend.rdp_state().color_image().is_some(),
+            "positive control: durable state must actually carry a color image into \
+             submission three -- without this the test would pass vacuously against a \
+             default state the probe happens to agree with"
+        );
+
+        // Submission three: a texrect with NO SetColorImage of its own. Its
+        // destination image can only come from durable state.
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(texrect_words_in_target(7));
+        let request_three = session.plan_request(capture(words));
+        let planned_three = backend
+            .plan_raw_dpc(request_three)
+            .expect("a texrect against an earlier submission's color image must plan");
+
+        // The sealed plan exposes no journal accessor, so the declared
+        // write run is counted where it is derived: `plan_raw_dpc_inner`'s
+        // own journal, rebuilt here against the same durable state the
+        // backend now holds. `finish`'s access-for-access check above
+        // already proved the two agree; this pins the count they agree on.
+        //
+        // Hand-derived from RT64's own `FixedRect`, not captured from this
+        // port's output. `texrect_words_in_target`'s wire fields are 10.2
+        // fixed point: `uly = 2 << 2 = 8`, `lry = 4 << 2 = 16`. The staged
+        // `set_other_mode(0, 0)` is 1-cycle, so neither the copy-mode
+        // `lry |= 3` nor the fill/copy `uly &= !3` applies. `FixedRect`'s
+        // edges both ceil (`RDP::drawRect` passes `ceil = true` to
+        // `height(true, true)`): `top = (8 + 3) >> 2 = 2`,
+        // `bottom = (16 + 3) >> 2 = 4`. `bottom` is *exclusive*
+        // (`plan_texture_rectangle` takes `y1 = bottom - 1 = 3`), so the
+        // covered rows are y 2..=3 -- **2 rows**, not the 3 an inclusive
+        // reading of the wire `lry` would suggest. Likewise x: `left =
+        // (16 + 3) >> 2 = 4`, `right = (44 + 3) >> 2 = 11`, so x 4..=10.
+        // x0 != 0, so `plan_render_target_rows` takes its per-row branch
+        // and declares one `RenderTarget` write per row -- 2 writes.
+        let mut probe_words = Vec::new();
+        probe_words.extend(set_other_mode(0, 0));
+        probe_words.extend(set_combine(0, 0));
+        probe_words.extend(texrect_words_in_target(7));
+        let probe_capture = capture(probe_words);
+        let probe_submission = probe_capture.submission().clone();
+        let probe_layout = probe_capture.memory_layout();
+        let probe_journal =
+            single_source_probe_journal(&probe_submission, probe_layout).unwrap();
+        let probe_decoded = finalize_with_zero_reads(
+            probe_layout,
+            probe_capture.transaction_sequence(),
+            probe_submission,
+            probe_capture.cmd_end(),
+            probe_capture.full_sync_boundaries().to_vec(),
+            probe_journal,
+        )
+        .unwrap();
+        let probe_ticket = submit_locally(probe_decoded).unwrap();
+        let against_durable = match crate::decode_raw_dpc(probe_ticket, backend.rdp_state()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            other => panic!("probe decode must disagree with the single-source journal: {other:?}"),
+        };
+        let render_target_writes = against_durable
+            .iter()
+            .filter(|access| {
+                access.purpose() == AccessPurpose::RenderTarget
+                    && access.mode() == AccessMode::Write
+            })
+            .count();
+        assert_eq!(
+            render_target_writes, 2,
+            "the texrect covers 2 rows (y 2..=3, RT64's bottom edge being exclusive) at \
+             nonzero x0, so the real decode declares exactly 2 per-row ColorFramebuffer \
+             writes -- and the plan above sealed cleanly only because the probe that built \
+             its journal saw the same 2, not the 0 a default-state probe sees"
+        );
+        drop(planned_three);
     }
 
     /// Two `LoadBlock`s in one submission whose destination TMEM ranges
