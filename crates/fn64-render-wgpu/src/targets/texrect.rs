@@ -73,10 +73,24 @@
 //!   ([`TexrectExecutionError::UnsupportedCycleType`]); two-cycle needs the
 //!   `Combined` carry and a second texel, neither of which this executor
 //!   supplies. Measured absent from the window above.
-//! - **No blending, alpha compare, dither, or coverage.** The combiner's
-//!   output is written to the destination; the blender is a separate stage
-//!   this executor does not run. `run_one_cycle`'s `alphaCompareValue`
-//!   out-parameter is deliberately discarded for that reason.
+//! - **No alpha compare, dither, or coverage.** `run_one_cycle`'s
+//!   `alphaCompareValue` out-parameter is deliberately discarded for that
+//!   reason. **Dither is the measured residual against the reference
+//!   oracle** and is disclosed rather than approximated: WM2000's frame-0
+//!   texrects latch `alpha_dither = Noise`, and the oracle's noise stream
+//!   is a SplitMix64 policy its own source declares is "deliberately not
+//!   described as the silicon sequence"
+//!   (`fn64-render-reference/src/raster/mod.rs:85-119`). Reproducing it
+//!   would transcribe an invented sequence, not implement a documented
+//!   stage. See `docs/RT64-WM2000-VALIDATION.md` §3.
+//! - **The blender IS run**, through `crate::blend::blend_fragment` --
+//!   this crate's already-landed literal port of the reference
+//!   rasterizer's own `blend_fragment`, reached rather than
+//!   reimplemented. Its admitted subset is gated by
+//!   [`require_blendable_mode`], which refuses `FORCE_BL`-clear,
+//!   `A = Shade` and `B = FramebufferAlpha` by name: each needs a
+//!   coverage count or a vertex-interpolated color this executor does not
+//!   maintain.
 //! - **No Shade.** This executor has no vertex-interpolated color to
 //!   supply, so a program reading `Shade` is refused rather than combined
 //!   against zero.
@@ -110,10 +124,13 @@
 //!
 //! Copy cycle and one-cycle; one rectangle per packet; a non-negative,
 //! non-empty, in-target pixel extent; point sampling; texcoords that
-//! recover integer S10.5 endpoints; and, in one-cycle, a combiner program
+//! recover integer S10.5 endpoints; in one-cycle, a combiner program
 //! reading only `Texel0`/`Primitive`/`Environment`/`One`/`Zero` with every
-//! register it reads actually set. Everything outside that is a named
-//! [`TexrectExecutionError`], never an approximation.
+//! register it reads actually set; and a blender mode with `FORCE_BL` set
+//! whose cycles select neither `A = Shade` nor `B = FramebufferAlpha`,
+//! with every color register those cycles read actually set. Everything
+//! outside that is a named [`TexrectExecutionError`], never an
+//! approximation.
 //!
 //! ## Scope status
 //!
@@ -133,6 +150,9 @@
 //! for every tile whose first row is even (all this crate's fixtures) and
 //! is a frontier for a tile loaded at an odd row parity.
 
+use crate::blend::{
+    blend_fragment, BlendFramebufferSample, BlendImageReadError, BlendModeState, BlendedFragment,
+};
 use crate::combiner::{
     combiner_inputs_from_fragment_registers, run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput,
     ColorInputSlot, CombineParams, CombinerInputs,
@@ -371,6 +391,39 @@ pub enum TexrectExecutionError {
         row: u32,
         source: PointSampleError,
     },
+    /// A blender cycle selects `A = Shade`, which this executor cannot
+    /// resolve: it has no vertex-interpolated color to supply, exactly as
+    /// its combiner refuses a `Shade`-reading program. Named rather than
+    /// combined against a zero this executor invented.
+    UnsupportedBlendShadeAlpha,
+    /// A blender cycle selects `B = FramebufferAlpha`, the destination
+    /// *coverage count*. RGBA16 stores one coverage bit, not the three a
+    /// count needs, and this executor runs no coverage stage, so the term
+    /// cannot be resolved. Refused rather than approximated from the bit.
+    UnsupportedBlendFramebufferAlpha,
+    /// `FORCE_BL` is clear **and** `AA_EN` is set, so the reference's
+    /// `blend_enabled` reduces to `!wraps`, and `wraps` needs the
+    /// destination coverage count this executor does not maintain
+    /// (`fn64-render-reference/src/raster/coverage.rs:68-69`). Refused
+    /// rather than guessed in either direction, since guessing `true` runs
+    /// a blender the RDP bypasses and guessing `false` bypasses one it
+    /// runs.
+    ///
+    /// The other two `FORCE_BL`-clear cases are **not** refused, because
+    /// the disjunction settles without `wraps`: with `AA_EN` clear it is
+    /// `false` outright, and with `FORCE_BL` set it is `true` outright.
+    BlendEnabledNotDerivable,
+    /// The blender selected a framebuffer term while `IM_RD` is disabled,
+    /// so no destination sample legally exists. Propagated by name from
+    /// [`crate::blend::blend_fragment`] rather than substituted with a
+    /// zero destination, which would draw a plausible-looking wrong pixel
+    /// -- exactly the failure this executor's other refusals exist to
+    /// prevent.
+    Blend {
+        column: u32,
+        row: u32,
+        source: BlendImageReadError,
+    },
     Target(TargetError),
 }
 
@@ -440,6 +493,28 @@ impl core::fmt::Display for TexrectExecutionError {
             } => write!(
                 formatter,
                 "texture rectangle texel fetch failed at pixel ({column}, {row}): {source}"
+            ),
+            Self::UnsupportedBlendShadeAlpha => formatter.write_str(
+                "the blender cycle selects A = Shade, and execute_texture_rectangle has no \
+                 vertex-interpolated shade alpha to resolve it with",
+            ),
+            Self::UnsupportedBlendFramebufferAlpha => formatter.write_str(
+                "the blender cycle selects B = FramebufferAlpha (destination coverage count), \
+                 and execute_texture_rectangle maintains no coverage count; RGBA16 stores one \
+                 coverage bit, not the three a count needs",
+            ),
+            Self::BlendEnabledNotDerivable => formatter.write_str(
+                "FORCE_BL is clear and AA_EN is set, so blend_enabled reduces to !wraps, which \
+                 needs the destination coverage count execute_texture_rectangle does not \
+                 maintain",
+            ),
+            Self::Blend {
+                column,
+                row,
+                source,
+            } => write!(
+                formatter,
+                "texture rectangle blender refused at pixel ({column}, {row}): {source}"
             ),
             Self::Target(error) => write!(formatter, "{error}"),
         }
@@ -724,6 +799,12 @@ impl TexrectShading {
 pub enum TexrectConstantRegister {
     Primitive,
     Environment,
+    /// `SetBlendColor`, read by the blender's `P`/`M = Blend` selector --
+    /// never by the combiner.
+    Blend,
+    /// `SetFogColor`, read by the blender's `P`/`M = Fog` and `A = Fog`
+    /// selectors -- never by the combiner.
+    Fog,
 }
 
 impl core::fmt::Display for TexrectConstantRegister {
@@ -731,6 +812,8 @@ impl core::fmt::Display for TexrectConstantRegister {
         match self {
             Self::Primitive => formatter.write_str("G_SETPRIMCOLOR"),
             Self::Environment => formatter.write_str("G_SETENVCOLOR"),
+            Self::Blend => formatter.write_str("G_SETBLENDCOLOR"),
+            Self::Fog => formatter.write_str("G_SETFOGCOLOR"),
         }
     }
 }
@@ -767,6 +850,7 @@ pub fn execute_texture_rectangle(
     tmem: &PendingTmemImage<'_>,
     lut_mode: TextureLutMode,
     shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
     resident_bytes: &[u8],
     already_initialized: Option<TargetRectangle>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
@@ -787,6 +871,13 @@ pub fn execute_texture_rectangle(
     } else {
         None
     };
+    // The blender's own admission, run at the same point and for the same
+    // reason as the combiner's: before any pixel is produced, so a mode
+    // this executor cannot evaluate exactly refuses with an untouched
+    // target rather than a half-drawn one. Copy cycle passes through with
+    // `cycle_count() == 0`, which is the RDP's own blender bypass.
+    let blend_state = blend_registers.mode_state(other_mode)?;
+    require_blendable_mode(blend_state)?;
 
     let key = candidate.key();
     let format = key.format();
@@ -865,7 +956,21 @@ pub fn execute_texture_rectangle(
             let pixel_y = draw.top() + row;
             let offset =
                 (pixel_y as usize * extent.width() as usize + pixel_x as usize) * bytes_per_pixel;
-            write_pixel(format, &mut bytes[offset..offset + bytes_per_pixel], rgba);
+            // **The blender, the stage this executor previously declared it
+            // did not run**, composed with the write in one named function
+            // so a mutation that drops it is reachable from a unit test --
+            // the same reason `combine_one_texel` is a function rather than
+            // an inline block (see its own doc: while that arithmetic was
+            // inline, replacing `round()` with a truncating cast left the
+            // entire suite green).
+            blend_and_write_pixel(
+                format,
+                &mut bytes[offset..offset + bytes_per_pixel],
+                rgba,
+                blend_state,
+                column,
+                row,
+            )?;
         }
     }
 
@@ -975,6 +1080,242 @@ fn combine_one_texel(combine: CombineParams, base: CombinerInputs, texel: [u8; 4
     };
     let (combined_color, _alpha_compare) = run_one_cycle(combine, inputs);
     combined_color.map(|channel| (channel * 255.0).round() as u8)
+}
+
+/// The two blender-only color registers, snapshotted at the texrect's own
+/// stream position exactly as [`TexrectShading`]'s combiner registers are.
+///
+/// Separate from [`TexrectShading`] because these feed a different stage:
+/// the combiner never reads `SetBlendColor`, and the blender never reads
+/// `SetPrimColor`. Both are `Option` for the same reason `TexrectShading`'s
+/// are -- a register is genuinely unset until its own wire command runs,
+/// and a blender cycle that selects an unset one is a named refusal rather
+/// than a silently-black default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TexrectBlendRegisters {
+    blend_color: Option<Color4>,
+    fog_color: Option<Color4>,
+}
+
+impl TexrectBlendRegisters {
+    pub const fn new(blend_color: Option<Color4>, fog_color: Option<Color4>) -> Self {
+        Self {
+            blend_color,
+            fog_color,
+        }
+    }
+
+    /// Assembles the [`BlendModeState`] [`blend_fragment`] consumes,
+    /// refusing by name when an active cycle selects a register no wire
+    /// command has set.
+    ///
+    /// The substituted `[0; 4]` for an unset register is unreachable for
+    /// any register a cycle actually selects -- this function refused that
+    /// combination already -- exactly as [`TexrectShading::base_inputs`]'s
+    /// own `Color4::from_wire(0)` substitution is.
+    fn mode_state(self, other_mode: OtherMode) -> Result<BlendModeState, TexrectExecutionError> {
+        let state = BlendModeState {
+            other_mode,
+            blend_color_register: self.blend_color.map_or([0u8; 4], Color4::rgba8),
+            fog_color: self.fog_color.map_or([0u8; 4], Color4::rgba8),
+        };
+        let cycle_count = state.cycle_count();
+        for cycle_index in 0..cycle_count {
+            let cycle = state.cycle(cycle_index);
+            let reads_blend = matches!(cycle.p, crate::blend::BlendColorInput::Blend)
+                || matches!(cycle.m, crate::blend::BlendColorInput::Blend);
+            let reads_fog = matches!(cycle.p, crate::blend::BlendColorInput::Fog)
+                || matches!(cycle.m, crate::blend::BlendColorInput::Fog)
+                || matches!(cycle.a, crate::blend::BlendAlphaInput::Fog);
+            if reads_blend && self.blend_color.is_none() {
+                return Err(TexrectExecutionError::UnsetConstantRegister {
+                    register: TexrectConstantRegister::Blend,
+                });
+            }
+            if reads_fog && self.fog_color.is_none() {
+                return Err(TexrectExecutionError::UnsetConstantRegister {
+                    register: TexrectConstantRegister::Fog,
+                });
+            }
+        }
+        Ok(state)
+    }
+}
+
+/// Admits exactly the blender states this executor can evaluate exactly,
+/// refusing every other by name before any pixel is produced.
+///
+/// Three refusals, each for a term this executor genuinely cannot supply
+/// rather than for one it has merely not written yet:
+///
+/// - **`FORCE_BL` clear with `AA_EN` set.** The reference derives
+///   `blend_enabled` as `force_blend() || (antialias_enabled() && !wraps)`
+///   (`fn64-render-reference/src/raster/coverage.rs:69`). `wraps` is
+///   `image_read && pixel_coverage + memory_coverage > 8`, and this
+///   executor maintains no coverage count on either side. Two of the three
+///   `FORCE_BL`-clear cases still settle exactly: `AA_EN` clear makes the
+///   conjunction `false` outright. Only `FORCE_BL` clear **and** `AA_EN`
+///   set leaves the value resting on `wraps`, and that one is refused
+///   rather than blended under a guess.
+/// - **`A = Shade`.** No vertex-interpolated color exists here, matching
+///   the combiner's own `Shade` refusal.
+/// - **`B = FramebufferAlpha`.** The destination coverage *count*, which
+///   RGBA16's single stored bit cannot express.
+///
+/// Copy cycle is admitted unconditionally: [`BlendModeState::cycle_count`]
+/// returns 0 for it and [`blend_fragment`] then returns the source
+/// unchanged, which is the RDP's own blender bypass in that mode, not an
+/// approximation.
+fn require_blendable_mode(state: BlendModeState) -> Result<(), TexrectExecutionError> {
+    let cycle_count = state.cycle_count();
+    if cycle_count == 0 {
+        return Ok(());
+    }
+    // `blend_enabled = force_blend() || (antialias_enabled() && !wraps)`
+    // (`fn64-render-reference/src/raster/coverage.rs:69`). Only the middle
+    // case consults `wraps`: `force_blend()` short-circuits the disjunction
+    // to `true`, and a clear `AA_EN` short-circuits the conjunction to
+    // `false`. Refusing every `FORCE_BL`-clear mode instead of only this
+    // one was measured wrong -- three composed one-cycle fixtures latch
+    // other-mode low `0`, where `AA_EN` is clear and `blend_enabled` is
+    // exactly `false` with no coverage count needed.
+    if !state.other_mode.force_blend() && state.other_mode.antialias_enabled() {
+        return Err(TexrectExecutionError::BlendEnabledNotDerivable);
+    }
+    for cycle_index in 0..cycle_count {
+        let cycle = state.cycle(cycle_index);
+        if matches!(cycle.a, crate::blend::BlendAlphaInput::Shade) {
+            return Err(TexrectExecutionError::UnsupportedBlendShadeAlpha);
+        }
+        if cycle.requires_framebuffer_alpha() {
+            return Err(TexrectExecutionError::UnsupportedBlendFramebufferAlpha);
+        }
+    }
+    Ok(())
+}
+
+/// Reads one already-stored destination pixel back out of the target's own
+/// pixel format into the RGBA8888 domain the blender consumes.
+///
+/// The exact inverse of [`write_pixel`], and deliberately written as its
+/// mirror: RGBA16's three 5-bit channels expand through
+/// [`crate::targets::fill::expand_five`]'s `(v << 3) | (v >> 2)` -- the same
+/// expansion `decode_fill_cycle_pixel` already applies to a fill color, so a
+/// pixel this executor wrote and a pixel the fill executor wrote decode
+/// identically. RGBA16's single stored bit is **coverage**, not retained
+/// pixel alpha (`fn64-render-reference/src/backend/framebuffer_io.rs:120-122`
+/// states the same for the oracle's own packing), so it expands to a full or
+/// empty coverage count rather than to an alpha byte.
+///
+/// The returned [`BlendFramebufferSample::rgba`]'s alpha channel is the
+/// coverage-derived value the same bit encodes; this executor's admitted
+/// modes never select [`crate::blend::BlendBInput::FramebufferAlpha`] (see
+/// [`blend_texrect_fragment`]'s own refusal), so no admitted program reads
+/// it as a blend term.
+fn read_pixel(format: ColorTargetFormat, source: &[u8]) -> BlendFramebufferSample {
+    match format {
+        ColorTargetFormat::Rgba16 => {
+            let packed = u16::from_be_bytes([source[0], source[1]]);
+            let expand = |value: u16| -> u8 {
+                let value = value as u8;
+                (value << 3) | (value >> 2)
+            };
+            let coverage_bit = (packed & 1) as u8;
+            BlendFramebufferSample {
+                rgba: [
+                    expand((packed >> 11) & 0x1f),
+                    expand((packed >> 6) & 0x1f),
+                    expand((packed >> 1) & 0x1f),
+                    if coverage_bit != 0 { 255 } else { 0 },
+                ],
+                coverage_count: if coverage_bit != 0 { 8 } else { 0 },
+            }
+        }
+        ColorTargetFormat::Rgba32 => BlendFramebufferSample {
+            rgba: [source[0], source[1], source[2], source[3]],
+            coverage_count: source[3] >> 5,
+        },
+    }
+}
+
+/// Runs the RDP blender over one combined fragment against the destination
+/// pixel already stored in the target.
+///
+/// This is the stage this executor's header previously declared it did not
+/// run. It is not a second blender: [`blend_fragment`] is `crate::blend`'s
+/// already-landed literal port of the reference rasterizer's
+/// `blend_fragment` (`crates/fn64-render-reference/src/raster/blend.rs:157-240`),
+/// reached here rather than reimplemented, so a disagreement between this
+/// executor and that port is unrepresentable rather than merely tested for.
+///
+/// **`blend_enabled` is `force_blend()`, not a coverage derivation.** The
+/// reference computes it as `force_blend() || (antialias_enabled() &&
+/// !wraps)` (`raster/coverage.rs:69`), where `wraps` needs the destination
+/// coverage *count* this executor does not maintain -- RGBA16 stores one
+/// coverage bit, not the three the count needs, and the executor declares no
+/// coverage stage. [`require_blendable_mode`] admits only the modes where
+/// the disjunction settles without `wraps`, and on every one of them
+/// `force_blend()` is the disjunction's exact value: `true` when
+/// `FORCE_BL` is set, and `false` when `AA_EN` is clear (which collapses
+/// the other disjunct). So no admitted fragment reaches the blender with a
+/// `blend_enabled` this executor guessed.
+///
+/// # Errors
+/// [`TexrectExecutionError::Blend`] when the blender selects a framebuffer
+/// term with `IM_RD` disabled -- propagated, never substituted.
+fn blend_texrect_fragment(
+    combined: [u8; 4],
+    destination: BlendFramebufferSample,
+    state: BlendModeState,
+    column: u32,
+    row: u32,
+) -> Result<[u8; 4], TexrectExecutionError> {
+    let memory = state.other_mode.image_read_enabled().then_some(destination);
+    // `shade_alpha` is zero because this executor has no vertex-interpolated
+    // color; a cycle whose `A` selects `Shade` is refused before any pixel
+    // is produced (see `require_blendable_mode`), so the zero is never read.
+    // Exact on the admitted set, not a stand-in: see this function's own
+    // doc. A hardcoded `true` would additionally be wrong for the
+    // `AA_EN`-clear modes `require_blendable_mode` admits, where the RDP
+    // bypasses the last cycle.
+    let blend_enabled = state.other_mode.force_blend();
+    let BlendedFragment { rgba } = blend_fragment(combined, memory, 0, state, blend_enabled)
+        .map_err(|source| TexrectExecutionError::Blend {
+            column,
+            row,
+            source,
+        })?;
+    Ok(rgba)
+}
+
+/// Blends one combined fragment against the destination pixel already
+/// stored at `dest`, then writes the result back over it.
+///
+/// **The destination is read back out of the buffer being written**, not
+/// out of the caller's `resident_bytes`, so a later pixel in the same
+/// rectangle blends against an earlier one's result exactly as the RDP's
+/// serial per-pixel pipeline does. Reading `resident_bytes` instead would
+/// make an overlapping rectangle's self-composition invisible.
+///
+/// A named function rather than an inline block inside the pixel loop, for
+/// the reason [`combine_one_texel`]'s own doc records: an inline stage is
+/// unreachable from a unit test, so a mutation that drops it survives.
+///
+/// # Errors
+/// [`TexrectExecutionError::Blend`], propagated from
+/// [`blend_texrect_fragment`].
+fn blend_and_write_pixel(
+    format: ColorTargetFormat,
+    dest: &mut [u8],
+    combined: [u8; 4],
+    state: BlendModeState,
+    column: u32,
+    row: u32,
+) -> Result<(), TexrectExecutionError> {
+    let destination = read_pixel(format, dest);
+    let blended = blend_texrect_fragment(combined, destination, state, column, row)?;
+    write_pixel(format, dest, blended);
+    Ok(())
 }
 
 /// Packs one decoded RGBA8888 texel into the target's own pixel format.
@@ -1771,5 +2112,610 @@ mod one_cycle_tests {
                 "the refusal must state which modes ARE admitted: {message}"
             );
         }
+    }
+}
+
+/// The blender stage this executor runs, checked against hand-derived
+/// arithmetic rather than against either implementation's output.
+///
+/// Every expectation here is derived from WM2000's frame-0 packet's own
+/// latched words and the public `GBL_c1` formula, computed independently in
+/// the test body from those words -- never captured from a run. The
+/// measured whole-image consequence lives in `fn64-abi`'s
+/// `wm2000_frame_zero_*` comparison against `fn64-render-reference`; these
+/// pin the arithmetic that produces it.
+#[cfg(test)]
+mod blend_stage_tests {
+    use super::*;
+    use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput};
+
+    /// WM2000 frame 0's latched other-mode words, read off the captured
+    /// packet (`docs/RT64-WM2000-VALIDATION.md` §3): high `0x0000acef`
+    /// (one-cycle, RGB dither Disabled, alpha dither Noise), low
+    /// `0x005041c8` (`AA_EN`, `IM_RD`, `CLR_ON_CVG`, `cvg_dst = Wrap`,
+    /// `FORCE_BL`, `CVG_X_ALPHA` and `ALPHA_CVG_SEL` clear).
+    const WM2000_OTHER_MODE_HIGH: u32 = 0x0000_acef;
+    const WM2000_OTHER_MODE_LOW: u32 = 0x0050_41c8;
+
+    fn wm2000_other_mode() -> OtherMode {
+        OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, WM2000_OTHER_MODE_LOW)
+    }
+
+    fn wm2000_blend_state() -> BlendModeState {
+        TexrectBlendRegisters::new(None, None)
+            .mode_state(wm2000_other_mode())
+            .expect("WM2000's cycle selects neither the blend nor the fog register")
+    }
+
+    /// **Positive control for every expectation below.** The two wire words
+    /// really do decode to the mode the derivation assumes.
+    ///
+    /// Each field is asserted from the accessor AND reconciled against an
+    /// independent bit derivation of the same literal, so an off-by-one in
+    /// either the mask or the transcription contradicts itself rather than
+    /// agreeing by construction.
+    #[test]
+    fn wm2000_frame_zero_other_mode_decodes_to_the_derived_blender_state() {
+        let mode = wm2000_other_mode();
+        assert_eq!(mode.cycle_type(), CycleType::OneCycle);
+        assert_eq!(
+            (WM2000_OTHER_MODE_HIGH >> 20) & 0x3,
+            0,
+            "one-cycle, derived from the literal independently of the accessor"
+        );
+        assert!(mode.force_blend());
+        assert_eq!(WM2000_OTHER_MODE_LOW & 0x4000, 0x4000, "FORCE_BL is bit 14");
+        assert!(mode.image_read_enabled());
+        assert_eq!(WM2000_OTHER_MODE_LOW & 0x0040, 0x0040, "IM_RD is bit 6");
+
+        let cycle = ResolvedBlendCycleUnderTest::of(mode);
+        assert_eq!(cycle.p, BlendColorInput::Combined);
+        assert_eq!(cycle.a, BlendAlphaInput::Combined);
+        assert_eq!(cycle.m, BlendColorInput::Framebuffer);
+        assert_eq!(cycle.b, BlendBInput::OneMinusA);
+        // The same four selectors, re-derived from the literal's own bit
+        // fields rather than from `blender_cycle_1`.
+        assert_eq!((WM2000_OTHER_MODE_LOW >> 30) & 0x3, 0, "P = Combined");
+        assert_eq!((WM2000_OTHER_MODE_LOW >> 26) & 0x3, 0, "A = Combined");
+        assert_eq!((WM2000_OTHER_MODE_LOW >> 22) & 0x3, 1, "M = Framebuffer");
+        assert_eq!((WM2000_OTHER_MODE_LOW >> 18) & 0x3, 0, "B = OneMinusA");
+    }
+
+    struct ResolvedBlendCycleUnderTest;
+    impl ResolvedBlendCycleUnderTest {
+        fn of(mode: OtherMode) -> crate::blend::ResolvedBlendCycle {
+            crate::blend::ResolvedBlendCycle::from_wire(mode.blender_cycle_1())
+        }
+    }
+
+    /// **The hand-derivation the whole card rests on.**
+    ///
+    /// WM2000's texrect combiner is `(Zero - Zero) * Zero + Primitive` with
+    /// `SetPrimColor 0xffffffdf`, so the combined fragment is RGB 255 at
+    /// alpha 223. The cycle above is `P = Combined, A = Combined,
+    /// M = Framebuffer, B = 1 - A`, and `blend_fragment`'s
+    /// `M == Framebuffer` arm makes the composite
+    /// `combined * (223/255) + destination * (1 - 223/255)`.
+    ///
+    /// Derived here in the test, twice and by different routes: once as the
+    /// closed form, once by stepping the selector arms the same way the
+    /// blender does. The two must agree, so a transcription slip in either
+    /// contradicts itself rather than being confirmed by the implementation
+    /// it is supposed to check.
+    #[test]
+    fn the_wm2000_composite_is_hand_derived_over_a_zero_destination() {
+        const COMBINED: [u8; 4] = [255, 255, 255, 223];
+        let destination = BlendFramebufferSample {
+            rgba: [0, 0, 0, 255],
+            coverage_count: 8,
+        };
+
+        let a = f32::from(COMBINED[3]) / 255.0;
+        let closed_form = (f32::from(COMBINED[0]) * a + 0.0 * (1.0 - a)).round() as u8;
+
+        // The selector walk: P resolves to the combined color (cycle 0's
+        // `Combined`), M to the framebuffer; the `M == Framebuffer` arm
+        // keeps P as the blender color and makes A the composite factor.
+        let p = f32::from(COMBINED[0]);
+        let final_alpha = a;
+        let stepped = (p * final_alpha + 0.0 * (1.0 - final_alpha)).round() as u8;
+        assert_eq!(
+            closed_form, stepped,
+            "the two derivations of the same composite must agree"
+        );
+        assert_eq!(closed_form, 223, "255 * 223/255 over a zero destination");
+
+        let blended = blend_texrect_fragment(COMBINED, destination, wm2000_blend_state(), 0, 0)
+            .expect("WM2000's mode is admitted");
+        assert_eq!(blended[0..3], [223, 223, 223]);
+        // **A corrected derivation, kept as a correction.** The first draft
+        // expected 223 here by assuming the alpha channel composites the
+        // same way RGB does. It does not: `blend_fragment` composites alpha
+        // as `255 * final_alpha + memory_alpha * (1 - final_alpha)`
+        // (`crates/fn64-render-reference/src/raster/blend.rs:232-236`) --
+        // the *source* alpha term is the constant 255, not the fragment's
+        // own 223. With the destination's alpha byte also 255 the result is
+        // 255 for every `final_alpha`. The test caught the wrong
+        // expectation; the implementation was right.
+        let memory_alpha = f32::from(destination.rgba[3]);
+        let derived_alpha = (255.0 * a + memory_alpha * (1.0 - a)).round() as u8;
+        assert_eq!(derived_alpha, 255);
+        assert_eq!(blended[3], derived_alpha);
+
+        // And the packed RGBA16 halfword the executor writes, derived from
+        // `write_pixel`'s own `>> 3` / `>> 7` packing rather than quoted.
+        let mut packed = [0u8; 2];
+        write_pixel(ColorTargetFormat::Rgba16, &mut packed, blended);
+        let five = 223u16 >> 3;
+        let expected = (five << 11) | (five << 6) | (five << 1) | u16::from(blended[3] >> 7);
+        assert_eq!(u16::from_be_bytes(packed), expected);
+        assert_eq!(
+            expected, 0xdef7,
+            "27 in all three channels, coverage bit set"
+        );
+        // The alpha correction above does not move this pixel: 223 and 255
+        // both set `>> 7`, so the packed halfword is the same either way.
+        // Stated because it is the reason the wrong expectation could have
+        // survived a whole-image comparison unnoticed.
+        assert_eq!(223u8 >> 7, blended[3] >> 7);
+    }
+
+    /// The unblended value the executor produced before this stage existed,
+    /// asserted as a **contrast**, so a regression that silently drops the
+    /// blender is a failing assertion rather than a quiet return to the
+    /// old output.
+    ///
+    /// Asserted through [`blend_and_write_pixel`] -- **the executor's own
+    /// per-pixel composition**, the exact function the sampling loop calls
+    /// -- not through `blend_texrect_fragment` alone. Measured, not
+    /// stylistic: while this test went through the lower helper, deleting
+    /// the blender call from the pixel loop left this crate's entire suite
+    /// green and was caught only by `fn64-abi`'s whole-image comparison.
+    /// A mutant that survives is first a question about the test's reach.
+    #[test]
+    fn skipping_the_blender_would_produce_a_different_pixel() {
+        const COMBINED: [u8; 4] = [255, 255, 255, 223];
+        let mut unblended = [0u8; 2];
+        write_pixel(ColorTargetFormat::Rgba16, &mut unblended, COMBINED);
+        assert_eq!(
+            u16::from_be_bytes(unblended),
+            0xffff,
+            "the pre-blend combiner output, which the port used to publish"
+        );
+
+        // A zero destination, which is what WM2000's Fill-cycle
+        // `0x00010001` decodes to: RGB 0 with the coverage bit set.
+        let mut stored = 0x0001u16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            COMBINED,
+            wm2000_blend_state(),
+            0,
+            0,
+        )
+        .expect("WM2000's mode is admitted");
+        assert_ne!(
+            u16::from_be_bytes(stored),
+            u16::from_be_bytes(unblended),
+            "running the blender must change this pixel; if it does not, the stage is not running"
+        );
+        assert_eq!(
+            u16::from_be_bytes(stored),
+            0xdef7,
+            "the blended value derived in \
+             `the_wm2000_composite_is_hand_derived_over_a_zero_destination`"
+        );
+    }
+
+    /// The destination a pixel blends against is the **buffer being
+    /// written**, not the caller's incoming resident bytes, so two writes
+    /// to the same pixel compose serially the way the RDP's per-pixel
+    /// pipeline does.
+    ///
+    /// Without this, reading `resident_bytes` instead would pass every
+    /// other test in this module -- every one of them writes each pixel
+    /// once.
+    #[test]
+    fn a_second_write_to_one_pixel_blends_against_the_first() {
+        const COMBINED: [u8; 4] = [255, 255, 255, 223];
+        let state = wm2000_blend_state();
+        let mut stored = 0x0001u16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            COMBINED,
+            state,
+            0,
+            0,
+        )
+        .unwrap();
+        let after_first = u16::from_be_bytes(stored);
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            COMBINED,
+            state,
+            0,
+            0,
+        )
+        .unwrap();
+        let after_second = u16::from_be_bytes(stored);
+        assert_ne!(
+            after_first, after_second,
+            "the second write must see the first's result as its destination"
+        );
+
+        // Hand-derived: the first write leaves 5-bit 27, which `read_pixel`
+        // expands to `(27 << 3) | (27 >> 2)` = 222. Blending white at
+        // 223/255 over 222 gives 222 + 33/255*... -- computed here rather
+        // than quoted.
+        let a = 223.0f32 / 255.0;
+        let first_channel = ((27u8 << 3) | (27u8 >> 2)) as f32;
+        let second = (255.0 * a + first_channel * (1.0 - a)).round() as u16;
+        let five = second >> 3;
+        assert_eq!(after_second >> 11, five);
+    }
+
+    /// Source and destination are **not** interchangeable in this
+    /// composite. Swapping them is a standard mutation, and without this
+    /// it survives on WM2000's own fixture only because its destination is
+    /// zero -- so the witness deliberately uses a non-zero destination.
+    ///
+    /// **The first witness was wrong and is recorded as a correction.**
+    /// Alpha 128 was chosen by hand; at `128/255 = 0.50196` the composite is
+    /// symmetric to within a byte and the "swapped" result was *identical*
+    /// (`[108, 150, 145]` both ways), so the mutation it was written to
+    /// catch survived. Alpha 64 separates them (`[62, 175, 192]` vs
+    /// `[154, 125, 98]`). A hand-picked witness near `a = 1/2` proves
+    /// nothing here.
+    #[test]
+    fn the_blend_source_and_destination_are_not_interchangeable() {
+        const COMBINED: [u8; 4] = [200, 100, 50, 64];
+        let destination = BlendFramebufferSample {
+            rgba: [16, 200, 240, 255],
+            coverage_count: 8,
+        };
+        let state = wm2000_blend_state();
+        let forward = blend_texrect_fragment(COMBINED, destination, state, 0, 0).unwrap();
+
+        let swapped_combined = [
+            destination.rgba[0],
+            destination.rgba[1],
+            destination.rgba[2],
+            COMBINED[3],
+        ];
+        let swapped_destination = BlendFramebufferSample {
+            rgba: [COMBINED[0], COMBINED[1], COMBINED[2], destination.rgba[3]],
+            coverage_count: destination.coverage_count,
+        };
+        let reversed =
+            blend_texrect_fragment(swapped_combined, swapped_destination, state, 0, 0).unwrap();
+        assert_ne!(
+            forward[0..3],
+            reversed[0..3],
+            "P and M are asymmetric: A weights the source and (1 - A) the destination"
+        );
+
+        // Hand-derived, both directions, at alpha 64/255.
+        let a = f32::from(COMBINED[3]) / 255.0;
+        let expect =
+            |src: u8, dst: u8| (f32::from(src) * a + f32::from(dst) * (1.0 - a)).round() as u8;
+        assert_eq!(forward[0], expect(200, 16));
+        assert_eq!(forward[1], expect(100, 200));
+        assert_eq!(forward[2], expect(50, 240));
+    }
+
+    /// Rounding, not truncation, and it is observable. The witness is
+    /// chosen by exhaustive search below rather than guessed -- most
+    /// (source, destination, alpha) triples round and truncate to the same
+    /// byte, which is exactly why a spot check would have let the mutation
+    /// live.
+    #[test]
+    fn the_blend_composite_rounds_rather_than_truncating() {
+        let state = wm2000_blend_state();
+        let mut witnesses = 0usize;
+        for alpha in [1u8, 64, 128, 200, 223, 254] {
+            for source in [0u8, 1, 7, 100, 200, 255] {
+                for destination in [0u8, 3, 9, 128, 255] {
+                    let a = f32::from(alpha) / 255.0;
+                    let exact = f32::from(source) * a + f32::from(destination) * (1.0 - a);
+                    let rounded = exact.round() as u8;
+                    let truncated = exact as u8;
+                    if rounded == truncated {
+                        continue;
+                    }
+                    witnesses += 1;
+                    let blended = blend_texrect_fragment(
+                        [source, source, source, alpha],
+                        BlendFramebufferSample {
+                            rgba: [destination, destination, destination, 255],
+                            coverage_count: 8,
+                        },
+                        state,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        blended[0], rounded,
+                        "source {source} over destination {destination} at alpha {alpha}: \
+                         the composite must round ({rounded}), not truncate ({truncated})"
+                    );
+                }
+            }
+        }
+        assert!(
+            witnesses > 0,
+            "the sweep must contain at least one triple where rounding and truncation differ, \
+             or it proves nothing about which one runs"
+        );
+    }
+
+    /// `read_pixel`'s 5-bit expansion is the crate's existing one, asserted
+    /// against **the fill executor's own decode** rather than against a
+    /// literal.
+    ///
+    /// The round-trip test below cannot catch this on its own, and that is
+    /// measured, not assumed: dropping the `>> 2` low-bit replication
+    /// leaves `write_pixel`'s `>> 3` recovering the same five bits, so the
+    /// round trip is preserved while every non-zero destination changes
+    /// (5-bit 27 expands to 222 with the replication and 216 without). The
+    /// mutant survived until this test existed.
+    ///
+    /// The authority is [`crate::targets::decode_fill_cycle_pixel`], which
+    /// applies the identical `(value << 3) | (value >> 2)` to a fill colour
+    /// (`targets/fill.rs`'s `expand_five`) and is itself the port of the
+    /// oracle's `decode_16` (`fn64-render-reference/src/raster/draw.rs:130-142`).
+    /// A destination the fill executor wrote must decode back to the colour
+    /// the fill executor meant, or the two halves of a composed image
+    /// disagree about their shared format.
+    #[test]
+    fn read_pixel_expands_five_bit_channels_the_way_the_fill_decode_does() {
+        use crate::state::FillColor;
+        use crate::targets::decode_fill_cycle_pixel;
+        for five in 0u16..32 {
+            // A fill colour whose even-column halfword carries `five` in
+            // all three channels with the coverage bit set.
+            let halfword = (five << 11) | (five << 6) | (five << 1) | 1;
+            let fill_word = (u32::from(halfword) << 16) | u32::from(halfword);
+            let from_fill = decode_fill_cycle_pixel(
+                FillColor::from_wire(fill_word),
+                ColorTargetFormat::Rgba16,
+                0,
+            );
+            let from_read = read_pixel(ColorTargetFormat::Rgba16, &halfword.to_be_bytes());
+            assert_eq!(
+                [from_read.rgba[0], from_read.rgba[1], from_read.rgba[2]],
+                [from_fill.red, from_fill.green, from_fill.blue],
+                "read_pixel and the fill decode must expand 5-bit {five} identically"
+            );
+            // And reconciled against an independent derivation of the same
+            // expansion, so a shared slip in both would still contradict.
+            let value = five as u8;
+            assert_eq!(from_read.rgba[0], (value << 3) | (value >> 2));
+        }
+        // The witness that separates the two expansions, named so a
+        // "simplification" to `<< 3` fails loudly rather than silently.
+        assert_eq!(
+            read_pixel(ColorTargetFormat::Rgba16, &(27u16 << 11).to_be_bytes()).rgba[0],
+            222,
+            "5-bit 27 expands to 222, not 216: the low-bit replication is load bearing"
+        );
+    }
+
+    /// `read_pixel` is the exact inverse of `write_pixel` on every value
+    /// RGBA16 can hold, so a destination the executor wrote decodes back to
+    /// the color it meant. Exhaustive over all 65,536 halfwords, not
+    /// sampled.
+    ///
+    /// **Necessary but not sufficient** -- see
+    /// `read_pixel_expands_five_bit_channels_the_way_the_fill_decode_does`
+    /// for the expansion this round trip cannot see.
+    #[test]
+    fn read_pixel_inverts_write_pixel_over_every_rgba16_halfword() {
+        for raw in 0u16..=u16::MAX {
+            let stored = raw.to_be_bytes();
+            let sample = read_pixel(ColorTargetFormat::Rgba16, &stored);
+            let mut round_tripped = [0u8; 2];
+            write_pixel(ColorTargetFormat::Rgba16, &mut round_tripped, sample.rgba);
+            assert_eq!(
+                u16::from_be_bytes(round_tripped),
+                raw,
+                "read_pixel then write_pixel must be the identity on {raw:#06x}"
+            );
+        }
+    }
+
+    /// Copy cycle runs no blender at all -- `cycle_count() == 0` is the
+    /// RDP's own bypass, not this executor declining to implement one. A
+    /// mutation that blends in Copy cycle changes the pixel; this catches
+    /// it.
+    #[test]
+    fn copy_cycle_passes_the_fragment_through_unblended() {
+        let copy_mode = OtherMode::from_wire(2 << 20, WM2000_OTHER_MODE_LOW);
+        assert_eq!(copy_mode.cycle_type(), CycleType::Copy);
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(copy_mode)
+            .expect("Copy cycle reads no blender register");
+        assert_eq!(state.cycle_count(), 0);
+        const TEXEL: [u8; 4] = [200, 100, 50, 128];
+        let blended = blend_texrect_fragment(
+            TEXEL,
+            BlendFramebufferSample {
+                rgba: [16, 200, 240, 255],
+                coverage_count: 8,
+            },
+            state,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(blended, TEXEL, "Copy cycle blits the texel unchanged");
+    }
+
+    /// Each of the three admission refusals fires by name, and none of
+    /// them fires on WM2000's own mode.
+    #[test]
+    fn every_unevaluatable_blender_mode_is_refused_by_name() {
+        assert_eq!(require_blendable_mode(wm2000_blend_state()), Ok(()));
+
+        // FORCE_BL clear (bit 14) with AA_EN set (bit 3): the one case
+        // where `blend_enabled` rests on the coverage count.
+        let no_force =
+            OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, WM2000_OTHER_MODE_LOW & !0x4000);
+        assert!(!no_force.force_blend());
+        assert!(no_force.antialias_enabled(), "WM2000's mode sets AA_EN");
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(no_force)
+            .unwrap();
+        assert_eq!(
+            require_blendable_mode(state),
+            Err(TexrectExecutionError::BlendEnabledNotDerivable)
+        );
+
+        // **The narrowing, pinned.** FORCE_BL clear AND AA_EN clear is
+        // admitted, because `force_blend() || (antialias_enabled() &&
+        // !wraps)` is then `false` outright with no `wraps` consulted.
+        // Refusing this case too was measured wrong: three composed
+        // one-cycle fixtures in `production.rs` latch other-mode low `0`
+        // and had executed correctly for the life of the texrect path.
+        let no_force_no_aa = OtherMode::from_wire(
+            WM2000_OTHER_MODE_HIGH,
+            WM2000_OTHER_MODE_LOW & !0x4000 & !0x0008,
+        );
+        assert!(!no_force_no_aa.force_blend());
+        assert!(!no_force_no_aa.antialias_enabled());
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(no_force_no_aa)
+            .unwrap();
+        assert_eq!(require_blendable_mode(state), Ok(()));
+        // And that admitted mode bypasses the blender: `is_last &&
+        // !blend_enabled` selects P, which is `Combined`, leaving the
+        // fragment unchanged. Derived from the selector, not from a run.
+        const FRAGMENT: [u8; 4] = [200, 100, 50, 64];
+        assert_eq!(
+            crate::blend::ResolvedBlendCycle::from_wire(no_force_no_aa.blender_cycle_1()).p,
+            BlendColorInput::Combined
+        );
+        assert_eq!(
+            blend_texrect_fragment(
+                FRAGMENT,
+                BlendFramebufferSample {
+                    rgba: [16, 200, 240, 255],
+                    coverage_count: 8,
+                },
+                state,
+                0,
+                0,
+            )
+            .unwrap()[0..3],
+            FRAGMENT[0..3],
+            "the no-FORCE_BL last-cycle bypass selects P = Combined unchanged"
+        );
+
+        // A = Shade: cycle 1's alpha_a is bits 26:27, encoding 2.
+        let shade_low = (WM2000_OTHER_MODE_LOW & !(0x3 << 26)) | (0x2 << 26);
+        let shade = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, shade_low);
+        assert_eq!(
+            crate::blend::ResolvedBlendCycle::from_wire(shade.blender_cycle_1()).a,
+            BlendAlphaInput::Shade
+        );
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(shade)
+            .unwrap();
+        assert_eq!(
+            require_blendable_mode(state),
+            Err(TexrectExecutionError::UnsupportedBlendShadeAlpha)
+        );
+
+        // B = FramebufferAlpha: cycle 1's alpha_b is bits 18:19, encoding 1.
+        let fba_low = (WM2000_OTHER_MODE_LOW & !(0x3 << 18)) | (0x1 << 18);
+        let fba = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, fba_low);
+        assert_eq!(
+            crate::blend::ResolvedBlendCycle::from_wire(fba.blender_cycle_1()).b,
+            BlendBInput::FramebufferAlpha
+        );
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(fba)
+            .unwrap();
+        assert_eq!(
+            require_blendable_mode(state),
+            Err(TexrectExecutionError::UnsupportedBlendFramebufferAlpha)
+        );
+    }
+
+    /// A blender cycle that reads an unset `SetBlendColor`/`SetFogColor`
+    /// is a named refusal, never a silently-black default -- matching the
+    /// combiner's own `UnsetConstantRegister` treatment of `SetPrimColor`
+    /// and `SetEnvColor`.
+    #[test]
+    fn an_unset_blender_register_is_refused_only_when_a_cycle_reads_it() {
+        // P = Blend is cycle 1's color_a (bits 30:31) encoding 2.
+        let blend_low = (WM2000_OTHER_MODE_LOW & !(0x3u32 << 30)) | (0x2u32 << 30);
+        let mode = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, blend_low);
+        assert_eq!(
+            TexrectBlendRegisters::new(None, None).mode_state(mode),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Blend
+            })
+        );
+        assert!(
+            TexrectBlendRegisters::new(Some(Color4::from_wire(0x1122_3344)), None)
+                .mode_state(mode)
+                .is_ok()
+        );
+
+        // A = Fog is cycle 1's alpha_a (bits 26:27) encoding 1.
+        let fog_low = (WM2000_OTHER_MODE_LOW & !(0x3 << 26)) | (0x1 << 26);
+        let mode = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, fog_low);
+        assert_eq!(
+            TexrectBlendRegisters::new(None, None).mode_state(mode),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Fog
+            })
+        );
+        assert!(
+            TexrectBlendRegisters::new(None, Some(Color4::from_wire(0x5566_7788)))
+                .mode_state(mode)
+                .is_ok()
+        );
+
+        // WM2000's own cycle reads neither, so both stay legitimately unset.
+        assert!(TexrectBlendRegisters::new(None, None)
+            .mode_state(wm2000_other_mode())
+            .is_ok());
+    }
+
+    /// `IM_RD` disabled with a `Framebuffer` selector is propagated as a
+    /// named error, never substituted with a zero destination.
+    #[test]
+    fn a_framebuffer_selector_without_image_read_is_refused_by_name() {
+        let no_read = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, WM2000_OTHER_MODE_LOW & !0x0040);
+        assert!(!no_read.image_read_enabled());
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(no_read)
+            .unwrap();
+        let error = blend_texrect_fragment(
+            [255, 255, 255, 223],
+            BlendFramebufferSample {
+                rgba: [0, 0, 0, 255],
+                coverage_count: 8,
+            },
+            state,
+            7,
+            9,
+        )
+        .expect_err("a Framebuffer selector with IM_RD clear has no legal destination");
+        let TexrectExecutionError::Blend {
+            column,
+            row,
+            source,
+        } = error
+        else {
+            panic!("expected the blender's own refusal, got {error:?}");
+        };
+        assert_eq!((column, row), (7, 9), "the refusal names the pixel");
+        assert_eq!(source.selector, "framebuffer color");
     }
 }
