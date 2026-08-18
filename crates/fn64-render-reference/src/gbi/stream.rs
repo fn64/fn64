@@ -1,16 +1,13 @@
-use fn64_render::{
-    MicrocodeDataImageIdentity, TaskAdmissionGeneration,
-    TaskAdmissionSource,
-};
-use sha2::{Digest, Sha256};
-use super::*;
-use super::wire::*;
-use super::types::*;
-use super::matrix::*;
-use super::tmem::*;
-use super::state::*;
 use super::entries::*;
 use super::geometry::*;
+use super::matrix::*;
+use super::state::*;
+use super::tmem::*;
+use super::types::*;
+use super::wire::*;
+use super::*;
+use fn64_render::{MicrocodeDataImageIdentity, TaskAdmissionGeneration, TaskAdmissionSource};
+use sha2::{Digest, Sha256};
 
 pub(super) fn decode_stream(
     rdram: &mut [u8],
@@ -263,6 +260,10 @@ pub(super) fn decode_stream_impl(
         pc += 8;
 
         super::census::note(opcode, raw_rdp);
+        // Same `(w0, w1)` bindings dispatch matches on, and the same
+        // site the histogram counts from, so a dumped word pair and a
+        // census row cannot disagree about what was decoded.
+        super::census::packet::note(command_pc, w0, w1, raw_rdp);
 
         if !raw_rdp && family.is_line() && matches!(opcode, G_TRI2 | G_QUAD) {
             crate::render_unsupported_panic(
@@ -1323,6 +1324,15 @@ pub(super) fn decode_stream_impl(
             G_TEXRECT | G_TEXRECTFLIP => {
                 let (coords, gradients, continuation_bytes) =
                     decode_texture_rectangle_continuation(rdram, pc, *family, raw_rdp, opcode);
+                // The dispatch-site dump sees only (w0, w1). This pair
+                // carries the S/T origin and the per-pixel gradients, and a
+                // replay without them would fabricate texture coordinates.
+                // On the raw-RDP lane the pair IS the wire words at `pc`
+                // (`decode_texture_rectangle_continuation` returns them
+                // unmodified, 8 bytes), so a dumped row at `pc` reconstructs
+                // the wire stream exactly; on the GBI lane the same pair is
+                // the RDPHALF-envelope payload, which is what dispatch used.
+                super::census::packet::note_continuation(pc, coords, gradients, raw_rdp);
                 pc += continuation_bytes;
                 if continuation_bytes == 16 {
                     state.cmds_decoded += 2;
