@@ -1139,8 +1139,19 @@ mod game {
                     // close the window cannot be repeated identically, and
                     // "any timing claim needs repeated runs" is the bar.
                     self.pump_census.report_once(self.active_renderer);
-                    event_loop.exit();
-                    return;
+                    // Terminate from HERE rather than by unwinding to
+                    // `run_app`'s return. The ordinary exit path was observed
+                    // to print "exited cleanly" and then hang with the
+                    // process alive and its CPU time frozen -- a benchmark
+                    // driver that waits on such a process waits forever, and
+                    // killing it mid-matrix is how a run gets truncated into
+                    // a plausible short log. Everything this census measures
+                    // is already flushed above; the guest coroutines a normal
+                    // teardown exists to seal are not observed after it.
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(0);
                 }
                 self.pump_steps_total = self.pump_steps_total.saturating_add(outcome.steps);
                 self.pump_steps_max = self.pump_steps_max.max(outcome.steps);
