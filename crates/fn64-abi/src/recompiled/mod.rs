@@ -73,9 +73,13 @@ thread_local! {
         std::cell::Cell<Option<FunctionEntryObservationSchema>> =
         const { std::cell::Cell::new(None) };
     static FUNCTION_EXECUTION_DESTINATIONS:
-        RefCell<Vec<FunctionExecutionDestinationObservation>> = const {
-        RefCell::new(Vec::new())
+        RefCell<VecDeque<FunctionExecutionDestinationObservation>> = const {
+        RefCell::new(VecDeque::new())
     };
+    static FUNCTION_EXECUTION_DESTINATION_HISTORY_LIMIT: Cell<Option<NonZeroUsize>> = const {
+        Cell::new(None)
+    };
+    static FUNCTION_EXECUTION_DESTINATION_HISTORY_ENABLED: Cell<bool> = const { Cell::new(true) };
     static BLOCK_HOST_BOUNDARIES: RefCell<VecDeque<BlockHostBoundaryObservation>> = const {
         RefCell::new(VecDeque::new())
     };
@@ -157,10 +161,7 @@ fn next_sp_writer_trace_epoch_id() -> u64 {
 }
 
 fn next_cpu_writer_trace_epoch_id() -> u64 {
-    next_writer_trace_epoch_id(
-        &NEXT_CPU_WRITER_TRACE_EPOCH_ID,
-        "CPU instruction-store",
-    )
+    next_writer_trace_epoch_id(&NEXT_CPU_WRITER_TRACE_EPOCH_ID, "CPU instruction-store")
 }
 
 fn next_pi_writer_trace_epoch_id() -> u64 {
@@ -940,9 +941,7 @@ impl WatchedExecutableBytesV1 {
                 let words = body / 4;
                 while word < words {
                     let chunk = CHUNK.min(words - word);
-                    if live[word * 4..(word + chunk) * 4]
-                        == mirror[word * 4..(word + chunk) * 4]
-                    {
+                    if live[word * 4..(word + chunk) * 4] == mirror[word * 4..(word + chunk) * 4] {
                         word += chunk;
                         continue;
                     }
@@ -1058,7 +1057,10 @@ impl WatchedExecutableBytesV1 {
     /// bytes have an identical digest.
     fn refresh_page_digests_over(&mut self, changed: &[(u32, u32)]) {
         let len = self.expected.len();
-        debug_assert_eq!(self.expected_page_tree.leaves().len(), Self::page_count(len));
+        debug_assert_eq!(
+            self.expected_page_tree.leaves().len(),
+            Self::page_count(len)
+        );
         let mut dirty: Vec<usize> = Vec::new();
         let mut previous: Option<usize> = None;
         for &(physical_start, physical_end) in changed {
@@ -1925,13 +1927,13 @@ impl CatalogResolverInstallV1 {
     }
 }
 
-mod receipts;
-mod validation;
-mod live_program;
-mod snapshots;
 mod execution;
 mod host_memory;
+mod live_program;
+mod receipts;
 mod runners;
+mod snapshots;
+mod validation;
 
 // `execution`, `receipts`, `runners`, and `snapshots` carry this module's
 // public surface, so their globs stay `pub use`. `validation` holds only
