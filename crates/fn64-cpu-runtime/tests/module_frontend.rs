@@ -171,13 +171,23 @@ static LOOKUP_TABLE: &[(u32, RecompFunc)] = &[
     (0x80003000, tail_caller as RecompFunc),
 ];
 
+// Vrams claimed by more than one overlay bank: resolved against guest residency.
+// Empty for this synthetic module: no two of its three functions share a vram.
+// `banked_dispatch` below builds its own collided table to exercise the path.
+static BANKED_LOOKUP_TABLE: &[(u32, &[(usize, &'static str, RecompFunc)])] = &[];
+
 pub fn lookup(vram: u32) -> RecompFunc {
     if let Some(func) = resolve_host_function(vram) {
         return func;
     }
     match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
         Ok(index) => LOOKUP_TABLE[index].1,
-        Err(_) => panic!("lookup: no recompiled function or host shim at vram {vram:#010X}"),
+        Err(_) => match BANKED_LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
+            Ok(index) => {
+                fn64_cpu_runtime::resolve_banked_function(vram, BANKED_LOOKUP_TABLE[index].1)
+            }
+            Err(_) => panic!("lookup: no recompiled function or host shim at vram {vram:#010X}"),
+        },
     }
 }
 
@@ -339,4 +349,217 @@ fn host_lookup_overrides_recompiled_table_without_unsafe() {
     lookup(CALLEE_VRAM)(&mut ctx, &mut mem);
     set_host_lookup(previous);
     assert_eq!(ctx.r(2), 99);
+}
+
+// --- Bank-aware dispatch of a VRAM claimed by two overlay banks ---
+//
+// WM2000's `bank1_text` and `bank4_text` both link at 0x800E1B90, so two
+// differently-named bodies claim one address. A flat `vram -> fn` table cannot
+// express that, and dropping both bodies made 42 of them undispatchable — the
+// exact trap the rs lane hit before its first VI swap. These tests assert the
+// resolution follows the guest's *actual* residency, and that it traps rather
+// than picking when residency does not name exactly one bank.
+//
+// Every assertion checks WHICH body ran, not merely that one did: a
+// "first-claimant" mutation resolves a function too, and a length-or-liveness
+// assertion would let it survive.
+
+const BANKED_VRAM: u32 = 0x800E_1B90;
+const BANK_A_SECTION: usize = 2;
+const BANK_B_SECTION: usize = 5;
+/// A section registered but never a claimant of `BANKED_VRAM`. Marking it
+/// resident must not make a contested vram resolvable.
+const UNRELATED_SECTION: usize = 1;
+
+/// Distinct sentinel per bank so an assertion names the body, not just a hit.
+fn bank_a_body(ctx: &mut RecompContext, _mem: &mut Rdram) {
+    ctx.set_r32(2, 0x0A);
+}
+
+fn bank_b_body(ctx: &mut RecompContext, _mem: &mut Rdram) {
+    ctx.set_r32(2, 0x0B);
+}
+
+fn banked_claimants() -> Vec<(usize, &'static str, RecompFunc)> {
+    vec![
+        (BANK_A_SECTION, "func_800E1B90", bank_a_body as RecompFunc),
+        (
+            BANK_B_SECTION,
+            "func_800E1B90_bank4_text",
+            bank_b_body as RecompFunc,
+        ),
+    ]
+}
+
+thread_local! {
+    static RESIDENT_SECTIONS: std::cell::RefCell<Vec<usize>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn test_section_resident(index: usize) -> bool {
+    RESIDENT_SECTIONS.with(|set| set.borrow().contains(&index))
+}
+
+/// Install a residency answer and run `body` with it, restoring afterwards.
+fn with_resident<T>(sections: &[usize], body: impl FnOnce() -> T) -> T {
+    RESIDENT_SECTIONS.with(|set| *set.borrow_mut() = sections.to_vec());
+    let previous = fn64_cpu_runtime::set_host_section_resident(Some(test_section_resident));
+    let out = body();
+    fn64_cpu_runtime::set_host_section_resident(previous);
+    RESIDENT_SECTIONS.with(|set| set.borrow_mut().clear());
+    out
+}
+
+fn run_banked() -> u64 {
+    let mut bytes = [0u8; 64];
+    let mut mem = Rdram::new(&mut bytes);
+    let mut ctx = RecompContext::new();
+    fn64_cpu_runtime::resolve_banked_function(BANKED_VRAM, &banked_claimants())(&mut ctx, &mut mem);
+    ctx.r(2)
+}
+
+/// POSITIVE CONTROL. Before asserting anything about residency, prove the
+/// fixture really is a collision: one vram, two differently-named claimants in
+/// two different sections, and the symbol table has dropped it from the flat
+/// direct-call map while retaining both claimants.
+#[test]
+fn fixture_really_is_a_two_bank_collision() {
+    let symbols = SymbolTable::from_section_entries([
+        (BANK_A_SECTION, "func_800E1B90", BANKED_VRAM),
+        (BANK_B_SECTION, "func_800E1B90_bank4_text", BANKED_VRAM),
+        (UNRELATED_SECTION, "uncontested", 0x8000_4000u32),
+    ]);
+    assert!(
+        symbols.is_ambiguous(BANKED_VRAM),
+        "fixture does not collide: the residency tests below would prove nothing"
+    );
+    assert_eq!(symbols.name_of(BANKED_VRAM), None);
+    assert_eq!(
+        symbols.ambiguous_claimants(),
+        vec![(
+            BANKED_VRAM,
+            vec![
+                (BANK_A_SECTION, "func_800E1B90"),
+                (BANK_B_SECTION, "func_800E1B90_bank4_text"),
+            ]
+        )],
+        "both claimants must be retained with their owning sections"
+    );
+    assert_eq!(symbols.banked_body_count(), 2);
+    // The uncontested vram is unaffected: it still resolves directly.
+    assert_eq!(symbols.name_of(0x8000_4000), Some("uncontested"));
+    assert!(!symbols.is_ambiguous(0x8000_4000));
+
+    // And the emitted dispatcher carries the collision, keyed by section.
+    let emitted = fn64_cpu_runtime_codegen::emit_lookup_dispatcher(&symbols);
+    assert!(
+        emitted.contains("static BANKED_LOOKUP_TABLE"),
+        "emitted dispatcher lacks the banked table:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(
+            "(0x800E1B90, &[(2, \"func_800E1B90\", func_800E1B90 as RecompFunc), \
+             (5, \"func_800E1B90_bank4_text\", func_800E1B90_bank4_text as RecompFunc), ]),"
+        ),
+        "banked row must name both claimants with their sections:\n{emitted}"
+    );
+    // The collided vram must NOT also appear in the flat table.
+    let flat = emitted
+        .split("static BANKED_LOOKUP_TABLE")
+        .next()
+        .expect("dispatcher has a flat table before the banked one");
+    assert!(
+        !flat.contains("0x800E1B90"),
+        "collided vram leaked into the flat table, where residency cannot be consulted:\n{flat}"
+    );
+}
+
+/// Bank A resident resolves bank A's body — asserted by its sentinel, so
+/// swapping the claimant order or defaulting to the first entry is caught.
+#[test]
+fn resident_bank_a_resolves_bank_a_body() {
+    assert_eq!(with_resident(&[BANK_A_SECTION], run_banked), 0x0A);
+}
+
+/// The mutation-killing twin: the SAME vram and the SAME claimant list, with
+/// only residency changed, must resolve the OTHER body. A "pick the first
+/// claimant" implementation passes the test above and fails this one.
+#[test]
+fn resident_bank_b_resolves_bank_b_body() {
+    assert_eq!(with_resident(&[BANK_B_SECTION], run_banked), 0x0B);
+}
+
+/// Residency of an unrelated section is not a licence to dispatch. This kills
+/// the "any section loaded => use the first claimant" mutation.
+#[test]
+fn unrelated_resident_section_does_not_resolve_a_contested_vram() {
+    let trapped = std::panic::catch_unwind(|| with_resident(&[UNRELATED_SECTION], run_banked));
+    assert!(
+        trapped.is_err(),
+        "a contested vram resolved while only an unrelated section was resident"
+    );
+}
+
+/// No resident claimant is a named trap, not a pick. The message must name the
+/// vram and every claimant so the next reader can act on it.
+#[test]
+fn no_resident_bank_traps_naming_the_vram_and_claimants() {
+    let message = std::panic::catch_unwind(|| with_resident(&[], run_banked))
+        .expect_err("no resident bank must trap");
+    let text = panic_text(&message);
+    assert!(
+        text.contains("0x800E1B90"),
+        "trap must name the vram: {text}"
+    );
+    assert!(
+        text.contains("func_800E1B90") && text.contains("func_800E1B90_bank4_text"),
+        "trap must name every claimant: {text}"
+    );
+    assert!(
+        text.contains("none is resident"),
+        "trap must say why it refused: {text}"
+    );
+}
+
+/// Two banks cannot occupy one window at once. If the host reports that, the
+/// residency source is wrong — say so loudly rather than choosing.
+#[test]
+fn two_resident_banks_trap_rather_than_choosing() {
+    let message =
+        std::panic::catch_unwind(|| with_resident(&[BANK_A_SECTION, BANK_B_SECTION], run_banked))
+            .expect_err("two resident claimants must trap");
+    let text = panic_text(&message);
+    assert!(
+        text.contains("0x800E1B90"),
+        "trap must name the vram: {text}"
+    );
+    assert!(
+        text.contains("MORE THAN ONE is \n                 resident")
+            || text.contains("MORE THAN ONE is resident"),
+        "trap must name the inconsistency: {text}"
+    );
+}
+
+/// With no residency query installed at all, nothing is resident, so a
+/// contested vram traps. A host that forgot to wire residency must not get a
+/// silently-chosen bank.
+#[test]
+fn absent_residency_query_traps_instead_of_defaulting() {
+    let previous = fn64_cpu_runtime::set_host_section_resident(None);
+    assert!(!fn64_cpu_runtime::host_section_resident(BANK_A_SECTION));
+    let trapped = std::panic::catch_unwind(run_banked);
+    fn64_cpu_runtime::set_host_section_resident(previous);
+    assert!(
+        trapped.is_err(),
+        "an unwired host must trap on a contested vram, not default to a bank"
+    );
+}
+
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
