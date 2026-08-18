@@ -1000,6 +1000,18 @@ mod game {
             }
             match event {
                 WindowEvent::CloseRequested => {
+                    // Same rule as Esc below: while the census is armed the
+                    // run ends at its pump budget and nowhere else. A
+                    // benchmark window sitting under whatever else is on the
+                    // desktop must not have its sample size decided by a
+                    // stray click or a window manager.
+                    if self.pump_census.armed() {
+                        println!(
+                            "[fn64-shell] close request IGNORED: FN64_PUMP_CENSUS is armed and \
+                             this run ends at its pump budget"
+                        );
+                        return;
+                    }
                     println!("[fn64-shell] window close requested -- exiting");
                     event_loop.exit();
                 }
