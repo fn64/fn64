@@ -6,8 +6,12 @@ publishes 230,400 bytes into guest RDRAM. It closed with the honest caveat
 that **no pixel was validated against anything**, and that a uniform `0xffff`
 majority "is equally consistent with a texel decode that saturates".
 
-This card takes that measurement. Every number here comes from a run on this
-machine, at `87925f36`.
+This card took that measurement at `87925f36` and found a 99.38%
+disagreement caused by one missing pipeline stage. It has since been
+**revised at `3817911f`**: the port now runs that stage, the diff is
+re-measured, and §3's original diagnosis of *why* the oracle produced two
+values is recorded as disproved and replaced. Every number here comes from a
+run on this machine.
 
 Companion docs: [`RT64-WM2000-REPLAY.md`](RT64-WM2000-REPLAY.md),
 [`RT64-WM2000-CENSUS.md`](RT64-WM2000-CENSUS.md),
@@ -16,30 +20,39 @@ assert").
 
 ---
 
-## 1. Headline: the two implementations DISAGREE, and the port is the one at fault
+## 1. Headline: the blender now runs, and the residual is the oracle's dither
 
-**114,481 of 115,200 pixels differ — 99.38%.** The 719 fill pixels agree
-byte-for-byte; every one of the 60 texrects' pixels disagrees.
+**100,235 of 115,200 pixels differ — 87.01%**, down from 114,481 (99.38%)
+before the port ran the blender.
 
 | | Port (`fn64-render-wgpu`) | Oracle (`fn64-render-reference`) |
 |---|---|---|
-| `0xffff` (R=G=B=31) | 114,481 | — |
+| `0xffff` (R=G=B=31) | — (was 114,481) | — |
 | `0xe739` (R=G=B=28) | — | 100,235 |
-| `0xdef7` (R=G=B=27) | — | 14,246 |
+| `0xdef7` (R=G=B=27) | **114,481** | 14,246 |
 | `0x0001` (fill) | 719 | 719 |
 
-`100,235 + 14,246 = 114,481` exactly: the oracle resolves the same pixel set
-into **two** structured values where the port emits one flat value.
+The 719 fill pixels still agree byte-for-byte, and **14,246 texrect pixels
+now agree that previously did not**. Every remaining difference is a pixel
+where the oracle's *noise alpha dither* rounded the blended alpha into the
+next five-bit bucket.
 
-**The port is wrong, and the cause is named**: the port does not run the
-blender. Its own module doc says so — `targets/texrect.rs:76-77`, "**No
-blending, alpha compare, dither, or coverage.**" The oracle runs it. §3
-derives both sides' values from the packet's own words and reproduces them
-exactly.
+**The residual is not reachable by a correct port.** WM2000's texrects latch
+`alpha_dither = Noise` (other-mode high `0x0000acef`, bits 4:5 == 2). The
+oracle's noise stream is SplitMix64 under a fixed arbitrary seed, and its own
+source says what that is worth
+(`crates/fn64-render-reference/src/raster/mod.rs:85-119`): the Programming
+Manual "does not publish the hardware generator or its seed, so the
+deterministic reference policy below is deliberately not described as the
+silicon sequence", and SplitMix64 is used "without pretending to be the RDP's
+unknown polynomial". §4 proves the dependence by control: changing only the
+oracle's seed moves the split (100,235 / 99,912 / 100,253 / 100,310) while
+the port's output does not move at all.
 
-**The `0xffff` saturation suspicion is refuted** (§4), but not in the port's
-favour: `0xffff` is the arithmetically *correct* combiner output, written
-without the blending stage that must follow it.
+Reproducing that stream would transcribe an invented sequence, not implement
+a documented stage. **Zero differing pixels is therefore not the right
+target for this packet**, and a port that reached it would have copied the
+oracle rather than agreed with it.
 
 ---
 
@@ -76,52 +89,94 @@ available.
 
 ---
 
-## 3. The disagreement, diagnosed
+## 3. The disagreement, diagnosed — and the first diagnosis corrected
 
 **The texrects' combiner reads no texel at all.** The state latched
 immediately before the 60 texrects (packet offset `0x0960`) is
-`SetCombine 0xfcffffff / 0xfffdf6fb`, which decodes to
-`(Zero - Zero) * Zero + Primitive` — flat `Primitive`. The `SetPrimColor` at
-`0x0968` is `0xffffffdf`: RGB 255,255,255, **alpha `0xdf` = 223**.
+`SetCombine 0xfcffffff / 0xfffdf6fb`. Decoded through `CombineParams`' own
+second-cycle bit positions, both slices are
+`(Zero − Zero) * Zero + Primitive` — flat `Primitive`. The `SetPrimColor` at
+`0x0968` is `0xffffffdf`: RGB 255,255,255, alpha `0xdf` = 223.
 
-That single fact explains both sides' behaviour:
+**The blender program.** Other-mode low `0x005041c8` gives cycle 1
+`P = Combined, A = Combined, M = Framebuffer, B = 1 − A`, with `FORCE_BL`
+and `IM_RD` set and `AA_EN` set. `blend_fragment`'s `M == Framebuffer` arm
+makes the composite `combined * (223/255) + destination * (1 − 223/255)`.
 
-- **Port**: writes the combiner output straight to the destination. RGB 255
-  → 5-bit 31 → `0xffff`. Correct combiner arithmetic, no blender.
-- **Oracle**: blends under the latched other-mode low word `0x005041c8`
-  (`FORCE_BL`, `IM_RD`, `AA_EN`, `CLR_ON_CVG`, `cvg_dst=Wrap`). White at
-  α = 223/255 over the destination gives
-  `255 * 223/255 + dst * (1 - 223/255)`:
+**The destination is zero everywhere.** The 60 fills are Fill-cycle with
+fill colour `0x00010001`, whose `decode_16` is RGB `[0, 0, 0]` with the
+coverage bit set. So the composite is `255 * 223/255 + 0` = 223 → 5-bit 27
+→ `0xdef7`, which is exactly what the port now publishes on all 114,481
+texrect pixels.
 
-  | destination | blended | 5-bit | value |
-  |---|---|---|---|
-  | 0 (poison-cleared) | 223.0 | 27 | `0xdef7` |
-  | 8 (the `0x0001` fill) | 224.0 | 28 | `0xe739` |
+**A correction, recorded rather than quietly replaced.** This card's first
+version derived the oracle's two values from *destination content* — 0 for
+"poison-cleared" pixels and 8 for the `0x0001` fill — and landed on 223/224,
+which happens to fall in the same two five-bit buckets. That derivation is
+**wrong**, and the measurement that disproves it is direct: replaying the
+packet with the 60 texrects removed publishes a uniform `0x0001` across all
+115,200 pixels on *both* backends, so no pixel has a non-zero destination
+for the texrects to blend against. The two values are also scattered
+pseudo-randomly rather than following the fill geometry (row 0's first
+sixteen pixels are `e739 e739 e739 e739 def7 def7 e739 …`), which no
+destination-content explanation predicts.
 
-  Both are reproduced exactly, and the derivation is asserted in the pin
-  test rather than read off either implementation.
+**What actually splits them is noise alpha dither.** Other-mode high
+`0x0000acef` selects `rgb_dither = Disabled` but `alpha_dither = Noise`.
+The oracle perturbs the combined alpha before blending
+(`raster/draw.rs:606-612`) via `apply_alpha_dither`, whose arithmetic is
+`(alpha >> 3) + ((alpha & 7) > threshold)` re-expanded by
+`(five << 3) | (five >> 2)`. With `alpha = 223`, `alpha & 7 == 7`, so the
+comparison is true for every 3-bit threshold except 7:
 
-**Which side is right.** The oracle. `FORCE_BL` is set, so the blender is
-unconditionally active for these texrects; a prim alpha of 223 is not
-incidental, it is the game asking for an 87.5%-opacity overlay. The port
-skipping that stage is a documented gap in its own module header, not a
-disputed reading. This is a **missing stage**, not an arithmetic error —
-the port's combiner output is right and is then published unmodified.
+| noise threshold | five | dithered alpha | blended | 5-bit | value |
+|---|---|---|---|---|---|
+| 0–6 (7 cases in 8) | 28 | 231 | 231.0 | 28 | `0xe739` |
+| 7 (1 case in 8) | 27 | 222 | 222.0 | 27 | `0xdef7` |
 
-**Not claimed:** that the oracle is hardware-correct. Nothing here is
-checked against an N64. What is proven is that two independent
-implementations of the same documented pipeline disagree, that the
-difference is exactly one pipeline stage, and that the stage is one the port
-declares it does not implement.
+Predicted 7/8 : 1/8 of 114,481 is **100,171 : 14,310**; measured is
+**100,235 : 14,246** — the expected fluctuation of a pseudo-random stream
+over that many samples, and a 0.06% agreement with a ratio nothing was
+fitted to.
+
+**Which side is right.** On the blender, the oracle was, and the port now
+matches it: `FORCE_BL` is set, so the blender is unconditionally active, and
+a prim alpha of 223 is the game asking for an 87.5%-opacity overlay. On the
+dither, **neither side is established as right**, because the quantity in
+dispute is an unpublished hardware noise sequence. The port applies no
+dither and says so; the oracle applies a stream it declares non-silicon.
+
+**Not claimed:** that either implementation is hardware-correct. Nothing
+here is checked against an N64.
 
 One further caveat, from the oracle's side: its RGBA16 LSB is the high bit
 of *stored coverage*, not pixel alpha (`backend/framebuffer_io.rs:120-122`).
-That affects bit 0 only and cannot account for a 3-to-4 step in the 5-bit
-color channels.
+That affects bit 0 only. It is not the cause of the residual — both values
+in dispute carry LSB 1.
 
 ---
 
-## 4. The palette-invariance probe: refuted, via its own control
+## 4. The seed control, and the palette-invariance probe
+
+### 4.0 The residual tracks the oracle's seed, not the packet
+
+Replaying the identical captured bytes through the oracle at four different
+noise seeds, with nothing else changed and neither implementation modified:
+
+| oracle noise seed | `0xe739` | `0xdef7` |
+|---|---|---|
+| `0x4e36345244504e53` (default) | 100,235 | 14,246 |
+| `0x1` | 99,912 | 14,569 |
+| `0x2` | 100,253 | 14,228 |
+| `0xdeadbeef` | 100,310 | 14,171 |
+
+The port's output is `0xdef7` × 114,481 in every one of these runs. The
+split is a property of the oracle's seed; the packet does not mention it.
+Every seed still lands within 0.4% of the 7/8 the dither arithmetic
+predicts, which is what makes them the same mechanism rather than noise in
+the measurement.
+
+### 4.1 The palette-invariance probe: refuted, via its own control
 
 The brief's hypothesis was that `0xffff` uniformity meant the texel path was
 not really sampling the TLUT. **Measured, it is not the explanation.**
@@ -178,7 +233,8 @@ The comparison and its probes live beside the existing replay test in
 | Test | What it measures |
 |---|---|
 | `wm2000_frame_zero_compared_against_the_reference_rasterizer` | the byte-for-byte diff, reported not asserted |
-| `wm2000_frame_zero_port_omits_the_blender_the_oracle_runs` | pins both sides' images and derives the blend arithmetic |
+| `wm2000_frame_zero_blender_runs_and_the_residual_is_oracle_dither` | pins both sides' images, derives the blend and the dither arithmetic, and asserts the 719 fill pixels separately |
+| `wm2000_frame_zero_oracle_split_is_a_property_of_its_noise_seed` | the seed control that makes the residual a finding, not a defect |
 | `wm2000_frame_zero_palette_invariance_probe` | the port's TLUT invariance |
 | `wm2000_frame_zero_palette_invariance_reference_control` | the oracle's, which refutes the one-sided reading |
 | `wm2000_frame_zero_texture_data_sensitivity_probe` | both sides vs. the CI4 texture data |
@@ -207,63 +263,97 @@ which is a harness artifact and not a port finding.
 ## 6. Verification
 
 - **10 consecutive identical comparison runs.** All ten report the same
-  three histogram lines and the same 114,481-pixel diff.
-- **Mutation-tested, 5 mutants, 5 kills.** Port histogram `0xffff`→`0xfffe`;
-  oracle count `100_235`→`100_236`; diff count `114_481`→`114_480`; blend
-  derivation `27`→`28`; and — the load-bearing one — **substituting the port
-  for the oracle**, which fails, proving the two sides are genuinely
-  different code paths and not the same backend read twice.
+  three histogram lines and the same 100,235-pixel diff.
+- **Mutation-tested, 8 mutants, 7 kills, 1 proven equivalent.**
+  - *Killed*: skip the blend stage (3 tests); swap the blend source and
+    destination operands (15); truncate instead of round in the composite
+    (8); apply a blend to the fill executor too (19) — the fills already
+    agreed byte-for-byte, so this had to fail; drop `read_pixel`'s 5-bit
+    low-bit replication (1); widen the `FORCE_BL` refusal back over the
+    `AA_EN`-clear case (6); hardcode `blend_enabled = true` (1).
+  - *Two mutants first survived, and the reach gaps they exposed are the
+    deliverable.* Skipping the blend stage was initially caught only by the
+    whole-image comparison, because the crate-local test exercised the
+    helper rather than the pixel loop; the composition is now a named
+    `blend_and_write_pixel` the test calls, matching the precedent
+    `combine_one_texel`'s own doc records. Dropping the `>> 2` expansion
+    survived a round-trip test, because `write_pixel`'s `>> 3` recovers the
+    same five bits either way; it is now pinned against the fill
+    executor's own decode (5-bit 27 → 222, not 216).
+  - *Equivalent, with proof*: reading the blend destination from the
+    caller's `resident_bytes` instead of the buffer being written. `offset`
+    is injective in `(row, column)` over the loop's range, so each byte
+    range is written at most once per call and the two reads are provably
+    identical; cross-command composition is preserved by the caller, which
+    threads each command's full-extent output in as the next one's
+    `resident_bytes` (`production.rs`'s own "the accumulation is the
+    composition" note). The working-buffer form is kept as the more robust
+    one, not because it is observably different here.
 - **Positive control on the fixture**: the census identity assertions (366
   commands, 19 opcodes, 60 `G_FILLRECT`, 60 `G_TEXRECT`) run before the
-  comparison, and a trimmed packet is measured as failing them.
-- **Workspace**: 8285 passed / 13 skipped before, 8294 / 13 after (nine new
-  tests). Measured in this worktree, not quoted.
-- **Release profile** (`RUSTFLAGS="-C debug-assertions=off"`): same counts.
-- **`scripts/lint-docs.py`**: clean, 3 pre-existing warnings before and
-  after, unchanged.
+  comparison, and a fixture trimmed to 3/4 of its entry-0 rows was measured
+  as failing them.
+- **Workspace**: 8,294 passed / 13 skipped before, **8,307 / 13 after**
+  (thirteen new tests). Measured in this worktree at `3817911f`, not
+  quoted.
+- **Release profile** (`RUSTFLAGS="-C debug-assertions=off"`): 8,294 before
+  and 8,307 after, identical to debug in both directions. The test *set* is
+  also identical across profiles (`cargo nextest list`, 2,626 lines each,
+  diff empty apart from the build-time line), so no count here is
+  profile-dependent.
+- **`scripts/lint-docs.py`**: 3 warnings and 1 error before, the same 3 and
+  the same 1 after — measured in a clean baseline worktree at `3817911f`
+  and in this one. The error is the pre-existing "content hash that no test
+  checks" on this file's own §5 citation; it is a baseline to preserve, not
+  a regression introduced here.
 - **Dead code**: 1,060 `never used` / 1,218 including `never read` and
-  `never constructed`, unchanged before and after. The brief's 1,201 did not
-  reproduce under either recipe in a fresh worktree; both figures are
-  reported with the recipe that produced them rather than reconciled to a
-  quoted number.
-- Two host-GPU tests (`texture_rectangle_at`, `flip_wire_position`) are
-  pre-existing red and were not run in this lane's default profile; no blame
-  is inherited or claimed.
+  `never constructed`, unchanged before and after, both measured with
+  `cargo check --workspace --all-targets` — the baseline in a separate
+  clean worktree. The circulating 1,201 did not reproduce under either
+  recipe.
+- **Host-GPU tests.** `wgpu_backend_draws_a_real_texture_rectangle_at_its_own_wire_position`
+  is red under `--features host-gpu-tests` on the clean `3817911f`
+  worktree **and** on this one — pre-existing, verified rather than
+  inherited. A `flip_wire_position` test matches no test name in this
+  checkout; all 34 tests matching `/flip/` pass, so that half of the
+  briefed red pair is reported as not found rather than assumed.
 
 ---
 
 ## 7. Verdict: does WM2000's frame 0 render correctly through the Rust port?
 
-**No.** 99.38% of its pixels are wrong, by a named and reproduced mechanism.
+**Not proven, and closer than it was — with the remaining gap named and
+shown to be outside the port's reach.**
 
-The bar the card was set — "prove those bytes are right" — is **met as a
-measurement and failed as a result**. That is the more useful outcome: the
-port's frame 0 was previously "two distinct values, unvalidated"; it is now
-"one missing pipeline stage, quantified to the pixel, with the correct
-values known".
+The blender was the whole of the mechanically-attributable disagreement, and
+it now runs: 114,481 → 100,235 differing pixels, with the 14,246-pixel
+agreement gained being exactly the subset where the oracle's dither happened
+not to fire. What is left is one stage whose reference implementation
+declares itself non-silicon, so agreeing with it would be copying rather
+than validating.
+
+**What would settle it** is not more port work on this packet. It is either
+(a) hardware or an independent emulator to establish the RDP's actual noise
+sequence, or (b) a packet that does not latch `alpha_dither = Noise`, where
+the blender's output is checkable against the oracle without a dither term
+in the way. Entry 0 is not such a packet, and this card does not have one.
 
 What this does and does not cover: **one entry, one frame, one title's
 boot/logo window**. Entry 0 is triangle-free and its texrect program reads
-no texel, so this validates the fill path and the constant-color path and
-says nothing about texture sampling, triangles, or the 152 of 218 frames the
-census measured as carrying triangles. Entries 1–3 still stop at the v11
-access-count frontier and were not compared.
+no texel, so this validates the fill path, the constant-color path and now
+the blender's `M = Framebuffer` arm, and says nothing about texture
+sampling, triangles, or the 152 of 218 frames the census measured as
+carrying triangles. Entries 1–3 were not compared.
 
-What remains, precisely:
-
-1. **Implement the blender for the CPU texrect path**, or route texrects
-   through a path that has one. This is the whole of the measured
-   disagreement. It is not a one-line fix and was not attempted here.
-2. **Re-run this comparison** once it lands; agreement then is a real
-   validation of frame 0.
-3. **Find a packet whose combiner reads `Texel0`** to validate the sampler
-   at all — entry 0 cannot, and the palette probe's inconclusiveness on that
-   question is a gap this card records and did not fill.
-
-**Nonclaims.** Neither implementation was adjusted to make them agree. No
-hardware comparison was made and no claim of hardware correctness is made
-for either side. The port's TMEM/TLUT sampler is neither validated nor
-faulted — this packet does not exercise it. No claim is made about entries
-1–3, about frames carrying triangles, or about any other title. The oracle's
-coverage-derived RGBA16 LSB is disclosed as a known second-order difference
-and is not the cause of the disagreement reported here.
+**Nonclaims.** The oracle was not adjusted, and neither implementation was
+tuned toward the other. No hardware comparison was made and no claim of
+hardware correctness is made for either side, on the blender or on the
+dither. Alpha compare, dither and coverage remain unimplemented in the CPU
+texrect executor and are declared so in its header; of those, **only dither
+is exercised by this packet**, and it is the residual measured above —
+`ALPHA_COMPARE` is `G_AC_NONE` and both `CVG_X_ALPHA` and `ALPHA_CVG_SEL`
+are clear in `0x005041c8`, so this comparison would not detect a defect in
+either of those two stages. The port's TMEM/TLUT sampler is neither
+validated nor faulted — this packet does not exercise it. No claim is made
+about entries 1–3, about frames carrying triangles, or about any other
+title.
