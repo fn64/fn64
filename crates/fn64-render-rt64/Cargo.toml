@@ -42,6 +42,9 @@ sha2 = "0.10"
 fn64-abi = { path = "../fn64-abi" }
 fn64-boot-harness = { path = "../fn64-boot-harness" }
 fn64-render-reference = { path = "../fn64-render-reference" }
+# The three-way WM2000 frame-0 comparison drives the wgpu port, the
+# reference oracle and RT64 over one captured packet in one process.
+fn64-render-wgpu = { path = "../fn64-render-wgpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -56,6 +59,10 @@ name = "synthetic_fixed_cycle_release"
 
 [[example]]
 name = "rt64_pixel_differential"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_wm2000_three_way"
 required-features = ["rt64"]
 
 [[example]]
