@@ -186,7 +186,14 @@ fn main() {
         let mut backend = fn64_render_reference::ReferenceBackend::new()
             .with_f3dex2()
             .with_clear_color([0, 0, 0, 255])
-            .with_auto_dump("/tmp/wm2000-gfx-dumps", "wm2000", 8);
+            .with_auto_dump(
+                &format!(
+                    "{}/wm2000-gfx-dumps",
+                    std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string())
+                ),
+                "wm2000",
+                8,
+            );
         backend
             .create(&fn64_render::RenderConfig::ntsc(320, 240))
             .expect("reference backend create");
@@ -240,14 +247,19 @@ fn main() {
     // call below (which still runs too, on a clean exit, and rewrites the
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
-    const TRACE_PATH: &str = "/tmp/wm2000-boot-trace.jsonl";
-    if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
+    // Diagnostic outputs live under `WM2000_OUT_DIR` when set. Default is
+    // unchanged so existing recipes keep working; the diagnostic lane sets it
+    // because `/private/tmp` is wiped by a host restart.
+    let out_dir = std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let trace_path = format!("{out_dir}/wm2000-boot-trace.jsonl");
+    let trace_path = trace_path.as_str();
+    if let Err(e) = fn64_abi::set_trace_sink_file(trace_path) {
         eprintln!(
-            "[wm2000-census] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+            "[wm2000-census] WARNING: failed to arm incremental trace sink at {trace_path}: {e} -- \
              a crash mid-boot will lose the trace (falling back to end-of-run-only)."
         );
     } else {
-        println!("[wm2000-census] incremental trace sink armed at {TRACE_PATH}");
+        println!("[wm2000-census] incremental trace sink armed at {trace_path}");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
@@ -358,6 +370,8 @@ fn main() {
     // boot has reached a genuinely idle steady state (not just a thread
     // temporarily blocked waiting for a soon-to-fire timer/retrace).
     const IDLE_TICKS_BEFORE_STOP: u32 = 200;
+    let input_script = InputScript::from_env();
+    let mut last_buttons = 0u16;
     let mut last_swap_count = 0u64;
     let mut fb_dumps = Vec::new();
     let mut thread0_death_logged = false;
@@ -440,6 +454,22 @@ fn main() {
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
             }
+            // Swap-indexed scripted input. Off unless `WM2000_INPUT_SCRIPT` is
+            // set, so an un-driven run still sees the honest neutral pad
+            // `fn64_runtime::ContInput::default()` documents. VI-swap ordinal
+            // (not step count) is the clock, because that is the boundary the
+            // guest's own per-field controller poll is phase-locked to.
+            if let Some(script) = input_script.as_ref() {
+                let buttons = script.buttons_at(swap_count);
+                if buttons != last_buttons {
+                    fn64_abi::set_controller_state(0, buttons, 0, 0);
+                    println!(
+                        "[wm2000-census] input: swap #{swap_count} port0 buttons={buttons:#06x}"
+                    );
+                    let _ = std::io::stdout().flush();
+                    last_buttons = buttons;
+                }
+            }
             last_swap_count = swap_count;
         }
 
@@ -498,8 +528,8 @@ fn main() {
 
     let trace = fn64_abi::copy_trace();
     println!("[wm2000-census] trace events recorded: {}", trace.len());
-    write_trace_file(&trace, TRACE_PATH);
-    println!("[wm2000-census] trace written to {TRACE_PATH}");
+    write_trace_file(&trace, trace_path);
+    println!("[wm2000-census] trace written to {trace_path}");
 
     // Clean shutdown: parked guest coroutines must NOT be force-unwound by
     // the TLS destructor (they're suspended inside nounwind extern "C"
@@ -555,7 +585,10 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         "[wm2000-census] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
          dumping PNG."
     );
-    let path = format!("/tmp/fn64-fb-{swap_index}.png");
+    let path = format!(
+        "{}/fn64-fb-{swap_index}.png",
+        std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string())
+    );
     match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[wm2000-census] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
@@ -701,5 +734,62 @@ fn write_trace_file(trace: &[fn64_runtime::TraceEvent], path: &str) {
     for event in trace {
         let line = format!("{event:?}\n");
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Swap-indexed scripted controller input for the diagnostic lane.
+///
+/// `WM2000_INPUT_SCRIPT` holds `first_swap:end_swap:buttons_hex` phases,
+/// comma-separated (e.g. `1200:1210:0x1000,1260:1270:0x1000` for two Start
+/// taps). Outside every phase the pad is neutral, which is what makes a
+/// state change attributable to the press rather than to the harness having
+/// held a button since boot. Ranges are half-open and evaluated in order.
+///
+/// This is deliberately NOT
+/// `fn64_boot_harness::parse_controller_input_schedule`: that schema indexes
+/// by successful controller-READ ordinal, which is the right clock for a
+/// determinism replay but is not observable from this harness (no read-ordinal
+/// counter is exported). Swap ordinal is observable here and is the clock the
+/// framebuffer captures are already indexed by, so a press and the frame it
+/// changed share one axis.
+struct InputScript {
+    phases: Vec<(u64, u64, u16)>,
+}
+
+impl InputScript {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("WM2000_INPUT_SCRIPT").ok()?;
+        let mut phases = Vec::new();
+        for field in raw.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            let parts = field.split(':').collect::<Vec<_>>();
+            let [first, end, buttons] = parts.as_slice() else {
+                panic!("WM2000_INPUT_SCRIPT phase {field:?} is not first:end:buttons_hex");
+            };
+            let first = first
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT: bad first_swap in {field:?}"));
+            let end = end
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT: bad end_swap in {field:?}"));
+            assert!(
+                first < end,
+                "WM2000_INPUT_SCRIPT phase {field:?} is empty (first_swap >= end_swap)"
+            );
+            let buttons = u16::from_str_radix(buttons.trim_start_matches("0x"), 16)
+                .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT: bad buttons_hex in {field:?}"));
+            phases.push((first, end, buttons));
+        }
+        println!(
+            "[wm2000-census] input script armed: {} phase(s)",
+            phases.len()
+        );
+        Some(Self { phases })
+    }
+
+    fn buttons_at(&self, swap: u64) -> u16 {
+        self.phases
+            .iter()
+            .find(|&&(first, end, _)| swap >= first && swap < end)
+            .map_or(0, |&(_, _, buttons)| buttons)
     }
 }
