@@ -1065,6 +1065,23 @@ mod game {
                             return;
                         }
                         if code == KeyCode::Escape && pressed {
+                            // A bounded census run must end at its pump
+                            // budget and nowhere else. These runs open a real
+                            // window that takes focus, so a keystroke typed at
+                            // a terminal lands in the game -- which truncated
+                            // four runs of a measurement matrix into short
+                            // logs that still parsed, still exited 0, and
+                            // still printed a plausible report. Ignoring Esc
+                            // while the census is armed makes the run's length
+                            // a property of the experiment rather than of what
+                            // was typed nearby.
+                            if self.pump_census.armed() {
+                                println!(
+                                    "[fn64-shell] Esc IGNORED: FN64_PUMP_CENSUS is armed and \
+                                     this run ends at its pump budget"
+                                );
+                                return;
+                            }
                             println!("[fn64-shell] Esc pressed -- exiting");
                             event_loop.exit();
                             return;
