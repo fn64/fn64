@@ -203,7 +203,7 @@ use crate::targets::{
     TargetError, TargetRectangle,
 };
 use crate::tmem::{
-    sample_point, PendingTmemImage, PointSampleCoordinates, PointSampleError, PointSampleRequest,
+    sample_point, PointSampleCoordinates, PointSampleError, PointSampleRequest,
     TextureCoordinateS10_5, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
     TmemFirstRowParity, TmemWordAddress,
 };
@@ -922,9 +922,23 @@ impl core::fmt::Display for TexrectConstantRegister {
 }
 
 /// Executes one admitted `TextureRectangle` against `candidate`, sampling
-/// every texel from `tmem` -- which is a
-/// [`PendingTmemImage`], the post-image of the **same packet's** own TMEM
-/// loads.
+/// every texel from `tmem` -- any [`TmemByteSource`], which in practice is
+/// one of exactly two images the caller chooses between by a rule this
+/// function does not apply:
+///
+/// - a [`PendingTmemImage`](crate::tmem::PendingTmemImage), the sealed
+///   post-image of the **same packet's**
+///   own TMEM loads, for a packet that carries at least one load; or
+/// - the durable [`PhysicalTmemState`] the coordinator holds, for a packet
+///   that carries **no** load at all and therefore samples what an earlier
+///   packet already published.
+///
+/// Generic rather than two overloads for the same reason
+/// [`sample_point`] is: one addressing/validity/XOR4/TLUT path, so the two
+/// images cannot disagree about a texel. The distinction survives in the
+/// data, not the signature -- a sampled texel's `snapshot()` answers
+/// `Proposed` for the post-image and `Committed` for durable state, and the
+/// caller checks that crossing rather than trusting it.
 ///
 /// Produces the same [`CompletedColorTargetWrite`] the fill executor
 /// produces, so the two compose at the identical
@@ -945,12 +959,12 @@ impl core::fmt::Display for TexrectConstantRegister {
 /// post-image, so a `LoadBlock` staged before this call is visible and one
 /// staged after is not.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_texture_rectangle(
+pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     other_mode: OtherMode,
     draw: TexrectDraw,
     tile: TexrectTileBinding,
-    tmem: &PendingTmemImage<'_>,
+    tmem: &S,
     lut_mode: TextureLutMode,
     shading: TexrectShading,
     blend_registers: TexrectBlendRegisters,
