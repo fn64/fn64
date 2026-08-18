@@ -1662,3 +1662,87 @@ fn resampling_runs_end_to_end_through_the_public_scanout() {
     );
     assert_ne!(field.pixel(1, 0).unwrap()[0], 255);
 }
+
+/// The coverage reconstruction's limitation, pinned so it cannot be quietly
+/// forgotten or "improved" into a fabricated intermediate value.
+///
+/// Real hardware stores two hidden bits per RGBA16 halfword which, with the
+/// visible low bit, give coverage `1..=8`. This backend cannot read them and
+/// does not invent them: it reconstructs from the visible low bit alone,
+/// which reaches only the two saturated ends. Every one of the 65,536
+/// possible halfwords maps to 8 or 1 and never to anything between.
+///
+/// This is exactly why `SilhouetteAntialias` still refuses -- it weights a
+/// blend by the coverage magnitude -- while dither restoration is admitted,
+/// since restoration asks only the boolean `== 8`.
+#[test]
+fn reconstructed_coverage_reaches_only_the_saturated_ends_never_a_middle_value() {
+    let mut rdram = fresh_rdram();
+    let memory_len = rdram.len();
+    let geometry = SourceGeometry {
+        origin: 0,
+        stride_pixels: 1,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for pixel in 0..=u16::MAX {
+        write_rgba16(&mut rdram, 0, pixel);
+        let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+        let coverage = geometry.coverage(&memory, 0, 0);
+        assert_eq!(
+            coverage,
+            if pixel & 1 == 0 { 1 } else { 8 },
+            "coverage must come from the visible low bit of {pixel:#06x} and nothing else"
+        );
+        seen.insert(coverage);
+    }
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([1, 8]),
+        "the reconstruction must NOT produce an intermediate coverage it cannot know"
+    );
+    for middle in 2u8..=7 {
+        assert!(
+            !seen.contains(&middle),
+            "coverage {middle} would be fabricated: the hidden bits carrying it are unreadable"
+        );
+    }
+    assert_eq!(memory_len, rdram.len());
+}
+
+/// Silhouette AA still refuses, and its reason still names the coverage
+/// dependency the reconstruction above cannot satisfy. Guards against a
+/// later change admitting it on the strength of the coverage this module
+/// now computes -- which would be a blend weighted by a value that is only
+/// ever 1 or 8.
+#[test]
+fn silhouette_aa_still_refuses_because_the_coverage_magnitude_is_unavailable() {
+    let rdram = fresh_rdram();
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    for aa_mode in [0u32, 1] {
+        let status_word = (2 << status::TYPE.offset) | (aa_mode << status::AA_MODE.offset);
+        let registers = live_registers(
+            status_word,
+            0x400,
+            4,
+            0,
+            4,
+            0,
+            4,
+            u32::from(ViScaleAxis::ONE),
+            u32::from(ViScaleAxis::ONE),
+        );
+        let error = scan_out_guest_rdram(presentation(registers), &memory)
+            .expect_err("AA modes 0 and 1 must still refuse");
+        let RenderError::Backend { reason, .. } = &error else {
+            panic!("expected a named backend refusal, got {error:?}");
+        };
+        assert_eq!(reason, ViScanoutRefusal::SilhouetteAntialias.reason());
+        assert!(
+            reason.contains("coverage"),
+            "the refusal must still name the coverage dependency"
+        );
+    }
+}

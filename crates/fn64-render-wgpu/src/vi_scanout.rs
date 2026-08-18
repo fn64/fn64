@@ -669,6 +669,24 @@ struct SourcePlane {
     rgba8: Vec<u8>,
     /// Per-pixel coverage count in `1..=8`, parallel to `rgba8`.
     ///
+    /// **This is a RECONSTRUCTION of the hidden bits, not a read of them.**
+    /// The N64 stores two hidden bits per RGBA16 halfword that no ordinary
+    /// RDRAM read returns; combined with the visible low bit they carry the
+    /// pixel's three-bit coverage. This backend has no access to those bits
+    /// and does not synthesize a plausible value for them: it derives
+    /// coverage from the visible low bit alone, which can express only the
+    /// two saturated ends of the range (8 or 1) and **cannot represent any
+    /// intermediate coverage 2..=7**. A pixel the RDP wrote with, say,
+    /// coverage 4 is read here as coverage 1.
+    ///
+    /// That limitation is why `SilhouetteAntialias` still refuses: it
+    /// consumes the coverage *magnitude* as a blend weight, and a filter
+    /// weighted by a value this backend cannot represent would produce a
+    /// confidently wrong image. Dither restoration is admitted because it
+    /// uses coverage only as the boolean `== 8` gate selecting which pixels
+    /// to restore, and never reads the magnitude -- so the reconstruction is
+    /// exact on the one predicate restoration actually asks.
+    ///
     /// **Named deviation.** `fn64-render-reference` keeps an
     /// `RdramHiddenBits` sidecar populated by its own rasterizer's
     /// `commit_color_image`, and consults it in `load_vi_source`
