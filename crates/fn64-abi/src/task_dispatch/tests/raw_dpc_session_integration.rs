@@ -5221,6 +5221,271 @@ fn wm2000_frame_zero_blender_runs_and_the_residual_is_oracle_dither() {
     assert_eq!(dithered >> 3, 28, "0xe739's 5-bit channel is 28");
 }
 
+/// Rewrite the `alpha_dither` field (other-mode high bits 4:5) of every
+/// `SetOtherMode` (`0x2f`) command in a captured packet, returning a new
+/// packet whose word stream differs from the capture in exactly those two
+/// bits per command and nowhere else.
+///
+/// **This is variable control, not result doctoring, and the property that
+/// makes it so is structural: the returned `CapturedPacket` is handed to
+/// BOTH `wm2000_port_image*` and `wm2000_reference_image*` unchanged.**
+/// Neither implementation is modified and neither is fed a stream the other
+/// does not see; there is exactly one word buffer and both backends decode
+/// it. A rewrite applied to one side only would be tuning, and the single
+/// shared buffer is what structurally prevents that here.
+///
+/// Why this specific field: `alpha_dither = Noise` is the one term in this
+/// packet whose reference value is an admittedly-invented pseudo-random
+/// sequence (`fn64-render-reference/src/raster/mod.rs:112` -- SplitMix64
+/// "without pretending to be the RDP's unknown polynomial"). Every other
+/// stage the packet exercises is deterministic in both implementations.
+/// Setting the field to a deterministic mode therefore removes the single
+/// unmatchable quantity and leaves the blend, combiner, texel fetch, tile
+/// addressing and write-back to be compared exactly.
+fn wm2000_packet_with_alpha_dither(packet: &CapturedPacket, mode: u32) -> CapturedPacket {
+    assert!(
+        mode < 4,
+        "alpha_dither is a two-bit field; {mode} does not fit"
+    );
+    let commands = walk_raw_rdp_commands(&packet.words);
+    let mut words = packet.words.clone();
+    let mut rewritten = 0usize;
+    for &(offset, cmd6, _, _) in &commands {
+        if cmd6 != 0x2f {
+            continue;
+        }
+        let index = offset / 4;
+        words[index] = (words[index] & !(0x3 << 4)) | (mode << 4);
+        rewritten += 1;
+    }
+    assert!(
+        rewritten > 0,
+        "the packet must latch other-mode at least once for this control to mean anything"
+    );
+    // The rewrite touches only the two bits it claims to. Any other
+    // difference would make the control a different packet rather than the
+    // same packet with one variable held.
+    for (before, after) in packet.words.iter().zip(words.iter()) {
+        assert_eq!(
+            before & !(0x3 << 4),
+            after & !(0x3 << 4),
+            "the alpha_dither rewrite altered a bit outside other-mode high 4:5"
+        );
+    }
+    CapturedPacket {
+        entry: packet.entry,
+        words,
+        source_pc: packet.source_pc,
+    }
+}
+
+/// **Part 1's headline: the port and the oracle compared over the same
+/// packet with the one unmatchable term removed.**
+///
+/// The as-captured comparison leaves 100,235 differing pixels, and every
+/// one of them is a pixel where the oracle's *noise* alpha dither happened
+/// to round the blended alpha into the next five-bit bucket. That residual
+/// is not reachable by a correct port: the oracle's own source declines to
+/// call its SplitMix64 stream the silicon sequence, so agreeing with it
+/// would be transcription rather than validation.
+///
+/// `AlphaDither` has four modes and only `Noise` is unmatchable. This test
+/// rewrites the field to `Disabled` (encoding 3) in the shared word stream
+/// -- **the same stream both backends decode** -- and compares again. With
+/// the invented term gone, the two independent implementations must agree
+/// exactly, and they do: **0 differing pixels of 115,200**.
+///
+/// Hand-derived rather than read off either side: the texrects' combiner is
+/// flat `Primitive` with prim alpha `0xdf` = 223, blended over a zero
+/// destination, so the composite is `255 * 223/255 = 223`, whose five-bit
+/// channel is `223 >> 3 = 27` -> `0xdef7`. With dither disabled both sides
+/// must produce exactly that, and the 719 fill pixels stay `0x0001`.
+#[test]
+fn wm2000_frame_zero_agrees_exactly_when_alpha_dither_is_disabled() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[dither-off] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    assert_eq!(commands.len(), 366, "WM2000 entry 0 is 366 commands");
+
+    // `Disabled` is encoding 3 (`state.rs:262-268`'s `_ => Disabled` arm
+    // over bits 4:5), asserted here from the decoder rather than assumed.
+    let controlled = wm2000_packet_with_alpha_dither(&packet, 3);
+    let controlled_commands = walk_raw_rdp_commands(&controlled.words);
+    // Decoded here by hand off the wire rather than through the port's own
+    // accessor, so the control is checked by an instrument independent of
+    // the implementation it is controlling.
+    for &(_, cmd6, w0, _) in &controlled_commands {
+        if cmd6 == 0x2f {
+            assert_eq!(
+                (w0 >> 4) & 0x3,
+                3,
+                "every rewritten SetOtherMode must latch alpha_dither = Disabled"
+            );
+        }
+    }
+
+    let port = wm2000_port_image(&controlled, &controlled_commands);
+    let oracle = wm2000_reference_image(&controlled, &controlled_commands)
+        .expect("the oracle executes this packet");
+
+    let differing = port
+        .chunks_exact(2)
+        .zip(oracle.chunks_exact(2))
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "[dither-off] differing pixels: {differing} of {}",
+        port.len() / 2
+    );
+    eprintln!(
+        "[dither-off] port   histogram: {:04x?}",
+        rgba16_histogram(&port)
+    );
+    eprintln!(
+        "[dither-off] oracle histogram: {:04x?}",
+        rgba16_histogram(&oracle)
+    );
+
+    // The hand-derived expectation, asserted on both sides independently so
+    // that a defect moving both in the same direction cannot pass as
+    // agreement.
+    let undithered_five = 223u32 >> 3;
+    assert_eq!(undithered_five, 27);
+    assert_eq!(
+        rgba16_histogram(&port),
+        vec![(0xdef7, 114_481), (0x0001, 719)],
+        "the port publishes the undithered blend"
+    );
+    assert_eq!(
+        rgba16_histogram(&oracle),
+        vec![(0xdef7, 114_481), (0x0001, 719)],
+        "with dither disabled the oracle publishes the same undithered blend"
+    );
+    assert_eq!(
+        differing, 0,
+        "with the one invented term removed the two independent implementations agree exactly"
+    );
+}
+
+/// The same control at `alpha_dither = Pattern` (encoding 0), the other
+/// deterministic mode this packet can be driven into.
+///
+/// **This one does not produce an image, and the refusal is the finding.**
+/// `Pattern` resolves to an ordered dither tile, substituting `Bayer` when
+/// RGB dither is `Disabled` -- which is exactly what this packet latches
+/// (other-mode high `0xef00acef`, bits 6:7 == 3). The port refuses `Bayer`
+/// by name (`OrderedDitherAuthorityUnsettled`) because this workspace's two
+/// ports disagree about that table at 8 of 16 cells, already pinned by
+/// `rgb_dither.rs`'s own
+/// `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`.
+///
+/// So `Pattern` cannot yield a comparison for this packet, and reporting a
+/// pixel count for it would mean weakening that refusal to manufacture one.
+/// The refusal is recorded as the measurement instead: **`Pattern` is
+/// refused, not compared**, and `Disabled` is the mode that carries the
+/// validation.
+#[test]
+fn wm2000_frame_zero_pattern_alpha_dither_is_refused_by_name_not_compared() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[dither-pattern] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    let controlled = wm2000_packet_with_alpha_dither(&packet, 0);
+    let controlled_commands = walk_raw_rdp_commands(&controlled.words);
+
+    // The substitution that makes this Bayer rather than MagicSquare, read
+    // off the decoder over the rewritten words.
+    let (texrect_high, _) = controlled_commands
+        .iter()
+        .filter(|&&(_, cmd6, _, _)| cmd6 == 0x2f)
+        .last()
+        .map(|&(_, _, w0, w1)| (w0, w1))
+        .expect("the packet latches other-mode");
+    assert_eq!((texrect_high >> 4) & 0x3, 0, "alpha_dither = Pattern");
+    assert_eq!(
+        (texrect_high >> 6) & 0x3,
+        3,
+        "rgb_dither = Disabled, which substitutes Bayer"
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wm2000_port_image(&controlled, &controlled_commands)
+    }));
+    match outcome {
+        Ok(image) => {
+            let histogram = rgba16_histogram(&image);
+            panic!(
+                "[dither-pattern] the port produced an image under Pattern/Bayer, which means the \
+                 ordered-dither refusal no longer fires: {histogram:04x?}"
+            );
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>")
+                .to_owned();
+            eprintln!("[dither-pattern] REFUSED, as recorded: {message}");
+            assert!(
+                message.contains("Bayer") || message.to_lowercase().contains("dither"),
+                "the refusal must name the dither authority it is missing, got: {message}"
+            );
+        }
+    }
+    teardown();
+}
+
+/// **The mutation control for the noise-free comparison.** Perturb exactly
+/// one pixel of one side and confirm the `Disabled` comparison catches it.
+///
+/// Without this, "0 differing pixels" is indistinguishable from a
+/// comparator that cannot see a difference at all. The sibling
+/// `the_wm2000_image_comparator_detects_a_single_perturbed_pixel` proves
+/// the same property for the as-captured comparison; this proves it for the
+/// controlled one, which is the comparison the validation now rests on.
+#[test]
+fn the_noise_free_comparison_detects_a_single_perturbed_pixel() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[dither-off-mutation] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    let controlled = wm2000_packet_with_alpha_dither(&packet, 3);
+    let controlled_commands = walk_raw_rdp_commands(&controlled.words);
+
+    let port = wm2000_port_image(&controlled, &controlled_commands);
+    let oracle = wm2000_reference_image(&controlled, &controlled_commands)
+        .expect("the oracle executes this packet");
+    assert_eq!(
+        port.chunks_exact(2)
+            .zip(oracle.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count(),
+        0,
+        "the unperturbed controlled comparison agrees"
+    );
+
+    // One pixel, one bit. If the comparison cannot see this it cannot see
+    // anything.
+    for index in [0usize, 57_600, 115_199] {
+        let mut mutated = port.clone();
+        mutated[index * 2] ^= 0x01;
+        let differing = mutated
+            .chunks_exact(2)
+            .zip(oracle.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing, 1,
+            "perturbing pixel {index} must be caught by the controlled comparison"
+        );
+    }
+}
+
 /// **The control that makes the residual a finding rather than a defect.**
 ///
 /// The oracle's two-value split is a property of its own pseudo-random
