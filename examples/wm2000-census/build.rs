@@ -35,6 +35,14 @@
 use std::env;
 use std::path::PathBuf;
 
+// The shared generated-C preparer, used verbatim by `fn64-shell/build.rs`.
+// Sharing it is the point: this harness previously carried a hand-rolled
+// subset that normalized only N64Recomp's `jr_addend_XXXX` declarations, and
+// so silently omitted the address-proven fall-through mend. See this file's
+// "Why the shared preparer" note in `main`.
+#[path = "../../crates/fn64-boot-harness/build_support.rs"]
+mod build_support;
+
 fn required_env(name: &str, hint: &str) -> PathBuf {
     match env::var(name) {
         Ok(v) => PathBuf::from(v),
@@ -116,62 +124,60 @@ fn main() {
         // this same source, per M1-WORKLIST.md's method section).
         .warnings(false);
 
-    // N64Recomp's jump-table codegen declares `gpr jr_addend_XXXX = <expr>;`
-    // mid-function, and other case arms `goto` past that declaration. Valid
-    // C11 (the variable is simply uninitialized on bypassing paths, and the
-    // generated code only reads it after the assignment), but a hard error in
-    // C++ ("jump bypasses variable initialization"), which this build needs
-    // for fn64_mmio_proxy.h. Splitting into declaration + assignment is
-    // semantically identical and legal in both languages, so rewrite each .c
-    // into OUT_DIR before compiling. ponytail: line-based string match, not a
-    // C parser -- generated code is mechanically regular, so this holds until
-    // N64Recomp changes its emission shape (then the C++ error returns loudly).
-    let patched_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("cxx-safe-funcs");
-    std::fs::create_dir_all(&patched_dir).unwrap();
-    let mut c_file_count = 0usize;
-    for entry in std::fs::read_dir(&recompiled_dir).unwrap_or_else(|e| {
-        panic!(
-            "wm2000-census build.rs: failed to read RECOMPILED_DIR={}: {e}",
-            recompiled_dir.display()
-        )
-    }) {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("c") {
-            let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("wm2000-census build.rs: reading {}: {e}", path.display())
-            });
-            let patched: String = source
-                .lines()
-                .map(|line| {
-                    let trimmed = line.trim_start();
-                    if let Some(rest) = trimmed.strip_prefix("gpr jr_addend_") {
-                        if let Some((name_tail, expr)) = rest.split_once(" = ") {
-                            let indent = &line[..line.len() - trimmed.len()];
-                            return format!(
-                                "{indent}gpr jr_addend_{name_tail}; jr_addend_{name_tail} = {expr}\n"
-                            );
-                        }
-                    }
-                    format!("{line}\n")
-                })
-                .collect();
-            let out_path = patched_dir.join(path.file_name().unwrap());
-            std::fs::write(&out_path, patched).unwrap_or_else(|e| {
-                panic!("wm2000-census build.rs: writing {}: {e}", out_path.display())
-            });
-            build.file(&out_path);
-            c_file_count += 1;
-        }
-    }
+    // ## Why the shared preparer
+    //
+    // This used to be a hand-rolled loop that rewrote only N64Recomp's
+    // `gpr jr_addend_XXXX = <expr>;` mid-function declarations (valid C11, a
+    // hard error in C++, which this build needs for fn64_mmio_proxy.h). That
+    // subset compiled, but it omitted the *address-proven fall-through mend*
+    // that `fn64-shell/build.rs` already applies to the same generated shape,
+    // and the omission was load-bearing rather than cosmetic.
+    //
+    // MEASURED on this corpus (NWXE `RecompiledFuncs/*.c`, 2,387 generated
+    // functions): 13 of them allocate a stack frame with
+    // `addiu $sp, $sp, -0xN` and never emit the matching `addiu $sp, $sp, 0xN`
+    // epilogue, because IDO emitted a *shared* epilogue that N64Recomp split
+    // into the address-contiguous next function. `func_8011F67C` (bank2_text,
+    // `size:0x7FC` per the corpus's own `disasm/symbol_addrs.txt`) ends at
+    // 0x8011FE74 in a `jal` delay slot and falls through into
+    // `func_8011FE78`, which restores `$ra`/`$fp`/`$s7..$s0` from
+    // 0x84..0x60($sp) and does `addiu $sp, $sp, 0x88` -- exactly matching
+    // `func_8011F67C`'s own `-0x88` prologue and save slots.
+    //
+    // Without the mend, `func_8011F67C` returns with `$sp` 0x88 low and every
+    // callee-saved register clobbered. Its caller `func_801200DC` then reloads
+    // `$s1` from `0x2C($sp)` -- now pointing into the wrong frame -- and hands
+    // the garbage up to `func_80121764`, whose `lw $v0, 0xDC($s1)` at guest PC
+    // 0x80121A3C computes 0xF0 + 0xDC = 0x1CC and traps. That is the abort the
+    // census docs recorded as an "unmodelled 0x1CC MMIO read": 0x1CC is not a
+    // device offset at all, it is a KUSEG near-null address reached through a
+    // corrupted frame pointer.
+    //
+    // The mend is section-local and structurally gated
+    // (`prepare_recompiled_cxx_sources_with_proven_fallthrough_repair`): it
+    // fires only where the generated section table proves an address-contiguous
+    // successor AND that successor has the split-epilogue instruction shape.
+    // Ordinary adjacent functions are left untouched, so this cannot invent a
+    // call between two unrelated bodies.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+    let (cxx_sources, jump_snapshot_count, prototype_count, fallthrough_count) =
+        build_support::prepare_recompiled_cxx_sources_with_proven_fallthrough_repair(
+            &recompiled_dir,
+            &out_dir,
+        );
+    let c_file_count = cxx_sources.len();
     assert!(
         c_file_count > 0,
         "wm2000-census build.rs: found zero .c files in RECOMPILED_DIR={} -- expected N64Recomp's \
          generated RecompiledFuncs/*.c output.",
         recompiled_dir.display()
     );
+    build.files(cxx_sources);
     println!(
-        "cargo:warning=wm2000-census: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
+        "cargo:warning=wm2000-census: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
+         ({jump_snapshot_count} C jump snapshots normalized, {prototype_count} missing C \
+         prototypes supplied for C++, and {fallthrough_count} structurally admitted \
+         fall-through fragments mended)",
         recompiled_dir.display()
     );
 
