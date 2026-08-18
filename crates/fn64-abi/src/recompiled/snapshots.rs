@@ -925,10 +925,50 @@ pub fn copy_function_execution_destinations() -> Vec<FunctionExecutionDestinatio
             )
         });
     });
-    FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow().clone())
+    FUNCTION_EXECUTION_DESTINATIONS
+        .with(|destinations| destinations.borrow().iter().cloned().collect())
+}
+
+/// Bound diagnostic function-entry history. `None` restores complete history,
+/// which is the default required by certification evidence.
+///
+/// Complete history is correct for a test that enters a bounded number of
+/// functions and then reads the log. It is not survivable for a real boot:
+/// every entered function pushes a record and nothing drains it until the
+/// next program install, so a title that runs for minutes accumulates until
+/// the process is killed. Measured on WM2000's rs lane, which enters
+/// functions in a tight device-wait poll: physical footprint grew ~2 GB/s
+/// (MALLOC_REALLOC 83 GB across 667 regions) and the OS killed the run before
+/// the first VI swap.
+///
+/// This is the same knob, with the same default and the same semantics, that
+/// `set_block_host_boundary_history_limit` already gives the block lane; the
+/// function lane simply never got one.
+pub fn set_function_execution_destination_history_limit(limit: Option<NonZeroUsize>) {
+    FUNCTION_EXECUTION_DESTINATION_HISTORY_LIMIT.with(|installed| installed.set(limit));
+    if let Some(limit) = limit {
+        FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| {
+            let mut destinations = destinations.borrow_mut();
+            while destinations.len() > limit.get() {
+                destinations.pop_front();
+            }
+        });
+    }
+}
+
+/// Enable or suppress diagnostic function-entry history. Complete history is
+/// enabled by default; suppressing it also clears any retained entries.
+pub fn set_function_execution_destination_history_enabled(enabled: bool) {
+    FUNCTION_EXECUTION_DESTINATION_HISTORY_ENABLED.with(|installed| installed.set(enabled));
+    if !enabled {
+        FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
+    }
 }
 
 pub(super) fn observe_function_entry(function: TranslatedFunctionIdentity) {
+    if !FUNCTION_EXECUTION_DESTINATION_HISTORY_ENABLED.with(Cell::get) {
+        return;
+    }
     let artifact_identity = FUNCTION_LANE_ARTIFACT_IDENTITY
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| {
@@ -936,13 +976,19 @@ pub(super) fn observe_function_entry(function: TranslatedFunctionIdentity) {
         });
     let at = fn64_runtime::Cycles::new(crate::sim_time());
     FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| {
-        destinations
-            .borrow_mut()
-            .push(FunctionExecutionDestinationObservation {
-                at,
-                artifact_identity,
-                function,
-            });
+        let mut destinations = destinations.borrow_mut();
+        destinations.push_back(FunctionExecutionDestinationObservation {
+            at,
+            artifact_identity,
+            function,
+        });
+        FUNCTION_EXECUTION_DESTINATION_HISTORY_LIMIT.with(|limit| {
+            if let Some(limit) = limit.get() {
+                while destinations.len() > limit.get() {
+                    destinations.pop_front();
+                }
+            }
+        });
     });
 }
 
@@ -1141,10 +1187,7 @@ pub mod activation_census {
         let mut guard = BY_PC.lock().expect("activation census poisoned");
         let by_pc = guard.get_or_insert_with(std::collections::BTreeMap::new);
         *by_pc
-            .entry((
-                observation.generation.get(),
-                observation.requested_pc.get(),
-            ))
+            .entry((observation.generation.get(), observation.requested_pc.get()))
             .or_insert(0) += 1;
         drop(guard);
 
@@ -1423,7 +1466,11 @@ pub(crate) fn track_rdp_renderer_mutation<R>(
     rdram: &mut [u8],
     operation: impl FnOnce(&mut [u8]) -> R,
 ) -> R {
-    track_catalog_nested_mutation(rdram, operation, fn64_cpu_runtime::notify_rdp_renderer_write)
+    track_catalog_nested_mutation(
+        rdram,
+        operation,
+        fn64_cpu_runtime::notify_rdp_renderer_write,
+    )
 }
 
 /// Record one renderer operation whose backend contract has crossed a commit
