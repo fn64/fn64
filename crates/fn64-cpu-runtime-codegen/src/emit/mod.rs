@@ -421,7 +421,17 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
                     );
                 }
                 CallTarget::Indirect => {
-                    let _ = writeln!(out, "            pc = {next_vram:#010X};");
+                    // Unknown OR bank-ambiguous. `lookup` is the right seam for
+                    // both: it consults residency for a banked vram and traps
+                    // by name for a genuinely unknown one. WM2000's
+                    // `func_80120B84` is claimed by two overlay banks, so it is
+                    // absent from the flat table and only `lookup` can pick the
+                    // resident body. Falling back to `pc =` here would abort in
+                    // the `_ =>` arm even though the successor exists.
+                    let _ = writeln!(
+                        out,
+                        "            lookup({next_vram:#010X})(ctx, mem); return;"
+                    );
                 }
             }
             let _ = writeln!(out, "        }}");
@@ -1823,6 +1833,35 @@ mod escaping_branch_tests {
         assert!(
             src.contains("call_host_or_recompiled(0x80120B84, func_80120B84, ctx, mem); return;"),
             "a function ending mid-flow must tail-call its successor:\n{src}"
+        );
+    }
+
+    /// The real `func_80120B84` is claimed by two overlay banks, so the symbol
+    /// table leaves it `Indirect` and it lives only in `BANKED_LOOKUP_TABLE`.
+    /// The mid-flow successor must still reach `lookup`, which resolves it
+    /// against residency, rather than falling back to a `pc =` that aborts.
+    #[test]
+    fn a_bank_ambiguous_successor_still_reaches_the_residency_dispatcher() {
+        let words = [0xAFA2_0040u32];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80120B28",
+                vram: 0x8012_0B80,
+                words: &words,
+            },
+            // Two claimants at one vram: `SymbolTable` reports Indirect.
+            &SymbolTable::from_section_entries([
+                (3usize, "func_80120B84", 0x8012_0B84u32),
+                (4usize, "func_80120B84_bank3_text", 0x8012_0B84u32),
+            ]),
+        );
+        assert!(
+            src.contains("lookup(0x80120B84)(ctx, mem); return;"),
+            "a bank-ambiguous successor must go through lookup:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x80120B84;\n"),
+            "must not fall back to a pc assignment the dispatcher cannot serve:\n{src}"
         );
     }
 
