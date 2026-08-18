@@ -2681,7 +2681,6 @@ fn a_composed_fill_and_tmem_packet_lands_both_halves() {
         "no TMEM byte may be valid before the composed packet"
     );
 
-    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
     let poisoned = poison_fill_target(&mut rdram);
     let expected_image = expected_whole_target_image(FILL_COLOR);
     assert_ne!(
@@ -2697,9 +2696,25 @@ fn a_composed_fill_and_tmem_packet_lands_both_halves() {
     );
 
     // Half one: the fill reached guest RDRAM.
+    //
+    // **Supersession (byte-lane).** This assertion read `rdram[target]`
+    // directly and was CORRECT under the pre-`43d595c2` raw copyback, which
+    // `copy_from_slice`d the backend's logical guest-order payload into the
+    // native-word allocation unmapped -- making physical storage
+    // coincidentally equal the logical image. `43d595c2` routed the copyback
+    // through `RdramViewMut::write_logical_bytes`, so logical byte `o` now
+    // lives at storage `o ^ 3` and a raw index no longer names it.
+    //
+    // The EXPECTATION is unchanged and still hand-derived: it was always a
+    // logical guest-order image, never a model of physical storage. Only the
+    // readback moved, onto `fn64-runtime`'s one lane authority. Re-derived
+    // independently rather than transcribed: mapping the hand-derived
+    // logical image through `^3` gives physical `[133, 16, 66, 8, ...]`,
+    // which reconciles with the observed bytes, and its logical inverse is
+    // exactly the unchanged `expected_whole_target_image`.
     assert_eq!(
-        rdram[target],
-        expected_image[..],
+        read_fill_target_logical(&rdram),
+        expected_image,
         "the fill half of a composed packet must write its hand-derived image into guest RDRAM"
     );
 
@@ -2804,10 +2819,14 @@ fn both_composed_orders_dispatch_and_land_both_halves() {
              rejected here with EffectAccessMismatch against this stream's own journal"
         );
 
-        let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+        // Read through the lane authority, for the reason recorded at
+        // `a_composed_fill_and_tmem_packet_lands_both_halves`'s own fill
+        // assertion: `43d595c2` lane-maps the copyback, so a raw index no
+        // longer names these bytes. The expectation is untouched -- it was
+        // always a hand-derived logical image.
         assert_eq!(
-            rdram[target],
-            expected_image[..],
+            read_fill_target_logical(&rdram),
+            expected_image,
             "{label}: the fill half must still land its hand-derived image"
         );
         let tmem = published_tmem_bytes(&backend, 128);
@@ -2912,10 +2931,17 @@ fn a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam() 
     );
 
     // The loud-rejection half: nothing was half-published into guest memory.
-    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    //
+    // Read through the lane authority for the same reason as the sibling
+    // composition tests (see
+    // `a_composed_fill_and_tmem_packet_lands_both_halves`). This assertion
+    // compares against `poisoned`, which `poison_fill_target` also writes and
+    // returns in logical order, so both sides moved together -- and the
+    // claim is unweakened: a fill half that leaked through would still
+    // displace the poison and still fail here.
     assert_eq!(
-        rdram[target],
-        poisoned[..],
+        read_fill_target_logical(&rdram),
+        poisoned,
         "a refused composition must leave every guest target byte at its poisoned value -- \
          never the fill half applied while the triangle half was dropped"
     );
@@ -2983,18 +3009,26 @@ fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
         }
     }
 
-    let base = FILL_TARGET_ADDR as usize;
+    // Read through the lane authority, and index the returned logical
+    // image rather than raw storage -- see
+    // `a_composed_fill_and_tmem_packet_lands_both_halves` for the
+    // supersession record. `expected` is built from `poisoned` (logical) and
+    // the hand-derived `expected_fill_halfword`, so it was always a logical
+    // image; only the readback moved. The disjoint-rows claim is unweakened:
+    // the surviving-poison discriminators below still compare against the
+    // ORIGINAL poison, so only an exactly-sized set of three disjoint copies
+    // can pass.
+    let observed = read_fill_target_logical(&rdram);
     assert_eq!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        expected[..],
+        observed, expected,
         "a composed packet's partial-width fill must write exactly its three disjoint rows \
          and leave every other guest byte at its poisoned value"
     );
 
     // The discriminators a collapsed span would destroy, named individually.
-    let row2 = base + (FILL_TARGET_WIDTH * 2 * 2) as usize;
+    let row2 = (FILL_TARGET_WIDTH * 2 * 2) as usize;
     assert_eq!(
-        &rdram[row2..row2 + (X0 * 2) as usize],
+        &observed[row2..row2 + (X0 * 2) as usize],
         &poisoned
             [(FILL_TARGET_WIDTH * 2 * 2) as usize..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize],
         "columns 0..4 of row 2 lie inside a collapsed [first_start, last_end) span and must \
@@ -3002,7 +3036,7 @@ fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
     );
     let row2_last = row2 + ((FILL_TARGET_WIDTH - 1) * 2) as usize;
     assert_eq!(
-        &rdram[row2_last..row2_last + 2],
+        &observed[row2_last..row2_last + 2],
         &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + (FILL_TARGET_WIDTH - 1) * 2) as usize
             ..(FILL_TARGET_WIDTH * 2 * 2 + FILL_TARGET_WIDTH * 2) as usize],
         "column 15 of row 2 is right of x1 and must still be poison"
@@ -3010,7 +3044,7 @@ fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
     // And the rectangle really was written, so 'everything is poison' fails.
     let inside = row2 + (X0 * 2) as usize;
     assert_eq!(
-        &rdram[inside..inside + 2],
+        &observed[inside..inside + 2],
         &expected_fill_halfword(FILL_COLOR, X0).to_be_bytes(),
         "the rectangle's own first pixel must carry the composed fill's color"
     );
