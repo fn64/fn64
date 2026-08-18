@@ -439,3 +439,92 @@ this lane exists to avoid.
 - **No claim the four fixed blockers are the last ones.** Each was found by
   running into it; the next one is behind bank dispatch and has not been seen.
 - **No block-lane claim.** Untouched.
+
+---
+
+## 8. 2026-08-18 (third pass): bank dispatch resolved; the next blocker is an interior address
+
+§7.3 left the rs lane stopped at `0x800E1B90` and explicitly declined to guess
+a twin. That question is now answered from the guest's own behaviour rather
+than by a guess, and the lane runs past it into a **different** blocker.
+
+### 8.1 The mechanism already existed and was not consulted
+
+Nothing here is a new residency tracker. `SectionRegistry` already keeps a
+`loaded` set per section, and `fn64_abi::note_dma_overlay_load`
+(`crates/fn64-abi/src/pi/timing.rs:658`) already sets it from the guest's own
+PI DMA. The C lane resolves the same collisions through
+`SectionRegistry::resolve`, which only considers loaded sections. The rs lane's
+emitted dispatcher simply never asked. What this pass added is the seam:
+
+- `SymbolTable::from_section_entries` retains every claimant of a collided
+  vram with its owning section index (`from_entries` delegates to it).
+- `emit_lookup_dispatcher` emits `BANKED_LOOKUP_TABLE` beside the flat one.
+- `fn64_cpu_runtime::resolve_banked_function` selects the resident claimant.
+- `fn64_abi::is_section_loaded` exposes the existing bit; the shell and the
+  WM2000 harness install it via `set_host_section_resident`.
+
+**Unknown residency is a named trap, never a pick.** Zero resident claimants
+and two-or-more resident claimants both panic quoting the vram and every
+claimant with its section. A host that never wires the query gets the zero
+case, so forgetting to wire it fails loudly instead of silently choosing.
+
+### 8.2 The differential, measured
+
+Same script, same ROM, same `WM2000_MAX_STEPS=2000000`, `FN64_DEBUG_BOOT=1`;
+only fn64 differs. The two runs are identical up to the overlay DMAs:
+
+```
+line 6659  note_dma_overlay_load rom=0x0004c160 dest=0x800e1b90 -> exact=Some(2)
+line 6974  note_dma_overlay_load rom=0x00073390 dest=0x8011c900 -> exact=Some(3)
+```
+
+| | base `8238fb7d` | with bank dispatch |
+|---|---|---|
+| trap vram | `0x800E1B90` (contested) | `0x800385F0` |
+| trap at debug-log line | 7,084 | 16,948 |
+| total debug-log lines | 7,118 | 16,982 |
+
+The base stops 110 lines after the bank DMA. With residency consulted, section
+2 wins `0x800E1B90` and the lane runs **9,864 further log lines** — 2.4x the
+boot depth — before stopping somewhere else.
+
+### 8.3 The next blocker is a different bug class
+
+```
+lookup: no recompiled function or host shim at vram 0x800385F0
+```
+
+`0x800385F0` is **not a function entry and not a bank collision**. It is
+offset `0x170` inside `func_80038480` (vram `0x80038480`, size `0x1D0`), and
+the word there is `0x14C00003` — `bnez $a2, +3`, an ordinary interior
+instruction. The guest is performing a computed jump into the middle of a
+function, which a per-function dispatcher cannot serve at any residency.
+
+`games/NWXE/wm2000.toml` names this address independently: its stub-list
+comment records that `func_800383B4` is `__ull_div`, "which their profiler
+math calls through the 0x800385F0 glue." So the next card is interior-address
+dispatch (or host-binding that glue), not overlay banking.
+
+### 8.4 Reporting: the silent exclusion is closed
+
+`gap-report.md` now carries a **Bank-ambiguous vrams** section naming all 21
+vrams and all 42 claimants with their section indices, and the summary line
+reads `bank-ambiguous vrams: 21 (42 bodies)`. A config with no shared VRAM
+window states "None" explicitly, so the absence is a measurement rather than
+something a reader has to infer from a missing section.
+
+## Nonclaims (2026-08-18 third pass)
+
+- **Still no VI swap, still no pixels.** `vi_swaps` is 0 and no framebuffer
+  exists. The lane goes 2.4x deeper and stops for a different reason; that is
+  the whole claim.
+- **No claim the resident bank is the semantically correct bank.** The claim
+  is only that it is the bank the guest DMA'd in. If a game's residency were
+  itself wrong, this dispatches the wrong body faithfully.
+- **No claim `0x800385F0` is the last blocker.** It is the next one, found by
+  running into it, exactly as the four before it were.
+- **No claim about the two-resident case in practice.** It is implemented as a
+  trap and unit-tested, but WM2000 never produced it in these runs, so its
+  message is untested against a live occurrence.
+- **No block-lane claim.** Untouched.
