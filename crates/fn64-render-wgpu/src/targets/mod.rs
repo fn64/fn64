@@ -506,6 +506,29 @@ impl CompletedColorTargetWrite {
     pub const fn device_bytes(&self) -> &DeviceColorBytes {
         &self.device_bytes
     }
+
+    /// Widens this completion's claimed rectangle to `rectangle`, leaving
+    /// every byte untouched.
+    ///
+    /// The N-command accumulation seam's own need: with several fills and
+    /// texrects composing into one buffer, the *last* command's completion
+    /// carries the composed bytes but claims only its own sub-rectangle,
+    /// while the region the composed buffer actually proves is the union of
+    /// every command's. `admit_completed_initialization` reads exactly this
+    /// rectangle to decide whether a brand-new target is fully initialized,
+    /// so reporting the last command's alone would understate what N proved
+    /// and reject a legitimately complete composition.
+    ///
+    /// Deliberately takes the rectangle rather than computing a union here:
+    /// the caller is the only party that saw every command, and a union
+    /// recomputed from one completion would have nothing to union with.
+    ///
+    /// Nonclaim: this asserts nothing about the bytes, and cannot -- the
+    /// caller vouches that every pixel in `rectangle` came from a proven
+    /// write, exactly as it vouches for the single-command case.
+    pub(crate) fn with_claimed_rectangle(self, rectangle: TargetRectangle) -> Self {
+        Self { rectangle, ..self }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
