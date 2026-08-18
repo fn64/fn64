@@ -15,6 +15,8 @@ use super::*;
 
 const SET_TEXTURE_IMAGE: u8 = 0x3d;
 const SET_TILE: u8 = 0x35;
+const SET_TILE_SIZE: u8 = 0x32;
+const SET_COMBINE: u8 = 0x3c;
 const LOAD_SYNC: u8 = 0x26;
 const LOAD_BLOCK: u8 = 0x33;
 const FULL_SYNC: u8 = 0x29;
@@ -790,6 +792,77 @@ fn fill_then_texrect_words() -> Vec<u32> {
     words
 }
 
+/// The **executable** WM2000-title-screen shape: a whole-target fill in
+/// Fill cycle, a `LoadBlock` filling tile 7, then a `TextureRectangle` in
+/// **Copy** cycle sampling that tile.
+///
+/// Three details are load-bearing and none is incidental:
+///
+/// - The **cycle switch**. A fill is admitted only in Fill cycle and this
+///   texrect executor only in Copy cycle (it evaluates no color combiner),
+///   so a real stream must set each at its own point. `fill_then_texrect_
+///   words` above keeps its single fill-cycle mode and is used only by the
+///   refusal test, which never executes.
+/// - The **`SetTileSize`**. `one_load_block_words` stages a `SetTile` but no
+///   `SetTileSize`; without one the tile has no S/T extent and the sample
+///   is refused with `UnboundTile`. High S/T of 7 texels in 10.2 is
+///   `7 << 2`, low S/T zero.
+/// - The **order**. Load before texrect. The reverse is refused by name
+///   (`TexrectBeforeItsOwnLoad`), because the pending post-image is sealed
+///   once per packet and a texrect preceding a load would otherwise observe
+///   texels a later command loaded.
+///
+/// `dsdx`/`dtdy` are `0x0400`, one texel per pixel in S5.10. Copy mode
+/// halves the effective S step twice (`dsdx >>= 2`), so S runs
+/// `lrs = (0 + 0x100 * (8 << 2)) >> 7 = 64` in S10.5 -- **2 texels across
+/// the 8-pixel row**. `dtdy` is NOT shifted, so T runs
+/// `lrt = (0 + 0x400 * (3 << 2)) >> 7 = 96` -- **3 texels over the 3
+/// rows**, one per row. Both spans are asserted by the test that uses this
+/// fixture, and both were corrected from a first draft that used `0x0100`
+/// and produced a uniform 0.5-texel S span: the "at least two distinct
+/// texels" assertion caught it, which is exactly what it is there for.
+fn fill_load_and_copy_texrect_words() -> Vec<u32> {
+    let mut words = whole_target_fill_words();
+    words.extend(set_texture_image(0, 2, 8, TEXTURE_SOURCE_ADDR));
+    words.extend(set_tile(7, 2, 0));
+    words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+    words.extend(load_sync());
+    // A wider, UNSKEWED LoadBlock than `one_load_block_words`': `uls=0,
+    // lrs=23` loads 24 texels and `dxt=0` applies no row skew, so TMEM
+    // bytes 0..48 are contiguously valid -- three complete rows at this
+    // tile's `line_words = 2` (16 bytes = 8 RGBA16 texels per row).
+    //
+    // Both changes were forced by measurement, not chosen. The narrower
+    // 8-texel load fills only row 0, and the texrect's T advancing one
+    // texel per row then reaches an unloaded row: refused, correctly and
+    // loudly, as `physical TMEM texel byte 0x014 is invalid`. And
+    // `one_load_block_words`' own `dxt = 0x800` skews so hard that even 24
+    // texels land in bytes 0..8 and 24..32 with a hole between them, which
+    // is the same refusal one byte later. `dxt = 0` is what makes three
+    // usable rows.
+    words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+    // Copy cycle (2).
+    words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    // The same rectangle `fn64-render-wgpu`'s composed fixture uses:
+    // ulx=4<<2, uly=2<<2, lrx=11<<2, lry=4<<2, tile 7.
+    words.extend([
+        word(TEXRECT, ((11u32 << 2) << 12) | (4u32 << 2)),
+        7 << 24 | ((4u32 << 2) << 12) | (2u32 << 2),
+        0,
+        (0x0400u32 << 16) | 0x0400,
+    ]);
+    words
+}
+
+/// `SetTileSize`'s two wire words. Low S/T live in w0 (bits 23:12 and
+/// 11:0), high S/T and the tile index in w1 -- the placement
+/// `fn64_render_wgpu::tmem::wire`'s `tile_size` decode reads. All four
+/// coordinates are raw 10.2 fixed point.
+fn set_tile_size_words(tile: u32, high_s: u32, high_t: u32) -> [u32; 2] {
+    [word(SET_TILE_SIZE, 0), tile << 24 | high_s << 12 | high_t]
+}
+
 /// A partial-width, three-row fill: `x0 = 4` is nonzero, so the decoder
 /// declares three disjoint, width-strided write accesses rather than one
 /// collapsed range.
@@ -923,63 +996,210 @@ fn expected_whole_target_image(fill_color: u32) -> Vec<u8> {
         .collect()
 }
 
-/// **T-17's successor. The nonclaim is retired: an admitted fill now DOES
-/// write guest RDRAM.**
+/// **The inversion, end to end: a fill composed with a TMEM load and a
+/// `TextureRectangle` now reaches guest RDRAM through the real
+/// `dispatch_dpc_submission` seam, and the texrect's pixels are real texels
+/// fetched from the TMEM its own packet loaded.**
 ///
-/// T-17 (`guest_rdram_is_not_modified_by_an_admitted_fill`) asserted the
-/// opposite, and it was true when written: `execute_fill_rectangle` produced
-/// an owned `Vec<u8>`, `ResidentPublication::publish` wrote into a
-/// backend-local `Vec`, and a `CompletedWrite` was a range plus a content
-/// digest with no bytes in motion. Its own doc required that a future slice
-/// adding the RDRAM copyback break it DELIBERATELY rather than silently
-/// edit it, so this test replaces it under a new name asserting the new
-/// behavior, and this paragraph is the record of the supersession.
+/// The predecessor of this test asserted the opposite -- that the composed
+/// packet was refused by name and changed no guest byte -- and was correct
+/// when written: nothing produced texel content on the CPU, so
+/// `stage_and_report` refused fill-plus-triangle before staging anything,
+/// and a texrect was two triangles by the time it got there. That refusal
+/// is now narrowed (a texrect declares its own journal write where a raw
+/// triangle declares none, so there IS a declared order to compose it on),
+/// and this test replaces it under a new name asserting the new behavior.
+/// This paragraph is the record of the supersession.
 ///
-/// What changed is only the transport, not the verification: the copy lives
-/// in `rsp_commit.rs`'s `copy_committed_guest_writes`, runs strictly AFTER
-/// `commit_guest_render_target_writes` returned `Ok`, and re-derives each
-/// committed `ContentDigest` from the bytes before writing any of them.
-/// `CompletedWrite` still carries no bytes.
+/// # What is proven here that the unit test cannot prove
 ///
-/// The expectation is hand-derived from `SET_FILL_COLOR`'s own word and the
-/// RGBA16 even/odd column rule, never captured from the code under test.
-/// A fill composed with a `TextureRectangle` reaches the real
-/// `dispatch_dpc_submission` seam and is refused **by name**, with guest
-/// RDRAM left byte-for-byte untouched.
+/// The unit test in `fn64-render-wgpu` reads the backend's own published
+/// device buffer. This one reads **guest RDRAM**, through the whole real
+/// path -- decode, stage, execute, guest commit, `copy_committed_guest_
+/// writes`' `^3` byte-lane mapping -- and asserts logical bytes via
+/// `read_fill_target_logical`. That is the difference between "the backend
+/// computed the right pixels" and "the guest can see them".
 ///
-/// This is the end-to-end half of this card's measurement, and it is a
-/// *refusal* test on purpose. The decoder half landed: a texrect now
-/// declares its own `ColorFramebuffer` write range in the resource journal
-/// (proven in `fn64-render-wgpu`'s
-/// `a_texture_rectangle_declares_a_render_target_write_access`, which can
-/// read the journal directly). The executor half did not: nothing yet
-/// produces the texel *content* for that declared range on the CPU, so
-/// `stage_and_report` still refuses fill-plus-triangle before staging
-/// anything -- and a texrect is two triangles by the time it gets there.
+/// # The expectation, hand-derived twice
 ///
-/// What this pins is that the refusal is total: a packet the backend cannot
-/// execute must change no guest byte at all. A texrect that published
-/// plausible pixels without a proven texel fetch is the one outcome this
-/// card was told is unacceptable, so the absence of any write is the
-/// property worth a test.
+/// **The rectangle.** Wire fields `ulx=4<<2=16, uly=2<<2=8, lrx=11<<2=44,
+/// lry=4<<2=16`, in **Copy** cycle. Derivation 1, RT64's own path: copy
+/// mode applies `lrx |= 3` and `lry |= 3` giving `47, 19`; fill/copy UL
+/// round-down `&= !3` leaves `16, 8` unchanged; then
+/// `FixedRect::left/top/right/bottom(ceil=true)` is `(coord + 3) >> 2` on
+/// all four, giving `4, 2, 12, 5`. Half-open: pixels **x 4..=11, y 2..=4**,
+/// 8 wide by 3 tall. Derivation 2, independent: `ceil(coord / 4)` on the
+/// copy-mutated `16, 8, 47, 19` gives the same `4, 2, 12, 5`.
 ///
-/// # The rectangle, hand-derived twice
+/// The naive wire-corner reading would give x 4..=11, y 2..=4 only by
+/// guessing the copy-mode `|= 3`; under one-cycle the identical words give
+/// 7x2 instead. That is why the extent comes from
+/// `texture_rectangle_vertices`, not from the wire fields.
 ///
-/// `fill_then_texrect_words`' texrect is `x0=4, y0=2, x1=10, y1=3` in whole
-/// pixels -- 10.2 wire fields `ulx=16, uly=8, lrx=40, lry=12`. The staged
-/// `OtherMode` is fill cycle, so RT64's `drawRect` rounds the UL corner down
-/// (`&= ~3`; both are already multiples of 4, so unchanged) and
-/// `FixedRect::left/top/right/bottom(ceil=true)` gives `(coord + 3) >> 2 =
-/// 4, 2, 10, 3`. Half-open, so the covered pixels are **x 4..=9, y 2..=2**.
-/// Derivation 2: `ceil(coord / 4)` on the same four values gives the same
-/// `4, 2, 10, 3`.
+/// **The content.** Two independent claims, reconciled:
 ///
-/// The rectangle is therefore NARROWER than its wire corners read -- x1=10
-/// and y1=3 do not become inclusive pixels 10 and 3. That is exactly why the
-/// planner takes its extent from `texture_rectangle_vertices` (the ported
-/// RT64 geometry) rather than re-deriving it from the wire fields.
+/// 1. Every pixel OUTSIDE the rectangle equals the whole-target fill's own
+///    value, from `SET_FILL_COLOR`'s word by the RGBA16 even/odd column
+///    rule -- the same `expected_fill_halfword` the fill-only tests use.
+/// 2. Every pixel INSIDE it DIFFERS from that fill value, and the three
+///    declared rows are byte-identical to each other.
+///
+/// Claim 2 is the texel evidence available at this seam. The exact texel
+/// values are asserted in `fn64-render-wgpu`'s own composed test against a
+/// committed-TMEM oracle, which can reach the physical state this crate
+/// cannot; here the load-bearing facts are that guest bytes changed inside
+/// the rectangle, that they are not the fill, and that they landed in the
+/// three hand-derived rows and nowhere else.
+///
+/// **Both axes are asserted to vary.** `dsdx`/`dtdy` are `0x0400`; copy
+/// mode's `dsdx >>= 2` makes S span 2 texels across the 8-pixel row while T
+/// spans 3 texels over the 3 rows. So the row must contain at least two
+/// distinct values (a sampler ignoring S would give one), and the rows must
+/// differ from each other (a sampler ignoring T would make them identical).
+/// A first draft used `0x0100`, whose S span is half a texel -- every pixel
+/// sampled the same texel and the row-distinctness assertion failed. That
+/// failure is the reason both assertions exist rather than one.
 #[test]
-fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
+fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let poisoned = poison_fill_target(&mut rdram);
+    dispatch_words(&mut rdram, &fill_load_and_copy_texrect_words());
+    let observed = read_fill_target_logical(&rdram);
+    assert_ne!(
+        observed, poisoned,
+        "the composed packet must change guest bytes -- every byte still carrying the poison \
+         would mean nothing reached RDRAM at all"
+    );
+
+    // Hand-derived rectangle, stated as constants so the two loops below
+    // and the row-range assertion cannot drift from each other.
+    const X0: u32 = 4;
+    const Y0: u32 = 2;
+    const W: u32 = 8;
+    const H: u32 = 3;
+
+    let mut inside_values = Vec::new();
+    for y in 0..FILL_TARGET_HEIGHT {
+        for x in 0..FILL_TARGET_WIDTH {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            let actual = u16::from_be_bytes([observed[offset], observed[offset + 1]]);
+            let fill = expected_fill_halfword(0x0842_1085, x);
+            if x >= X0 && x < X0 + W && y >= Y0 && y < Y0 + H {
+                assert_ne!(
+                    actual, fill,
+                    "pixel ({x}, {y}) is inside the texrect, so it must NOT still be the fill \
+                     value -- a texrect that drew nothing would leave the fill underneath and \
+                     satisfy every other assertion here"
+                );
+                inside_values.push((x, y, actual));
+            } else {
+                assert_eq!(
+                    actual, fill,
+                    "pixel ({x}, {y}) is outside the texrect, so it must carry the fill's own \
+                     value; a difference here means the texrect wrote outside its declared rows"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        inside_values.len() as u32,
+        W * H,
+        "the texrect must have covered exactly its hand-derived {W}x{H} rectangle"
+    );
+
+    // S varies across a row: it advances 2 texels over the 8 pixels, so a
+    // row must contain at least two distinct values. A sampler that ignored
+    // S entirely would produce a uniform row and pass every assertion above
+    // -- measured, not hypothesised: a first draft's `dsdx` gave a half-
+    // texel span and this assertion is what caught it.
+    let first_row: std::collections::BTreeSet<u16> = inside_values[..W as usize]
+        .iter()
+        .map(|(_, _, value)| *value)
+        .collect();
+    assert!(
+        first_row.len() >= 2,
+        "the texrect's first row must contain at least two distinct texels (S advances two \
+         texels across it), or the sampler is not reading S at all -- got {first_row:?}"
+    );
+
+    // **The per-pixel texel index, hand-derived without touching the
+    // executor's own stepping helper.** This is what makes the whole test
+    // independent rather than self-consistent: every assertion above (and
+    // the unit test's committed-TMEM oracle) computes S through the same
+    // `TexrectDraw::s_at`, so a shared off-by-one in it agrees with itself
+    // and survives. Measured: a `column + 1` mutation in `s_at` passed the
+    // entire 5021-test suite until this block existed.
+    //
+    // Derivation, from the wire fields alone: `uls = 0` and (copy mode,
+    // `dsdx >>= 2`) `lrs = (0 + 0x100 * (8 << 2)) >> 7 = 64`, linear over
+    // the 8-pixel width, so `S(col) = 64 * col / 8 = 8 * col` in S10.5 and
+    // the sampled texel is `S >> 5`. That gives texel **0** for columns
+    // 0..=3 and texel **1** for columns 4..=7 -- the row must therefore
+    // split exactly in half.
+    //
+    // The TMEM content is `LoadBlock`'s own source, RDRAM bytes
+    // `0x0000..` written by `rdram_with_texture_source` as the big-endian
+    // halfwords 0, 1, 2, ...; at `dxt = 0` they land contiguously, so
+    // texel `n` of row 0 is the halfword `n`. Columns 0..=3 must all read
+    // texel 0 and columns 4..=7 must all read texel 1, and the two must
+    // differ.
+    let row0: Vec<u16> = (0..W)
+        .map(|column| inside_values[column as usize].2)
+        .collect();
+    for column in 0..W {
+        let expected_texel_index = (8 * column) >> 5;
+        let reference = row0[if expected_texel_index == 0 { 0 } else { 4 } as usize];
+        assert_eq!(
+            row0[column as usize],
+            reference,
+            "column {column} must sample texel {expected_texel_index} (S = {} in S10.5), the \
+             same texel every other column in its half samples -- row 0 was {row0:?}",
+            8 * column
+        );
+    }
+    assert_ne!(
+        row0[0], row0[4],
+        "columns 0..=3 sample texel 0 and columns 4..=7 sample texel 1, so the row must split \
+         exactly in half at column 4 -- an off-by-one in S stepping moves that boundary and is \
+         invisible to any assertion that computes S the same way the executor does"
+    );
+
+    // T varies across rows: it advances 3 texels over the 3 rows, one per
+    // row, so the three rows must not all be identical. A sampler that
+    // ignored T would make them identical and pass the S assertion above.
+    let rows: Vec<Vec<u16>> = (0..H)
+        .map(|row| {
+            (0..W)
+                .map(|column| inside_values[(row * W + column) as usize].2)
+                .collect()
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|row| *row != rows[0]),
+        "the texrect's three rows must not all be identical (T advances one texel per row), or \
+         the sampler is not reading T at all -- got {rows:?}"
+    );
+    teardown();
+}
+
+/// A fill composed with a `TextureRectangle` and **no TMEM load** is still
+/// refused by name, and guest RDRAM is left byte-for-byte untouched.
+///
+/// The narrowed survivor of the refusal the test above superseded. There is
+/// no pending TMEM post-image for such a texrect to sample, and
+/// census-measured that shape does not occur (0 of WM2000's 219 decode
+/// entries carry a texrect without a load in the same entry), so refusing
+/// it costs nothing real -- while admitting it would mean silently sampling
+/// a previous packet's committed TMEM.
+///
+/// The total absence of any write is the property worth pinning: a texrect
+/// publishing plausible pixels without a proven texel fetch is the one
+/// outcome this whole line of work must not produce.
+#[test]
+fn a_fill_composed_with_a_texrect_and_no_tmem_load_changes_no_guest_byte() {
     crate::load_rom(Vec::new());
     let mut rdram = rdram_with_texture_source();
     register_session_backend_for_fills(rdram.len());
@@ -997,19 +1217,17 @@ fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
          proves nothing about refusal"
     );
 
-    // Re-poison, then dispatch the composed packet. The refusal reaches the
-    // guest as a PANIC at the ABI seam (`rsp_commit`'s `execute_raw_dpc`
-    // unwrap), not as a returned error, so it is caught here rather than
-    // observed as a return value -- catching it is also what lets the RDRAM
-    // assertion below run at all.
+    // Re-poison, then dispatch. The refusal reaches the guest as a PANIC at
+    // the ABI seam (`rsp_commit`'s `execute_raw_dpc` unwrap), not as a
+    // returned error.
     let poisoned = poison_fill_target(&mut rdram);
     let words = fill_then_texrect_words();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dispatch_words(&mut rdram, &words);
     }));
     let payload = outcome.expect_err(
-        "a fill composed with a texture rectangle must still be refused -- the decoder now \
-         declares the texrect's write, but no CPU executor produces its texel content",
+        "a fill composed with a texture rectangle and no TMEM load must be refused -- there is \
+         no pending TMEM post-image for the texrect to sample",
     );
     let message = payload
         .downcast_ref::<String>()
@@ -1017,34 +1235,17 @@ fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("");
     assert!(
-        message.contains(
-            "declares both an admitted FillRectangle and at least one admitted \
-                          triangle"
-        ),
-        "the refusal must be the named mixed-packet rejection, got: {message}"
+        message.contains("completed no TMEM load"),
+        "the refusal must be the named TexrectWithoutTmemLoad rejection, got: {message}"
     );
 
-    // Read back through the lane authority, not by indexing storage. Both
-    // sides of this comparison are then logical guest bytes: `poison_fill_
-    // target` writes through `write_logical_bytes` and returns the logical
-    // image, so a raw `rdram[..]` slice would compare a logical expectation
-    // against physical storage and see the `^3` permutation as a difference.
-    //
-    // Supersession, per `3d64e9bf`'s convention: this assertion indexed
-    // `rdram` raw when written, and was correct then -- it branched from
-    // `92affbee`, before `43d595c2` lane-mapped the copyback, when the raw
-    // copy made storage coincidentally equal to logical order. `3d64e9bf`
-    // moved the four composition tests onto `read_fill_target_logical` for
-    // exactly this reason; this test branched alongside them and needed the
-    // same move. No literal changed: the poison was always the logical
-    // image, and it still is.
     assert_eq!(
         read_fill_target_logical(&rdram),
         poisoned,
         "a refused fill+texrect packet must change no guest byte -- every one must still carry \
          the poison. A partial write here would mean the fill half published while the texrect \
          half silently vanished, which is exactly the 'plausible pixels without a proven texel \
-         fetch' outcome this card must not produce"
+         fetch' outcome this must not produce"
     );
     teardown();
 }

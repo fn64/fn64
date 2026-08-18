@@ -20,7 +20,10 @@ use fn64_render_ir::{
 
 use crate::raw_dpc::BoundTmemTransfer;
 
-use super::{TmemLoadEpoch, TmemLoadSourceIdentity, TmemTransferPhysicalWord, TmemTransferWord};
+use super::{
+    ProposedTmemImageIdentity, TmemByteSource, TmemLoadEpoch, TmemLoadSourceIdentity,
+    TmemSnapshotIdentity, TmemTransferPhysicalWord, TmemTransferWord,
+};
 
 const TMEM_LEN: usize = TMEM_BYTES as usize;
 const PROPOSAL_DOMAIN: &[u8] = b"fn64.render-wgpu.physical-tmem-proposal.v1\0";
@@ -693,6 +696,57 @@ impl PendingTmemTransaction {
         &self.effects
     }
 
+    /// A read-only view of this transaction's **proposed post-image** --
+    /// the exact `bytes`/`valid` arrays a successful publication would
+    /// install -- usable as a [`super::TmemByteSource`] before any
+    /// publication exists.
+    ///
+    /// This is the seam a texture rectangle in the *same packet* as its own
+    /// `LoadBlock`/`LoadTile`/`LoadTLUT` needs. Such a texrect must sample
+    /// texels its own packet loaded, and those texels exist only in this
+    /// post-image until `into_physical_successor`/`publish` runs -- which
+    /// happens strictly *after* staging, i.e. after the point the texrect
+    /// has to produce its pixels. Census-measured, this is not a corner
+    /// case but the only case: of WM2000's 219 decode entries, 86 carry
+    /// both a `G_TEXRECT` and a TMEM load and **zero** carry a texrect
+    /// without a load in the same entry, so "sample a prior packet's
+    /// committed TMEM" is a shape that never occurs.
+    ///
+    /// ## What this does not relax
+    ///
+    /// Three things, each deliberately preserved:
+    ///
+    /// 1. **No publication.** This borrows; it cannot commit, cannot
+    ///    advance a generation, and cannot be converted into a
+    ///    `PhysicalTmemState`. `into_physical_successor` and
+    ///    `PhysicalTmemPublicationAuthority::publish` remain the only two
+    ///    routes to a durable post-image, with every base-state,
+    ///    generation, epoch, effect-report and `validate_proposal` check
+    ///    they already ran, unchanged and in the same order.
+    /// 2. **No forged snapshot identity.** Reads through this view answer
+    ///    with `TmemSnapshotIdentity::Proposed`, never `Committed`. A
+    ///    pending post-image genuinely has no durable `(state, generation)`
+    ///    pair: `binding.state` names the *base* state and
+    ///    `binding.next_generation` names a generation that will not exist
+    ///    if publication is rejected. Minting a
+    ///    `PhysicalTmemSnapshotIdentity` from that pair is precisely the
+    ///    forgery the committed/pending split prevents, so the type system
+    ///    prevents it instead of a convention.
+    /// 3. **No effect-report participation.** Reading is not a write.
+    ///    Nothing observed here enters `proposed_effects`, so
+    ///    `validate_proposal`'s recomputation and
+    ///    `validate_backend_effects`' supersequence walk see exactly what
+    ///    they saw before this method existed.
+    ///
+    /// The proposal digest the view reports is this transaction's own
+    /// `proposal_identity`, so a recorded pending read names the exact
+    /// proposal content it observed -- and `validate_proposal` recomputes
+    /// that digest at both publication routes, so a read cannot be
+    /// attributed to a proposal that has since changed.
+    pub fn pending_image(&self) -> PendingTmemImage<'_> {
+        PendingTmemImage { pending: self }
+    }
+
     pub const fn proposal_identity(&self) -> ContentDigest {
         self.proposal_identity
     }
@@ -772,6 +826,53 @@ impl PendingTmemTransaction {
             generation: self.binding.next_generation,
             last_load_epoch: self.last_load_epoch,
         })
+    }
+}
+
+/// Borrowed read-only view of a [`PendingTmemTransaction`]'s proposed
+/// post-image, as a [`TmemByteSource`].
+///
+/// Created only by [`PendingTmemTransaction::pending_image`], whose doc
+/// states what this view does and does not relax. It holds a shared borrow
+/// of the transaction, so the transaction cannot be published, converted
+/// into a successor, or otherwise consumed while any read is outstanding --
+/// the "read the post-image, then publish it" ordering is enforced by the
+/// borrow checker rather than by review.
+#[derive(Debug)]
+pub struct PendingTmemImage<'pending> {
+    pending: &'pending PendingTmemTransaction,
+}
+
+impl PendingTmemImage<'_> {
+    pub const fn binding(&self) -> PhysicalTmemBinding {
+        self.pending.binding
+    }
+
+    /// This view's own identity, the same value its reads report.
+    pub const fn identity(&self) -> ProposedTmemImageIdentity {
+        ProposedTmemImageIdentity::new(
+            self.pending.proposal_identity,
+            self.pending.binding.state,
+            self.pending.binding.transaction,
+            self.pending.binding.next_generation,
+        )
+    }
+}
+
+impl TmemByteSource for PendingTmemImage<'_> {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Proposed(self.identity())
+    }
+
+    /// Answers from the transaction's own staged post-image arrays -- the
+    /// exact `bytes`/`valid` a publication would install -- with the
+    /// identical validity gate and identical out-of-range handling
+    /// `PhysicalTmemState::valid_byte` applies. The two implementations
+    /// agree byte-for-byte on the same arrays by construction; only the
+    /// snapshot identity differs.
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        let address = usize::from(address);
+        (address < TMEM_LEN && self.pending.valid[address]).then(|| self.pending.bytes[address])
     }
 }
 
