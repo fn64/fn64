@@ -327,7 +327,10 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         base,
         words.len()
     );
-    let _ = writeln!(out, "// Emitted by fn64-cpu-runtime (typed Rust, no unsafe).");
+    let _ = writeln!(
+        out,
+        "// Emitted by fn64-cpu-runtime (typed Rust, no unsafe)."
+    );
     // A leaf function may not touch memory (or, degenerately, registers); the
     // fixed ABI signature keeps both params, so allow the unused-var lint per
     // function rather than second-guessing which params a body references.
@@ -1379,6 +1382,30 @@ fn emit_control_transfer(
     // the resolver decides how to emit).
     let in_func = |t: u32| t >= base && t < func_end;
 
+    // A conditional branch whose target leaves this function is a *tail call*,
+    // exactly like the inter-function `J` arm below: the target's own `jr $ra`
+    // returns to OUR caller. Assigning such a target to the local `pc`
+    // dispatcher instead would land in the `match`'s `_ =>` catch-all, because
+    // the leader set (see `emit_function_resolved`) deliberately only admits
+    // in-function targets.
+    //
+    // WM2000 makes this reachable: `func_80038480`'s true body ends at
+    // `0x800385F0` (`disasm/symbol_addrs.txt`: `func_800385F0 ... size:0x60`),
+    // and `beqz $v1, 0x800385F0` at `0x800384D8` branches to it.
+    //
+    // Returns the emitted taken-arm source, or `None` when the target is local.
+    let escaping_taken_arm = |t: u32| -> Option<String> {
+        if in_func(t) {
+            return None;
+        }
+        Some(match resolver.resolve(t) {
+            CallTarget::Direct(name) => {
+                format!("call_host_or_recompiled({t:#010X}, {name}, ctx, mem); return;")
+            }
+            CallTarget::Indirect => format!("lookup({t:#010X})(ctx, mem); return;"),
+        })
+    };
+
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
             let _ = writeln!(out, "            // delay: {:#010X}: {:?}", delay_vram, d);
@@ -1532,10 +1559,23 @@ fn emit_control_transfer(
             let t = target.unwrap();
             let _ = writeln!(out, "            if {} {{", c);
             emit_delay(out);
-            let _ = writeln!(out, "                pc = {:#010X};", t);
-            let _ = writeln!(out, "            }} else {{");
-            let _ = writeln!(out, "                pc = {:#010X};", fallthrough);
-            let _ = writeln!(out, "            }} continue 'run;");
+            match escaping_taken_arm(t) {
+                Some(tail) => {
+                    let _ = writeln!(out, "                {tail}");
+                    let _ = writeln!(out, "            }}");
+                    let _ = writeln!(
+                        out,
+                        "            pc = {:#010X}; continue 'run;",
+                        fallthrough
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "                pc = {:#010X};", t);
+                    let _ = writeln!(out, "            }} else {{");
+                    let _ = writeln!(out, "                pc = {:#010X};", fallthrough);
+                    let _ = writeln!(out, "            }} continue 'run;");
+                }
+            }
         }
         _ => {
             // Normal conditional branch: delay slot runs unconditionally.
@@ -1543,11 +1583,115 @@ fn emit_control_transfer(
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
             emit_delay(out);
-            let _ = writeln!(
-                out,
-                "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
-                t, fallthrough
-            );
+            match escaping_taken_arm(t) {
+                Some(tail) => {
+                    let _ = writeln!(out, "            if _take {{ {tail} }}");
+                    let _ = writeln!(
+                        out,
+                        "            pc = {:#010X}; continue 'run;",
+                        fallthrough
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
+                        t, fallthrough
+                    );
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod escaping_branch_tests {
+    use super::*;
+    use crate::module::SymbolTable;
+
+    /// WM2000 `func_80038480` at its true size `0x170` ends with
+    /// `beqz $v1, 0x800385F0` at `0x800384D8` — a *conditional* branch whose
+    /// target is the NEXT function. Until the conditional arm learned to route
+    /// an escaping target through the resolver, it emitted a bare
+    /// `pc = 0x800385F0; continue 'run;` into a `match` that has no such arm,
+    /// which the `_ =>` catch-all turns into `unreachable!`.
+    #[test]
+    fn conditional_branch_out_of_the_function_is_a_resolved_tail_call() {
+        // beqz $v1, +0x114 (0x800384D8 -> 0x800385F0), nop, jr $ra, nop
+        let words = [0x1060_0045u32, 0x0000_0000, 0x03E0_0008, 0x0000_0000];
+        let symbols = SymbolTable::from_entries([("func_800385F0", 0x8003_85F0u32)]);
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_84D8,
+                words: &words,
+            },
+            &symbols,
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x800385F0, func_800385F0, ctx, mem); return;"),
+            "escaping conditional branch must tail-call the resolved target:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x800385F0"),
+            "must never assign an out-of-function pc into the local dispatcher:\n{src}"
+        );
+        // The not-taken path must still fall through locally, not tail-call.
+        assert!(
+            src.contains("pc = 0x800384E0; continue 'run;"),
+            "the not-taken arm must fall through to the next local block:\n{src}"
+        );
+    }
+
+    /// Positive control for the mechanism above: an IN-function conditional
+    /// branch must keep the plain two-way `pc =` form. Without this the test
+    /// above would also pass if every conditional branch became a tail call.
+    #[test]
+    fn conditional_branch_inside_the_function_stays_a_local_pc_assignment() {
+        // beqz $v1, +2 (0x80038480 -> 0x8003848C), nop, nop, jr $ra, nop
+        let words = [
+            0x1060_0002u32,
+            0x0000_0000,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_8480,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("elsewhere", 0x8003_848Cu32)]),
+        );
+        assert!(
+            src.contains("pc = if _take { 0x8003848C } else { 0x80038488 }; continue 'run;"),
+            "an in-function branch must not be rerouted through the resolver:\n{src}"
+        );
+        assert!(
+            !src.contains("call_host_or_recompiled(0x8003848C"),
+            "a symbol that merely shares an in-function vram must not hijack \
+             a local branch:\n{src}"
+        );
+    }
+
+    /// An escaping conditional branch to an UNKNOWN vram must go through
+    /// `lookup`, which traps by name — never a silent fall-through and never
+    /// a nearest-match.
+    #[test]
+    fn escaping_conditional_branch_to_an_unknown_target_is_a_named_lookup() {
+        let words = [0x1060_0045u32, 0x0000_0000, 0x03E0_0008, 0x0000_0000];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_84D8,
+                words: &words,
+            },
+            &SymbolTable::from_entries([] as [(&str, u32); 0]),
+        );
+        assert!(
+            src.contains("lookup(0x800385F0)(ctx, mem); return;"),
+            "an unknown escaping target must reach the trapping dispatcher:\n{src}"
+        );
     }
 }
