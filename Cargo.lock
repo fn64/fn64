@@ -963,6 +963,7 @@ dependencies = [
  "fn64-render",
  "fn64-render-reference",
  "fn64-render-rt64",
+ "fn64-render-wgpu",
  "fn64-runtime",
  "gilrs",
  "pixels",
