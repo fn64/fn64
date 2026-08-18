@@ -2583,37 +2583,32 @@ fn stage_and_report(
     // now checks the identity crossing in the direction this arm requires.
     //
     // **Within-packet ordering is semantics, and this is where it is
-    // enforced.**
+    // honoured.**
     //
-    // The pending post-image is sealed ONCE per packet, from every load in
-    // it, before any texrect executes -- `into_pending` runs after the load
-    // loop above. So a texrect that appears BEFORE a load in the command
-    // stream would, without this gate, still observe that load's texels:
-    // the executor would answer a question about the past with the future's
-    // data. Measured, not hypothesised -- with the gate removed, a stream
-    // whose texrect precedes its `LoadBlock` executed and produced
+    // The RDP's TMEM is durable *within* a packet exactly as it is across
+    // packets: a texture rectangle samples whatever TMEM holds at its own
+    // stream position, which is the result of every load BEFORE it and no
+    // load after it. A single post-image sealed from all of a packet's
+    // loads answers that question with the future's data.
+    //
+    // That was measured, not hypothesised. With no ordering gate at all, a
+    // stream whose texrect precedes its `LoadBlock` executed and produced
     // byte-identical texrect rows to the correctly-ordered stream (the same
-    // three `CompletedWrite` content digests). That is the defect this
-    // refuses.
-    //
-    // The refusal is the honest answer rather than "sample a partial
-    // post-image": there is no per-load post-image to sample. Serving one
-    // would mean re-sealing the transaction at every command boundary,
-    // which is a different transaction shape, not a smaller change. A
-    // packet whose texrect genuinely precedes its load is refused by name
-    // until that shape exists.
+    // three `CompletedWrite` content digests) -- ordering was not semantics,
+    // it was ignored. A `TexrectBeforeItsOwnLoad` refusal named that defect
+    // honestly while there was no per-position image to serve.
     //
     // ## The shape WM2000 actually emits, measured
     //
     // Dumped from the real ROM on the all-Rust stack (`FN64_RECOMP=rs` +
-    // `FN64_RENDER=wgpu`), the packet this refuses is the sixth WM2000
-    // issues, and it is a **sprite strip**: one TLUT load followed by
-    // seven `LoadTile`/texrect PAIRS in strict alternation.
+    // `FN64_RENDER=wgpu`), the sixth packet WM2000 issues is a **sprite
+    // strip**: one TLUT load followed by seven `LoadTile`/texrect PAIRS in
+    // strict alternation.
     //
     // ```text
     // cmd 33  LoadTLUT  tile 7  TMEM 2048..2176
     // cmd 39  LoadTile  tile 7  TMEM    0..1576   (49 source rows)
-    // cmd 42  TEXRECT   tile 0                    <-- refused here
+    // cmd 42  TEXRECT   tile 0
     // cmd 47  LoadTile  tile 7  TMEM    0..1960
     // cmd 50  TEXRECT
     // cmd 55  LoadTile  tile 7  TMEM    0..1960
@@ -2628,58 +2623,44 @@ fn stage_and_report(
     // cmd 90  TEXRECT
     // ```
     //
-    // Every one of the seven `LoadTile`s writes the SAME TMEM range
-    // starting at word 0. They overwrite each other. So the once-per-packet
-    // seal is not merely too coarse here -- it is maximally wrong: the
-    // sealed post-image holds only the LAST load's texels, and all seven
-    // texrects would draw the same sprite. This packet is precisely the
-    // case the guard was written to catch, and the guard is right.
+    // Every one of the seven `LoadTile`s writes the SAME TMEM range from
+    // word 0. They overwrite each other, so a once-per-packet post-image is
+    // not merely too coarse here -- it is maximally wrong: it holds only the
+    // SEVENTH load's texels, and all seven texrects would draw the seventh
+    // sprite. Refusing the packet was correct while that was the only
+    // alternative; serving each texrect its own position is correct
+    // outright, and is what the loop below does.
     //
-    // ## Why per-load sealing is not a smaller change (sized, not guessed)
+    // ## Per-position views, not per-position transactions
     //
-    // Four separate structures assume exactly one post-image per packet,
-    // and each would have to change:
+    // The seal stays **once per packet**, and every structure that assumes
+    // one post-image per packet is untouched:
     //
-    // 1. `into_pending` consumes the `PhysicalTmemPacketTransaction` by
-    //    value and requires access-for-access coverage of EVERY journal
-    //    `TmemLoadDestination` write. Sealing after load 1 of 8 fails its
-    //    own `DestinationCoverageMismatch` by construction.
-    // 2. `PhysicalTmemBinding` carries ONE `next_generation` for the
-    //    packet. N seals would each claim the same successor generation --
-    //    the same forgery `stage_color_commands` refuses N candidates for.
-    // 3. `proposal_identity` is computed over the whole projection and
-    //    effect list, and `validate_proposal` recomputes it at both
-    //    publication routes. A per-load proposal is a different digest over
-    //    a different domain, so publication identity moves with the seal.
-    // 4. The TMEM loop and `stage_color_commands` are sequential PHASES,
-    //    not one interleaved walk, and deliberately so: color staging runs
-    //    last precisely so a TMEM rejection leaves no color token in
-    //    existence. Per-position sampling requires interleaving them, which
-    //    reopens that ordering guarantee.
+    // 1. `into_pending` still runs exactly once, still consuming the
+    //    `PhysicalTmemPacketTransaction` by value and still requiring
+    //    access-for-access coverage of EVERY journal `TmemLoadDestination`
+    //    write. Nothing seals after load 1 of 8.
+    // 2. `PhysicalTmemBinding`'s single `next_generation` is claimed once,
+    //    by that one seal. A prefix claims no generation.
+    // 3. `proposal_identity` is computed once over the whole projection and
+    //    effect list, and `validate_proposal` recomputes that same digest at
+    //    both publication routes. A prefix read reports it verbatim.
+    // 4. The TMEM loop and `stage_color_commands` remain sequential PHASES.
+    //    `capture_prefix` copies `bytes`/`valid` out during the load loop --
+    //    it is a read, it cannot fail, and it touches no registry -- so
+    //    color staging still runs strictly last and a TMEM rejection still
+    //    leaves no color token in existence.
     //
-    // The GPU half has the same problem one layer over: `draw_tmem` is one
-    // `TmemGpuProjection` per `draw_admitted_triangles` call, shared by
-    // every triangle in the draw.
-    //
-    // What already fits, and is worth keeping in view for whoever sizes
-    // this: `finish_load` returns the packet transaction BY VALUE with
-    // `bytes`/`valid` already updated for every load so far, so a borrowed
-    // per-position view needs no new seal, generation, or digest; and
+    // What made this small is that `finish_load` returns the packet
+    // transaction BY VALUE with `bytes`/`valid` already current for every
+    // load so far, so a prefix is a copy of arrays that already exist; and
     // `execute_scheduled_texrect` is already generic over `TmemByteSource`,
-    // so there is one sampler to point at it, not two.
-    if let Some(&(_, _, _, texrect_command)) = collector.plan.texrect_commands.first() {
-        if let Some((load_command, _)) = collector
-            .plan
-            .loads
-            .iter()
-            .find(|(load_command, _)| *load_command > texrect_command)
-        {
-            return Err(WgpuRawDpcExecutionError::TexrectBeforeItsOwnLoad {
-                texrect_command,
-                load_command: *load_command,
-            });
-        }
-    }
+    // so the per-position image is served through the one sampler rather
+    // than a parallel reader.
+    //
+    // The GPU half is unchanged and remains one `TmemGpuProjection` per
+    // `draw_admitted_triangles` call: it projects the sealed post-image,
+    // which is what a triangle drawn after the whole packet observes.
     // A color-target command with no TMEM load keeps its own dedicated
     // path: the packet has no physical successor to offer, so it must not
     // reach `complete_execution`.
@@ -2721,6 +2702,13 @@ fn stage_and_report(
     let sequence = transaction_sequence(packet);
 
     let mut packet_transaction: Option<PhysicalTmemPacketTransaction> = None;
+    // **TMEM as of each load, keyed by the load's own stream position.**
+    //
+    // Appended in load order, which is stream order (`plan.loads` is filled
+    // by the decoder's single stream walk), so a texrect at command C reads
+    // the LAST entry whose command index is below C -- see
+    // `tmem_source_for_command`.
+    let mut prefixes: Vec<(u32, crate::tmem::TmemPrefixSnapshot)> = Vec::new();
 
     for (command_index, load) in collector.plan.loads.iter() {
         let command_index = *command_index;
@@ -2765,11 +2753,15 @@ fn stage_and_report(
                 .map_err(WgpuRawDpcExecutionError::Physical)?;
         }
 
-        packet_transaction = Some(
-            staged
-                .finish_load()
-                .map_err(WgpuRawDpcExecutionError::Physical)?,
-        );
+        let finished = staged
+            .finish_load()
+            .map_err(WgpuRawDpcExecutionError::Physical)?;
+        // Taken after THIS load and before the next stages anything, so the
+        // snapshot is exactly what TMEM holds at this command's position.
+        // A read of arrays that already exist: it cannot fail and touches
+        // no registry, so the load loop stays a pure phase.
+        prefixes.push((command_index, finished.capture_prefix()));
+        packet_transaction = Some(finished);
     }
 
     let packet_transaction = match packet_transaction {
@@ -2819,8 +2811,14 @@ fn stage_and_report(
     // staging last means a TMEM rejection returns `Err` with no token in
     // existence at all, which is the same "nothing published" outcome the
     // fill-only path reaches by never storing the token on the error path.
-    let staged_fill =
-        stage_color_commands(collector, packet, TexrectTmemSource::Pending(&pending))?;
+    let staged_fill = stage_color_commands(
+        collector,
+        packet,
+        TexrectTmemSource::Pending {
+            pending: &pending,
+            prefixes: &prefixes,
+        },
+    )?;
 
     let Some(staged_fill) = staged_fill else {
         let effects = BackendEffectReport::try_new(packet, tmem_writes)
@@ -2980,11 +2978,13 @@ enum ColorCommandKind {
 /// The RDP's TMEM is durable across submissions. A texrect samples whatever
 /// is in TMEM at its own stream position, which is:
 ///
-/// - [`Self::Pending`] -- the sealed post-image of this packet's own loads,
-///   when the packet carries at least one. `TexrectBeforeItsOwnLoad`
-///   independently refuses a texrect that precedes a load in the same
-///   packet, so every texrect reaching this case genuinely follows every
-///   load whose texels it observes.
+/// - [`Self::Pending`] -- this packet's own staged loads, when the packet
+///   carries at least one. **Not one image for the whole packet:** the
+///   variant carries the per-load prefix snapshots alongside the sealed
+///   transaction, and each texrect is served the prefix taken after the
+///   last load BEFORE its own stream position. A texrect that precedes
+///   every load in its packet reads no prefix at all and falls to durable
+///   committed TMEM, because that is what TMEM holds at that position.
 /// - [`Self::Committed`] -- the coordinator's durable [`PhysicalTmemState`],
 ///   when the packet carries **zero** loads. There is no proposal to
 ///   observe, and the durable state is not "stale": it is precisely the
@@ -3004,7 +3004,12 @@ enum ColorCommandKind {
 /// staging failed. A `None` where a pending image was expected stays a
 /// named refusal.
 enum TexrectTmemSource<'a> {
-    Pending(&'a crate::tmem::PendingTmemTransaction),
+    Pending {
+        pending: &'a crate::tmem::PendingTmemTransaction,
+        /// TMEM as of each of this packet's loads, keyed by the load's own
+        /// stream command index, in stream order.
+        prefixes: &'a [(u32, crate::tmem::TmemPrefixSnapshot)],
+    },
     Committed(&'a PhysicalTmemState),
 }
 
@@ -3127,26 +3132,51 @@ fn stage_color_commands(
                 execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
             }
             ColorCommandKind::Texrect(index) => {
-                // A texrect samples the TMEM image `stage_and_report`
-                // selected for the whole packet from its own load count --
-                // this packet's pending post-image when it carries loads,
-                // durable committed state when it carries none. The choice
-                // is made once, upstream, from a fact about the wire
-                // stream; this loop applies it rather than re-deciding per
-                // command.
+                // **A texrect samples TMEM at its OWN stream position.**
+                //
+                // `stage_and_report` chose the family once, upstream, from
+                // a fact about the wire stream (does this packet carry
+                // loads at all). Within the pending family the position is
+                // still per command, because TMEM is durable within a
+                // packet: a texrect observes every load before it and no
+                // load after it. Selecting on the command index the
+                // decoder's own stream walk assigned -- the same index this
+                // schedule is sorted by -- keeps that a recovery of the
+                // stream's order rather than a policy.
                 let resident = accumulated
                     .as_deref()
                     .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+                let command_index = collector.plan.texrect_commands[index].3;
                 match tmem {
-                    TexrectTmemSource::Pending(pending) => execute_scheduled_texrect(
-                        collector,
-                        &candidate,
-                        &pending.pending_image(),
-                        true,
-                        index,
-                        resident,
-                        claimed,
-                    )?,
+                    TexrectTmemSource::Pending { pending, prefixes } => {
+                        match prefix_before(prefixes, command_index) {
+                            Some(prefix) => execute_scheduled_texrect(
+                                collector,
+                                &candidate,
+                                &pending.prefix_image(prefix),
+                                true,
+                                index,
+                                resident,
+                                claimed,
+                            )?,
+                            // No load precedes this texrect in its own
+                            // packet, so what TMEM holds here is exactly
+                            // what an earlier packet published: durable
+                            // committed state, read through the same one
+                            // sampler. Not a fallback for a missing image
+                            // -- the absence of a preceding load IS the
+                            // stream fact that makes committed correct.
+                            None => execute_scheduled_texrect(
+                                collector,
+                                &candidate,
+                                collector.physical,
+                                false,
+                                index,
+                                resident,
+                                claimed,
+                            )?,
+                        }
+                    }
                     TexrectTmemSource::Committed(state) => execute_scheduled_texrect(
                         collector, &candidate, state, false, index, resident, claimed,
                     )?,
@@ -3184,6 +3214,29 @@ fn stage_color_commands(
         initialized,
         guest_writes,
     }))
+}
+
+/// The TMEM prefix a command at `command_index` observes: the one taken
+/// after the LAST load whose own stream position is strictly earlier.
+///
+/// Strictly earlier, never equal: a load and the texrect that samples it are
+/// separate wire commands with separate indices, and an equal index would
+/// mean one command was both, which the decoder cannot produce. `None` means
+/// no load in this packet precedes the command, so it observes durable
+/// committed TMEM instead.
+///
+/// `prefixes` is in stream order by construction (`stage_and_report` appends
+/// one per load as it walks `plan.loads`, which the decoder filled in its
+/// single stream walk), so the last qualifying entry is the latest one.
+fn prefix_before(
+    prefixes: &[(u32, crate::tmem::TmemPrefixSnapshot)],
+    command_index: u32,
+) -> Option<&crate::tmem::TmemPrefixSnapshot> {
+    prefixes
+        .iter()
+        .rev()
+        .find(|(load_command, _)| *load_command < command_index)
+        .map(|(_, prefix)| prefix)
 }
 
 /// The smallest rectangle containing both, or `covered` alone when there is
@@ -11702,40 +11755,45 @@ mod tests {
     /// **Invariant 2, proven: ordering within a packet is semantics, and
     /// the reverse order observably differs.**
     ///
-    /// Forward (`LoadBlock` then texrect) executes and produces texels.
-    /// Reversed (texrect then `LoadBlock`) is refused by name. Same
-    /// commands, same wire words, same fill -- only the order changed.
+    /// Forward (`LoadBlock` then texrect) and reversed (texrect then
+    /// `LoadBlock`) both execute -- both are legal RDP streams -- and they
+    /// produce **different** texrect pixels. Same commands, same wire
+    /// words, same fill; only the order changed.
     ///
     /// # This test found a real defect, and records it
     ///
-    /// The first draft of this test asserted only that the reversed order
-    /// "must not execute", and it **failed**: the reversed stream executed
-    /// cleanly and produced texrect rows with byte-identical
-    /// `CompletedWrite` content digests to the forward stream's. The cause
-    /// is structural, not a slip: `stage_and_report` runs its load loop to
-    /// completion and seals ONE pending post-image before any texrect
-    /// executes, so a texrect's position in the command stream had no
-    /// effect on what it saw. Ordering was not semantics; it was ignored.
+    /// The first draft asserted only that the reversed order "must not
+    /// execute", and it **failed**: the reversed stream executed cleanly
+    /// and produced texrect rows with byte-identical `CompletedWrite`
+    /// content digests to the forward stream's. The cause was structural,
+    /// not a slip: `stage_and_report` sealed ONE pending post-image from
+    /// every load before any texrect executed, so a texrect's position in
+    /// the command stream had no effect on what it saw. Ordering was not
+    /// semantics; it was ignored.
     ///
-    /// `TexrectBeforeItsOwnLoad` is the fix, and refusal is the honest
-    /// shape of it: there is no per-load post-image to hand a texrect that
-    /// precedes a load, so the alternatives were "refuse" or "re-seal the
-    /// transaction at every command boundary", and the latter is a
-    /// different transaction design rather than a smaller change.
+    /// A `TexrectBeforeItsOwnLoad` refusal named that honestly while there
+    /// was no per-position image to serve. Per-load prefix views replaced
+    /// it: the texrect in the reversed stream now samples what TMEM held at
+    /// its own position -- durable committed state, because no load in its
+    /// packet precedes it -- and the load that follows it still stages, so
+    /// the stream executes and the two orders differ in output.
     ///
-    /// The identical-digest observation is what makes the refusal load
-    /// bearing rather than defensive -- without the gate the two orders are
-    /// genuinely indistinguishable in their output, which is precisely the
-    /// invariant violation.
+    /// The identical-digest observation is what keeps this load bearing
+    /// rather than defensive: without a position-aware image the two orders
+    /// are genuinely indistinguishable in their output, which is precisely
+    /// the invariant violation. Asserting a *difference* is strictly
+    /// stronger than asserting a refusal -- a refusal proves only that one
+    /// order was rejected, while this proves the accepted orders disagree.
     #[test]
     fn a_texrect_before_its_load_observably_differs_from_one_after_it() {
         // Forward order: fill, load, texrect. Executes.
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
+        let forward_words = fill_load_and_copy_texrect_words();
         let (_, forward) = plan_and_execute_composed(
             &mut backend,
             &mut session,
-            fill_load_and_copy_texrect_words(),
+            forward_words.clone(),
         );
         assert!(
             forward.is_ok(),
@@ -11755,33 +11813,43 @@ mod tests {
         reversed.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
 
         // Control: the reversed stream really does still carry both an
-        // admitted texrect and an admitted load. Without this, "the
-        // reversed order is refused" could mean the reordering broke the
-        // decode instead of tripping the ordering gate.
+        // admitted texrect and an admitted load. Without this, a difference
+        // below could mean the reordering broke the decode instead of
+        // moving the texrect to a position with different texels.
         assert_eq!(
             admitted_texture_rectangle_triangles(reversed.clone()),
             2,
-            "the reversed stream must still admit its texture rectangle, or its refusal below \
+            "the reversed stream must still admit its texture rectangle, or the difference below \
              proves nothing about ordering"
         );
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
-        let (_, backward) = plan_and_execute_composed(&mut backend, &mut session, reversed);
-        let error = backward
-            .expect_err("a texrect placed before its own load must not execute")
-            .to_string();
+        let (_, backward) = plan_and_execute_composed(&mut backend, &mut session, reversed.clone());
         assert!(
-            error.contains("appearing before the TMEM load"),
-            "the refusal must be the named TexrectBeforeItsOwnLoad variant, got: {error}"
+            backward.is_ok(),
+            "the reversed order is a legal RDP stream and must execute -- its texrect samples \
+             durable committed TMEM, which is what TMEM holds at its own position: {backward:?}"
         );
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "a refused reversed packet must leave no redeemable fill token"
-        );
-        assert!(
-            backend.color_targets().is_none(),
-            "the ordering refusal must fire before either executor built the registry"
+
+        // The observable difference, read off the composed color-target
+        // bytes both orders published. Digests, not a pixel spot-check, so
+        // a difference anywhere in the composed image counts.
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let forward_writes = publish_composed(&mut backend, &mut session, forward_words);
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let backward_writes = publish_composed(&mut backend, &mut session, reversed);
+
+        let forward_digests: Vec<_> = forward_writes.iter().map(|w| w.content()).collect();
+        let backward_digests: Vec<_> = backward_writes.iter().map(|w| w.content()).collect();
+        assert_ne!(
+            forward_digests, backward_digests,
+            "a texrect placed BEFORE its own load must not observe that load's texels, so the \
+             two orders must produce different composed content -- identical digests are the \
+             exact defect this test exists to catch"
         );
     }
 

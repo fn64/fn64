@@ -923,7 +923,7 @@ impl fmt::Debug for TmemPrefixSnapshot {
 /// proposal in existence and the one `validate_proposal` recomputes. The
 /// prefix is a position inside that proposal, not a rival to it.
 #[derive(Debug)]
-pub struct PendingTmemPrefixImage<'pending> {
+pub(crate) struct PendingTmemPrefixImage<'pending> {
     pending: &'pending PendingTmemTransaction,
     prefix: &'pending TmemPrefixSnapshot,
 }
@@ -931,7 +931,7 @@ pub struct PendingTmemPrefixImage<'pending> {
 impl PendingTmemPrefixImage<'_> {
     /// The sealed transaction's identity -- the same value
     /// [`PendingTmemImage::identity`] reports, deliberately.
-    pub const fn identity(&self) -> ProposedTmemImageIdentity {
+    pub(crate) const fn identity(&self) -> ProposedTmemImageIdentity {
         ProposedTmemImageIdentity::new(
             self.pending.proposal_identity,
             self.pending.binding.state,
