@@ -737,14 +737,20 @@ fn fragment_coverage_params_bytes_rejects_save_destination() {
     );
 }
 
+/// `image_read_enabled` with `force_blend` CLEAR still refuses: there
+/// `blend_enabled == antialias_enabled && !wraps` genuinely reads the
+/// unknown `memory` through `wraps`, so the value would reach
+/// `blend_fragment_cycle_fn` (`triangle_pipeline_fragment.wgsl:326`).
+/// This is the arm a real `image_read_enabled` triangle takes, and it is
+/// the constraint-1 proof that narrowing the refusal did not delete it.
 #[test]
 #[should_panic(expected = "must be rejected before GPU submission")]
-fn fragment_coverage_params_bytes_rejects_clamp_with_image_read_enabled() {
+fn fragment_coverage_params_bytes_rejects_clamp_with_image_read_and_no_force_blend() {
     let _ = fragment_coverage_params_bytes(
         crate::state::CoverageDestination::Clamp,
         true,
         false,
-        false,
+        true,
         false,
         false,
     );
@@ -752,14 +758,144 @@ fn fragment_coverage_params_bytes_rejects_clamp_with_image_read_enabled() {
 
 #[test]
 #[should_panic(expected = "must be rejected before GPU submission")]
-fn fragment_coverage_params_bytes_rejects_wrap_with_image_read_enabled() {
+fn fragment_coverage_params_bytes_rejects_wrap_with_image_read_and_no_force_blend() {
     let _ = fragment_coverage_params_bytes(
         crate::state::CoverageDestination::Wrap,
         true,
         false,
+        true,
         false,
         false,
+    );
+}
+
+/// `alpha_coverage_select` set routes the `memory`-dependent
+/// `adjusted_coverage` into `output.color.a`
+/// (`triangle_pipeline_fragment.wgsl:283-285`), so it refuses even with
+/// `force_blend` set -- the second half of the named boundary.
+#[test]
+#[should_panic(expected = "must be rejected before GPU submission")]
+fn fragment_coverage_params_bytes_rejects_wrap_with_image_read_and_alpha_coverage_select() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Wrap,
+        true,
+        true,
+        true,
         false,
+        true,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be rejected before GPU submission")]
+fn fragment_coverage_params_bytes_rejects_clamp_with_image_read_and_alpha_coverage_select() {
+    let _ = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Clamp,
+        true,
+        true,
+        true,
+        false,
+        true,
+    );
+}
+
+/// The admitted narrow case: `image_read_enabled` with `force_blend` set and
+/// `alpha_coverage_select` clear. Hand-derived from
+/// `triangle_pipeline_fragment.wgsl`'s two coverage-output routes -- with
+/// `force_blend` set, `blend_enabled` is `true` for every `memory` value, and
+/// with `alpha_coverage_select` clear the `memory`-dependent `destination`
+/// never reaches `output.color.a`. The serialized `coverage_destination` word
+/// is the mode's own encoding (Clamp=0/Wrap=1), NOT a substituted `Full`(2):
+/// a substitution is what this admission must not be, and asserting the
+/// distinct wire values is what would catch one.
+#[test]
+fn fragment_coverage_params_bytes_admits_image_read_when_memory_cannot_be_observed() {
+    let clamp = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Clamp,
+        true,
+        true,
+        true,
+        false,
+        false,
+    );
+    assert_eq!(&clamp[0..4], &0u32.to_le_bytes());
+    assert_eq!(&clamp[4..8], &1u32.to_le_bytes());
+    assert_eq!(&clamp[8..12], &1u32.to_le_bytes());
+
+    let wrap = fragment_coverage_params_bytes(
+        crate::state::CoverageDestination::Wrap,
+        true,
+        true,
+        true,
+        false,
+        false,
+    );
+    assert_eq!(&wrap[0..4], &1u32.to_le_bytes());
+    assert_eq!(&wrap[4..8], &1u32.to_le_bytes());
+    assert_eq!(&wrap[8..12], &1u32.to_le_bytes());
+}
+
+/// WM2000's own latched texrect mode, decoded from the captured packet's
+/// other-mode low word `0x005041c8` rather than transcribed: `cvg_dst=Wrap`
+/// (bits 9:8 == 1), `IM_RD` (bit 6), `AA_EN` (bit 3), `CLR_ON_CVG` (bit 7),
+/// `FORCE_BL` (bit 14), `CVG_X_ALPHA` (bit 12) clear, `ALPHA_CVG_SEL`
+/// (bit 13) clear. The bits are re-derived here through `OtherMode`'s own
+/// accessors from the raw word, so a change to either the word or an
+/// accessor breaks this rather than silently agreeing.
+#[test]
+fn wm2000_latched_texrect_coverage_mode_is_admitted_and_is_not_memory_dependent() {
+    let mode = crate::state::OtherMode::from_wire(0x0000_acef, 0x0050_41c8);
+    assert_eq!(
+        mode.coverage_destination(),
+        crate::state::CoverageDestination::Wrap
+    );
+    assert!(mode.image_read_enabled());
+    assert!(mode.antialias_enabled());
+    assert!(mode.clear_on_coverage());
+    assert!(mode.force_blend());
+    assert!(!mode.coverage_times_alpha());
+    assert!(!mode.alpha_coverage_select());
+
+    let bytes = fragment_coverage_params_bytes(
+        mode.coverage_destination(),
+        mode.image_read_enabled(),
+        mode.force_blend(),
+        mode.antialias_enabled(),
+        mode.coverage_times_alpha(),
+        mode.alpha_coverage_select(),
+    );
+    assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
+    assert_eq!(&bytes[4..8], &1u32.to_le_bytes());
+}
+
+/// The safety argument stated as arithmetic over `coverage_result` itself,
+/// independent of the shader transcription: under WM2000's latched mode
+/// every `memory` in `0..=8` yields the same `blend_enabled`, so the one
+/// term the admitted draw actually consumes is `memory`-invariant. The
+/// companion half is deliberately asserted too -- `destination` DOES vary
+/// with `memory`, which is why the admission rests on non-observability
+/// rather than on the accumulation being a no-op.
+#[test]
+fn wm2000_mode_blend_enabled_is_memory_invariant_while_destination_is_not() {
+    let mode = crate::CoverageModeBits {
+        coverage_destination: crate::state::CoverageDestination::Wrap,
+        image_read_enabled: true,
+        force_blend: true,
+        antialias_enabled: true,
+    };
+    let pixel = crate::Coverage::FULL;
+    let mut destinations = std::collections::BTreeSet::new();
+    for memory in 0..=8u8 {
+        let result = crate::coverage_result(pixel, crate::Coverage::new(memory), mode);
+        assert!(
+            result.blend_enabled,
+            "force_blend must dominate for memory={memory}"
+        );
+        destinations.insert(result.destination.count());
+    }
+    assert!(
+        destinations.len() > 1,
+        "destination must genuinely vary with memory: {destinations:?}"
     );
 }
 
