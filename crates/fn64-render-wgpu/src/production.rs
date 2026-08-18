@@ -19,14 +19,23 @@
 //! `process_task`/`present` are honest, named rejections -- this slice
 //! proves the raw-DPC production seam, not general gfx-task execution.
 //!
-//! **Guest-write nonclaim.** An admitted `FillRectangle` declares
+//! **Guest-write boundary.** An admitted `FillRectangle` declares
 //! guest-visible `RenderTarget` *journal* writes and commits them through
-//! `RawDpcAbiSession::commit_guest_render_target_writes`. Nothing in that
-//! chain modifies guest RDRAM: `execute_fill_rectangle` produces an owned
-//! `Vec<u8>`, `ResidentPublication::publish` writes into a backend-local
-//! `Vec`, and a `CompletedWrite` is a range plus a content digest, not
-//! bytes in motion. The RDRAM copyback is a separate, deferred slice, and
-//! no code here may be described as "publishing to guest memory".
+//! `RawDpcAbiSession::commit_guest_render_target_writes`. Nothing **in this
+//! crate** modifies guest RDRAM, and that remains true after the copyback
+//! landed: `execute_fill_rectangle` still produces an owned `Vec<u8>`,
+//! `ResidentPublication::publish` still writes into a backend-local `Vec`,
+//! and a `CompletedWrite` is still a range plus a content digest, never
+//! bytes in motion.
+//!
+//! What changed is that this backend now also *hands over* those bytes, on
+//! request, through [`RenderBackend::committed_guest_render_target_bytes`].
+//! It does not write them. The RDRAM copy is performed by `fn64-abi`'s
+//! `task_dispatch::rsp_commit::copy_committed_guest_writes`, strictly after
+//! the guest commit succeeded, and it re-derives each committed
+//! `ContentDigest` from these bytes before writing any of them. Code here
+//! may be described as "producing the bytes a committed write names", never
+//! as "publishing to guest memory".
 
 use fn64_render::{
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome, ExactRawDpcPlanVisitor,
@@ -1390,6 +1399,66 @@ impl RenderBackend for WgpuBackend {
             .unwrap_or_default()
     }
 
+    /// The bytes behind the same pending fill token
+    /// [`Self::staged_guest_render_target_writes`] reported ranges for, in
+    /// the identical order -- one `Vec<u8>` per `CompletedWrite`, sliced out
+    /// of the fill's own full-extent `DeviceColorBytes` buffer at each
+    /// write's declared physical range.
+    ///
+    /// The slicing is the same physical -> buffer-relative arithmetic
+    /// `fill_completed_writes` used to build the digests in the first place,
+    /// so these bytes are by construction the exact bytes those digests
+    /// cover. The caller re-derives each digest anyway (see the trait
+    /// method's own doc) rather than trusting that construction argument.
+    ///
+    /// A submission mismatch yields an EMPTY list, exactly as the sibling
+    /// method does and for the same reason: a caller that committed a
+    /// nonempty write list and then gets no bytes must fail loudly, never
+    /// copy some other submission's pixels into guest memory.
+    ///
+    /// Nonclaim: this method writes nothing. It hands owned copies to a
+    /// caller that owns the RDRAM allocation; whether any guest byte changes
+    /// is that caller's decision, made after its own commit succeeded.
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        let Some(pending) = self
+            .pending_fill_publication
+            .as_ref()
+            .filter(|pending| pending.submission == submission)
+        else {
+            return Vec::new();
+        };
+
+        let key = pending.initialized.key();
+        let base = key.address().get();
+        let buffer = pending.initialized.device_bytes().device_bytes();
+        pending
+            .guest_writes
+            .iter()
+            .map(|write| {
+                let fn64_render_ir::ResourceRegion::Rdram { range, .. } = write.access().region()
+                else {
+                    panic!(
+                        "a staged guest render-target write must name an RDRAM region; \
+                         fill_completed_writes rejected every other kind when it built this list"
+                    );
+                };
+                let start = (range.start().get() - base) as usize;
+                let end = start + range.len() as usize;
+                buffer
+                    .get(start..end)
+                    .expect(
+                        "every staged write's range lies inside its own color target's \
+                         full-extent buffer -- fill_completed_writes sliced these same \
+                         bounds to compute the digests",
+                    )
+                    .to_vec()
+            })
+            .collect()
+    }
+
     fn publish_raw_dpc(
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
@@ -1943,7 +2012,11 @@ fn stage_and_report(
 ///
 /// Nonclaim: nothing here writes guest RDRAM. `execute_fill_rectangle`
 /// produces an owned `Vec<u8>`, and the `CompletedWrite`s are ranges plus
-/// content digests, not bytes in motion.
+/// content digests, not bytes in motion. That is still exactly true after
+/// the RDRAM copyback landed -- the copy is performed by `fn64-abi`, from
+/// bytes this backend hands over separately through
+/// `committed_guest_render_target_bytes`, and only after the guest commit
+/// has succeeded.
 fn stage_fills_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
