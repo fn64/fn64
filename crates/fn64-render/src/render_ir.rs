@@ -28,7 +28,7 @@ pub use production::{
     RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
     RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
     TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape, TmemTransferLayout,
-    TriangleSource,
+    TriangleAccessSpan, TriangleSource,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -1493,6 +1493,53 @@ mod production {
         pub vertices: [NeutralTriangleVertex; 3],
         pub source: TriangleSource,
         pub viewport: Option<RectViewportPixels>,
+        /// The exact ordered `RenderTarget` write-access span the decoder
+        /// declared for the originating `TextureRectangle` command, or
+        /// `None`.
+        ///
+        /// `None` for every `TriangleSource::RawTriangle` -- a raw triangle
+        /// pushes zero accesses, as this type's own doc states -- and also
+        /// `None` for a `TextureRectangle` whose destination was not
+        /// provable at decode time (no staged `SetColorImage`, an
+        /// unsupported color format, a fractional or reversed rectangle, or
+        /// flip; see the wgpu decoder's `plan_texture_rectangle`). A texrect
+        /// that declared no write is not a silent no-op: it still rasters
+        /// through the triangle path, it simply has no `ColorFramebuffer`
+        /// range for a CPU-side executor to compose into.
+        ///
+        /// Carried for the same reason [`RdpFillRectangleCommand`] carries
+        /// its own pair: so a visitor can locate the accesses this command
+        /// declared **without re-deriving them** from the rectangle's
+        /// geometry, which is exactly the second-independent-derivation
+        /// drift `ExactRawDpcPlanWriter::finish`'s access-for-access check
+        /// exists to catch.
+        ///
+        /// One texture rectangle is admitted as two triangles, and **both
+        /// halves carry the identical span** -- it describes the
+        /// originating wire command, not either half's own share of it.
+        /// A consumer counting declared writes must therefore attribute the
+        /// span once per originating command, never once per triangle.
+        pub texrect_accesses: Option<TriangleAccessSpan>,
+    }
+
+    /// One `TextureRectangle`-sourced triangle's originating command's
+    /// declared `RenderTarget` write-access span, in the owning plan's
+    /// ordered access list.
+    ///
+    /// Field-for-field the same pair [`RdpFillRectangleCommand`] carries
+    /// (`first_access_index`/`access_count`), named as a struct here because
+    /// the whole pair is optional on a triangle where it is mandatory on a
+    /// fill -- `Option<TriangleAccessSpan>` makes "declared nothing"
+    /// unrepresentable as "declared zero accesses starting at zero".
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct TriangleAccessSpan {
+        /// Index into the owning plan's ordered access list of the
+        /// originating command's first `RenderTarget` write access.
+        pub first_access_index: u32,
+        /// How many consecutive accesses starting at `first_access_index`
+        /// belong to it. `1` for a full-image-width rectangle, the
+        /// rectangle's covered pixel-row count otherwise.
+        pub access_count: u32,
     }
 
     /// Neutral carrier for one admitted fill-cycle `FillRectangle` (RDP
@@ -2421,6 +2468,18 @@ mod production {
             &self.capture
         }
 
+        /// How many [`ResourceAccess`] entries this writer has pushed so
+        /// far -- i.e. the index the *next* pushed access will occupy.
+        ///
+        /// Exists so a caller about to push a run of accesses can record
+        /// its own `first_access_index` from the writer's own state rather
+        /// than tracking a parallel counter that could drift from it. Read
+        /// immediately before the matching push; reading it after would
+        /// name the run's end, not its start.
+        pub fn access_count(&self) -> u32 {
+            self.accesses.len() as u32
+        }
+
         pub fn push_tmem_load(&mut self, load: TmemLoadSemantics) {
             self.accesses.push(load.source);
             self.accesses.push(load.destination);
@@ -3168,6 +3227,7 @@ mod production {
                 raw_words: words.into_boxed_slice(),
                 source: TriangleSource::RawTriangle,
                 viewport: None,
+                texrect_accesses: None,
                 vertices: [NeutralTriangleVertex {
                     x: 0.0,
                     y: 0.0,

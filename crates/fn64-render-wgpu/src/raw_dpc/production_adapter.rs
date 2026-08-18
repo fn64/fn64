@@ -988,6 +988,9 @@ pub fn push_decoded_raw_dpc(
                     vertices,
                     source: TriangleSource::RawTriangle,
                     viewport: None,
+                    // A `RawTriangle` pushes zero accesses, so there is no
+                    // span to carry -- `None`, never an empty span.
+                    texrect_accesses: None,
                 });
             }
             RawDpcCommandKind::TextureRectangle(rectangle) => {
@@ -1047,13 +1050,41 @@ pub fn push_decoded_raw_dpc(
                 let texrect_accesses = resource_plan
                     .bind_texture_rectangle(command_index)
                     .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                // The span is read off the writer's own access list
+                // *before* this command's accesses are appended, exactly as
+                // `push_fill_rectangle`'s caller does: `first_access_index`
+                // is where they are about to land, and `access_count` is
+                // how many the decoder's slice carries. Both are taken from
+                // the one slice `bind_texture_rectangle` returned -- never
+                // re-derived from the rectangle's geometry, which would be
+                // the second independent derivation `finish`'s
+                // access-for-access check exists to catch.
+                //
+                // An empty slice means this texrect declared no destination
+                // write (no staged `SetColorImage`, unsupported format,
+                // fractional/reversed rectangle, or flip -- see
+                // `plan_texture_rectangle`). That is `None`, not a
+                // zero-count span: "declared nothing" and "declared zero
+                // accesses" must not be the same value.
+                let texrect_span = if texrect_accesses.is_empty() {
+                    None
+                } else {
+                    Some(fn64_render::TriangleAccessSpan {
+                        first_access_index: writer.access_count(),
+                        access_count: texrect_accesses.len() as u32,
+                    })
+                };
                 writer.push_texture_rectangle_accesses(texrect_accesses);
+                // Both halves carry the identical span: it describes the
+                // originating wire command, not either half's share. A
+                // consumer must attribute it once per command.
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.clone().into_boxed_slice(),
                     vertices: first,
                     source: TriangleSource::TextureRectangle,
                     viewport: Some(vertices.viewport),
+                    texrect_accesses: texrect_span,
                 });
                 writer.push_triangle(RdpTriangleCommand {
                     location,
@@ -1061,6 +1092,7 @@ pub fn push_decoded_raw_dpc(
                     vertices: second,
                     source: TriangleSource::TextureRectangle,
                     viewport: Some(vertices.viewport),
+                    texrect_accesses: texrect_span,
                 });
             }
             RawDpcCommandKind::NoOp { .. } => {}

@@ -85,7 +85,7 @@ pub use render_ir::{
     RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
     RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
     StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
-    TmemTransferLayout, TriangleSource,
+    TmemTransferLayout, TriangleAccessSpan, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
