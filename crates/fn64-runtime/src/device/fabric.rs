@@ -637,6 +637,29 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         (width != 0).then_some(width)
     }
 
+    /// The guest-programmed active digital output height in lines, decoded
+    /// from VI_V_START (`vi_registers[10]`) exactly as
+    /// `fn64_render::ViActiveWindow` decodes it: the half-line interval
+    /// `(end - start) / 2`. `None` until both the H and V intervals have been
+    /// programmed, since register initialization is not atomic.
+    ///
+    /// A presenter must size its surface from this rather than from a fixed
+    /// 240: the guest's own output rectangle is the only authority for how
+    /// many scanned-out lines exist, and rows past it are memory the game
+    /// never rendered into. Measured on WM2000, V_START is `0x002501ff` --
+    /// half-lines 37..511, i.e. **237** output lines, not 240.
+    pub fn vi_output_height(&self) -> Option<u32> {
+        let horizontal = self.vi_registers[9];
+        let vertical = self.vi_registers[10];
+        let used = 0x03ff | (0x03ff << 16);
+        if horizontal & used == 0 || vertical & used == 0 {
+            return None;
+        }
+        let start = (vertical >> 16) & 0x03ff;
+        let end = vertical & 0x03ff;
+        (end > start).then(|| (end - start) / 2)
+    }
+
     /// The physical RDRAM address the video interface is currently scanning
     /// out, read straight from VI_ORIGIN (`vi_registers[1]`, masked to 24 bits
     /// on write). `None` while the register is still zero, so a presenter can

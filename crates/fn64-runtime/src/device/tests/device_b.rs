@@ -948,6 +948,61 @@ use super::*;
     }
 
 
+    /// `vi_output_height` is the presenter's authority for how many lines
+    /// the guest actually scans out. Pinned against WM2000's measured
+    /// registers -- H_START `0x006c02ec`, V_START `0x002501ff` -- which
+    /// decode to a 640x237 output rectangle, the same values
+    /// `fn64_render::ViActiveWindow` asserts for the identical words.
+    ///
+    /// 237, not 240: a presenter that assumes 240 blits three rows of RDRAM
+    /// the game never rendered into, which is visible as an edge band.
+    #[test]
+    fn vi_output_height_decodes_the_programmed_half_line_interval() {
+        const VI_H_START_REG: MmioAddr = MmioAddr::new(0xA440_0024);
+        const VI_V_START_REG: MmioAddr = MmioAddr::new(0xA440_0028);
+
+        let mut fabric = fabric();
+        // Register initialization is not atomic: neither interval alone is
+        // an active window.
+        assert_eq!(fabric.vi_output_height(), None);
+        fabric.write_mmio(VI_V_START_REG, 0x0025_01ff).unwrap();
+        assert_eq!(
+            fabric.vi_output_height(),
+            None,
+            "V_START alone is not an active window"
+        );
+
+        fabric.write_mmio(VI_H_START_REG, 0x006c_02ec).unwrap();
+        // (0x1ff - 0x25) / 2 = (511 - 37) / 2 = 474 / 2 = 237.
+        assert_eq!(
+            fabric.vi_output_height(),
+            Some(237),
+            "WM2000's V_START programs 237 output lines, not 240"
+        );
+
+        // Derived a second, independent way from the raw half-line fields,
+        // so a transcription slip in either expression is caught.
+        let (start, end) = (0x25u32, 0x1ffu32);
+        assert_eq!(fabric.vi_output_height(), Some((end - start) / 2));
+
+        // A full 240-line window decodes to 240, so the accessor is not
+        // simply biased low.
+        fabric.write_mmio(VI_V_START_REG, (0x25 << 16) | 0x205).unwrap();
+        assert_eq!(fabric.vi_output_height(), Some(240));
+
+        // An ODD half-line interval must truncate, not round up. Every real
+        // window is an even number of half-lines (`ViActiveWindow` asserts
+        // that), but the arithmetic here must still be the plain halving --
+        // `(end - start + 1) / 2` agrees on every even interval and would
+        // otherwise be an invisible substitution.
+        fabric.write_mmio(VI_V_START_REG, (0x25 << 16) | 0x204).unwrap();
+        assert_eq!(
+            fabric.vi_output_height(),
+            Some(239),
+            "an odd half-line interval truncates; it does not round up"
+        );
+    }
+
     #[test]
     fn vi_current_and_field_follow_progressive_and_interlaced_half_line_sequences() {
         let mut progressive = fabric();

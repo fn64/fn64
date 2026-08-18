@@ -249,6 +249,20 @@ pub fn vi_width() -> Option<u32> {
     with_host(|host| host.device_fabric.vi_width())
 }
 
+/// The guest-programmed active digital output height in lines, decoded from
+/// VI_V_START. `None` before the guest has programmed both the H and V
+/// intervals.
+///
+/// A windowed presenter must size its surface from this rather than assuming
+/// a fixed 240, for the same reason it must use [`vi_width`] rather than
+/// assuming 320: rows past the programmed output rectangle were never
+/// rendered into, so presenting them shows whatever the previous frame or the
+/// allocator left in that memory. Measured on WM2000 this is **237**, so a
+/// presenter fixed at 240 shows three rows of stale RDRAM along the bottom.
+pub fn vi_output_height() -> Option<u32> {
+    with_host(|host| host.device_fabric.vi_output_height())
+}
+
 /// Install an explicit VI field-duration override for compatibility tests or
 /// embedders without IPL state. Production boot uses `configure_tv_type`,
 /// allowing live VI timing registers to derive the interval.
