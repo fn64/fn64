@@ -1489,3 +1489,176 @@ fn replication_still_agrees_with_the_reference_oracle() {
     );
     assert_agrees_with_reference(&rdram, registers);
 }
+
+/// The bottom halo, hand-derived per reader and asserted exactly.
+///
+/// Three cases, each a separate derivation rather than a table of captured
+/// numbers. With `y_offset = 0` and `y_step = ONE`, output row `n` maps to
+/// source centre `n`, so `last_center = output_height - 1`:
+///
+/// | filters | rows the readers touch | expected |
+/// |---|---|---|
+/// | neither (AA 3, bit 16 clear) | centres `0..=last_center` | `last_center + 1` |
+/// | resampling only | plus `upper = last_center + 1` | `last_center + 2` |
+/// | restoration only | plus the 3x3 row below | `last_center + 2` |
+/// | both | the *same* row below, not two | `last_center + 2` |
+///
+/// The last row is the one that matters: summing the halos would load
+/// `last_center + 3` and give restoration's bottom row a neighbour it should
+/// not have. Both halos name the single row immediately below the last
+/// centre, so they compose by `max`, never by `+`.
+#[test]
+fn the_bottom_halo_is_derived_per_reader_and_composes_by_max() {
+    let output_height = 6u32;
+    let last_center = u64::from(output_height - 1);
+    let unit = u32::from(ViScaleAxis::ONE);
+    let rgba16 = 2 << status::TYPE.offset;
+    let replicate = 3 << status::AA_MODE.offset;
+    let resample = 2 << status::AA_MODE.offset;
+    let dither = 1 << status::DITHER_FILTER.offset;
+
+    let rows_for = |status_word: u32| {
+        let registers = live_registers(status_word, 0x1000, 8, 0, 8, 0, 12, unit, unit);
+        assert_eq!(
+            registers.active_window().unwrap().output_height(),
+            output_height,
+            "fixture must program the output height this derivation assumes"
+        );
+        source_rows(
+            registers,
+            output_height,
+            fn64_render::ViFilterControl::from_status(status_word),
+        )
+    };
+
+    assert_eq!(
+        rows_for(rgba16 | replicate),
+        last_center + 1,
+        "replication reads only the centres"
+    );
+    assert_eq!(
+        rows_for(rgba16 | resample),
+        last_center + 2,
+        "bilinear additionally reads `upper = last_center + 1`"
+    );
+    assert_eq!(
+        rows_for(rgba16 | replicate | dither),
+        last_center + 2,
+        "restoration additionally reads the 3x3 row below the last centre"
+    );
+    assert_eq!(
+        rows_for(rgba16 | resample | dither),
+        last_center + 2,
+        "both halos name the SAME row below the last centre, so they max, not sum"
+    );
+    // Stated as the inequality the `max` exists to enforce, so a `+` cannot
+    // pass by coincidence on some other fixture.
+    assert_ne!(
+        rows_for(rgba16 | resample | dither),
+        last_center + 3,
+        "summing the halos would hand restoration's bottom row a neighbour it must not have"
+    );
+}
+
+/// End-to-end hand-derived proof that restoration RUNS through
+/// `scan_out_guest_rdram`, not merely through `SourcePlane` directly.
+///
+/// A 3x3 full-coverage RGBA16 image presented 1:1 with AA mode 3, so no
+/// resampling can perturb the result. Red five-bit values:
+///
+/// ```text
+///   0  0  0
+///   0 16  0      centre = 16, all eight neighbours lesser
+///   0  0  0
+/// ```
+///
+/// `(16 << 3) - 8 = 120`. Second derivation: the unrestored expansion is
+/// `expand_five_bit(16) = 132`, and restoration replaces that with
+/// `128 - 8 = 120`, so the two differ by 12 -- a difference no pass-through
+/// could produce. Positive control: `assert_ne!` against the unrestored
+/// value proves the filter is latched rather than the test passing
+/// vacuously.
+#[test]
+fn restoration_runs_end_to_end_through_the_public_scanout() {
+    let mut rdram = fresh_rdram();
+    for row in 0..3u32 {
+        for column in 0..3u32 {
+            let r5 = if row == 1 && column == 1 { 16 } else { 0 };
+            write_rgba16(
+                &mut rdram,
+                0x1000 + (row * 3 + column) * 2,
+                pack_rgba5551(r5, 0, 0, 1),
+            );
+        }
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let status_word = (2 << status::TYPE.offset)
+        | (3 << status::AA_MODE.offset)
+        | (1 << status::DITHER_FILTER.offset);
+    let unit = u32::from(ViScaleAxis::ONE);
+    let registers = live_registers(status_word, 0x1000, 3, 0, 3, 0, 4, unit, unit);
+    let field = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect("dither restoration over RGBA16 must scan out, not refuse");
+    assert!(
+        fn64_render::ViFilterControl::from_status(status_word).dither_filter,
+        "positive control: this fixture really does latch bit 16"
+    );
+    assert_eq!(
+        field.pixel(1, 1).unwrap()[0],
+        120,
+        "(16 << 3) - 8 for eight lesser neighbours"
+    );
+    assert_ne!(
+        field.pixel(1, 1).unwrap()[0],
+        expand_five_bit(16),
+        "a pass-through would emit the plain expansion; restoration must change it"
+    );
+}
+
+/// End-to-end hand-derived proof that bilinear resampling RUNS through
+/// `scan_out_guest_rdram`.
+///
+/// Two source columns, red 0 and 31, presented to three output columns with
+/// a half-step horizontal scale and restoration off. Output column 1 sits at
+/// fraction 512 between expanded 0 and 255, so it must be the hand-derived
+/// 128. Positive control: `assert_ne!` against both endpoints proves an
+/// interpolated value, which nearest-neighbour replication cannot produce.
+#[test]
+fn resampling_runs_end_to_end_through_the_public_scanout() {
+    let mut rdram = fresh_rdram();
+    write_rgba16(&mut rdram, 0x1000, pack_rgba5551(0, 0, 0, 0));
+    write_rgba16(&mut rdram, 0x1002, pack_rgba5551(31, 0, 0, 0));
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let status_word = (2 << status::TYPE.offset) | (2 << status::AA_MODE.offset);
+    let registers = live_registers(
+        status_word,
+        0x1000,
+        2,
+        0,
+        3,
+        0,
+        2,
+        512,
+        u32::from(ViScaleAxis::ONE),
+    );
+    let field = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect("AA mode 2 must scan out, not refuse");
+    assert!(
+        fn64_render::ViFilterControl::from_status(status_word)
+            .antialias_mode
+            .resampling_enabled(),
+        "positive control: this fixture really is on the resampling branch"
+    );
+    assert_eq!(field.pixel(0, 0).unwrap()[0], 0, "output 0 is source 0");
+    assert_eq!(
+        field.pixel(1, 0).unwrap()[0],
+        128,
+        "output 1 is the fraction-512 midpoint of 0 and 255"
+    );
+    assert_ne!(
+        field.pixel(1, 0).unwrap()[0],
+        0,
+        "replication would hold the lower sample; interpolation must not"
+    );
+    assert_ne!(field.pixel(1, 0).unwrap()[0], 255);
+}
