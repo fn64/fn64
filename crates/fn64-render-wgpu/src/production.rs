@@ -132,6 +132,15 @@ pub struct WgpuBackend {
     /// `InitializedCandidateColorTarget`; redeemed by `publish_raw_dpc`.
     /// See [`PendingFillPublication`].
     pending_fill_publication: Option<PendingFillPublication>,
+    /// The most recent successfully presented VI field, and nothing else.
+    ///
+    /// `None` until the first `present` succeeds. A `present` that returns a
+    /// named refusal or a typed bounds/alignment error leaves the previous
+    /// field in place rather than clearing it: the retrace that failed
+    /// produced no image, and discarding the last good one would fabricate a
+    /// black frame the VI never scanned out. A *successful* present always
+    /// replaces it, so this is never an accumulated history.
+    presented_field: Option<crate::PresentedField>,
 }
 
 /// Capacity rationale: 4 is the fixed bounded ceiling for concurrently
@@ -213,9 +222,21 @@ impl WgpuBackend {
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
+                presented_field: None,
             },
             session,
         ))
+    }
+
+    /// The most recently presented VI field, or `None` before the first
+    /// successful `present`.
+    ///
+    /// Exposed for diagnostics and tests, mirroring `physical_tmem()` and
+    /// `color_targets()`'s convention on this struct. This is the retrieval
+    /// half of `RenderBackend::present`'s own contract for a headless
+    /// backend ("finalize it as retrievable").
+    pub fn presented_field(&self) -> Option<&crate::PresentedField> {
+        self.presented_field.as_ref()
     }
 
     /// The currently-published physical TMEM state. Exposed for diagnostics
@@ -1224,13 +1245,64 @@ impl RenderBackend for WgpuBackend {
         })
     }
 
-    fn present(&mut self, _request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
-        Err(RenderError::Backend {
-            backend: "render-wgpu",
-            reason: "WgpuBackend implements only the T3 production raw-DPC seam; presentation \
-                      is out of scope"
-                .to_string(),
-        })
+    /// **Shape (a): a real scanout, not a refusal.** This replaces the named
+    /// "presentation is out of scope" rejection that made a registered
+    /// `WgpuBackend` fatal at the first VI retrace, because
+    /// `present_render_backend` -> `with_render_backend` turns any backend
+    /// error into a panic by design (`fn64-abi`'s `setup.rs`).
+    ///
+    /// A VI retrace is not rasterization. The trait's own doc says so:
+    /// "`osViSwapBuffer` only selects which rendered buffer a later field
+    /// consumes." What present owes is a *scanout* of the buffer the guest's
+    /// latched VI registers point at -- and for this backend that buffer is
+    /// in guest RDRAM, because an admitted `FillRectangle`'s bytes are copied
+    /// back there by `fn64-abi`'s `copy_committed_guest_writes`. So present
+    /// reads guest memory; it does not need a resident image and does not
+    /// invent one.
+    ///
+    /// **Both `PresentMemory` variants are handled, and they are not
+    /// symmetric.**
+    ///
+    /// - `Physical` -- implemented. `crate::vi_scanout` reads the programmed
+    ///   source rectangle through the retrace-scoped `PhysicalRdramRead`
+    ///   capability, which is the same lane-mapped authority (`^2`/`^3`) the
+    ///   reference backend's `load_vi_source` reads through and
+    ///   `RdramViewMut::write_u16` writes through. Every VI filter it does
+    ///   not implement is refused by its own name (`ViScanoutRefusal`),
+    ///   never silently skipped.
+    /// - `BackendResidentCompatibility` -- **refused, specifically.** This
+    ///   backend holds no resident scanout image to present. Its color
+    ///   targets are published *to guest RDRAM* (`ColorTargetRegistry` plus
+    ///   `copy_committed_guest_writes`), and `triangle_draw_output` is a
+    ///   single draw's readback, replaced per submission and never a
+    ///   framebuffer the VI would sample. Presenting it would claim the last
+    ///   triangle draw was the field the guest programmed, which for a
+    ///   double-buffered title is simply a different buffer. The error names
+    ///   that, and names the request forms that do work.
+    ///
+    /// A failed present leaves the previously presented field in place; see
+    /// `presented_field`'s own doc for why discarding it would fabricate a
+    /// frame.
+    fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+        let (vi, memory) = request.into_parts();
+        let memory = match memory {
+            fn64_render::PresentMemory::Physical(memory) => memory,
+            fn64_render::PresentMemory::BackendResidentCompatibility => {
+                return Err(RenderError::Backend {
+                    backend: "render-wgpu",
+                    reason: "PresentMemory::BackendResidentCompatibility is not supported: \
+                             WgpuBackend retains no resident scanout image. Its color targets \
+                             are published into guest RDRAM and its triangle_draw_output is one \
+                             submission's readback, not a VI-sampled framebuffer. Use \
+                             PresentRequest::live or PresentRequest::physical_compatibility, \
+                             which supply the physical memory this backend scans out."
+                        .to_string(),
+                })
+            }
+        };
+        let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
+        self.presented_field = Some(field);
+        Ok(())
     }
 
     /// **Shape (a): a real reconfiguration, not a refusal.** This replaces a

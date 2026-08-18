@@ -1888,9 +1888,22 @@ fn a_rejected_guest_commit_leaves_guest_rdram_untouched() {
 // halves are registered, and the second proves the SAME registration is
 // killed by the very next VI field.
 //
-// Together they are the evidence for why no `FN64_RENDER=wgpu` arm ships:
-// it would be selectable and immediately fatal, which AGENTS.md's loud-trap
-// rule prefers over a silent fallback but which is not a shippable option.
+// **This block's conclusion changed, and the change is recorded here rather
+// than by editing the old sentence away.** It previously read: "Together
+// they are the evidence for why no `FN64_RENDER=wgpu` arm ships: it would be
+// selectable and immediately fatal." That was true while
+// `WgpuBackend::present` was a named "presentation is out of scope"
+// rejection. It now scans guest RDRAM out through `fn64-render-wgpu`'s
+// `vi_scanout`, so the second test asserts survival rather than death (see
+// `a_registered_wgpu_backend_survives_the_first_vi_present`, which records
+// the supersession).
+//
+// What is still NOT claimed: that a shell arm is *complete*. The scanout
+// implements AA mode 3 (replicate) over RGBA16/RGBA32 and refuses every
+// other VI filter by name, so a title programming silhouette AA, divot,
+// gamma, or bilinear resampling still reaches a loud trap --
+// `an_unimplemented_vi_filter_still_panics_the_production_retrace_path`
+// measures exactly that, and it is the honest boundary of the claim.
 // ---------------------------------------------------------------------
 
 /// The exact two-call registration a shell arm would perform -- backend
@@ -1946,13 +1959,26 @@ fn shell_shaped_registration_reaches_the_raw_dpc_session_seam() {
     teardown();
 }
 
-/// Constraint measured, not assumed: a shell that selected `WgpuBackend`
-/// dies on its first VI field. `present_render_backend` is the production
-/// retrace path's only presentation call, `with_render_backend` turns a
-/// backend error into a panic, and `WgpuBackend::present` is a named
-/// out-of-scope rejection -- so the composition is fatal.
+/// **The tripwire, flipped. Its predecessor asserted the opposite, and was
+/// correct when written.**
+///
+/// `a_registered_wgpu_backend_panics_on_the_first_vi_present` asserted that
+/// `present_render_backend` panics with `WgpuBackend`'s "presentation is out
+/// of scope" rejection, and its own message said "if this ever passes, the
+/// present blocker is gone and a `FN64_RENDER=wgpu` shell arm becomes
+/// shippable". `WgpuBackend::present` now scans guest RDRAM out through
+/// `crate::vi_scanout`, so that assertion is false and this test replaces it
+/// under a new name asserting the new behavior. This paragraph is the record
+/// of the supersession; the old test is not silently edited.
+///
+/// Nothing about the guard changed: `with_render_backend` still panics on
+/// any backend error (that contract is load-bearing and was deliberately not
+/// weakened). What changed is that the backend no longer produces one.
+///
+/// This drives the **production** caller, not `present()` directly -- the
+/// panic was in the caller, so the caller is what has to be exercised.
 #[test]
-fn a_registered_wgpu_backend_panics_on_the_first_vi_present() {
+fn a_registered_wgpu_backend_survives_the_first_vi_present() {
     crate::load_rom(Vec::new());
     let rdram = rdram_with_texture_source();
     let (backend, session) =
@@ -1968,17 +1994,45 @@ fn a_registered_wgpu_backend_panics_on_the_first_vi_present() {
         host.runtime_rdram_len = rdram.len();
     });
 
-    // A complete live VI register image, as `PresentRequest::live` requires
-    // and as the retrace drain always supplies from the real register file:
-    // 16-bit progressive NTSC, 320-wide source, standard active window.
+    let presentation = ntsc_replicate_presentation(0, 320, 320, 240);
+    // No `catch_unwind`: a panic here fails the test directly, which is the
+    // stronger statement. `with_render_backend` would turn any backend error
+    // into exactly that panic.
+    crate::task_dispatch::present_render_backend(presentation);
+
+    assert!(
+        crate::last_render_error().is_none(),
+        "a successful present must clear the recorded render error"
+    );
+    teardown();
+}
+
+/// A complete live VI register image of the shape the retrace drain supplies
+/// from the real register file: RGBA16 (`pixel type 2`), AA mode 3
+/// (replicate), progressive, unit scale on both axes.
+///
+/// AA mode 3 is chosen deliberately and is not a convenience: it is the one
+/// mode `crate::vi_scanout` implements, and every other mode is refused *by
+/// name*. A fixture programming AA mode 0 would be testing the refusal, not
+/// the scanout.
+fn ntsc_replicate_presentation(
+    origin: u32,
+    width: u32,
+    output_width: u32,
+    output_height: u32,
+) -> fn64_render::ViPresentation {
     let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
-    words[0] = 2;
-    words[2] = 320;
-    words[9] = 0x006c_02ec;
-    words[10] = 0x0025_01ff;
+    // pixel type 2 (RGBA16) | AA mode 3 (replicate, no resampling).
+    words[0] = 2 | (3 << 8);
+    words[1] = origin;
+    words[2] = width;
+    // H_START: start 0, end `output_width` pixels.
+    words[9] = output_width;
+    // V_START: start 0, end `output_height` output lines = 2x half-lines.
+    words[10] = output_height * 2;
     words[12] = u32::from(fn64_render::ViScaleAxis::ONE);
-    words[13] = 0x0123_0200;
-    let presentation = fn64_render::ViPresentation {
+    words[13] = u32::from(fn64_render::ViScaleAxis::ONE);
+    fn64_render::ViPresentation {
         blanked: false,
         fade: None,
         repeat_line: false,
@@ -1986,22 +2040,376 @@ fn a_registered_wgpu_backend_panics_on_the_first_vi_present() {
             fn64_render::ViScanoutRegisters::from_words(words),
         ),
         noise_seed: 0,
+    }
+}
+
+/// Transparently delegates every `RenderBackend` method to a shared
+/// `WgpuBackend`, telling no lies at all.
+///
+/// This exists for one reason: `present_render_backend` reaches the backend
+/// through `RENDER_BACKEND`'s `Box<dyn RenderBackend>`, and the trait has no
+/// downcast seam, so a test that drives the **production** path cannot
+/// otherwise read the presented field back out. Holding the same backend
+/// through an `Rc<RefCell<_>>` gives the test a handle to the very object
+/// the production path just called. Same mechanism as
+/// `OverReportingBackend`, minus its single deliberate lie.
+struct SharedWgpuBackend {
+    inner: std::rc::Rc<std::cell::RefCell<fn64_render_wgpu::WgpuBackend>>,
+}
+
+impl fn64_render::RenderBackend for SharedWgpuBackend {
+    fn create(&mut self, cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().create(cfg)
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        self.inner.borrow_mut().observe_non_rdp_write16(write)
+    }
+
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        self.inner
+            .borrow_mut()
+            .process_task(rdram, rsp_memory, task, output_addr)
+    }
+
+    fn present(
+        &mut self,
+        request: fn64_render::PresentRequest<'_>,
+    ) -> Result<(), fn64_render::RenderError> {
+        self.inner.borrow_mut().present(request)
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        self.inner.borrow_mut().resize(w, h);
+    }
+
+    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+        &[]
+    }
+
+    fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
+        self.inner.borrow().raw_dpc_ir_capability()
+    }
+
+    fn plan_raw_dpc(
+        &mut self,
+        request: fn64_render::RawDpcPlanRequest,
+    ) -> Result<fn64_render::PlannedRawDpcSubmission, fn64_render::RenderError> {
+        self.inner.borrow_mut().plan_raw_dpc(request)
+    }
+
+    fn execute_raw_dpc(
+        &mut self,
+        bound: fn64_render::BoundSubmittedRawDpc,
+    ) -> Result<fn64_render::BackendPreparedRawDpc, fn64_render::RenderError> {
+        self.inner.borrow_mut().execute_raw_dpc(bound)
+    }
+
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<fn64_render::ir::CompletedWrite> {
+        self.inner
+            .borrow_mut()
+            .staged_guest_render_target_writes(submission)
+    }
+
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render::ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        self.inner
+            .borrow_mut()
+            .committed_guest_render_target_bytes(submission)
+    }
+
+    fn publish_raw_dpc(
+        &mut self,
+        publication: fn64_render::ReadyRawDpcCommitCapsule<'_>,
+    ) -> fn64_render::CommittedRawDpcOutcome {
+        self.inner.borrow_mut().publish_raw_dpc(publication)
+    }
+}
+
+/// **The end-to-end proof.** Dispatch an admitted `FillRectangle` through the
+/// real producer seam, then drive the real VI retrace presentation call, and
+/// assert the presented pixels against the fill content -- hand-derived from
+/// `SET_FILL_COLOR`'s own word, never captured from a run.
+///
+/// This is the whole claim in one test: the raw-DPC lane writes guest RDRAM,
+/// and the VI lane scans that same guest RDRAM back out. Neither half is
+/// mocked.
+///
+/// **A measured disagreement this test pins rather than papers over.** The
+/// fill's bytes reach RDRAM through `copy_committed_guest_writes`, which
+/// `copy_from_slice`s them into the raw allocation with **no byte-lane
+/// mapping**. The VI reads them through `PhysicalRdramRead::read_u16`, which
+/// applies the N64Recomp `^2` lane XOR -- the same mapping
+/// `RdramViewMut::write_u16` applies on write and the same one the reference
+/// backend's own RDP writeback (`framebuffer_io.rs`'s `view.write_u16`) uses.
+/// The two conventions disagree, and the presented image is the fill's with
+/// **both** an adjacent-column swap and a per-halfword byte reversal (see
+/// the derivation at the assertion, which corrects an earlier draft that had
+/// only the column half). That is a real defect in the *fill* writeback, not
+/// in this scanout, and it lives outside this change's boundary (`fn64-abi`'s
+/// `rsp_commit.rs` and `fn64-render-wgpu`'s `targets/fill.rs`). It is
+/// asserted here explicitly, with the agreeing-conventions image asserted to
+/// be WRONG, so that fixing the writeback breaks this test loudly instead of
+/// silently changing what "correct" means.
+///
+/// Which side is wrong, measured not assumed: the reference backend writes
+/// its RDP color image through `RdramViewMut::write_u16`
+/// (`crates/fn64-render-reference/src/backend/framebuffer_io.rs:188`), which
+/// applies the lane mapping. The lane-mapped convention is therefore the
+/// established one and the raw `copy_from_slice` in
+/// `copy_committed_guest_writes` is the outlier.
+#[test]
+fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+
+    let (mut backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    let _ = backend.create(&fn64_render::RenderConfig {
+        width: FILL_TARGET_WIDTH,
+        height: FILL_TARGET_HEIGHT,
+        tv_type: fn64_runtime::TvType::default(),
+    });
+    let inner = std::rc::Rc::new(std::cell::RefCell::new(backend));
+    set_render_backend(
+        Box::new(SharedWgpuBackend {
+            inner: std::rc::Rc::clone(&inner),
+        }),
+        rdram.len(),
+    );
+    set_raw_dpc_session(session);
+
+    // Poison the target first, so a present that read the wrong address or
+    // scanned out a fabricated image cannot accidentally match.
+    let poisoned = poison_fill_target(&mut rdram);
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+
+    // Half 1: the fill really reached guest RDRAM. Hand-derived, and the
+    // exact assertion `an_admitted_fill_writes_guest_rdram` already makes.
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        expected_whole_target_image(FILL_COLOR)[..],
+        "the admitted fill must have written the whole target"
+    );
+    assert_ne!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        poisoned[..],
+        "the fill must have displaced the poison"
+    );
+
+    // Half 2: the production retrace path presents that same memory.
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+    });
+    let presentation = ntsc_replicate_presentation(
+        FILL_TARGET_ADDR,
+        FILL_TARGET_WIDTH,
+        FILL_TARGET_WIDTH,
+        FILL_TARGET_HEIGHT,
+    );
+    crate::task_dispatch::present_render_backend(presentation);
+    assert!(
+        crate::last_render_error().is_none(),
+        "presenting the filled target must not raise a backend error"
+    );
+
+    let borrowed = inner.borrow();
+    let field = borrowed
+        .presented_field()
+        .expect("a successful present must retain its field");
+    assert_eq!(
+        (field.width, field.height),
+        (FILL_TARGET_WIDTH, FILL_TARGET_HEIGHT),
+        "the presented field must be exactly the guest-programmed active output rectangle"
+    );
+
+    // The hand-derived expectation, built from the fill's own halfwords and
+    // the VI's five-bit expansion. `expected_fill_halfword` and
+    // `expected_fill_halfword_via_expansion` are reconciled per source
+    // column, as they are everywhere else in this file.
+    let expand_five = |value: u8| -> u8 { (value << 3) | (value >> 2) };
+    let expected_pixel = |halfword: u16| -> [u8; 4] {
+        [
+            expand_five(((halfword >> 11) & 0x1f) as u8),
+            expand_five(((halfword >> 6) & 0x1f) as u8),
+            expand_five(((halfword >> 1) & 0x1f) as u8),
+            255,
+        ]
     };
+
+    // CORRECTION, found by this assertion failing. It was first written as a
+    // bare `x ^ 1` column swap, reasoning that a `^2` byte-address XOR on a
+    // 2-byte pixel grid is exactly a swap of adjacent columns. That is only
+    // HALF of it, and the half that was missing changes every channel.
+    //
+    // The measured transformation, derived from the two conventions and
+    // confirmed against the observed pixel:
+    //
+    //   fill writeback stores column `x`'s halfword `h` big-endian at
+    //     byte `2x`   -> mem[2x] = h >> 8,  mem[2x+1] = h & 0xff
+    //   read_u16(2x) reads little-endian at `(2x) ^ 2`
+    //     -> mem[2x^2] | (mem[2x^2 + 1] << 8)
+    //
+    // `2x ^ 2` is `2(x ^ 1)`, so the bytes come from column `x ^ 1` -- and
+    // they are assembled little-endian from big-endian-stored bytes, so the
+    // halfword also arrives byte-reversed. Both effects, not one.
+    //
+    // Worked witness at column 0: the odd-column fill halfword is
+    // `0x1085`; byte-reversed it is `0x8510`, which expands to
+    // `[132, 165, 66, 255]` -- the value this assertion observes.
+    let lane_read_halfword = |x: u32| -> u16 {
+        let source_column = x ^ 1;
+        let stored = expected_fill_halfword(FILL_COLOR, source_column);
+        assert_eq!(
+            stored,
+            expected_fill_halfword_via_expansion(FILL_COLOR, source_column),
+            "the two independent fill-halfword derivations must agree at column \
+             {source_column}"
+        );
+        stored.swap_bytes()
+    };
+
+    // Pin the worked witness before the sweep, so a failure says which half
+    // of the transformation broke rather than only that pixels differ.
+    assert_eq!(expected_fill_halfword(FILL_COLOR, 1), 0x1085);
+    assert_eq!(lane_read_halfword(0), 0x8510);
+    assert_eq!(expected_pixel(0x8510), [132, 165, 66, 255]);
+
+    for y in 0..FILL_TARGET_HEIGHT {
+        for x in 0..FILL_TARGET_WIDTH {
+            assert_eq!(
+                field.pixel(x, y).unwrap(),
+                expected_pixel(lane_read_halfword(x)),
+                "presented pixel ({x}, {y}) must be column {}'s fill halfword, byte-reversed \
+                 -- the measured disagreement between copy_committed_guest_writes (raw \
+                 big-endian copy, no lane mapping) and PhysicalRdramRead::read_u16 (^2 lane \
+                 XOR, little-endian assembly)",
+                x ^ 1
+            );
+        }
+    }
+
+    // The disagreement is REAL, not a restatement of the implementation: the
+    // image a matching pair of conventions WOULD have produced is asserted
+    // to be wrong. Fixing the fill writeback's byte order breaks this
+    // assertion loudly, which is the point of writing it.
+    let agreeing = expected_pixel(expected_fill_halfword(FILL_COLOR, 0));
+    assert_eq!(agreeing, [8, 8, 8, 255]);
+    assert_ne!(
+        field.pixel(0, 0).unwrap(),
+        agreeing,
+        "if this ever passes, the fill writeback's byte-lane convention was fixed and this \
+         test's swap must be removed rather than left in place to mask it"
+    );
+
+    drop(borrowed);
+    teardown();
+}
+
+/// `PresentMemory::BackendResidentCompatibility` is refused with a reason
+/// that names *which* variant and *why* -- never a generic "out of scope".
+///
+/// This is a direct `present()` call on purpose: the production retrace path
+/// only ever constructs `PresentRequest::live`, so the resident variant has
+/// no production caller to drive it through.
+#[test]
+fn a_backend_resident_present_is_refused_by_name_not_generically() {
+    use fn64_render::RenderBackend as _;
+    let (mut backend, _session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    let error = backend
+        .present(fn64_render::PresentRequest::backend_resident(
+            fn64_render::ViPresentation::default(),
+        ))
+        .expect_err("WgpuBackend retains no resident image to present");
+    let fn64_render::RenderError::Backend { backend: name, reason } = &error else {
+        panic!("expected a named backend refusal, got {error:?}");
+    };
+    assert_eq!(*name, "render-wgpu");
+    assert!(
+        reason.contains("BackendResidentCompatibility"),
+        "the refusal must name the unsupported variant, got: {reason}"
+    );
+    assert!(
+        reason.contains("retains no resident scanout image"),
+        "the refusal must say why, got: {reason}"
+    );
+    assert!(
+        reason.contains("PresentRequest::live"),
+        "the refusal must name the variant that does work, got: {reason}"
+    );
+    assert!(
+        !reason.contains("out of scope"),
+        "the generic rejection this replaced must not come back, got: {reason}"
+    );
+}
+
+/// A VI filter `WgpuBackend` does not implement still panics the production
+/// path -- and that is correct, not a regression.
+///
+/// `with_render_backend`'s panic-on-error contract is load-bearing and was
+/// deliberately NOT weakened to make presentation pass. This test is the
+/// proof that the guard is intact: a programmed filter the scanout cannot
+/// produce is a loud trap naming the filter, exactly as AGENTS.md's
+/// loud-trap rule requires, rather than a silently unfiltered field.
+#[test]
+fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
+    crate::load_rom(Vec::new());
+    let rdram = rdram_with_texture_source();
+    let (backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    set_render_backend(Box::new(backend), rdram.len());
+    set_raw_dpc_session(session);
+    let mut rdram = rdram;
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+    });
+
+    // The same fixture, with AA mode 0 (coverage silhouette AA) programmed
+    // instead of mode 3.
+    let mut presentation = ntsc_replicate_presentation(0, 320, 320, 240);
+    let fn64_render::ViScanoutState::Registers(registers) = presentation.scanout else {
+        unreachable!("the fixture builds a live register image");
+    };
+    let mut words = registers.words();
+    words[0] &= !(3 << 8);
+    presentation.scanout = fn64_render::ViScanoutState::Registers(
+        fn64_render::ViScanoutRegisters::from_words(words),
+    );
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::task_dispatch::present_render_backend(presentation);
     }));
     assert!(
         outcome.is_err(),
-        "a registered WgpuBackend must panic at VI presentation -- if this ever passes, the \
-         present blocker is gone and a FN64_RENDER=wgpu shell arm becomes shippable"
+        "an unimplemented VI filter must be a loud trap, not a silently unfiltered field"
     );
-
-    // Name the failure, so a future change that panics for a DIFFERENT
-    // reason cannot silently keep this test green.
     let reason = crate::last_render_error().expect("the failed present must be recorded");
     assert!(
-        reason.contains("presentation is out of scope"),
-        "the blocker must be WgpuBackend's own named present rejection, got: {reason}"
+        reason.contains("coverage silhouette antialiasing"),
+        "the trap must name the filter it could not produce, got: {reason}"
+    );
+    assert!(
+        !reason.contains("out of scope"),
+        "the refusal must be specific, got: {reason}"
     );
     teardown();
 }

@@ -1,0 +1,717 @@
+//! Unit evidence for the guest-RDRAM VI scanout.
+//!
+//! Every expectation here is hand-derived from the VI register semantics and
+//! the RGBA5551 packing, never captured from a run of the code under test.
+//! Where a quantity has two independent derivations (the U2.10 coordinate,
+//! the five-bit expansion) both are written out and reconciled, per the
+//! standing brief's §3.2/§3.3.
+
+use super::*;
+use crate::rt64_vi_registers::{status, x_transform, y_transform};
+
+/// Build a live fourteen-word VI image. Register indices are named against
+/// the public VI interface order so a transposed word is visible here rather
+/// than only in a failing pixel.
+fn live_registers(
+    st: u32,
+    origin: u32,
+    width: u32,
+    h_start: u32,
+    h_end: u32,
+    v_start_half: u32,
+    v_end_half: u32,
+    x_scale: u32,
+    y_scale: u32,
+) -> ViScanoutRegisters {
+    let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+    words[0] = st;
+    words[1] = origin;
+    words[2] = width;
+    words[9] = (h_start << 16) | h_end;
+    words[10] = (v_start_half << 16) | v_end_half;
+    words[12] = x_scale;
+    words[13] = y_scale;
+    ViScanoutRegisters::from_words(words)
+}
+
+fn presentation(registers: ViScanoutRegisters) -> ViPresentation {
+    ViPresentation {
+        blanked: false,
+        fade: None,
+        repeat_line: false,
+        scanout: fn64_render::ViScanoutState::Registers(registers),
+        noise_seed: 0,
+    }
+}
+
+/// VI STATUS for RGBA16 (`pixel type 2`) with AA mode 3 (replicate) and
+/// every optional filter off. Built from the *ported RT64 field extents*
+/// rather than a hand-typed literal, and reconciled against the literal --
+/// two independent derivations of the same word (§3.2).
+fn rgba16_replicate_status() -> u32 {
+    let derived = (2 << status::TYPE.offset) | (3 << status::AA_MODE.offset);
+    assert_eq!(
+        derived, 0x0302,
+        "the RGBA16+replicate STATUS word must agree between the ported rt64_vi.h field \
+         offsets and its literal spelling"
+    );
+    derived
+}
+
+fn rgba32_replicate_status() -> u32 {
+    let derived = (3 << status::TYPE.offset) | (3 << status::AA_MODE.offset);
+    assert_eq!(derived, 0x0303);
+    derived
+}
+
+/// Write one RGBA16 pixel into guest RDRAM through the *same* lane-mapped
+/// authority the scanout reads through, so this fixture cannot encode a
+/// second byte-order convention.
+fn write_rgba16(rdram: &mut [u8], address: u32, pixel: u16) {
+    fn64_runtime::RdramViewMut::from_storage(rdram)
+        .write_u16(fn64_runtime::RdramAddr::from_offset(address), pixel);
+}
+
+fn fresh_rdram() -> Vec<u8> {
+    vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE]
+}
+
+/// Pack five-bit channels into an RGBA5551 halfword, the inverse of the
+/// scanout's expansion.
+const fn pack_rgba5551(r5: u8, g5: u8, b5: u8, a1: u8) -> u16 {
+    ((r5 as u16) << 11) | ((g5 as u16) << 6) | ((b5 as u16) << 1) | (a1 as u16)
+}
+
+// ---------------------------------------------------------------------
+// The coordinate convention, asserted as fn64's and NOT as RT64's.
+// ---------------------------------------------------------------------
+
+/// fn64 multiplies the raw U2.10 step; RT64 divides by
+/// `xScaleFloat() = 1024.0f / xScale`. This test pins fn64's form.
+///
+/// **CORRECTION, found by a surviving mutant.** An earlier version of this
+/// test asserted only `step = 3 << 9` at indices 0..3 and reasoned in a doc
+/// comment that "fn64 never materializes a float, so no rounding can perturb
+/// it". That reasoning is true and the test was still worthless: substituting
+/// RT64's `(index / (1024.0 / step)) as u64` for the port's body left the
+/// whole suite green. A convention claim needs an input where the two
+/// conventions **disagree**, not an argument that they might.
+///
+/// The discriminator, found by sweeping every 12-bit step against indices
+/// 0..64: at `step = 896, index = 8` the exact product is
+/// `8 * 896 = 7168`, and `7168 >> 10` is exactly `7`. RT64's path computes
+/// `1024.0f / 896.0f = 1.1428571f`, then `8.0f / 1.1428571f = 6.9999995f`,
+/// which truncates to **6**. Same quantity, one whole sample apart -- the
+/// exact "RT64 always rounding down at ties" shape the port brief warns
+/// about. `step = 448, index = 16` and `step = 224, index = 32` reach the
+/// same 7168 by different routes and separate identically.
+#[test]
+fn source_index_multiplies_the_raw_u2_10_step_with_no_float_reciprocal() {
+    let axis = ViScaleAxis::from_register(3 << 9);
+    // Hand-derived, entirely in integers:
+    //   index 0 -> (0 + 0*1536) >> 10 = 0
+    //   index 1 -> (0 + 1*1536) >> 10 = 1536 >> 10 = 1
+    //   index 2 -> (0 + 2*1536) >> 10 = 3072 >> 10 = 3
+    //   index 3 -> (0 + 3*1536) >> 10 = 4608 >> 10 = 4
+    for (output, expected) in [(0u32, 0u64), (1, 1), (2, 3), (3, 4)] {
+        assert_eq!(
+            source_index(output, axis, 64),
+            expected,
+            "output index {output} must sample source row/column {expected} under fn64's \
+             multiply-the-raw-step convention"
+        );
+    }
+
+    // Second, independent derivation of the same four answers, written as
+    // the explicit accumulator the register field describes rather than as
+    // the port's expression (§3.3).
+    let mut accumulator: u64 = u64::from(axis.offset_u2_10());
+    for output in 0..4u32 {
+        assert_eq!(
+            accumulator >> 10,
+            source_index(output, axis, 64),
+            "the running U2.10 accumulator and the port's closed form must agree at {output}"
+        );
+        accumulator += u64::from(axis.step_u2_10());
+    }
+
+    // The discriminating cases. Each asserts fn64's answer AND that RT64's
+    // reciprocal form would give a different one, so importing RT64's
+    // convention breaks this test rather than sliding through it.
+    for (step, index) in [(896u32, 8u32), (448, 16), (224, 32)] {
+        let axis = ViScaleAxis::from_register(step);
+        let fn64_answer = source_index(index, axis, 64);
+        // Integer derivation, independent of the port: the exact product.
+        assert_eq!(u64::from(index) * u64::from(step), 7168);
+        assert_eq!(
+            fn64_answer, 7,
+            "fn64 multiplies the raw step: (0 + {index} * {step}) >> 10 = 7"
+        );
+
+        // RT64's form, written out literally in f32 as `rt64_vi.cpp` spells
+        // it, and asserted to disagree. This is not the port's code path --
+        // it exists only to prove the two conventions are separable here.
+        let rt64_scale_float = 1024.0f32 / (step as f32);
+        let rt64_answer = ((index as f32) / rt64_scale_float) as u64;
+        assert_eq!(
+            rt64_answer, 6,
+            "RT64's 1024.0/{step} reciprocal divide floors this exact tie down to 6"
+        );
+        assert_ne!(
+            fn64_answer, rt64_answer,
+            "step {step} at index {index} must separate the two conventions; if it stops \
+             doing so, this test has stopped proving anything and needs a new discriminator"
+        );
+    }
+}
+
+/// The offset field participates: a nonzero `X_OFFSET`/`Y_OFFSET` shifts
+/// every sample. A port that read only the scale field would pass every
+/// unit-scale test and fail this one.
+#[test]
+fn source_index_adds_the_programmed_u2_10_offset() {
+    // Offset 2.0 (2 << 10) with unit step: output 0 samples source 2.
+    let axis = ViScaleAxis::from_register((2 << 10) << 16 | u32::from(ViScaleAxis::ONE));
+    assert_eq!(axis.offset_u2_10(), 2 << 10);
+    assert_eq!(axis.step_u2_10(), ViScaleAxis::ONE);
+    assert_eq!(source_index(0, axis, 64), 2);
+    assert_eq!(source_index(1, axis, 64), 3);
+    assert_eq!(source_index(5, axis, 64), 7);
+}
+
+/// The high edge is held rather than read out of bounds.
+#[test]
+fn source_index_holds_the_last_sample_at_the_high_edge() {
+    let axis = ViScaleAxis::from_register(u32::from(ViScaleAxis::ONE));
+    assert_eq!(source_index(3, axis, 4), 3);
+    assert_eq!(source_index(4, axis, 4), 3);
+    assert_eq!(source_index(4000, axis, 4), 3);
+}
+
+/// The ported RT64 `XTransform`/`YTransform` field extents and fn64's
+/// `ViScaleAxis` decode must name the same twelve-bit scale and offset
+/// halves. Two independent representations of one register layout,
+/// reconciled (§3.2).
+#[test]
+fn rt64_transform_field_extents_agree_with_fn64_scale_axis_decode() {
+    for register in [
+        0x0000_0400u32,
+        0x0800_0200,
+        0x0fff_0fff,
+        0x0123_0456,
+        0xffff_ffff,
+    ] {
+        let axis = ViScaleAxis::from_register(register);
+        assert_eq!(
+            u32::from(axis.step_u2_10()),
+            x_transform::X_SCALE.get(register),
+            "the scale half of {register:#010x} must agree between rt64_vi.h's XTransform \
+             field and ViScaleAxis"
+        );
+        assert_eq!(
+            u32::from(axis.offset_u2_10()),
+            x_transform::X_OFFSET.get(register),
+            "the offset half of {register:#010x} must agree"
+        );
+        // YTransform is declared with the identical shape; assert it rather
+        // than assume it.
+        assert_eq!(
+            x_transform::X_SCALE.get(register),
+            y_transform::Y_SCALE.get(register)
+        );
+        assert_eq!(
+            x_transform::X_OFFSET.get(register),
+            y_transform::Y_OFFSET.get(register)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// The five-bit expansion, proven exhaustively rather than spot-checked.
+// ---------------------------------------------------------------------
+
+/// TWO CORRECTIONS, both found by this test failing rather than by reading
+/// the code -- §3.3's exact failure mode, twice in a row on the same
+/// quantity.
+///
+/// 1. The independent derivation was first written as `value * 255 / 31`
+///    **truncated**, on the reasoning that bit-replication is that rescale.
+///    It is not: at `value = 4`, replication gives `0b100_00100 = 33` while
+///    truncation gives `floor(32.90) = 32`.
+/// 2. It was then rewritten as **round-to-nearest** (`+15`). That is also
+///    wrong: at `value = 3`, replication gives `0b011_00011 = 24` while
+///    round-to-nearest gives `round(24.68) = 25`.
+///
+/// Replication is neither. It is the leading eight bits of the *infinite
+/// repetition* of the five-bit pattern -- `0.vvvvvvvvvv...` in binary,
+/// truncated to eight fractional bits. The derivation below writes that out
+/// literally (four repetitions is more than enough to fix the top eight
+/// bits) and is genuinely independent of the port's two-shift form. The port
+/// was right on both occasions and the expectation was wrong.
+///
+/// Disagreement counts, measured over all 32 inputs: truncation differs on
+/// 15 values, round-to-nearest on 4. Neither is a spot-check away from
+/// looking correct, which is why an exhaustive sweep is the assertion.
+#[test]
+fn five_bit_expansion_is_the_truncated_infinite_bit_repetition() {
+    let mut truncation_disagreements = 0u32;
+    let mut rounding_disagreements = 0u32;
+    for value in 0..32u8 {
+        let expanded = expand_five_bit(value);
+        // Independent derivation: repeat the five-bit pattern four times
+        // into a twenty-bit word and keep its top eight bits.
+        let repeated = (u32::from(value) << 15)
+            | (u32::from(value) << 10)
+            | (u32::from(value) << 5)
+            | u32::from(value);
+        let independent = (repeated >> 12) as u8;
+        assert_eq!(
+            expanded, independent,
+            "the replicate expansion of {value} must equal the top eight bits of its own \
+             infinite bit repetition"
+        );
+        assert_eq!(expanded >> 3, value, "the expansion must be recoverable");
+
+        if expanded != ((u32::from(value) * 255) / 31) as u8 {
+            truncation_disagreements += 1;
+        }
+        if expanded != ((u32::from(value) * 255 + 15) / 31) as u8 {
+            rounding_disagreements += 1;
+        }
+    }
+    // The two endpoints, which every candidate rescale agrees on -- which is
+    // exactly why checking only them would have missed both corrections.
+    assert_eq!(expand_five_bit(0), 0);
+    assert_eq!(expand_five_bit(31), 255);
+    // The two witnesses, pinned so neither disproved form can return.
+    assert_eq!(
+        expand_five_bit(4),
+        33,
+        "separates replication from truncation"
+    );
+    assert_eq!((4u32 * 255) / 31, 32);
+    assert_eq!(
+        expand_five_bit(3),
+        24,
+        "separates replication from rounding"
+    );
+    assert_eq!((3u32 * 255 + 15) / 31, 25);
+    assert_eq!(truncation_disagreements, 15);
+    assert_eq!(rounding_disagreements, 4);
+}
+
+// ---------------------------------------------------------------------
+// Scanout behavior.
+// ---------------------------------------------------------------------
+
+/// A 4x2 output over a 4-pixel-wide RGBA16 source at unit scale is the
+/// identity: output pixel (x, y) is source pixel (x, y), expanded.
+#[test]
+fn unit_scale_rgba16_scanout_is_the_identity_over_the_source_rectangle() {
+    const ORIGIN: u32 = 0x400;
+    let mut rdram = fresh_rdram();
+    // Hand-chosen five-bit channels, distinct per pixel so a transposed
+    // row/column or a wrong stride is visible.
+    let source: [(u8, u8, u8, u8); 8] = [
+        (31, 0, 0, 1),
+        (0, 31, 0, 1),
+        (0, 0, 31, 1),
+        (31, 31, 31, 1),
+        (1, 2, 3, 0),
+        (4, 5, 6, 0),
+        (7, 8, 9, 1),
+        (10, 11, 12, 1),
+    ];
+    for (index, &(r, g, b, a)) in source.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            ORIGIN + index as u32 * 2,
+            pack_rgba5551(r, g, b, a),
+        );
+    }
+
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        ORIGIN,
+        4,
+        100,
+        104,
+        20,
+        24,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory).unwrap();
+
+    assert_eq!((field.width, field.height), (4, 2));
+    for y in 0..2u32 {
+        for x in 0..4u32 {
+            let (r5, g5, b5, _) = source[(y * 4 + x) as usize];
+            assert_eq!(
+                field.pixel(x, y).unwrap(),
+                [
+                    expand_five_bit(r5),
+                    expand_five_bit(g5),
+                    expand_five_bit(b5),
+                    255
+                ],
+                "output ({x}, {y}) must be source pixel {} expanded",
+                y * 4 + x
+            );
+        }
+    }
+}
+
+/// The source stride, not the output width, selects the next row. A 4-wide
+/// output over an 8-wide source must skip four pixels per row.
+#[test]
+fn the_source_stride_advances_rows_not_the_output_width() {
+    const ORIGIN: u32 = 0x800;
+    let mut rdram = fresh_rdram();
+    // 8-pixel-wide source, 2 rows. Row 0 is red, row 1 is blue; the four
+    // pixels past the output width are green so a stride-as-output-width
+    // bug lands on them.
+    for x in 0..8u32 {
+        let row0 = if x < 4 {
+            pack_rgba5551(31, 0, 0, 1)
+        } else {
+            pack_rgba5551(0, 31, 0, 1)
+        };
+        let row1 = if x < 4 {
+            pack_rgba5551(0, 0, 31, 1)
+        } else {
+            pack_rgba5551(0, 31, 0, 1)
+        };
+        write_rgba16(&mut rdram, ORIGIN + x * 2, row0);
+        write_rgba16(&mut rdram, ORIGIN + 16 + x * 2, row1);
+    }
+
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        ORIGIN,
+        8,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory).unwrap();
+
+    assert_eq!((field.width, field.height), (4, 2));
+    for x in 0..4u32 {
+        assert_eq!(
+            field.pixel(x, 0).unwrap(),
+            [255, 0, 0, 255],
+            "row 0 column {x} must be red"
+        );
+        assert_eq!(
+            field.pixel(x, 1).unwrap(),
+            [0, 0, 255, 255],
+            "row 1 column {x} must be blue -- green here means the row advanced by the \
+             output width (4) instead of the source stride (8)"
+        );
+    }
+}
+
+/// The programmed origin selects the source, not address zero.
+#[test]
+fn the_programmed_origin_selects_the_source_rectangle() {
+    let mut rdram = fresh_rdram();
+    // Decoys at two other plausible origins.
+    for address in [0u32, 0x400] {
+        for x in 0..2u32 {
+            write_rgba16(&mut rdram, address + x * 2, pack_rgba5551(31, 31, 0, 1));
+        }
+    }
+    const ORIGIN: u32 = 0x1_0000;
+    write_rgba16(&mut rdram, ORIGIN, pack_rgba5551(0, 31, 31, 1));
+    write_rgba16(&mut rdram, ORIGIN + 2, pack_rgba5551(31, 0, 31, 1));
+
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        ORIGIN,
+        2,
+        0,
+        2,
+        0,
+        2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory).unwrap();
+    assert_eq!(field.pixel(0, 0).unwrap(), [0, 255, 255, 255]);
+    assert_eq!(field.pixel(1, 0).unwrap(), [255, 0, 255, 255]);
+}
+
+/// RGBA32 reads four bytes per pixel through the lane-mapped byte accessor
+/// and rescales the five-bit alpha/coverage byte.
+#[test]
+fn rgba32_scanout_reads_four_byte_pixels_and_rescales_coverage_alpha() {
+    const ORIGIN: u32 = 0x2000;
+    let mut rdram = fresh_rdram();
+    {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        for (index, bytes) in [[0x11u8, 0x22, 0x33, 0x1f], [0xaa, 0xbb, 0xcc, 0x00]]
+            .into_iter()
+            .enumerate()
+        {
+            for (byte_index, byte) in bytes.into_iter().enumerate() {
+                view.write_u8(
+                    fn64_runtime::RdramAddr::from_offset(
+                        ORIGIN + index as u32 * 4 + byte_index as u32,
+                    ),
+                    byte,
+                );
+            }
+        }
+    }
+
+    let registers = live_registers(
+        rgba32_replicate_status(),
+        ORIGIN,
+        2,
+        0,
+        2,
+        0,
+        2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory).unwrap();
+    // alpha 0x1f -> five bits 31 -> expand to 255; alpha 0x00 -> 0.
+    assert_eq!(field.pixel(0, 0).unwrap(), [0x11, 0x22, 0x33, 255]);
+    assert_eq!(field.pixel(1, 0).unwrap(), [0xaa, 0xbb, 0xcc, 0]);
+}
+
+/// A blanked field is black at the programmed rectangle -- the VI's own
+/// behavior, and distinguishable from a refusal.
+#[test]
+fn a_blanked_field_is_black_at_the_programmed_output_rectangle() {
+    let rdram = fresh_rdram();
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let mut vi = presentation(registers);
+    vi.blanked = true;
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(vi, &memory).unwrap();
+    assert_eq!((field.width, field.height), (4, 2));
+    assert!(field
+        .rgba8
+        .chunks_exact(4)
+        .all(|pixel| pixel == [0, 0, 0, 255]));
+}
+
+/// A source rectangle running past physical RDRAM is a typed bounds
+/// rejection, not a panic and not a clamped read.
+#[test]
+fn an_out_of_bounds_source_rectangle_is_a_typed_bounds_error() {
+    let rdram = fresh_rdram();
+    let origin = (fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32) - 16;
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        origin,
+        320,
+        0,
+        320,
+        0,
+        480,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    match scan_out_guest_rdram(presentation(registers), &memory) {
+        Err(RenderError::InvalidViSourceBounds { origin: o, .. }) => assert_eq!(o, origin),
+        other => panic!("expected a typed VI bounds rejection, got {other:?}"),
+    }
+}
+
+/// An odd origin cannot address whole RGBA16 pixels.
+#[test]
+fn an_unaligned_rgba16_origin_is_a_typed_alignment_error() {
+    let rdram = fresh_rdram();
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        0x401,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    match scan_out_guest_rdram(presentation(registers), &memory) {
+        Err(RenderError::InvalidViSourceAlignment {
+            origin,
+            bytes_per_pixel,
+        }) => {
+            assert_eq!(origin, 0x401);
+            assert_eq!(bytes_per_pixel, 2);
+        }
+        other => panic!("expected a typed VI alignment rejection, got {other:?}"),
+    }
+}
+
+/// Every unimplemented filter is refused BY NAME. A generic "out of scope"
+/// would pass a weaker version of this test; naming each one is what makes
+/// the refusal actionable.
+#[test]
+fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
+    let rdram = fresh_rdram();
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let base = rgba16_replicate_status();
+
+    let cases: [(u32, bool, bool, ViScanoutRefusal); 8] = [
+        // AA mode 0: silhouette AA (and resampling; AA is checked first).
+        (
+            base & !(3 << 8),
+            false,
+            false,
+            ViScanoutRefusal::SilhouetteAntialias,
+        ),
+        // AA mode 1: the same.
+        (
+            (base & !(3 << 8)) | (1 << 8),
+            false,
+            false,
+            ViScanoutRefusal::SilhouetteAntialias,
+        ),
+        // AA mode 2: resample only, no silhouette AA.
+        (
+            (base & !(3 << 8)) | (2 << 8),
+            false,
+            false,
+            ViScanoutRefusal::BilinearResampling,
+        ),
+        (
+            base | (1 << 16),
+            false,
+            false,
+            ViScanoutRefusal::DitherRestoration,
+        ),
+        (base | (1 << 4), false, false, ViScanoutRefusal::Divot),
+        (base | (1 << 3), false, false, ViScanoutRefusal::Gamma),
+        (base | (1 << 2), false, false, ViScanoutRefusal::GammaDither),
+        (base, true, false, ViScanoutRefusal::Fade),
+    ];
+
+    for (status_word, fade, repeat, expected) in cases {
+        let registers = live_registers(
+            status_word,
+            0x400,
+            4,
+            0,
+            4,
+            0,
+            4,
+            u32::from(ViScaleAxis::ONE),
+            u32::from(ViScaleAxis::ONE),
+        );
+        let mut vi = presentation(registers);
+        vi.fade = fade.then_some(0);
+        vi.repeat_line = repeat;
+        let error = scan_out_guest_rdram(vi, &memory)
+            .expect_err("an unimplemented VI filter must be refused, never silently ignored");
+        let RenderError::Backend { backend, reason } = &error else {
+            panic!("expected a named backend refusal, got {error:?}");
+        };
+        assert_eq!(*backend, "render-wgpu-vi-scanout");
+        assert_eq!(
+            reason,
+            expected.reason(),
+            "STATUS {status_word:#010x} (fade={fade}, repeat={repeat}) must be refused as \
+             {expected:?}"
+        );
+        assert!(
+            !reason.contains("out of scope"),
+            "a refusal must name the filter, not say 'out of scope'"
+        );
+    }
+
+    // repeat_line, checked separately so its own row cannot be masked by a
+    // status bit.
+    let registers = live_registers(
+        base,
+        0x400,
+        4,
+        0,
+        4,
+        0,
+        4,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let mut vi = presentation(registers);
+    vi.repeat_line = true;
+    let error = scan_out_guest_rdram(vi, &memory).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        RenderError::Backend {
+            backend: "render-wgpu-vi-scanout",
+            reason: ViScanoutRefusal::RepeatLine.reason().to_string(),
+        }
+        .to_string()
+    );
+}
+
+/// Every refusal reason is distinct and none of them is the generic text the
+/// old `present` returned. A copy-paste that gave two filters the same
+/// message would make a rejection unactionable.
+#[test]
+fn refusal_reasons_are_distinct_and_never_generic() {
+    let all = [
+        ViScanoutRefusal::SilhouetteAntialias,
+        ViScanoutRefusal::DitherRestoration,
+        ViScanoutRefusal::Divot,
+        ViScanoutRefusal::Gamma,
+        ViScanoutRefusal::GammaDither,
+        ViScanoutRefusal::BilinearResampling,
+        ViScanoutRefusal::Fade,
+        ViScanoutRefusal::RepeatLine,
+        ViScanoutRefusal::ReservedPixelType,
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for refusal in all {
+        let reason = refusal.reason();
+        assert!(
+            seen.insert(reason),
+            "{refusal:?} reuses another refusal's reason text"
+        );
+        assert!(!reason.contains("out of scope"), "{refusal:?} is generic");
+        assert!(!reason.is_empty());
+    }
+    assert_eq!(seen.len(), all.len());
+}
+
+/// A backend-only presentation has no register image to read guest memory
+/// through, and says so by name.
+#[test]
+fn a_backend_only_presentation_names_the_missing_register_image() {
+    let rdram = fresh_rdram();
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let vi = ViPresentation::default();
+    let error = scan_out_guest_rdram(vi, &memory).unwrap_err();
+    let RenderError::Backend { reason, .. } = &error else {
+        panic!("expected a named refusal, got {error:?}");
+    };
+    assert!(
+        reason.contains("live fourteen-word register image"),
+        "got: {reason}"
+    );
+}
