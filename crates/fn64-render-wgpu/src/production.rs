@@ -2602,6 +2602,71 @@ fn stage_and_report(
     // which is a different transaction shape, not a smaller change. A
     // packet whose texrect genuinely precedes its load is refused by name
     // until that shape exists.
+    //
+    // ## The shape WM2000 actually emits, measured
+    //
+    // Dumped from the real ROM on the all-Rust stack (`FN64_RECOMP=rs` +
+    // `FN64_RENDER=wgpu`), the packet this refuses is the sixth WM2000
+    // issues, and it is a **sprite strip**: one TLUT load followed by
+    // seven `LoadTile`/texrect PAIRS in strict alternation.
+    //
+    // ```text
+    // cmd 33  LoadTLUT  tile 7  TMEM 2048..2176
+    // cmd 39  LoadTile  tile 7  TMEM    0..1576   (49 source rows)
+    // cmd 42  TEXRECT   tile 0                    <-- refused here
+    // cmd 47  LoadTile  tile 7  TMEM    0..1960
+    // cmd 50  TEXRECT
+    // cmd 55  LoadTile  tile 7  TMEM    0..1960
+    // cmd 58  TEXRECT
+    // cmd 63  LoadTile  tile 7  TMEM    0..1960
+    // cmd 66  TEXRECT
+    // cmd 71  LoadTile  tile 7  TMEM    0..1576
+    // cmd 74  TEXRECT
+    // cmd 79  LoadTile  tile 7  TMEM    0..1608
+    // cmd 82  TEXRECT
+    // cmd 87  LoadTile  tile 7  TMEM    0..2000
+    // cmd 90  TEXRECT
+    // ```
+    //
+    // Every one of the seven `LoadTile`s writes the SAME TMEM range
+    // starting at word 0. They overwrite each other. So the once-per-packet
+    // seal is not merely too coarse here -- it is maximally wrong: the
+    // sealed post-image holds only the LAST load's texels, and all seven
+    // texrects would draw the same sprite. This packet is precisely the
+    // case the guard was written to catch, and the guard is right.
+    //
+    // ## Why per-load sealing is not a smaller change (sized, not guessed)
+    //
+    // Four separate structures assume exactly one post-image per packet,
+    // and each would have to change:
+    //
+    // 1. `into_pending` consumes the `PhysicalTmemPacketTransaction` by
+    //    value and requires access-for-access coverage of EVERY journal
+    //    `TmemLoadDestination` write. Sealing after load 1 of 8 fails its
+    //    own `DestinationCoverageMismatch` by construction.
+    // 2. `PhysicalTmemBinding` carries ONE `next_generation` for the
+    //    packet. N seals would each claim the same successor generation --
+    //    the same forgery `stage_color_commands` refuses N candidates for.
+    // 3. `proposal_identity` is computed over the whole projection and
+    //    effect list, and `validate_proposal` recomputes it at both
+    //    publication routes. A per-load proposal is a different digest over
+    //    a different domain, so publication identity moves with the seal.
+    // 4. The TMEM loop and `stage_color_commands` are sequential PHASES,
+    //    not one interleaved walk, and deliberately so: color staging runs
+    //    last precisely so a TMEM rejection leaves no color token in
+    //    existence. Per-position sampling requires interleaving them, which
+    //    reopens that ordering guarantee.
+    //
+    // The GPU half has the same problem one layer over: `draw_tmem` is one
+    // `TmemGpuProjection` per `draw_admitted_triangles` call, shared by
+    // every triangle in the draw.
+    //
+    // What already fits, and is worth keeping in view for whoever sizes
+    // this: `finish_load` returns the packet transaction BY VALUE with
+    // `bytes`/`valid` already updated for every load so far, so a borrowed
+    // per-position view needs no new seal, generation, or digest; and
+    // `execute_scheduled_texrect` is already generic over `TmemByteSource`,
+    // so there is one sampler to point at it, not two.
     if let Some(&(_, _, _, texrect_command)) = collector.plan.texrect_commands.first() {
         if let Some((load_command, _)) = collector
             .plan
