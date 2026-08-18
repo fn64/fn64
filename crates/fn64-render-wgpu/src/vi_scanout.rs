@@ -52,7 +52,8 @@
 //! establish the U2.10 scale/offset split.
 
 use fn64_render::{
-    RenderError, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis, ViScanoutRegisters,
+    vi_public_filters::restore_rgba16_component_bounded_v1, RenderError, ViPixelType,
+    ViPresentation, ViResampleControl, ViScaleAxis, ViScanoutRegisters,
 };
 
 /// A VI feature this scanout genuinely does not implement, named
@@ -69,9 +70,14 @@ pub(crate) enum ViScanoutRefusal {
     /// RGBA16 carries in its low bit and hidden bits -- state this backend
     /// does not track.
     SilhouetteAntialias,
-    /// VI STATUS bit 16: the dither-restoration filter. Same coverage and
-    /// hidden-bit dependency.
-    DitherRestoration,
+    /// VI STATUS bit 16 **with a coverage-bearing pixel that this backend
+    /// cannot classify**: dither restoration is implemented (see
+    /// [`restore_dither`]), but only for RGBA16. Bit 16 over an RGBA32
+    /// scanout image asks to restore a five-bit dither that an eight-bit
+    /// source never carried, which the reference backend also refuses
+    /// (`crates/fn64-render-reference/src/vi.rs`'s "VI dither restoration
+    /// requires an RGBA16 scanout image").
+    DitherRestorationNonRgba16,
     /// VI STATUS bit 4: the divot median filter over three horizontal
     /// post-filter samples.
     Divot,
@@ -82,10 +88,6 @@ pub(crate) enum ViScanoutRefusal {
     /// VI STATUS bit 2: gamma dither, which needs a retrace-seeded noise
     /// generator this module does not own.
     GammaDither,
-    /// VI STATUS AA mode 0/1/2: bilinear resampling between adjacent source
-    /// samples. Only AA mode 3 (`Replicate`, nearest-neighbor) is
-    /// implemented.
-    BilinearResampling,
     /// `osViFade`'s two-row interpolation.
     Fade,
     /// `osViRepeatLine`.
@@ -103,9 +105,9 @@ impl ViScanoutRefusal {
                  scanout implements only AA mode 3 (replicate) because it tracks no per-pixel \
                  coverage"
             }
-            Self::DitherRestoration => {
-                "VI STATUS bit 16 selects the dither-restoration filter; this scanout tracks \
-                 no RDRAM hidden bits and cannot restore dithered RGBA16"
+            Self::DitherRestorationNonRgba16 => {
+                "VI STATUS bit 16 selects the dither-restoration filter over a non-RGBA16 \
+                 scanout image; there is no five-bit dither in an RGBA32 source to restore"
             }
             Self::Divot => {
                 "VI STATUS bit 4 selects the divot median filter; this scanout implements no \
@@ -118,10 +120,6 @@ impl ViScanoutRefusal {
             Self::GammaDither => {
                 "VI STATUS bit 2 selects gamma dither; this scanout owns no retrace-seeded \
                  noise generator"
-            }
-            Self::BilinearResampling => {
-                "VI STATUS selects a resampling AA mode (0, 1, or 2); this scanout implements \
-                 only AA mode 3 (replicate) nearest-neighbor sampling"
             }
             Self::Fade => {
                 "osViFade programmed a two-row interpolation factor; this scanout implements \
@@ -206,6 +204,15 @@ const fn expand_five_bit(value: u8) -> u8 {
 /// fn64's U2.10 source coordinate: multiply the raw register step, never
 /// divide by a reciprocal. See this module's header for the RT64
 /// disagreement this deliberately does not adopt.
+///
+/// Superseded at the sampling sites by [`AxisSample::from_output`], which
+/// resolves the same position into a lower/upper pair so bilinear
+/// resampling can weight between them. Retained as the independent
+/// derivation of the *nearest* index: `AxisSample::from_output(..).lower`
+/// must equal this for every input, and
+/// `replication_agrees_with_source_index_on_every_output_column` pins that
+/// so the two cannot drift apart.
+#[cfg(test)]
 fn source_index(output_index: u32, axis: ViScaleAxis, source_extent: u64) -> u64 {
     let position = u64::from(axis.offset_u2_10())
         .checked_add(
@@ -266,6 +273,17 @@ fn source_rows(registers: ViScanoutRegisters, output_height: u32) -> u64 {
 /// way; measured on the real WM2000 ROM, its first present latches
 /// `AaResampleAlways` **with `ViPixelType::Blank`**, which the reference
 /// blanks and this module previously refused.
+///
+/// **Measured on the real WM2000 ROM, `FN64_RENDER=wgpu`.** Fields 0-19 are
+/// blanked; field 20 is the first with content and latches
+/// `status=0x00013202`: `ViPixelType::Rgba16`, `ViAaMode::ResampleOnly`
+/// (AA mode 2), `dither_filter = true`, and `gamma`, `gamma_dither`,
+/// `divot`, `fade`, `repeat_line` all clear. Exactly two of the eight named
+/// refusals were reachable, and both are now implemented: dither
+/// restoration ([`restore_dither`]) and resampling ([`resample_bilinear`]).
+/// Silhouette AA, divot, gamma, gamma dither, fade and repeat-line stay
+/// refusing by name because WM2000 never selects them and this module still
+/// cannot produce them.
 fn admitted_filters(vi: ViPresentation) -> Result<(), ViScanoutRefusal> {
     let filters = vi.scanout.filters();
     if filters.pixel_type == ViPixelType::Reserved {
@@ -283,14 +301,11 @@ fn admitted_filters(vi: ViPresentation) -> Result<(), ViScanoutRefusal> {
     if filters.antialias_mode.silhouette_aa_enabled() {
         return Err(ViScanoutRefusal::SilhouetteAntialias);
     }
-    if filters.dither_filter {
-        return Err(ViScanoutRefusal::DitherRestoration);
+    if filters.dither_filter && filters.pixel_type != ViPixelType::Rgba16 {
+        return Err(ViScanoutRefusal::DitherRestorationNonRgba16);
     }
     if filters.divot {
         return Err(ViScanoutRefusal::Divot);
-    }
-    if filters.antialias_mode.resampling_enabled() {
-        return Err(ViScanoutRefusal::BilinearResampling);
     }
     if filters.gamma {
         return Err(ViScanoutRefusal::Gamma);
@@ -401,6 +416,55 @@ impl SourceGeometry {
         Ok(())
     }
 
+    /// Coverage count in `1..=8` for one source pixel.
+    ///
+    /// This is the reference backend's sidecar-miss branch, reproduced
+    /// exactly: `load_vi_source` synthesizes `bits = if pixel & 1 == 0 { 0 }
+    /// else { 3 }`, packs `stored = ((pixel & 1) << 2) | bits`, and
+    /// `Coverage::from_stored` returns `(stored & 7) + 1`. So the RGBA16 low
+    /// bit alone decides: set means 8 (full), clear means 1 (partial). See
+    /// [`SourcePlane::coverage`] for the deviation this backend is choosing
+    /// by having no sidecar to hit.
+    ///
+    /// RGBA32 carries coverage in the top three bits of its fourth byte,
+    /// which the reference reads the same way.
+    fn coverage(
+        self,
+        memory: &fn64_runtime::PhysicalRdramRead<'_>,
+        source_x: u64,
+        source_y: u64,
+    ) -> u8 {
+        let address = self.pixel_address(source_x, source_y);
+        let stored = match self.pixel_type {
+            ViPixelType::Rgba16 => {
+                let low_bit = (memory.read_u16(address) & 1) as u8;
+                (low_bit << 2) | if low_bit == 0 { 0 } else { 3 }
+            }
+            ViPixelType::Rgba32 => {
+                memory.read_u8(
+                    address
+                        .checked_add(3)
+                        .expect("VI RGBA32 coverage address overflow"),
+                ) >> 5
+            }
+            ViPixelType::Blank | ViPixelType::Reserved | ViPixelType::Unspecified => {
+                unreachable!("SourceGeometry::derive admits only Rgba16 and Rgba32")
+            }
+        };
+        (stored & 7) + 1
+    }
+
+    /// The lane-mapped physical address of one source pixel.
+    fn pixel_address(self, source_x: u64, source_y: u64) -> fn64_runtime::RdramAddr {
+        let index = source_y * u64::from(self.stride_pixels) + source_x;
+        let byte_offset = index * u64::from(self.bytes_per_pixel);
+        let logical = u64::from(self.origin)
+            .checked_add(byte_offset)
+            .expect("VI source pixel address overflow");
+        let logical = u32::try_from(logical).expect("validated VI source address exceeds u32");
+        fn64_runtime::RdramAddr::from_offset(logical)
+    }
+
     /// Read one source pixel through the lane-mapped physical capability and
     /// expand it to 8-bit RGBA.
     fn sample(
@@ -409,13 +473,7 @@ impl SourceGeometry {
         source_x: u64,
         source_y: u64,
     ) -> [u8; 4] {
-        let index = source_y * u64::from(self.stride_pixels) + source_x;
-        let byte_offset = index * u64::from(self.bytes_per_pixel);
-        let logical = u64::from(self.origin)
-            .checked_add(byte_offset)
-            .expect("VI source pixel address overflow");
-        let logical = u32::try_from(logical).expect("validated VI source address exceeds u32");
-        let address = fn64_runtime::RdramAddr::from_offset(logical);
+        let address = self.pixel_address(source_x, source_y);
         match self.pixel_type {
             ViPixelType::Rgba16 => {
                 let pixel = memory.read_u16(address);
@@ -501,16 +559,19 @@ pub(crate) fn scan_out_guest_rdram(
     geometry.validate(memory.len())?;
 
     let ViResampleControl { x, y, .. } = registers.resample();
-    let source_width = u64::from(geometry.stride_pixels);
-    let source_height = geometry.rows;
-    let mut rgba8 = Vec::with_capacity((output_width as usize) * (output_height as usize) * 4);
-    for output_y in 0..output_height {
-        let source_y = source_index(output_y, y, source_height);
-        for output_x in 0..output_width {
-            let source_x = source_index(output_x, x, source_width);
-            rgba8.extend_from_slice(&geometry.sample(memory, source_x, source_y));
-        }
+    let filters = vi.scanout.filters();
+    let mut plane = SourcePlane::load(geometry, memory);
+    if filters.dither_filter {
+        // `admitted_filters` proved `pixel_type == Rgba16` before this point;
+        // bit 16 over any other source is refused by
+        // `DitherRestorationNonRgba16`.
+        plane.restore_dither();
     }
+    let rgba8 = if filters.antialias_mode.resampling_enabled() {
+        resample_bilinear(&plane, x, y, output_width, output_height)
+    } else {
+        replicate(&plane, x, y, output_width, output_height)
+    };
 
     Ok(PresentedField {
         width: output_width,
@@ -518,6 +579,261 @@ pub(crate) fn scan_out_guest_rdram(
         rgba8,
         presentation: vi,
     })
+}
+
+/// The source rectangle expanded to eight-bit RGBA, held whole so a
+/// neighborhood filter can read pixels the output rectangle never samples.
+///
+/// The VI's post-filters run over the *source* plane, before the coordinate
+/// generators pick output samples: US 6,166,748 Figures 34A/35M/35N order
+/// the filtered line pair ahead of the interpolators, and
+/// `fn64-render-reference`'s `scanout` composes them the same way
+/// (`filter_scanout` mutates the source-sized buffer, then `apply_resampling`
+/// consumes it). Restoring after resampling would read interpolated
+/// neighbors that carry no five-bit dither, which is a different filter.
+struct SourcePlane {
+    width: usize,
+    height: usize,
+    /// Row-major RGBA8, `width * height * 4` bytes.
+    rgba8: Vec<u8>,
+    /// Per-pixel coverage count in `1..=8`, parallel to `rgba8`.
+    ///
+    /// **Named deviation.** `fn64-render-reference` keeps an
+    /// `RdramHiddenBits` sidecar populated by its own rasterizer's
+    /// `commit_color_image`, and consults it in `load_vi_source`
+    /// (`crates/fn64-render-reference/src/backend/vi_source.rs:142-155`).
+    /// This backend publishes color targets into guest RDRAM and reports
+    /// `NonRdpWrite16Disposition::NoRustHiddenSidecar`
+    /// (`crate::production`), so it holds no such map. It therefore takes
+    /// exactly the branch the reference itself takes on a sidecar miss:
+    /// `bits = if pixel & 1 == 0 { 0 } else { 3 }`, then
+    /// `stored = ((pixel & 1) << 2) | bits`, then
+    /// `Coverage::from_stored(stored) = (stored & 7) + 1`. That collapses to
+    /// 8 for a set low bit and 1 for a clear one. The two backends agree
+    /// pixel-for-pixel wherever the reference's map is also cold; where the
+    /// reference has a tracked partial-coverage entry this backend reads
+    /// full coverage instead. That difference is inert for the *restoration*
+    /// filter's own output — restoration recomputes each component from
+    /// five-bit neighbors and never reads the coverage value — but it does
+    /// change *which* pixels restoration is applied to, and it is why
+    /// `SilhouetteAntialias`, which consumes the coverage magnitude
+    /// directly, still refuses by name.
+    coverage: Vec<u8>,
+}
+
+impl SourcePlane {
+    fn load(geometry: SourceGeometry, memory: &fn64_runtime::PhysicalRdramRead<'_>) -> Self {
+        let width = geometry.stride_pixels as usize;
+        let height = usize::try_from(geometry.rows).expect("validated VI source rows exceed usize");
+        let mut rgba8 = Vec::with_capacity(width * height * 4);
+        let mut coverage = Vec::with_capacity(width * height);
+        for source_y in 0..height as u64 {
+            for source_x in 0..width as u64 {
+                rgba8.extend_from_slice(&geometry.sample(memory, source_x, source_y));
+                coverage.push(geometry.coverage(memory, source_x, source_y));
+            }
+        }
+        Self {
+            width,
+            height,
+            rgba8,
+            coverage,
+        }
+    }
+
+    /// US 5,699,079's dither-restoration filter, VI STATUS bit 16.
+    ///
+    /// Each full-coverage RGBA16 component is recovered from the signed
+    /// comparisons against its available 3x3 neighbors. The arithmetic is
+    /// **not reimplemented here**: it is
+    /// `fn64_render::vi_public_filters::restore_rgba16_component_bounded_v1`,
+    /// the identical shared entry point `fn64-render-reference`'s
+    /// `filter_scanout` calls, so the two backends cannot drift.
+    ///
+    /// Neighbors are read from a snapshot taken before any pixel is written,
+    /// matching the reference's `let original = output.pixels.clone()` --
+    /// filtering in place would feed already-restored components back in as
+    /// neighbors and make the result scan-order dependent.
+    fn restore_dither(&mut self) {
+        let original = self.rgba8.clone();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let pixel = y * self.width + x;
+                if self.coverage[pixel] != 8 {
+                    continue;
+                }
+                for channel in 0..3 {
+                    let center = original[pixel * 4 + channel] >> 3;
+                    let mut neighbors = [0u8; 8];
+                    let mut count = 0;
+                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
+                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
+                            if neighbor_x == x && neighbor_y == y {
+                                continue;
+                            }
+                            neighbors[count] =
+                                original[(neighbor_y * self.width + neighbor_x) * 4 + channel] >> 3;
+                            count += 1;
+                        }
+                    }
+                    self.rgba8[pixel * 4 + channel] =
+                        restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
+                }
+            }
+        }
+    }
+
+    fn component(&self, x: usize, y: usize, channel: usize) -> u8 {
+        self.rgba8[(y * self.width + x) * 4 + channel]
+    }
+}
+
+/// One axis position resolved to a lower/upper source pair plus the U0.10
+/// weight between them.
+///
+/// This is the same `AxisSample` split `fn64-render-reference` uses
+/// (`crates/fn64-render-reference/src/vi.rs:390-419`), including its
+/// `HeldLast` high-edge rule: at or past the last source sample both
+/// endpoints collapse onto it and the fraction is forced to zero, so the
+/// held edge is a repeat rather than an extrapolation. Recomputing it here
+/// rather than importing keeps this module's U2.10 multiply-not-divide
+/// convention (see the module header) as the single coordinate authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct AxisSample {
+    lower: usize,
+    upper: usize,
+    fraction_u0_10: u16,
+}
+
+impl AxisSample {
+    fn from_output(index: u32, axis: ViScaleAxis, source_extent: usize) -> Self {
+        assert!(
+            source_extent > 0,
+            "VI resampling requires a nonempty source axis"
+        );
+        let position = u64::from(axis.offset_u2_10())
+            .checked_add(
+                u64::from(index)
+                    .checked_mul(u64::from(axis.step_u2_10()))
+                    .expect("VI source coordinate product overflow"),
+            )
+            .expect("VI source coordinate sum overflow");
+        let integer = position >> ViScaleAxis::FRACTION_BITS;
+        let last = source_extent - 1;
+        if integer >= last as u64 {
+            return Self {
+                lower: last,
+                upper: last,
+                fraction_u0_10: 0,
+            };
+        }
+        let lower = usize::try_from(integer).expect("in-range VI source coordinate exceeds usize");
+        Self {
+            lower,
+            upper: lower + 1,
+            fraction_u0_10: (position & u64::from(ViScaleAxis::ONE - 1)) as u16,
+        }
+    }
+}
+
+/// Round-to-nearest U2.10 linear interpolation.
+///
+/// Byte-for-byte `fn64-render-reference`'s `interpolate_u2_10`
+/// (`crates/fn64-render-reference/src/vi.rs:434-443`), including the
+/// `+ ONE / 2` rounding bias. The patents specify linear interpolation but
+/// not the accumulator's tie behavior, so this shares fn64's bounded policy
+/// rather than inventing a second one.
+fn interpolate_u2_10(lower: u8, upper: u8, fraction_u0_10: u16) -> u8 {
+    debug_assert!(fraction_u0_10 < ViScaleAxis::ONE);
+    let upper_weight = u32::from(fraction_u0_10);
+    let lower_weight = u32::from(ViScaleAxis::ONE) - upper_weight;
+    ((u32::from(lower) * lower_weight
+        + u32::from(upper) * upper_weight
+        + u32::from(ViScaleAxis::ONE / 2))
+        / u32::from(ViScaleAxis::ONE)) as u8
+}
+
+/// VI AA modes 0, 1 and 2: bilinear resampling, vertical pass then
+/// horizontal.
+///
+/// The pass order is US 6,166,748 Figure 34A's and the reference's: vertical
+/// interpolation between successive filtered lines produces a
+/// `output_height x source_width` intermediate, and the horizontal pass then
+/// interpolates that to the output width. Doing both in one pass over the
+/// source would apply the horizontal weight to unfiltered rather than
+/// vertically-blended samples.
+///
+/// Alpha is interpolated with the colour channels, matching the reference's
+/// "all four stored host channels share this interpolation so identity
+/// scanout preserves alpha". For an RGBA16 source every alpha is already
+/// 255, so the pass is an identity on that channel.
+fn resample_bilinear(
+    plane: &SourcePlane,
+    x_axis: ViScaleAxis,
+    y_axis: ViScaleAxis,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<u8> {
+    let width = output_width as usize;
+    let height = output_height as usize;
+    let mut vertical = vec![0u8; height * plane.width * 4];
+    for output_y in 0..height {
+        let sample = AxisSample::from_output(output_y as u32, y_axis, plane.height);
+        for source_x in 0..plane.width {
+            let destination = (output_y * plane.width + source_x) * 4;
+            for channel in 0..4 {
+                vertical[destination + channel] = interpolate_u2_10(
+                    plane.component(source_x, sample.lower, channel),
+                    plane.component(source_x, sample.upper, channel),
+                    sample.fraction_u0_10,
+                );
+            }
+        }
+    }
+
+    let mut rgba8 = vec![0u8; width * height * 4];
+    for output_y in 0..height {
+        for output_x in 0..width {
+            let sample = AxisSample::from_output(output_x as u32, x_axis, plane.width);
+            let destination = (output_y * width + output_x) * 4;
+            let lower = (output_y * plane.width + sample.lower) * 4;
+            let upper = (output_y * plane.width + sample.upper) * 4;
+            for channel in 0..4 {
+                rgba8[destination + channel] = interpolate_u2_10(
+                    vertical[lower + channel],
+                    vertical[upper + channel],
+                    sample.fraction_u0_10,
+                );
+            }
+        }
+    }
+    rgba8
+}
+
+/// VI AA mode 3: nearest-neighbor replication.
+///
+/// Preserves this module's original sampling exactly -- the coordinate
+/// generators still run, but the lower resident sample is copied without
+/// interpolation, which is `AxisSample::lower` and therefore the same index
+/// [`source_index`] produced.
+fn replicate(
+    plane: &SourcePlane,
+    x_axis: ViScaleAxis,
+    y_axis: ViScaleAxis,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<u8> {
+    let width = output_width as usize;
+    let mut rgba8 = Vec::with_capacity(width * (output_height as usize) * 4);
+    for output_y in 0..output_height {
+        let source_y = AxisSample::from_output(output_y, y_axis, plane.height).lower;
+        for output_x in 0..output_width {
+            let source_x = AxisSample::from_output(output_x, x_axis, plane.width).lower;
+            let offset = (source_y * plane.width + source_x) * 4;
+            rgba8.extend_from_slice(&plane.rgba8[offset..offset + 4]);
+        }
+    }
+    rgba8
 }
 
 #[cfg(test)]
