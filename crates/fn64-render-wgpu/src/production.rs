@@ -1576,19 +1576,55 @@ impl RenderBackend for WgpuBackend {
         fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
     }
 
+    /// This backend has no HLE display-list front end: it holds no geometry
+    /// microcode catalog, no segment/matrix/vertex state, and no GBI command
+    /// decoder. Its whole graphics surface is the raw-DPC seam
+    /// (`process_rdp_commands` / `plan_raw_dpc` / `execute_raw_dpc` /
+    /// `publish_raw_dpc`), which consumes RDP command words, not `Gfx` words.
+    ///
+    /// So the only truthful answer to "execute this graphics task" is the
+    /// trait's existing one for a microcode this backend cannot high-level
+    /// emulate: [`FrameStatus::NeedsLle`], carrying the live IMEM digest.
+    /// `fn64-abi`'s `osSpTaskStartGo_recomp` then runs the task's microcode
+    /// on the RSP interpreter (`dispatch_lle_task`), and the RDP commands
+    /// that microcode writes into DMEM arrive back here through the XBUS
+    /// raw-DPC path this backend does implement. That is the same disposition
+    /// `ReferenceBackend` reaches for this title -- measured on WM2000
+    /// (NWXE), whose every graphics task carries a well-formed F3DEX2 display
+    /// list under IMEM digest
+    /// `c50d2949c23baae24e706e8e1a5abf2dd315d00aff4cfdd567a03fe81807d1be`,
+    /// which is in no catalog, so `ReferenceBackend::process_task` returns
+    /// `NeedsLle` for all of them. It is a *disposition*, not a silent no-op:
+    /// the task is executed, by the RSP, and `fn64-abi` records a
+    /// `render.hle-ucode.needs-lle` unsupported event naming the digest.
+    ///
+    /// The digest is read from live IMEM, the same authority
+    /// `GeometryUcodeCatalog::require_text` and `ReferenceBackend` use, so
+    /// the reported microcode identity cannot disagree with theirs. A task
+    /// that is not `M_GFXTASK` is still a routing bug rather than a
+    /// microcode this backend declines, and stays a loud named error.
     fn process_task(
         &mut self,
         _rdram: &mut [u8],
-        _rsp_memory: &mut fn64_runtime::RspMemory,
-        _task: &fn64_render::OsTask,
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
         _output_addr: u32,
     ) -> Result<fn64_render::FrameStatus, RenderError> {
-        Err(RenderError::Backend {
-            backend: "render-wgpu",
-            reason: "WgpuBackend implements only the T3 production raw-DPC seam; general gfx \
-                      task execution is out of scope"
-                .to_string(),
-        })
+        if task.task_type != fn64_render::M_GFXTASK {
+            return Err(RenderError::Backend {
+                backend: "render-wgpu",
+                reason: format!(
+                    "graphics task dispatch received task type {}; only M_GFXTASK ({}) reaches \
+                     this seam",
+                    task.task_type,
+                    fn64_render::M_GFXTASK
+                ),
+            });
+        }
+        let ucode_sha256 =
+            fn64_render::UcodeDigest::from_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))
+                .as_bytes();
+        Ok(fn64_render::FrameStatus::NeedsLle { ucode_sha256 })
     }
 
     /// **Shape (a): a real scanout, not a refusal.** This replaces the named
@@ -10932,6 +10968,150 @@ mod tests {
         assert!(
             !backend.has_pending_fill_publication(),
             "a refused fill+triangle composition must leave no redeemable fill token behind"
+        );
+    }
+
+    /// Build an `RspMemory` whose IMEM holds `text`, zero-padded, so the
+    /// digest `process_task` reports is a value this test chose rather than
+    /// whatever a default bank happens to hash to.
+    fn rsp_memory_with_imem(text: &[u8]) -> fn64_runtime::RspMemory {
+        let mut memory = fn64_runtime::RspMemory::new();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                text,
+            )
+            .expect("the fixture microcode fits in the IMEM bank");
+        memory
+    }
+
+    /// A graphics task is a disposition, not an error: this backend has no
+    /// HLE display-list front end, so it reports `NeedsLle` and `fn64-abi`
+    /// runs the microcode on the RSP. Measured on WM2000 (NWXE), whose gfx
+    /// tasks carry a real F3DEX2 display list under an uncatalogued IMEM
+    /// digest -- `ReferenceBackend` returns `NeedsLle` for those same tasks.
+    #[test]
+    fn a_graphics_task_defers_to_lle_with_the_live_imem_digest() {
+        let mut backend = WgpuBackend::try_new().unwrap().0;
+        let mut rdram = vec![0u8; LAYOUT_BYTES as usize];
+        let mut rsp_memory = rsp_memory_with_imem(b"wm2000-uncatalogued-geometry-microcode");
+        let expected = fn64_render::UcodeDigest::from_text(
+            rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem),
+        )
+        .as_bytes();
+
+        let task = fn64_render::OsTask {
+            task_type: fn64_render::M_GFXTASK,
+            data_ptr: COMMAND_START,
+            data_size: 64,
+            ..fn64_render::OsTask::default()
+        };
+        let status = backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .expect("a graphics task is a disposition, not a backend error");
+
+        assert_eq!(
+            status,
+            fn64_render::FrameStatus::NeedsLle {
+                ucode_sha256: expected
+            },
+            "the reported microcode identity must be the live IMEM digest"
+        );
+    }
+
+    /// The digest is read from live IMEM, not from the task header or a
+    /// constant, so a different microcode reports a different identity. A
+    /// mutant returning a fixed digest, or hashing the task's `ucode` image
+    /// instead, fails here.
+    #[test]
+    fn the_deferred_ucode_digest_tracks_live_imem_not_a_constant() {
+        let mut backend = WgpuBackend::try_new().unwrap().0;
+        let mut rdram = vec![0u8; LAYOUT_BYTES as usize];
+        let task = fn64_render::OsTask {
+            task_type: fn64_render::M_GFXTASK,
+            ..fn64_render::OsTask::default()
+        };
+
+        let mut first = rsp_memory_with_imem(b"microcode-a");
+        let mut second = rsp_memory_with_imem(b"microcode-b");
+        let a = backend
+            .process_task(&mut rdram, &mut first, &task, 0)
+            .unwrap();
+        let b = backend
+            .process_task(&mut rdram, &mut second, &task, 0)
+            .unwrap();
+
+        assert_ne!(
+            a, b,
+            "two different live microcodes must not report one identity"
+        );
+        for (memory, status) in [(&mut first, a), (&mut second, b)] {
+            let fn64_render::FrameStatus::NeedsLle { ucode_sha256 } = status else {
+                panic!("a graphics task must defer to LLE, got {status:?}");
+            };
+            assert_eq!(
+                ucode_sha256,
+                fn64_render::UcodeDigest::from_text(
+                    memory.bank(fn64_runtime::RspMemoryBank::Imem)
+                )
+                .as_bytes(),
+                "the digest must be the live IMEM bank's"
+            );
+        }
+    }
+
+    /// Deferring a graphics task must not become a shrug that swallows a
+    /// routing bug. A non-graphics task is still a loud named error, and the
+    /// message names the type it received rather than saying "out of scope".
+    #[test]
+    fn a_non_graphics_task_is_still_refused_by_name() {
+        let mut backend = WgpuBackend::try_new().unwrap().0;
+        let mut rdram = vec![0u8; LAYOUT_BYTES as usize];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        let audio = fn64_render::OsTask {
+            task_type: fn64_render::M_GFXTASK + 1,
+            ..fn64_render::OsTask::default()
+        };
+
+        let error = backend
+            .process_task(&mut rdram, &mut rsp_memory, &audio, 0)
+            .expect_err("a non-graphics task at this seam is a routing bug");
+        let reason = error.to_string();
+        assert!(
+            reason.contains(&(fn64_render::M_GFXTASK + 1).to_string()),
+            "the refusal must name the task type it received: {reason}"
+        );
+    }
+
+    /// A graphics task must not mutate guest memory on the way to its
+    /// deferral: `fn64-abi` runs the very same task through LLE afterwards,
+    /// and a half-applied prefix would be executed twice.
+    #[test]
+    fn deferring_a_graphics_task_leaves_guest_memory_untouched() {
+        let mut backend = WgpuBackend::try_new().unwrap().0;
+        let mut rdram = vec![0u8; LAYOUT_BYTES as usize];
+        for (index, byte) in rdram.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let before = rdram.clone();
+        let mut rsp_memory = rsp_memory_with_imem(b"uncatalogued");
+        let rsp_before = rsp_memory.clone();
+
+        let task = fn64_render::OsTask {
+            task_type: fn64_render::M_GFXTASK,
+            data_ptr: COMMAND_START,
+            data_size: 64,
+            ..fn64_render::OsTask::default()
+        };
+        backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .expect("a graphics task defers rather than failing");
+
+        assert_eq!(rdram, before, "deferral must not write guest RDRAM");
+        assert_eq!(
+            rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem),
+            rsp_before.bank(fn64_runtime::RspMemoryBank::Imem),
+            "deferral must not write RSP IMEM"
         );
     }
 }
