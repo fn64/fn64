@@ -92,12 +92,16 @@ fn64_c_recompiled_function_enter: entered native callable ... was not
 registered in the generated section table
 ```
 
-in `func_8011EA20`, reached from `func_8011C900_bank3_text`. `func_8011EA20`
-belongs to `section_4_bank3_text`, and the harness marks **only sections 0 and
-1** loaded (`examples/wm2000-census/src/main.rs`, whose own comment says "this
-milestone does not yet drive that swap"). Sections 3 and 4 both live at
-`ram=0x8011c900` — genuine overlay banks sharing one VRAM slot. **Overlay bank
-swapping is the next card.**
+in `func_8011EA20`, reached from `func_8011C900_bank3_text`.
+
+> **This section's diagnosis was wrong and is retained as a disproof.** It read
+> the abort as an overlay-residency problem because `func_8011EA20` lives in
+> `section_4_bank3_text` while the harness marks only sections 0/1. Measurement
+> showed bank swapping already works — the guest's own `osEPiStartDma` marks
+> sections 2/3/4, section 4 before this abort — and that the failing symbol is
+> `static_4_8011FFA4`, one of 40 section-local bodies registered nowhere. The
+> trap reads an execution-evidence registry, not the resident set. See
+> [`RT64-WM2000-SECTION-LOCAL.md`](RT64-WM2000-SECTION-LOCAL.md).
 
 ## Verification
 

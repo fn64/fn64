@@ -133,17 +133,32 @@ fn main() {
 
     // Per fn64_runtime::overlay's module doc: sections 0 (entry) and 1
     // (main/resident) are always-loaded; the four overlay banks (2-5) are
-    // NOT loaded at boot (they are PI-bank-switched in later, per
-    // overlays.json) -- this milestone does not yet drive that swap, so
-    // only the always-resident sections are marked loaded, matching real
-    // boot-time hardware state (no overlay bank has been PI-mapped in yet
-    // this early).
+    // NOT loaded at boot. They do NOT need marking here: the guest's own
+    // `func_80000744` (overlays.json's `load_fn`) DMAs each bank in through
+    // `osEPiStartDma`, and `fn64_abi::note_dma_overlay_load` -- already wired
+    // into the PI completion path -- marks the matching section loaded at the
+    // base the guest actually chose. MEASURED on this ROM: banks 1/2/3 are
+    // marked from their own DMAs (rom 0x4C160 -> section 2, 0x73390 ->
+    // section 3, 0x809D0 -> section 4), each an exact `rom_addr` match. This
+    // is why sections 3 and 4 can share link base 0x8011C900 without either
+    // being guessed at: residency follows the guest's DMA, never a
+    // convention.
+    //
+    // What the harness DOES have to supply is the registration of
+    // N64Recomp's SECTION-LOCAL bodies (`static_<section>_<vram>`), which
+    // appear in no `FuncEntry` table yet carry the entry observer; that is
+    // handled by `register_linked_sections` (see its
+    // `section_local_count`).
     for section_key in [0usize, 1usize] {
         if let Some(idx) = registration.registry_index(section_key) {
             fn64_abi::set_section_loaded(idx);
             println!("[wm2000-census] marked section {section_key} (index {idx}) loaded");
         }
     }
+    println!(
+        "[wm2000-census] registered {} section-local bodies (absent from every FuncEntry table)",
+        registration.section_local_count()
+    );
 
     // Real audio: replay every M_AUDTASK's genuine in-ROM ucode through the
     // clean-room RSP LLE interpreter (the same fallback path gfx tasks take)
