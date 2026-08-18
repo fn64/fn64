@@ -6903,6 +6903,48 @@ mod tests {
     /// `PlannedRawDpcSubmission` exposes no journal accessor -- but keeps
     /// the purpose tag rather than filtering to `RenderTarget`, because the
     /// interleaving of the two purposes IS the fact under test.
+    /// Every `RenderTarget` write access one word stream's decode declares,
+    /// as `(start, end)` guest byte ranges in the journal's own order.
+    ///
+    /// Same probe-decode technique as `declared_write_purposes`
+    /// (`PlannedRawDpcSubmission` exposes no journal accessor), but keeps the
+    /// RDRAM *range* rather than the purpose tag: a count alone cannot tell a
+    /// correctly-placed rectangle from one shifted by a row, which is exactly
+    /// the mutation that survived a count-only assertion.
+    fn declared_render_target_ranges(words: Vec<u32>) -> Vec<(u32, u32)> {
+        let capture = capture(words);
+        let layout = capture.memory_layout();
+        let submission = capture.submission().clone();
+        let probe_journal = single_source_probe_journal(&submission, layout).unwrap();
+        let decoded = finalize_with_zero_reads(
+            layout,
+            capture.transaction_sequence(),
+            submission.clone(),
+            capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
+            probe_journal,
+        )
+        .unwrap();
+        let ticket = submit_locally(decoded).unwrap();
+        let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            other => panic!("probe decode must report the real access list, got {other:?}"),
+        };
+        accesses
+            .iter()
+            .filter(|access| {
+                access.mode() == AccessMode::Write
+                    && access.purpose() == AccessPurpose::RenderTarget
+            })
+            .filter_map(|access| match access.region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                    Some((range.start().get(), range.end()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn declared_write_purposes(words: Vec<u32>) -> Vec<(u32, AccessPurpose)> {
         let capture = capture(words);
         let layout = capture.memory_layout();
@@ -7557,27 +7599,30 @@ mod tests {
         }
     }
 
-    /// **The structural question this card was dispatched to answer, measured
-    /// rather than reasoned: a `TextureRectangle` declares NO journal write
-    /// access at all.**
+    /// **A `TextureRectangle` now declares a journal write access for its
+    /// destination rectangle** -- the inversion of this card's own starting
+    /// measurement.
     ///
-    /// The card's premise was that a texrect, unlike a triangle, "writes the
-    /// color image -- so it should have a declared access to compose onto".
-    /// It does not. `raw_dpc::production_adapter`'s `TextureRectangle` arm
-    /// admits the command as exactly two `push_triangle` calls
-    /// (`TriangleSource::TextureRectangle`), and `push_triangle` binds no
-    /// resource access; the only two access producers in the whole decoder
-    /// are `bind_fill_rectangle` and `bind_tmem_transfer`
-    /// (`raw_dpc::mod`'s `push_access` has exactly those two callers).
+    /// At `92affbee` this test asserted the opposite, and its failure message
+    /// named the condition under which it should be rewritten: "if this ever
+    /// fails, a texrect has gained a journal write access and the composition
+    /// this card was dispatched to build becomes tractable". That is what
+    /// happened. `raw_dpc::mod`'s `plan_texture_rectangle` derives the
+    /// rectangle's rasterized pixel extent from
+    /// `texture_rectangle_vertices` (the ported RT64 `drawTexRect`/`drawRect`)
+    /// and declares the same per-row `ColorFramebuffer` writes `plan_fill`
+    /// does, through the same `plan_render_target_rows`.
     ///
-    /// So a texrect is, to the journal, indistinguishable from a triangle:
-    /// there is no declared write to compose onto, and
-    /// `merged_fill_and_tmem_writes`' journal-derived order -- which is the
-    /// whole mechanism the fill+TMEM composition rests on -- has nothing to
-    /// place. This is measured here so the next card starts from the fact
-    /// rather than the premise.
+    /// The counts here are hand-derived, not captured. `texrect_words_in_target`
+    /// is `ulx=4<<2, uly=2<<2, lrx=11<<2, lry=4<<2`; RT64's
+    /// `left/top/right/bottom = (coord + 3) >> 2` gives `4, 2, 11, 4`, a
+    /// half-open extent, so the covered pixels are x `4..=10`, y `2..=3`.
+    /// That is 7 pixels wide in a 16-wide image -- a *partial*-width
+    /// rectangle -- so it declares one access per row: **2**. Cross-checked
+    /// independently: `ceil(coord / 4)` for each of the four wire values
+    /// yields the same `4, 2, 11, 4`.
     #[test]
-    fn a_texture_rectangle_declares_no_journal_write_access() {
+    fn a_texture_rectangle_declares_a_render_target_write_access() {
         // A TMEM load alone declares its TMEM destination write.
         let tmem_only = declared_write_purposes(one_load_block_words());
         assert!(
@@ -7592,18 +7637,20 @@ mod tests {
             "the TMEM-only control must declare only TMEM destination writes, got {tmem_only:?}"
         );
 
-        // The SAME stream with a texture rectangle appended declares exactly
-        // the same writes -- the texrect contributed none.
+        // `tmem_then_texrect_words` stages no `SetColorImage`, so its texrect
+        // has no destination image and declares no write -- the documented
+        // "declaring nothing is not a silent no-op" case in
+        // `plan_texture_rectangle`'s contract. Pinned so that case cannot
+        // silently start declaring a range.
         let with_texrect = declared_write_purposes(tmem_then_texrect_words());
         assert_eq!(
             with_texrect, tmem_only,
-            "appending a TextureRectangle must not change the declared write list -- if this \
-             ever fails, a texrect has gained a journal write access and the composition this \
-             card was dispatched to build becomes tractable"
+            "a texrect with no staged SetColorImage has no destination image, so it must \
+             declare no write"
         );
 
-        // And a fill's write is still the ONLY RenderTarget write in a
-        // fill+TMEM+texrect stream: the texrect adds nothing to compose.
+        // With a color image staged (by the fill), the SAME texrect declares
+        // its own RenderTarget writes on top of the fill's.
         let composed = declared_write_purposes(fill_tmem_and_texrect_words());
         let render_target_writes = composed
             .iter()
@@ -7614,9 +7661,96 @@ mod tests {
             .filter(|(_, purpose)| *purpose == AccessPurpose::RenderTarget)
             .count();
         assert_eq!(
-            render_target_writes, fill_only_render_target_writes,
-            "a texrect must contribute zero RenderTarget writes -- the fill's own count is the \
-             whole of the composed stream's"
+            fill_only_render_target_writes, 1,
+            "the whole-target fill is full-image-width, so it collapses to exactly one \
+             contiguous access -- if this moves, the derivation below is measuring \
+             something else"
+        );
+        assert_eq!(
+            render_target_writes,
+            fill_only_render_target_writes + 2,
+            "the texrect must contribute exactly 2 RenderTarget writes of its own -- one per \
+             covered row (y 2..=3), because at 7 pixels wide in a 16-wide image its rows are \
+             disjoint and must not collapse"
+        );
+
+        // A count alone cannot tell a correctly-placed rectangle from one
+        // shifted by a row (measured: that mutation survived a count-only
+        // assertion). Assert the exact declared byte ranges.
+        //
+        // Hand-derived: the fill is the whole 16x8 RGBA16 target at
+        // `0x2000`, so it declares `0x2000..0x2000 + 16*8*2 = 0x2100`. The
+        // texrect covers x 4..=10 (7 pixels) on rows 2 and 3, so each row is
+        // `0x2000 + (y*16 + 4)*2` for `7*2 = 14` bytes: row 2 is
+        // `0x2048..0x2056`, row 3 is `0x2068..0x2076`. The two are disjoint
+        // and strided by the image width (`0x2068 - 0x2048 = 0x20 = 16*2`) --
+        // a partial-width rectangle must never collapse its rows into one
+        // range spanning the untouched bytes between them.
+        let ranges = declared_render_target_ranges(fill_tmem_and_texrect_words());
+        assert_eq!(
+            ranges,
+            vec![
+                (FILL_TARGET_ADDRESS, FILL_TARGET_ADDRESS + 16 * 8 * 2),
+                (0x2048, 0x2056),
+                (0x2068, 0x2076),
+            ],
+            "the declared RenderTarget ranges must be the fill's whole target followed by the \
+             texrect's two disjoint hand-derived rows, in journal order"
+        );
+        // The same two rows, derived from the geometry rather than written
+        // as literals, so an arithmetic slip cannot agree with itself.
+        for (index, row) in [2u32, 3].iter().enumerate() {
+            let start = FILL_TARGET_ADDRESS + (row * 16 + 4) * 2;
+            assert_eq!(
+                ranges[index + 1],
+                (start, start + 7 * 2),
+                "texrect row {row}'s declared range, derived from the extent"
+            );
+        }
+    }
+
+    /// `TextureRectangleFlip` declares **no** destination write, even with a
+    /// color image staged and a footprint that would otherwise be provable.
+    ///
+    /// Flip's destination footprint is the same as the unflipped rectangle's
+    /// (only the S/T pairing swaps across the diagonal), so it would be easy
+    /// to declare a write for it. This slice does not execute flip, and
+    /// declaring a write no executor fills would promise content that never
+    /// arrives -- the "declaring nothing is not a silent no-op" case in
+    /// `plan_texture_rectangle`'s contract.
+    ///
+    /// Measured, not assumed: without this test, deleting the flip gate
+    /// entirely left the whole suite green (mutant I), because no other
+    /// fixture pairs a flip texrect with a staged color image.
+    #[test]
+    fn a_texture_rectangle_flip_declares_no_destination_write() {
+        // The identical rectangle as a plain texrect (0x24) DOES declare its
+        // two rows -- the control that makes the flip assertion meaningful.
+        let mut unflipped = whole_target_fill_words();
+        unflipped.extend(texrect_words_in_target(7));
+        let unflipped_ranges = declared_render_target_ranges(unflipped);
+        assert_eq!(
+            unflipped_ranges.len(),
+            3,
+            "control: the unflipped texrect must declare the fill's range plus its own two \
+             rows, or the flip comparison below proves nothing -- got {unflipped_ranges:?}"
+        );
+
+        // The same wire words with only the opcode changed to 0x25.
+        let mut flipped_words = texrect_words_in_target(7);
+        flipped_words[0] = (flipped_words[0] & 0x00ff_ffff) | (u32::from(TEXRECT_FLIP) << 24);
+        let mut flipped = whole_target_fill_words();
+        flipped.extend(flipped_words);
+        let flipped_ranges = declared_render_target_ranges(flipped);
+        assert_eq!(
+            flipped_ranges.len(),
+            1,
+            "a flip texrect must declare no destination write, leaving only the fill's own \
+             range -- got {flipped_ranges:?}"
+        );
+        assert_eq!(
+            flipped_ranges[0], unflipped_ranges[0],
+            "the fill's own declared range must be identical in both streams"
         );
     }
 
