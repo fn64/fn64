@@ -873,8 +873,10 @@ mod production {
     /// `LoadTile`, or `LoadTLUT`): staged tile/source-image state, the exact
     /// opcode-specific addressing geometry, the load-sync epoch it was bound
     /// under, the command's own raw wire words, exact source-byte
-    /// accounting, an explicit index into the owning plan's access list for
-    /// the destination access, transfer layout, and the full ordered
+    /// accounting (the complete ordered source-access run, which a
+    /// partial-width `LoadTile` splits one-per-row), an explicit index into
+    /// the owning plan's access list for the destination access, transfer
+    /// layout, and the full ordered
     /// transfer-word set a real decoder (T1) already computed. This is the
     /// complete neutral semantic/load representation the execution seam
     /// needs -- every field T3's physical executor reads is here,
@@ -889,7 +891,7 @@ mod production {
         tile_index: u8,
         source_image: NeutralTextureImage,
         tile_descriptor: NeutralTileDescriptor,
-        source: ResourceAccess,
+        sources: Box<[ResourceAccess]>,
         source_access_index: u32,
         destination: ResourceAccess,
         destination_access_index: u32,
@@ -911,7 +913,7 @@ mod production {
             tile_index: u8,
             source_image: NeutralTextureImage,
             tile_descriptor: NeutralTileDescriptor,
-            source: ResourceAccess,
+            sources: Vec<ResourceAccess>,
             source_access_index: u32,
             destination: ResourceAccess,
             destination_access_index: u32,
@@ -922,6 +924,10 @@ mod production {
             layout: TmemTransferLayout,
             transfer_words: Vec<NeutralTmemTransferWord>,
         ) -> Self {
+            assert!(
+                !sources.is_empty(),
+                "a TMEM load always reads at least one source access"
+            );
             Self {
                 location,
                 raw_words: raw_words.into_boxed_slice(),
@@ -930,7 +936,7 @@ mod production {
                 tile_index,
                 source_image,
                 tile_descriptor,
-                source,
+                sources: sources.into_boxed_slice(),
                 source_access_index,
                 destination,
                 destination_access_index,
@@ -979,13 +985,39 @@ mod production {
             self.tile_descriptor
         }
 
-        pub const fn source(&self) -> ResourceAccess {
-            self.source
+        /// Every [`ResourceAccess`] this load reads from, in the exact
+        /// journal order the decoder produced them, occupying the owning
+        /// plan's access list contiguously starting at
+        /// [`Self::source_access_index`].
+        ///
+        /// This is a slice, not a single access, precisely because a
+        /// partial-width `LoadTile` declares **one source read per row**
+        /// (`tmem::wire::decode_load_tile`'s `(low_t..=high_t)` arm): a
+        /// 49-row sub-rectangle of a wider texture is 49 disjoint RDRAM
+        /// reads, not one contiguous span. Only a load whose source columns
+        /// cover the full texture-image width collapses to a single range.
+        /// There is no "collapse to one access" path and there must never
+        /// be one -- a collapsed range would claim the untouched
+        /// inter-row bytes as read, and `transfer_words[].source_access_index`
+        /// already binds each transfer word to the exact row it came from.
+        pub fn sources(&self) -> &[ResourceAccess] {
+            &self.sources
         }
 
-        /// Index of [`Self::source`] within the owning plan's exact ordered
-        /// access list -- lets T3 correlate this load's source without
-        /// re-deriving which journal entry it came from.
+        /// The load's **first** source access -- the one at
+        /// [`Self::source_access_index`]. Callers that must account for
+        /// every byte the load reads want [`Self::sources`]; this names
+        /// only the first fragment, exactly as [`Self::destination`] names
+        /// only the first destination fragment.
+        pub fn source(&self) -> ResourceAccess {
+            self.sources[0]
+        }
+
+        /// Index of [`Self::sources`]`[0]` within the owning plan's exact
+        /// ordered access list -- lets T3 correlate this load's source run
+        /// without re-deriving which journal entries it came from. The run
+        /// is contiguous, so fragment `i` sits at
+        /// `source_access_index() + i`.
         pub const fn source_access_index(&self) -> u32 {
             self.source_access_index
         }
@@ -2480,8 +2512,42 @@ mod production {
             self.accesses.len() as u32
         }
 
+        /// Pushes one admitted TMEM load and **every** source
+        /// [`ResourceAccess`] it declares followed by its *first*
+        /// destination access, in the decoder's exact journal order.
+        ///
+        /// The decoder emits a load's accesses as one contiguous run of
+        /// `N` `TmemLoadSource` reads followed by `M` `TmemLoadDestination`
+        /// writes (`tmem::wire::source_accesses` builds the source run,
+        /// then `tmem::wire::transfer_plan` appends the destination run to
+        /// the same vector). `N` is greater than one for every
+        /// partial-width `LoadTile` -- one read per source row -- so this
+        /// method pushes `load.sources()` whole rather than a single
+        /// access. The caller pushes the remaining `M - 1` destination
+        /// fragments with [`Self::push_command_decode_access`] immediately
+        /// after, keeping `self.accesses` position-for-position identical
+        /// to the journal, which is exactly what [`Self::finish`]'s
+        /// element-wise check requires.
+        ///
+        /// Source-before-destination is load-bearing, not cosmetic:
+        /// `fn64_render_ir::validate_effects` compares a backend's writes
+        /// against the journal by position under an equal-length
+        /// precondition, so pushing the destination before the sources
+        /// would mis-commit guest memory rather than fail loudly.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `load` declares no source access. A TMEM load always
+        /// reads at least one range; a load with an empty source run is a
+        /// decoder bug, not a no-op to be admitted quietly. The type
+        /// cannot express it either -- `sources` is validated nonempty at
+        /// construction.
         pub fn push_tmem_load(&mut self, load: TmemLoadSemantics) {
-            self.accesses.push(load.source);
+            assert!(
+                !load.sources.is_empty(),
+                "a TMEM load always reads at least one source access"
+            );
+            self.accesses.extend_from_slice(&load.sources);
             self.accesses.push(load.destination);
             self.commands.push(OwnedSemanticCommand::TmemLoad(load));
         }
@@ -3147,7 +3213,7 @@ mod production {
                 0,
                 source_image,
                 tile_descriptor,
-                tmem_source,
+                vec![tmem_source],
                 1,
                 tmem_destination,
                 2,
