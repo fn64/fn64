@@ -663,9 +663,15 @@ fn full_sync_reserved_by_capture(writer: &ExactRawDpcPlanWriter, ordinal: u32) -
 /// flat word image of the submission `decoded` was decoded from
 /// (`writer.capture().submission().command_words()`); `layout` is that same
 /// capture's memory layout. Returns the first unadmitted command
-/// encountered, if any -- v11's frozen scope is TMEM-only,
-/// no-FullSync, no-guest-write, so any other decoded command kind is a loud
-/// rejection, not a silent omission. The writer retains every command
+/// encountered, if any -- the admitted scope is the exact list
+/// [`UnadmittedRawDpcCommand`]'s own doc enumerates (the TMEM
+/// staging/load commands, the nine pure-RDP-state commands, `RawTriangle`,
+/// `TextureRectangle`, `FillRectangle`, and `FullSync`; `NoOp` is admitted
+/// and discarded), so any other decoded command kind is a loud rejection,
+/// not a silent omission. That type's doc is authoritative; do not restate
+/// the list here, where it would drift out of date -- an earlier
+/// "TMEM-only, no-FullSync, no-guest-write" wording survived several scope
+/// widenings and misdirected a live diagnosis. The writer retains every command
 /// pushed before the rejection; the caller must not call `finish` on a
 /// writer this function rejected against, since the resulting plan would
 /// silently omit the unadmitted command's semantics.
@@ -1221,16 +1227,24 @@ fn push_tmem_load(
 
     let source_accesses = bound.source_accesses();
     let destination_accesses = bound.destination_accesses();
-    assert_eq!(
-        source_accesses.len(),
-        1,
-        "v11's admitted TMEM source plan is exactly one journal access wide"
+    // The source union spans one access per source *row* for every
+    // partial-width `LoadTile` -- `tmem::wire::decode_load_tile`'s
+    // `(low_t..=high_t)` arm emits one `TmemLoadSource` read per row, and
+    // only a load whose columns cover the full texture-image width takes
+    // the collapsed single-range arm above it. WM2000's first textured
+    // load is a 49-row sub-rectangle, so 49 accesses is the mainstream
+    // case, not an exotic one. `TmemLoadSemantics::sources` carries the
+    // whole run and `push_tmem_load` pushes all of it, in the decoder's
+    // exact journal order, before the destination -- see that method's own
+    // doc for why the ordering is load-bearing.
+    assert!(
+        !source_accesses.is_empty(),
+        "a TMEM load always reads at least one source access"
     );
     assert!(
         !destination_accesses.is_empty(),
         "a TMEM load always writes at least one destination access"
     );
-    let source = source_accesses[0];
     // The destination union can span more than one journal access (the
     // canonical sorted/disjoint fragment set `destination_ranges` computes,
     // e.g. the low/high split-bank halves an odd-row exchange produces).
@@ -1269,7 +1283,7 @@ fn push_tmem_load(
         load.tile().get(),
         neutral_texture_image(load.source_image(), location.source_address.layout()),
         neutral_tile_descriptor(load.tile_descriptor()),
-        source,
+        source_accesses.to_vec(),
         source_access_index,
         destination,
         destination_access_index,
@@ -1795,6 +1809,252 @@ mod tests {
             plan_destination_accesses,
             expected_destination_accesses.as_slice(),
             "every split-bank destination fragment must be pushed, in order, not just the first"
+        );
+    }
+
+    /// Hand-derived multi-row `LoadTile` fixture matching the shape
+    /// WM2000's first textured load takes: a **partial-width**
+    /// sub-rectangle of a wider texture image, which
+    /// `tmem::wire::decode_load_tile` splits into **one `TmemLoadSource`
+    /// read per row**.
+    ///
+    /// Geometry, derived from the wire fields rather than captured from a
+    /// run: the texture image is RGBA/16-bit (2 bytes per texel) and 64
+    /// texels wide; the tile bounds are S in `[0, 31]` and T in `[0, 48]`.
+    /// The S span is 32 texels, which is *not* the image's full 64-texel
+    /// width, so the collapsed single-range arm does not apply. The T span
+    /// is `48 - 0 + 1 = `**`49`** rows, so the decoder emits 49 source
+    /// accesses of `32 * 2 = 64` bytes each: 3,136 source bytes total.
+    /// Row `t` starts at texel `t * 64`, i.e. byte `0x200 + t * 128`, so
+    /// the rows are disjoint and non-contiguous -- exactly why they cannot
+    /// collapse into one range.
+    const MULTI_ROW_IMAGE_WIDTH: u32 = 64;
+    const MULTI_ROW_HIGH_S: u32 = 31;
+    const MULTI_ROW_HIGH_T: u32 = 48;
+    const MULTI_ROW_EXPECTED_SOURCES: usize = (MULTI_ROW_HIGH_T + 1) as usize;
+    const MULTI_ROW_BYTES_PER_ROW: u32 = (MULTI_ROW_HIGH_S + 1) * 2;
+
+    /// Builds the fixture described above. Returns the decoded capture plus
+    /// the journal the decoder itself asked for.
+    fn multi_row_load_tile_fixture() -> (DecodedRawDpc, OwnedRawDpcCapture, ResourceJournal) {
+        let mut words = Vec::new();
+        // RGBA (format 0), 16-bit (size 2), 64 texels wide, base 0x200.
+        words.extend(set_texture_image(0, 2, MULTI_ROW_IMAGE_WIDTH, 0x200));
+        // `line` is in 64-bit TMEM words per row: 64 source bytes = 8 words.
+        words.extend(set_tile(7, 8, 0));
+        // Wire coordinate fields are 10.2 fixed point; `integer()` is
+        // `raw >> 2`, so the integer bounds shift left by two.
+        words.extend(set_tile_size(
+            7,
+            MULTI_ROW_HIGH_S << 2,
+            MULTI_ROW_HIGH_T << 2,
+        ));
+        words.extend(load_sync());
+        words.extend([
+            word(LOAD_TILE, 0),
+            7 << 24 | (MULTI_ROW_HIGH_S << 2) << 12 | (MULTI_ROW_HIGH_T << 2),
+        ]);
+        // The probe source range only has to be in bounds; the harness
+        // rediscovers the decoder's real 49-access journal via
+        // `JournalMismatch::expected`.
+        decode_admitted_capture(words, (0x200, 0x1a40))
+    }
+
+    /// Positive control for every multi-source test below: prove the
+    /// fixture really is a 49-row load whose source rows are disjoint and
+    /// non-adjacent, so none of those tests can pass vacuously against a
+    /// load that collapsed to a single access.
+    #[test]
+    fn multi_row_load_tile_fixture_really_declares_forty_nine_disjoint_source_rows() {
+        let (decoded, _, _) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let bound = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap();
+        let sources = bound.source_accesses();
+
+        assert_eq!(
+            sources.len(),
+            MULTI_ROW_EXPECTED_SOURCES,
+            "hand-derived row count: high_t - low_t + 1 = 48 - 0 + 1"
+        );
+        assert_eq!(
+            source_load.transfer_plan().unwrap().row_count() as usize,
+            MULTI_ROW_EXPECTED_SOURCES,
+            "the transfer plan's own row count must agree with the source access count"
+        );
+        for access in sources {
+            assert_eq!(
+                access.region().declared_bytes(),
+                MULTI_ROW_BYTES_PER_ROW,
+                "each row reads (high_s - low_s + 1) * 2 bytes"
+            );
+            assert_eq!(access.mode(), fn64_render_ir::AccessMode::Read);
+            assert_eq!(
+                access.purpose(),
+                fn64_render_ir::AccessPurpose::TmemLoadSource
+            );
+        }
+        // Disjoint AND non-adjacent: consecutive row starts differ by the
+        // full image stride (128 bytes), not by the 64 bytes each row
+        // reads. A gap between every pair is precisely what makes a
+        // single collapsed range wrong.
+        let starts: Vec<u32> = sources
+            .iter()
+            .map(|access| match access.region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => range.start().get(),
+                other => panic!("TMEM source must be an RDRAM read, got {other:?}"),
+            })
+            .collect();
+        for pair in starts.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                MULTI_ROW_IMAGE_WIDTH * 2,
+                "rows advance by the image stride, leaving a gap a collapsed range would swallow"
+            );
+        }
+        assert!(
+            MULTI_ROW_IMAGE_WIDTH * 2 > MULTI_ROW_BYTES_PER_ROW,
+            "the fixture is only a positive control if the stride really exceeds the row"
+        );
+    }
+
+    /// The defect this card fixes: `push_tmem_load` used to assert the
+    /// source plan was exactly one journal access wide, aborting on any
+    /// partial-width `LoadTile`. Every source access must now reach the
+    /// plan, and `TmemLoadSemantics::sources` must carry all of them.
+    #[test]
+    fn multi_row_load_tile_admits_every_source_access() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let expected_sources = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap()
+            .source_accesses()
+            .to_vec();
+
+        let plan = push_and_visit(&decoded, capture, journal);
+
+        assert_eq!(plan.loads.len(), 1);
+        let load = &plan.loads[0];
+        assert_eq!(
+            load.sources(),
+            expected_sources.as_slice(),
+            "the neutral load must carry the decoder's whole ordered source run"
+        );
+        assert_eq!(load.sources().len(), MULTI_ROW_EXPECTED_SOURCES);
+        assert_eq!(
+            load.source(),
+            expected_sources[0],
+            "`source()` still names the first fragment"
+        );
+    }
+
+    /// **Journal ordering.** `fn64_render_ir::validate_effects` compares a
+    /// backend's writes against the journal position by position under an
+    /// equal-length precondition, so the order the writer pushes accesses
+    /// in is load-bearing, not cosmetic. This pins the exact positional
+    /// layout: `[CommandDecode, source_0 .. source_48, destination_0 ..]`.
+    ///
+    /// Two different orders give observably different results here: the
+    /// per-position comparison against `expected_sources` below fails if
+    /// the sources are pushed after the destination, if they are reversed,
+    /// or if only the first is pushed -- see the mutation tests in
+    /// `render_ir.rs` that perturb exactly those.
+    #[test]
+    fn multi_row_load_tile_pushes_sources_before_destinations_in_journal_order() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let bound = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap();
+        let expected_sources = bound.source_accesses().to_vec();
+        let expected_destinations = bound.destination_accesses().to_vec();
+
+        let plan = push_and_visit(&decoded, capture, journal.clone());
+        let load = &plan.loads[0];
+
+        // Position 0 is the command-decode read; the source run starts at 1.
+        assert_eq!(load.source_access_index(), 1);
+        assert_eq!(
+            &plan.accesses[1..1 + expected_sources.len()],
+            expected_sources.as_slice(),
+            "sources occupy one contiguous run, in decoder order, before any destination"
+        );
+        // Destinations follow immediately -- never interleaved, never first.
+        let destination_start = 1 + expected_sources.len();
+        assert_eq!(load.destination_access_index() as usize, destination_start);
+        assert_eq!(
+            &plan.accesses[destination_start..],
+            expected_destinations.as_slice(),
+            "every destination fragment follows the whole source run, in order"
+        );
+
+        // The whole access list must equal the journal the decoder itself
+        // asked for, position for position. `finish` already enforces this
+        // (it is why the old assert aborted rather than mis-committing),
+        // but pinning it here names the property the ordering protects.
+        assert_eq!(
+            plan.accesses.as_slice(),
+            journal.accesses(),
+            "the plan's access list is the journal, position for position"
+        );
+
+        // Each source access's operation id is consecutive, which is the
+        // fact `destination_access_run`-style contiguity scans rely on.
+        for (offset, access) in expected_sources.iter().enumerate() {
+            assert_eq!(
+                access.operation().get(),
+                expected_sources[0].operation().get() + offset as u32
+            );
+        }
+    }
+
+    /// Every transfer word must bind to a real source access in the run,
+    /// with an offset that lies inside *that row's* bytes -- not inside a
+    /// flattened concatenation of all 49. This is the fact
+    /// `production::word_source_bytes` depends on to slice the right row.
+    #[test]
+    fn multi_row_load_tile_transfer_words_bind_within_their_own_source_row() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let plan = push_and_visit(&decoded, capture, journal);
+        let load = &plan.loads[0];
+
+        let first = load.source_access_index();
+        let mut seen = vec![false; load.sources().len()];
+        for word in load.transfer_words() {
+            let relative = word
+                .source_access_index
+                .checked_sub(first)
+                .expect("a transfer word never names an access before the load's own run");
+            let index = relative as usize;
+            assert!(
+                index < load.sources().len(),
+                "word {} names source access {relative} beyond the {}-access run",
+                word.index,
+                load.sources().len()
+            );
+            seen[index] = true;
+            let row_bytes = load.sources()[index].region().declared_bytes();
+            let defined = word.defined_source_byte_mask.count_ones();
+            assert!(
+                word.source_access_byte_offset + defined <= row_bytes,
+                "word {} reads past the end of its own {row_bytes}-byte source row",
+                word.index
+            );
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "every one of the 49 source rows must be read by at least one transfer word"
         );
     }
 
