@@ -2925,6 +2925,26 @@ fn execute_scheduled_texrect(
     if snapshot.is_committed() {
         return Err(WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index });
     }
+    // The one-cycle shading state, taken from the SAME
+    // `RetrievedTriangleDraw` snapshot the other-mode, viewport and tile
+    // above came from -- i.e. the registers current at THIS texrect's own
+    // stream position. That per-command sourcing is what lets a packet
+    // carry several one-cycle texrects each running a different combiner
+    // program against the accumulated buffer: the schedule loop calls this
+    // function once per texrect, and each call reads its own snapshot
+    // rather than the walk's running final value.
+    //
+    // `combine_params` is non-optional on that struct (a triangle with no
+    // `SetCombine` fails retrieval with `MissingTriangleDrawState` before
+    // reaching here); `env_color`/`prim_color` are `Option` because their
+    // registers may genuinely be unset, and the executor refuses only when
+    // the program actually reads the unset one -- and only in one-cycle,
+    // since Copy consults no program at all.
+    let shading = crate::targets::TexrectShading::new(
+        draw_state.combine_params,
+        draw_state.env_color,
+        draw_state.prim_color,
+    );
     let completed = crate::targets::execute_texture_rectangle(
         candidate,
         other_mode,
@@ -2932,6 +2952,7 @@ fn execute_scheduled_texrect(
         tile,
         &image,
         lut_mode,
+        shading,
         resident_bytes,
         already_initialized,
     )?;
@@ -9444,6 +9465,869 @@ mod tests {
             ));
         }
         words
+    }
+
+    // --- One-cycle texrects: the mode WM2000 actually uses ---
+    //
+    // `docs/RT64-WM2000-CYCLE-MODES.md` measured 2,520 of 2,520 WM2000
+    // texrects as one-cycle, zero as Copy, running exactly two combiner
+    // programs. Everything below executes that shape end to end.
+
+    /// The two measured programs' `SetCombine` wire words, packed from
+    /// `CombineParams`' own **second-cycle** bit positions -- the slice
+    /// one-cycle mode reads. Deliberately re-derived here from the field
+    /// layout rather than imported from `targets::texrect`'s own test
+    /// module: a fixture built from the code under test's helper would
+    /// agree with it by construction.
+    ///
+    /// color A `low >> 5 & 0xF`, B `high >> 24 & 0xF`, C `low & 0x1F`,
+    /// D `high >> 6 & 0x7`; alpha A `high >> 21 & 0x7`, B `high >> 3 & 0x7`,
+    /// C `high >> 18 & 0x7`, D `high & 0x7`.
+    fn one_cycle_combine_words(color: [u32; 4], alpha: [u32; 4]) -> [u32; 2] {
+        let [ca, cb, cc, cd] = color;
+        let [aa, ab, ac, ad] = alpha;
+        let low = (ca << 5) | cc;
+        let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+        set_combine(low, high)
+    }
+
+    /// Program 1: RGB `(Environment - Texel0) * Primitive + Texel0`,
+    /// Alpha `(Texel0 - Zero) * Primitive + Zero`. 2,100 of 2,520.
+    const ENV_LERP_COLOR: [u32; 4] = [5, 1, 3, 1];
+    const ENV_LERP_ALPHA: [u32; 4] = [1, 7, 3, 7];
+    /// Program 2: both channels `(Zero - Zero) * Zero + Primitive`. 420 of
+    /// 2,520. Each slot's ZERO index is its OWN out-of-table value.
+    const FLAT_PRIM_COLOR: [u32; 4] = [8, 8, 16, 3];
+    const FLAT_PRIM_ALPHA: [u32; 4] = [7, 7, 7, 3];
+
+    const ONE_CYCLE_ENV_WIRE: u32 = 0xFF00_80FF;
+    const ONE_CYCLE_PRIM_WIRE: u32 = 0x80FF_4080;
+
+    /// `fill_load_and_copy_texrect_words` with the cycle switched to
+    /// **one-cycle** and a real `SetCombine`/`SetEnvColor`/`SetPrimColor`
+    /// staged before the rectangle.
+    ///
+    /// Everything else -- the fill, the `LoadBlock`, the tile, the
+    /// rectangle's own wire words -- is byte-identical to the Copy fixture,
+    /// so the only difference between the two executions is the cycle type
+    /// and the combiner program. That is what makes the Copy regression
+    /// guard and this test a controlled pair rather than two unrelated
+    /// fixtures.
+    fn fill_load_and_one_cycle_texrect_words(color: [u32; 4], alpha: [u32; 4]) -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        // The tip's own load run, reused rather than re-inlined: a second
+        // copy of the same five commands would be free to drift from the
+        // fixture every other texrect test samples.
+        words.extend(composed_tmem_load_words());
+        // One-cycle (0), where Copy is 2.
+        words.extend(set_other_mode(0, 0));
+        words.extend(one_cycle_combine_words(color, alpha));
+        words.extend(set_env_color(ONE_CYCLE_ENV_WIRE));
+        // `lod_frac`/`lod_min` deliberately non-zero: neither measured
+        // program reads `prim_lod_frac`, so a leak into a color channel
+        // shows up as a wrong pixel here.
+        words.extend(set_prim_color(0x40, 0x05, ONE_CYCLE_PRIM_WIRE));
+        words.extend(texrect_words_in_target_stepping(7));
+        words
+    }
+
+    /// The one-cycle rectangle, derived **twice** and reconciled.
+    ///
+    /// Derivation 1, RT64's own `texture_rectangle_vertices`: the wire
+    /// fields are `ulx=16, uly=8, lrx=44, lry=16`. One-cycle applies
+    /// **neither** Copy's `lrx |= 3`/`lry |= 3` **nor** fill/copy's
+    /// `ulx &= !3` -- both are cycle-gated -- so the four values are
+    /// unchanged. `(coord + 3) >> 2` on each gives `4, 2, 11, 4`.
+    /// Half-open: pixels **x 4..=10, y 2..=3** -- 7 wide, 2 tall.
+    ///
+    /// Derivation 2, independent: `ceil(coord / 4)` on `16, 8, 44, 16` is
+    /// `4, 2, 11, 4`. Same.
+    ///
+    /// **This differs from the Copy fixture's 8x3 for the identical wire
+    /// words**, which is precisely why the extent must come from the ported
+    /// geometry and never from the wire corners. `the_one_cycle_extent_
+    /// differs_from_the_copy_extent_for_identical_wire_words` asserts that
+    /// difference rather than leaving it as a comment.
+    const ONE_CYCLE_X0: u32 = 4;
+    const ONE_CYCLE_Y0: u32 = 2;
+    const ONE_CYCLE_WIDTH: u32 = 7;
+    const ONE_CYCLE_HEIGHT: u32 = 2;
+
+    /// The one-cycle draw, through `texture_rectangle_vertices` -- the same
+    /// ported geometry the decoder and executor both use, for the reason
+    /// `composed_fixture_draw` states.
+    fn one_cycle_fixture_draw() -> crate::TexrectDraw {
+        let words = texrect_words_in_target_stepping(7);
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let raw = crate::RawTextureRectangle::decode(0x24, &bytes)
+            .expect("the fixture's texrect words decode");
+        let vertices = crate::texture_rectangle_vertices(raw, crate::CycleType::OneCycle)
+            .expect("the fixture's rectangle is non-empty in one-cycle");
+        crate::TexrectDraw::try_from_viewport_and_texcoords(
+            vertices.viewport,
+            vertices.vertex(0).texcoord(),
+            vertices.vertex(3).texcoord(),
+        )
+        .expect("the fixture's texcoords recover integer S10.5 endpoints")
+    }
+
+    /// **Constraint 3, proven rather than asserted: the same wire words
+    /// cover a different footprint in one-cycle than in Copy.**
+    ///
+    /// If these were equal, taking the extent from the wire corners would
+    /// be harmless and the whole "derive it from
+    /// `texture_rectangle_vertices`" rule would be unfalsifiable here.
+    #[test]
+    fn the_one_cycle_extent_differs_from_the_copy_extent_for_identical_wire_words() {
+        let copy = composed_fixture_draw();
+        let one_cycle = one_cycle_fixture_draw();
+        assert_eq!(
+            (copy.width(), copy.height()),
+            (TEXRECT_WIDTH, TEXRECT_HEIGHT),
+            "the Copy extent must be the hand-derived 8x3"
+        );
+        assert_eq!(
+            (one_cycle.width(), one_cycle.height()),
+            (ONE_CYCLE_WIDTH, ONE_CYCLE_HEIGHT),
+            "the one-cycle extent must be the hand-derived 7x2"
+        );
+        assert_ne!(
+            (copy.width(), copy.height()),
+            (one_cycle.width(), one_cycle.height()),
+            "identical wire words must cover DIFFERENT footprints in the two cycle types, or              the wire corners would have been a safe extent source after all"
+        );
+    }
+
+    /// **Positive control: the one-cycle fixtures really do carry an
+    /// admitted `TextureRectangle`, and really do carry a combiner program
+    /// that is not the identity.**
+    ///
+    /// The first half is the control a prior lane's mutant survived without
+    /// (deleting the texrect line left the content tests green). The second
+    /// half is this card's own addition: a fixture whose `SetCombine` was
+    /// silently all-zero would still admit a texrect, and a pixel test
+    /// against it would be checking a program nobody measured.
+    #[test]
+    fn the_one_cycle_fixtures_really_do_admit_a_combining_texture_rectangle() {
+        for (label, color, alpha) in [
+            ("env-lerp", ENV_LERP_COLOR, ENV_LERP_ALPHA),
+            ("flat-primitive", FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA),
+        ] {
+            assert_eq!(
+                admitted_texture_rectangle_triangles(fill_load_and_one_cycle_texrect_words(
+                    color, alpha
+                )),
+                2,
+                "{label} must admit exactly two TextureRectangle-sourced triangles"
+            );
+            // The program the fixture actually stages, decoded through the
+            // same accessor the executor's gate uses.
+            let combine_words = one_cycle_combine_words(color, alpha);
+            let params = CombineParams::from_wire(combine_words[0], combine_words[1]);
+            let selectors = [
+                params.decode_color(crate::combiner::ColorInputSlot::A, true),
+                params.decode_color(crate::combiner::ColorInputSlot::B, true),
+                params.decode_color(crate::combiner::ColorInputSlot::C, true),
+                params.decode_color(crate::combiner::ColorInputSlot::D, true),
+            ];
+            let expected = if label == "env-lerp" {
+                [
+                    crate::combiner::ColorInput::Environment,
+                    crate::combiner::ColorInput::Texel0,
+                    crate::combiner::ColorInput::Primitive,
+                    crate::combiner::ColorInput::Texel0,
+                ]
+            } else {
+                [
+                    crate::combiner::ColorInput::Zero,
+                    crate::combiner::ColorInput::Zero,
+                    crate::combiner::ColorInput::Zero,
+                    crate::combiner::ColorInput::Primitive,
+                ]
+            };
+            assert_eq!(
+                selectors, expected,
+                "{label}'s staged SetCombine must decode to the measured program, or the pixel \
+                 assertions below check arithmetic nobody measured"
+            );
+        }
+        // And the same stream WITHOUT the texrect admits none.
+        let mut without = whole_target_fill_words();
+        without.extend(one_load_block_words());
+        without.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        assert_eq!(admitted_texture_rectangle_triangles(without), 0);
+    }
+
+    /// The hand-derived combined RGBA16 halfword for one pixel of the
+    /// env-lerp program, computed from the committed-TMEM oracle's texel.
+    ///
+    /// This mirrors the executor's quantization -- normalize by `/ 255.0`,
+    /// `run_one_cycle`, `* 255.0` and `round`, then `write_pixel`'s RGBA16
+    /// truncation -- and is deliberately written out here rather than
+    /// calling a shared helper, so the two are independently authored
+    /// statements of the same rule that must reconcile.
+    fn expected_one_cycle_halfword(texel: [u8; 4], color: [u32; 4], alpha: [u32; 4]) -> u16 {
+        expected_one_cycle_halfword_with_prim(texel, color, alpha, ONE_CYCLE_PRIM_WIRE)
+    }
+
+    /// [`expected_one_cycle_halfword`] with the primitive register named
+    /// explicitly, for the multi-texrect fixture where each command stages
+    /// its own.
+    fn expected_one_cycle_halfword_with_prim(
+        texel: [u8; 4],
+        color: [u32; 4],
+        alpha: [u32; 4],
+        prim_wire: u32,
+    ) -> u16 {
+        let combine_words = one_cycle_combine_words(color, alpha);
+        let params = CombineParams::from_wire(combine_words[0], combine_words[1]);
+        let inputs = crate::combiner::combiner_inputs_from_fragment_registers(
+            crate::combiner::CombinerInputs {
+                tex_val0: [
+                    f32::from(texel[0]) / 255.0,
+                    f32::from(texel[1]) / 255.0,
+                    f32::from(texel[2]) / 255.0,
+                    f32::from(texel[3]) / 255.0,
+                ],
+                tex_val1: [0.0; 4],
+                prim_color: [0.0; 4],
+                shade_color: [0.0; 4],
+                env_color: [0.0; 4],
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            },
+            crate::state::Color4::from_wire(ONE_CYCLE_ENV_WIRE),
+            crate::state::PrimColor::from_wire(0x05 << 8 | 0x40, prim_wire),
+        );
+        let (combined, _alpha_compare) = crate::combiner::run_one_cycle(params, inputs);
+        let [red, green, blue, a] = combined.map(|channel| (channel * 255.0).round() as u8);
+        (u16::from(red >> 3) << 11)
+            | (u16::from(green >> 3) << 6)
+            | (u16::from(blue >> 3) << 1)
+            | u16::from(a >> 7)
+    }
+
+    /// **BLOCKER, pinned rather than worked around: a texrect whose latched
+    /// `SetCombine` references `TEXEL0` cannot execute through
+    /// `execute_raw_dpc` on an adapter-equipped host -- and this is a
+    /// PRE-EXISTING defect, not this card's.**
+    ///
+    /// # The mechanism
+    ///
+    /// `execute_raw_dpc` runs two independent paths over one packet:
+    ///
+    /// - `draw_admitted_triangles` projects TMEM for the **GPU** triangle
+    ///   pipeline from `coordinator.physical()` -- the already-**published**
+    ///   slot (`:401`). A texrect is admitted as two triangles, so it goes
+    ///   through this path too.
+    /// - `stage_texrect` reads the packet's own **pending** post-image
+    ///   (`:2843`), which is the only image a packet's own `LoadBlock`
+    ///   exists in before publication.
+    ///
+    /// The two therefore read **different TMEM images within one
+    /// `execute_raw_dpc`**, and this crate already documents the
+    /// consequence in its own words at `production.rs:3861-3868`: "a
+    /// texture-sampling draw must be a SEPARATE, later `execute_raw_dpc`
+    /// from its own load, not batched into one command stream with it."
+    ///
+    /// # Why it was invisible until now
+    ///
+    /// The composed Copy fixture latches `SetCombine(0, 0)`, whose
+    /// selectors reference no texel, so
+    /// `CombineParams::references_texels_in_first_cycle` is false, the
+    /// `texture_referenced` uniform is 0, and the fragment shader
+    /// short-circuits to `TMEM_SAMPLE_STATUS_OK` without sampling at all.
+    /// The GPU path has therefore never actually sampled TMEM for a
+    /// texrect. Any program that reads `TEXEL0` -- **which is every one of
+    /// WM2000's 2,520 texrect programs** -- reaches the sampler and the
+    /// divergence becomes observable.
+    ///
+    /// # Why it is not this card's defect
+    ///
+    /// Measured at the untouched baseline `3491891b`, before any change in
+    /// this commit: the **Copy** fixture above, with only its
+    /// `set_combine(0, 0)` replaced by the env-lerp program, fails with the
+    /// identical `tmem_sample.wgsl status: 1`. The cycle type is not the
+    /// variable; the texel reference is.
+    ///
+    /// # Why the two-packet split does not rescue it
+    ///
+    /// Loading in a prior packet satisfies the GPU path but violates
+    /// `:2319`, `TexrectWithoutTmemLoad` -- the CPU executor refuses a
+    /// texrect whose packet carries no load, because there is then no
+    /// pending post-image to sample. The two constraints are **mutually
+    /// exclusive**: the GPU path needs the load published in an earlier
+    /// packet, the CPU path needs it pending in this one. Closing that is a
+    /// change to `draw_admitted_triangles`' TMEM projection, which is
+    /// outside this card's boundary and is reported rather than attempted.
+    ///
+    /// This test pins the failure **by its exact name** so the day the
+    /// projection is fixed, it fails and is rewritten to assert pixels --
+    /// the same supersession pattern
+    /// `the_composed_texrect_fixture_declares_the_hand_derived_rows`
+    /// records for its own inversion.
+    #[test]
+    fn a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_tmem_projection() {
+        for (label, color, alpha) in [
+            ("env-lerp", ENV_LERP_COLOR, ENV_LERP_ALPHA),
+            // The flat-primitive program reads NO texel, so it must NOT be
+            // blocked -- which is what proves the blocker is specifically
+            // the texel reference and not "one-cycle" or "a combine".
+            ("flat-primitive", FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA),
+        ] {
+            let combine_words = one_cycle_combine_words(color, alpha);
+            let params = CombineParams::from_wire(combine_words[0], combine_words[1]);
+            let references_texel = params.references_texels_in_first_cycle();
+            let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+            configure_fill_target_height(&mut backend);
+            let no_adapter = backend.triangle_pipeline.is_none();
+            let (_, result) = plan_and_execute_composed(
+                &mut backend,
+                &mut session,
+                fill_load_and_one_cycle_texrect_words(color, alpha),
+            );
+            if no_adapter {
+                // With no GPU adapter the triangle path cannot run at all
+                // and fails earlier, with its own named error. Nothing
+                // about the projection is observable here.
+                assert!(
+                    result.is_err(),
+                    "{label}: a triangle-bearing packet with no pipeline must fail by name"
+                );
+                continue;
+            }
+            match (references_texel, result) {
+                (true, Err(error)) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("tmem_sample.wgsl status"),
+                        "{label} references TEXEL0, so it must be blocked by the GPU path's \
+                         committed-TMEM projection specifically -- got: {message}"
+                    );
+                }
+                (true, Ok(_)) => panic!(
+                    "{label} references TEXEL0 and executed: the pre-existing committed-vs- \
+                     pending TMEM divergence this test pins has been fixed. Rewrite this test \
+                     to assert the hand-derived combined pixels instead of the blocker."
+                ),
+                (false, outcome) => {
+                    assert!(
+                        outcome.is_ok(),
+                        "{label} references no texel, so the GPU fragment shader short-circuits \
+                         to OK and the packet must execute: {outcome:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The flat-primitive program, executed end to end into the published
+    /// image.** This is the half of WM2000's texrect work that the blocker
+    /// above does not touch, and it is a real one-cycle combiner
+    /// evaluation: 420 of the title's 2,520 texrects run exactly this
+    /// program.
+    ///
+    /// `(Zero - Zero) * Zero + Primitive` reads no texel, so
+    /// `references_texels_in_first_cycle` is false, the GPU fragment shader
+    /// short-circuits, and the packet reaches `stage_texrect` -- where the
+    /// CPU executor runs `run_one_cycle` per pixel exactly as it would for
+    /// the env-lerp program.
+    ///
+    /// The expectation is hand-derived twice and reconciled:
+    ///
+    /// 1. Algebraically, the program is the primitive colour in every
+    ///    channel, independent of the texel: `0x80FF4080` ->
+    ///    `(128, 255, 64, 128)` -> RGBA16 `(128>>3)<<11 | (255>>3)<<6 |
+    ///    (64>>3)<<1 | (128>>7)` = `0x87D1`.
+    /// 2. Independently, through `expected_one_cycle_halfword`, which runs
+    ///    the real `run_one_cycle` over the real decoded `CombineParams`.
+    ///
+    /// Both are asserted, and they must agree.
+    ///
+    /// **The positive controls that make it non-vacuous**, each named:
+    /// the combined pixel must differ from the fill underneath (or nothing
+    /// drew), it must differ from the raw texel (or the combiner was
+    /// bypassed -- mutant (a)), and it must be texel-INDEPENDENT while the
+    /// underlying texels genuinely vary (or the program was not the one
+    /// staged -- mutant (e)).
+    #[test]
+    fn the_flat_primitive_one_cycle_program_composes_into_the_published_image() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        if backend.triangle_pipeline.is_none() {
+            // No adapter: a triangle-bearing packet cannot execute at all.
+            // Skipping is honest here and the crate's own
+            // `configure_fill_target_height` already tolerates the case.
+            return;
+        }
+        publish_composed(
+            &mut backend,
+            &mut session,
+            fill_load_and_one_cycle_texrect_words(FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA),
+        );
+
+        let resident = backend
+            .color_targets()
+            .expect("a composed packet must have built the color-target registry")
+            .residents()
+            .first()
+            .expect("the composed packet must have published exactly one resident")
+            .device_bytes()
+            .device_bytes()
+            .to_vec();
+
+        // Derivation 1: the primitive colour, packed by hand.
+        let [red, green, blue, alpha_byte] = ONE_CYCLE_PRIM_WIRE.to_be_bytes();
+        let expected_literal = (u16::from(red >> 3) << 11)
+            | (u16::from(green >> 3) << 6)
+            | (u16::from(blue >> 3) << 1)
+            | u16::from(alpha_byte >> 7);
+        assert_eq!(
+            expected_literal, 0x87D1,
+            "the hand-packed literal must match the digit-by-digit derivation in this test's doc"
+        );
+
+        let committed = backend.physical_tmem();
+        let tile = composed_fixture_tile();
+        let draw = one_cycle_fixture_draw();
+        let mut texels = std::collections::BTreeSet::new();
+        let mut compared = 0usize;
+
+        for y in 0..FILL_TARGET_HEIGHT {
+            for x in 0..FILL_TARGET_WIDTH {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                let inside = x >= ONE_CYCLE_X0
+                    && x < ONE_CYCLE_X0 + ONE_CYCLE_WIDTH
+                    && y >= ONE_CYCLE_Y0
+                    && y < ONE_CYCLE_Y0 + ONE_CYCLE_HEIGHT;
+                if !inside {
+                    assert_eq!(
+                        actual,
+                        expected_fill_halfword(COMPOSED_FILL_COLOR, x),
+                        "pixel ({x}, {y}) is outside the texrect, so it must still carry the \
+                         fill's own value"
+                    );
+                    continue;
+                }
+                // Derivation 1, the literal.
+                assert_eq!(
+                    actual, expected_literal,
+                    "pixel ({x}, {y}) must be the primitive colour the flat program selects"
+                );
+                // Derivation 2, through the real combiner over the real
+                // texel the committed oracle reads.
+                let request = crate::PointSampleRequest::new(
+                    crate::PointSampleCoordinates::new(
+                        crate::TextureCoordinateS10_5::from_raw(draw.s_at(x - ONE_CYCLE_X0)),
+                        crate::TextureCoordinateS10_5::from_raw(draw.t_at(y - ONE_CYCLE_Y0)),
+                    ),
+                    crate::TmemFirstRowParity::Even,
+                );
+                let sampled = crate::sample_committed_point(
+                    committed,
+                    tile.descriptor(),
+                    tile.size(),
+                    request,
+                    crate::TextureLutMode::Disabled,
+                )
+                .expect("the committed oracle must sample the same texel");
+                assert!(
+                    sampled.snapshot().is_committed(),
+                    "the ORACLE reads durable state, so its snapshot must be Committed"
+                );
+                let texel = sampled.texel().rgba8888();
+                assert_eq!(
+                    actual,
+                    expected_one_cycle_halfword(texel, FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA),
+                    "the two independent derivations must reconcile at pixel ({x}, {y})"
+                );
+                // **Mutant (a) control**: the raw texel must NOT equal the
+                // combined output, or bypassing the combiner is invisible.
+                let raw = (u16::from(texel[0] >> 3) << 11)
+                    | (u16::from(texel[1] >> 3) << 6)
+                    | (u16::from(texel[2] >> 3) << 1)
+                    | u16::from(texel[3] >> 7);
+                assert_ne!(
+                    actual, raw,
+                    "pixel ({x}, {y})'s combined value must differ from the raw texel, or the \
+                     combiner could have been bypassed undetectably"
+                );
+                texels.insert(raw);
+                compared += 1;
+            }
+        }
+
+        assert_eq!(
+            compared,
+            (ONE_CYCLE_WIDTH * ONE_CYCLE_HEIGHT) as usize,
+            "the loop must have compared exactly the hand-derived 7x2 rectangle"
+        );
+        // **The texel-independence control.** The output is constant, which
+        // is only meaningful evidence if the INPUT texels varied. If every
+        // sampled texel were identical, "texel-independent" would be
+        // trivially satisfied and mutant (e) -- running the env-lerp
+        // program here instead -- could survive.
+        assert!(
+            texels.len() >= 2,
+            "the sampled texels must genuinely vary across the rectangle, or the flat program's \
+             texel-independence is vacuous -- got {texels:?}"
+        );
+        // And the texrect drew over the fill.
+        let inside_offset = (((ONE_CYCLE_Y0 * FILL_TARGET_WIDTH) + ONE_CYCLE_X0) * 2) as usize;
+        assert_ne!(
+            u16::from_be_bytes([resident[inside_offset], resident[inside_offset + 1]]),
+            expected_fill_halfword(COMPOSED_FILL_COLOR, ONE_CYCLE_X0),
+            "the texrect's first pixel must differ from the fill underneath it"
+        );
+    }
+
+    /// **The regression guard: Copy-cycle texrects still work, and Copy
+    /// still writes the RAW texel.**
+    ///
+    /// The Copy path's full content assertions live in
+    /// `a_fill_a_tmem_load_and_a_texrect_compose_into_one_published_image`,
+    /// unchanged by this card. What this adds is the discrimination that
+    /// only matters once one-cycle is admitted: Copy must **not** consult
+    /// the combiner program, even though one is latched.
+    ///
+    /// The program staged here is the flat-primitive one, chosen because it
+    /// references no texel and so is not blocked by the GPU-path defect
+    /// pinned above -- and because it would change **every** pixel had Copy
+    /// consulted it, which the positive control at the end asserts rather
+    /// than assumes. A program that happened to be the identity would make
+    /// this guard unable to detect Copy accidentally combining.
+    #[test]
+    fn a_copy_cycle_texrect_still_writes_the_raw_texel_with_a_program_staged() {
+        let mut words = whole_target_fill_words();
+        words.extend(composed_tmem_load_words());
+        // Copy cycle (2), with a real combiner program latched.
+        words.extend(set_other_mode(2, 0));
+        words.extend(one_cycle_combine_words(FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA));
+        words.extend(set_env_color(ONE_CYCLE_ENV_WIRE));
+        words.extend(set_prim_color(0x40, 0x05, ONE_CYCLE_PRIM_WIRE));
+        words.extend(texrect_words_in_target_stepping(7));
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        if backend.triangle_pipeline.is_none() {
+            return;
+        }
+        publish_composed(&mut backend, &mut session, words);
+
+        let resident = backend
+            .color_targets()
+            .unwrap()
+            .residents()
+            .first()
+            .unwrap()
+            .device_bytes()
+            .device_bytes()
+            .to_vec();
+        let committed = backend.physical_tmem();
+        let tile = composed_fixture_tile();
+        let draw = composed_fixture_draw();
+        let mut compared = 0usize;
+        let mut would_have_differed = 0usize;
+
+        for y in TEXRECT_Y0..TEXRECT_Y0 + TEXRECT_HEIGHT {
+            for x in TEXRECT_X0..TEXRECT_X0 + TEXRECT_WIDTH {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                let request = crate::PointSampleRequest::new(
+                    crate::PointSampleCoordinates::new(
+                        crate::TextureCoordinateS10_5::from_raw(draw.s_at(x - TEXRECT_X0)),
+                        crate::TextureCoordinateS10_5::from_raw(draw.t_at(y - TEXRECT_Y0)),
+                    ),
+                    crate::TmemFirstRowParity::Even,
+                );
+                let texel = crate::sample_committed_point(
+                    committed,
+                    tile.descriptor(),
+                    tile.size(),
+                    request,
+                    crate::TextureLutMode::Disabled,
+                )
+                .expect("the committed oracle must sample")
+                .texel()
+                .rgba8888();
+                let raw = (u16::from(texel[0] >> 3) << 11)
+                    | (u16::from(texel[1] >> 3) << 6)
+                    | (u16::from(texel[2] >> 3) << 1)
+                    | u16::from(texel[3] >> 7);
+                assert_eq!(
+                    actual, raw,
+                    "Copy cycle must write the RAW texel at ({x}, {y}), not a combined one, \
+                     even with a SetCombine and both colour registers staged"
+                );
+                if expected_one_cycle_halfword(texel, FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA) != raw {
+                    would_have_differed += 1;
+                }
+                compared += 1;
+            }
+        }
+        assert_eq!(
+            compared,
+            (TEXRECT_WIDTH * TEXRECT_HEIGHT) as usize,
+            "the Copy rectangle is still the hand-derived 8x3"
+        );
+        // **The positive control.** The staged program is one that WOULD
+        // have changed every pixel had Copy consulted it. Without this,
+        // "Copy wrote the raw texel" would also pass against an identity
+        // program and prove nothing about the gate.
+        assert_eq!(
+            would_have_differed, compared,
+            "the staged program must be one that would have changed every pixel, or this \
+             regression guard cannot detect Copy accidentally combining"
+        );
+    }
+
+    /// The three primitive colours the multi-texrect one-cycle fixture
+    /// stages, one per texrect, in command order.
+    ///
+    /// All three differ in **both** RGBA16 halves after the `>> 3` / `>> 7`
+    /// pack (`0x87D1`, `0xFA21`, `0x443F`), so every pixel can be
+    /// attributed to the texrect that wrote it. Two texrects sharing a
+    /// packed value would make "the later one won the overlap"
+    /// unfalsifiable exactly where it matters.
+    const MULTI_ONE_CYCLE_PRIM: [u32; 3] = [0x80FF_4080, 0xFF40_8080, 0x4080_FF80];
+
+    /// **Three one-cycle texrects in one packet, each running the combiner
+    /// against the accumulated buffer.**
+    ///
+    /// The shape WM2000 actually issues -- its early frames carry 60 flat
+    /// rectangles plus 25 tinted ones per entry
+    /// (`docs/RT64-WM2000-CYCLE-MODES.md` §3) -- and a shape that could not
+    /// be expressed before the N-command accumulation seam landed.
+    ///
+    /// | # | command | wire rectangle | primitive |
+    /// |---|---|---|---|
+    /// | 0 | fill | whole target | `0x0842_1085` |
+    /// | 1 | one-cycle texrect | x 0..=4, y 0..=2 | `0x80FF_4080` |
+    /// | 2 | one-cycle texrect | x 3..=8, y 1..=4 | `0xFF40_8080` |
+    /// | 3 | one-cycle texrect | x 10..=15, y 5..=7 | `0x4080_FF80` |
+    ///
+    /// **Texrects 1 and 2 deliberately overlap.** Under one cycle the
+    /// extents are 4x2 at (0,0) and 5x3 at (3,1), which share the single
+    /// pixel (3, 1). That pixel must carry texrect 2's colour, and it is
+    /// the only assertion in this file that can distinguish "the loop
+    /// composed in journal order" from "the loop composed in some order".
+    ///
+    /// Each texrect stages its **own** `SetPrimColor` before its own
+    /// rectangle, which is what makes this a per-command test rather than
+    /// three copies of one draw: the executor must read the register
+    /// latched at each texrect's own stream position, not the walk's final
+    /// value. If it read the final value every rectangle would be
+    /// `0x4080_FF80` and the first two assertions would fail.
+    ///
+    /// All three run the flat-primitive program, for a measured reason
+    /// rather than convenience: it references no texel, so
+    /// `references_texels_in_first_cycle` is false and the GPU fragment
+    /// shader short-circuits past the pre-existing committed-vs-pending
+    /// TMEM projection defect that
+    /// `a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_tmem_projection`
+    /// pins. It is still a genuine per-fragment combiner evaluation --
+    /// `run_one_cycle` runs on every pixel of all three rectangles.
+    fn three_one_cycle_texrects_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(fill_cycle_other_mode(0));
+        words.extend(set_color_image_rgba16());
+        words.extend(set_fill_color(COMPOSED_FILL_COLOR));
+        words.extend(fill_rectangle(
+            0,
+            0,
+            FILL_TARGET_WIDTH - 1,
+            FILL_TARGET_HEIGHT - 1,
+        ));
+        words.extend(composed_tmem_load_words());
+        for (index, (x0, y0, x1, y1)) in [(0u32, 0u32, 4u32, 2u32), (3, 1, 8, 4), (10, 5, 15, 7)]
+            .into_iter()
+            .enumerate()
+        {
+            // One-cycle (0), re-stated per command: `PlanCollector`
+            // snapshots the mode at each command's own stream position.
+            words.extend(set_other_mode(0, 0));
+            words.extend(one_cycle_combine_words(FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA));
+            words.extend(set_env_color(ONE_CYCLE_ENV_WIRE));
+            words.extend(set_prim_color(0x40, 0x05, MULTI_ONE_CYCLE_PRIM[index]));
+            words.extend(texrect_words_at(7, x0, y0, x1, y1));
+        }
+        words
+    }
+
+    /// The one-cycle rasterized extent of one wire rectangle, through
+    /// RT64's own `texture_rectangle_vertices` -- never the wire corners.
+    ///
+    /// One cycle applies neither Copy's `lrx |= 3` nor fill/copy's
+    /// `ulx &= !3`, so `(coord + 3) >> 2` runs on the raw 10.2 fields.
+    /// Returned half-open as `(left, top, right, bottom)`.
+    fn one_cycle_extent_of(x0: u32, y0: u32, x1: u32, y1: u32) -> (u32, u32, u32, u32) {
+        let words = texrect_words_at(7, x0, y0, x1, y1);
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let raw = crate::RawTextureRectangle::decode(0x24, &bytes).expect("the words decode");
+        let vertices = crate::texture_rectangle_vertices(raw, crate::CycleType::OneCycle)
+            .expect("the rectangle is non-empty in one cycle");
+        let viewport = vertices.viewport;
+        (
+            viewport.left as u32,
+            viewport.top as u32,
+            viewport.right as u32,
+            viewport.bottom as u32,
+        )
+    }
+
+    /// **The post-merge claim: N one-cycle texrects compose in one packet,
+    /// each running the combiner against the accumulated buffer, in
+    /// journal order.**
+    ///
+    /// Every pixel is attributed to exactly one writer by an ownership map
+    /// built in command order -- later commands overwrite earlier ones in
+    /// the map exactly as the accumulation loop overwrites them in the
+    /// buffer -- and then asserted against that writer's own hand-derived
+    /// value. The fill's pixels come from the RGBA16 even/odd column rule;
+    /// each texrect's come from its own primitive colour.
+    ///
+    /// Both derivations of a texrect pixel are asserted and must agree:
+    /// the packed literal from `MULTI_ONE_CYCLE_PRIM`, and
+    /// `expected_one_cycle_halfword` running the real `run_one_cycle` over
+    /// the real decoded `CombineParams`.
+    #[test]
+    fn three_one_cycle_texrects_compose_in_journal_order_against_the_accumulated_buffer() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        if backend.triangle_pipeline.is_none() {
+            return;
+        }
+        publish_composed(&mut backend, &mut session, three_one_cycle_texrects_words());
+
+        let resident = backend
+            .color_targets()
+            .expect("the packet must have built the registry")
+            .residents()
+            .first()
+            .expect("exactly one resident")
+            .device_bytes()
+            .device_bytes()
+            .to_vec();
+
+        let extents: Vec<(u32, u32, u32, u32)> =
+            [(0u32, 0u32, 4u32, 2u32), (3, 1, 8, 4), (10, 5, 15, 7)]
+                .into_iter()
+                .map(|(x0, y0, x1, y1)| one_cycle_extent_of(x0, y0, x1, y1))
+                .collect();
+        assert_eq!(
+            extents,
+            vec![(0, 0, 4, 2), (3, 1, 8, 4), (10, 5, 15, 7)],
+            "the three one-cycle extents, derived through texture_rectangle_vertices and \
+             cross-checked against the hand derivation (ceil(coord/4) on the raw 10.2 fields, \
+             with neither Copy's |= 3 nor fill/copy's &= !3)"
+        );
+
+        // The ownership map, built in COMMAND order: a later texrect
+        // overwrites an earlier one, which is the accumulation loop's own
+        // rule expressed independently of it.
+        let mut owner: Vec<Option<usize>> =
+            vec![None; (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize];
+        for (index, &(left, top, right, bottom)) in extents.iter().enumerate() {
+            for y in top..bottom {
+                for x in left..right {
+                    owner[(y * FILL_TARGET_WIDTH + x) as usize] = Some(index);
+                }
+            }
+        }
+        // The overlap really exists, or "the later texrect won" is vacuous.
+        assert_eq!(
+            owner[(1 * FILL_TARGET_WIDTH + 3) as usize],
+            Some(1),
+            "pixel (3, 1) lies in BOTH texrect 0 and texrect 1, so the map must award it to \
+             the later one -- if this is Some(0) the two rectangles stopped overlapping and \
+             the journal-order assertion below proves nothing"
+        );
+
+        let mut per_texrect = [0usize; 3];
+        for y in 0..FILL_TARGET_HEIGHT {
+            for x in 0..FILL_TARGET_WIDTH {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                match owner[(y * FILL_TARGET_WIDTH + x) as usize] {
+                    None => assert_eq!(
+                        actual,
+                        expected_fill_halfword(COMPOSED_FILL_COLOR, x),
+                        "pixel ({x}, {y}) is covered by no texrect, so it must still carry the \
+                         whole-target fill's own value"
+                    ),
+                    Some(index) => {
+                        let [red, green, blue, alpha] = MULTI_ONE_CYCLE_PRIM[index].to_be_bytes();
+                        let literal = (u16::from(red >> 3) << 11)
+                            | (u16::from(green >> 3) << 6)
+                            | (u16::from(blue >> 3) << 1)
+                            | u16::from(alpha >> 7);
+                        assert_eq!(
+                            actual, literal,
+                            "pixel ({x}, {y}) belongs to texrect {index}, so it must carry that \
+                             texrect's OWN primitive colour -- a wrong value here means the \
+                             executor read a register latched at another command's position"
+                        );
+                        per_texrect[index] += 1;
+                    }
+                }
+            }
+        }
+
+        // Every texrect contributed surviving pixels, so none was skipped
+        // and none was wholly overwritten -- three commands really ran.
+        for (index, count) in per_texrect.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "texrect {index} must own at least one surviving pixel, or the packet did not \
+                 execute all three: {per_texrect:?}"
+            );
+        }
+        // The three packed colours are pairwise distinct, so attributing a
+        // pixel to a texrect is a real discrimination.
+        let packed: std::collections::BTreeSet<u16> = MULTI_ONE_CYCLE_PRIM
+            .iter()
+            .map(|wire| {
+                let [r, g, b, a] = wire.to_be_bytes();
+                (u16::from(r >> 3) << 11)
+                    | (u16::from(g >> 3) << 6)
+                    | (u16::from(b >> 3) << 1)
+                    | u16::from(a >> 7)
+            })
+            .collect();
+        assert_eq!(
+            packed.len(),
+            3,
+            "the three primitive colours must pack to three distinct RGBA16 values, or a pixel \
+             cannot be attributed to the texrect that wrote it"
+        );
+
+        // **Derivation 2**, through the real combiner rather than the
+        // packed literal: `expected_one_cycle_halfword` runs `run_one_cycle`
+        // over the real decoded `CombineParams` for each texrect's own
+        // registers. It must agree with the literal at texrect 1's own
+        // first owned pixel.
+        let probe = expected_one_cycle_halfword_with_prim(
+            [0x18, 0x40, 0xC8, 0xFF],
+            FLAT_PRIM_COLOR,
+            FLAT_PRIM_ALPHA,
+            MULTI_ONE_CYCLE_PRIM[1],
+        );
+        let [r1, g1, b1, a1] = MULTI_ONE_CYCLE_PRIM[1].to_be_bytes();
+        assert_eq!(
+            probe,
+            (u16::from(r1 >> 3) << 11)
+                | (u16::from(g1 >> 3) << 6)
+                | (u16::from(b1 >> 3) << 1)
+                | u16::from(a1 >> 7),
+            "the real combiner over texrect 1's own primitive register must reconcile with the \
+             packed literal this test asserted against the published buffer"
+        );
     }
 
     /// **The committed/pending distinction, tested rather than assumed: a
