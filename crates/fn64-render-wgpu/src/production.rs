@@ -1594,34 +1594,61 @@ fn destination_access_run(accesses: &[ResourceAccess], start: usize) -> &[Resour
     &accesses[start..end]
 }
 
-/// The exact captured source bytes for one load, bound at its declared
-/// `source_access_index` -- mirrors
-/// `crate::tmem::execute::load_block::ExactLoadBlockGuestReads::bytes_for_word`'s
-/// binding rule (match on `CapturedGuestRead::read().access_index()`), but
-/// against [`ExecutionCollector`]'s owned `(access_index, bytes)` pairs
-/// (extracted from `execution_view`'s finalized `&[CapturedGuestRead]` in
+/// The exact captured source bytes for **every** access in one load's
+/// ordered source run, returned in that same order -- mirrors
+/// `crate::tmem::execute::load_tile::ExactLoadTileGuestReads::bind`'s
+/// binding rule (one `CapturedGuestRead::read().access_index()` match per
+/// declared source access, at `first_access_index + ordinal`), but against
+/// [`ExecutionCollector`]'s owned `(access_index, bytes)` pairs (extracted
+/// from `execution_view`'s finalized `&[CapturedGuestRead]` in
 /// `captured_reads`, since neither the slice nor its elements outlive that
 /// call).
+///
+/// Returns `None` if any fragment of the run is missing, so a partially
+/// captured load is refused rather than executed against the fragments
+/// that happened to arrive. A partial-width `LoadTile` declares one source
+/// read per row, so a 49-row load must find all 49.
 fn load_source_bytes<'a>(
     reads: &'a [(u32, Vec<u8>)],
     load: &TmemLoadSemantics,
-) -> Option<&'a [u8]> {
-    reads
+) -> Option<Vec<&'a [u8]>> {
+    let first = load.source_access_index();
+    load.sources()
         .iter()
-        .find(|(access_index, _)| *access_index == load.source_access_index())
-        .map(|(_, bytes)| bytes.as_slice())
+        .enumerate()
+        .map(|(ordinal, _)| {
+            let access_index = first.checked_add(u32::try_from(ordinal).ok()?)?;
+            reads
+                .iter()
+                .find(|(captured_index, _)| *captured_index == access_index)
+                .map(|(_, bytes)| bytes.as_slice())
+        })
+        .collect()
 }
 
-/// One transfer word's exact captured source-byte slice, bound by
-/// `word.source_access_byte_offset()`/`defined_source_byte_mask()` into the
-/// load's whole captured source range -- mirrors `load_block.rs`'s
-/// `bytes_for_word` exactly (defined byte count, offset, bounds-checked
-/// slice).
-fn word_source_bytes(source_bytes: &[u8], word: TmemTransferWord) -> Option<&[u8]> {
+/// One transfer word's exact captured source-byte slice, bound first to the
+/// **access** the word names (`word.source_access_index()`, resolved
+/// against the load's own `source_access_index()` base) and then by
+/// `word.source_access_byte_offset()`/`defined_source_byte_mask()` within
+/// that access's captured bytes -- mirrors `load_tile.rs`'s `bytes_for_word`
+/// exactly, including its two-step binding.
+///
+/// The offset is relative to the word's own source access, never to the
+/// concatenation of the run: `tmem::physical`'s word projection subtracts
+/// the preceding accesses' byte total (`logical_offset - preceding`) before
+/// storing it. Slicing a flattened run at that offset would silently read
+/// the wrong row for every access after the first.
+fn word_source_bytes<'a>(
+    source_bytes: &[&'a [u8]],
+    first_access_index: u32,
+    word: TmemTransferWord,
+) -> Option<&'a [u8]> {
+    let relative = word.source_access_index().checked_sub(first_access_index)?;
+    let access_bytes = *source_bytes.get(usize::try_from(relative).ok()?)?;
     let defined = word.defined_source_byte_mask().count_ones() as usize;
     let start = word.source_access_byte_offset() as usize;
     let end = start.checked_add(defined)?;
-    source_bytes.get(start..end)
+    access_bytes.get(start..end)
 }
 
 fn map_physical_lanes(
@@ -2661,7 +2688,7 @@ fn stage_and_report(
         };
 
         for word in staged.expected_words().to_vec() {
-            let bytes = word_source_bytes(source_bytes, word)
+            let bytes = word_source_bytes(&source_bytes, load.source_access_index(), word)
                 .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
             let physical_lanes = map_physical_lanes(load, word, bytes)
                 .map_err(WgpuRawDpcExecutionError::Physical)?;
@@ -3727,6 +3754,114 @@ mod tests {
     fn word(opcode: u8, payload: u32) -> u32 {
         u32::from(opcode) << 24 | payload
     }
+
+    /// A transfer word's `source_access_byte_offset` is relative to **its
+    /// own** source access, never to a flattened concatenation of the
+    /// load's whole source run (`tmem::physical`'s word projection
+    /// subtracts the preceding accesses' byte total before storing it).
+    /// A partial-width `LoadTile` declares one source read per row, so
+    /// resolving every word against row 0 would silently feed the wrong
+    /// row's pixels to every word after the first -- a wrong picture, not
+    /// a crash.
+    ///
+    /// Each row here is filled with its own row index, so a
+    /// misresolved row is directly observable in the returned bytes.
+    #[test]
+    fn word_source_bytes_slices_the_row_the_word_names_not_the_first_row() {
+        const ROWS: u32 = 4;
+        const ROW_BYTES: usize = 8;
+        const FIRST_ACCESS: u32 = 1;
+
+        let rows: Vec<Vec<u8>> = (0..ROWS)
+            .map(|row| vec![row as u8; ROW_BYTES])
+            .collect();
+        let source_bytes: Vec<&[u8]> = rows.iter().map(|row| row.as_slice()).collect();
+
+        for row in 0..ROWS {
+            let word = TmemTransferWord::new(
+                row as u16,
+                row * ROW_BYTES as u32,
+                FIRST_ACCESS + row,
+                0,
+                0xff,
+                0xff,
+                row as u16,
+                0,
+                false,
+                crate::TmemTransferPhysicalWord::Linear(
+                    fn64_render_ir::TmemRange::try_new(row * 8, row * 8 + 8).unwrap(),
+                ),
+            );
+            let bytes = word_source_bytes(&source_bytes, FIRST_ACCESS, word)
+                .expect("every word binds to a row in the run");
+            assert_eq!(
+                bytes,
+                &[row as u8; ROW_BYTES],
+                "word naming access {} must read row {row}, not row 0",
+                FIRST_ACCESS + row
+            );
+        }
+    }
+
+    /// The offset is applied *within* the named row, and a word that would
+    /// read past that row's end is refused rather than silently spilling
+    /// into the next row's captured bytes.
+    #[test]
+    fn word_source_bytes_refuses_a_word_that_overruns_its_own_row() {
+        const ROW_BYTES: usize = 8;
+        let rows = [vec![0xaa_u8; ROW_BYTES], vec![0xbb_u8; ROW_BYTES]];
+        let source_bytes: Vec<&[u8]> = rows.iter().map(|row| row.as_slice()).collect();
+
+        // Offset 4 with 8 defined bytes runs 4 bytes past row 0's end. If
+        // the rows were flattened this would happily return 4 bytes of
+        // row 0 followed by 4 bytes of row 1.
+        let overrun = TmemTransferWord::new(
+            0,
+            4,
+            1,
+            4,
+            0xff,
+            0xff,
+            0,
+            0,
+            false,
+            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+        );
+        assert!(
+            word_source_bytes(&source_bytes, 1, overrun).is_none(),
+            "a word may not read past the end of the row it names"
+        );
+
+        // A word naming an access outside the run is refused too, in both
+        // directions.
+        let before_run = TmemTransferWord::new(
+            0,
+            0,
+            0,
+            0,
+            0xff,
+            0xff,
+            0,
+            0,
+            false,
+            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+        );
+        assert!(word_source_bytes(&source_bytes, 1, before_run).is_none());
+        let past_run = TmemTransferWord::new(
+            0,
+            0,
+            9,
+            0,
+            0xff,
+            0xff,
+            0,
+            0,
+            false,
+            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+        );
+        assert!(word_source_bytes(&source_bytes, 1, past_run).is_none());
+    }
+
 
     fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
         [word(SET_OTHER_MODE, cycle_type << 20), low]
