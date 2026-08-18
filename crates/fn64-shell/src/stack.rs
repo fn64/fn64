@@ -37,23 +37,50 @@
 //!   `FN64_RENDER`, which reports the REQUEST and would print `wgpu` for a run
 //!   that fell back to the reference oracle.
 
+/// The lane string for a given compile-time selection.
+///
+/// A `const fn` of the cfg rather than two `#[cfg]`-gated constants,
+/// **deliberately**: with `#[cfg]` arms, only the arm the test binary was
+/// built under is ever compiled, so a mutant that deletes the cfg and hard-
+/// codes whichever literal matches today's build is INVISIBLE to the tests.
+/// That mutant was written and it survived. Routing both arms through one
+/// always-compiled function means the tests can exercise the lane the build
+/// is not on, and `lane_label_distinguishes_both_lanes` below kills it.
+///
+/// The caller is still the cfg and only the cfg -- see `RECOMPILER_LANE`.
+pub const fn lane_label(cpu_runtime: bool) -> &'static str {
+    if cpu_runtime {
+        "rs (fn64-cpu-runtime)"
+    } else {
+        "c (N64Recomp C bodies via bridge)"
+    }
+}
+
 /// Which recompiler produced the linked game bodies.
 ///
-/// `#[cfg]`-selected from the cfg `build.rs` sets (`fn64_cpu_runtime` for
-/// `FN64_RECOMP=rs`). Not a runtime inference -- see the module doc.
-#[cfg(fn64_cpu_runtime)]
-pub const RECOMPILER_LANE: &str = "rs (fn64-cpu-runtime)";
-#[cfg(not(fn64_cpu_runtime))]
-pub const RECOMPILER_LANE: &str = "c (N64Recomp C bodies via bridge)";
+/// Selected by `cfg!(fn64_cpu_runtime)` -- the cfg `build.rs` sets for
+/// `FN64_RECOMP=rs`. Not a runtime inference: `cfg!` is resolved at compile
+/// time from the same cfg that decides which bodies were actually linked, so
+/// this constant cannot drift from them. Reading `FN64_RECOMP` at runtime
+/// would report what the LAST build was asked for, which the environment can
+/// change without changing the binary.
+pub const RECOMPILER_LANE: &str = lane_label(cfg!(fn64_cpu_runtime));
+
+/// The game-link string for a given compile-time selection. Same
+/// always-compiled shape as `lane_label`, and for the same reason.
+pub const fn game_link_label(game_linked: bool) -> &'static str {
+    if game_linked {
+        "linked"
+    } else {
+        "none (content-free build)"
+    }
+}
 
 /// Whether a game is linked into this binary at all.
 ///
-/// Same cfg the `game` module in `main.rs` is gated on, so this cannot claim a
-/// linked game in a binary that has none.
-#[cfg(fn64_game_linked)]
-pub const GAME_LINK: &str = "linked";
-#[cfg(not(fn64_game_linked))]
-pub const GAME_LINK: &str = "none (content-free build)";
+/// Driven by the same cfg the `game` module in `main.rs` is gated on, so this
+/// cannot claim a linked game in a binary that has none.
+pub const GAME_LINK: &str = game_link_label(cfg!(fn64_game_linked));
 
 /// The build-time provenance of the linked bodies: the `RECOMPILED_DIR` (C
 /// lane) or `RECOMP_RS_HOST_LOOKUP` (rs lane) the build actually consumed.
@@ -314,6 +341,25 @@ mod tests {
     /// independently written derivation of the same condition. Replace
     /// `RECOMPILER_LANE`'s definition with either literal unconditionally and
     /// exactly one of the two cfg arms of this test fails.
+    /// **The mutant this exists to kill.** Collapsing `lane_label` to a
+    /// single literal -- the shape a hand-written "c lane" string would have --
+    /// fails here regardless of which cfg the test binary was compiled under.
+    /// The earlier `#[cfg]`-arm version of this constant could not catch that:
+    /// only one arm was ever compiled, so the literal that matched today's
+    /// build was indistinguishable from a correct selection.
+    #[test]
+    fn lane_label_distinguishes_both_lanes() {
+        assert_eq!(lane_label(true), "rs (fn64-cpu-runtime)");
+        assert_eq!(lane_label(false), "c (N64Recomp C bodies via bridge)");
+        assert_ne!(
+            lane_label(true),
+            lane_label(false),
+            "a label that reads the same for both lanes reports nothing"
+        );
+        assert_eq!(game_link_label(true), "linked");
+        assert_ne!(game_link_label(true), game_link_label(false));
+    }
+
     #[test]
     fn recompiler_lane_tracks_the_compiled_cfg_not_a_literal() {
         let compiled_lane_is_rs = cfg!(fn64_cpu_runtime);
@@ -325,21 +371,18 @@ mod tests {
         );
         // And the two lanes must not be spelled the same, or the assertion
         // above would hold for a constant that says nothing.
-        let other = if compiled_lane_is_rs {
-            "c (N64Recomp C bodies via bridge)"
-        } else {
-            "rs (fn64-cpu-runtime)"
-        };
-        assert_ne!(RECOMPILER_LANE, other);
+        assert_eq!(RECOMPILER_LANE, lane_label(compiled_lane_is_rs));
+        assert_ne!(RECOMPILER_LANE, lane_label(!compiled_lane_is_rs));
     }
 
     #[test]
     fn game_link_tracks_the_compiled_cfg() {
         assert_eq!(
-            GAME_LINK == "linked",
-            cfg!(fn64_game_linked),
+            GAME_LINK,
+            game_link_label(cfg!(fn64_game_linked)),
             "GAME_LINK={GAME_LINK:?} must be selected by cfg(fn64_game_linked)"
         );
+        assert_ne!(GAME_LINK, game_link_label(!cfg!(fn64_game_linked)));
     }
 
     /// The banner is the paste-into-a-bug-report artifact, so its shape is
