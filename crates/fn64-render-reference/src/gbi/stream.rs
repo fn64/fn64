@@ -262,6 +262,8 @@ pub(super) fn decode_stream_impl(
         };
         pc += 8;
 
+        super::census::note(opcode, raw_rdp);
+
         if !raw_rdp && family.is_line() && matches!(opcode, G_TRI2 | G_QUAD) {
             crate::render_unsupported_panic(
                 "render.gbi.geometry.command",
@@ -1332,6 +1334,16 @@ pub(super) fn decode_stream_impl(
                     );
                 }
                 let tile = ((w1 >> 24) & 0x07) as u8;
+                // Operand-level probe (env `FN64_GBI_TEXRECT_CENSUS`): the
+                // cycle mode latched for THIS rectangle, read from the same
+                // `state.other_mode` the rectangle below is built from, so
+                // the census and the decode cannot disagree about
+                // `G_MDSFT_CYCLETYPE`.
+                super::census::texrect::note(
+                    state.other_mode.cycle_type(),
+                    state.other_mode.raw_high(),
+                    &state.combiner.mode,
+                );
                 let storage = state.tex.tmem.clone();
                 state.ops.push(RenderOp::TextureRectangle(TextureRectangle {
                     ulx: ((w1 >> 12) & 0x0fff) as f32 / 4.0,
