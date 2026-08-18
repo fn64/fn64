@@ -752,6 +752,44 @@ fn whole_target_fill_words() -> Vec<u32> {
     words
 }
 
+const TEXRECT: u8 = 0x24;
+
+/// One `TextureRectangle` at whole-pixel coordinates (wire fields are 10.2
+/// fixed point, so each is shifted left by two), sampling `tile`.
+///
+/// `dsdx`/`dtdy` are S5.10 texel-per-pixel steps; `0x0400` is exactly one
+/// texel per pixel (1024/1024). `uls`/`ult` are S10.5 texture-space origins.
+fn texture_rectangle(
+    tile: u32,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    uls: u32,
+    ult: u32,
+    dsdx: u32,
+    dtdy: u32,
+) -> [u32; 4] {
+    [
+        word(TEXRECT, ((x1 << 2) << 12) | (y1 << 2)),
+        (tile & 0x7) << 24 | ((x0 << 2) << 12) | (y0 << 2),
+        (uls << 16) | ult,
+        (dsdx << 16) | dtdy,
+    ]
+}
+
+/// A whole-target fill followed by a `TextureRectangle` covering pixels
+/// x 4..=10, y 2..=3 of the same staged color image.
+///
+/// This is the WM2000-title-screen *shape* -- `G_FILLRECT` plus `G_TEXRECT`
+/// into one color image, zero triangles -- reduced to the smallest packet
+/// that carries both.
+fn fill_then_texrect_words() -> Vec<u32> {
+    let mut words = whole_target_fill_words();
+    words.extend(texture_rectangle(0, 4, 2, 10, 3, 0, 0, 0x0400, 0x0400));
+    words
+}
+
 /// A partial-width, three-row fill: `x0 = 4` is nonzero, so the decoder
 /// declares three disjoint, width-strided write accesses rather than one
 /// collapsed range.
@@ -905,6 +943,99 @@ fn expected_whole_target_image(fill_color: u32) -> Vec<u8> {
 ///
 /// The expectation is hand-derived from `SET_FILL_COLOR`'s own word and the
 /// RGBA16 even/odd column rule, never captured from the code under test.
+/// A fill composed with a `TextureRectangle` reaches the real
+/// `dispatch_dpc_submission` seam and is refused **by name**, with guest
+/// RDRAM left byte-for-byte untouched.
+///
+/// This is the end-to-end half of this card's measurement, and it is a
+/// *refusal* test on purpose. The decoder half landed: a texrect now
+/// declares its own `ColorFramebuffer` write range in the resource journal
+/// (proven in `fn64-render-wgpu`'s
+/// `a_texture_rectangle_declares_a_render_target_write_access`, which can
+/// read the journal directly). The executor half did not: nothing yet
+/// produces the texel *content* for that declared range on the CPU, so
+/// `stage_and_report` still refuses fill-plus-triangle before staging
+/// anything -- and a texrect is two triangles by the time it gets there.
+///
+/// What this pins is that the refusal is total: a packet the backend cannot
+/// execute must change no guest byte at all. A texrect that published
+/// plausible pixels without a proven texel fetch is the one outcome this
+/// card was told is unacceptable, so the absence of any write is the
+/// property worth a test.
+///
+/// # The rectangle, hand-derived twice
+///
+/// `fill_then_texrect_words`' texrect is `x0=4, y0=2, x1=10, y1=3` in whole
+/// pixels -- 10.2 wire fields `ulx=16, uly=8, lrx=40, lry=12`. The staged
+/// `OtherMode` is fill cycle, so RT64's `drawRect` rounds the UL corner down
+/// (`&= ~3`; both are already multiples of 4, so unchanged) and
+/// `FixedRect::left/top/right/bottom(ceil=true)` gives `(coord + 3) >> 2 =
+/// 4, 2, 10, 3`. Half-open, so the covered pixels are **x 4..=9, y 2..=2**.
+/// Derivation 2: `ceil(coord / 4)` on the same four values gives the same
+/// `4, 2, 10, 3`.
+///
+/// The rectangle is therefore NARROWER than its wire corners read -- x1=10
+/// and y1=3 do not become inclusive pixels 10 and 3. That is exactly why the
+/// planner takes its extent from `texture_rectangle_vertices` (the ported
+/// RT64 geometry) rather than re-deriving it from the wire fields.
+#[test]
+fn a_fill_composed_with_a_texture_rectangle_changes_no_guest_byte() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    let poisoned = poison_fill_target(&mut rdram);
+
+    // Positive control, in this same test: the fill ALONE does change these
+    // bytes through this same seam. Without this, "the composed packet wrote
+    // nothing" could equally mean the harness never wrote anything.
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    assert_ne!(
+        rdram[target.clone()],
+        poisoned[..],
+        "the fill alone must change guest bytes through this seam, or the composed case below \
+         proves nothing about refusal"
+    );
+
+    // Re-poison, then dispatch the composed packet. The refusal reaches the
+    // guest as a PANIC at the ABI seam (`rsp_commit`'s `execute_raw_dpc`
+    // unwrap), not as a returned error, so it is caught here rather than
+    // observed as a return value -- catching it is also what lets the RDRAM
+    // assertion below run at all.
+    let poisoned = poison_fill_target(&mut rdram);
+    let words = fill_then_texrect_words();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_words(&mut rdram, &words);
+    }));
+    let payload = outcome.expect_err(
+        "a fill composed with a texture rectangle must still be refused -- the decoder now \
+         declares the texrect's write, but no CPU executor produces its texel content",
+    );
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains(
+            "declares both an admitted FillRectangle and at least one admitted \
+                          triangle"
+        ),
+        "the refusal must be the named mixed-packet rejection, got: {message}"
+    );
+
+    assert_eq!(
+        rdram[target],
+        poisoned[..],
+        "a refused fill+texrect packet must change no guest byte -- every one must still carry \
+         the poison. A partial write here would mean the fill half published while the texrect \
+         half silently vanished, which is exactly the 'plausible pixels without a proven texel \
+         fetch' outcome this card must not produce"
+    );
+    teardown();
+}
+
 #[test]
 fn an_admitted_whole_target_fill_writes_its_image_into_guest_rdram() {
     const FILL_COLOR: u32 = 0x0842_1085;
