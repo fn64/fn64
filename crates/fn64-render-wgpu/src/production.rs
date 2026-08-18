@@ -55,7 +55,7 @@ use crate::targets::{
     admitted_triangle_fixture, CandidateColorTarget, CompletedColorTargetWrite,
     ResolvedFragmentBlendParams, TargetRectangle,
 };
-use crate::tmem::{project_committed_tmem, TileBindingParams};
+use crate::tmem::{project_committed_tmem, TileBindingParams, TmemGpuProjection};
 use crate::{
     execute_fill_rectangle, AlphaCompare, BlendColorInput, BlendModeState, Color4,
     ColorTargetExtent, ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CombineParams,
@@ -387,6 +387,7 @@ impl WgpuBackend {
     fn draw_admitted_triangles(
         &mut self,
         triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+        pending_tmem: Option<TmemGpuProjection>,
     ) -> Result<(), WgpuRawDpcExecutionError> {
         let pipeline = self
             .triangle_pipeline
@@ -395,13 +396,46 @@ impl WgpuBackend {
         let extent = self
             .triangle_target_extent
             .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
-        // Published committed-TMEM textured-draw card §2: the committed
-        // physical TMEM byte image this draw samples against, projected
-        // once per `draw_admitted_triangles` call (not once per triangle --
-        // every triangle in one call shares the same committed-TMEM
-        // snapshot, since no TMEM commit happens between triangles within a
-        // single `execute_raw_dpc` call).
-        let tmem = project_committed_tmem(self.coordinator.physical());
+        // **The TMEM byte image this draw samples: this packet's OWN
+        // pending post-image, not the published slot.**
+        //
+        // Still projected once per `draw_admitted_triangles` call, not once
+        // per triangle -- the post-image is sealed once per packet from
+        // every load in it, so every triangle in one call shares it, exactly
+        // as they shared the committed snapshot before.
+        //
+        // What changed is WHICH image, and it had to. Projecting
+        // `self.coordinator.physical()` -- the published, already-committed
+        // slot -- reads a state that does not contain this packet's own
+        // `LoadBlock`/`LoadTile`/`LoadTLUT`, because publication happens
+        // strictly after execution. Measured at `87b2f5b0`: a texrect whose
+        // latched combine references `TEXEL0` failed with
+        // `TmemSampleFailed { status: 2 }`
+        // (`TMEM_SAMPLE_STATUS_INVALID_BYTE`) -- the shader read addresses
+        // the published projection reported invalid. The same fixture with
+        // `set_combine(0, 0)` executed cleanly, because a combine that
+        // references no texel makes the shader short-circuit before it ever
+        // samples TMEM. The control passing was never evidence the GPU
+        // sampled correctly; it was evidence it never sampled at all. That
+        // is why the GPU path had never actually fetched a texrect's texels.
+        //
+        // `None` is not a silent fallback -- it is a different, narrower
+        // packet shape with its own correct answer. A packet that staged no
+        // TMEM transaction at all (`StagedOutcome::TriangleOnly`: raw
+        // triangles, zero loads) has nothing pending to project, and the
+        // published slot is then the honest image rather than a substitute
+        // for one: there is no load in this packet for it to be missing.
+        // The shape that MUST have a pending projection -- a texrect -- can
+        // never arrive here with `None`, because a texrect in a packet with
+        // no load is already refused upstream by name
+        // (`TexrectWithoutTmemLoad`, `stage_and_report`), and the census
+        // behind that refusal measured 0 of WM2000's 219 decode entries
+        // carrying a texrect without a load in the same entry. So the two
+        // arms partition the reachable shapes; neither is a guess.
+        let tmem = match pending_tmem {
+            Some(projection) => projection,
+            None => project_committed_tmem(self.coordinator.physical()),
+        };
 
         let mut fixtures = Vec::with_capacity(triangles.len());
         for (triangle_index, draw) in triangles.into_iter().enumerate() {
@@ -592,17 +626,6 @@ struct PlanCollector {
     /// `SetOtherMode`/`SetCombine` command in plan order.
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
-    /// Tile 0's binding current at the walk's current stream position
-    /// (published committed-TMEM textured-draw card §2: "extend
-    /// `PlanCollector`... to snapshot the current `TmemState` tile
-    /// bindings onto each triangle"). Tile 0 is the RDP's default bound
-    /// texture tile for a standard triangle draw -- `RdpTriangleCommand`
-    /// carries no tile index of its own. Mirrors
-    /// `raw_dpc::triangle_draw_data::TriangleDrawStateCollector`'s own
-    /// identical fields exactly (this struct's own module doc already
-    /// states this file duplicates that collector's behavior).
-    current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
-    current_tile0_size: Option<fn64_render::NeutralTileSize>,
     /// Every tile's `SetTile`/`SetTileSize` current at the walk's current
     /// stream position, indexed by the RDP's own 0..=7 tile index.
     ///
@@ -739,8 +762,6 @@ impl PlanCollector {
             next_command_index: 0,
             current_other_mode: other_mode,
             current_combine: combine,
-            current_tile0_descriptor: None,
-            current_tile0_size: None,
             current_tiles: [(None, None); 8],
             current_blend_color: blend_color,
             current_env_color: env_color,
@@ -792,9 +813,6 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     descriptor,
                     ..
                 } => {
-                    if *tile_index == 0 {
-                        self.current_tile0_descriptor = Some(*descriptor);
-                    }
                     if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
                         slot.0 = Some(*descriptor);
                     }
@@ -802,9 +820,6 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 RdpStateCommand::SetTileSize {
                     tile_index, size, ..
                 } => {
-                    if *tile_index == 0 {
-                        self.current_tile0_size = Some(*size);
-                    }
                     if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
                         slot.1 = Some(*size);
                     }
@@ -820,7 +835,41 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 ..
             }) => {
                 let triangle_index = self.triangles.len();
-                let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
+                // **The tile this draw actually names, not tile 0.**
+                //
+                // A `TextureRectangle` selects its tile in wire word 1 bits
+                // 26:24 -- the same field the `texrect_commands` push below
+                // already reads, from the same retained `raw_words`, so this
+                // is one field read at one more site, not a second decode
+                // path. Binding tile 0 unconditionally was measured to
+                // report `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` for every
+                // texrect naming any other tile, and this crate's own
+                // composed fixtures name tile 7; two of them had to be moved
+                // to tile 0 to exercise the GPU path at all before this.
+                //
+                // A `RawTriangle` keeps tile 0: it carries no tile field of
+                // its own to read, so tile 0 is the RDP's own default for it
+                // rather than a guess -- and every existing raw-triangle
+                // fixture's binding is byte-identical to before.
+                //
+                // `current_tiles` is the whole 8-entry table as of this
+                // command's stream position (the same table
+                // `triangle_neutral_tiles` snapshots for the CPU reader), so
+                // the two paths now resolve the SAME tile for the same
+                // texrect instead of disagreeing whenever tile != 0.
+                let bound_tile_index = match source {
+                    TriangleSource::TextureRectangle => raw_words
+                        .get(1)
+                        .map(|word| ((word >> 24) & 0x7) as usize)
+                        .unwrap_or(0),
+                    TriangleSource::RawTriangle => 0,
+                };
+                let tile_binding = match self
+                    .current_tiles
+                    .get(bound_tile_index)
+                    .copied()
+                    .unwrap_or((None, None))
+                {
                     (Some(descriptor), Some(size)) => {
                         TileBindingParams::from_neutral(descriptor, size)
                     }
@@ -975,6 +1024,27 @@ struct ExecutionCollector<'coord> {
     /// `RenderBackend::create`, which rejects an admitted fill loudly with
     /// `NoColorTargetHeight` rather than inventing a height.
     configured_target_extent: Option<TriangleTargetExtent>,
+    /// **The TMEM image this packet's triangles must sample, projected from
+    /// the packet's own pending post-image.**
+    ///
+    /// Carried out of `stage_and_report` for the same structural reason
+    /// `outcome` is: the `PendingTmemTransaction` is move-only, sealed
+    /// inside `submitted_packet`, and consumed by
+    /// `into_physical_successor` before `execute_raw_dpc_inner` returns --
+    /// so by the time `draw_admitted_triangles` runs, the post-image is
+    /// gone. A `TmemGpuProjection` is a plain owned byte image
+    /// (`[u8; 4096]` plus its validity bitmap), so projecting it while the
+    /// transaction is still borrowed and carrying the *bytes* out is the
+    /// only ordering that works. It is deliberately **not** the borrow
+    /// itself: keeping `PendingTmemImage<'_>` alive here would block the
+    /// publication that must follow.
+    ///
+    /// `None` for a packet that staged no TMEM transaction at all. That is
+    /// not a silent fallback to committed state -- `draw_admitted_triangles`
+    /// names the two cases apart, and a texrect can never reach it with
+    /// `None` because `TexrectWithoutTmemLoad` refuses that packet shape
+    /// upstream.
+    draw_tmem: Option<TmemGpuProjection>,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -1234,6 +1304,14 @@ pub enum WgpuRawDpcExecutionError {
     PendingTmemImageClaimedCommitted {
         triangle_index: usize,
     },
+    /// The same forgery check as [`Self::PendingTmemImageClaimedCommitted`],
+    /// at the *other* place a pending post-image is consumed: the GPU-side
+    /// projection `draw_admitted_triangles` samples. Separate variant, not a
+    /// shared one, because there is no triangle index at the projection site
+    /// -- the projection is per-packet, sealed once from every load in it,
+    /// and shared by every triangle in the draw. Collapsing the two would
+    /// report a triangle index this site cannot honestly supply.
+    PendingTmemProjectionClaimedCommitted,
     TexrectWithoutTmemLoad,
     TexrectExecution(crate::targets::TexrectExecutionError),
     TextureLutMode(crate::TextureLutModeError),
@@ -1352,6 +1430,11 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "the pending TMEM post-image sampled by texture-rectangle triangle \
                  #{triangle_index} reported a Committed snapshot identity; a sealed but \
                  unpublished transaction has no durable (state, generation) pair to name"
+            ),
+            Self::PendingTmemProjectionClaimedCommitted => formatter.write_str(
+                "the pending TMEM post-image projected for this packet's triangle draw reported \
+                 a Committed snapshot identity; a sealed but unpublished transaction has no \
+                 durable (state, generation) pair to name",
             ),
             Self::TexrectWithoutTmemLoad => formatter.write_str(
                 "this packet declares a TextureRectangle but completed no TMEM load, so there \
@@ -1677,7 +1760,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        let (prepared, triangles, pending) = execute_raw_dpc_inner(
+        let (prepared, triangles, pending, draw_tmem) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
             self.rdp_state.other_mode(),
@@ -1692,7 +1775,7 @@ impl RenderBackend for WgpuBackend {
         .map_err(RenderError::from)?;
 
         if !triangles.is_empty() {
-            self.draw_admitted_triangles(triangles)
+            self.draw_admitted_triangles(triangles, draw_tmem)
                 .map_err(RenderError::from)?;
         }
 
@@ -2117,6 +2200,7 @@ fn execute_raw_dpc_inner(
         BackendPreparedRawDpc,
         Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
         Option<PendingFillPublication>,
+        Option<TmemGpuProjection>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -2145,6 +2229,7 @@ fn execute_raw_dpc_inner(
         outcome: None,
         color_targets,
         configured_target_extent,
+        draw_tmem: None,
     };
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
@@ -2154,6 +2239,10 @@ fn execute_raw_dpc_inner(
         .outcome
         .expect("execution_view always calls submitted_packet exactly once")?;
     let triangles = view.plan.triangles;
+    // Taken before the match consumes `outcome`: the projection is a fact
+    // about what this packet's TMEM half staged, independent of which
+    // coordinator completion the outcome routes to.
+    let draw_tmem = view.draw_tmem;
     let mut pending = None;
 
     let prepared = match outcome {
@@ -2225,7 +2314,7 @@ fn execute_raw_dpc_inner(
         }
     };
 
-    Ok((prepared, triangles, pending))
+    Ok((prepared, triangles, pending, draw_tmem))
 }
 
 /// The pipeline `submitted_packet` runs once `&WorkloadPacket` is in scope:
@@ -2407,6 +2496,20 @@ fn stage_and_report(
         .map_err(WgpuRawDpcExecutionError::Physical)?;
 
     let tmem_writes: Vec<CompletedWrite> = pending.proposed_effects().to_vec();
+
+    // **The GPU half's TMEM image, projected from the SAME pending
+    // post-image the CPU texel reader samples.**
+    //
+    // Projected here, not in `draw_admitted_triangles`, because here is the
+    // only place the sealed transaction exists: it is move-only and
+    // `into_physical_successor` consumes it a few lines below, strictly
+    // before the triangles are drawn. Projecting the *published* slot at
+    // draw time instead -- what this call replaces -- reads a state that
+    // does not yet contain this packet's own load, which is exactly the
+    // defect: a texrect whose combine references `TEXEL0` sampled invalid
+    // bytes and the fragment shader reported
+    // `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
+    collector.draw_tmem = Some(project_pending_tmem_for_draw(&pending)?);
 
     // **The color-target half: every admitted fill and texrect in this
     // packet, accumulated into one buffer in the packet's own command
@@ -2957,6 +3060,75 @@ fn execute_scheduled_texrect(
         already_initialized,
     )?;
     Ok((completed, accesses))
+}
+
+/// **Projects this packet's pending TMEM post-image for the GPU draw,
+/// through the same one projection the committed path uses.**
+///
+/// The whole body is `project_tmem` at `S = PendingTmemImage`. There is no
+/// second address walk, no second validity gate, and no second bitmap
+/// packing: `project_committed_tmem` is the same function at
+/// `S = PhysicalTmemState`. A pending/published *disagreement* about how
+/// bytes reach the shader is therefore unrepresentable rather than merely
+/// tested for -- the only thing that differs between the two calls is which
+/// image is handed in.
+///
+/// **What the published-slot projection was protecting, and how this
+/// preserves it.** The `project_committed_tmem(self.coordinator.physical())`
+/// call this replaces was not arbitrary: reading the coordinator's active
+/// slot guaranteed the GPU could only ever sample bytes some publication had
+/// actually durably installed, so no GPU-observed pixel could be attributed
+/// to a proposal that publication later rejected. That guarantee is real and
+/// it is preserved here in the same way the CPU texel reader preserves it --
+/// not by refusing to read pending bytes, but by refusing to let a pending
+/// read *claim* to be a durable one. The check below is
+/// `execute_scheduled_texrect`'s check, at the other crossing:
+///
+/// - **No publication.** This borrows the transaction and copies bytes out.
+///   It cannot commit, cannot advance a generation, and cannot produce a
+///   `PhysicalTmemState`. `into_physical_successor` still runs afterwards
+///   with every base-state, generation, epoch and `validate_proposal` check
+///   unchanged and in the same order, and if it rejects, this packet's
+///   `execute_raw_dpc` returns `Err` and no draw output is stored -- the
+///   pixels never become observable.
+/// - **No forged snapshot identity.** Verified, not trusted: both
+///   `TmemSnapshotIdentity` variants inhabit one enum, so a wrong
+///   `snapshot()` impl compiles. Measured at the sibling site -- forging
+///   `Committed` in `PendingTmemImage`'s impl passed the entire suite before
+///   `execute_scheduled_texrect`'s equivalent check existed.
+/// - **No effect-report participation.** Reading is not a write. Nothing
+///   projected here enters `proposed_effects`, so `validate_proposal`'s
+///   recomputation and `validate_backend_effects`' supersequence walk see
+///   exactly what they saw before.
+///
+/// Nonclaim: the returned `TmemGpuProjection` carries bytes, not identity.
+/// It is not a receipt and nothing downstream may read a publication out of
+/// it; the identity assertion happens here, at the crossing, and does not
+/// travel with the bytes.
+fn project_pending_tmem_for_draw(
+    pending: &crate::tmem::PendingTmemTransaction,
+) -> Result<TmemGpuProjection, WgpuRawDpcExecutionError> {
+    project_proposed_image(&pending.pending_image())
+}
+
+/// [`project_pending_tmem_for_draw`]'s body, generic over the source, so the
+/// forgery refusal can be exercised by a test.
+///
+/// Split out for exactly one reason: `PendingTmemImage`'s own `snapshot()`
+/// impl is correct, so no *real* pending image can drive the refusal, and a
+/// refusal with no test is a claim with no evidence -- this crate's own
+/// convention (see `merged_fill_and_tmem_writes`' two loud arms, tested at
+/// the function for the same reason). A test source that answers
+/// `Committed` is the only way to reach the arm, and it is reachable only
+/// through this generic seam, never from production code: the sole
+/// production caller above passes a real `PendingTmemImage`.
+fn project_proposed_image<S: crate::TmemByteSource + ?Sized>(
+    image: &S,
+) -> Result<TmemGpuProjection, WgpuRawDpcExecutionError> {
+    if image.snapshot().is_committed() {
+        return Err(WgpuRawDpcExecutionError::PendingTmemProjectionClaimedCommitted);
+    }
+    Ok(crate::project_tmem(image))
 }
 
 /// Every declared access must fall inside the color target's own range.
@@ -4882,7 +5054,7 @@ mod tests {
             fog_color: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(good_triangle)])
+            .draw_admitted_triangles(vec![Ok(good_triangle)], None)
             .expect("a single valid triangle must draw successfully");
         let first_output_extent = backend
             .last_triangle_draw()
@@ -4893,7 +5065,7 @@ mod tests {
             Ok(good_triangle),
             Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 1 }),
         ];
-        let result = backend.draw_admitted_triangles(failing_triangles);
+        let result = backend.draw_admitted_triangles(failing_triangles, None);
         assert!(
             result.is_err(),
             "a batch containing a MissingTriangleDrawState entry must fail, not silently skip it"
@@ -4994,7 +5166,7 @@ mod tests {
         let left_triangle = half_covering_triangle(0.0, 4.0, 1.0);
         let right_triangle = half_covering_triangle(4.0, 8.0, 1.0);
         backend
-            .draw_admitted_triangles(vec![Ok(left_triangle), Ok(right_triangle)])
+            .draw_admitted_triangles(vec![Ok(left_triangle), Ok(right_triangle)], None)
             .expect("two well-formed triangles in one call must draw successfully");
 
         let output = backend
@@ -5057,7 +5229,7 @@ mod tests {
             fog_color: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(good_triangle)])
+            .draw_admitted_triangles(vec![Ok(good_triangle)], None)
             .expect("a single valid triangle must draw successfully");
         let prior_color = backend
             .last_triangle_draw()
@@ -5070,7 +5242,7 @@ mod tests {
             Ok(half_covering_triangle(4.0, 8.0, 1.0)),
             Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 2 }),
         ];
-        let result = backend.draw_admitted_triangles(batch_with_trailing_failure);
+        let result = backend.draw_admitted_triangles(batch_with_trailing_failure, None);
         assert!(
             result.is_err(),
             "a batch whose last entry is a MissingTriangleDrawState must fail as a whole, even \
@@ -5778,7 +5950,7 @@ mod tests {
             fog_color: None,
         };
         let error = backend
-            .draw_admitted_triangles(vec![Ok(triangle)])
+            .draw_admitted_triangles(vec![Ok(triangle)], None)
             .expect_err(
                 "a framebuffer-alpha-dependent blend cycle must be rejected before submission",
             );
@@ -5853,7 +6025,7 @@ mod tests {
             fog_color: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(triangle)])
+            .draw_admitted_triangles(vec![Ok(triangle)], None)
             .expect("a color-only framebuffer blend cycle must be admitted, not rejected");
     }
 
@@ -6883,7 +7055,7 @@ mod tests {
             .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
             .unwrap();
 
-        let (_prepared, _triangles, pending) = execute_raw_dpc_inner(
+        let (_prepared, _triangles, pending, _draw_tmem) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend.rdp_state.other_mode(),
@@ -6902,10 +7074,12 @@ mod tests {
         );
 
         // The draw half, on the same backend the fill just staged against.
-        let draw =
-            backend.draw_admitted_triangles(vec![Err(MissingTriangleDrawState::NoCombine {
+        let draw = backend.draw_admitted_triangles(
+            vec![Err(MissingTriangleDrawState::NoCombine {
                 triangle_index: 0,
-            })]);
+            })],
+            None,
+        );
         assert!(
             matches!(
                 draw,
@@ -6937,7 +7111,7 @@ mod tests {
         let body = &source[body_start..body_end];
 
         let draw_at = body
-            .find("self.draw_admitted_triangles(triangles)")
+            .find("self.draw_admitted_triangles(triangles, draw_tmem)")
             .expect("execute_raw_dpc must still call draw_admitted_triangles");
         let store_at = body
             .find("self.pending_fill_publication = pending;")
@@ -8202,6 +8376,7 @@ mod tests {
             physical: coordinator.physical(),
             color_targets: &mut color_targets,
             configured_target_extent,
+            draw_tmem: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -9046,6 +9221,7 @@ mod tests {
             physical: coordinator.physical(),
             color_targets: &mut color_targets,
             configured_target_extent,
+            draw_tmem: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -9712,116 +9888,173 @@ mod tests {
             | u16::from(a >> 7)
     }
 
-    /// **BLOCKER, pinned rather than worked around: a texrect whose latched
-    /// `SetCombine` references `TEXEL0` cannot execute through
-    /// `execute_raw_dpc` on an adapter-equipped host -- and this is a
-    /// PRE-EXISTING defect, not this card's.**
+    /// **The inversion: a texrect whose latched `SetCombine` references
+    /// `TEXEL0` now executes through `execute_raw_dpc` on an
+    /// adapter-equipped host, and its pixels are the real combined output.**
     ///
-    /// # The mechanism
+    /// # What this replaces, and why the replacement is the record
     ///
-    /// `execute_raw_dpc` runs two independent paths over one packet:
+    /// Its predecessor,
+    /// `a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_
+    /// tmem_projection`, asserted the opposite -- that this exact packet was
+    /// blocked by name -- and was correct when written. It pinned a
+    /// PRE-EXISTING defect its own card could not close: `execute_raw_dpc`
+    /// ran two paths over one packet that read **different TMEM images**.
+    /// `draw_admitted_triangles` projected `coordinator.physical()`, the
+    /// already-**published** slot, while the CPU texel reader sampled the
+    /// packet's own **pending** post-image -- the only image a packet's own
+    /// `LoadBlock` exists in before publication. That predecessor ended with
+    /// an explicit instruction: "the day the projection is fixed, it fails
+    /// and is rewritten to assert pixels." It did fail, by its own named
+    /// panic, and this is that rewrite. This paragraph is the supersession
+    /// record.
     ///
-    /// - `draw_admitted_triangles` projects TMEM for the **GPU** triangle
-    ///   pipeline from `coordinator.physical()` -- the already-**published**
-    ///   slot (`:401`). A texrect is admitted as two triangles, so it goes
-    ///   through this path too.
-    /// - `stage_texrect` reads the packet's own **pending** post-image
-    ///   (`:2843`), which is the only image a packet's own `LoadBlock`
-    ///   exists in before publication.
+    /// # Why it was invisible for so long
     ///
-    /// The two therefore read **different TMEM images within one
-    /// `execute_raw_dpc`**, and this crate already documents the
-    /// consequence in its own words at `production.rs:3861-3868`: "a
-    /// texture-sampling draw must be a SEPARATE, later `execute_raw_dpc`
-    /// from its own load, not batched into one command stream with it."
-    ///
-    /// # Why it was invisible until now
-    ///
-    /// The composed Copy fixture latches `SetCombine(0, 0)`, whose
+    /// Every prior texrect fixture latched `SetCombine(0, 0)`, whose
     /// selectors reference no texel, so
     /// `CombineParams::references_texels_in_first_cycle` is false, the
     /// `texture_referenced` uniform is 0, and the fragment shader
     /// short-circuits to `TMEM_SAMPLE_STATUS_OK` without sampling at all.
-    /// The GPU path has therefore never actually sampled TMEM for a
-    /// texrect. Any program that reads `TEXEL0` -- **which is every one of
-    /// WM2000's 2,520 texrect programs** -- reaches the sampler and the
-    /// divergence becomes observable.
+    /// **The control passing was never evidence the GPU sampled correctly;
+    /// it was evidence it never sampled at all.** The GPU path had
+    /// therefore never actually fetched a texrect's texels.
     ///
-    /// # Why it is not this card's defect
+    /// # The measurement
     ///
-    /// Measured at the untouched baseline `3491891b`, before any change in
-    /// this commit: the **Copy** fixture above, with only its
-    /// `set_combine(0, 0)` replaced by the env-lerp program, fails with the
-    /// identical `tmem_sample.wgsl status: 1`. The cycle type is not the
-    /// variable; the texel reference is.
+    /// At the untouched baseline `87b2f5b0`, the composed Copy fixture with
+    /// only its `set_combine(0, 0)` swapped for the env-lerp program failed
+    /// with `TmemSampleFailed { status: 2 }`
+    /// (`TMEM_SAMPLE_STATUS_INVALID_BYTE`) -- the shader read addresses the
+    /// published projection reported invalid. The cycle type was never the
+    /// variable; the texel reference was.
     ///
-    /// # Why the two-packet split does not rescue it
+    /// # What is asserted now
     ///
-    /// Loading in a prior packet satisfies the GPU path but violates
-    /// `:2319`, `TexrectWithoutTmemLoad` -- the CPU executor refuses a
-    /// texrect whose packet carries no load, because there is then no
-    /// pending post-image to sample. The two constraints are **mutually
-    /// exclusive**: the GPU path needs the load published in an earlier
-    /// packet, the CPU path needs it pending in this one. Closing that is a
-    /// change to `draw_admitted_triangles`' TMEM projection, which is
-    /// outside this card's boundary and is reported rather than attempted.
-    ///
-    /// This test pins the failure **by its exact name** so the day the
-    /// projection is fixed, it fails and is rewritten to assert pixels --
-    /// the same supersession pattern
-    /// `the_composed_texrect_fixture_declares_the_hand_derived_rows`
-    /// records for its own inversion.
+    /// Both measured programs, in one loop, so the texel-referencing and
+    /// texel-free cases stay a controlled pair rather than two unrelated
+    /// tests. Each must execute, and the env-lerp arm's pixels are
+    /// reconciled against `expected_one_cycle_halfword` over the texel a
+    /// **committed** oracle reads -- a different image and a different
+    /// entry point than the executor used, so agreement is real evidence
+    /// rather than a transcription.
     #[test]
-    fn a_texel_referencing_combine_is_blocked_by_the_gpu_paths_committed_tmem_projection() {
+    fn a_texel_referencing_combine_executes_and_carries_its_combined_pixels() {
         for (label, color, alpha) in [
             ("env-lerp", ENV_LERP_COLOR, ENV_LERP_ALPHA),
-            // The flat-primitive program reads NO texel, so it must NOT be
-            // blocked -- which is what proves the blocker is specifically
-            // the texel reference and not "one-cycle" or "a combine".
             ("flat-primitive", FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA),
         ] {
             let combine_words = one_cycle_combine_words(color, alpha);
             let params = CombineParams::from_wire(combine_words[0], combine_words[1]);
             let references_texel = params.references_texels_in_first_cycle();
+            // **Positive control**, asserted rather than assumed: the
+            // env-lerp arm must genuinely reference TEXEL0 and the
+            // flat-primitive arm must genuinely not. Without this a fixture
+            // that silently stopped referencing a texel would pass the whole
+            // loop while proving nothing about texel sampling.
+            assert_eq!(
+                references_texel,
+                label == "env-lerp",
+                "{label}'s texel reference must match the census program it names"
+            );
+
             let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
             configure_fill_target_height(&mut backend);
-            let no_adapter = backend.triangle_pipeline.is_none();
-            let (_, result) = plan_and_execute_composed(
+            if backend.triangle_pipeline.is_none() {
+                // No adapter: the triangle path cannot run at all, so
+                // nothing about the projection is observable here.
+                continue;
+            }
+            publish_composed(
                 &mut backend,
                 &mut session,
                 fill_load_and_one_cycle_texrect_words(color, alpha),
             );
-            if no_adapter {
-                // With no GPU adapter the triangle path cannot run at all
-                // and fails earlier, with its own named error. Nothing
-                // about the projection is observable here.
-                assert!(
-                    result.is_err(),
-                    "{label}: a triangle-bearing packet with no pipeline must fail by name"
-                );
-                continue;
+
+            let resident = backend
+                .color_targets()
+                .expect("a composed packet must have built the color-target registry")
+                .residents()
+                .first()
+                .expect("the composed packet must have published exactly one resident")
+                .device_bytes()
+                .device_bytes()
+                .to_vec();
+
+            let committed = backend.physical_tmem();
+            let tile = composed_fixture_tile();
+            let draw = one_cycle_fixture_draw();
+            let mut combined_values = std::collections::BTreeSet::new();
+            let mut compared = 0usize;
+
+            for y in 0..ONE_CYCLE_HEIGHT {
+                for x in 0..ONE_CYCLE_WIDTH {
+                    let target_x = ONE_CYCLE_X0 + x;
+                    let target_y = ONE_CYCLE_Y0 + y;
+                    let offset = ((target_y * FILL_TARGET_WIDTH + target_x) * 2) as usize;
+                    let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                    let request = crate::PointSampleRequest::new(
+                        crate::PointSampleCoordinates::new(
+                            crate::TextureCoordinateS10_5::from_raw(draw.s_at(x)),
+                            crate::TextureCoordinateS10_5::from_raw(draw.t_at(y)),
+                        ),
+                        crate::TmemFirstRowParity::Even,
+                    );
+                    let sampled = crate::sample_committed_point(
+                        committed,
+                        tile.descriptor(),
+                        tile.size(),
+                        request,
+                        crate::TextureLutMode::Disabled,
+                    )
+                    .expect("the committed oracle must sample the same texel");
+                    assert!(
+                        sampled.snapshot().is_committed(),
+                        "the ORACLE reads durable state, so its snapshot must be Committed -- if \
+                         this is Proposed the oracle is not independent of the executor"
+                    );
+                    assert_eq!(
+                        actual,
+                        expected_one_cycle_halfword(sampled.texel().rgba8888(), color, alpha),
+                        "{label}: pixel ({target_x}, {target_y}) must be the combiner's own \
+                         output over the texel the committed oracle reads at this position"
+                    );
+                    assert_ne!(
+                        actual,
+                        expected_fill_halfword(COMPOSED_FILL_COLOR, target_x),
+                        "{label}: pixel ({target_x}, {target_y}) must differ from the fill \
+                         underneath, or the texrect drew nothing"
+                    );
+                    combined_values.insert(actual);
+                    compared += 1;
+                }
             }
-            match (references_texel, result) {
-                (true, Err(error)) => {
-                    let message = error.to_string();
-                    assert!(
-                        message.contains("tmem_sample.wgsl status"),
-                        "{label} references TEXEL0, so it must be blocked by the GPU path's \
-                         committed-TMEM projection specifically -- got: {message}"
-                    );
-                }
-                (true, Ok(_)) => panic!(
-                    "{label} references TEXEL0 and executed: the pre-existing committed-vs- \
-                     pending TMEM divergence this test pins has been fixed. Rewrite this test \
-                     to assert the hand-derived combined pixels instead of the blocker."
-                ),
-                (false, outcome) => {
-                    assert!(
-                        outcome.is_ok(),
-                        "{label} references no texel, so the GPU fragment shader short-circuits \
-                         to OK and the packet must execute: {outcome:?}"
-                    );
-                }
+            assert_eq!(
+                compared,
+                (ONE_CYCLE_WIDTH * ONE_CYCLE_HEIGHT) as usize,
+                "{label}: the loop must have compared exactly the hand-derived rectangle"
+            );
+            // **The claim that separates the two programs**, and the one
+            // that could only be made once the projection was fixed: the
+            // env-lerp output VARIES across the rectangle because it reads
+            // the texel, while the flat-primitive output is constant
+            // because it does not. A stale or empty projection would make
+            // the env-lerp arm constant too, satisfying every assertion
+            // above -- this is what catches that.
+            if references_texel {
+                assert!(
+                    combined_values.len() >= 2,
+                    "{label} reads TEXEL0, so its output must VARY across the rectangle -- a \
+                     constant image means the projection carried empty or stale bytes rather \
+                     than this packet's own load: got {combined_values:?}"
+                );
+            } else {
+                assert_eq!(
+                    combined_values.len(),
+                    1,
+                    "{label} reads no texel, so its output must be constant: got \
+                     {combined_values:?}"
+                );
             }
         }
     }
@@ -10327,6 +10560,110 @@ mod tests {
                 | u16::from(a1 >> 7),
             "the real combiner over texrect 1's own primitive register must reconcile with the \
              packed literal this test asserted against the published buffer"
+        );
+    }
+
+    /// **The GPU projection refuses a pending image that claims to be
+    /// committed, by name.**
+    ///
+    /// The sibling of `execute_scheduled_texrect`'s
+    /// `PendingTmemImageClaimedCommitted` check, at the other place a
+    /// pending post-image is consumed. Both exist because the type system
+    /// cannot enforce this: `Committed` and `Proposed` inhabit one enum, so
+    /// a wrong `snapshot()` impl compiles and passes.
+    ///
+    /// Measured, which is why this test exists: deleting the refusal left
+    /// the env-lerp pixel test, the projection unit tests and the
+    /// guest-RDRAM end-to-end test all green. No real `PendingTmemImage`
+    /// can reach the arm -- its own impl is correct -- so a source that lies
+    /// is the only way to prove the refusal is wired rather than decorative.
+    #[test]
+    fn the_gpu_projection_refuses_a_pending_image_claiming_to_be_committed() {
+        /// A byte source with a pending image's bytes and a durable
+        /// image's *claim* -- the forgery the split exists to catch.
+        struct ForgedCommitted;
+        impl crate::TmemByteSource for ForgedCommitted {
+            fn snapshot(&self) -> crate::TmemSnapshotIdentity {
+                let state = PhysicalTmemState::try_new().unwrap();
+                crate::TmemByteSource::snapshot(&state)
+            }
+            fn valid_byte(&self, address: u16) -> Option<u8> {
+                Some(address as u8)
+            }
+        }
+
+        let error = project_proposed_image(&ForgedCommitted)
+            .expect_err("a source claiming Committed must be refused, not projected");
+        assert!(
+            matches!(
+                error,
+                WgpuRawDpcExecutionError::PendingTmemProjectionClaimedCommitted
+            ),
+            "the refusal must be the named variant, not some other error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Committed snapshot identity"),
+            "the refusal must name what went wrong: {error}"
+        );
+
+        // The contrast that makes the claim mean something: the SAME bytes
+        // behind an honest `Proposed` identity project successfully, so the
+        // refusal discriminates on the identity, not on the content. The
+        // honest identity comes from a real sealed transaction driven
+        // through the composed execution path -- the only route to one in
+        // this file, since `PendingTmemTransaction` is move-only.
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_composed(
+            &mut backend,
+            &mut session,
+            fill_load_and_copy_texrect_words(),
+        );
+        assert!(
+            result.is_ok(),
+            "a composed packet must execute, which requires its own pending post-image to have \
+             projected successfully through this same function: {result:?}"
+        );
+    }
+
+    /// **A later packet's triangles never sample an earlier packet's pending
+    /// projection.**
+    ///
+    /// The pending post-image belongs to the packet that sealed it. A second
+    /// `execute_raw_dpc` carrying triangles but no TMEM load of its own must
+    /// project the *published* slot -- which by then does contain the first
+    /// packet's load, because publication ran between them -- and must never
+    /// reuse a retained projection from the earlier call.
+    ///
+    /// This is the cross-packet half of the same invariant
+    /// `TexrectBeforeItsOwnLoad` enforces within a packet: a draw may only
+    /// observe TMEM already established at its own position in the stream,
+    /// never state from a different transaction.
+    ///
+    /// Measured: caching the projection on the backend and reusing it when a
+    /// later packet supplied none passed the env-lerp pixel test, the
+    /// projection unit tests and the guest-RDRAM end-to-end test. Only this
+    /// test kills that mutant, which is why it asserts on the retained
+    /// *state* rather than on pixels -- the leaked and correct projections
+    /// happen to agree on content here, so a pixel comparison cannot
+    /// separate them, but the leak is still a real cross-transaction read.
+    #[test]
+    fn a_later_packet_does_not_reuse_an_earlier_packets_pending_projection() {
+        let source = include_str!("production.rs");
+        let struct_start = source
+            .find("pub struct WgpuBackend {")
+            .expect("WgpuBackend must exist in this file");
+        let struct_end = source[struct_start..]
+            .find("\n}\n")
+            .expect("WgpuBackend must have a closing brace")
+            + struct_start;
+        let fields = &source[struct_start..struct_end];
+        assert!(
+            !fields.contains("TmemGpuProjection"),
+            "WgpuBackend must hold no TmemGpuProjection field -- a retained projection is a \
+             pending post-image outliving the packet that sealed it, which is exactly the \
+             cross-transaction read the committed/pending split exists to prevent. Fields: \
+             {fields}"
         );
     }
 

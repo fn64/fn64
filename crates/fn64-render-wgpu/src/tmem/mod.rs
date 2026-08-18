@@ -62,8 +62,8 @@ pub use execute::{
 };
 pub(crate) use execute::{map_physical_lanes_block, map_physical_lanes_tlut};
 pub use gpu_projection::{
-    project_committed_tmem, TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES,
-    TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
+    project_committed_tmem, project_tmem, TileBindingParams, TmemGpuProjection,
+    TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
