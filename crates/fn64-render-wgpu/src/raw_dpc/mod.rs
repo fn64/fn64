@@ -4203,6 +4203,85 @@ mod tests {
         ));
     }
 
+    /// The canonical libultra `gDPLoadTLUT_pal16` destination tile is
+    /// `siz == G_IM_SIZ_4b`, and must decode.
+    ///
+    /// Public libultra `gbi.h` (identical in four independent SDK copies on
+    /// this machine: `sm64-decomp/include/PR/gbi.h:4229`,
+    /// `mm-decomp/include/PR/gbi.h:4655`,
+    /// `kirby64-decomp/include/PR/gbi.h:4239`,
+    /// `oot-decomp/include/ultra64/gbi.h:4657`) expands
+    /// `gDPLoadTLUT_pal16(pkt, pal, dram)` to
+    /// `gDPSetTextureImage(pkt, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, dram)`
+    /// followed by
+    /// `gDPSetTile(pkt, 0, 0, 0, (256+((pal&0xf)*16)), G_TX_LOADTILE, ...)`.
+    /// `gDPSetTile`'s parameter order is `(pkt, fmt, siz, line, tmem, tile,
+    /// ...)` (`sm64-decomp/include/PR/gbi.h:3401`), so that second `0` is
+    /// `siz`, and `G_IM_SIZ_4b == 0` (`:410`). `gDPLoadTLUT_pal256` (`:4283`)
+    /// and the generic `gDPLoadTLUT` (`:4331`) program the same `siz == 0`.
+    ///
+    /// Fail-against-bug: an earlier revision required the DESTINATION
+    /// descriptor to be `Bits16` and refused every canonical macro emission --
+    /// including all seven `LoadTLUT`s in WWF WrestleMania 2000's captured
+    /// frame-0 packet. The sibling SOURCE-image check is the correct one and
+    /// is asserted here too, so deleting either check fails this test.
+    ///
+    /// The `set_tile` helper hardcodes `siz == 2`, which is why no existing
+    /// fixture could reach this shape; these cases build the word directly.
+    #[test]
+    fn load_tlut_accepts_the_canonical_macro_four_bit_destination_descriptor() {
+        // `gDPSetTile(pkt, fmt=0, siz, line=0, tmem=256, tile=7, ...)`.
+        let set_tile_siz = |siz: u32| [word(0, SET_TILE, siz << 19 | 256), 7 << 24];
+
+        // Every destination `siz` decodes: the field describes a TMEM region
+        // for a quadricated palette write, not the palette's pixel format,
+        // and nothing downstream consumes it for this load kind.
+        for siz in 0..=3 {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 2, 1, 0x300));
+            words.extend(set_tile_siz(siz));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 15 << 14]);
+            let decoded = decode_raw_dpc(
+                submit(packet_with_tmem_sources(7, words, &[(0x300, 0x320)])),
+                &RdpState::default(),
+            )
+            .unwrap_or_else(|error| panic!("siz={siz} must decode: {error}"));
+            let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
+                panic!("siz={siz}: expected LoadTLUT");
+            };
+            let TmemLoadKind::Tlut { entries, .. } = load.kind() else {
+                panic!("siz={siz}: expected TLUT load kind");
+            };
+            // The transfer is sized from the SOURCE image and the entry
+            // count, never from the destination descriptor -- so the shape
+            // is identical across all four destination sizes.
+            assert_eq!(entries.get(), 16, "siz={siz}");
+            assert_eq!(load.source_plan().total_bytes(), 32, "siz={siz}");
+        }
+
+        // The sibling SOURCE check remains, and is the one the macro
+        // actually constrains: a non-16-bit `SetTextureImage` is refused
+        // even with the canonical 4-bit destination descriptor.
+        for source_siz in [0, 1, 3] {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, source_siz, 1, 0x300));
+            words.extend(set_tile_siz(0));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 15 << 14]);
+            let error =
+                decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RawDpcDecodeError::InvalidCommand { reason: ref actual, .. }
+                        if actual.contains("16-bit SetTextureImage source")
+                ),
+                "source siz={source_siz}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn load_tlut_rejects_every_non_macro_coordinate_field() {
         for (name, w0_payload, w1_payload, reason) in [
