@@ -309,6 +309,17 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
     with_host(|host| host.sections.set_section_unloaded(index));
 }
 
+/// Whether overlay section `index` is currently PI-swapped in.
+///
+/// The rs lane's emitted dispatcher asks this to disambiguate a vram claimed
+/// by more than one bank. An index past the registered sections answers
+/// `false` rather than panicking: an unregistered section is by definition not
+/// resident, and the dispatcher's own trap already names the vram and every
+/// claimant, which is the more useful message than an index assertion here.
+pub fn is_section_loaded(index: fn64_runtime::SectionIndex) -> bool {
+    with_host(|host| host.sections.is_section_loaded(index))
+}
+
 /// Honor a game-driven overlay DMA at the section registry: if `rom_addr`
 /// is exactly some registered section's ROM start, mark it loaded at
 /// `dest_vram` (the DMA's RDRAM destination as a KSEG0 vram). Returns the
