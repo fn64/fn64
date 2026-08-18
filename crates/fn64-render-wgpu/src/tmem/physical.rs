@@ -1042,6 +1042,13 @@ pub enum PhysicalTmemError {
         field: &'static str,
     },
     DestinationPlanMismatch,
+    /// A load's ordered source-access run could not be expressed as a
+    /// physical binding -- today, only because its length exceeds `u16`.
+    /// Named separately from [`Self::DestinationPlanMismatch`] so a source
+    /// side failure is never reported as a destination one; the decoder
+    /// already bounds the run by `MAX_RESOURCE_ACCESSES`, so this is a
+    /// defence-in-depth refusal rather than a reachable production path.
+    SourcePlanMismatch,
     GenerationExhausted,
     EpochNotNewer {
         previous: Option<TmemLoadEpoch>,
@@ -1130,6 +1137,8 @@ impl fmt::Display for PhysicalTmemError {
             }
             Self::DestinationPlanMismatch => formatter
                 .write_str("TMEM physical fragments differ from the canonical destination plan"),
+            Self::SourcePlanMismatch => formatter
+                .write_str("TMEM load source-access run is not expressible as a physical binding"),
             Self::GenerationExhausted => formatter.write_str("physical TMEM generation exhausted"),
             Self::EpochNotNewer { previous, actual } => write!(
                 formatter,
@@ -1420,9 +1429,21 @@ fn neutral_validate_transfer(
     let destination_access_identity = access_identity(destination_accesses)?;
     Ok(PhysicalTmemLoadBinding {
         identity: mint_load_identity()?,
-        source_access_identity: access_identity(core::slice::from_ref(&load.source()))?,
+        // Mirrors the decoder-typed path's `plan.source().access_count()` /
+        // `source_access_identity()` above: the identity and the count are
+        // taken over the load's **whole** ordered source run, not just its
+        // first fragment. A partial-width `LoadTile` reads one access per
+        // source row, so hard-coding 1 here would hash a 49-row load's
+        // source identity over a single row. Both fields feed
+        // `proposal_digest`'s per-load projection, so a collapsed count
+        // would make a 49-row load's published proposal digest
+        // indistinguishable from a one-row load's over the same first row
+        // -- pinned by
+        // `neutral_source_run_widens_the_binding_count_and_identity`.
+        source_access_identity: access_identity(load.sources())?,
         source_first_access_index: load.source_access_index(),
-        source_access_count: 1,
+        source_access_count: u16::try_from(load.sources().len())
+            .map_err(|_| PhysicalTmemError::SourcePlanMismatch)?,
         destination_access_identity,
         destination_first_access_index: load.destination_access_index(),
         destination_access_count: u16::try_from(destination_accesses.len())
@@ -2141,6 +2162,191 @@ mod tests {
     fn word(opcode: u8, payload: u32) -> u32 {
         u32::from(opcode) << 24 | payload
     }
+
+    /// Builds a neutral [`fn64_render::TmemLoadSemantics`] whose source run
+    /// is `source_rows` accesses wide, each reading 8 bytes, with one
+    /// transfer word per row bound to its own row.
+    fn neutral_load_with_source_rows(
+        layout: PhysicalMemoryLayout,
+        source_rows: u32,
+    ) -> fn64_render::TmemLoadSemantics {
+        use fn64_render::{
+            NeutralImageFormat, NeutralPixelSize, NeutralTextureImage, NeutralTileAddressMode,
+            NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+            NeutralTmemTransferWord, RawDpcCommandLocation, TmemLoadEpoch, TmemLoadKind,
+            TmemTransferLayout,
+        };
+
+        // One 8-byte source access per row, spaced 16 bytes apart so the
+        // rows are disjoint and non-adjacent -- the real partial-width
+        // `LoadTile` shape, which cannot collapse to one range.
+        let sources: Vec<ResourceAccess> = (0..source_rows)
+            .map(|row| {
+                let start = 0x200 + row * 16;
+                ResourceAccess::try_new(
+                    OperationId::new(1 + row),
+                    AccessMode::Read,
+                    fn64_render_ir::AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::Buffer,
+                        range: layout.range(start, start + 8).unwrap(),
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let destination = ResourceAccess::try_new(
+            OperationId::new(1 + source_rows),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, source_rows * 8).unwrap()),
+        )
+        .unwrap();
+        let transfer_words: Vec<NeutralTmemTransferWord> = (0..source_rows)
+            .map(|row| NeutralTmemTransferWord {
+                index: row as u16,
+                logical_source_offset: row * 8,
+                source_access_index: 1 + row,
+                source_access_byte_offset: 0,
+                defined_source_byte_mask: 0xff,
+                defined_destination_byte_mask: 0xff,
+                destination_word: row as u16,
+                row_advance: 0,
+                odd_row_exchange: false,
+                physical: NeutralTmemTransferPhysicalWord::Linear(
+                    TmemRange::try_new(row * 8, row * 8 + 8).unwrap(),
+                ),
+            })
+            .collect();
+
+        fn64_render::TmemLoadSemantics::new(
+            RawDpcCommandLocation {
+                command_index: 0,
+                stream_index: 0,
+                chunk_index: 0,
+                source_address: layout.address(COMMAND_START).unwrap(),
+                source_byte_offset: 0,
+                source_byte_len: 8,
+                wire_opcode: 0xf4,
+            },
+            vec![0xf400_0000, 0],
+            TmemLoadEpoch::new(core::num::NonZeroU64::new(1).unwrap()),
+            TmemLoadKind::Tile {
+                bounds: NeutralTileSize {
+                    low_s: 0,
+                    low_t: 0,
+                    high_s: 3,
+                    high_t: (source_rows - 1) as u16,
+                },
+            },
+            0,
+            NeutralTextureImage {
+                format: NeutralImageFormat::Rgba,
+                size: NeutralPixelSize::Bits16,
+                width: 8,
+                address: layout.address(0x200).unwrap(),
+            },
+            NeutralTileDescriptor {
+                format: NeutralImageFormat::Rgba,
+                size: NeutralPixelSize::Bits16,
+                line_words: 1,
+                tmem_word_address: 0,
+                palette: 0,
+                s_mode: NeutralTileAddressMode::default(),
+                mask_s: 0,
+                shift_s: 0,
+                t_mode: NeutralTileAddressMode::default(),
+                mask_t: 0,
+                shift_t: 0,
+            },
+            sources,
+            1,
+            destination,
+            1 + source_rows,
+            source_rows * 8,
+            0,
+            1,
+            source_rows as u16,
+            TmemTransferLayout::Linear,
+            transfer_words,
+        )
+    }
+
+    /// The neutral path's physical binding must take its source identity
+    /// and count over the load's **whole** ordered source run, exactly as
+    /// the decoder-typed path takes `plan.source().access_count()`.
+    ///
+    /// Both fields feed `proposal_digest`'s per-load projection, so
+    /// hard-coding the count to 1 would let a many-row load publish the
+    /// same proposal digest as a one-row load reading the same first row.
+    /// This asserts the count widens AND that the two digests actually
+    /// differ -- the second half is what makes the first non-cosmetic.
+    #[test]
+    fn neutral_source_run_widens_the_binding_count_and_identity() {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let wide = neutral_load_with_source_rows(layout, 8);
+        let narrow = neutral_load_with_source_rows(layout, 1);
+
+        assert_eq!(wide.sources().len(), 8);
+        assert_eq!(narrow.sources().len(), 1);
+        assert_eq!(
+            wide.sources()[0],
+            narrow.sources()[0],
+            "both loads read the same first row, so only the run width can distinguish them"
+        );
+
+        let wide_identity = access_identity(wide.sources()).unwrap();
+        let narrow_identity = access_identity(narrow.sources()).unwrap();
+        assert_ne!(
+            wide_identity, narrow_identity,
+            "an 8-row source run must not hash to the same identity as its own first row"
+        );
+        assert_eq!(
+            access_identity(core::slice::from_ref(&wide.source())).unwrap(),
+            narrow_identity,
+            "positive control: hashing only the first fragment IS the collapsed identity, \
+             which is exactly the bug this test forbids"
+        );
+
+        // Now drive the real binding builder. `neutral_validate_transfer`
+        // ignores the identity argument (see its `_source` parameter's own
+        // comment), so any well-formed one serves.
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let submitted = queue
+            .submit(DecodedTicket::new(planned_packet(1)))
+            .unwrap();
+        let identity = TmemLoadSourceIdentity::new(
+            submitted.packet().identity(),
+            submitted.packet().journal().identity(),
+            submitted.identity(),
+            submitted.packet().memory_layout(),
+        );
+
+        let wide_destination = [ResourceAccess::try_new(
+            OperationId::new(9),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, 64).unwrap()),
+        )
+        .unwrap()];
+        let wide_binding =
+            neutral_validate_transfer(&wide, &wide_destination, identity, None).unwrap();
+
+        assert_eq!(
+            wide_binding.source_access_count, 8,
+            "the binding's source_access_count must be the whole run's width, not 1"
+        );
+        assert_eq!(
+            wide_binding.source_access_identity, wide_identity,
+            "the binding's source identity must be hashed over the whole run"
+        );
+        assert_ne!(
+            wide_binding.source_access_identity, narrow_identity,
+            "a collapsed identity would make an 8-row load indistinguishable from a 1-row one"
+        );
+        assert_eq!(wide_binding.source_first_access_index, 1);
+    }
+
 
     fn load_tile_words(load_count: usize) -> Vec<u32> {
         let mut words = vec![
