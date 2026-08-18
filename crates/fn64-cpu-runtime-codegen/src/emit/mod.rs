@@ -1406,6 +1406,42 @@ fn emit_control_transfer(
         })
     };
 
+    // A function whose LAST instruction is a call (`JAL`/`JALR`) or a
+    // conditional branch has a *fallthrough* address one past its end. Writing
+    // `pc = <func_end>` sends the local dispatcher into its `_ =>` catch-all
+    // and aborts with "jumped to unmapped vram", even though the guest is
+    // simply running on into the next function.
+    //
+    // WM2000's `func_8011F67C` (size 0x7FC) ends with `jal func_800E7B64` at
+    // 0x8011FE70 plus its delay slot; 0x8011FE78 is the next real function.
+    // Four functions ROM-wide have this shape.
+    //
+    // Emitting the fallthrough as a resolved tail call is the same treatment
+    // the inter-function `J` arm already gives an escaping jump, and it keeps
+    // the "never guess a target" rule: an unresolved fallthrough goes to
+    // `lookup`, which traps with the exact vram.
+    let fallthrough_tail = |t: u32| -> Option<String> {
+        if in_func(t) {
+            return None;
+        }
+        Some(match resolver.resolve(t) {
+            CallTarget::Direct(name) => {
+                format!("call_host_or_recompiled({t:#010X}, {name}, ctx, mem); return;")
+            }
+            CallTarget::Indirect => format!("lookup({t:#010X})(ctx, mem); return;"),
+        })
+    };
+    // Emits the post-call fallthrough: a local `pc =` when it stays inside the
+    // body, a resolved tail call when the function ends here.
+    let emit_fallthrough = |out: &mut String| match fallthrough_tail(fallthrough) {
+        Some(tail) => {
+            let _ = writeln!(out, "            {tail}");
+        }
+        None => {
+            let _ = writeln!(out, "            pc = {fallthrough:#010X}; continue 'run;");
+        }
+    };
+
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
             let _ = writeln!(out, "            // delay: {:#010X}: {:?}", delay_vram, d);
@@ -1496,11 +1532,7 @@ fn emit_control_transfer(
                     let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
                 }
             }
-            let _ = writeln!(
-                out,
-                "            pc = {:#010X}; continue 'run;",
-                fallthrough
-            );
+            emit_fallthrough(out);
         }
         Jalr { rd, rs } => {
             // JALR reads the target before writing the link; this matters when
@@ -1513,11 +1545,7 @@ fn emit_control_transfer(
             );
             emit_delay(out);
             let _ = writeln!(out, "            lookup(_target)(ctx, mem);");
-            let _ = writeln!(
-                out,
-                "            pc = {:#010X}; continue 'run;",
-                fallthrough
-            );
+            emit_fallthrough(out);
         }
         Bltzal { .. } | Bgezal { .. } => {
             // Conditional branch-and-link.
@@ -1586,19 +1614,26 @@ fn emit_control_transfer(
             match escaping_taken_arm(t) {
                 Some(tail) => {
                     let _ = writeln!(out, "            if _take {{ {tail} }}");
-                    let _ = writeln!(
-                        out,
-                        "            pc = {:#010X}; continue 'run;",
-                        fallthrough
-                    );
+                    emit_fallthrough(out);
                 }
-                None => {
-                    let _ = writeln!(
-                        out,
-                        "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
-                        t, fallthrough
-                    );
-                }
+                None => match fallthrough_tail(fallthrough) {
+                    // Taken target is local but the function ENDS here, so the
+                    // not-taken path runs on into the next function.
+                    Some(tail) => {
+                        let _ = writeln!(
+                            out,
+                            "            if _take {{ pc = {t:#010X}; continue 'run; }}"
+                        );
+                        let _ = writeln!(out, "            {tail}");
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
+                            t, fallthrough
+                        );
+                    }
+                },
             }
         }
     }
@@ -1692,6 +1727,66 @@ mod escaping_branch_tests {
         assert!(
             src.contains("lookup(0x800385F0)(ctx, mem); return;"),
             "an unknown escaping target must reach the trapping dispatcher:\n{src}"
+        );
+    }
+
+    /// WM2000 `func_8011F67C` (size 0x7FC) ends with `jal func_800E7B64` at
+    /// `0x8011FE70` plus its delay slot, so its fallthrough `0x8011FE78` is
+    /// the NEXT function. Writing `pc = 0x8011FE78` aborts the local
+    /// dispatcher with "jumped to unmapped vram". Four functions ROM-wide have
+    /// this shape.
+    #[test]
+    fn a_call_in_the_last_slot_falls_through_to_the_next_function() {
+        // jal func_800E7B64 ; addiu $a0, $sp, 0x28   (the whole function)
+        let words = [0x0C03_9ED9u32, 0x27A4_0028];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_8011F67C",
+                vram: 0x8011_FE70,
+                words: &words,
+            },
+            &SymbolTable::from_entries([
+                ("func_800E7B64", 0x800E_7B64u32),
+                ("func_8011FE78", 0x8011_FE78u32),
+            ]),
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x800E7B64, func_800E7B64, ctx, mem);"),
+            "the call itself must still be emitted:\n{src}"
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x8011FE78, func_8011FE78, ctx, mem); return;"),
+            "the escaping fallthrough must tail-call the next function:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x8011FE78"),
+            "must never assign an out-of-function fallthrough to pc:\n{src}"
+        );
+    }
+
+    /// Positive control: a call that is NOT in the last slot keeps its plain
+    /// local `pc =` fallthrough.
+    #[test]
+    fn a_call_mid_function_keeps_a_local_fallthrough() {
+        // jal ; delay ; nop ; jr $ra ; nop
+        let words = [
+            0x0C03_9ED9u32,
+            0x27A4_0028,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "mid",
+                vram: 0x8011_FE70,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("func_800E7B64", 0x800E_7B64u32)]),
+        );
+        assert!(
+            src.contains("pc = 0x8011FE78; continue 'run;"),
+            "an in-function fallthrough must stay a local pc assignment:\n{src}"
         );
     }
 }
