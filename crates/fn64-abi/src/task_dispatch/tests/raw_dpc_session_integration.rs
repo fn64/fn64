@@ -1872,3 +1872,136 @@ fn a_rejected_guest_commit_leaves_guest_rdram_untouched() {
     );
     teardown();
 }
+
+// ---------------------------------------------------------------------
+// Shell-selectability: what a `FN64_RENDER=wgpu` arm in `fn64-shell` would
+// actually meet at runtime.
+//
+// `crates/fn64-shell/src/main.rs`'s backend selection registers whatever
+// `Box<dyn RenderBackend>` it built through `set_render_backend`, and the
+// shell then runs the real guest loop. That loop reaches
+// `RenderBackend::present` on EVERY VI retrace, through exactly one call
+// site (`crate::pi::timing`'s retrace drain -> `present_render_backend`),
+// with no backend-capability check in between. The two tests below measure
+// that seam directly rather than reasoning about it: the first proves the
+// raw-DPC half a shell arm exists to reach really is reachable once both
+// halves are registered, and the second proves the SAME registration is
+// killed by the very next VI field.
+//
+// Together they are the evidence for why no `FN64_RENDER=wgpu` arm ships:
+// it would be selectable and immediately fatal, which AGENTS.md's loud-trap
+// rule prefers over a silent fallback but which is not a shippable option.
+// ---------------------------------------------------------------------
+
+/// The exact two-call registration a shell arm would perform -- backend
+/// first (so the paired `RawDpcBackendAuthority` is already the registered
+/// backend's, per `set_raw_dpc_session`'s own doc comment), session second
+/// -- proving `try_dispatch_raw_dpc_via_session` no longer takes its
+/// `if !registered { return None; }` early return.
+#[test]
+fn shell_shaped_registration_reaches_the_raw_dpc_session_seam() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+
+    // Before ANY registration the seam is unreachable: this is the state
+    // `fn64-shell` is in today, with no `FN64_RENDER=wgpu` arm.
+    assert!(
+        RAW_DPC_SESSION.with(|cell| cell.borrow().is_none()),
+        "no session may be registered before the shell-shaped setup runs"
+    );
+
+    // The two public calls, in the documented order.
+    let (backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    set_render_backend(Box::new(backend), rdram.len());
+    set_raw_dpc_session(session);
+
+    assert!(
+        RAW_DPC_SESSION.with(|cell| cell.borrow().is_some()),
+        "set_raw_dpc_session must leave a session registered -- this is the exact predicate \
+         try_dispatch_raw_dpc_via_session's early return reads"
+    );
+
+    // Drive the real producer seam. A TMEM-only LoadBlock is inside
+    // `WgpuBackend`'s admitted set, so reaching the session path returns
+    // normally; taking the legacy `process_rdp_commands` path instead would
+    // panic (`WgpuBackend` leaves that trait method unimplemented), which is
+    // what makes this assertion discriminating rather than vacuous.
+    let words = one_load_block_words();
+    let bytes = words_to_rdram_bytes(&words);
+    let start = 0x1000u32;
+    let end = start + bytes.len() as u32;
+    rdram[start as usize..end as usize].copy_from_slice(&bytes);
+    let submission = admit_dram_submission(start, end);
+    unsafe {
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+    }
+
+    // Reaching here at all is the claim: the production raw-DPC conveyor
+    // ran through the registered `WgpuBackend`.
+    assert!(
+        crate::last_render_error().is_none(),
+        "the admitted TMEM submission must have routed through the session conveyor cleanly"
+    );
+    teardown();
+}
+
+/// Constraint measured, not assumed: a shell that selected `WgpuBackend`
+/// dies on its first VI field. `present_render_backend` is the production
+/// retrace path's only presentation call, `with_render_backend` turns a
+/// backend error into a panic, and `WgpuBackend::present` is a named
+/// out-of-scope rejection -- so the composition is fatal.
+#[test]
+fn a_registered_wgpu_backend_panics_on_the_first_vi_present() {
+    crate::load_rom(Vec::new());
+    let rdram = rdram_with_texture_source();
+    let (backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    set_render_backend(Box::new(backend), rdram.len());
+    set_raw_dpc_session(session);
+
+    // The host must own the same allocation `present_render_backend` reads
+    // through `with_host`, exactly as the boot contract arranges.
+    let mut rdram = rdram;
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+    });
+
+    // A complete live VI register image, as `PresentRequest::live` requires
+    // and as the retrace drain always supplies from the real register file:
+    // 16-bit progressive NTSC, 320-wide source, standard active window.
+    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+    words[0] = 2;
+    words[2] = 320;
+    words[9] = 0x006c_02ec;
+    words[10] = 0x0025_01ff;
+    words[12] = u32::from(fn64_render::ViScaleAxis::ONE);
+    words[13] = 0x0123_0200;
+    let presentation = fn64_render::ViPresentation {
+        blanked: false,
+        fade: None,
+        repeat_line: false,
+        scanout: fn64_render::ViScanoutState::Registers(
+            fn64_render::ViScanoutRegisters::from_words(words),
+        ),
+        noise_seed: 0,
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::task_dispatch::present_render_backend(presentation);
+    }));
+    assert!(
+        outcome.is_err(),
+        "a registered WgpuBackend must panic at VI presentation -- if this ever passes, the \
+         present blocker is gone and a FN64_RENDER=wgpu shell arm becomes shippable"
+    );
+
+    // Name the failure, so a future change that panics for a DIFFERENT
+    // reason cannot silently keep this test green.
+    let reason = crate::last_render_error().expect("the failed present must be recorded");
+    assert!(
+        reason.contains("presentation is out of scope"),
+        "the blocker must be WgpuBackend's own named present rejection, got: {reason}"
+    );
+    teardown();
+}
