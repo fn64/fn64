@@ -292,7 +292,7 @@ mod game {
         /// Pumps in the current heartbeat window whose interval exceeded one
         /// 60 Hz field. Counted rather than derived: the percentile summary
         /// cannot report *how many* frames breached, only where the ranks fell.
-        frame_intervals_over_budget: usize,
+        pumps_over_budget: usize,
         pump_times: TimingWindow,
         present_times: TimingWindow,
         pump_steps_total: u64,
@@ -611,7 +611,7 @@ mod game {
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
-                frame_intervals_over_budget: 0,
+                pumps_over_budget: 0,
                 pump_times: TimingWindow::default(),
                 present_times: TimingWindow::default(),
                 pump_steps_total: 0,
@@ -895,20 +895,22 @@ mod game {
                         .expect("heartbeat must follow at least one present");
                     let window_hz = 1000.0 / interval.median_ms;
                     // Choppy and slow are different failures and the median
-                    // cannot tell them apart: a run whose p50 sits exactly on
-                    // the 16.67 ms deadline while its p95 is double it is
-                    // JITTER, not uniform slowness, and the fraction of pumps
-                    // that breach the deadline is the statistic that says
-                    // which. `over_budget` is that fraction; p99/max above are
-                    // already computed by `TimingStats` and were being
-                    // discarded.
-                    let over_budget = self.frame_intervals_over_budget;
+                    // cannot tell them apart. `over_budget` is the fraction
+                    // of pumps whose OWN COST breached the deadline -- not the
+                    // fraction of frame intervals, which was the original
+                    // shape and was an artifact: the interval median sits
+                    // exactly on FRAME, so it fired as a coin flip on
+                    // microsecond scheduler jitter (measured 50.4% against a
+                    // real pump-cost breach rate of 0.1%, and it read 50.4 vs
+                    // 56.3 on two lanes whose pump costs differed 3x). p99/max
+                    // are computed by `TimingStats` and were being discarded.
+                    let over_budget = self.pumps_over_budget;
                     let over_budget_pct = if interval.samples > 0 {
                         100.0 * over_budget as f64 / interval.samples as f64
                     } else {
                         0.0
                     };
-                    self.frame_intervals_over_budget = 0;
+                    self.pumps_over_budget = 0;
                     let average_steps =
                         self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
                     let audio_health = fn64_abi::audio_stream_health();
@@ -1251,9 +1253,6 @@ mod game {
                 let mut hud_interval = None;
                 if let Some(previous) = self.last_pump_started.replace(now_t) {
                     let elapsed = now_t.duration_since(previous);
-                    if elapsed > FRAME {
-                        self.frame_intervals_over_budget += 1;
-                    }
                     self.frame_intervals.record(elapsed);
                     hud_interval = Some(elapsed);
                 }
@@ -1266,6 +1265,16 @@ mod game {
                 self.pump_census.before_pump();
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
+                // **Pump cost, not frame interval.** The interval median sits
+                // exactly on FRAME, so counting interval breaches is a coin
+                // flip on microsecond scheduler jitter -- measured at 50.4%
+                // on a lane whose real pump-cost breach rate was 0.1%
+                // (9 of 6000), and it could not tell two lanes apart whose
+                // pump costs differed 3x. Pump cost is the work the shell
+                // actually did, so a breach here is a real missed deadline.
+                if pump_wall > FRAME {
+                    self.pumps_over_budget += 1;
+                }
                 self.pump_times.record(pump_wall);
                 if let Some(interval) = hud_interval {
                     self.hud_timing.record(interval, pump_wall);
