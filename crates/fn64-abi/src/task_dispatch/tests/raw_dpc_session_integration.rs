@@ -837,10 +837,11 @@ fn fill_and_copy_texrect_without_load_words() -> Vec<u32> {
 ///   `SetTileSize`; without one the tile has no S/T extent and the sample
 ///   is refused with `UnboundTile`. High S/T of 7 texels in 10.2 is
 ///   `7 << 2`, low S/T zero.
-/// - The **order**. Load before texrect. The reverse is refused by name
-///   (`TexrectBeforeItsOwnLoad`), because the pending post-image is sealed
-///   once per packet and a texrect preceding a load would otherwise observe
-///   texels a later command loaded.
+/// - The **order**. Load before texrect. A texrect samples TMEM at its own
+///   stream position, so the reverse order does not observe this load's
+///   texels at all -- it reads durable committed TMEM, which for this
+///   fixture holds nothing valid, and the texel reader refuses rather than
+///   inventing a zero.
 ///
 /// `dsdx`/`dtdy` are `0x0400`, one texel per pixel in S5.10. Copy mode
 /// halves the effective S step twice (`dsdx >>= 2`), so S runs
