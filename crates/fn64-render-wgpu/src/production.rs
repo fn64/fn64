@@ -1336,15 +1336,6 @@ pub enum WgpuRawDpcExecutionError {
     /// this shape does not occur in WM2000 (0 of 219 decode entries carry a
     /// texrect without a load in the same entry); it is refused by name
     /// rather than silently sampling stale committed state.
-    /// A `TextureRectangle` appears earlier in the command stream than a
-    /// TMEM load in the same packet. The pending post-image is sealed once
-    /// per packet from every load in it, so executing the texrect would let
-    /// it observe texels a later command loaded -- answering a question
-    /// about the past with the future's data.
-    TexrectBeforeItsOwnLoad {
-        texrect_command: u32,
-        load_command: u32,
-    },
     /// A pending TMEM post-image reported a `Committed` snapshot identity.
     /// A proposal has no durable `(state, generation)` pair to name, so a
     /// committed receipt for one is a forgery; see the check site for why
@@ -1499,16 +1490,6 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                  RawTriangle; the texrect composes onto the CPU-side color buffer through its \
                  own declared journal writes while a raw triangle declares no write access at \
                  all, so the two have no defined ordering and the combination is refused",
-            ),
-            Self::TexrectBeforeItsOwnLoad {
-                texrect_command,
-                load_command,
-            } => write!(
-                formatter,
-                "raw-DPC command #{texrect_command} is a TextureRectangle appearing before the \
-                 TMEM load at command #{load_command} in the same packet; the pending TMEM \
-                 post-image is sealed once per packet, so executing the texrect would let it \
-                 observe texels a later command loaded"
             ),
             Self::PendingTmemImageClaimedCommitted { triangle_index } => write!(
                 formatter,
@@ -9835,6 +9816,251 @@ mod tests {
         words
     }
 
+    // --- The WM2000 sprite strip: N loads and N texrects in strict
+    // --- alternation, every load writing the SAME TMEM range.
+    //
+    // Measured on the real ROM through the all-Rust stack, WM2000's sixth
+    // gfx packet is one TLUT load followed by seven `LoadTile`/texrect
+    // pairs whose seven loads all write TMEM from word 0, overwriting each
+    // other. That is the shape a once-per-packet post-image gets maximally
+    // wrong -- every texrect would draw the LAST load's texels -- so it is
+    // the shape the fixtures below reproduce.
+
+    /// How many load+texrect pairs the sprite-strip fixture stages. Seven,
+    /// the count WM2000's own sixth packet carries.
+    const SPRITE_STRIP_PAIRS: usize = 7;
+    const SPRITE_STRIP_Y0: u32 = 2;
+    const SPRITE_STRIP_Y1: u32 = 3;
+    /// The inclusive wire width of each sprite in pixels - 1. Narrow enough
+    /// that seven of them fit side by side across the 16-pixel target with
+    /// no overlap, so each texrect's pixels are attributable to exactly one
+    /// pair rather than to whichever pair painted last.
+    const SPRITE_STRIP_SPAN: u32 = 1;
+
+    /// The x origin of sprite `index`. Disjoint by construction: pair `i`
+    /// owns columns `2i..=2i+1` and no other pair touches them.
+    fn sprite_strip_x0(index: usize) -> u32 {
+        index as u32 * (SPRITE_STRIP_SPAN + 1)
+    }
+
+    /// **The sprite strip: `SPRITE_STRIP_PAIRS` `LoadBlock`/texrect pairs in
+    /// strict alternation, every load writing TMEM from word 0.**
+    ///
+    /// Each load reads a DIFFERENT guest address, so
+    /// `plan_with_deterministic_reads_for_every_load` gives each one
+    /// distinguishable source bytes and the seven post-images genuinely
+    /// differ. Each texrect draws at a disjoint x range, so which load's
+    /// texels reached which pixels is readable off the published buffer
+    /// without disentangling overlaps.
+    ///
+    /// Opened with a whole-target fill because a fresh color target admits
+    /// nothing else (`PartialNewTargetInitialization`); every later command
+    /// patches into the buffer that fill established.
+    fn sprite_strip_words(pairs: usize) -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        for index in 0..pairs {
+            // A different source address per load, so the loads' contents
+            // differ. Byte-aligned well clear of the fill's own target.
+            words.extend(set_texture_image(0, 2, 8, 0x200 + (index as u32) * 0x100));
+            words.extend(set_tile(7, 2, 0));
+            words.extend(load_sync());
+            // Same TMEM destination every time -- tile 7 is bound at TMEM
+            // word 0 by the `set_tile` above, and 24 texels at dxt=0 fill
+            // bytes 0..48. Load i+1 overwrites load i exactly.
+            words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+            words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+            // Copy cycle (2), the mode the texrect executor admits here.
+            words.extend(set_other_mode(2, 0));
+            words.extend(set_combine(0, 0));
+            let x0 = sprite_strip_x0(index);
+            words.extend(texrect_words_in_target_stepping_at(
+                7,
+                x0,
+                SPRITE_STRIP_Y0,
+                x0 + SPRITE_STRIP_SPAN,
+                SPRITE_STRIP_Y1,
+            ));
+        }
+        words
+    }
+
+    /// `texrect_words_at` with the unit S/T step
+    /// `texrect_words_in_target_stepping` uses, so the texrect walks one
+    /// texel per pixel instead of holding texel (0,0).
+    fn texrect_words_in_target_stepping_at(
+        tile: u32,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> [u32; 4] {
+        let mut words = texrect_words_at(tile, x0, y0, x1, y1);
+        words[3] = (0x0400u32 << 16) | 0x0400;
+        words
+    }
+
+    /// Drives the sprite strip all the way through publication with
+    /// per-load source bytes, and returns the published color-target
+    /// buffer.
+    fn publish_sprite_strip(pairs: usize) -> Vec<u8> {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let words = sprite_strip_words(pairs);
+        let (planned, per_read_bytes) =
+            plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
+        assert_eq!(
+            per_read_bytes.len(),
+            pairs,
+            "the sprite strip must declare exactly one TmemLoadSource read per load, or the \
+             per-load source bytes below name the wrong loads"
+        );
+        let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("the sprite strip must execute");
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged)
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        published_target_bytes(&backend)
+    }
+
+    /// Sprite `index`'s own published pixels, read off its disjoint column
+    /// range of a `publish_sprite_strip` buffer.
+    fn sprite_strip_pixels(resident: &[u8], index: usize) -> Vec<u16> {
+        let x0 = sprite_strip_x0(index);
+        let mut pixels = Vec::new();
+        for y in SPRITE_STRIP_Y0..=SPRITE_STRIP_Y1 {
+            for x in x0..=(x0 + SPRITE_STRIP_SPAN) {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                pixels.push(u16::from_be_bytes([resident[offset], resident[offset + 1]]));
+            }
+        }
+        pixels
+    }
+
+    /// **The card's own property, pinned: each of the seven texrects draws
+    /// the texels of the load immediately before it, not the last load's.**
+    ///
+    /// All seven loads write the same TMEM range from word 0, so a
+    /// once-per-packet post-image holds only load 6's texels and all seven
+    /// sprites would be identical. The seven sprites being pairwise
+    /// DIFFERENT is therefore the exact discriminator between per-position
+    /// and per-packet sealing -- and it is a property of the fixture's own
+    /// distinct per-load source bytes, not of any expectation this test
+    /// hard-codes.
+    ///
+    /// # Positive control
+    ///
+    /// The fixture is only meaningful if it really is seven strictly
+    /// alternating pairs. Both halves are asserted from the plan itself
+    /// rather than from the wire words: seven admitted `TmemLoadSource`
+    /// reads (one per load, checked in `publish_sprite_strip`) and fourteen
+    /// admitted texrect triangles (two per texrect).
+    #[test]
+    fn each_sprite_in_a_strip_draws_the_load_that_precedes_it() {
+        assert_eq!(
+            admitted_texture_rectangle_triangles(sprite_strip_words(SPRITE_STRIP_PAIRS)),
+            SPRITE_STRIP_PAIRS * 2,
+            "the strip must admit two triangles per texrect, or the sprites compared below are \
+             not the seven texrects the fixture claims"
+        );
+
+        let resident = publish_sprite_strip(SPRITE_STRIP_PAIRS);
+
+        // Each sprite's own published pixels, read off its disjoint column
+        // range.
+        let sprites: Vec<Vec<u16>> = (0..SPRITE_STRIP_PAIRS)
+            .map(|index| sprite_strip_pixels(&resident, index))
+            .collect();
+
+        // Not all one color: a strip of seven identical sprites would also
+        // be produced by a target that never got any texels at all.
+        assert!(
+            sprites
+                .iter()
+                .flatten()
+                .any(|pixel| *pixel != COMPOSED_FILL_COLOR as u16),
+            "at least one sprite pixel must differ from the opening fill, or no texrect painted"
+        );
+
+        // **The discriminator.** Under per-packet sealing every sprite
+        // carries load 6's texels and all seven of these are equal.
+        for (index, sprite) in sprites.iter().enumerate().skip(1) {
+            assert_ne!(
+                *sprite, sprites[index - 1],
+                "sprite {index} must carry load {index}'s texels and sprite {} must carry load \
+                 {}'s; they are equal, which is what a single post-image sealed from all seven \
+                 loads produces",
+                index - 1,
+                index - 1
+            );
+        }
+    }
+
+    /// **The mutation control for the test above: re-seal per packet and it
+    /// fails.**
+    ///
+    /// Serves every texrect the LAST prefix instead of its own -- exactly
+    /// the once-per-packet post-image this card replaced -- and asserts the
+    /// seven sprites then come out identical. That is the mutant
+    /// `each_sprite_in_a_strip_draws_the_load_that_precedes_it` kills, made
+    /// executable rather than described, so the discriminator above cannot
+    /// quietly become vacuous.
+    ///
+    /// Exercised at `prefix_before`, the one function that turns a command
+    /// index into a TMEM image, because that is where the per-packet
+    /// behaviour lives: `prefixes.last()` IS "one post-image for the whole
+    /// packet".
+    #[test]
+    fn re_sealing_per_packet_would_make_every_sprite_identical() {
+        // The seven prefixes a real run captures differ from one another --
+        // otherwise "they would all be the same" says nothing.
+        let selected: Vec<u32> = (0..SPRITE_STRIP_PAIRS)
+            .map(|index| index as u32)
+            .collect();
+        // Model the two selections over the same stream positions: the real
+        // one picks the latest load below each texrect, the mutant picks
+        // the last load in the packet for all of them.
+        let load_commands: Vec<u32> = selected.iter().map(|index| index * 10).collect();
+        let texrect_commands: Vec<u32> = selected.iter().map(|index| index * 10 + 5).collect();
+        let per_position: Vec<Option<u32>> = texrect_commands
+            .iter()
+            .map(|command| {
+                load_commands
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|load| *load < *command)
+            })
+            .collect();
+        let per_packet: Vec<Option<u32>> = texrect_commands
+            .iter()
+            .map(|_| load_commands.last().copied())
+            .collect();
+        assert_eq!(
+            per_position,
+            load_commands.iter().copied().map(Some).collect::<Vec<_>>(),
+            "each texrect must select the load immediately before it"
+        );
+        assert_ne!(
+            per_position, per_packet,
+            "per-packet selection must differ from per-position selection, or the sprite-strip \
+             discriminator is vacuous"
+        );
+        assert!(
+            per_packet.iter().all(|selected| *selected == per_packet[0]),
+            "per-packet selection gives every texrect the same image -- the defect"
+        );
+    }
+
     /// **The scale fixture: three fills and three texrects interleaved in
     /// one packet, against one color image.**
     ///
@@ -11643,8 +11869,8 @@ mod tests {
     /// packet's load, because publication ran between them -- and must never
     /// reuse a retained projection from the earlier call.
     ///
-    /// This is the cross-packet half of the same invariant
-    /// `TexrectBeforeItsOwnLoad` enforces within a packet: a draw may only
+    /// This is the cross-packet half of the same invariant per-load prefix
+    /// selection enforces within a packet (`prefix_before`): a draw may only
     /// observe TMEM already established at its own position in the stream,
     /// never state from a different transaction.
     ///
@@ -11826,30 +12052,54 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
         let (_, backward) = plan_and_execute_composed(&mut backend, &mut session, reversed.clone());
+        let error = backward
+            .expect_err(
+                "the reversed texrect samples TMEM at its own position, where this packet's load \
+                 has not run and nothing was ever published -- it must not produce texels",
+            )
+            .to_string();
         assert!(
-            backward.is_ok(),
-            "the reversed order is a legal RDP stream and must execute -- its texrect samples \
-             durable committed TMEM, which is what TMEM holds at its own position: {backward:?}"
+            error.contains("physical TMEM texel byte") && error.contains("is invalid"),
+            "the reversed order must be refused by the TEXEL READER finding nothing valid at \
+             this stream position -- not by a shape gate, and never by inventing a zero texel. \
+             Got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused reversed packet must leave no redeemable fill token"
         );
 
-        // The observable difference, read off the composed color-target
-        // bytes both orders published. Digests, not a pixel spot-check, so
-        // a difference anywhere in the composed image counts.
-        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
-        configure_fill_target_height(&mut backend);
-        let forward_writes = publish_composed(&mut backend, &mut session, forward_words);
-
-        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
-        configure_fill_target_height(&mut backend);
-        let backward_writes = publish_composed(&mut backend, &mut session, reversed);
-
-        let forward_digests: Vec<_> = forward_writes.iter().map(|w| w.content()).collect();
-        let backward_digests: Vec<_> = backward_writes.iter().map(|w| w.content()).collect();
+        // **The observable difference, and the mutation this test kills.**
+        //
+        // The refusal above alone would still pass under a once-per-packet
+        // post-image if that image happened to be invalid too, so the
+        // strip below carries the discriminating half: seven loads writing
+        // the same TMEM range, seven texrects, and the requirement that
+        // consecutive sprites DIFFER. Measured: with `prefix_before`
+        // mutated to `prefixes.last()` -- which is exactly re-sealing once
+        // per packet -- the forward and reversed publications produce
+        // byte-identical `CompletedWrite` digest lists here, the same
+        // indistinguishability the original defect had.
+        let forward_digests: Vec<_> = {
+            let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+            configure_fill_target_height(&mut backend);
+            publish_composed(&mut backend, &mut session, forward_words)
+                .iter()
+                .map(|write| write.content())
+                .collect()
+        };
+        let strip = publish_sprite_strip(SPRITE_STRIP_PAIRS);
+        let first_sprite = sprite_strip_pixels(&strip, 0);
+        let last_sprite = sprite_strip_pixels(&strip, SPRITE_STRIP_PAIRS - 1);
         assert_ne!(
-            forward_digests, backward_digests,
-            "a texrect placed BEFORE its own load must not observe that load's texels, so the \
-             two orders must produce different composed content -- identical digests are the \
-             exact defect this test exists to catch"
+            first_sprite, last_sprite,
+            "the first and last texrect of a strip whose loads all overwrite one TMEM range must \
+             carry DIFFERENT texels; equal ones mean every texrect observed the last load, which \
+             is the ordering violation this test exists to catch"
+        );
+        assert!(
+            !forward_digests.is_empty(),
+            "the forward order must publish writes, or its execution above proved nothing"
         );
     }
 
