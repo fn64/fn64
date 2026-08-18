@@ -264,7 +264,8 @@ which is a harness artifact and not a port finding.
 
 - **10 consecutive identical comparison runs.** All ten report the same
   three histogram lines and the same 100,235-pixel diff.
-- **Mutation-tested, 8 mutants, 7 kills, 1 proven equivalent.**
+- **Mutation-tested, 16 mutants, 15 kills, 1 proven equivalent** (8 on the
+  blender, 8 on §8's stages).
   - *Killed*: skip the blend stage (3 tests); swap the blend source and
     destination operands (15); truncate instead of round in the composite
     (8); apply a blend to the fill executor too (19) — the fills already
@@ -280,6 +281,18 @@ which is a harness artifact and not a port finding.
     survived a round-trip test, because `write_pixel`'s `>> 3` recovers the
     same five bits either way; it is now pinned against the fill
     executor's own decode (5-bit 27 → 222, not 216).
+  - *Stage mutants, all killed*: skip the alpha-compare gate; make it
+    strict (`>` for `>=`) at the threshold boundary; skip coverage-to-alpha;
+    swap `CVG_X_ALPHA` with `ALPHA_CVG_SEL`; skip alpha dither; move the
+    noise-dither threshold off its proven endpoint; admit the reserved
+    `G_AC` encoding; admit `cvg_dst = Save`.
+  - *Two more reach gaps found and fixed the same way.* Skipping
+    coverage-to-alpha survived a `CVG_X_ALPHA`-with-zero-alpha witness,
+    because a zero alpha makes the blend a pure destination pass-through and
+    the stored halfword was unchanged either way; `ALPHA_CVG_SEL` separates
+    them (5-bit 31 with the stage, 8 without). Skipping alpha dither
+    survived until the ordered `MagicSquare` arm was exercised **through the
+    pixel loop** rather than through `apply_alpha_dither` alone.
   - *Equivalent, with proof*: reading the blend destination from the
     caller's `resident_bytes` instead of the buffer being written. `offset`
     is injective in `(row, column)` over the loop's range, so each byte
@@ -293,11 +306,11 @@ which is a harness artifact and not a port finding.
   commands, 19 opcodes, 60 `G_FILLRECT`, 60 `G_TEXRECT`) run before the
   comparison, and a fixture trimmed to 3/4 of its entry-0 rows was measured
   as failing them.
-- **Workspace**: 8,294 passed / 13 skipped before, **8,307 / 13 after**
-  (thirteen new tests). Measured in this worktree at `3817911f`, not
-  quoted.
+- **Workspace**: 8,294 passed / 13 skipped before, **8,307 after the
+  blender** and **8,319 after §8's three stages** (twenty-five new tests
+  in total). Measured in this worktree at `3817911f`, not quoted.
 - **Release profile** (`RUSTFLAGS="-C debug-assertions=off"`): 8,294 before
-  and 8,307 after, identical to debug in both directions. The test *set* is
+  and 8,319 after, identical to debug in both directions. The test *set* is
   also identical across profiles (`cargo nextest list`, 2,626 lines each,
   diff empty apart from the build-time line), so no count here is
   profile-dependent.
@@ -345,15 +358,74 @@ the blender's `M = Framebuffer` arm, and says nothing about texture
 sampling, triangles, or the 152 of 218 frames the census measured as
 carrying triangles. Entries 1–3 were not compared.
 
+---
+
+## 8. The other three post-combiner stages, and why this comparison does not validate them
+
+A follow-on commit wired **alpha compare, alpha dither and coverage** into
+the same executor, so three of the four stages its header declared absent
+now run. The pixel diff **did not move**: still 100,235.
+
+That is the expected result, and it is the reason this section exists rather
+than a claim of broader validation. Measured across **all four captured
+entries** (315 texrects), every one latches the identical mode:
+
+| stage | latched value | exercised here? |
+|---|---|---|
+| alpha compare | `G_AC_NONE` (low bits 0:1 = 0) | **no** — the gate always passes |
+| `CVG_X_ALPHA` / `ALPHA_CVG_SEL` | both clear | **no** — coverage never touches colour |
+| alpha dither | `Noise` (high bits 4:5 = 2) | yes, and it is §1's residual |
+| RGB dither | `Disabled` (high bits 6:7 = 3) | no |
+
+**So this oracle comparison would not detect a defect in the alpha-compare
+gate or the coverage-alpha interaction at all.** Their evidence is
+hand-derived characterization plus mutation testing
+(`fragment_stage_tests`), not this differential, and the card says so rather
+than letting one number imply four validations.
+
+**Two deliberate non-ports, both blocked on evidence rather than effort.**
+
+- **RGB dither is not run.** The workspace's two ports disagree on the Bayer
+  table at 8 of 16 cells — already pinned by `rgb_dither.rs`'s own
+  `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells` — and
+  on the arithmetic at every input where `(channel & 7)` straddles the
+  threshold: RT64 computes `min(channel + threshold, 255) >> 3`, the
+  reference `if (channel & 7) > threshold { (channel & !7) + 8 }`. Witness:
+  channel 1 at threshold 0 gives 5-bit 0 under one and 1 under the other.
+  Refusing outright was measured and rejected — encoding 0 is `MagicSquare`,
+  the power-on default this crate's own fixtures latch, so a refusal would
+  decline packets that execute correctly today.
+- **`G_AC_DITHER` is refused by name.** A gate has no bounded-interval
+  argument, so no endpoint substitutes for the missing sequence.
+
+**The `Noise` dither modes run at a proven endpoint, not a guess.** Over all
+256 alpha values the mode's output set is exactly `{floor, floor + 1}` in
+the five-bit channel — asserted exhaustively — and the maximum 3-bit
+threshold selects `floor`. The executor's constant is therefore a member of
+the mode's real output range rather than a third value between the two.
+This is disclosed in the module's Nonclaims, not presented as parity.
+
+**The `blend_cycle_count` hazard, settled.**
+`rt64_blender_analysis::blend_cycle_count` and
+`BlendModeState::cycle_count` disagree numerically for every
+non-`FORCE_BL` mode, and **neither is wrong**: the former counts cycles that
+*actually blend* (its consumers are the `uses_*` predicates, and a bypassed
+last cycle reads only `P`), the latter counts *loop iterations* (the loop
+handles the bypass internally and must still visit the cycle to resolve
+`P`). Both are faithful ports of differently-purposed upstream functions.
+Pinned, with the reconciliation, in
+`the_two_cycle_counts_disagree_by_design_and_the_reason_is_pinned`. It is
+unreachable for this packet in any case — `FORCE_BL` is set, where the two
+agree.
+
+---
+
 **Nonclaims.** The oracle was not adjusted, and neither implementation was
 tuned toward the other. No hardware comparison was made and no claim of
-hardware correctness is made for either side, on the blender or on the
-dither. Alpha compare, dither and coverage remain unimplemented in the CPU
-texrect executor and are declared so in its header; of those, **only dither
-is exercised by this packet**, and it is the residual measured above —
-`ALPHA_COMPARE` is `G_AC_NONE` and both `CVG_X_ALPHA` and `ALPHA_CVG_SEL`
-are clear in `0x005041c8`, so this comparison would not detect a defect in
-either of those two stages. The port's TMEM/TLUT sampler is neither
-validated nor faulted — this packet does not exercise it. No claim is made
-about entries 1–3, about frames carrying triangles, or about any other
-title.
+hardware correctness is made for either side, on any stage. **RGB dither is
+not implemented** and is declared so in the executor's header; alpha
+compare, alpha dither and coverage are implemented but **not validated by
+this comparison** (§8). The port's TMEM/TLUT sampler is neither validated
+nor faulted — this packet does not exercise it. No claim is made about
+entries 1–3, about frames carrying triangles, or about any other title. No
+`repr(C)`, size, alignment or ABI claim is made.
