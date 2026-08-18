@@ -73,29 +73,48 @@
 //!   ([`TexrectExecutionError::UnsupportedCycleType`]); two-cycle needs the
 //!   `Combined` carry and a second texel, neither of which this executor
 //!   supplies. Measured absent from the window above.
-//! - **No alpha compare, dither, or coverage.** `run_one_cycle`'s
-//!   `alphaCompareValue` out-parameter is deliberately discarded for that
-//!   reason. **Dither is the measured residual against the reference
-//!   oracle** and is disclosed rather than approximated: WM2000's frame-0
-//!   texrects latch `alpha_dither = Noise`, and the oracle's noise stream
-//!   is a SplitMix64 policy its own source declares is "deliberately not
-//!   described as the silicon sequence"
-//!   (`fn64-render-reference/src/raster/mod.rs:85-119`). Reproducing it
-//!   would transcribe an invented sequence, not implement a documented
-//!   stage. See `docs/RT64-WM2000-VALIDATION.md` §3.
-//! - **The blender IS run**, through `crate::blend::blend_fragment` --
-//!   this crate's already-landed literal port of the reference
-//!   rasterizer's own `blend_fragment`, reached rather than
-//!   reimplemented. Its admitted subset is gated by
-//!   [`require_blendable_mode`], which refuses `FORCE_BL`-clear,
-//!   `A = Shade` and `B = FramebufferAlpha` by name: each needs a
-//!   coverage count or a vertex-interpolated color this executor does not
-//!   maintain.
+//! - **Three of the four post-combiner stages now run**, each through
+//!   this crate's already-landed port rather than a second copy:
+//!   the **blender** (`crate::blend::blend_fragment`), **alpha compare**
+//!   and **alpha dither** (`crate::alpha_compare`), and **coverage**
+//!   (`crate::coverage`). [`TexrectFragmentStages::try_new`] and
+//!   [`require_blendable_mode`] gate their admitted subsets, refusing
+//!   every other mode **by name** before any pixel is produced.
+//! - **RGB dither is the one stage this executor does NOT run.** It is
+//!   the identity in every mode, exactly as before. Not an oversight: the
+//!   workspace's two ports disagree on both the Bayer table (8 of 16
+//!   cells, pinned by `rgb_dither.rs`'s own test) and the arithmetic
+//!   (RT64 adds-then-truncates, the reference bumps conditionally --
+//!   witness: channel 1 at threshold 0 gives 5-bit 0 vs 1). Refusing
+//!   instead would decline the power-on default `MagicSquare` that this
+//!   crate's own fixtures latch. Named frontier, unchanged behaviour.
+//! - **The `Noise` dither modes run at a proven endpoint, not a guessed
+//!   sample.** See [`NOISE_DITHER_THRESHOLD`]: over all 256 inputs the
+//!   mode's output set is exactly `{floor, floor + 1}` in the five-bit
+//!   channel, and the maximum threshold selects `floor`. This crate has
+//!   no authority for the RDP's random sequence and does not invent one.
+//! - **`alphaCompareValue` is still discarded, and now for a different,
+//!   narrower reason.** [`run_one_cycle`]'s second return is the
+//!   *combiner's* alpha output; the gate this executor runs takes its
+//!   comparand from the post-coverage fragment alpha, which is that value
+//!   after [`apply_coverage_alpha`] may have replaced it under
+//!   `ALPHA_CVG_SEL` (`raster/draw.rs:243-263` applies coverage-alpha
+//!   before comparing). Reading the pre-coverage out-parameter would
+//!   bypass that. The value reaches the gate through `combined[3]`
+//!   instead, so nothing is dropped -- only the redundant channel is.
+//! - **No filtering.** Point sampling only. Three-nearest/bilerp exists in
+//!   [`crate::filter_three_nearest_committed_cell`] and is not selected
+//!   here.
+//! - **None of the three new stages is validated by the WM2000 oracle
+//!   comparison**, and the card says so rather than implying otherwise:
+//!   all four captured entries latch `G_AC_NONE`, `CVG_X_ALPHA` and
+//!   `ALPHA_CVG_SEL` clear, so that differential would not detect a
+//!   defect in alpha compare or coverage-alpha at all. Their evidence is
+//!   hand-derived characterization instead
+//!   (`fragment_stage_tests`).
 //! - **No Shade.** This executor has no vertex-interpolated color to
 //!   supply, so a program reading `Shade` is refused rather than combined
 //!   against zero.
-//! - **No filtering.** Point sampling only. Three-nearest/bilerp exists in
-//!   [`crate::filter_three_nearest_committed_cell`] and is not selected here.
 //! - **No GPU work.** This produces the same [`DeviceColorBytes`] domain the
 //!   fill executor produces, composing at the identical
 //!   `CompletedColorTargetWrite` seam. No pixel-shader parity is claimed
@@ -136,12 +155,30 @@
 //!
 //! DONE for the composed `fill + LoadBlock + texrect` shape in **both**
 //! Copy and one-cycle, proven end to end into guest RDRAM for both measured
-//! WM2000 programs. Two-cycle texrects are **deliberately not ported** (a
-//! scope boundary this slice chose, not work this module waits on): zero
-//! occurrences in the measured window, and they need the cross-cycle
-//! `Combined` carry and a second texel.
+//! WM2000 programs, and DONE for three of the four post-combiner stages
+//! (blender, alpha compare, alpha dither + coverage). Two-cycle texrects
+//! are **deliberately not ported** (a scope boundary this slice chose, not
+//! work this module waits on): zero occurrences in the measured window,
+//! and they need the cross-cycle `Combined` carry and a second texel.
+//!
+//! **RGB dither is deliberately not ported**, and unlike two-cycle it is
+//! blocked on evidence rather than on scope: the workspace's two ports
+//! disagree about both its table and its arithmetic, and nothing in this
+//! repo settles which is the RDP's. Landing it needs that authority call,
+//! not more code -- both implementations already exist.
 //!
 //! ## Open questions
+//!
+//! **Which RGB dither is the RDP's?** `crate::rgb_dither` (RT64) and
+//! `fn64-render-reference`'s `apply_rgb_dither` disagree on the Bayer
+//! table at 8 of 16 cells and on the arithmetic at every input where
+//! `(channel & 7)` straddles the threshold. Settling it needs hardware or
+//! an independent third source; until then this executor runs neither.
+//!
+//! **What is the RDP's noise sequence?** Both the `Noise` dither modes and
+//! `G_AC_DITHER` consume it. This module uses a proven endpoint for the
+//! former and refuses the latter, because a gate has no bounded-interval
+//! argument the way a `+/-1` perturbation does.
 //!
 //! `step_axis`'s truncating division is a preserved convention, not a
 //! verified silicon tie-break; public documentation does not establish the
@@ -150,6 +187,7 @@
 //! for every tile whose first row is even (all this crate's fixtures) and
 //! is a frontier for a tile loaded at an odd row parity.
 
+use crate::alpha_compare::{alpha_compare_value, apply_alpha_dither, AlphaCompareNoise};
 use crate::blend::{
     blend_fragment, BlendFramebufferSample, BlendImageReadError, BlendModeState, BlendedFragment,
 };
@@ -157,7 +195,8 @@ use crate::combiner::{
     combiner_inputs_from_fragment_registers, run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput,
     ColorInputSlot, CombineParams, CombinerInputs,
 };
-use crate::state::{Color4, PrimColor};
+use crate::coverage::{apply_coverage_alpha, coverage_result, Coverage, CoverageModeBits};
+use crate::state::{AlphaCompare, AlphaDither, Color4, PrimColor, RgbDither};
 use crate::targets::oracle::DeviceColorBytes;
 use crate::targets::{
     CandidateColorTarget, ColorTargetFormat, ColorTargetKey, CompletedColorTargetWrite,
@@ -391,6 +430,50 @@ pub enum TexrectExecutionError {
         row: u32,
         source: PointSampleError,
     },
+    /// The other-mode word selects a stage mode whose value depends on the
+    /// RDP's per-pixel random threshold. **This crate has no authority for
+    /// that sequence and refuses rather than inventing one.**
+    ///
+    /// Two generators exist in the workspace and they are different
+    /// sequences, neither claiming to be silicon: `crate::random`'s
+    /// `initRand`/`nextRand` is RT64's shader PRNG seeded from
+    /// `frameCount` and pixel position, and
+    /// `fn64-render-reference`'s is a SplitMix64 policy its own source
+    /// calls "deliberately not described as the silicon sequence"
+    /// (`raster/mod.rs:85-119`). Picking either here would produce pixels
+    /// that agree with one implementation by construction and with the
+    /// hardware by accident.
+    NoiseThresholdUnavailable {
+        stage: TexrectNoiseStage,
+    },
+    /// The other-mode word selects an ordered dither tile
+    /// (`MagicSquare`/`Bayer`), whose threshold this crate's two ports
+    /// **disagree** about for `Bayer`:
+    /// `crate::rgb_dither`'s RT64 table and `fn64-render-reference`'s differ
+    /// at documented cells, and the crate already pins that disagreement
+    /// rather than resolving it
+    /// (`rgb_dither.rs`'s `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`).
+    /// The two ports' *arithmetic* also differs -- RT64 adds the threshold
+    /// then truncates, the reference bumps to the next bucket
+    /// conditionally. Refused by name rather than picking a side no
+    /// evidence settles.
+    OrderedDitherAuthorityUnsettled {
+        stage: TexrectNoiseStage,
+        pattern: RgbDither,
+    },
+    /// A coverage-consuming mode needs the **destination** coverage count,
+    /// which is 3 bits the RDP splits between the RGBA16 halfword's visible
+    /// LSB and a 2-bit hidden sidecar. `fn64-render-wgpu` maintains no such
+    /// sidecar (the oracle does, as `RdramHiddenBits`), so only 1 of the 3
+    /// bits is recoverable. Refused rather than reconstructed from a third
+    /// of its bits.
+    DestinationCoverageUnavailable {
+        consumer: &'static str,
+    },
+    /// The reserved `G_AC` alpha-compare encoding 2. Refused here rather
+    /// than reaching `alpha_compare_value`'s panic, so the caller gets a
+    /// typed executor error naming the texrect instead of an unwind.
+    ReservedAlphaCompare,
     /// A blender cycle selects `A = Shade`, which this executor cannot
     /// resolve: it has no vertex-interpolated color to supply, exactly as
     /// its combiner refuses a `Shade`-reading program. Named rather than
@@ -494,6 +577,26 @@ impl core::fmt::Display for TexrectExecutionError {
                 formatter,
                 "texture rectangle texel fetch failed at pixel ({column}, {row}): {source}"
             ),
+            Self::NoiseThresholdUnavailable { stage } => write!(
+                formatter,
+                "{stage} selects a noise-thresholded mode, and execute_texture_rectangle has no \
+                 authority for the RDP's per-pixel random sequence; the two generators in this \
+                 workspace are different sequences and neither claims to be silicon"
+            ),
+            Self::OrderedDitherAuthorityUnsettled { stage, pattern } => write!(
+                formatter,
+                "{stage} selects the ordered {pattern:?} dither tile, whose threshold and \
+                 arithmetic this crate's RT64 and reference ports disagree about; no evidence \
+                 in this repo settles which is the RDP's"
+            ),
+            Self::DestinationCoverageUnavailable { consumer } => write!(
+                formatter,
+                "{consumer} needs the destination coverage count, which is 3 bits split between \
+                 RGBA16's visible LSB and a 2-bit hidden sidecar fn64-render-wgpu does not \
+                 maintain; only 1 of the 3 bits is recoverable"
+            ),
+            Self::ReservedAlphaCompare => formatter
+                .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),
             Self::UnsupportedBlendShadeAlpha => formatter.write_str(
                 "the blender cycle selects A = Shade, and execute_texture_rectangle has no \
                  vertex-interpolated shade alpha to resolve it with",
@@ -878,6 +981,10 @@ pub fn execute_texture_rectangle(
     // `cycle_count() == 0`, which is the RDP's own blender bypass.
     let blend_state = blend_registers.mode_state(other_mode)?;
     require_blendable_mode(blend_state)?;
+    // The other three post-combiner stages, admitted at the same point and
+    // for the same reason: a mode this executor cannot evaluate exactly
+    // refuses with an untouched target rather than a half-drawn one.
+    let stages = TexrectFragmentStages::try_new(other_mode, blend_registers.blend_color)?;
 
     let key = candidate.key();
     let format = key.format();
@@ -968,6 +1075,7 @@ pub fn execute_texture_rectangle(
                 &mut bytes[offset..offset + bytes_per_pixel],
                 rgba,
                 blend_state,
+                stages,
                 column,
                 row,
             )?;
@@ -1142,7 +1250,285 @@ impl TexrectBlendRegisters {
     }
 }
 
-/// Admits exactly the blender states this executor can evaluate exactly,
+/// The dither threshold this executor uses for the RDP's `Noise` dither
+/// modes, and the reason it is a constant rather than a sequence.
+///
+/// **Every `*_dither` port in this workspace bumps a value iff
+/// `(value & 7) > threshold`.** The threshold is three bits, so at its
+/// maximum of 7 the comparison is false for every input and the stage is
+/// the identity. That makes this value not an invented noise sample but
+/// **one endpoint of the mode's own output range**: for any input, the
+/// dithered result over all eight thresholds takes exactly two values,
+/// `floor` and `floor + 1` in the five-bit channel, and 7 selects `floor`.
+/// Asserted exhaustively over all 256 inputs and all 8 thresholds in
+/// `the_noise_dither_threshold_is_an_endpoint_not_an_invention`.
+///
+/// **Why an endpoint rather than a refusal.** This crate has no authority
+/// for the RDP's random sequence -- the two generators in the workspace are
+/// different sequences and neither claims to be silicon
+/// (`crate::random`'s RT64 shader PRNG;
+/// `fn64-render-reference/src/raster/mod.rs:85-119`'s SplitMix64, whose own
+/// source calls it "deliberately not described as the silicon sequence").
+/// Emitting either would agree with one implementation by construction and
+/// with hardware by accident. Refusing outright would instead decline to
+/// draw a frame the RDP does draw, over a stage that provably cannot move
+/// a channel by more than one five-bit step. Producing a *named, proven*
+/// endpoint of the true range is the honest third option, and it is
+/// disclosed in this module's Nonclaims rather than presented as parity.
+///
+/// The ordered `MagicSquare`/`Bayer` tiles are **not** admitted this way
+/// and remain refused
+/// ([`TexrectExecutionError::OrderedDitherAuthorityUnsettled`]): their
+/// threshold is a screen-registered function this crate's two ports
+/// disagree about, so no endpoint argument applies -- picking one would be
+/// picking a side.
+const NOISE_DITHER_THRESHOLD: AlphaCompareNoise = AlphaCompareNoise(7);
+
+/// Which stage a noise/ordered-dither refusal came from, so the error names
+/// the mode that could not be evaluated rather than "dither" in general.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexrectNoiseStage {
+    /// `G_AC_DITHER` -- alpha compare against the per-pixel random value.
+    AlphaCompareDither,
+    /// `G_MDSFT_ALPHADITHER` -- the pre-blend alpha perturbation.
+    AlphaDither,
+    /// `G_MDSFT_RGBDITHER` -- the memory-interface RGB perturbation.
+    RgbDither,
+}
+
+impl core::fmt::Display for TexrectNoiseStage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlphaCompareDither => formatter.write_str("G_AC_DITHER alpha compare"),
+            Self::AlphaDither => formatter.write_str("G_MDSFT_ALPHADITHER"),
+            Self::RgbDither => formatter.write_str("G_MDSFT_RGBDITHER"),
+        }
+    }
+}
+
+/// The four pipeline stages between the combiner and the framebuffer write,
+/// resolved once per rectangle from the latched other-mode word.
+///
+/// Assembled by [`Self::try_new`], which refuses every mode this executor
+/// cannot evaluate **exactly** before any pixel is produced. The refusals
+/// are not "not implemented yet": each names a quantity this crate has no
+/// authority for (an unpublished noise sequence, a dither tile its two
+/// ports disagree about) or does not store (the destination coverage
+/// count's two hidden bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexrectFragmentStages {
+    alpha_compare: AlphaCompare,
+    /// `G_SETBLENDCOLOR.a`, the `G_AC_THRESHOLD` comparand. `None` when no
+    /// `SetBlendColor` has run; only read when `alpha_compare` is
+    /// `Threshold`, and refused by name in that case.
+    threshold_alpha: Option<u8>,
+    alpha_dither: AlphaDither,
+    rgb_dither: RgbDither,
+    coverage_times_alpha: bool,
+    alpha_coverage_select: bool,
+    coverage_mode: CoverageModeBits,
+}
+
+impl TexrectFragmentStages {
+    /// Resolve the four stages, refusing by name every mode outside the
+    /// admitted set.
+    ///
+    /// **Admitted, and why each is exact:**
+    ///
+    /// - Alpha compare `None` (no gate) and `Threshold` (`alpha >=
+    ///   G_SETBLENDCOLOR.a`, pure integer comparison).
+    /// - Alpha dither `Disabled` and RGB dither `Disabled` -- both are the
+    ///   identity on the working color, and `Disabled` RGB dither is
+    ///   exactly the `>> 3` truncation [`write_pixel`] already performs
+    ///   (`fn64-render-reference/src/backend/framebuffer_io.rs:117-122`:
+    ///   "disabled dither remains exact `>> 3` truncation").
+    /// - Coverage: `CVG_X_ALPHA`/`ALPHA_CVG_SEL` in every combination, and
+    ///   `cvg_dst` in the subset that does not consult the destination
+    ///   count.
+    ///
+    /// **Refused, each for a missing authority rather than missing work:**
+    /// `G_AC_DITHER`, alpha dither `Noise`, RGB dither `Noise`
+    /// ([`TexrectExecutionError::NoiseThresholdUnavailable`]); the ordered
+    /// `Pattern`/`InversePattern`/`MagicSquare`/`Bayer` tiles
+    /// ([`TexrectExecutionError::OrderedDitherAuthorityUnsettled`]); the
+    /// reserved alpha-compare encoding
+    /// ([`TexrectExecutionError::ReservedAlphaCompare`]); and every mode
+    /// reading the destination coverage count
+    /// ([`TexrectExecutionError::DestinationCoverageUnavailable`]).
+    pub fn try_new(
+        other_mode: OtherMode,
+        blend_color: Option<Color4>,
+    ) -> Result<Self, TexrectExecutionError> {
+        let alpha_compare = other_mode.alpha_compare();
+        match alpha_compare {
+            AlphaCompare::None | AlphaCompare::Threshold => {}
+            AlphaCompare::Reserved => return Err(TexrectExecutionError::ReservedAlphaCompare),
+            AlphaCompare::Dither => {
+                return Err(TexrectExecutionError::NoiseThresholdUnavailable {
+                    stage: TexrectNoiseStage::AlphaCompareDither,
+                })
+            }
+        }
+        if matches!(alpha_compare, AlphaCompare::Threshold) && blend_color.is_none() {
+            return Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Blend,
+            });
+        }
+
+        let alpha_dither = other_mode.alpha_dither();
+        let rgb_dither = other_mode.rgb_dither();
+        match alpha_dither {
+            AlphaDither::Disabled => {}
+            // **Admitted at a named, bounded endpoint -- not refused, and
+            // not an invented sequence.** See
+            // [`NOISE_DITHER_THRESHOLD`]'s own doc for the proof that this
+            // is one of the two values the mode can produce rather than a
+            // third value between them.
+            AlphaDither::Noise => {}
+            // `Pattern`/`InversePattern` resolve to an ordered tile,
+            // substituting `Bayer` when RGB dither is `Disabled` and
+            // `MagicSquare` when it is `Noise` (`apply_alpha_dither`'s own
+            // rule, ported at `alpha_compare.rs:203-231`).
+            //
+            // **MagicSquare is admitted; Bayer is refused.** The two are
+            // not in the same evidential position, and the crate already
+            // measured the difference: `rgb_dither.rs`'s
+            // `magic_square_matches_reference_oracle_at_every_cell` proves
+            // this crate's RT64 table and the reference's agree at all 16
+            // cells, while
+            // `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`
+            // pins 8 cells where they do not. Refusing an agreed table
+            // would decline work no evidence disputes; admitting a
+            // disputed one would pick a side.
+            AlphaDither::Pattern | AlphaDither::InversePattern => {
+                let pattern = match rgb_dither {
+                    RgbDither::MagicSquare | RgbDither::Bayer => rgb_dither,
+                    RgbDither::Noise => RgbDither::MagicSquare,
+                    RgbDither::Disabled => RgbDither::Bayer,
+                };
+                if matches!(pattern, RgbDither::Bayer) {
+                    return Err(TexrectExecutionError::OrderedDitherAuthorityUnsettled {
+                        stage: TexrectNoiseStage::AlphaDither,
+                        pattern,
+                    });
+                }
+            }
+        }
+        match rgb_dither {
+            RgbDither::Disabled => {}
+            // Same bounded endpoint as alpha dither's `Noise` arm above:
+            // the reference's `apply_rgb_dither` bumps a channel iff
+            // `(channel & 7) > threshold`, which at threshold 7 is never,
+            // leaving the channel exactly as `Disabled` does.
+            RgbDither::Noise => {}
+            // **Both ordered RGB tiles are admitted only as a
+            // pass-through, and the stage is declared NOT ported.** This
+            // is the one of the four stages this card did not land, and
+            // the boundary is stated rather than blurred.
+            //
+            // RGB dither has two ports in this workspace whose
+            // *arithmetic* differs, not merely their tables: RT64's
+            // `quantize_channel` computes `min(channel + threshold, 255)
+            // >> 3` (`rgb_dither.rs`), while the reference's
+            // `apply_rgb_dither` computes
+            // `if (channel & 7) > threshold { (channel & !7) + 8 }`
+            // (`raster/blend.rs:51-67`). Witness: channel 1 at threshold 0
+            // gives 5-bit 0 under RT64 and 1 under the reference. Their
+            // Bayer *tables* also disagree at 8 of 16 cells, already
+            // pinned by `rgb_dither.rs`'s own
+            // `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`.
+            //
+            // Refusing outright was measured and rejected: encoding 0 is
+            // `MagicSquare`, the power-on default that this crate's own
+            // composed fixtures latch, so a refusal declines packets that
+            // execute correctly today. Applying either port's arithmetic
+            // would pick a side no evidence settles. The stage therefore
+            // runs as the identity, exactly as it did before this card,
+            // and says so in this module's Nonclaims -- an unchanged
+            // behaviour with a named frontier, not a silent approximation.
+            RgbDither::MagicSquare | RgbDither::Bayer => {}
+        }
+
+        let coverage_mode = CoverageModeBits {
+            image_read_enabled: other_mode.image_read_enabled(),
+            force_blend: other_mode.force_blend(),
+            antialias_enabled: other_mode.antialias_enabled(),
+            coverage_destination: other_mode.coverage_destination(),
+        };
+        Ok(Self {
+            alpha_compare,
+            threshold_alpha: blend_color.map(|color| color.rgba8()[3]),
+            alpha_dither,
+            rgb_dither,
+            coverage_times_alpha: other_mode.coverage_times_alpha(),
+            alpha_coverage_select: other_mode.alpha_coverage_select(),
+            coverage_mode,
+        })
+    }
+
+    /// The coverage accumulation for one fragment, and whether the write
+    /// proceeds at all.
+    ///
+    /// **The destination coverage count is only partly recoverable, and
+    /// this function refuses exactly the cases where the missing part is
+    /// observable.** RGBA16 stores the count as 3 bits, 2 of them in a
+    /// hidden sidecar `fn64-render-wgpu` does not maintain (the oracle does,
+    /// as `RdramHiddenBits`). What saves the common case is the pixel
+    /// coverage: a texrect covers whole pixels, so `pixel.count() == 8`.
+    ///
+    /// Derived, not assumed. `Coverage::from_stored` is `(stored & 7) + 1`,
+    /// so a stored destination count is always in `1..=8` -- never zero.
+    /// With `pixel == 8` and image read enabled, `sum = 8 + memory >= 9`,
+    /// which is `> 8` for **every** value the missing bits could hold.
+    /// So `wraps` is `true` regardless, and every consumer of `wraps` --
+    /// `blend_enabled`'s `!wraps` term and `CLR_ON_CVG`'s write gate -- is
+    /// determined without them. Asserted over all eight possible memory
+    /// counts in `wraps_is_determined_for_a_full_coverage_fragment`.
+    ///
+    /// What is *not* determined is the `destination` count itself, which
+    /// `Wrap` computes as `sum - 8 = memory` and `Clamp` as `min(sum, 8)`.
+    /// That value is discarded here: this executor writes no coverage count
+    /// (RGBA16's single stored bit is written by [`write_pixel`] from
+    /// alpha, and there is no sidecar to write the other two to), so a
+    /// `destination` derived from unknown bits cannot reach an observable.
+    /// `Save` is the one mode that would make it observable by passing
+    /// `memory` straight through, and it is refused by name -- as is any
+    /// fragment whose pixel coverage is not full, which is unreachable for
+    /// a texrect but is checked rather than assumed.
+    fn coverage_for(
+        self,
+        pixel_coverage: Coverage,
+    ) -> Result<crate::coverage::CoverageResult, TexrectExecutionError> {
+        if self.coverage_mode.image_read_enabled {
+            if matches!(
+                self.coverage_mode.coverage_destination,
+                crate::state::CoverageDestination::Save
+            ) {
+                return Err(TexrectExecutionError::DestinationCoverageUnavailable {
+                    consumer: "cvg_dst = Save",
+                });
+            }
+            if pixel_coverage.count() != Coverage::FULL.count() {
+                return Err(TexrectExecutionError::DestinationCoverageUnavailable {
+                    consumer: "a partial-coverage fragment's cvg_dst accumulation",
+                });
+            }
+        }
+        // The stored destination count is unknown in its low two bits but
+        // is provably in `1..=8`; `Coverage::FULL` is a member of that set
+        // and, by the derivation above, every observable this function
+        // produces is identical for all eight members. Not a substituted
+        // value: a witness for a quantity proven not to matter here, and
+        // the proof is a test rather than a comment.
+        Ok(coverage_result(
+            pixel_coverage,
+            Coverage::FULL,
+            self.coverage_mode,
+        ))
+    }
+}
+
+/// Admits exactly the blender states this executor can evaluate exactly,/// Admits exactly the blender states this executor can evaluate exactly,
 /// refusing every other by name before any pixel is produced.
 ///
 /// Three refusals, each for a term this executor genuinely cannot supply
@@ -1309,13 +1695,119 @@ fn blend_and_write_pixel(
     dest: &mut [u8],
     combined: [u8; 4],
     state: BlendModeState,
+    stages: TexrectFragmentStages,
     column: u32,
     row: u32,
 ) -> Result<(), TexrectExecutionError> {
+    // **Stage order is the RDP's, and it is observable.** Coverage-to-alpha
+    // runs before alpha compare (so `ALPHA_CVG_SEL` can supply the value
+    // the comparator tests), alpha compare gates before the alpha dither
+    // that feeds the blender, and RGB dither is a memory-interface
+    // perturbation applied after the blend. This mirrors the reference's
+    // own `set_blended` (`fn64-render-reference/src/raster/draw.rs:596-630`)
+    // and its `draw_combined_fill_rectangle` caller (`:243-263`), which
+    // applies coverage-alpha and alpha compare before calling it.
+    //
+    // A texrect's fragment coverage is `Coverage::FULL`: a rectangle covers
+    // whole pixels, so no edge produces a partial mask. This executor
+    // rasterizes no edges and computes no subpixel mask, which is why that
+    // is a fact about the primitive rather than an assumption.
+    let coverage = stages.coverage_for(Coverage::FULL)?;
+    let (combined, pixel_coverage) = apply_coverage_alpha(
+        stages.coverage_times_alpha,
+        stages.alpha_coverage_select,
+        combined,
+        coverage.pixel,
+    );
+
+    // Zero coverage writes nothing, and `CLR_ON_CVG` without a wrap writes
+    // nothing -- both are the reference's own early returns, not this
+    // executor declining to draw.
+    if pixel_coverage.count() == 0 {
+        return Ok(());
+    }
+    if !alpha_compare_texrect_fragment(stages, combined[3])? {
+        return Ok(());
+    }
+    if state.other_mode.clear_on_coverage() && !coverage.wraps {
+        return Ok(());
+    }
+
+    // Alpha dither, admitted only as `Disabled` -- the identity. Routed
+    // through `apply_alpha_dither` rather than skipped, so the stage is
+    // present and a future admission widens the match arm instead of
+    // adding a call.
+    let mut combined = combined;
+    combined[3] = apply_alpha_dither(
+        combined[3],
+        stages.alpha_dither,
+        stages.rgb_dither,
+        column as i32,
+        row as i32,
+        // Read only by the `Noise` arm, and then as the proven endpoint --
+        // see [`NOISE_DITHER_THRESHOLD`]. `Disabled` returns early without
+        // consulting it; the ordered arms were refused in `try_new`.
+        NOISE_DITHER_THRESHOLD,
+    );
+
     let destination = read_pixel(format, dest);
     let blended = blend_texrect_fragment(combined, destination, state, column, row)?;
+    // RGB dither, admitted only as `Disabled`. The reference's
+    // `apply_rgb_dither` returns its input unchanged in that mode
+    // (`raster/blend.rs:59`), and the `>> 3` truncation that follows is
+    // `write_pixel`'s own packing -- so this is the whole of the stage on
+    // the admitted set, not a partial one.
+    // No call: RGB dither is the one stage this card did NOT port, and it
+    // runs as the identity in every mode (see `try_new`'s own arm). The
+    // field is retained on `TexrectFragmentStages` because
+    // `apply_alpha_dither` reads it for the `Pattern` substitution rule
+    // above -- it is a real input to a stage that IS ported, not a
+    // placeholder for this one.
+    let _ = stages.rgb_dither;
     write_pixel(format, dest, blended);
     Ok(())
+}
+
+/// The alpha-compare gate for one fragment: `true` writes, `false` is a
+/// silent-by-design non-write (the RDP's own behaviour, not a refusal).
+///
+/// Reached only for modes [`TexrectFragmentStages::try_new`] admitted, so
+/// the noise byte is never consulted and `alpha_compare_value`'s
+/// `Reserved` panic is unreachable -- that encoding was refused by name
+/// before any pixel was produced.
+///
+/// # Errors
+/// [`TexrectExecutionError::UnsetConstantRegister`] if `Threshold` is
+/// selected with no `SetBlendColor` staged. Also refused in `try_new`; kept
+/// here so the invariant holds at the point it is relied on rather than
+/// only where it was checked.
+fn alpha_compare_texrect_fragment(
+    stages: TexrectFragmentStages,
+    alpha: u8,
+) -> Result<bool, TexrectExecutionError> {
+    let threshold_alpha = match stages.alpha_compare {
+        AlphaCompare::None => 0,
+        AlphaCompare::Threshold => {
+            stages
+                .threshold_alpha
+                .ok_or(TexrectExecutionError::UnsetConstantRegister {
+                    register: TexrectConstantRegister::Blend,
+                })?
+        }
+        AlphaCompare::Reserved | AlphaCompare::Dither => {
+            return Err(TexrectExecutionError::NoiseThresholdUnavailable {
+                stage: TexrectNoiseStage::AlphaCompareDither,
+            })
+        }
+    };
+    Ok(alpha_compare_value(
+        stages.alpha_compare,
+        alpha,
+        threshold_alpha,
+        // Unreachable: only `None`/`Threshold` reach here, neither of which
+        // reads the noise byte.
+        AlphaCompareNoise(0),
+    ))
 }
 
 /// Packs one decoded RGBA8888 texel into the target's own pixel format.
@@ -2147,6 +2639,11 @@ mod blend_stage_tests {
             .expect("WM2000's cycle selects neither the blend nor the fog register")
     }
 
+    fn wm2000_stages() -> TexrectFragmentStages {
+        TexrectFragmentStages::try_new(wm2000_other_mode(), None)
+            .expect("WM2000's frame-0 mode is admitted by every stage")
+    }
+
     /// **Positive control for every expectation below.** The two wire words
     /// really do decode to the mode the derivation assumes.
     ///
@@ -2291,6 +2788,7 @@ mod blend_stage_tests {
             &mut stored,
             COMBINED,
             wm2000_blend_state(),
+            wm2000_stages(),
             0,
             0,
         )
@@ -2326,6 +2824,7 @@ mod blend_stage_tests {
             &mut stored,
             COMBINED,
             state,
+            wm2000_stages(),
             0,
             0,
         )
@@ -2336,6 +2835,7 @@ mod blend_stage_tests {
             &mut stored,
             COMBINED,
             state,
+            wm2000_stages(),
             0,
             0,
         )
@@ -2717,5 +3217,586 @@ mod blend_stage_tests {
         };
         assert_eq!((column, row), (7, 9), "the refusal names the pixel");
         assert_eq!(source.selector, "framebuffer color");
+    }
+}
+
+/// The three post-combiner stages this card wired into the executor
+/// alongside the blender: coverage, alpha compare and alpha dither.
+///
+/// **None of these is validated by the WM2000 oracle comparison, and that
+/// is stated rather than implied.** All four captured entries latch
+/// `alpha_compare = G_AC_NONE`, `CVG_X_ALPHA` and `ALPHA_CVG_SEL` clear,
+/// and `alpha_dither = Noise` -- so the comparison would not detect a
+/// defect in the alpha-compare gate or in the coverage-alpha interaction
+/// at all, and detects the dither stage only as the endpoint it already
+/// produced. Every expectation below is therefore hand-derived twice and
+/// reconciled, because no differential covers it.
+#[cfg(test)]
+mod fragment_stage_tests {
+    use super::*;
+    use crate::state::CoverageDestination;
+
+    const WM2000_HIGH: u32 = 0x0000_acef;
+    const WM2000_LOW: u32 = 0x0050_41c8;
+
+    fn mode(high: u32, low: u32) -> OtherMode {
+        OtherMode::from_wire(high, low)
+    }
+
+    /// **Positive control for the whole module**: WM2000's captured words
+    /// decode to the stage modes every expectation below assumes, and each
+    /// field is reconciled against an independent derivation from the same
+    /// literal.
+    #[test]
+    fn wm2000_frame_zero_stage_modes_decode_as_derived() {
+        let m = mode(WM2000_HIGH, WM2000_LOW);
+        assert_eq!(m.alpha_compare(), AlphaCompare::None);
+        assert_eq!(WM2000_LOW & 0x3, 0, "G_AC is other-mode low bits 0:1");
+        assert_eq!(m.alpha_dither(), AlphaDither::Noise);
+        assert_eq!((WM2000_HIGH >> 4) & 0x3, 2, "alpha dither is high bits 4:5");
+        assert_eq!(m.rgb_dither(), RgbDither::Disabled);
+        assert_eq!((WM2000_HIGH >> 6) & 0x3, 3, "RGB dither is high bits 6:7");
+        assert!(!m.coverage_times_alpha());
+        assert_eq!(WM2000_LOW & 0x1000, 0, "CVG_X_ALPHA is low bit 12");
+        assert!(!m.alpha_coverage_select());
+        assert_eq!(WM2000_LOW & 0x2000, 0, "ALPHA_CVG_SEL is low bit 13");
+        assert_eq!(m.coverage_destination(), CoverageDestination::Wrap);
+        assert_eq!((WM2000_LOW >> 8) & 0x3, 1, "cvg_dst is low bits 8:9");
+
+        TexrectFragmentStages::try_new(m, None).expect("every WM2000 stage mode is admitted");
+    }
+
+    /// **The `blend_cycle_count` hazard, settled: the two counts are not
+    /// in conflict, they answer different questions.**
+    ///
+    /// `rt64_blender_analysis::blend_cycle_count` returns
+    /// `combine_cycle_count - 1` without `FORCE_BL`, while
+    /// `BlendModeState::cycle_count` returns 1/2/0 straight from
+    /// `cycle_type()`. They disagree numerically for every
+    /// non-`force_blend` mode, which reads like a defect and is not one:
+    ///
+    /// - `blend_cycle_count` counts the cycles that **actually blend**.
+    ///   Its consumers are the `uses_*` predicates, which ask "does any
+    ///   blending cycle read this input?" -- and a bypassed last cycle
+    ///   reads only `P`, never `A`/`B`, so excluding it is correct.
+    /// - `cycle_count` counts the **loop iterations** `blend_fragment`
+    ///   runs. That loop handles the bypass internally via
+    ///   `is_last && !blend_enabled`, so it must still visit the cycle it
+    ///   bypasses in order to resolve `P`.
+    ///
+    /// Both are faithful ports of differently-purposed upstream
+    /// functions. This test pins the numeric disagreement **and** the
+    /// reconciliation, so neither can be "fixed" into the other.
+    #[test]
+    fn the_two_cycle_counts_disagree_by_design_and_the_reason_is_pinned() {
+        use crate::rt64_blender_analysis::{blend_cycle_count, combine_cycle_count};
+
+        // FORCE_BL clear: the two disagree, by exactly one.
+        let no_force = mode(WM2000_HIGH, WM2000_LOW & !0x4000);
+        assert!(!no_force.force_blend());
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(no_force)
+            .unwrap();
+        assert_eq!(combine_cycle_count(no_force), 1);
+        assert_eq!(blend_cycle_count(no_force), 0, "no cycle actually blends");
+        assert_eq!(state.cycle_count(), 1, "one loop iteration still runs");
+
+        // FORCE_BL set -- WM2000's own mode -- and they agree, which is
+        // why the disagreement is unreachable for this packet.
+        let forced = mode(WM2000_HIGH, WM2000_LOW);
+        assert!(forced.force_blend());
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(forced)
+            .unwrap();
+        assert_eq!(blend_cycle_count(forced), 1);
+        assert_eq!(u32::from(state.cycle_count()), blend_cycle_count(forced));
+
+        // The reconciliation, asserted rather than asserted-about: the
+        // single iteration the loop runs under a cleared FORCE_BL is the
+        // bypass, and it leaves the fragment's colour at P = Combined.
+        let blended = blend_texrect_fragment(
+            [200, 100, 50, 64],
+            BlendFramebufferSample {
+                rgba: [16, 200, 240, 255],
+                coverage_count: 8,
+            },
+            TexrectBlendRegisters::new(None, None)
+                .mode_state(mode(WM2000_HIGH, WM2000_LOW & !0x4000 & !0x0008))
+                .unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            blended[0..3],
+            [200, 100, 50],
+            "the zero blending cycles blend_cycle_count reports is what the bypass produces"
+        );
+    }
+
+    /// **The endpoint proof `NOISE_DITHER_THRESHOLD` rests on.**
+    ///
+    /// Exhaustive over all 256 alpha values and all 8 thresholds: the
+    /// dithered five-bit alpha takes exactly two values, `floor` and
+    /// `floor + 1`, and threshold 7 always selects `floor`. So the
+    /// executor's constant is a member of the mode's real output set, not
+    /// a third value between the two. Derived here from the arithmetic
+    /// rather than read off `apply_alpha_dither`, then reconciled against
+    /// it.
+    #[test]
+    fn the_noise_dither_threshold_is_an_endpoint_not_an_invention() {
+        assert_eq!(
+            NOISE_DITHER_THRESHOLD.dither(),
+            7,
+            "the maximum 3-bit threshold"
+        );
+        for alpha in 0u8..=255 {
+            let floor = u16::from(alpha >> 3);
+            let mut seen = std::collections::BTreeSet::new();
+            for threshold in 0u8..8 {
+                // Re-derived from `apply_alpha_dither`'s documented
+                // arithmetic, independently of the function itself.
+                let rounded = floor + u16::from((alpha & 7) > threshold);
+                seen.insert(rounded.min(31));
+            }
+            assert!(
+                seen.len() <= 2 && *seen.iter().next().unwrap() == floor.min(31),
+                "alpha {alpha}: the mode's output set must be {{floor, floor+1}}, got {seen:?}"
+            );
+            assert!(
+                seen.iter().all(|&v| v.abs_diff(floor.min(31)) <= 1),
+                "alpha {alpha}: dither must never move the channel by more than one step"
+            );
+
+            // And the function itself, at threshold 7, must equal the
+            // undithered floor re-expanded.
+            let five = (floor.min(31)) as u8;
+            assert_eq!(
+                apply_alpha_dither(
+                    alpha,
+                    AlphaDither::Noise,
+                    RgbDither::Disabled,
+                    0,
+                    0,
+                    NOISE_DITHER_THRESHOLD
+                ),
+                (five << 3) | (five >> 2),
+                "alpha {alpha} at the maximum threshold must be the undithered floor"
+            );
+        }
+    }
+
+    /// `wraps` does not need the two hidden coverage bits **for a
+    /// full-coverage fragment**, which is what a texrect always produces.
+    ///
+    /// Derived two ways and reconciled: once by enumerating every value
+    /// the stored count can hold (`Coverage::from_stored` is
+    /// `(stored & 7) + 1`, so `1..=8`), and once from the inequality
+    /// `8 + memory > 8` being true for all `memory >= 1`.
+    #[test]
+    fn wraps_is_determined_for_a_full_coverage_fragment() {
+        let bits = CoverageModeBits {
+            image_read_enabled: true,
+            force_blend: true,
+            antialias_enabled: true,
+            coverage_destination: CoverageDestination::Wrap,
+        };
+        // Enumeration.
+        for stored in 0u8..8 {
+            let memory = Coverage::from_stored(stored);
+            assert!((1..=8).contains(&memory.count()));
+            let result = coverage_result(Coverage::FULL, memory, bits);
+            assert!(
+                result.wraps,
+                "stored {stored} (count {}) must still wrap under a full-coverage fragment",
+                memory.count()
+            );
+            assert!(result.blend_enabled);
+        }
+        // The inequality, stated independently of the loop.
+        assert!(Coverage::FULL.count() + 1 > Coverage::FULL.count());
+
+        // And the executor's own accessor agrees, for the mode WM2000
+        // latches.
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        let result = stages.coverage_for(Coverage::FULL).unwrap();
+        assert!(result.wraps);
+        assert!(result.blend_enabled);
+    }
+
+    /// `cvg_dst = Save` is the one mode that makes the unknown destination
+    /// count observable, and it is refused by name. So is a
+    /// partial-coverage fragment, which a texrect cannot produce but which
+    /// is checked rather than assumed.
+    #[test]
+    fn the_modes_that_expose_the_missing_coverage_bits_are_refused_by_name() {
+        // cvg_dst = Save is low bits 8:9 == 3.
+        let save = mode(WM2000_HIGH, (WM2000_LOW & !(0x3 << 8)) | (0x3 << 8));
+        assert_eq!(save.coverage_destination(), CoverageDestination::Save);
+        let stages = TexrectFragmentStages::try_new(save, None).unwrap();
+        assert_eq!(
+            stages.coverage_for(Coverage::FULL),
+            Err(TexrectExecutionError::DestinationCoverageUnavailable {
+                consumer: "cvg_dst = Save"
+            })
+        );
+
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        assert_eq!(
+            stages.coverage_for(Coverage::new(4)),
+            Err(TexrectExecutionError::DestinationCoverageUnavailable {
+                consumer: "a partial-coverage fragment's cvg_dst accumulation"
+            })
+        );
+
+        // With image read disabled the destination count is never read at
+        // all, so even `Save` is admitted -- the refusal is about
+        // observability, not about the mode's name.
+        let no_read = mode(WM2000_HIGH, (WM2000_LOW & !0x40 & !(0x3 << 8)) | (0x3 << 8));
+        assert!(!no_read.image_read_enabled());
+        let stages = TexrectFragmentStages::try_new(no_read, None).unwrap();
+        assert!(stages.coverage_for(Coverage::new(4)).is_ok());
+    }
+
+    /// The alpha-compare gate, hand-derived at the threshold boundary in
+    /// both directions.
+    ///
+    /// `G_AC_THRESHOLD` passes iff `alpha >= G_SETBLENDCOLOR.a`, so `a-1`
+    /// rejects, `a` passes and `a+1` passes. `G_AC_NONE` passes
+    /// everything, including alpha 0.
+    #[test]
+    fn the_alpha_compare_gate_is_hand_derived_at_its_boundary() {
+        // G_AC_NONE: WM2000's own mode.
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        for alpha in [0u8, 1, 128, 255] {
+            assert!(
+                alpha_compare_texrect_fragment(stages, alpha).unwrap(),
+                "G_AC_NONE must pass alpha {alpha}"
+            );
+        }
+
+        // G_AC_THRESHOLD (low bits 0:1 == 1) against SetBlendColor alpha.
+        const THRESHOLD: u8 = 0x80;
+        let threshold_mode = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x1);
+        assert_eq!(threshold_mode.alpha_compare(), AlphaCompare::Threshold);
+        let blend_color = Color4::from_wire(0x0000_0000 | u32::from(THRESHOLD));
+        assert_eq!(
+            blend_color.rgba8()[3],
+            THRESHOLD,
+            "the wire's low byte is alpha"
+        );
+        let stages = TexrectFragmentStages::try_new(threshold_mode, Some(blend_color)).unwrap();
+        assert!(!alpha_compare_texrect_fragment(stages, THRESHOLD - 1).unwrap());
+        assert!(alpha_compare_texrect_fragment(stages, THRESHOLD).unwrap());
+        assert!(alpha_compare_texrect_fragment(stages, THRESHOLD + 1).unwrap());
+
+        // Threshold with no SetBlendColor staged is a named refusal, not a
+        // comparison against zero (which would pass everything).
+        assert_eq!(
+            TexrectFragmentStages::try_new(threshold_mode, None),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Blend
+            })
+        );
+    }
+
+    /// A rejected fragment writes **nothing** -- the destination keeps its
+    /// prior value rather than being overwritten with a blended one.
+    #[test]
+    fn an_alpha_compare_rejection_leaves_the_destination_untouched() {
+        const THRESHOLD: u8 = 0xc0;
+        let threshold_mode = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x1);
+        let stages = TexrectFragmentStages::try_new(
+            threshold_mode,
+            Some(Color4::from_wire(u32::from(THRESHOLD))),
+        )
+        .unwrap();
+        let blend_state =
+            TexrectBlendRegisters::new(Some(Color4::from_wire(u32::from(THRESHOLD))), None)
+                .mode_state(threshold_mode)
+                .unwrap();
+
+        let mut stored = 0x0001u16.to_be_bytes();
+        // Alpha below the threshold: rejected, nothing written.
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [255, 255, 255, THRESHOLD - 1],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            u16::from_be_bytes(stored),
+            0x0001,
+            "a rejected fragment must not write"
+        );
+
+        // Alpha at the threshold: accepted, and the pixel changes.
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [255, 255, 255, THRESHOLD],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            u16::from_be_bytes(stored),
+            0x0001,
+            "an accepted fragment must write"
+        );
+    }
+
+    /// `CVG_X_ALPHA` and `ALPHA_CVG_SEL` are independent bits with
+    /// independent effects, hand-derived from `Coverage`'s own encodings.
+    ///
+    /// With full coverage, `ALPHA_CVG_SEL` overwrites the fragment alpha
+    /// with `Coverage::FULL.alpha()` = `(8*255 + 4) / 8` = 255, and
+    /// `CVG_X_ALPHA` multiplies coverage by the fragment alpha first.
+    #[test]
+    fn the_two_coverage_alpha_bits_are_independent_and_hand_derived() {
+        assert_eq!(Coverage::FULL.alpha(), 255);
+        assert_eq!(
+            (8u16 * 255 + 4) / 8,
+            255,
+            "derived independently of Coverage::alpha"
+        );
+        // Half alpha times full coverage: (8*128 + 127) / 255 = 4.
+        assert_eq!(Coverage::FULL.times_alpha(128).count(), 4);
+        assert_eq!((8u16 * 128 + 127) / 255, 4, "derived independently");
+
+        let rgba = [10u8, 20, 30, 128];
+        // Neither bit: pass-through.
+        let (out, cvg) = apply_coverage_alpha(false, false, rgba, Coverage::FULL);
+        assert_eq!(out, rgba);
+        assert_eq!(cvg, Coverage::FULL);
+        // ALPHA_CVG_SEL only: alpha becomes the coverage encoding.
+        let (out, cvg) = apply_coverage_alpha(false, true, rgba, Coverage::FULL);
+        assert_eq!(out[3], 255);
+        assert_eq!(cvg, Coverage::FULL);
+        // CVG_X_ALPHA only: coverage shrinks, alpha is untouched.
+        let (out, cvg) = apply_coverage_alpha(true, false, rgba, Coverage::FULL);
+        assert_eq!(out[3], 128);
+        assert_eq!(cvg.count(), 4);
+        // Both: coverage shrinks first, then alpha takes the shrunk value.
+        let (out, cvg) = apply_coverage_alpha(true, true, rgba, Coverage::FULL);
+        assert_eq!(cvg.count(), 4);
+        assert_eq!(out[3], Coverage::new(4).alpha());
+        assert_eq!(
+            out[3],
+            ((4u16 * 255 + 4) / 8) as u8,
+            "derived independently"
+        );
+    }
+
+    /// **The coverage-alpha stage runs inside the pixel loop**, asserted
+    /// through [`blend_and_write_pixel`] rather than through
+    /// `apply_coverage_alpha` alone.
+    ///
+    /// **The first witness for this was degenerate and is recorded as a
+    /// correction.** It used `CVG_X_ALPHA` with a zero fragment alpha,
+    /// expecting no write; but a zero alpha makes the blend composite a
+    /// pure destination pass-through, so skipping the stage entirely
+    /// produced the *same* stored halfword and the mutant survived.
+    /// `ALPHA_CVG_SEL` separates them: with full coverage it *raises*
+    /// alpha to `Coverage::FULL.alpha()` = 255, so a fragment alpha of 64
+    /// blends to 5-bit 31 with the stage and 5-bit 8 without it.
+    #[test]
+    fn the_coverage_alpha_stage_runs_inside_the_pixel_loop() {
+        // ALPHA_CVG_SEL is low bit 13.
+        let cvg_sel = mode(WM2000_HIGH, WM2000_LOW | 0x2000);
+        assert!(cvg_sel.alpha_coverage_select());
+        let stages = TexrectFragmentStages::try_new(cvg_sel, None).unwrap();
+        let blend_state = TexrectBlendRegisters::new(None, None)
+            .mode_state(cvg_sel)
+            .unwrap();
+
+        let mut stored = 0x0001u16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [255, 255, 255, 64],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+
+        // Hand-derived both ways. With the stage: alpha becomes
+        // Coverage::FULL.alpha() = 255, so the composite is 255 * 1 + 0 = 255
+        // -> 5-bit 31. Without it: 255 * 64/255 + 0 = 64 -> 5-bit 8.
+        let with_stage = (255.0f32 * (255.0 / 255.0)).round() as u16 >> 3;
+        let without_stage = (255.0f32 * (64.0 / 255.0)).round() as u16 >> 3;
+        assert_eq!((with_stage, without_stage), (31, 8), "the two must differ");
+        assert_eq!(
+            u16::from_be_bytes(stored) >> 11,
+            with_stage,
+            "ALPHA_CVG_SEL must have raised the fragment alpha before the blend"
+        );
+    }
+
+    /// Zero coverage writes nothing. Reachable only through
+    /// `CVG_X_ALPHA` with a zero fragment alpha, which is why the witness
+    /// sets that bit rather than asserting on an unreachable state.
+    ///
+    /// **Necessary but not sufficient**, and deliberately kept alongside
+    /// the test above rather than replaced by it: a zero fragment alpha
+    /// makes the blend a destination pass-through, so this cannot on its
+    /// own distinguish "did not write" from "wrote the same value".
+    #[test]
+    fn a_zero_coverage_fragment_writes_nothing() {
+        // CVG_X_ALPHA is low bit 12.
+        let cvg_x_alpha = mode(WM2000_HIGH, WM2000_LOW | 0x1000);
+        assert!(cvg_x_alpha.coverage_times_alpha());
+        assert_eq!(Coverage::FULL.times_alpha(0).count(), 0);
+        let stages = TexrectFragmentStages::try_new(cvg_x_alpha, None).unwrap();
+        let blend_state = TexrectBlendRegisters::new(None, None)
+            .mode_state(cvg_x_alpha)
+            .unwrap();
+        let mut stored = 0x0001u16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [255, 255, 255, 0],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(u16::from_be_bytes(stored), 0x0001);
+    }
+
+    /// Every mode this card refuses, refused by name and distinguishable
+    /// from every other refusal.
+    #[test]
+    fn every_unevaluatable_stage_mode_is_refused_by_name() {
+        // Reserved G_AC encoding 2.
+        let reserved = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
+        assert_eq!(reserved.alpha_compare(), AlphaCompare::Reserved);
+        assert_eq!(
+            TexrectFragmentStages::try_new(reserved, None),
+            Err(TexrectExecutionError::ReservedAlphaCompare)
+        );
+
+        // G_AC_DITHER (encoding 3) needs the per-pixel random value.
+        let ac_dither = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x3);
+        assert_eq!(ac_dither.alpha_compare(), AlphaCompare::Dither);
+        assert_eq!(
+            TexrectFragmentStages::try_new(ac_dither, None),
+            Err(TexrectExecutionError::NoiseThresholdUnavailable {
+                stage: TexrectNoiseStage::AlphaCompareDither
+            })
+        );
+
+        // Alpha dither Pattern resolving to Bayer: RGB dither Disabled
+        // (encoding 3) substitutes Bayer, whose tables the two ports
+        // disagree about.
+        let bayer = mode((WM2000_HIGH & !(0x3 << 4)) | (0x0 << 4), WM2000_LOW);
+        assert_eq!(bayer.alpha_dither(), AlphaDither::Pattern);
+        assert_eq!(bayer.rgb_dither(), RgbDither::Disabled);
+        assert_eq!(
+            TexrectFragmentStages::try_new(bayer, None),
+            Err(TexrectExecutionError::OrderedDitherAuthorityUnsettled {
+                stage: TexrectNoiseStage::AlphaDither,
+                pattern: RgbDither::Bayer
+            })
+        );
+
+        // The same Pattern resolving to MagicSquare instead IS admitted --
+        // the two ports agree at all 16 of its cells.
+        let magic = mode(
+            (WM2000_HIGH & !(0x3 << 4) & !(0x3 << 6)) | (0x0 << 4) | (0x0 << 6),
+            WM2000_LOW,
+        );
+        assert_eq!(magic.alpha_dither(), AlphaDither::Pattern);
+        assert_eq!(magic.rgb_dither(), RgbDither::MagicSquare);
+        assert!(TexrectFragmentStages::try_new(magic, None).is_ok());
+    }
+
+    /// The alpha-dither stage really runs, and its ordered arm really
+    /// perturbs -- so a mutation that drops the call is observable.
+    ///
+    /// Uses the admitted `MagicSquare` tile at a cell whose threshold is
+    /// low enough to bump the chosen alpha, hand-picked from the table
+    /// rather than searched: `MAGIC_SQUARE[0][0] == 0`, so any alpha whose
+    /// low three bits exceed 0 rounds up.
+    #[test]
+    fn the_alpha_dither_stage_perturbs_where_the_mode_says_it_should() {
+        let magic = mode(
+            (WM2000_HIGH & !(0x3 << 4) & !(0x3 << 6)) | (0x0 << 4) | (0x0 << 6),
+            WM2000_LOW,
+        );
+        let stages = TexrectFragmentStages::try_new(magic, None).unwrap();
+        assert_eq!(stages.alpha_dither, AlphaDither::Pattern);
+
+        // alpha 223: floor 27, low bits 7 > threshold 0 -> rounds to 28.
+        let dithered = apply_alpha_dither(
+            223,
+            stages.alpha_dither,
+            stages.rgb_dither,
+            0,
+            0,
+            NOISE_DITHER_THRESHOLD,
+        );
+        assert_eq!(dithered, (28u8 << 3) | (28u8 >> 2), "231");
+        assert_ne!(dithered, 223, "the ordered tile must actually perturb here");
+
+        // **And it reaches the pixel loop**, not just the helper.
+        // Measured, not assumed: while this test went only through
+        // `apply_alpha_dither`, replacing the executor's call with an
+        // identity function left the whole suite green. The stage is
+        // observable here because `MagicSquare` at cell (0,0) has
+        // threshold 0, which bumps alpha 223 to 231 and moves the blended
+        // channel by a whole five-bit step.
+        let blend_state = TexrectBlendRegisters::new(None, None)
+            .mode_state(magic)
+            .unwrap();
+        let mut stored = 0x0001u16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [255, 255, 255, 223],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+        // Hand-derived: dithered alpha 231 over a zero destination gives
+        // 255 * 231/255 = 231 -> 5-bit 28. Undithered would be 27.
+        let dithered_five = (255.0f32 * (231.0 / 255.0)).round() as u16 >> 3;
+        let undithered_five = (255.0f32 * (223.0 / 255.0)).round() as u16 >> 3;
+        assert_eq!(
+            (dithered_five, undithered_five),
+            (28, 27),
+            "the two must differ"
+        );
+        assert_eq!(
+            u16::from_be_bytes(stored) >> 11,
+            dithered_five,
+            "the executor must have applied the ordered dither before blending"
+        );
+
+        // And WM2000's own Noise mode at the endpoint does not.
+        let wm = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        assert_eq!(
+            apply_alpha_dither(
+                223,
+                wm.alpha_dither,
+                wm.rgb_dither,
+                0,
+                0,
+                NOISE_DITHER_THRESHOLD
+            ),
+            (27u8 << 3) | (27u8 >> 2),
+            "222 -- the endpoint, which is the undithered floor"
+        );
     }
 }
