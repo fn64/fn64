@@ -268,6 +268,51 @@ fn fragment_alpha_compare_params_bytes(
 /// here at the pipeline's own submission boundary since no upstream
 /// retrieval-time collector exists for coverage yet (this card's scope is
 /// this crate's pipeline/shader files only, not `raw_dpc`/`production.rs`).
+///
+/// ## The `memory`-independent `Clamp`/`Wrap` admission
+///
+/// `Clamp`/`Wrap` with `image_read_enabled` are admitted **only** when the
+/// unknown `memory` value provably cannot reach any shader output. That is
+/// not a substituted coverage value: `memory_count` stays the `0u` literal
+/// `fs_main` already passes, and the admission is conditioned on the
+/// accumulation's result being unobservable rather than on it being correct.
+///
+/// `coverage_fragment_fn`'s result reaches `FragmentOutput` by exactly two
+/// routes, both read off `shaders/triangle_pipeline_fragment.wgsl`:
+///
+/// 1. `output.color.a = coverage.adjusted_alpha`, guarded by
+///    `alpha_coverage_select != 0u` (`:283-285`). `adjusted_alpha` is the
+///    only consumer of `destination`/`adjusted_coverage`, and both
+///    `destination` and `adjusted_coverage` are `memory`-dependent under
+///    `Clamp`/`Wrap` + image read. With `alpha_coverage_select` clear this
+///    route is dead, so `destination` is computed and discarded.
+/// 2. `coverage.blend_enabled`, passed to `blend_fragment_cycle_fn` /
+///    `blend_fragment_memory_composite_fn` (`:326`, `:344`).
+///    `blend_enabled == force_blend || (antialias_enabled && !wraps)`
+///    (`coverage.rs:149`), and `wraps` is the `memory`-dependent term. With
+///    `force_blend` set the disjunction short-circuits to `true` for every
+///    `memory` in `0..=8`, so this route is `memory`-independent too.
+///
+/// `wraps` itself is otherwise unexported: the shader writes it to no output
+/// and this pipeline has no `clear_on_coverage` discard (the CPU reference's
+/// `set_blended` consumer, `raster/draw.rs:598`, has no counterpart here).
+///
+/// So the admitted predicate is `!alpha_coverage_select && force_blend`, and
+/// under it the draw's every observable output is a function of the supplied
+/// `pixel` alone. Anything outside it -- `alpha_coverage_select` set, or
+/// `force_blend` clear (where `antialias_enabled && !wraps` makes
+/// `blend_enabled` genuinely read `memory`) -- still panics, and `Save`
+/// still panics unconditionally since `destination = memory` has no
+/// `memory`-independent case at all.
+///
+/// **This is a narrowing of the refusal, not an implementation of the read.**
+/// No framebuffer coverage is read, and none is invented. A draw whose
+/// coverage arithmetic would actually matter is refused exactly as before.
+/// Measured, not assumed: all 60 of WM2000's frame-0 texrects latch low word
+/// `0x005041c8` -- `cvg_dst=Wrap`, `IM_RD`, `AA_EN`, `CLR_ON_CVG`,
+/// `FORCE_BL`, with `CVG_X_ALPHA` and `ALPHA_CVG_SEL` both clear -- which
+/// satisfies this predicate (`docs/RT64-WM2000-REPLAY.md` §2's capture,
+/// decoded per `state.rs`'s own bit accessors).
 fn fragment_coverage_params_bytes(
     coverage_destination: CoverageDestination,
     image_read_enabled: bool,
@@ -277,12 +322,18 @@ fn fragment_coverage_params_bytes(
     alpha_coverage_select: bool,
 ) -> [u8; COVERAGE_PARAMS_BYTES as usize] {
     let coverage_destination_wire: u32 = match coverage_destination {
-        CoverageDestination::Clamp | CoverageDestination::Wrap if image_read_enabled => panic!(
-            "submit_admitted_triangle received coverage_destination={coverage_destination:?} \
-             with image_read_enabled=true: this pipeline has no framebuffer-read mechanism to \
-             supply a real memory coverage value (node 2, out of scope) -- must be rejected \
-             before GPU submission, not silently substituted"
-        ),
+        CoverageDestination::Clamp | CoverageDestination::Wrap
+            if image_read_enabled && (alpha_coverage_select || !force_blend) =>
+        {
+            panic!(
+                "submit_admitted_triangle received coverage_destination={coverage_destination:?} \
+                 with image_read_enabled=true and alpha_coverage_select={alpha_coverage_select} \
+                 force_blend={force_blend}: this pipeline has no framebuffer-read mechanism to \
+                 supply a real memory coverage value (node 2, out of scope), and this mode \
+                 combination lets that value reach a shader output -- must be rejected before \
+                 GPU submission, not silently substituted"
+            )
+        }
         CoverageDestination::Save => panic!(
             "submit_admitted_triangle received coverage_destination=Save: this pipeline has no \
              framebuffer-read mechanism to supply a real memory coverage value (node 2, out of \
