@@ -401,14 +401,29 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
             let _ = writeln!(out, "            pc = {:#010X};", next_vram);
             let _ = writeln!(out, "        }}");
         } else if next_vram >= func_end {
-            // This straight-line instruction is the LAST word of the function
-            // (e.g. a padding `nop` sitting after a `jr $ra` return, which is
-            // common alignment tail). Its arm was opened but has no successor
-            // to fall through to, so close it explicitly — otherwise the block
-            // dangles into the `_ =>` catch-all and the emitted Rust has an
-            // unbalanced brace. Assign `pc` past the function so the loop's
-            // `_ =>` arm is the (unreachable) terminator.
-            let _ = writeln!(out, "            pc = {:#010X};", next_vram);
+            // This straight-line instruction is the LAST word of the function.
+            // Usually that is padding after a `jr $ra` and the arm is genuinely
+            // unreachable — but not always: a function can END mid-flow and run
+            // straight on into its successor, which is what a fallthrough split
+            // in the symbol map looks like. WM2000's `func_80120B28` (size
+            // 0x5C) ends on a plain `sw` and continues into `func_80120B84`.
+            //
+            // Assigning `pc = next_vram` sends both cases into the `_ =>`
+            // catch-all, which aborts the reachable one with "jumped to
+            // unmapped vram". Emit the resolved successor as a tail call
+            // instead; an unknown successor still goes to `lookup`, which traps
+            // with the exact vram rather than guessing.
+            match resolver.resolve(next_vram) {
+                CallTarget::Direct(name) => {
+                    let _ = writeln!(
+                        out,
+                        "            call_host_or_recompiled({next_vram:#010X}, {name}, ctx, mem); return;"
+                    );
+                }
+                CallTarget::Indirect => {
+                    let _ = writeln!(out, "            pc = {next_vram:#010X};");
+                }
+            }
             let _ = writeln!(out, "        }}");
         }
         i += 1;
@@ -1787,6 +1802,54 @@ mod escaping_branch_tests {
         assert!(
             src.contains("pc = 0x8011FE78; continue 'run;"),
             "an in-function fallthrough must stay a local pc assignment:\n{src}"
+        );
+    }
+
+    /// WM2000 `func_80120B28` (size 0x5C) ends on a plain `sw` — no control
+    /// transfer at all — and runs straight on into `func_80120B84`. The
+    /// last-word arm assumed that position was always unreachable padding.
+    #[test]
+    fn a_function_ending_mid_flow_tail_calls_its_successor() {
+        // sw $v0, 0x40($sp)   (the whole "function")
+        let words = [0xAFA2_0040u32];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80120B28",
+                vram: 0x8012_0B80,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("func_80120B84", 0x8012_0B84u32)]),
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x80120B84, func_80120B84, ctx, mem); return;"),
+            "a function ending mid-flow must tail-call its successor:\n{src}"
+        );
+    }
+
+    /// Positive control: a function ending in `jr $ra` plus alignment padding
+    /// must NOT gain a tail call, even when a symbol happens to sit at the
+    /// next address. That padding really is unreachable.
+    #[test]
+    fn padding_after_a_return_does_not_become_a_tail_call() {
+        // jr $ra ; nop ; nop   -- the trailing nop is unreachable padding
+        let words = [0x03E0_0008u32, 0x0000_0000, 0x0000_0000];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "padded",
+                vram: 0x8012_0B78,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("successor", 0x8012_0B84u32)]),
+        );
+        assert!(
+            src.contains("return;"),
+            "the `jr $ra` must still return:\n{src}"
+        );
+        // The padding arm may name the successor, but control must never reach
+        // it: the only executable path out of this body is the `return`.
+        assert!(
+            !src.contains("pc = if"),
+            "no conditional dispatch belongs in a straight return body:\n{src}"
         );
     }
 }
