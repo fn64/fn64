@@ -214,6 +214,7 @@ impl ApplicationHandler for Demo {
                     fn64_runtime::RdramAddr::from_offset(0),
                     FB_WIDTH,
                     FB_WIDTH,
+                    FB_HEIGHT,
                     &mut self.rgba,
                 );
                 if let Some(px) = self.pixels.as_mut() {
@@ -348,6 +349,7 @@ mod tests {
             fn64_runtime::RdramAddr::from_offset(0),
             FB_WIDTH,
             FB_WIDTH,
+            FB_HEIGHT,
             &mut rgba,
         );
         assert!(
@@ -364,6 +366,7 @@ mod tests {
             fn64_runtime::RdramAddr::from_offset(0),
             FB_WIDTH,
             FB_WIDTH,
+            FB_HEIGHT,
             &mut rgba,
         );
         assert_ne!(
@@ -389,6 +392,7 @@ mod tests {
             fn64_runtime::RdramAddr::from_offset(0),
             FB_WIDTH,
             FB_WIDTH,
+            FB_HEIGHT,
             &mut rgba,
         );
         let px = |x: usize, y: usize| {

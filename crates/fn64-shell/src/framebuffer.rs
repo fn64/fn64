@@ -14,10 +14,16 @@
 
 use fn64_runtime::{RdramAddr, RdramView};
 
-/// N64 low-res NTSC framebuffer dimensions. Matches oot-boot's
-/// `capture_framebuffer` assumption; this shell does not yet decode the
-/// ROM's real `OSViMode` mode table (same limitation `fn64_runtime::vi`
-/// documents), so a fixed 320x240 is the honest default.
+/// N64 low-res NTSC framebuffer dimensions, used only as the pre-boot
+/// default: the surface starts at this size and is resized to the guest's
+/// own programmed geometry once VI_WIDTH and VI_V_START are latched.
+///
+/// **`FB_HEIGHT` is not the scanned-out line count.** The VI's active output
+/// rectangle comes from V_START, and a game is free to program fewer lines
+/// than 240 -- WM2000 programs 237. Rows past that rectangle were never
+/// rendered into, so presenting a fixed 240 shows stale RDRAM along the
+/// bottom edge. `fn64_abi::vi_output_height` is the authority; this constant
+/// is only the value to use before the guest has programmed one.
 pub const FB_WIDTH: usize = 320;
 pub const FB_HEIGHT: usize = 240;
 /// RGBA5551 is 2 bytes per pixel.
@@ -42,17 +48,22 @@ fn expand5(v: u16) -> u8 {
 ///
 /// `src_stride` is the framebuffer's real line width in pixels (VI_WIDTH,
 /// from `fn64_abi::vi_width`). The source advances by `src_stride` per row
-/// while `dst` stays `FB_WIDTH`-wide, so a game whose framebuffer line width
+/// while `dst` stays `dst_width`-wide, so a game whose framebuffer line width
 /// differs from the presented 320 no longer shears/offsets each scanline.
-/// When `src_stride == FB_WIDTH` this is the previous linear behavior exactly.
+///
+/// `dst_height` is the guest's own active output line count
+/// (`fn64_abi::vi_output_height`), NOT a fixed 240. Reading past it walks
+/// into rows the game never rendered, which is visible as a band of stale or
+/// uninitialized pixels along the bottom of the window.
 pub fn rgba5551_to_rgba8888(
     rdram: RdramView<'_>,
     start: RdramAddr,
     src_stride: usize,
     dst_width: usize,
+    dst_height: usize,
     dst: &mut [u8],
 ) -> usize {
-    debug_assert_eq!(dst.len(), dst_width * FB_HEIGHT * 4);
+    debug_assert_eq!(dst.len(), dst_width * dst_height * 4);
     assert!(
         start.offset().is_multiple_of(4),
         "RGBA5551 framebuffer base must be word-aligned, got {:#x}",
@@ -68,7 +79,7 @@ pub fn rgba5551_to_rgba8888(
     // `dst_width` columns of each row, still at the correct per-row offset.
     let copy_width = dst_width.min(src_stride);
     let mut written = 0;
-    for row in 0..FB_HEIGHT {
+    for row in 0..dst_height {
         let row_first = row * src_stride;
         for col in 0..copy_width {
             let i = row_first + col;
@@ -142,6 +153,7 @@ mod tests {
             RdramAddr::from_offset(0),
             FB_WIDTH,
             FB_WIDTH,
+            FB_HEIGHT,
             dst,
         )
     }
@@ -205,6 +217,7 @@ mod tests {
             RdramAddr::from_offset(0),
             width, // src_stride
             width, // dst_width (surface sized to the real width)
+            FB_HEIGHT,
             &mut dst,
         );
         assert_eq!(&dst[0..4], &[255, 0, 0, 255], "row 0 col 0 red");
@@ -238,6 +251,7 @@ mod tests {
             RdramAddr::from_offset(0),
             stride,
             FB_WIDTH, // narrow surface
+            FB_HEIGHT,
             &mut dst,
         );
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
@@ -256,6 +270,128 @@ mod tests {
         assert_eq!(dst[8], 7);
         // 2-byte remnant (half a word): zero pixels, no panic.
         assert_eq!(decode(&[0xF8, 0x01], &mut dst), 0);
+    }
+
+    /// The bug this pins: the presenter used to read a fixed `FB_HEIGHT`
+    /// (240) rows regardless of what the guest programmed, so a game whose
+    /// VI active window is shorter had rows of never-rendered RDRAM blitted
+    /// into the window as an edge band.
+    ///
+    /// WM2000's measured V_START is `0x002501ff` -- half-lines 37..511, i.e.
+    /// **237** output lines (the same decode `fn64_render::ViActiveWindow`
+    /// asserts). The fixture below fills 237 rows with a known value and the
+    /// three rows past them with a *different* known value, so reading one
+    /// row too many is a visible wrong answer rather than a silent one.
+    #[test]
+    fn conversion_stops_at_the_programmed_output_height() {
+        const STRIDE: usize = 480;
+        const OUT_H: usize = 237; // WM2000's V_START decode
+        const PAST: usize = 3; // rows the guest never rendered
+
+        // In-image pixels are white; the rows past the active window hold a
+        // distinct "stale RDRAM" value that must never be presented.
+        let in_image = 0xFFFFu16;
+        let stale = 0x0843u16;
+        let mut src_px = vec![in_image; STRIDE * (OUT_H + PAST)];
+        for px in src_px.iter_mut().skip(STRIDE * OUT_H) {
+            *px = stale;
+        }
+        let src = fb_with(&src_px);
+
+        let mut dst = vec![0u8; STRIDE * OUT_H * 4];
+        let written = rgba5551_to_rgba8888(
+            RdramView::from_storage(&src),
+            RdramAddr::from_offset(0),
+            STRIDE,
+            STRIDE,
+            OUT_H,
+            &mut dst,
+        );
+        assert_eq!(
+            written,
+            STRIDE * OUT_H,
+            "every pixel of the programmed rectangle must be written"
+        );
+
+        // Positive control: the fixture really does exercise the last row.
+        // Without this a test that read 236 rows would also pass.
+        let last_row = (OUT_H - 1) * STRIDE * 4;
+        assert_eq!(
+            &dst[last_row..last_row + 4],
+            &[255, 255, 255, 255],
+            "row {} (the last programmed line) must be present and in-image",
+            OUT_H - 1
+        );
+
+        // The stale value expands to a distinct RGBA, so its absence is a
+        // real assertion rather than a coincidence of two identical colors.
+        let stale_rgba = [
+            expand5((stale >> 11) & 0x1F),
+            expand5((stale >> 6) & 0x1F),
+            expand5((stale >> 1) & 0x1F),
+            255,
+        ];
+        assert_ne!(
+            stale_rgba,
+            [255, 255, 255, 255],
+            "fixture is only meaningful if the stale rows differ from the image"
+        );
+        assert!(
+            !dst.chunks_exact(4).any(|px| px == stale_rgba),
+            "no pixel past the programmed {OUT_H}-line output rectangle may be presented"
+        );
+    }
+
+    /// The other half of the same defect: the presenter must read from
+    /// VI_ORIGIN, and a base one row low shifts the whole image and drags a
+    /// never-rendered row in at the bottom. This pins the arithmetic that
+    /// makes the two bases differ by exactly one line.
+    #[test]
+    fn a_base_one_row_low_shifts_every_presented_row() {
+        const STRIDE: usize = 480;
+        const OUT_H: usize = 8;
+
+        // Row r is filled with the value r+1, so a one-row shift is visible
+        // as an off-by-one in the decoded red channel rather than as noise.
+        let mut src_px = vec![0u16; STRIDE * (OUT_H + 1)];
+        for row in 0..=OUT_H {
+            let shade = (row as u16 + 1) & 0x1F;
+            for col in 0..STRIDE {
+                src_px[row * STRIDE + col] = (shade << 11) | 1;
+            }
+        }
+        let src = fb_with(&src_px);
+
+        let read_at = |start_pixels: usize| {
+            let mut dst = vec![0u8; STRIDE * OUT_H * 4];
+            rgba5551_to_rgba8888(
+                RdramView::from_storage(&src),
+                RdramAddr::from_offset((start_pixels * 2) as u32),
+                STRIDE,
+                STRIDE,
+                OUT_H,
+                &mut dst,
+            );
+            dst
+        };
+
+        let correct = read_at(STRIDE); // VI_ORIGIN: one row into the buffer
+        let one_row_low = read_at(0); // the buffer base the RDP renders to
+
+        assert_eq!(
+            correct[0],
+            expand5(2),
+            "reading from VI_ORIGIN must start at the second stored row"
+        );
+        assert_eq!(
+            one_row_low[0],
+            expand5(1),
+            "reading from the render base starts one row earlier"
+        );
+        assert_ne!(
+            correct, one_row_low,
+            "a one-row base error must change the presented image"
+        );
     }
 
     #[test]

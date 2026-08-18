@@ -263,6 +263,11 @@ mod game {
         /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
         /// latched, so the full framebuffer line is presented (not cropped).
         fb_width: usize,
+        /// Current pixels-surface / scratch height in lines. Starts at
+        /// FB_HEIGHT and is resized to the game's own VI active output height
+        /// once V_START is latched, so the window shows exactly the
+        /// scanned-out rectangle and never rows the game did not render.
+        fb_height: usize,
         /// `Arc<Window>` (not a bare `Window`) so the `SurfaceTexture`
         /// pixels holds can own a `'static` window handle, letting `pixels`
         /// be `Pixels<'static>` -- otherwise pixels 0.15 borrows the window
@@ -596,6 +601,7 @@ mod game {
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
                 fb_width: FB_WIDTH,
+                fb_height: FB_HEIGHT,
                 window: None,
                 pixels: None,
                 rgba_holds_a_frame: false,
@@ -717,7 +723,21 @@ mod game {
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
-            let fb_offset = match fn64_abi::current_vi_framebuffer() {
+            // VI_ORIGIN, not the `osViSwapBuffer` bookkeeping pointer.
+            // `scanout_vi_framebuffer`'s own doc names this distinction: the
+            // two agree for a game that swaps through libultra, but only
+            // VI_ORIGIN is defined for a game that programs the register
+            // directly. Measured on WM2000 they differ by exactly one
+            // 480-pixel row (`0x38f800` vs `0x38fbc0`, and `0x3c7c00` vs
+            // `0x3c7fc0`; the two G_SETCIMG bases are 480*240*2 apart, so
+            // they are the real buffer bases and VI_ORIGIN is one row into
+            // each). Reading the bookkeeping pointer therefore shifts the
+            // whole image up one line and pulls a row of never-rendered
+            // memory in at the bottom. Fall back to the swap pointer only
+            // when VI_ORIGIN has not been programmed at all.
+            let fb_offset = match fn64_abi::scanout_vi_framebuffer()
+                .or_else(fn64_abi::current_vi_framebuffer)
+            {
                 Some(o) => o as usize,
                 None => return,
             };
@@ -731,6 +751,11 @@ mod game {
                 );
                 return;
             }
+            // The guest's own active output rectangle, from V_START. Rows
+            // past it were never rendered into, so presenting a fixed 240
+            // shows stale RDRAM along the bottom -- WM2000 programs 237.
+            let target_height = fn64_abi::vi_output_height()
+                .map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
@@ -750,16 +775,18 @@ mod game {
             // Resize only on change -- pixels' buffer resize reallocates GPU
             // storage. wgpu caps texture dimensions; clamp defensively.
             let target_width = src_stride.clamp(1, 4096);
-            if target_width != self.fb_width {
+            if target_width != self.fb_width || target_height != self.fb_height {
                 if pixels
-                    .resize_buffer(target_width as u32, FB_HEIGHT as u32)
+                    .resize_buffer(target_width as u32, target_height as u32)
                     .is_ok()
                 {
                     self.fb_width = target_width;
-                    self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
+                    self.fb_height = target_height;
+                    self.rgba = vec![0u8; target_width * target_height * 4];
                     println!(
-                        "[fn64-shell] resized present surface to {target_width}x{FB_HEIGHT} \
-                         (game VI_WIDTH); window shows the full framebuffer line."
+                        "[fn64-shell] resized present surface to {target_width}x{target_height} \
+                         (game VI_WIDTH x VI active output lines); window shows exactly the \
+                         scanned-out rectangle."
                     );
                 }
             }
@@ -768,6 +795,7 @@ mod game {
                 fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
                 src_stride,
                 self.fb_width,
+                self.fb_height,
                 &mut self.rgba,
             );
             // `rgba` now holds a real frame, so F2 may encode it. Set here and
@@ -978,7 +1006,7 @@ mod game {
                 &dir,
                 &file,
                 self.fb_width,
-                FB_HEIGHT,
+                self.fb_height,
                 &self.rgba,
                 self.rgba_holds_a_frame,
             ) {
@@ -987,10 +1015,11 @@ mod game {
                     // a shortcut has no idea what the working directory is.
                     let shown = std::fs::canonicalize(&path).unwrap_or(path);
                     println!(
-                        "[fn64-shell] screenshot saved: {} ({}x{FB_HEIGHT}, game frame only -- \
+                        "[fn64-shell] screenshot saved: {} ({}x{}, game frame only -- \
                          the settings overlay is not captured)",
                         shown.display(),
-                        self.fb_width
+                        self.fb_width,
+                        self.fb_height
                     );
                 }
                 Err(e) => {

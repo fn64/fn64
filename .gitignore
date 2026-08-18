@@ -45,3 +45,4 @@ crates/fn64-discover/reference/corpus-certification-sample.tsv
 # truth, and large enough to be swept into a merge by accident.
 /CLAUDE-PORT-TAKEOVER.md
 /.claude-handoffs/
+scratch/
