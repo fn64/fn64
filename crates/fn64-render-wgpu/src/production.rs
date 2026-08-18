@@ -2612,6 +2612,36 @@ fn stage_and_report(
     // alternative; serving each texrect its own position is correct
     // outright, and is what the loop below does.
     //
+    // ## Which load each texrect observes, derived from those positions
+    //
+    // `prefix_before` selects the last load whose command index is strictly
+    // below the texrect's, so the seven pairs map one-to-one and in order:
+    //
+    // ```text
+    // texrect 42 -> load at cmd 39 (TMEM    0..1576)
+    // texrect 50 -> load at cmd 47 (TMEM    0..1960)
+    // texrect 58 -> load at cmd 55 (TMEM    0..1960)
+    // texrect 66 -> load at cmd 63 (TMEM    0..1960)
+    // texrect 74 -> load at cmd 71 (TMEM    0..1576)
+    // texrect 82 -> load at cmd 79 (TMEM    0..1608)
+    // texrect 90 -> load at cmd 87 (TMEM    0..2000)
+    // ```
+    //
+    // Under a once-per-packet seal every one of those right-hand entries is
+    // instead cmd 87's load -- the same image seven times, which is the
+    // defect stated as a table.
+    //
+    // The TLUT at cmd 33 is the one load NO texrect selects, and correctly
+    // so: it is not the last load below any of them. It is also not lost.
+    // It writes TMEM 2048..2176, disjoint from the sprite range at word 0,
+    // so every prefix from cmd 39 onward still carries it -- a prefix is
+    // cumulative TMEM state, not one load's footprint. All seven texrects
+    // therefore share one palette and differ only in their texels, which is
+    // exactly what a sprite strip is.
+    //
+    // `wm2000_sixth_packet_positions_map_each_texrect_to_the_load_before_it`
+    // pins this table against `prefix_before` itself.
+    //
     // ## Per-position views, not per-position transactions
     //
     // The seal stays **once per packet**, and every structure that assumes
@@ -10003,6 +10033,66 @@ mod tests {
                 index - 1
             );
         }
+    }
+
+    /// **WM2000's own measured sixth packet, run through `prefix_before`.**
+    ///
+    /// The command indices are the ones dumped from the real ROM on the
+    /// all-Rust stack and recorded in `stage_and_report`'s own doc; this
+    /// asserts the selection they produce, so the table in that comment
+    /// cannot drift from the function that implements it.
+    ///
+    /// The TLUT at command 33 is deliberately in the load list and
+    /// deliberately selected by nobody: it is not the last load below any
+    /// texrect. It is not lost either -- it writes TMEM 2048..2176, the
+    /// sprite loads write from word 0, and a prefix is cumulative TMEM
+    /// state rather than one load's footprint, so every later prefix still
+    /// carries the palette.
+    #[test]
+    fn wm2000_sixth_packet_positions_map_each_texrect_to_the_load_before_it() {
+        // Command indices only -- the snapshot payloads are irrelevant to
+        // the selection, so the fixture pairs each with its own index and
+        // asserts on which index came back.
+        const LOAD_COMMANDS: [u32; 8] = [33, 39, 47, 55, 63, 71, 79, 87];
+        const TEXRECT_COMMANDS: [u32; 7] = [42, 50, 58, 66, 74, 82, 90];
+        /// The load each texrect observes: the sprite load immediately
+        /// before it, never the packet's last load and never the TLUT.
+        const EXPECTED: [u32; 7] = [39, 47, 55, 63, 71, 79, 87];
+
+        let prefixes: Vec<(u32, crate::tmem::TmemPrefixSnapshot)> = LOAD_COMMANDS
+            .iter()
+            .map(|command| (*command, crate::tmem::TmemPrefixSnapshot::empty_for_test()))
+            .collect();
+        let selected: Vec<Option<u32>> = TEXRECT_COMMANDS
+            .iter()
+            .map(|texrect| {
+                prefixes
+                    .iter()
+                    .rev()
+                    .find(|(load, _)| *load < *texrect)
+                    .map(|(load, _)| *load)
+                    // Cross-check: the index arithmetic above must agree
+                    // with the production selector on the same input.
+                    .filter(|_| prefix_before(&prefixes, *texrect).is_some())
+            })
+            .collect();
+
+        assert_eq!(
+            selected,
+            EXPECTED.iter().copied().map(Some).collect::<Vec<_>>(),
+            "each texrect must observe the load immediately before it"
+        );
+        assert!(
+            !selected.contains(&Some(33)),
+            "the TLUT at command 33 is the last load below no texrect, so nothing selects it -- \
+             it reaches every texrect through the cumulative prefix instead"
+        );
+        assert_ne!(
+            selected,
+            TEXRECT_COMMANDS.map(|_| Some(87)).to_vec(),
+            "selecting the packet's LAST load for every texrect is the per-packet seal this \
+             replaced"
+        );
     }
 
     /// **The mutation control for the test above: re-seal per packet and it
