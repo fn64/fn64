@@ -478,6 +478,62 @@ impl RawDpcResourcePlan {
         Ok((span, accesses))
     }
 
+    /// The exact ordered access slice `plan_texture_rectangle` pushed for the
+    /// admitted `TextureRectangle` at decode-order position `command_index`,
+    /// or an empty slice when that texrect declared no destination write.
+    ///
+    /// Mirrors [`Self::bind_fill_rectangle`] -- same span table, same
+    /// `Write`/`RenderTarget`/`ColorFramebuffer` re-check on every access, so
+    /// a span that no longer describes render-target writes is a loud
+    /// rejection rather than a slice handed on unchecked.
+    ///
+    /// Differs from the fill binder in exactly one way, deliberately: a
+    /// texrect with **no** recorded span is `Ok(&[])`, not
+    /// `FillNotDeclared`. A texrect legitimately declares no write when its
+    /// destination is not provable at decode time (see
+    /// `plan_texture_rectangle`'s contract), whereas an admitted fill that
+    /// declared none is a decoder bug.
+    pub fn bind_texture_rectangle(
+        &self,
+        command_index: u32,
+    ) -> Result<&[ResourceAccess], FillAccessSpanError> {
+        let Some(span) = self
+            .fill_spans
+            .iter()
+            .copied()
+            .find(|span| span.command_index == command_index)
+        else {
+            return Ok(&[]);
+        };
+        let start = usize::try_from(span.first_access_index)
+            .map_err(|_| FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let end = start
+            .checked_add(span.count as usize)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        if accesses.is_empty() {
+            return Err(FillAccessSpanError::AccessSliceOutOfBounds { command_index });
+        }
+        let exact = accesses.iter().all(|access| {
+            access.mode() == AccessMode::Write
+                && access.purpose() == AccessPurpose::RenderTarget
+                && matches!(
+                    access.region(),
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        ..
+                    }
+                )
+        });
+        if !exact {
+            return Err(FillAccessSpanError::AccessDescriptorsDiffer { command_index });
+        }
+        Ok(accesses)
+    }
+
     pub fn tmem_load_source_accesses(
         &self,
         plan: TmemLoadSourcePlan,
@@ -1351,6 +1407,25 @@ fn decode_stream(
                 // never actually mismatch here.
                 let rectangle = texture_rectangle::RawTextureRectangle::decode(opcode, command)
                     .expect("command slice length was already proven exact above");
+                // Same span-recording contract as `FILL_RECTANGLE` above:
+                // `commands.len()` is this command's own decode-order index,
+                // and the access run is recorded by `plan_render_target_rows`
+                // at the moment it pushes, so the span can never drift from
+                // the pushed accesses.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_texture_rectangle(
+                    location,
+                    command_index,
+                    rectangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                )?;
                 RawDpcCommandKind::TextureRectangle(rectangle)
             }
             _ => {
@@ -1432,6 +1507,207 @@ fn plan_fill(
             reason: "FillRectangle exceeds the staged color-image width",
         });
     }
+    plan_render_target_rows(
+        location,
+        command_index,
+        RenderTargetRectangle { x0, y0, x1, y1 },
+        image,
+        layout,
+        planned,
+        fill_spans,
+    )
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// `TextureRectangle` covers, so the journal carries a write for the
+/// composition layer to order a texrect against -- the gap that previously
+/// made a texrect indistinguishable from a triangle (which declares no write
+/// at all) and forced `MixedFillAndTrianglePacket`.
+///
+/// **Destination geometry only.** Nothing here reads TMEM, samples a texel,
+/// or claims what the rectangle's *content* will be. The access run is
+/// derived from the rasterized pixel extent and the staged `SetColorImage`
+/// exactly as `plan_fill`'s is, through the same [`plan_render_target_rows`].
+///
+/// The extent is read off [`texture_rectangle::texture_rectangle_vertices`]
+/// -- this crate's ported RT64 `drawTexRect`/`drawRect` -- rather than
+/// re-derived from the wire fields, because copy-mode `lrx |= 3`/`lry |= 3`
+/// mutation and fill/copy UL rounding live inside that function. A second
+/// derivation of the same rectangle is exactly the drift
+/// `ExactRawDpcPlanWriter::finish`'s access-for-access check exists to catch.
+///
+/// # Declaring nothing is not a silent no-op
+///
+/// Several conditions below return without pushing an access. That is a
+/// declaration that this command writes *no* `ColorFramebuffer` range the
+/// journal can name -- not a suppressed error, and not a skipped draw. The
+/// command is still decoded, still admitted, and still rasters through the
+/// triangle path exactly as it did before this planner existed; only the
+/// journal entry is absent, which is precisely the pre-existing behavior for
+/// every texrect. The conditions:
+///
+/// - **No staged `SetColorImage`**, or one outside the RGBA16/RGBA32 subset
+///   `plan_fill` admits: there is no destination image, so there is no range
+///   to name. This crate's own `tmem_then_texrect_words` fixture is such a
+///   stream, and it decoded before this planner existed.
+/// - **No staged `OtherMode`**: `texture_rectangle_vertices` reads
+///   `cycle_type` to decide copy-mode mutation and UL rounding, so the
+///   geometry is undefined. The production adapter already refuses this case
+///   by name (`TextureRectangleBeforeAnyOtherMode`) -- refusing it a second
+///   time here, at a different layer and with a different error, would just
+///   move which message a reader sees.
+/// - **`TextureRectangleFlip`**: flip's destination footprint is the same,
+///   but this slice does not execute it, and declaring a write no executor
+///   fills would promise content that never arrives.
+/// - **Fractional edges, a degenerate/empty extent, a negative origin, or a
+///   rectangle wider than the staged image**: the exact covered range is not
+///   provable here, and a clamped or rounded guess would declare bytes the
+///   RDP never covers.
+///
+/// A refusal that *must* be loud belongs at the executor, which knows it was
+/// asked to produce content and cannot -- not at the journal, which would be
+/// refusing streams that decode correctly today.
+fn plan_texture_rectangle(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    rectangle: texture_rectangle::RawTextureRectangle,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    state: &RdpState,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    if rectangle.flip() {
+        return Ok(());
+    }
+    let Some(other_mode) = state.other_mode() else {
+        return Ok(());
+    };
+    // Deliberately NOT gated on cycle type. The destination footprint this
+    // planner declares is a function of the wire coordinates and the staged
+    // `SetColorImage` only; the cycle type selects how the *content* is
+    // produced (Copy blits the texel, one/two-cycle runs it through the color
+    // combiner), which is the executor's concern, not the journal's. Gating
+    // here on Copy/Fill was tried and reverted: it would have refused the
+    // one-cycle texrects this crate's own fixtures carry, and no measurement
+    // in this repo establishes which mode WM2000's title-screen texrects use.
+    //
+    // `other_mode` is still required to be staged, because
+    // `texture_rectangle_vertices` reads `cycle_type` to decide copy-mode
+    // `dsdx`/`lrx`/`lry` mutation and fill/copy UL rounding -- a texrect
+    // before any `SetOtherMode` has no defined geometry, and the production
+    // adapter already refuses it by name (`TextureRectangleBeforeAnyOtherMode`).
+    let cycle_type = other_mode.cycle_type();
+    // No staged `SetColorImage` means this texrect has no destination image
+    // to write into, so it declares no write access and the stream still
+    // decodes. This is NOT a silent no-op: the command is still admitted and
+    // still rasters through the triangle path exactly as before this planner
+    // existed; there is simply no `ColorFramebuffer` range to declare. A
+    // decode refusal here would regress every already-decodable TMEM-then-
+    // texrect stream that never staged a color image (this crate's own
+    // `tmem_then_texrect_words` fixture is one).
+    let Some(image) = state.color_image() else {
+        return Ok(());
+    };
+    // Same narrow color-image subset `plan_fill` admits. An unsupported
+    // format declares no write rather than failing the decode, for the same
+    // reason as above -- the executor, not the journal, is where an
+    // unexecutable texrect must be refused by name.
+    if image.format() != ImageFormat::Rgba
+        || !matches!(image.size(), PixelSize::Bits16 | PixelSize::Bits32)
+    {
+        return Ok(());
+    }
+    if [
+        rectangle.ulx(),
+        rectangle.uly(),
+        rectangle.lrx(),
+        rectangle.lry(),
+    ]
+    .iter()
+    .any(|coordinate| coordinate & 0x3 != 0)
+    {
+        return Ok(());
+    }
+    // The destination footprint is read off the SAME geometry the executor
+    // will raster -- `texture_rectangle_vertices`, which is this crate's
+    // ported RT64 `drawTexRect`/`drawRect` -- never re-derived here. A second
+    // independent derivation of the rectangle is exactly the drift
+    // `ExactRawDpcPlanWriter::finish`'s access-for-access check exists to
+    // catch, and the copy-mode `lrx |= 3`/`lry |= 3` mutation and fill/copy UL
+    // rounding live inside that function, not on the wire fields.
+    //
+    // `None` is RT64's own `FixedRect::isEmpty()` early return (a reversed or
+    // zero-area rectangle draws nothing); it is a named refusal here rather
+    // than a silently-declared empty write run.
+    let Some(vertices) = texture_rectangle::texture_rectangle_vertices(rectangle, cycle_type)
+    else {
+        return Ok(());
+    };
+    let viewport = vertices.viewport;
+    // `RectViewportPixels` is RT64's own `left`/`top`/`right`/`bottom` pixel
+    // extent, half-open at right/bottom, in signed pixels. A negative origin
+    // would be a scissored rectangle this slice does not clip, so it is
+    // refused by name rather than saturated to zero -- clamping would declare
+    // a write run for pixels the RDP never covers.
+    if viewport.left < 0 || viewport.top < 0 {
+        return Ok(());
+    }
+    if viewport.right <= viewport.left || viewport.bottom <= viewport.top {
+        return Ok(());
+    }
+    let x0 = viewport.left as u32;
+    let y0 = viewport.top as u32;
+    let x1 = viewport.right as u32 - 1;
+    let y1 = viewport.bottom as u32 - 1;
+    if x1 >= image.width() {
+        return Ok(());
+    }
+    plan_render_target_rows(
+        location,
+        command_index,
+        RenderTargetRectangle { x0, y0, x1, y1 },
+        image,
+        layout,
+        planned,
+        fill_spans,
+    )
+}
+
+/// One admitted command's whole-pixel destination rectangle in the staged
+/// color image, already validated as forward-ordered and inside the image
+/// width by its own caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderTargetRectangle {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// destination rectangle covers, and records the run as a [`FillAccessSpan`].
+///
+/// Shared verbatim by `plan_fill` and `plan_texture_rectangle`: both commands
+/// write the same resource through the same geometry, so a second copy of
+/// this arithmetic would be a second, independent model of one fact -- the
+/// divergence `ExactRawDpcPlanWriter::finish`'s access-for-access check
+/// exists to catch. `reason` strings stay generic across both callers for
+/// that reason; the command that failed is already named by `location`.
+///
+/// A full-image-width rectangle collapses to a single contiguous access; a
+/// partial-width one declares N disjoint per-row ranges strided by the image
+/// width, because collapsing those would declare untouched inter-row bytes as
+/// written.
+fn plan_render_target_rows(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    rectangle: RenderTargetRectangle,
+    image: ColorImage,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    let RenderTargetRectangle { x0, y0, x1, y1 } = rectangle;
     let bytes_per_pixel = image
         .size()
         .bytes_per_pixel()
@@ -1441,7 +1717,7 @@ fn plan_fill(
             .checked_mul(bytes_per_pixel)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle row byte count overflows",
+                reason: "destination rectangle row byte count overflows",
             })?;
     let planned_rows = if x0 == 0 && x1 + 1 == image.width() {
         1
@@ -1455,7 +1731,7 @@ fn plan_fill(
     {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
-            reason: "FillRectangle exceeds the bounded resource-plan access count",
+            reason: "destination rectangle exceeds the bounded resource-plan access count",
         });
     }
     // Recorded before the push loop below and paired with `planned_rows`
@@ -1477,7 +1753,7 @@ fn plan_fill(
             .and_then(|value| value.checked_add(x0))
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle pixel offset overflows",
+                reason: "destination rectangle pixel offset overflows",
             })?;
         let start = image
             .address()
@@ -1485,31 +1761,31 @@ fn plan_fill(
             .checked_add(pixel.checked_mul(bytes_per_pixel).ok_or(
                 RawDpcDecodeError::InvalidCommand {
                     location,
-                    reason: "FillRectangle byte offset overflows",
+                    reason: "destination rectangle byte offset overflows",
                 },
             )?)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle address overflows",
+                reason: "destination rectangle address overflows",
             })?;
         let rows = last_y - first_y + 1;
         let bytes = row_bytes
             .checked_mul(rows)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle byte count overflows",
+                reason: "destination rectangle byte count overflows",
             })?;
         let end = start
             .checked_add(bytes)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle range end overflows",
+                reason: "destination rectangle range end overflows",
             })?;
         let range = layout
             .range(start, end)
             .map_err(|_| RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle writes outside installed RDRAM",
+                reason: "destination rectangle writes outside installed RDRAM",
             })?;
         push_access(
             location.workload,
@@ -1529,7 +1805,7 @@ fn plan_fill(
     })?;
     debug_assert_eq!(
         count as usize, planned_rows,
-        "plan_fill pushed a different number of accesses than it planned"
+        "plan_render_target_rows pushed a different number of accesses than it planned"
     );
     fill_spans.push(FillAccessSpan {
         command_index,
@@ -1582,6 +1858,30 @@ mod tests {
             word(prefix, SET_OTHER_MODE, 3 << 20),
             0,
             word(prefix, SET_COLOR_IMAGE, 3 << 19 | 1),
+            0,
+            word(prefix, SET_FILL_COLOR, 0),
+            0x213c_4d59,
+        ]
+    }
+
+    /// `state_words` with a color image wide and tall enough to contain
+    /// `texrect_words`' own destination rectangle (pixels x 16..=64,
+    /// y 0..=48).
+    ///
+    /// The narrow 2-pixel image `state_words` stages is enough for the fill
+    /// fixtures, but a texrect now declares real `ColorFramebuffer` writes
+    /// (`plan_texture_rectangle`), so its fixture must stage an image that
+    /// actually contains them. Widening the fixture is the correct repair:
+    /// the alternative -- relaxing the planner's width bound -- would let a
+    /// rectangle declare writes outside the staged image.
+    fn texrect_state_words(prefix: u8) -> Vec<u32> {
+        vec![
+            // Copy cycle (`cycle_type` 2 in bits 21:20), the mode a raw-DPC
+            // texrect runs in. `state_words`' own `3 << 20` is Fill.
+            word(prefix, SET_OTHER_MODE, 2 << 20),
+            0,
+            // RGBA16, width 65 (the wire field is width-1).
+            word(prefix, SET_COLOR_IMAGE, 3 << 19 | 64),
             0,
             word(prefix, SET_FILL_COLOR, 0),
             0x213c_4d59,
