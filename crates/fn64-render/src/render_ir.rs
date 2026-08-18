@@ -2442,6 +2442,33 @@ mod production {
             self.accesses.push(access);
         }
 
+        /// Pushes the [`ResourceAccess`] entries one admitted
+        /// `TextureRectangle` declares for its destination rectangle, in the
+        /// exact order the decoder produced them.
+        ///
+        /// A texrect is admitted as two [`RdpTriangleCommand`]s (RT64's own
+        /// two-triangle decomposition of one rectangle), and `push_triangle`
+        /// pushes no access. This method carries the rectangle's *destination
+        /// writes* -- which the decoder's `plan_texture_rectangle` derived
+        /// from the same rasterized extent -- so the journal has a write to
+        /// order the texrect against, exactly as a fill's does.
+        ///
+        /// Call this **before** the two `push_triangle` calls for the same
+        /// rectangle, so `self.accesses` stays in decoder order: the decoder
+        /// pushes a texrect's accesses at the point it decodes the command,
+        /// and `finish` compares the two lists position by position.
+        ///
+        /// Unlike [`Self::push_fill_rectangle`], an empty slice is accepted
+        /// and pushes nothing. A texrect legitimately declares no write when
+        /// its destination is not provable at decode time (no staged
+        /// `SetColorImage`, a flip, an off-image or degenerate extent -- see
+        /// `plan_texture_rectangle`'s own contract); that is the pre-existing
+        /// behavior for every texrect, not an admitted fill's "declares no
+        /// write" decoder bug.
+        pub fn push_texture_rectangle_accesses(&mut self, accesses: &[ResourceAccess]) {
+            self.accesses.extend_from_slice(accesses);
+        }
+
         /// Pushes one admitted fill-cycle `FillRectangle` and **every**
         /// [`ResourceAccess`] it declares, in the exact order the decoder
         /// produced them.
