@@ -57,7 +57,7 @@ use crate::targets::{
 };
 use crate::tmem::{project_committed_tmem, TileBindingParams, TmemGpuProjection};
 use crate::{
-    execute_fill_rectangle, AlphaCompare, BlendColorInput, BlendModeState, Color4,
+    execute_fill_rectangle, AlphaCompare, BlendColorInput, BlendModeState, Color4, ColorImage,
     ColorTargetExtent, ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CombineParams,
     FillColor, FillExecutionError, FillRectangle, HeadlessBackend, InitializedCandidateColorTarget,
     MissingTriangleDrawState, OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction,
@@ -425,13 +425,14 @@ impl WgpuBackend {
         // triangles, zero loads) has nothing pending to project, and the
         // published slot is then the honest image rather than a substitute
         // for one: there is no load in this packet for it to be missing.
-        // The shape that MUST have a pending projection -- a texrect -- can
-        // never arrive here with `None`, because a texrect in a packet with
-        // no load is already refused upstream by name
-        // (`TexrectWithoutTmemLoad`, `stage_and_report`), and the census
-        // behind that refusal measured 0 of WM2000's 219 decode entries
-        // carrying a texrect without a load in the same entry. So the two
-        // arms partition the reachable shapes; neither is a guess.
+        // A texrect in a packet with no load reaches the `None` arm too,
+        // and committed TMEM is the correct image for it for the same
+        // reason `TexrectTmemSource::Committed` is on the CPU side: the
+        // packet staged no proposal, so durable state is not a substitute
+        // for one -- it is what the RDP's TMEM holds. Both paths therefore
+        // project the SAME image for the same packet, which is what keeps
+        // the GPU raster and the CPU texel reader from disagreeing about a
+        // load-free texrect. Neither arm is a guess.
         let tmem = match pending_tmem {
             Some(projection) => projection,
             None => project_committed_tmem(self.coordinator.physical()),
@@ -723,6 +724,26 @@ struct PlanCollector {
             Option<fn64_render::NeutralTileSize>,
         ); 8],
     >,
+    /// `G_SETCIMG` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
+    /// time (`Self::seeded`), then updated on every `SetColorImage`
+    /// command in plan order. The seventh instance of the same
+    /// seed-then-track pattern as `current_other_mode`/`current_combine`/
+    /// `current_blend_color`/`current_env_color`/`current_prim_color`/
+    /// `current_fog_color`, and for the same reason: the RDP's color-image
+    /// register is durable across submissions, so a packet that names no
+    /// `SetColorImage` of its own still has one.
+    ///
+    /// **The durable seed is load-bearing, not defensive.** The decoder
+    /// already derives a texrect's declared `ColorFramebuffer` write
+    /// accesses from `state.color_image()` -- durable state -- in
+    /// `raw_dpc::plan_texture_rectangle`. Deriving the executor's
+    /// [`ColorTargetKey`] from a packet-local `FillRectangle` instead made
+    /// those two derivations disagree for any packet whose texrects follow
+    /// an earlier packet's `SetColorImage`: measured on WM2000, a real
+    /// packet of 14 texrects, 4 TMEM loads and **zero** fills, whose
+    /// texrects every one declared a real four-access write run.
+    current_color_image: Option<ColorImage>,
     /// One entry per admitted `TextureRectangle` **wire command**, in plan
     /// order: the declared `RenderTarget` write-access span the decoder
     /// recorded for it (`None` when it declared no write), and the index
@@ -755,6 +776,7 @@ impl PlanCollector {
         env_color: Option<Color4>,
         prim_color: Option<PrimColor>,
         fog_color: Option<Color4>,
+        color_image: Option<ColorImage>,
     ) -> Self {
         Self {
             loads: Vec::new(),
@@ -767,6 +789,7 @@ impl PlanCollector {
             current_env_color: env_color,
             current_prim_color: prim_color,
             current_fog_color: fog_color,
+            current_color_image: color_image,
             triangles: Vec::new(),
             fills: Vec::new(),
             full_sync_sites: Vec::new(),
@@ -807,6 +830,14 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Some(Color4::from_wire(color.value));
+                }
+                RdpStateCommand::SetColorImage { image, .. } => {
+                    self.current_color_image = Some(ColorImage::from_wire(
+                        image_format(image.format),
+                        pixel_size(image.size),
+                        image.width,
+                        image.address,
+                    ));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
@@ -1039,11 +1070,14 @@ struct ExecutionCollector<'coord> {
     /// itself: keeping `PendingTmemImage<'_>` alive here would block the
     /// publication that must follow.
     ///
-    /// `None` for a packet that staged no TMEM transaction at all. That is
-    /// not a silent fallback to committed state -- `draw_admitted_triangles`
-    /// names the two cases apart, and a texrect can never reach it with
-    /// `None` because `TexrectWithoutTmemLoad` refuses that packet shape
-    /// upstream.
+    /// `None` for a packet that staged no TMEM transaction at all --
+    /// including a load-free texrect packet, which is a real WM2000 shape
+    /// (measured: its fourth packet is 46 texrects, 0 loads, 0 fills).
+    /// `draw_admitted_triangles` then projects durable committed TMEM,
+    /// which is not a silent fallback: the packet proposed nothing, so
+    /// durable state is the only image in existence, and it is the same one
+    /// `TexrectTmemSource::Committed` hands the CPU texel reader for that
+    /// packet.
     draw_tmem: Option<TmemGpuProjection>,
 }
 
@@ -1110,7 +1144,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // its exact seed values are irrelevant.
         self.plan = core::mem::replace(
             plan_visitor,
-            PlanCollector::seeded(None, None, None, None, None, None),
+            PlanCollector::seeded(None, None, None, None, None, None, None),
         );
     }
 
@@ -1312,7 +1346,34 @@ pub enum WgpuRawDpcExecutionError {
     /// and shared by every triangle in the draw. Collapsing the two would
     /// report a triangle index this site cannot honestly supply.
     PendingTmemProjectionClaimedCommitted,
-    TexrectWithoutTmemLoad,
+    /// The mirror of [`Self::PendingTmemImageClaimedCommitted`]: durable
+    /// `PhysicalTmemState`, selected for a packet that staged no TMEM load,
+    /// reported a `Proposed` snapshot identity. Durable state has no
+    /// proposal digest to name, so a proposed receipt from it is a forgery
+    /// in the other direction, and a texrect would be attributing its
+    /// pixels to a transaction that does not exist.
+    CommittedTmemImageClaimedProposed {
+        triangle_index: usize,
+    },
+    /// A packet staged at least one color-target command (a
+    /// `FillRectangle` or a `TextureRectangle`) but no `SetColorImage` was
+    /// current at its stream position -- neither carried in this packet nor
+    /// durable from an earlier one. There is no destination image to derive
+    /// a [`ColorTargetKey`] from, and one is never invented.
+    ///
+    /// Distinct from [`Self::NoColorTargetHeight`], which is the *height*
+    /// half of the same key: that names a missing `RenderBackend::create`,
+    /// this names a missing RDP register.
+    NoStagedColorImage,
+    /// An admitted `FillRectangle`'s own `color_image` field disagrees with
+    /// the `SetColorImage` register current at its stream position. The
+    /// decoder derives write accesses from the register and the executor
+    /// composes into the key derived from it, so a disagreeing fill would
+    /// write pixels into one image while declaring them against another.
+    /// Refused by name rather than silently preferring either source.
+    FillColorImageDisagreesWithRegister {
+        command_index: u32,
+    },
     TexrectExecution(crate::targets::TexrectExecutionError),
     TextureLutMode(crate::TextureLutModeError),
 }
@@ -1353,6 +1414,16 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "triangle #{triangle_index} (plan order) selected a blend-cycle input that reads \
                  the framebuffer alpha (coverage count); this crate does not yet implement \
                  framebuffer-alpha-dependent blending"
+            ),
+            Self::NoStagedColorImage => formatter.write_str(
+                "a color-target command reached execution with no SetColorImage current at its \
+                 stream position, in this packet or durable from an earlier one, so there is no \
+                 destination image to compose into",
+            ),
+            Self::FillColorImageDisagreesWithRegister { command_index } => write!(
+                formatter,
+                "FillRectangle command #{command_index} carries a color image that differs from \
+                 the SetColorImage register current at its own stream position"
             ),
             Self::NoColorTargetHeight => formatter.write_str(
                 "an admitted FillRectangle reached execution before any RenderBackend::create \
@@ -1431,14 +1502,15 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                  #{triangle_index} reported a Committed snapshot identity; a sealed but \
                  unpublished transaction has no durable (state, generation) pair to name"
             ),
+            Self::CommittedTmemImageClaimedProposed { triangle_index } => write!(
+                formatter,
+                "texture rectangle #{triangle_index} (plan order) sampled durable committed TMEM \
+                 that reported a Proposed snapshot identity"
+            ),
             Self::PendingTmemProjectionClaimedCommitted => formatter.write_str(
                 "the pending TMEM post-image projected for this packet's triangle draw reported \
                  a Committed snapshot identity; a sealed but unpublished transaction has no \
                  durable (state, generation) pair to name",
-            ),
-            Self::TexrectWithoutTmemLoad => formatter.write_str(
-                "this packet declares a TextureRectangle but completed no TMEM load, so there \
-                 is no pending TMEM post-image for it to sample",
             ),
             Self::TexrectExecution(error) => write!(formatter, "{error}"),
             Self::TextureLutMode(error) => write!(formatter, "{error}"),
@@ -1805,6 +1877,7 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.env_color(),
             self.rdp_state.prim_color(),
             self.rdp_state.fog_color(),
+            self.rdp_state.color_image(),
             &mut self.color_targets,
             self.configured_target_extent,
         )
@@ -2242,7 +2315,9 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// so a triangle in this submission with no `SetOtherMode`/`SetCombine`/
 /// `SetBlendColor`/`SetEnvColor`/`SetPrimColor`/`SetFogColor` of its own
 /// still resolves its draw state from durable cross-submission carry-in, not
-/// `None`.
+/// `None`. `durable_color_image` is the same carry-in for `SetColorImage`,
+/// and is what `color_target_key` derives this packet's destination from --
+/// the register the decoder's own write-access planner already reads.
 #[allow(clippy::too_many_arguments)]
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
@@ -2253,6 +2328,7 @@ fn execute_raw_dpc_inner(
     durable_env_color: Option<Color4>,
     durable_prim_color: Option<PrimColor>,
     durable_fog_color: Option<Color4>,
+    durable_color_image: Option<ColorImage>,
     color_targets: &mut Option<ColorTargetRegistry>,
     configured_target_extent: Option<TriangleTargetExtent>,
 ) -> Result<
@@ -2271,6 +2347,7 @@ fn execute_raw_dpc_inner(
         durable_env_color,
         durable_prim_color,
         durable_fog_color,
+        durable_color_image,
     );
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
@@ -2284,6 +2361,7 @@ fn execute_raw_dpc_inner(
             durable_env_color,
             durable_prim_color,
             durable_fog_color,
+            durable_color_image,
         ),
         reads: Vec::new(),
         outcome: None,
@@ -2430,12 +2508,32 @@ fn stage_and_report(
     if texrect_count > 0 && raw_triangle_count > 0 {
         return Err(WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket);
     }
-    // Census-measured: 0 of WM2000's 219 decode entries carry a texrect
-    // without a TMEM load in the same entry, so there is no shape here to
-    // serve by silently sampling stale committed state.
-    if texrect_count > 0 && collector.plan.loads.is_empty() {
-        return Err(WgpuRawDpcExecutionError::TexrectWithoutTmemLoad);
-    }
+    // **A texrect in a packet with no TMEM load samples durable committed
+    // TMEM, and that is the RDP's own semantics, not a fallback.**
+    //
+    // This was a `TexrectWithoutTmemLoad` refusal, justified by a census
+    // reading "0 of WM2000's 219 decode entries carry a texrect without a
+    // load in the same entry". The count was correct; the window was not.
+    // That census covered 219 decode entries of boot/attract and was
+    // superseded twice in its own doc (383 -> 1,056 -> 4,454 VI fields,
+    // 219 -> 2,219 -> 5,792 entries). Re-measured on the real ROM through
+    // the shell's `FN64_RENDER=wgpu` seam, the fourth packet WM2000 issues
+    // is **46 texrects, 0 loads, 0 fills** -- the refused shape, from the
+    // game, one packet after the packet whose 4 loads filled the tiles it
+    // samples.
+    //
+    // The refusal's own worry -- "silently sampling stale committed state"
+    // -- does not apply to the state actually read here. TMEM is durable
+    // RDP hardware state; committed `PhysicalTmemState` is not a stale
+    // approximation of a proposal, it is the published result of every
+    // earlier packet's loads, which is the only thing a load-free packet's
+    // texrect could observe on hardware. The guard against inventing texels
+    // is preserved and strengthened rather than dropped: the read goes
+    // through the same single `sample_point`/`read_texel` path a pending
+    // read uses, an invalid TMEM byte is still a named refusal from that
+    // reader rather than a zero, and `CommittedTmemImageClaimedProposed`
+    // now checks the identity crossing in the direction this arm requires.
+    //
     // **Within-packet ordering is semantics, and this is where it is
     // enforced.**
     //
@@ -2469,9 +2567,35 @@ fn stage_and_report(
             });
         }
     }
-    // A fill with no TMEM load keeps its own dedicated path: it has no
-    // physical successor to offer, so it must not reach `complete_execution`.
-    if !collector.plan.fills.is_empty() && collector.plan.loads.is_empty() {
+    // A color-target command with no TMEM load keeps its own dedicated
+    // path: the packet has no physical successor to offer, so it must not
+    // reach `complete_execution`.
+    //
+    // Reached by a texrect as well as a fill. Both write the same resource
+    // through the same accumulation seam and neither stages a TMEM
+    // transaction, so the routing question is "did this packet complete a
+    // load", not "which command wrote". Gating on `fills` alone sent a
+    // load-free texrect packet down the transaction path, where
+    // `into_pending` has nothing to seal.
+    //
+    // **Only a texrect that DECLARED a write counts.** The decoder emits no
+    // `ColorFramebuffer` access for a texrect with no staged
+    // `SetColorImage` (`raw_dpc::plan_texture_rectangle` returns early), and
+    // such a packet has no color target to compose into at all -- it
+    // rasters through the GPU triangle path and nothing else. Routing it
+    // here on the mere presence of a texrect would ask `color_target_key`
+    // for a key that cannot exist and refuse a packet the decoder
+    // deliberately admitted. Read off the decoder's own recorded span, not
+    // re-derived.
+    let writing_texrect_count = collector
+        .plan
+        .texrect_commands
+        .iter()
+        .filter(|(span, _, _, _)| span.is_some())
+        .count();
+    if (!collector.plan.fills.is_empty() || writing_texrect_count > 0)
+        && collector.plan.loads.is_empty()
+    {
         return stage_fills_and_report(collector, packet);
     }
 
@@ -2582,7 +2706,8 @@ fn stage_and_report(
     // staging last means a TMEM rejection returns `Err` with no token in
     // existence at all, which is the same "nothing published" outcome the
     // fill-only path reaches by never storing the token on the error path.
-    let staged_fill = stage_color_commands(collector, packet, Some(&pending))?;
+    let staged_fill =
+        stage_color_commands(collector, packet, TexrectTmemSource::Pending(&pending))?;
 
     let Some(staged_fill) = staged_fill else {
         let effects = BackendEffectReport::try_new(packet, tmem_writes)
@@ -2707,9 +2832,18 @@ fn stage_fills_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
-    let staged = stage_color_commands(collector, packet, None)?.ok_or(
-        WgpuRawDpcExecutionError::FillExecution(FillExecutionError::NotFillCycle),
-    )?;
+    // Durable TMEM, because this path is reached only for a packet whose
+    // `plan.loads` is empty -- there is no proposal in existence to sample.
+    // A texrect here observes exactly what an earlier packet published,
+    // which is what the hardware's TMEM holds at this stream position.
+    let staged = stage_color_commands(
+        collector,
+        packet,
+        TexrectTmemSource::Committed(collector.physical),
+    )?
+    .ok_or(WgpuRawDpcExecutionError::FillExecution(
+        FillExecutionError::NotFillCycle,
+    ))?;
     let effects = BackendEffectReport::try_new(packet, staged.guest_writes.clone())
         .map_err(WgpuRawDpcExecutionError::Effect)?;
     Ok(StagedOutcome::GuestWritesOnly(effects, staged))
@@ -2725,6 +2859,40 @@ fn stage_fills_and_report(
 enum ColorCommandKind {
     Fill(usize),
     Texrect(usize),
+}
+
+/// **Which TMEM image this packet's texrects sample, chosen once per packet
+/// by the packet's own load count -- never a fallback.**
+///
+/// The RDP's TMEM is durable across submissions. A texrect samples whatever
+/// is in TMEM at its own stream position, which is:
+///
+/// - [`Self::Pending`] -- the sealed post-image of this packet's own loads,
+///   when the packet carries at least one. `TexrectBeforeItsOwnLoad`
+///   independently refuses a texrect that precedes a load in the same
+///   packet, so every texrect reaching this case genuinely follows every
+///   load whose texels it observes.
+/// - [`Self::Committed`] -- the coordinator's durable [`PhysicalTmemState`],
+///   when the packet carries **zero** loads. There is no proposal to
+///   observe, and the durable state is not "stale": it is precisely the
+///   result of every load an earlier packet already published, which is the
+///   only thing the hardware's TMEM could contain.
+///
+/// The two are not interchangeable and the choice is not a heuristic. A
+/// packet with loads must **not** read `Committed`, because the coordinator
+/// has not published this packet's own loads yet and the texrect would miss
+/// texels the wire stream placed before it -- the defect commit `3a1a6a73`
+/// measured as `TMEM_SAMPLE_STATUS_INVALID_BYTE`. A packet without loads
+/// must not read a `Pending` image, because none exists.
+///
+/// **This is deliberately not a fallback for a missing pending image.** The
+/// selection is made from `plan.loads.is_empty()` -- a fact about the wire
+/// stream -- before any staging runs, not from a `None` observed after
+/// staging failed. A `None` where a pending image was expected stays a
+/// named refusal.
+enum TexrectTmemSource<'a> {
+    Pending(&'a crate::tmem::PendingTmemTransaction),
+    Committed(&'a PhysicalTmemState),
 }
 
 /// **The N-command accumulation seam.**
@@ -2787,7 +2955,7 @@ enum ColorCommandKind {
 fn stage_color_commands(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
-    pending: Option<&crate::tmem::PendingTmemTransaction>,
+    tmem: TexrectTmemSource<'_>,
 ) -> Result<Option<StagedFill>, WgpuRawDpcExecutionError> {
     // The ordered schedule, recovered from the decoder's own per-command
     // stream index. `sort_by_key` on that index is not a sort *policy*: the
@@ -2846,17 +3014,30 @@ fn stage_color_commands(
                 execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
             }
             ColorCommandKind::Texrect(index) => {
-                // A texrect samples the pending post-image of its own
-                // packet's TMEM loads. `stage_and_report` already refuses
-                // a texrect in a packet with no load
-                // (`TexrectWithoutTmemLoad`), so `None` here would mean
-                // that gate and this loop disagree -- named, never
-                // silently sampling committed state.
-                let pending = pending.ok_or(WgpuRawDpcExecutionError::TexrectWithoutTmemLoad)?;
+                // A texrect samples the TMEM image `stage_and_report`
+                // selected for the whole packet from its own load count --
+                // this packet's pending post-image when it carries loads,
+                // durable committed state when it carries none. The choice
+                // is made once, upstream, from a fact about the wire
+                // stream; this loop applies it rather than re-deciding per
+                // command.
                 let resident = accumulated
                     .as_deref()
                     .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
-                execute_scheduled_texrect(collector, &candidate, pending, index, resident, claimed)?
+                match tmem {
+                    TexrectTmemSource::Pending(pending) => execute_scheduled_texrect(
+                        collector,
+                        &candidate,
+                        &pending.pending_image(),
+                        true,
+                        index,
+                        resident,
+                        claimed,
+                    )?,
+                    TexrectTmemSource::Committed(state) => execute_scheduled_texrect(
+                        collector, &candidate, state, false, index, resident, claimed,
+                    )?,
+                }
             }
         };
         // This command's own output becomes the next command's resident
@@ -2909,32 +3090,61 @@ fn union_target_rectangle(
         .expect("a union of two in-bounds rectangles is in bounds")
 }
 
-/// This packet's color-target key, derived from its own staged
-/// `SetColorImage` -- reached through the fill command that carries it, the
-/// one place the image is available (a triangle carries none).
+/// This packet's color-target key, derived from the `SetColorImage`
+/// current at the packet's stream position -- `PlanCollector`'s tracked
+/// `current_color_image`, which is seeded from `WgpuBackend`'s durable
+/// `rdp_state` and updated by any `SetColorImage` this packet carries.
 ///
-/// Builds the registry on the first admitted fill ever, exactly as the
-/// single-fill path did, and for the same reason: neither `try_new` nor
-/// `create` has a memory layout to build it from.
+/// **Not read off the first `FillRectangle`.** That was the previous
+/// derivation and it was wrong in a way no fill-bearing packet could
+/// expose: the RDP's color-image register is durable across submissions,
+/// so a packet may compose into a target it never re-declares. The
+/// decoder's own `raw_dpc::plan_texture_rectangle` already derives a
+/// texrect's declared `ColorFramebuffer` write accesses from that same
+/// durable `state.color_image()`, so reading a packet-local fill here made
+/// the executor and the decoder answer one question two ways. Measured on
+/// WM2000: a real packet of 14 texrects, 4 loads and zero fills, every
+/// texrect declaring a four-access write run, aborted the run because
+/// `fills.first()` was `None`.
+///
+/// The fill is retained as a **cross-check**, not a source: a fill whose
+/// own `color_image` disagrees with the tracked register is a decoder /
+/// executor divergence and is refused by name rather than silently
+/// preferring either.
+///
+/// Builds the registry on the first admitted color-target command ever,
+/// exactly as the fill path did, and for the same reason: neither
+/// `try_new` nor `create` has a memory layout to build it from.
 fn color_target_key(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<ColorTargetKey, WgpuRawDpcExecutionError> {
-    let (_, fill, _) = collector
+    let image = collector
         .plan
-        .fills
-        .first()
-        .ok_or(WgpuRawDpcExecutionError::TexrectWithoutTmemLoad)?;
+        .current_color_image
+        .ok_or(WgpuRawDpcExecutionError::NoStagedColorImage)?;
+    if let Some((command_index, fill, _)) = collector.plan.fills.first() {
+        let declared = ColorImage::from_wire(
+            image_format(fill.color_image.format),
+            pixel_size(fill.color_image.size),
+            fill.color_image.width,
+            fill.color_image.address,
+        );
+        if declared != image {
+            return Err(
+                WgpuRawDpcExecutionError::FillColorImageDisagreesWithRegister {
+                    command_index: *command_index,
+                },
+            );
+        }
+    }
     let Some(extent) = collector.configured_target_extent else {
         return Err(WgpuRawDpcExecutionError::NoColorTargetHeight);
     };
-    let format = ColorTargetFormat::try_from_rdp(
-        image_format(fill.color_image.format),
-        pixel_size(fill.color_image.size),
-    )?;
+    let format = ColorTargetFormat::try_from_rdp(image.format(), image.size())?;
     let key = ColorTargetKey::try_new(
-        fill.color_image.address,
-        ColorTargetExtent::try_new(fill.color_image.width, extent.height)?,
+        image.address(),
+        ColorTargetExtent::try_new(image.width(), extent.height)?,
         format,
     )?;
     if collector.color_targets.is_none() {
@@ -2989,10 +3199,12 @@ fn execute_scheduled_fill(
 /// pixel extent from the `RectViewportPixels` `texture_rectangle_vertices`
 /// produced, and the declared write run from the span the decoder recorded
 /// when it pushed those accesses.
-fn execute_scheduled_texrect(
+#[allow(clippy::too_many_arguments)]
+fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
-    pending: &crate::tmem::PendingTmemTransaction,
+    tmem: &S,
+    expect_proposed: bool,
     index: usize,
     resident_bytes: &[u8],
     already_initialized: Option<TargetRectangle>,
@@ -3078,15 +3290,24 @@ fn execute_scheduled_texrect(
         .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
     // **The committed/pending distinction, asserted where it is crossed.**
     //
-    // A pending post-image must answer `TmemSnapshotIdentity::Proposed`,
-    // never `Committed`. Checked here rather than trusted, because the type
-    // system cannot: both variants inhabit one enum, so a wrong `snapshot()`
-    // impl compiles. Measured: forging `Committed` in `PendingTmemImage`'s
-    // impl passed the entire suite before this check existed.
-    let image = pending.pending_image();
-    let snapshot = crate::TmemByteSource::snapshot(&image);
-    if snapshot.is_committed() {
+    // The image this call was handed must answer the identity its *caller*
+    // selected, not merely a well-formed one: a pending post-image answers
+    // `TmemSnapshotIdentity::Proposed`, durable state answers `Committed`.
+    // Checked here rather than trusted, because the type system cannot:
+    // both variants inhabit one enum, so a wrong `snapshot()` impl
+    // compiles. Measured: forging `Committed` in `PendingTmemImage`'s impl
+    // passed the entire suite before this check existed.
+    //
+    // Both directions are checked, not just one. A committed image reaching
+    // the load-bearing packet's arm would mean the texrect silently missed
+    // its own packet's loads; a proposed image reaching the load-free arm
+    // would mean a proposal was fabricated for a packet that staged none.
+    let snapshot = crate::TmemByteSource::snapshot(tmem);
+    if expect_proposed && snapshot.is_committed() {
         return Err(WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index });
+    }
+    if !expect_proposed && !snapshot.is_committed() {
+        return Err(WgpuRawDpcExecutionError::CommittedTmemImageClaimedProposed { triangle_index });
     }
     // The one-cycle shading state, taken from the SAME
     // `RetrievedTriangleDraw` snapshot the other-mode, viewport and tile
@@ -3119,7 +3340,7 @@ fn execute_scheduled_texrect(
         other_mode,
         draw,
         tile,
-        &image,
+        tmem,
         lut_mode,
         shading,
         blend_registers,
@@ -5840,8 +6061,7 @@ mod tests {
         let probe_capture = capture(probe_words);
         let probe_submission = probe_capture.submission().clone();
         let probe_layout = probe_capture.memory_layout();
-        let probe_journal =
-            single_source_probe_journal(&probe_submission, probe_layout).unwrap();
+        let probe_journal = single_source_probe_journal(&probe_submission, probe_layout).unwrap();
         let probe_decoded = finalize_with_zero_reads(
             probe_layout,
             probe_capture.transaction_sequence(),
@@ -6089,6 +6309,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let fog_a = fixture_set_fog_color(0x7777_7777);
@@ -6252,6 +6473,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let env_a = fixture_set_env_color(0x1111_1111);
@@ -6311,6 +6533,7 @@ mod tests {
             Some(seed_env_color),
             Some(seed_prim_color),
             None,
+            None,
         );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -6329,7 +6552,7 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(None, None, None, None, None, None);
+        let mut collector = PlanCollector::seeded(None, None, None, None, None, None, None);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -6361,6 +6584,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -6387,6 +6611,7 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
+            None,
             None,
             None,
             None,
@@ -6434,6 +6659,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
@@ -6459,6 +6685,7 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
+            None,
             None,
             None,
             None,
@@ -7269,6 +7496,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.color_image(),
             &mut backend.color_targets,
             backend.configured_target_extent,
         )
@@ -8567,12 +8795,12 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None);
+        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None, None);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(None, None, None, None, None, None),
+            plan: PlanCollector::seeded(None, None, None, None, None, None, None),
             reads: Vec::new(),
             outcome: None,
             queue: bound.queue(),
@@ -9412,12 +9640,12 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None);
+        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None, None);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(None, None, None, None, None, None),
+            plan: PlanCollector::seeded(None, None, None, None, None, None, None),
             reads: Vec::new(),
             outcome: None,
             queue: bound.queue(),
@@ -11035,33 +11263,49 @@ mod tests {
         );
     }
 
-    /// **The inversion of this card's starting measurement, recorded.**
+    /// **The second inversion of this test, and the disproof that drove
+    /// it.**
     ///
-    /// At `be6ed65c` this test was named
-    /// `a_fill_composed_with_a_texture_rectangle_is_refused_by_name` and
-    /// asserted `MixedFillAndTrianglePacket`, on the reasoning that "a
+    /// At `be6ed65c` this was
+    /// `a_fill_composed_with_a_texture_rectangle_is_refused_by_name`,
+    /// asserting `MixedFillAndTrianglePacket` on the reasoning that "a
     /// texrect *is* two triangles by the time `stage_and_report` sees it".
-    /// That reasoning is now wrong in its premise: a texrect declares its
-    /// own journal `ColorFramebuffer` writes where a raw triangle declares
-    /// none, so there IS a declared order to compose it onto the fill with,
-    /// and `stage_and_report` partitions on the source rather than
-    /// refusing every triangle-bearing packet.
+    /// That premise fell: a texrect declares its own journal
+    /// `ColorFramebuffer` writes where a raw triangle declares none.
     ///
-    /// What survives is the narrower, still-true refusal this test now
-    /// pins: **fill + texrect with no TMEM load** is refused, because there
-    /// is no pending post-image for the texrect to sample. Census-measured,
-    /// that shape does not occur (0 of WM2000's 219 decode entries carry a
-    /// texrect without a load in the same entry), which is why refusing it
-    /// costs nothing real -- and refusing it by name is what keeps a
-    /// texrect from silently sampling a previous packet's committed TMEM.
+    /// It then asserted `TexrectWithoutTmemLoad`, justified by a census
+    /// reading "0 of WM2000's 219 decode entries carry a texrect without a
+    /// load in the same entry". **That premise has now fallen too, and the
+    /// count is not what was wrong with it.** The census window was 219
+    /// decode entries of boot/attract and its own doc supersedes it twice
+    /// (383 -> 1,056 -> 4,454 VI fields, 219 -> 2,219 -> 5,792 entries).
+    /// Re-measured on the real ROM through the shell's `FN64_RENDER=wgpu`
+    /// seam, the fourth packet WM2000 issues is 46 texrects, 0 loads and 0
+    /// fills -- the shape the refusal declared impossible, from the game.
+    ///
+    /// So this test now pins the **admission**: a texrect in a load-free
+    /// packet samples durable committed TMEM, which is not a stale
+    /// substitute for a proposal but the published result of every earlier
+    /// packet's loads -- the only thing hardware TMEM could hold at this
+    /// stream position. What kept the old refusal honest is kept by other
+    /// means, and they are asserted here too: the read goes through the
+    /// same `sample_point` path a pending read uses, so an invalid TMEM
+    /// byte is still a named refusal rather than a fabricated texel.
     ///
     /// The fill+**raw triangle** refusal is unchanged and still named
     /// `MixedFillAndTrianglePacket`; it is asserted separately below.
     #[test]
-    fn a_fill_composed_with_a_texture_rectangle_and_no_tmem_load_is_refused_by_name() {
+    fn a_fill_composed_with_a_texture_rectangle_and_no_tmem_load_samples_committed_tmem() {
         let mut fill_and_texrect = whole_target_fill_words();
         fill_and_texrect.extend(set_other_mode(2, 0));
         fill_and_texrect.extend(set_combine(0, 0));
+        // A bound tile, so the texrect reaches the SAMPLER rather than
+        // stopping at `TexrectUnboundTile` one step earlier. Without this
+        // the test would pass on a refusal that says nothing about what a
+        // load-free texrect reads, and the invalid-byte assertion below
+        // would be vacuous.
+        fill_and_texrect.extend(set_tile(7, 1, 0));
+        fill_and_texrect.extend(set_tile_size_words(7, 7 << 2, 2 << 2));
         fill_and_texrect.extend(texrect_words_in_target(7));
 
         // Positive control: this stream really does carry the texrect.
@@ -11082,23 +11326,36 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
         let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_texrect);
+
+        // **No refusal, and specifically not the deleted one.** Nothing in
+        // this backend may name `TexrectWithoutTmemLoad` any more: the
+        // variant is gone, so a reintroduction is a compile error rather
+        // than a string this assertion has to chase.
+        //
+        // The packet's TMEM is entirely unwritten here -- this fixture
+        // stages no load in this packet and publishes none before it -- so
+        // every texel the texrect asks for is an INVALID byte. That is the
+        // load-bearing half of the assertion: admitting the shape must not
+        // mean fabricating texels for it. The reader refuses by name, from
+        // the same `sample_point` path a pending read uses, and this test
+        // pins that the refusal is about the *bytes*, not about the packet
+        // shape.
         let error = result.expect_err(
-            "fill + texrect with no TMEM load must be refused -- there is no pending TMEM \
-             post-image for the texrect to sample",
+            "an unwritten TMEM must still refuse the texel fetch by name, or this admission \
+             would be producing plausible pixels from nothing",
+        );
+        let message = error.to_string();
+        assert!(
+            !message.contains("completed no TMEM load"),
+            "the packet SHAPE must no longer be the refusal -- got: {message}"
         );
         assert!(
-            error
-                .to_string()
-                .contains(&WgpuRawDpcExecutionError::TexrectWithoutTmemLoad.to_string()),
-            "the refusal must be the named TexrectWithoutTmemLoad variant, got: {error}"
+            message.contains("invalid") || message.contains("Invalid"),
+            "the refusal must name the invalid TMEM byte the sampler actually hit, got: {message}"
         );
         assert!(
             !backend.has_pending_fill_publication(),
             "a refused composition must leave no redeemable fill token behind"
-        );
-        assert!(
-            backend.color_targets().is_none(),
-            "the refusal must fire before the fill executor ever built the registry"
         );
     }
 
@@ -11157,10 +11414,9 @@ mod tests {
         let mut backend = WgpuBackend::try_new().unwrap().0;
         let mut rdram = vec![0u8; LAYOUT_BYTES as usize];
         let mut rsp_memory = rsp_memory_with_imem(b"wm2000-uncatalogued-geometry-microcode");
-        let expected = fn64_render::UcodeDigest::from_text(
-            rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem),
-        )
-        .as_bytes();
+        let expected =
+            fn64_render::UcodeDigest::from_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))
+                .as_bytes();
 
         let task = fn64_render::OsTask {
             task_type: fn64_render::M_GFXTASK,
@@ -11213,10 +11469,8 @@ mod tests {
             };
             assert_eq!(
                 ucode_sha256,
-                fn64_render::UcodeDigest::from_text(
-                    memory.bank(fn64_runtime::RspMemoryBank::Imem)
-                )
-                .as_bytes(),
+                fn64_render::UcodeDigest::from_text(memory.bank(fn64_runtime::RspMemoryBank::Imem))
+                    .as_bytes(),
                 "the digest must be the live IMEM bank's"
             );
         }
