@@ -41,6 +41,10 @@ pub enum Capture {
 
 pub struct Overlay {
     pub open: bool,
+    /// The always-cheap stack/framerate HUD (F3), independent of the settings
+    /// panel: a player who wants to SEE which stack a build is on should not
+    /// have to open a modal that neutralizes their input to read it.
+    pub hud: bool,
     pub capture: Option<Capture>,
     ctx: egui::Context,
     renderer: Option<egui_wgpu::Renderer>,
@@ -66,6 +70,7 @@ impl Overlay {
         ctx.set_visuals(visuals);
         Overlay {
             open: false,
+            hud: false,
             capture: None,
             ctx,
             renderer: None,
@@ -85,6 +90,17 @@ impl Overlay {
         });
     }
 
+    /// Whether anything at all needs the egui pass this frame. `present()`
+    /// takes the plain `pixels.render()` path when this is false, so a run
+    /// with both surfaces closed pays exactly what it paid before.
+    pub fn active(&self) -> bool {
+        self.open || self.hud
+    }
+
+    pub fn toggle_hud(&mut self) {
+        self.hud = !self.hud;
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.capture = None;
@@ -97,6 +113,9 @@ impl Overlay {
     /// Translate the few winit window events egui needs. Call for every
     /// window event while the overlay is open; cheap no-ops otherwise.
     pub fn on_window_event(&mut self, event: &WindowEvent, scale_factor: f32) {
+        // Keyed to `open`, not `active()`: the HUD is a read-only overlay with
+        // no widgets, so feeding it pointer events would only accumulate a
+        // queue nothing drains.
         if !self.open {
             return;
         }
@@ -180,6 +199,7 @@ impl Overlay {
         scale_factor: f32,
         config: &mut InputConfig,
         gamepads: &Gamepads,
+        hud: Option<&HudReadout>,
     ) -> Result<(), pixels::Error> {
         let (width, height) = window_size;
         let mut raw = egui::RawInput {
@@ -200,16 +220,22 @@ impl Overlay {
         let mut reset_armed = self.reset_armed;
         let mut dirty = false;
         let mut close_requested = false;
+        let settings_open = self.open;
         let full_output = self.ctx.clone().run(raw, |ctx| {
-            draw_ui(
-                ctx,
-                config,
-                gamepads,
-                &mut capture,
-                &mut reset_armed,
-                &mut dirty,
-                &mut close_requested,
-            );
+            if let Some(readout) = hud {
+                draw_hud(ctx, readout);
+            }
+            if settings_open {
+                draw_ui(
+                    ctx,
+                    config,
+                    gamepads,
+                    &mut capture,
+                    &mut reset_armed,
+                    &mut dirty,
+                    &mut close_requested,
+                );
+            }
         });
         self.capture = capture;
         self.reset_armed = reset_armed;
@@ -273,6 +299,71 @@ impl Overlay {
             Ok(())
         })
     }
+}
+
+/// Everything the on-screen HUD paints: the build's fixed stack identity plus
+/// the live timing line. Assembled by the caller from `crate::stack`, so the
+/// drawing code here never re-derives a fact it could get wrong.
+pub struct HudReadout {
+    /// `(label, value)` identity rows -- see `stack::hud_identity`.
+    pub identity: [(&'static str, String); 2],
+    /// The live timing line, or `None` before the first heartbeat window has
+    /// enough samples. Shown as "measuring" rather than as a fabricated zero:
+    /// a HUD that displays 0.0 fps for the first second teaches the reader to
+    /// distrust it.
+    pub live: Option<String>,
+    /// True when the renderer is a silent fallback, so the panel can carry the
+    /// alarm colour rather than only the text.
+    pub alarm: bool,
+}
+
+/// A compact top-left panel. Deliberately not a window: no title bar, no
+/// interaction, no hit-testing -- it must not become the thing that perturbs
+/// the measurement it displays.
+fn draw_hud(ctx: &egui::Context, readout: &HudReadout) {
+    let frame = egui::Frame::none()
+        .fill(Color32::from_black_alpha(190))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .stroke(Stroke::new(
+            1.0,
+            if readout.alarm {
+                START_RED
+            } else {
+                Color32::from_rgb(0x2A, 0x2A, 0x2F)
+            },
+        ));
+    egui::Area::new(egui::Id::new("fn64-hud"))
+        .order(egui::Order::Foreground)
+        // Offset from the corner so it clears a window manager's rounding and
+        // stays readable in borderless fullscreen.
+        .fixed_pos(Pos2::new(10.0, 10.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                for (label, value) in &readout.identity {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(*label).color(MUTED).small().strong());
+                        ui.label(
+                            RichText::new(value)
+                                .color(if readout.alarm && *label == "GPU" {
+                                    START_RED
+                                } else {
+                                    INK
+                                })
+                                .small()
+                                .monospace(),
+                        );
+                    });
+                }
+                ui.label(
+                    RichText::new(readout.live.as_deref().unwrap_or("measuring…"))
+                        .color(if readout.live.is_some() { INK } else { MUTED })
+                        .small()
+                        .monospace(),
+                );
+            });
+        });
 }
 
 fn accent(button: N64Button) -> Color32 {
@@ -424,7 +515,7 @@ fn draw_ui(
             let hint = match capture {
                 Some(Capture::Key(_)) => "press a key to bind · Delete clears · Esc cancels",
                 Some(Capture::Pad(_)) => "press a controller button · Delete clears · Esc cancels",
-                None => "F1 or Esc closes · F11 toggles fullscreen",
+                None => "F1 or Esc closes · F3 stack/fps HUD · F11 toggles fullscreen",
             };
             ui.label(RichText::new(hint).color(MUTED).small());
         });
