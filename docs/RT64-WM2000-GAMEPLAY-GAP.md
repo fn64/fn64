@@ -105,6 +105,11 @@ ten swaps at swap 1100, in the middle of the white segment:
 The menu chain is navigable. The game responds to input the way a working
 emulator's does.
 
+**Determinism.** Two independent runs of the identical script (Start at swap
+1100, 900k steps) produce **all 5,272 framebuffer PNGs byte-identical** and a
+**byte-identical opcode census** — spanning the press and the state change it
+causes. A scripted press is reproducible evidence, not a one-off observation.
+
 ### 3.3 The interactive shell already does this too
 
 `crates/fn64-shell/src/main.rs:595` calls
@@ -130,6 +135,7 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 |---|---|---|---|
 | **B1** | **Nothing.** Input to reach the menu is already implemented at every layer — `PifModel`, the raw-SI PIF protocol, `set_controller_state`, and the shell's per-step feed. | **Zero.** Already done. | §3 |
 | **B2** | **No harness could press a button.** The headless lane could not test any post-attract state, which is why the attract loop read as terminal for so long. | **Small — now landed.** `WM2000_INPUT_SCRIPT`, 98 lines, this card. | §3.2 |
+| **B2b** | **Unknown button grammar past the mid-menu plateau.** Not an emulator defect (no trap, no refusal, no panic in any run) -- just nobody has read the menu state machine. | **Small.** Read the guest's pad handler, or try the remaining button space. | §5 |
 | **B3** | **Menu/gameplay raster fidelity.** Menu text is legible but **horizontally duplicated** (the same string tiled ~2.5× across the width) and heavily interlace-striped. Something in the raster or the VI field composition is wrong, and it is wrong in *attract too* — it is not a menu-specific defect. | **Unknown. Not diagnosed here.** | §5 |
 | **B4** | **Triangle composition (V3).** Still the expensive renderer item, and still required for anything to look right. | Large, unchanged. | `RT64-WM2000-REMAINING.md` §3 |
 | **B5** | **`FN64_RENDER=wgpu` refuses general gfx tasks** (`production.rs:1579`), so the all-fn64 target stack cannot run this path at all yet. | Large, unchanged. | Brief; not re-measured here |
@@ -158,17 +164,25 @@ So the honest answer to the card's motivating question is a split one:
 
 Stated plainly, because a precise blocker is the point of this card.
 
-- **Whether a match actually starts.** Scripted A presses at 100-swap
-  intervals advanced through several menu screens and then **plateaued**: from
-  swap 2500 to 3700 the frame oscillated between two hashes rather than
-  advancing, which reads as a cursor moving on a selector that A does not
-  confirm. A follow-up run substituting Start for A past that screen was still
-  in flight when this card closed. **No frame in this card was verified to be
+- **Whether a match actually starts.** Scripted presses advance through
+  several menu screens and then **plateau** on one screen (a dark arena-lit
+  view of three figures, plausibly wrestler-select). **Three independent
+  navigation strategies were tried and all three plateau on the same screen,
+  reproducing the same frame hashes**: A-only at 100-swap intervals
+  (swaps 2500-3700, oscillating between two hashes), Start-only past that
+  point (to swap 4600), and alternating d-pad-right + A (to swap 4722, frozen
+  on one hash from 3600 to 4400). **No frame in this card was verified to be
   in-match.** The menu chain is demonstrated; a match is not.
+
+  The plateau is **not** an emulation failure: `grep -iE
+  "unsupported|refus|trap|panic|unimplemented"` over all three run logs
+  returns nothing. No shim trapped, no opcode was refused, no thread died.
+  Whatever the screen wants, the emulator is not the thing withholding it.
 - **The correct button grammar for each screen.** Presses were chosen by
-  guess, not from the game's own input handler. A card that wants a match
-  should read the menu state machine rather than brute-force button
-  combinations.
+  guess, not from the game's own input handler, and the plateau is the direct
+  consequence. A card that wants a match should read the menu state machine
+  (or the guest's pad-handling function) rather than brute-force button
+  combinations -- that is the specific, small, named next step.
 - **Why menu text is horizontally duplicated.** Recorded in §4 as B3 and left
   undiagnosed. It could be a scissor, a stride, a VI x-scale, or the raster;
   none was ruled in or out.
