@@ -556,7 +556,7 @@ pub use texture_gen::{
 pub use tmem::{
     address_point_texel, address_texture_cell, decode_direct_texel, decode_tlut_entry,
     execute_ordered_tmem_loads, filter_three_nearest_committed_cell, gather_committed_texture_cell,
-    prepare_load_block, prepare_load_tile, prepare_load_tlut, project_committed_tmem,
+    prepare_load_block, prepare_load_tile, prepare_load_tlut, project_committed_tmem, project_tmem,
     read_committed_texel, read_texel, resolve_indexed_texel, sample_committed_point, sample_point,
     unpack_ci4_texel, AddressedTextureCell, AddressedTmemTexel, Ci4Palette, Ci4PaletteError,
     Ci4UnpackError, CommittedTextureCell, CommittedTmemTransaction, DecodedPhysicalTexel,

@@ -28,7 +28,7 @@ use fn64_render_ir::TMEM_BYTES;
 
 use crate::state::{ImageFormat, PixelSize};
 
-use super::{PhysicalTmemState, TileDescriptor, TileSize};
+use super::{PhysicalTmemState, TileDescriptor, TileSize, TmemByteSource};
 
 const TMEM_LEN: usize = TMEM_BYTES as usize;
 /// `TMEM_LEN` bits, packed 32 bits per word: `4096 / 32 == 128`.
@@ -261,17 +261,38 @@ pub struct TmemGpuProjection {
     pub validity_words: [u32; TMEM_VALIDITY_WORDS],
 }
 
-/// Projects `state`'s committed bytes and per-byte validity into the exact
-/// layout [`TmemGpuProjection`] documents, reading every address through
-/// [`PhysicalTmemState::valid_byte`] -- the same public readout
-/// `read_committed_texel` itself is built on (`tmem/read.rs`'s
+/// Projects any physical-TMEM byte image into the exact layout
+/// [`TmemGpuProjection`] documents, reading every address through
+/// [`TmemByteSource::valid_byte`] -- the same public readout
+/// [`read_texel`](super::read_texel) itself is built on (`tmem/read.rs`'s
 /// `read_valid_byte`) -- so an invalid address is never promoted into a
 /// defined byte value by this projection either.
-pub fn project_committed_tmem(state: &PhysicalTmemState) -> TmemGpuProjection {
+///
+/// **Generic over the source for the same reason [`read_texel`] is.** The
+/// two images a packet can present -- the coordinator's durable
+/// [`PhysicalTmemState`] and a sealed-but-unpublished
+/// [`PendingTmemImage`](super::PendingTmemImage) post-image -- expose the
+/// identical three-method [`TmemByteSource`] surface and answer
+/// `valid_byte` from the same shape of `bytes`/`valid` arrays. Sharing one
+/// projection makes a committed/pending *disagreement* unrepresentable
+/// rather than merely tested for: there is no second copy of the
+/// address walk, the validity gate, or the bitmap packing that could
+/// drift from this one. Only the caller's choice of source, and the
+/// [`TmemSnapshotIdentity`](super::TmemSnapshotIdentity) that source
+/// reports, distinguish the two projections.
+///
+/// This function deliberately does **not** inspect
+/// [`TmemByteSource::snapshot`]. Projecting is a byte copy, not a
+/// publication: it mints no receipt, so it has no identity to forge. The
+/// committed/pending distinction is enforced by the *caller* that crosses
+/// it -- see `production.rs`'s `project_pending_tmem_for_draw`, which
+/// refuses a pending image claiming `Committed` by name before projecting
+/// it, exactly as `stage_texrect` does for the CPU texel reader.
+pub fn project_tmem<S: TmemByteSource + ?Sized>(source: &S) -> TmemGpuProjection {
     let mut bytes = [0u8; TMEM_LEN];
     let mut validity_words = [0u32; TMEM_VALIDITY_WORDS];
     for address in 0..TMEM_LEN {
-        if let Some(byte) = state.valid_byte(address as u16) {
+        if let Some(byte) = source.valid_byte(address as u16) {
             bytes[address] = byte;
             validity_words[address / 32] |= 1 << (address % 32);
         }
@@ -280,6 +301,15 @@ pub fn project_committed_tmem(state: &PhysicalTmemState) -> TmemGpuProjection {
         bytes,
         validity_words,
     }
+}
+
+/// [`project_tmem`] at `S = PhysicalTmemState`: the durable, already-
+/// published image. A thin monomorphization, exactly as
+/// [`read_committed_texel`](super::read_committed_texel) is of
+/// [`read_texel`](super::read_texel) -- deliberately not a second
+/// implementation.
+pub fn project_committed_tmem(state: &PhysicalTmemState) -> TmemGpuProjection {
+    project_tmem(state)
 }
 
 /// `TMEM_LEN` bytes packed 4-per-`u32`-word, little-endian (byte 0 in the
@@ -329,6 +359,78 @@ mod tests {
         let projection = project_committed_tmem(&state);
         assert_eq!(projection.bytes, [0u8; TMEM_LEN]);
         assert_eq!(projection.validity_words, [0u32; TMEM_VALIDITY_WORDS]);
+    }
+
+    /// **The projection copies each address to its OWN index, byte-exact.**
+    ///
+    /// Value-exact, not structural: every valid address must appear at
+    /// exactly its own offset with exactly its own byte, and every invalid
+    /// address must be absent from the bitmap. A shift of even one address
+    /// -- `valid_byte(address + 1)`, the classic off-by-one -- moves every
+    /// byte one slot and is caught here by a direct index comparison rather
+    /// than by a downstream sampler that might tolerate it.
+    ///
+    /// Measured: this test exists because that exact mutant survived the
+    /// end-to-end texrect assertions, which check that the sampled image
+    /// varies along S and T -- a property a shifted image still has.
+    #[test]
+    fn every_valid_address_projects_to_its_own_index_with_its_own_byte() {
+        struct Ramp;
+        impl TmemByteSource for Ramp {
+            fn snapshot(&self) -> super::super::TmemSnapshotIdentity {
+                unreachable!("project_tmem must not consult the snapshot identity")
+            }
+            /// A distinct byte at every third address, so a shift by one
+            /// changes both which addresses are valid and what they hold.
+            fn valid_byte(&self, address: u16) -> Option<u8> {
+                let address = usize::from(address);
+                (address < TMEM_LEN && address % 3 == 0).then(|| (address % 251) as u8)
+            }
+        }
+
+        let projection = project_tmem(&Ramp);
+        for address in 0..TMEM_LEN {
+            let expected = TmemByteSource::valid_byte(&Ramp, address as u16);
+            let bit_set = projection.validity_words[address / 32] & (1 << (address % 32)) != 0;
+            match expected {
+                Some(byte) => {
+                    assert!(
+                        bit_set,
+                        "address {address} is valid and must set its own bit"
+                    );
+                    assert_eq!(
+                        projection.bytes[address], byte,
+                        "address {address} must project its OWN byte at its OWN index -- a \
+                         mismatch here is an address shift in the projection walk"
+                    );
+                }
+                None => {
+                    assert!(
+                        !bit_set,
+                        "address {address} is invalid and must NOT set its bit -- promoting an \
+                         invalid address into a defined byte is the one thing this projection \
+                         must never do"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **One projection, not two: the committed entry point is exactly the
+    /// generic one at `S = PhysicalTmemState`.**
+    ///
+    /// Asserted rather than assumed, because a duplicated projection is the
+    /// failure mode this card was told to avoid. If `project_committed_tmem`
+    /// ever grew its own address walk, this comparison would diverge.
+    #[test]
+    fn the_committed_entry_point_is_the_generic_projection() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        assert_eq!(
+            project_committed_tmem(&state),
+            project_tmem(&state),
+            "project_committed_tmem must be a thin monomorphization of project_tmem, not a \
+             second implementation"
+        );
     }
 
     #[test]
