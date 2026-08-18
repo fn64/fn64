@@ -528,3 +528,123 @@ something a reader has to infer from a missing section.
   trap and unit-tested, but WM2000 never produced it in these runs, so its
   message is untested against a live occurrence.
 - **No block-lane claim.** Untouched.
+
+## 9. 2026-08-18 (fourth pass): the rs lane renders — 0 → 12,242 VI swaps
+
+The interior-address blocker section 8 named is closed, and with it four more
+of the same class behind it. **The rs lane now runs its full 2,000,000-step
+budget to a clean `EXIT=0` with no trap of any kind**, producing 12,242 VI
+swaps and 25,200 gfx tasks. This is the first time this lane has rendered a
+frame.
+
+| | third pass | fourth pass |
+|---|---|---|
+| trap vram | `0x800385F0` | none — runs to the step budget |
+| `vi_swaps` | 0 | **12,242** |
+| `gfx_tasks` | 0 | 25,200 |
+| exit | abort | `EXIT=0` |
+
+Captured framebuffers: 659 PNGs at 320x240, **558 distinct** by sha256, 248
+carrying rich content. `fn64-rt64-post-vi-swap-397-present-808.png`
+(sha256 `3765187f…`) is a textured, lit wrestler model over an attract-mode
+background — a real rendered frame, not a fade.
+
+### 9.1 The premise in section 8 was wrong, and that is the finding
+
+Section 8 read `0x800385F0` as a **computed** jump into a function body and
+scoped the next card as indirect-jump support. It is neither computed nor
+interior:
+
+- `disasm/symbol_addrs.txt:19` reads
+  `func_800385F0 = 0x800385F0; // type:func size:0x60`. splat identified it as
+  a function.
+- `disasm/asm/1050.s:65167` emits it as **`alabel`**, not `glabel`.
+  `aki_profile.gen_symbols` builds the symbol map from `glabel`, so the
+  function vanished and its predecessor's size absorbed it:
+  `0x80038480 + 0x1D0 == 0x800385F0 + 0x60 == 0x80038650`, exactly.
+- All five references are **static `JAL`s** (`0x800366B4` in `osInitialize`;
+  `0x800E1F94`, `0x800E215C`, `0x800E21A0`, `0x800E21F0` in the frame-profiler
+  pair). Nothing computes anything.
+
+Two contradictory claims by one disassembler about the same bytes. No
+indirect-jump machinery was needed or built.
+
+### 9.2 How many interior targets WM2000 actually needs
+
+A ROM-wide scan of every `J`/`JAL` immediate against the function intervals:
+
+| | distinct targets |
+|---|---|
+| cross-function interior, whole ROM | 1,449 |
+| …of which reached by `JAL` | 40 |
+| …**in the resident image** | **1** (`0x800385F0`) |
+| intra-function (`j` long-branch idiom, already a local `goto`) | 4,743 sites |
+
+The resident image needs exactly one. The other 1,448 sit in the
+deferred/overlay ranges `wm2000.toml` declares out of scope, and 27 of those
+turned out to be the same alabel defect once the lane ran deep enough to reach
+them.
+
+### 9.3 How the C lane serves it — and why that design is not reusable
+
+It does not solve it. `RecompiledFuncs/funcs_16.c` **hand-inlines** the
+two-branch glue (`if ($a2) __ll_div else __ull_div`) at each of the four
+`0x800E____` call sites, with a repair note saying the target "is mid-function
+glue that the symbol map never split out". `osInitialize`'s call was never
+reached. That is a per-call-site workaround that does not survive a regen, not
+a boundary fix.
+
+### 9.4 What was actually wrong, in two halves
+
+**Config half** (`aki-recomp`): a new `[syms] split_functions`, the exact
+inverse of the existing `merge_functions`. 30 entries restore boundaries splat
+already knew about. Every entry is re-validated at generation time against the
+ROM bytes — the predecessor must have returned (`jr $ra` + delay slot, nop
+padding allowed) or the head must be pure padding, **and** some `J`/`JAL`
+immediate in that section must target the split point exactly. A violation
+raises; there is no lenient path, because a split at a wrong offset would
+silently redirect a call into the middle of a body.
+
+**Emitter half** (this repo, four commits): the escaping-control-flow arms.
+`J` already tail-called an escaping target; four sibling paths did not, and
+each emitted `pc = <target>` into a `match` whose leader set deliberately
+admits only in-function addresses — so every one became
+`unreachable!("jumped to unmapped vram")`.
+
+| shape | ROM-wide count | commit |
+|---|---|---|
+| escaping conditional branch | 7 (3 resident) | `2e86ad84` |
+| trailing `JAL`/`JALR` fallthrough | 4 | `26a53a41` |
+| function ending mid-flow | — | `1ce01a0e` |
+| bank-ambiguous mid-flow successor | — | `a581d694` |
+
+`Bltzal`/`Bgezal`/`Bltzall`/`Bgezall` carry the same shape and were left
+untouched: the ROM contains **zero** branch-and-link instructions, so editing
+those arms would be speculative changes to a path no test can exercise.
+
+### 9.5 The escaping-site enumeration is closed
+
+A static pass over all 2,452 emitted functions finds every `pc = 0xNNN` write
+whose target is not one of that function's own `match` arms: **187 sites, all
+of one shape** (`target == arm + 4`). Every one is a duplicated delay slot or
+trailing pad sitting after a `return`/unconditional transfer — control never
+enters them via `pc`. The class is enumerated and closed, not open-ended; no
+general escaping-control-flow mechanism is outstanding.
+
+## Nonclaims (2026-08-18 fourth pass)
+
+- **"Runs to the step budget" is not "playable."** The lane renders and does
+  not trap within 2,000,000 steps. Input, timing, audio-visual sync, and
+  anything past that budget are unmeasured here.
+- **No frame-accuracy claim.** No frame was compared against the C lane or any
+  reference. 558 distinct framebuffers and one legible attract frame is
+  evidence of rendering, not of correctness.
+- **The 8 remaining mid-body targets are real and unfixed.** After the 30
+  splits, 8 cross-function interior targets remain in the overlay banks
+  (`0x80120474`, `0x80120884`, `0x80120A54`, `0x80127D54`, `0x8013EE44`,
+  `0x8013F240`, `0x8013F2C8`, `0x8013F314`) whose containing function has NOT
+  returned before them. Those are genuine mid-body entries that a split cannot
+  express. WM2000 did not reach any of them in these runs; a deeper run may.
+- **No claim the 30 splits are all of them ROM-wide.** They are every one
+  meeting the validator's evidence bar in the sections the symbol map covers.
+- **No block-lane claim.** Untouched.
