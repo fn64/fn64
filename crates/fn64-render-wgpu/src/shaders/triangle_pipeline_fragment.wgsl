@@ -86,11 +86,19 @@ var<uniform> fragment_alpha_compare_params: FragmentAlphaCompareParams;
 // (`coverage_destination`/`image_read_enabled`/`force_blend`/
 // `antialias_enabled`/`coverage_times_alpha`/`alpha_coverage_select`), one
 // value each, host-serialized `u32`s (bool fields 0/1) matching this file's
-// existing `FragmentAlphaCompareParams` convention. This slice is the
-// `Full`/no-image-read subset only: `image_read_enabled` reaching this
-// uniform as nonzero, or `coverage_destination == CVG_DST_SAVE` (3) at all,
-// is a host-side bug the CPU caller must reject before submission (see
-// `triangle_pipeline.rs`'s `submit_admitted_triangle` loud panic) --
+// existing `FragmentAlphaCompareParams` convention.
+//
+// `coverage_destination == CVG_DST_SAVE` (3) reaching this uniform at all is
+// a host-side bug the CPU caller must reject before submission (see
+// `triangle_pipeline.rs`'s `fragment_coverage_params_bytes` loud panic).
+// `image_read_enabled` MAY now arrive nonzero, but only under the
+// `memory`-independence predicate that same function enforces
+// (`!alpha_coverage_select && force_blend`, proven there against this file's
+// own two coverage-output routes): `memory_count` below stays the `0u`
+// literal, and under that predicate neither `output.color.a` nor
+// `blend_enabled` is a function of it. No real memory coverage is supplied
+// and none is invented -- the accumulation's `memory`-dependent terms
+// (`destination`, `adjusted_coverage`, `wraps`) are computed and discarded.
 // `fs_main` below does not re-check either condition, it trusts the
 // contract this uniform's producer already enforced.
 struct FragmentCoverageParams {
@@ -264,8 +272,10 @@ fn fs_main(
     // always `0u`: this slice's rasterizer produces only whole-pixel
     // coverage (no `CoverageMask` sub-pixel geometry, node 3, out of scope)
     // and no framebuffer-read mechanism exists to supply a real `memory`
-    // value (node 2, out of scope) -- the exact `Full`/no-image-read subset
-    // this uniform's host-side contract guarantees (struct doc above).
+    // value (node 2, out of scope). The `0u` is NOT a stand-in for an
+    // unknown memory coverage: the host admits an image-reading draw only
+    // when no output depends on that term (struct doc above), so the value
+    // passed here cannot change any result the draw produces.
     let coverage = coverage_fragment_fn(
         COVERAGE_FULL,
         0u,
