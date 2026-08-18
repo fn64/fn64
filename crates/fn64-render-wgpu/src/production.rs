@@ -628,7 +628,17 @@ struct PlanCollector {
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
     /// Every tile's `SetTile`/`SetTileSize` current at the walk's current
-    /// stream position, indexed by the RDP's own 0..=7 tile index.
+    /// stream position, indexed by the RDP's own 0..=7 tile index --
+    /// **seeded from `WgpuBackend.rdp_state`'s durable `tmem()` tiles**, then
+    /// updated on every `SetTile`/`SetTileSize` in plan order.
+    ///
+    /// The RDP's eight tile descriptors are durable registers, so a packet
+    /// that re-declares none still has them. Seeding `[(None, None); 8]`
+    /// made every texrect in such a packet a `TexrectUnboundTile` refusal:
+    /// measured on WM2000, the packet that follows the load-free texrect
+    /// admission carries 46 texrects and an entirely empty tile table.
+    /// Same seed-then-track pattern, and the same defect class, as
+    /// `current_color_image`.
     ///
     /// The two `current_tile0_*` fields above are deliberately kept: they
     /// mirror `TriangleDrawStateCollector` field-for-field and feed
@@ -777,6 +787,10 @@ impl PlanCollector {
         prim_color: Option<PrimColor>,
         fog_color: Option<Color4>,
         color_image: Option<ColorImage>,
+        tiles: [(
+            Option<fn64_render::NeutralTileDescriptor>,
+            Option<fn64_render::NeutralTileSize>,
+        ); 8],
     ) -> Self {
         Self {
             loads: Vec::new(),
@@ -784,7 +798,7 @@ impl PlanCollector {
             next_command_index: 0,
             current_other_mode: other_mode,
             current_combine: combine,
-            current_tiles: [(None, None); 8],
+            current_tiles: tiles,
             current_blend_color: blend_color,
             current_env_color: env_color,
             current_prim_color: prim_color,
@@ -1144,7 +1158,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // its exact seed values are irrelevant.
         self.plan = core::mem::replace(
             plan_visitor,
-            PlanCollector::seeded(None, None, None, None, None, None, None),
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]),
         );
     }
 
@@ -1878,6 +1892,7 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.prim_color(),
             self.rdp_state.fog_color(),
             self.rdp_state.color_image(),
+            durable_neutral_tiles(&self.rdp_state),
             &mut self.color_targets,
             self.configured_target_extent,
         )
@@ -2329,6 +2344,10 @@ fn execute_raw_dpc_inner(
     durable_prim_color: Option<PrimColor>,
     durable_fog_color: Option<Color4>,
     durable_color_image: Option<ColorImage>,
+    durable_tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
     color_targets: &mut Option<ColorTargetRegistry>,
     configured_target_extent: Option<TriangleTargetExtent>,
 ) -> Result<
@@ -2348,6 +2367,7 @@ fn execute_raw_dpc_inner(
         durable_prim_color,
         durable_fog_color,
         durable_color_image,
+        durable_tiles,
     );
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
@@ -2362,6 +2382,7 @@ fn execute_raw_dpc_inner(
             durable_prim_color,
             durable_fog_color,
             durable_color_image,
+            durable_tiles,
         ),
         reads: Vec::new(),
         outcome: None,
@@ -3302,13 +3323,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // the load-bearing packet's arm would mean the texrect silently missed
     // its own packet's loads; a proposed image reaching the load-free arm
     // would mean a proposal was fabricated for a packet that staged none.
-    let snapshot = crate::TmemByteSource::snapshot(tmem);
-    if expect_proposed && snapshot.is_committed() {
-        return Err(WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index });
-    }
-    if !expect_proposed && !snapshot.is_committed() {
-        return Err(WgpuRawDpcExecutionError::CommittedTmemImageClaimedProposed { triangle_index });
-    }
+    verify_tmem_identity(tmem, expect_proposed, triangle_index)?;
     // The one-cycle shading state, taken from the SAME
     // `RetrievedTriangleDraw` snapshot the other-mode, viewport and tile
     // above came from -- i.e. the registers current at THIS texrect's own
@@ -3397,6 +3412,46 @@ fn project_pending_tmem_for_draw(
     pending: &crate::tmem::PendingTmemTransaction,
 ) -> Result<TmemGpuProjection, WgpuRawDpcExecutionError> {
     project_proposed_image(&pending.pending_image())
+}
+
+/// **The committed/pending identity crossing, both directions, at one
+/// site.**
+///
+/// A texrect's TMEM image must answer the identity its caller
+/// *selected*, not merely a well-formed one. `expect_proposed` is
+/// `TexrectTmemSource`'s own choice, made per packet from
+/// `plan.loads.is_empty()`; this checks the image agrees.
+///
+/// Checked rather than trusted because the type system cannot: `Committed`
+/// and `Proposed` inhabit one enum, so a wrong `snapshot()` impl compiles.
+/// Measured on the pending direction: forging `Committed` in
+/// `PendingTmemImage`'s impl passed the entire suite before that half
+/// existed.
+///
+/// Both directions, not one. A committed image reaching a load-bearing
+/// packet would mean the texrect silently missed its own packet's loads --
+/// the `TMEM_SAMPLE_STATUS_INVALID_BYTE` defect commit `3a1a6a73` measured.
+/// A proposed image reaching a load-free packet would mean a proposal was
+/// fabricated for a packet that staged none.
+///
+/// Split out from `execute_scheduled_texrect` so a lying source can reach
+/// it: no real image can, since both real impls are correct, and a refusal
+/// with no test is a claim with no evidence.
+fn verify_tmem_identity<S: crate::TmemByteSource + ?Sized>(
+    tmem: &S,
+    expect_proposed: bool,
+    triangle_index: usize,
+) -> Result<(), WgpuRawDpcExecutionError> {
+    let snapshot = crate::TmemByteSource::snapshot(tmem);
+    match (expect_proposed, snapshot.is_committed()) {
+        (true, true) => {
+            Err(WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index })
+        }
+        (false, false) => {
+            Err(WgpuRawDpcExecutionError::CommittedTmemImageClaimedProposed { triangle_index })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// [`project_pending_tmem_for_draw`]'s body, generic over the source, so the
@@ -3534,6 +3589,101 @@ fn image_format(format: fn64_render::NeutralImageFormat) -> crate::ImageFormat {
         fn64_render::NeutralImageFormat::IntensityAlpha => crate::ImageFormat::IntensityAlpha,
         fn64_render::NeutralImageFormat::Intensity => crate::ImageFormat::Intensity,
     }
+}
+
+/// `image_format`'s inverse: the neutral mirror of a crate-typed
+/// [`crate::ImageFormat`].
+///
+/// Exists so `PlanCollector`'s tile table can be seeded from `RdpState`'s
+/// durable, crate-typed `TileState` while the table itself keeps storing
+/// neutral mirrors -- the shape both its consumers
+/// (`TileBindingParams::from_neutral` for the GPU uniform,
+/// `TexrectTileBinding::try_from_neutral` for the CPU reader) already read.
+/// Converting the *seed* is a five-function addition; converting the table
+/// would mean a new typed-to-uniform path for the GPU binding, which is a
+/// different change.
+fn neutral_image_format(format: crate::ImageFormat) -> fn64_render::NeutralImageFormat {
+    match format {
+        crate::ImageFormat::Rgba => fn64_render::NeutralImageFormat::Rgba,
+        crate::ImageFormat::Yuv => fn64_render::NeutralImageFormat::Yuv,
+        crate::ImageFormat::ColorIndex => fn64_render::NeutralImageFormat::ColorIndex,
+        crate::ImageFormat::IntensityAlpha => fn64_render::NeutralImageFormat::IntensityAlpha,
+        crate::ImageFormat::Intensity => fn64_render::NeutralImageFormat::Intensity,
+    }
+}
+
+/// `pixel_size`'s inverse; see [`neutral_image_format`].
+fn neutral_pixel_size(size: crate::PixelSize) -> fn64_render::NeutralPixelSize {
+    match size {
+        crate::PixelSize::Bits4 => fn64_render::NeutralPixelSize::Bits4,
+        crate::PixelSize::Bits8 => fn64_render::NeutralPixelSize::Bits8,
+        crate::PixelSize::Bits16 => fn64_render::NeutralPixelSize::Bits16,
+        crate::PixelSize::Bits32 => fn64_render::NeutralPixelSize::Bits32,
+    }
+}
+
+/// The neutral mirror of one durable [`crate::TileDescriptor`], field for
+/// field. The inverse of `TexrectTileBinding::try_from_neutral`'s own
+/// decode, and deliberately total: every field on the neutral mirror has
+/// exactly one accessor on the typed descriptor, so there is nothing to
+/// default and nothing to drop.
+fn neutral_tile_descriptor(
+    descriptor: crate::TileDescriptor,
+) -> fn64_render::NeutralTileDescriptor {
+    fn64_render::NeutralTileDescriptor {
+        format: neutral_image_format(descriptor.format()),
+        size: neutral_pixel_size(descriptor.size()),
+        line_words: descriptor.line_words(),
+        tmem_word_address: descriptor.tmem().get(),
+        palette: descriptor.palette(),
+        s_mode: fn64_render::NeutralTileAddressMode {
+            mirror: descriptor.s_mode().mirror(),
+            clamp: descriptor.s_mode().clamp(),
+        },
+        mask_s: descriptor.mask_s(),
+        shift_s: descriptor.shift_s(),
+        t_mode: fn64_render::NeutralTileAddressMode {
+            mirror: descriptor.t_mode().mirror(),
+            clamp: descriptor.t_mode().clamp(),
+        },
+        mask_t: descriptor.mask_t(),
+        shift_t: descriptor.shift_t(),
+    }
+}
+
+/// The neutral mirror of one durable [`crate::TileSize`], in the same raw
+/// 10.2 fixed-point encoding the neutral struct documents.
+fn neutral_tile_size(size: crate::TileSize) -> fn64_render::NeutralTileSize {
+    fn64_render::NeutralTileSize {
+        low_s: size.low_s().raw(),
+        low_t: size.low_t().raw(),
+        high_s: size.high_s().raw(),
+        high_t: size.high_t().raw(),
+    }
+}
+
+/// `RdpState`'s eight durable tile registers as the neutral pair
+/// `PlanCollector` tracks, for seeding one packet's walk.
+///
+/// A tile with no `SetTile` or no `SetTileSize` ever issued stays `None` on
+/// that half -- absence is carried through, never defaulted to a zeroed
+/// descriptor that would silently sample TMEM word zero.
+fn durable_neutral_tiles(
+    state: &RdpState,
+) -> [(
+    Option<fn64_render::NeutralTileDescriptor>,
+    Option<fn64_render::NeutralTileSize>,
+); 8] {
+    let mut tiles = [(None, None); 8];
+    for (index, slot) in tiles.iter_mut().enumerate() {
+        let Ok(tile_index) = crate::TileIndex::try_new(index as u8) else {
+            continue;
+        };
+        let tile = state.tmem().tile(tile_index);
+        slot.0 = tile.descriptor().map(neutral_tile_descriptor);
+        slot.1 = tile.size().map(neutral_tile_size);
+    }
+    tiles
 }
 
 fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
@@ -6310,6 +6460,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
 
         let fog_a = fixture_set_fog_color(0x7777_7777);
@@ -6474,6 +6625,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
 
         let env_a = fixture_set_env_color(0x1111_1111);
@@ -6534,6 +6686,7 @@ mod tests {
             Some(seed_prim_color),
             None,
             None,
+            [(None, None); 8],
         );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -6552,7 +6705,8 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(None, None, None, None, None, None, None);
+        let mut collector =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -6585,6 +6739,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
         let triangle = fixture_triangle(1.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -6616,6 +6771,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
 
         let first_triangle = fixture_triangle(0.0);
@@ -6660,6 +6816,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
 
         let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
@@ -6690,6 +6847,7 @@ mod tests {
             None,
             None,
             None,
+            [(None, None); 8],
         );
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -7497,6 +7655,7 @@ mod tests {
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
             backend.rdp_state.color_image(),
+            durable_neutral_tiles(&backend.rdp_state),
             &mut backend.color_targets,
             backend.configured_target_extent,
         )
@@ -8795,12 +8954,22 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None, None);
+        let mut plan_visitor =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(None, None, None, None, None, None, None),
+            plan: PlanCollector::seeded(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [(None, None); 8],
+            ),
             reads: Vec::new(),
             outcome: None,
             queue: bound.queue(),
@@ -9640,12 +9809,22 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(None, None, None, None, None, None, None);
+        let mut plan_visitor =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(None, None, None, None, None, None, None),
+            plan: PlanCollector::seeded(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [(None, None); 8],
+            ),
             reads: Vec::new(),
             outcome: None,
             queue: bound.queue(),
@@ -10996,6 +11175,149 @@ mod tests {
         );
     }
 
+    /// **A texrect that declared no write stays on the triangle path.**
+    ///
+    /// `stage_and_report` routes a load-free packet to the color-target
+    /// accumulation seam, and that seam needs a `ColorTargetKey`. A texrect
+    /// with no staged `SetColorImage` declares no `ColorFramebuffer` access
+    /// at all -- `raw_dpc::plan_texture_rectangle` returns early -- so
+    /// there is no key to build and no target to compose into. It belongs
+    /// on the GPU triangle path, exactly where it went before this file
+    /// learned about texrects.
+    ///
+    /// Routing on the mere *presence* of a texrect sent it to the seam
+    /// instead and refused it with `NoStagedColorImage`: measured, that
+    /// broke both `..._texture_rectangle_at_its_own_wire_position` fixtures.
+    /// This pins the same rule without needing a host GPU, so the guard
+    /// survives on an adapterless machine.
+    #[test]
+    fn a_texrect_that_declared_no_write_is_not_routed_to_the_color_target_seam() {
+        // No `SetColorImage` anywhere in the stream, so the decoder
+        // declares no RenderTarget write for the texrect.
+        let mut words = Vec::new();
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(set_tile(7, 1, 0));
+        words.extend(set_tile_size_words(7, 7 << 2, 2 << 2));
+        words.extend(texrect_words_in_target(7));
+
+        // Positive control, both halves. The stream must really carry a
+        // texrect (a stream with none would also pass the assertion below,
+        // vacuously), and that texrect must really declare no write.
+        //
+        // Measured against the SAME stream with a `SetColorImage` spliced
+        // in: that variant declares writes, this one declares none, and the
+        // only difference between them is the register. So the emptiness
+        // here is the decoder's early return on a missing color image, not
+        // a fixture that failed to carry a texrect at all.
+        let mut with_image = whole_target_fill_words();
+        with_image.extend(words.iter().copied());
+        assert!(
+            !declared_render_target_ranges(with_image).is_empty(),
+            "the same texrect must declare writes once a color image is staged, or this \
+             fixture carries no texrect and the test is vacuous"
+        );
+        assert!(
+            declared_render_target_ranges(words.clone()).is_empty(),
+            "the fixture's texrect must declare NO write, or it is not the shape under test"
+        );
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, words);
+
+        // On an adapterless host the triangle path refuses with
+        // `TriangleDrawBeforeCreate`; with an adapter it draws. Either way
+        // the packet must NOT have been routed to the color-target seam,
+        // which is what `NoStagedColorImage` would prove.
+        if let Some(error) = result.err() {
+            assert!(
+                !error.to_string().contains("no SetColorImage current"),
+                "a texrect declaring no write must stay on the triangle path, never reach \
+                 the color-target key derivation: {error}"
+            );
+        }
+    }
+
+    /// **The identity crossing refuses in BOTH directions, by name.**
+    ///
+    /// `verify_tmem_identity` is the one site where a texrect's TMEM image
+    /// is checked against the identity its caller selected. The pending
+    /// direction has been checked since commit `99bde6a3`; the committed
+    /// direction is new with the load-free texrect admission, and without a
+    /// test it would be decorative -- measured, deleting it left the entire
+    /// suite green.
+    ///
+    /// Both real impls are correct, so no real image can reach either arm.
+    /// Sources that lie are the only way to prove either refusal is wired,
+    /// and the honest pair below is what makes the lying pair mean
+    /// something: the check must discriminate on the identity, not refuse
+    /// everything.
+    #[test]
+    fn the_tmem_identity_crossing_refuses_a_forgery_in_either_direction() {
+        // Honest durable state -- a real `PhysicalTmemState`, exactly the
+        // source `TexrectTmemSource::Committed` hands a load-free packet.
+        let committed = PhysicalTmemState::try_new().unwrap();
+
+        // The committed arm accepts it, so the check discriminates on the
+        // identity rather than refusing everything.
+        verify_tmem_identity(&committed, false, 0)
+            .expect("durable state must pass the arm that selected it");
+
+        // The pending arm refuses that same honest committed image. This is
+        // the defect a load-bearing packet would suffer: its texrect
+        // silently missing its own packet's loads, which commit `3a1a6a73`
+        // measured as `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
+        let error = verify_tmem_identity(&committed, true, 5)
+            .expect_err("durable state must not satisfy the pending arm");
+        assert!(
+            matches!(
+                error,
+                WgpuRawDpcExecutionError::PendingTmemImageClaimedCommitted { triangle_index: 5 }
+            ),
+            "the refusal must be the named variant carrying its own triangle index: {error:?}"
+        );
+
+        // The mirror direction, which the load-free admission introduced.
+        // The source lies about its identity while returning durable bytes
+        // -- precisely the forgery shape, and the only way to reach the arm
+        // at all, since both real impls are correct.
+        //
+        // The `Proposed` identity is a REAL one, produced by
+        // `tmem::read`'s own test constructor rather than synthesized here,
+        // so this test cannot pass against a variant no real image could
+        // produce.
+        struct ForgedProposed<'a>(&'a PhysicalTmemState);
+        impl crate::TmemByteSource for ForgedProposed<'_> {
+            fn snapshot(&self) -> crate::TmemSnapshotIdentity {
+                crate::tmem::proposed_identity_for_test()
+            }
+            fn valid_byte(&self, address: u16) -> Option<u8> {
+                crate::TmemByteSource::valid_byte(self.0, address)
+            }
+        }
+        assert!(
+            !crate::tmem::proposed_identity_for_test().is_committed(),
+            "the identity borrowed for the forgery must really be Proposed, or the refusal \
+             below fires for the wrong reason"
+        );
+
+        let forged = ForgedProposed(&committed);
+        let error = verify_tmem_identity(&forged, false, 3)
+            .expect_err("a proposal must not satisfy the committed arm");
+        assert!(
+            matches!(
+                error,
+                WgpuRawDpcExecutionError::CommittedTmemImageClaimedProposed { triangle_index: 3 }
+            ),
+            "the refusal must be the named variant carrying its own triangle index: {error:?}"
+        );
+        // And the pending arm accepts that same identity, so this direction
+        // discriminates on the identity too.
+        verify_tmem_identity(&forged, true, 0)
+            .expect("a Proposed identity must pass the arm that selected it");
+    }
+
     /// **The GPU projection refuses a pending image that claims to be
     /// committed, by name.**
     ///
@@ -11356,6 +11678,229 @@ mod tests {
         assert!(
             !backend.has_pending_fill_publication(),
             "a refused composition must leave no redeemable fill token behind"
+        );
+    }
+
+    /// **Durable cross-packet carry-in for `SetColorImage`, measured as the
+    /// defect it closes.**
+    ///
+    /// The RDP's color-image register survives a submission boundary, so a
+    /// packet may compose into a target it never re-declares -- and WM2000
+    /// does exactly that: its texrect packet carries 14 texrects, 4 loads
+    /// and zero fills, every texrect declaring a real write run derived by
+    /// the decoder from the *previous* packet's `SetColorImage`.
+    ///
+    /// `color_target_key` used to read the image off `plan.fills.first()`,
+    /// so that packet aborted the run. This pins the fix at the seam: the
+    /// second packet declares no color image of its own and must still
+    /// resolve one.
+    ///
+    /// The positive control is the first packet's own success -- if it did
+    /// not establish a target, the second packet's admission would prove
+    /// nothing about carry-in.
+    #[test]
+    fn a_second_packet_composes_into_the_color_image_the_first_one_declared() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        // Packet one: declares the color image and fills the whole target.
+        let (_, first) =
+            plan_and_execute_fill(&mut backend, &mut session, whole_target_fill_words());
+        first.expect("the declaring packet must execute, or carry-in is untested");
+        assert!(
+            backend.rdp_state.color_image().is_some(),
+            "the first packet must leave a durable color image behind, or this test is vacuous"
+        );
+
+        // Packet two: a **texrect and no fill at all**, and no
+        // `SetColorImage` of its own. The absence of a fill is the whole
+        // point: with the key derived from `plan.fills.first()` there is
+        // nothing to derive it from, which is exactly the shape WM2000
+        // aborted on. A second fill would leave the old derivation working
+        // and this test asserting nothing.
+        let (_, second) =
+            plan_and_execute_fill(&mut backend, &mut session, second_words_for_control());
+
+        // **The positive control IS the refusal, and it names the derived
+        // key.** This packet still fails -- the first packet's fill was
+        // staged but never published, so the resident bytes a texrect must
+        // compose over do not exist yet. What matters is *which* refusal:
+        // `MissingResidentBytes` is raised by `execute_scheduled_texrect`,
+        // strictly downstream of `color_target_key`, and it prints the key
+        // that was derived. So a key genuinely was built for a packet
+        // carrying no fill to build one from.
+        //
+        // Asserting the address makes it non-vacuous: it is the *first*
+        // packet's `SetColorImage` address, carried across the submission
+        // boundary. Excluding the "no SetColorImage" message alone would
+        // also pass if some earlier gate refused first.
+        let error = second.expect_err("the unpublished target still refuses for resident bytes");
+        let message = error.to_string();
+        assert!(
+            !message.contains("no SetColorImage current"),
+            "the second packet must resolve the durable register, not refuse for its \
+             absence: {message}"
+        );
+        let carried = backend
+            .rdp_state
+            .color_image()
+            .expect("checked above")
+            .address()
+            .get();
+        assert!(
+            message.contains("requires resident_bytes")
+                && message.contains(&format!("address: {carried}")),
+            "the refusal must be the downstream resident-bytes one, naming a key at the \
+             first packet's own color-image address {carried} -- that key is the proof the \
+             durable register was read. Got: {message}"
+        );
+    }
+
+    /// `a_second_packet_composes_into_the_color_image_the_first_one_declared`'s
+    /// second packet, as its own function so the positive control measures
+    /// the identical word stream the test executes rather than a retyped
+    /// copy of it.
+    fn second_words_for_control() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(set_tile(7, 1, 0));
+        words.extend(set_tile_size_words(7, 7 << 2, 2 << 2));
+        words.extend(texrect_words_in_target(7));
+        words
+    }
+
+    /// The same durable-carry defect class as the test above, at the RDP's
+    /// eight **tile** registers.
+    ///
+    /// Found by the same measurement: with the color-image carry fixed, the
+    /// real ROM advanced one packet and stopped at `TexrectUnboundTile` with
+    /// an entirely empty tile table -- 46 texrects, none of which
+    /// re-declared a tile the earlier packet had already set.
+    ///
+    /// Asserted through `PlanCollector::seeded` directly rather than a full
+    /// packet, because the fact under test is exactly the seed: a collector
+    /// handed durable tiles must start with them bound, and one handed none
+    /// must not invent any. Both halves, so a seed that filled the table
+    /// with a zeroed default would fail the second assertion.
+    #[test]
+    fn a_plan_collector_starts_from_the_durable_tile_registers() {
+        let unseeded =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+        assert!(
+            unseeded
+                .current_tiles
+                .iter()
+                .all(|(descriptor, size)| descriptor.is_none() && size.is_none()),
+            "an unseeded collector must invent no tile -- a zeroed default would silently \
+             sample TMEM word zero"
+        );
+
+        // A real durable tile, taken from a backend that actually issued
+        // `SetTile`/`SetTileSize`, never a hand-built struct: the seed path
+        // under test is `durable_neutral_tiles(&rdp_state)`, so building the
+        // input by hand would test the converter and not the carry.
+        // **Every field distinct and nonzero**, borrowed field for field
+        // from `raw_dpc`'s own `tmem_state_commands_decode_every_public_
+        // field_width_for_all_prefixes`. This matters: with a tile whose
+        // `mask_s`, `mask_t` and `low_s` were all zero, a converter that
+        // swapped S for T or dropped a field produced an identical result
+        // and the round-trip below passed. Measured -- two mutants survived
+        // exactly that fixture.
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let words = vec![
+            word(SET_TILE, 4 << 21 | 3 << 19 | 0x01ab << 9 | 0x01fe),
+            5 << 24 | 0x0f << 20 | 3 << 18 | 0x0a << 14 | 0x0b << 10 | 1 << 8 | 0x0c << 4 | 0x0d,
+            word(SET_TILE_SIZE_OPCODE, 0x0fed << 12 | 0x0cba),
+            5 << 24 | 0x0abc << 12 | 0x0789,
+        ];
+        let planned = plan_with_no_reads(&mut backend, &session, words);
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let _ = backend.execute_raw_dpc(bound);
+
+        let tiles = durable_neutral_tiles(&backend.rdp_state);
+        assert!(
+            tiles[5].0.is_some() && tiles[5].1.is_some(),
+            "the fixture must actually leave tile 5 durable, or the seed assertion below is \
+             vacuous -- got {:?}",
+            tiles[5]
+        );
+
+        // **Round-trip, so the converters cannot permute or drop a field.**
+        //
+        // `neutral_tile_descriptor`/`neutral_tile_size` are the inverses of
+        // `TexrectTileBinding::try_from_neutral`'s own decode. Feeding the
+        // neutral output back through that decode must reproduce the typed
+        // value the durable register actually holds -- an equality on the
+        // neutral tuples alone would pass with `mask_s` and `mask_t`
+        // swapped, or `low_s` zeroed, because both sides would carry the
+        // same wrong value. Measured: those two mutants survived until this
+        // assertion existed.
+        let durable_tile = backend
+            .rdp_state
+            .tmem()
+            .tile(crate::TileIndex::try_new(5).unwrap());
+        let round_tripped = crate::targets::TexrectTileBinding::try_from_neutral(
+            tiles[5].0.expect("checked above"),
+            tiles[5].1.expect("checked above"),
+        )
+        .expect("a durable tile round-trips through the neutral mirror");
+        assert_eq!(
+            round_tripped.descriptor(),
+            durable_tile.descriptor().expect("checked above"),
+            "the neutral descriptor must decode back to the durable register field for field"
+        );
+        assert_eq!(
+            round_tripped.size(),
+            durable_tile.size().expect("checked above"),
+            "the neutral tile size must decode back to the durable register field for field"
+        );
+
+        // Hand-derived from the wire words above, so the round-trip is
+        // checked against the RDP's own field layout rather than against
+        // whatever the converter happened to produce. S and T carry
+        // different values in every pair, which is what makes a swap
+        // observable.
+        let neutral = tiles[5].0.expect("checked above");
+        assert_eq!(neutral.mask_s, 0x0c, "mask_s is w1 bits 7:4");
+        assert_eq!(neutral.mask_t, 0x0a, "mask_t is w1 bits 17:14");
+        assert_eq!(neutral.shift_s, 0x0d, "shift_s is w1 bits 3:0");
+        assert_eq!(neutral.shift_t, 0x0b, "shift_t is w1 bits 13:10");
+        assert!(neutral.s_mode.mirror && !neutral.s_mode.clamp);
+        assert!(neutral.t_mode.mirror && neutral.t_mode.clamp);
+        assert_eq!(neutral.line_words, 0x01ab);
+        assert_eq!(neutral.tmem_word_address, 0x01fe);
+        assert_eq!(neutral.palette, 0x0f);
+        // Format and pixel size, hand-derived from w0 bits 23:21 and 20:19
+        // above: the enum converters are total match arms and a wrong arm
+        // is otherwise invisible, since the round-trip decodes with the
+        // inverse of whatever this produced.
+        assert!(
+            matches!(neutral.format, fn64_render::NeutralImageFormat::Intensity),
+            "format is w0 bits 23:21 == 4, got {:?}",
+            neutral.format
+        );
+        assert!(
+            matches!(neutral.size, fn64_render::NeutralPixelSize::Bits32),
+            "pixel size is w0 bits 20:19 == 3, got {:?}",
+            neutral.size
+        );
+        let neutral_size = tiles[5].1.expect("checked above");
+        assert_eq!(neutral_size.low_s, 0x0fed, "low_s is w0 bits 23:12");
+        assert_eq!(neutral_size.low_t, 0x0cba, "low_t is w0 bits 11:0");
+        assert_eq!(neutral_size.high_s, 0x0abc, "high_s is w1 bits 23:12");
+        assert_eq!(neutral_size.high_t, 0x0789, "high_t is w1 bits 11:0");
+        let seeded = PlanCollector::seeded(None, None, None, None, None, None, None, tiles);
+        assert_eq!(
+            seeded.current_tiles[5], tiles[5],
+            "a collector seeded from durable state must start with tile 5 already bound, \
+             so a packet that re-declares no tile still resolves one"
+        );
+        assert!(
+            seeded.current_tiles[0].0.is_none(),
+            "seeding must carry only the tiles the guest actually set, never widen to all eight"
         );
     }
 
