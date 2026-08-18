@@ -76,9 +76,38 @@
 //!
 //! Nonclaims (port card §7, extended by the production depth-slice task
 //! card's nonclaims): no RT64 parity claim, no performance claim, no
-//! production/`decode_stream` wiring (fixture data only), no texture
-//! sampling/alpha-compare/blend/coverage-write/decal/backface-cull/MSAA/
-//! upscaling/`SetCombine` decode, no rasterization-algorithm claim of any
+//! `decode_stream` wiring -- draws arrive either from this module's own
+//! fixture or from `production.rs` via `submit_admitted_triangle`, never
+//! from the raw-DPC decode path itself.
+//!
+//! **Five stages this block previously declared absent are wired below and
+//! are no longer nonclaims** (`docs/RT64-COVERAGE-AUDIT.md`; each verified
+//! against the code in this file, not against the audit's summary): the
+//! `SetCombine` decode (`fragment_combine_params_bytes`, `:231`), texture
+//! sampling (the TMEM bytes/validity/tile-binding bindings and
+//! `tmem_sample.wgsl`'s `TMEM_SAMPLE_STATUS_*` readback channel, `:165`),
+//! alpha compare (`fragment_alpha_compare_params_bytes`, `:254`), coverage
+//! (`fragment_coverage_params_bytes`, `:345`), and blend
+//! (`fragment_blend_params_bytes`, `:541`, including the
+//! framebuffer-color-reading composite path). The restriction set quoted
+//! at the top of this header describes the original one-triangle fixture
+//! slice and is retained as that slice's history, not as the module's
+//! current surface. Stating them as absent would clear an auditor on five
+//! stages that do run -- the inverse of the defect that cost 99.38% of
+//! pixels, where a true nonclaim went unchecked against the ROM.
+//!
+//! What is genuinely still absent in those five areas: no **memory**
+//! coverage read (node 2) and no sub-pixel `CoverageMask` geometry
+//! (node 3) -- `fragment_coverage_params_bytes` panics by name on `Save`
+//! and on the `image_read_enabled` combinations where the unsupplied
+//! `memory` value could reach an output, and admits the rest only under
+//! the proven `!alpha_coverage_select && force_blend` predicate; and no
+//! `AlphaCompare::Reserved`/`Dither` mode, likewise a named panic.
+//!
+//! Still absent and still nonclaimed: no decal, no backface culling
+//! (`cull_mode: None`, `:1109`), no MSAA
+//! (`wgpu::MultisampleState::default()`), no upscaling, and no
+//! rasterization-algorithm claim of any
 //! kind -- coverage determination routes entirely through wgpu's own
 //! `TriangleList` primitive state and the host GPU's rasterizer. The
 //! `Z_CMP`/`Z_UPD` pipeline-variant slice additionally makes no `DepthMode`
