@@ -4500,3 +4500,824 @@ fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
     }
     teardown();
 }
+
+/// Replay one captured packet through `WgpuBackend` (the Rust port) and
+/// return the guest-visible RGBA16 color image it publishes.
+///
+/// Reads back through `RdramView::copy_logical_bytes` -- the same `^3`
+/// byte-lane authority `read_fill_target_logical` uses. The oracle side
+/// reads through the same accessor, so the two images are compared in one
+/// address space. Comparing a logical image against a raw-indexed one was
+/// a prior lane's whole defect class and is what this shared accessor
+/// forecloses.
+fn wm2000_port_image(packet: &CapturedPacket, commands: &[(usize, u8, u32, u32)]) -> Vec<u8> {
+    crate::load_rom(Vec::new());
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    let (target_width, target_height) = replay_target_extent(commands);
+    {
+        let (mut backend, session) = fn64_render_wgpu::WgpuBackend::try_new()
+            .expect("WgpuBackend::try_new is infallible here");
+        let _ = backend.create(&fn64_render::RenderConfig {
+            width: target_width,
+            height: target_height,
+            tv_type: fn64_runtime::TvType::default(),
+        });
+        set_render_backend(Box::new(backend), rdram.len());
+        set_raw_dpc_session(session);
+    }
+    let color_image_addr = wm2000_color_image_addr(commands);
+    let target_bytes = (target_width * target_height * 2) as usize;
+    dispatch_words(&mut rdram, &packet.words);
+    let mut published = vec![0u8; target_bytes];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &mut published,
+    );
+    teardown();
+    published
+}
+
+/// The packet's own `SetColorImage` destination address.
+fn wm2000_color_image_addr(commands: &[(usize, u8, u32, u32)]) -> u32 {
+    commands
+        .iter()
+        .find(|&&(_, cmd6, _, _)| cmd6 == 0x3f)
+        .map(|&(_, _, _, w1)| w1)
+        .expect("the packet must set a color image")
+}
+
+/// Replay the same captured packet through `fn64-render-reference`, the
+/// deterministic software rasterizer, and return the same guest-visible
+/// image.
+///
+/// This is the ORACLE side. It is a genuinely independent implementation:
+/// a CPU rasterizer with its own GBI/RDP decoder, its own TMEM model and
+/// its own combiner, sharing no rendering code with `fn64-render-wgpu`.
+/// It is driven through `RenderBackend::process_rdp_commands`, the same
+/// trait the port implements, over the identical word stream.
+///
+/// Returns `Err` with the reference's own refusal text when the oracle
+/// declines the packet -- a refusal is a measurement, not a skip.
+fn wm2000_reference_image(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+) -> Result<Vec<u8>, String> {
+    wm2000_reference_image_with_palette(packet, commands, None)
+}
+
+/// As `wm2000_reference_image`, optionally overwriting the packet's own
+/// TLUT source region first. `None` leaves guest RDRAM as the port's run
+/// sees it, so the two backends are compared over identical guest state.
+fn wm2000_reference_image_with_palette(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+    palette_fill: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    wm2000_reference_image_perturbed(packet, commands, palette_fill, None)
+}
+
+/// Replay through the oracle with either guest source region overwritten.
+fn wm2000_reference_image_perturbed(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+    palette_fill: Option<u16>,
+    texture_fill: Option<u8>,
+) -> Result<Vec<u8>, String> {
+    use fn64_render::RenderBackend as _;
+
+    let (target_width, target_height) = replay_target_extent(commands);
+    let color_image_addr = wm2000_color_image_addr(commands);
+    let target_bytes = (target_width * target_height * 2) as usize;
+
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    let bytes = words_to_rdram_bytes(&packet.words);
+    let start = 0x1000u32;
+    let loaded_end = start + bytes.len() as u32;
+    rdram[start as usize..loaded_end as usize].copy_from_slice(&bytes);
+    if let Some(value) = palette_fill {
+        write_wm2000_palette(&mut rdram, commands, value);
+    }
+    // WM2000's captured stream ends with its own `G_ENDDL` (`0xdf000000`),
+    // and `process_rdp_commands` appends a terminator of its own at `end`.
+    // Handing the oracle the packet's terminator as a command would make
+    // the harness the frontier: the reference refuses `0xdf` as an opcode
+    // by name. The last command is excluded from the range and the
+    // oracle's own terminator takes its place at exactly the same address,
+    // so the byte stream the oracle decodes is the packet's, unmodified.
+    let end = commands
+        .last()
+        .filter(|&&(_, cmd6, _, _)| cmd6 == 0x1f)
+        .map_or(loaded_end, |&(offset, _, _, _)| start + offset as u32);
+
+    let mut backend = fn64_render_reference::ReferenceBackend::new();
+    backend
+        .create(&fn64_render::RenderConfig {
+            width: target_width,
+            height: target_height,
+            tv_type: fn64_runtime::TvType::default(),
+        })
+        .map_err(|e| format!("reference create() refused: {e:?}"))?;
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.process_rdp_commands(&mut rdram, start, end, 0, true)
+    }));
+    match outcome {
+        Ok(Ok(_status)) => {}
+        Ok(Err(e)) => return Err(format!("reference returned an error: {e:?}")),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>")
+                .to_owned();
+            return Err(format!("reference panicked: {message}"));
+        }
+    }
+
+    let mut published = vec![0u8; target_bytes];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &mut published,
+    );
+    Ok(published)
+}
+
+/// **The palette-invariance probe.** Replay the packet twice with two
+/// different TLUT source palettes in guest RDRAM and report whether either
+/// backend's output changes at all.
+///
+/// The packet's seven `LoadTLUT`s source their palette from RDRAM
+/// `0x00100660` (its own `SetTextureImage`, `fmt=2 siz=2`). Writing a
+/// different palette there and re-running is the cheapest direct test of
+/// the question "is the texel path really sampling?" -- an output invariant
+/// to the palette is not sampling it, whatever the code reads.
+///
+/// Neither side is modified. Only the guest bytes the packet itself names
+/// as its palette source are changed.
+fn wm2000_port_image_with_palette(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+    palette_fill: u16,
+) -> Vec<u8> {
+    wm2000_port_image_perturbed(packet, commands, Some(palette_fill), None)
+}
+
+/// Replay through the port with either guest source region overwritten.
+fn wm2000_port_image_perturbed(
+    packet: &CapturedPacket,
+    commands: &[(usize, u8, u32, u32)],
+    palette_fill: Option<u16>,
+    texture_fill: Option<u8>,
+) -> Vec<u8> {
+    crate::load_rom(Vec::new());
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    let (target_width, target_height) = replay_target_extent(commands);
+    {
+        let (mut backend, session) = fn64_render_wgpu::WgpuBackend::try_new()
+            .expect("WgpuBackend::try_new is infallible here");
+        let _ = backend.create(&fn64_render::RenderConfig {
+            width: target_width,
+            height: target_height,
+            tv_type: fn64_runtime::TvType::default(),
+        });
+        set_render_backend(Box::new(backend), rdram.len());
+        set_raw_dpc_session(session);
+    }
+    if let Some(value) = palette_fill {
+        write_wm2000_palette(&mut rdram, commands, value);
+    }
+    if let Some(value) = texture_fill {
+        write_wm2000_texture_data(&mut rdram, commands, value);
+    }
+    let color_image_addr = wm2000_color_image_addr(commands);
+    let target_bytes = (target_width * target_height * 2) as usize;
+    dispatch_words(&mut rdram, &packet.words);
+    let mut published = vec![0u8; target_bytes];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(color_image_addr),
+        &mut published,
+    );
+    teardown();
+    published
+}
+
+/// Fill the packet's own CI4 texture-data source region with `value`.
+///
+/// The address is the `SetTextureImage` that precedes the packet's
+/// `LoadBlock` (a different region from the TLUT source), read off the
+/// packet rather than hardcoded. `LoadBlock` copies 64 words from here into
+/// TMEM word 0, which the drawing tile 0 (`fmt=CI`, `siz=4b`) then samples.
+///
+/// This is the companion perturbation to `write_wm2000_palette`: together
+/// they separate "the texel indices are not read" from "the palette is not
+/// read".
+fn write_wm2000_texture_data(rdram: &mut [u8], commands: &[(usize, u8, u32, u32)], value: u8) {
+    let mut last_texture_image = None;
+    let mut block_source = None;
+    for &(_, cmd6, _, w1) in commands {
+        match cmd6 {
+            0x3d => last_texture_image = Some(w1),
+            // `LoadBlock`'s wire opcode 0xf3 masks to command 0x33.
+            0x33 => {
+                if block_source.is_none() {
+                    block_source = last_texture_image;
+                }
+            }
+            _ => {}
+        }
+    }
+    let base = block_source.expect("the packet must set a texture image before its LoadBlock");
+    let mut view = fn64_runtime::RdramViewMut::from_storage(rdram);
+    // 64 words is what LoadBlock transfers; 512 bytes covers it with margin.
+    for offset in 0..512u32 {
+        view.write_u8(fn64_runtime::RdramAddr::from_offset(base + offset), value);
+    }
+}
+
+/// Fill the packet's own TLUT source region with `value`, through the
+/// logical byte-lane authority. The address is read off the packet's
+/// `SetTextureImage` that precedes a `LoadTLUT`, not hardcoded.
+fn write_wm2000_palette(rdram: &mut [u8], commands: &[(usize, u8, u32, u32)], value: u16) {
+    let mut tlut_source = None;
+    let mut last_texture_image = None;
+    for &(_, cmd6, _, w1) in commands {
+        match cmd6 {
+            0x3d => last_texture_image = Some(w1),
+            // `LoadTLUT`'s wire opcode 0xf0 masks to command 0x30.
+            0x30 => {
+                if tlut_source.is_none() {
+                    tlut_source = last_texture_image;
+                }
+            }
+            _ => {}
+        }
+    }
+    let base = tlut_source.expect("the packet must set a texture image before its LoadTLUT");
+    let mut view = fn64_runtime::RdramViewMut::from_storage(rdram);
+    // 256 entries is more than the 16 a pal16 load consumes; writing the
+    // whole quadrant makes the probe insensitive to which entries are read.
+    for entry in 0..256u32 {
+        view.write_u16(
+            fn64_runtime::RdramAddr::from_offset(base + entry * 2),
+            value,
+        );
+    }
+}
+
+/// Summarize an RGBA16 image as its distinct big-endian halfword values and
+/// their counts, most frequent first.
+fn rgba16_histogram(image: &[u8]) -> Vec<(u16, usize)> {
+    let mut counts = std::collections::BTreeMap::<u16, usize>::new();
+    for pixel in image.chunks_exact(2) {
+        *counts
+            .entry(u16::from_be_bytes([pixel[0], pixel[1]]))
+            .or_default() += 1;
+    }
+    let mut out = counts.into_iter().collect::<Vec<_>>();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// **The validation this card exists to perform: does WM2000's frame 0
+/// render the SAME image through the Rust port and through the independent
+/// software oracle?**
+///
+/// Both sides are fed the identical captured word stream and both images
+/// are read back through the same logical byte-lane accessor. The
+/// comparison is byte-for-byte; a disagreement is reported with its pixel
+/// count, its regions and both sides' values, and is the more valuable
+/// outcome.
+///
+/// The test does not assert agreement. Asserting it would make this a
+/// ratchet on a frontier neither side has been proven to sit at; what it
+/// asserts is that the fixture is the real packet (the same census
+/// positive control the replay test uses) and that the comparison ran.
+/// The finding is printed and the diff is quantified.
+#[test]
+fn wm2000_frame_zero_compared_against_the_reference_rasterizer() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!(
+            "[oracle] {WM2000_PACKET_ENV} unset -- NOT RUN. See \
+             docs/RT64-WM2000-VALIDATION.md for the capture command."
+        );
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+
+    // The same positive control the replay test uses: a synthetic
+    // stand-in fails these, so the comparison below is about WM2000's
+    // real bytes rather than whatever the environment named.
+    if packet.entry == 0 {
+        assert_eq!(commands.len(), 366, "WM2000 entry 0 is 366 commands");
+        let mut histogram = std::collections::BTreeMap::<u8, usize>::new();
+        for &(_, cmd6, _, _) in &commands {
+            *histogram.entry(cmd6).or_default() += 1;
+        }
+        assert_eq!(histogram.len(), 19, "entry 0 issues 19 distinct opcodes");
+        assert_eq!(histogram.get(&0x36).copied().unwrap_or(0), 60);
+        assert_eq!(histogram.get(&0x24).copied().unwrap_or(0), 60);
+    }
+
+    let port = wm2000_port_image(&packet, &commands);
+    let (width, height) = replay_target_extent(&commands);
+    eprintln!(
+        "[oracle] port image: {} bytes ({width}x{height} RGBA16), values {:?}",
+        port.len(),
+        rgba16_histogram(&port)
+    );
+
+    match wm2000_reference_image(&packet, &commands) {
+        Err(refusal) => {
+            eprintln!(
+                "[oracle] the reference rasterizer REFUSED the packet: {refusal}\n[oracle] \
+                 no comparison is possible; the refusal site is the measurement"
+            );
+        }
+        Ok(reference) => {
+            eprintln!(
+                "[oracle] reference image: {} bytes, values {:?}",
+                reference.len(),
+                rgba16_histogram(&reference)
+            );
+            assert_eq!(
+                port.len(),
+                reference.len(),
+                "the two backends must publish the same-sized image"
+            );
+            let differing = port
+                .chunks_exact(2)
+                .zip(reference.chunks_exact(2))
+                .filter(|(a, b)| a != b)
+                .count();
+            let total = port.len() / 2;
+            if differing == 0 {
+                eprintln!("[oracle] AGREEMENT: all {total} pixels are byte-for-byte identical");
+            } else {
+                let mut first = Vec::new();
+                for (index, (a, b)) in port
+                    .chunks_exact(2)
+                    .zip(reference.chunks_exact(2))
+                    .enumerate()
+                {
+                    if a != b && first.len() < 8 {
+                        first.push((
+                            index % width as usize,
+                            index / width as usize,
+                            u16::from_be_bytes([a[0], a[1]]),
+                            u16::from_be_bytes([b[0], b[1]]),
+                        ));
+                    }
+                }
+                eprintln!(
+                    "[oracle] DISAGREEMENT: {differing} of {total} pixels differ \
+                     ({:.2}%). First differing (x, y, port, reference): {first:?}",
+                    100.0 * differing as f64 / total as f64
+                );
+            }
+        }
+    }
+}
+
+/// **Step 4's direct test: is the texel path really sampling the palette?**
+///
+/// Replays the packet three times through `WgpuBackend` with three
+/// different palettes written into the guest RDRAM region the packet's own
+/// `SetTextureImage` names as its TLUT source, and reports whether the
+/// published image changes. An image invariant across all three is proof
+/// the palette is not reaching the output, regardless of what the sampler
+/// code appears to read.
+///
+/// Reported, not asserted: the finding is the measurement either way, and
+/// pinning one answer would ratchet a frontier this card is measuring
+/// rather than moving.
+#[test]
+fn wm2000_frame_zero_palette_invariance_probe() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[palette] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    if packet.entry == 0 {
+        assert_eq!(commands.len(), 366, "WM2000 entry 0 is 366 commands");
+    }
+
+    let mut results = Vec::new();
+    for palette in [0x0000u16, 0xf801, 0x07c1] {
+        let image = wm2000_port_image_with_palette(&packet, &commands, palette);
+        let histogram = rgba16_histogram(&image);
+        eprintln!("[palette] port with palette {palette:#06x}: values {histogram:?}");
+        results.push((palette, image));
+    }
+
+    let baseline = &results[0].1;
+    let mut any_changed = false;
+    for (palette, image) in &results[1..] {
+        let differing = baseline
+            .chunks_exact(2)
+            .zip(image.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        if differing == 0 {
+            eprintln!(
+                "[palette] palette {palette:#06x}: output IDENTICAL to the zero palette \
+                 -- invariant"
+            );
+        } else {
+            any_changed = true;
+            eprintln!(
+                "[palette] palette {palette:#06x}: {differing} pixels changed -- the texel \
+                 path IS sampling"
+            );
+        }
+    }
+    if any_changed {
+        eprintln!("[palette] VERDICT: the port's output depends on the TLUT contents.");
+    } else {
+        eprintln!(
+            "[palette] VERDICT: the port's output is INVARIANT to the TLUT contents across \
+             all three palettes. This is NOT by itself a defect -- see \
+             wm2000_frame_zero_palette_invariance_reference_control, which measures the \
+             oracle as equally invariant, and \
+             wm2000_frame_zero_port_omits_the_blender_the_oracle_runs, which shows the \
+             packet's texrect combiner is flat Primitive and reads no texel at all."
+        );
+    }
+}
+
+/// The oracle-side control for `wm2000_frame_zero_palette_invariance_probe`.
+///
+/// A probe that shows the port invariant to the palette proves nothing on
+/// its own -- the palette region might simply be unread by *any* correct
+/// implementation of this packet. Running the identical perturbation
+/// through the independent software rasterizer is what separates "the port
+/// is not sampling" from "there is nothing to sample". This is the
+/// positive control for the invariance finding.
+#[test]
+fn wm2000_frame_zero_palette_invariance_reference_control() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[palette-ctl] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+
+    let mut images = Vec::new();
+    for palette in [0x0000u16, 0xf801, 0x07c1] {
+        match wm2000_reference_image_with_palette(&packet, &commands, Some(palette)) {
+            Ok(image) => {
+                eprintln!(
+                    "[palette-ctl] reference with palette {palette:#06x}: values {:?}",
+                    rgba16_histogram(&image)
+                );
+                images.push((palette, image));
+            }
+            Err(refusal) => {
+                eprintln!("[palette-ctl] reference refused at palette {palette:#06x}: {refusal}");
+                return;
+            }
+        }
+    }
+
+    let baseline = &images[0].1;
+    let mut changed = 0usize;
+    for (palette, image) in &images[1..] {
+        let differing = baseline
+            .chunks_exact(2)
+            .zip(image.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "[palette-ctl] palette {palette:#06x}: {differing} pixels differ from the zero palette"
+        );
+        changed += differing;
+    }
+    if changed == 0 {
+        eprintln!(
+            "[palette-ctl] VERDICT: the ORACLE is also invariant -- the palette region is \
+             not read by either implementation, so the port's invariance is not by itself \
+             a defect."
+        );
+    } else {
+        eprintln!(
+            "[palette-ctl] VERDICT: the oracle's output DOES depend on the palette. The \
+             port's invariance is therefore a real difference in behaviour, not a property \
+             of the packet."
+        );
+    }
+}
+
+/// **Separating the two candidate causes: do the texel INDICES reach the
+/// output, on either side?**
+///
+/// `wm2000_frame_zero_palette_invariance_probe` found the port invariant to
+/// the TLUT, and its reference control found the oracle invariant too --
+/// so palette invariance is a property of the packet, not a port defect.
+/// This probe perturbs the other guest source: the CI4 texture data that
+/// `LoadBlock` copies into TMEM word 0 and that the drawing tile samples.
+///
+/// Reported, not asserted.
+#[test]
+fn wm2000_frame_zero_texture_data_sensitivity_probe() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[texdata] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+
+    let port_base = wm2000_port_image_perturbed(&packet, &commands, None, Some(0x00));
+    let port_alt = wm2000_port_image_perturbed(&packet, &commands, None, Some(0xff));
+    let port_diff = port_base
+        .chunks_exact(2)
+        .zip(port_alt.chunks_exact(2))
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "[texdata] port  texdata 0x00 -> {:?}",
+        rgba16_histogram(&port_base)
+    );
+    eprintln!(
+        "[texdata] port  texdata 0xff -> {:?}  ({port_diff} pixels changed)",
+        rgba16_histogram(&port_alt)
+    );
+
+    let ref_base = wm2000_reference_image_perturbed(&packet, &commands, None, Some(0x00));
+    let ref_alt = wm2000_reference_image_perturbed(&packet, &commands, None, Some(0xff));
+    match (ref_base, ref_alt) {
+        (Ok(base), Ok(alt)) => {
+            let ref_diff = base
+                .chunks_exact(2)
+                .zip(alt.chunks_exact(2))
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!(
+                "[texdata] oracle texdata 0x00 -> {:?}",
+                rgba16_histogram(&base)
+            );
+            eprintln!(
+                "[texdata] oracle texdata 0xff -> {:?}  ({ref_diff} pixels changed)",
+                rgba16_histogram(&alt)
+            );
+            eprintln!(
+                "[texdata] VERDICT: port sensitive={} oracle sensitive={}",
+                port_diff > 0,
+                ref_diff > 0
+            );
+        }
+        (base, alt) => {
+            eprintln!("[texdata] oracle refused: {base:?} / {alt:?}");
+        }
+    }
+}
+
+/// **Which combiner constant does each side actually emit?**
+///
+/// Both sides proved insensitive to the TLUT and to the CI4 texture data,
+/// so each is producing a texel-independent constant for the texrect
+/// pixels -- and they disagree on which constant. This probe rewrites the
+/// packet's own `SetEnvColor` (`0x3b`) and `SetPrimColor` (`0x3a`) operand
+/// words and reports how each side's output moves, which identifies the
+/// combiner term each side is actually evaluating.
+///
+/// The command words are edited in the replayed copy only; the fixture on
+/// disk is untouched and the census identity assertions still run against
+/// the unmodified stream.
+#[test]
+fn wm2000_frame_zero_combiner_constant_probe() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[combiner] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let base_commands = walk_raw_rdp_commands(&packet.words);
+    assert_eq!(base_commands.len(), 366, "WM2000 entry 0 is 366 commands");
+
+    // (label, opcode to rewrite, replacement operand word)
+    let cases: [(&str, u8, u32); 4] = [
+        ("baseline", 0x00, 0),
+        ("env := 0x00000000", 0x3b, 0x0000_0000),
+        ("env := 0x804020ff", 0x3b, 0x8040_20ff),
+        ("prim := 0xffffffff", 0x3a, 0xffff_ffff),
+    ];
+
+    for (label, opcode, replacement) in cases {
+        let mut words = packet.words.clone();
+        if opcode != 0x00 {
+            for &(offset, cmd6, _, _) in &base_commands {
+                if cmd6 == opcode {
+                    words[offset / 4 + 1] = replacement;
+                }
+            }
+        }
+        let edited = CapturedPacket {
+            entry: packet.entry,
+            words,
+            source_pc: packet.source_pc,
+        };
+        let commands = walk_raw_rdp_commands(&edited.words);
+        let port = wm2000_port_image_perturbed(&edited, &commands, None, None);
+        let reference = wm2000_reference_image_perturbed(&edited, &commands, None, None);
+        eprintln!(
+            "[combiner] {label:24} port   -> {:?}",
+            rgba16_histogram(&port)
+        );
+        match reference {
+            Ok(image) => eprintln!(
+                "[combiner] {label:24} oracle -> {:?}",
+                rgba16_histogram(&image)
+            ),
+            Err(e) => eprintln!("[combiner] {label:24} oracle -> refused: {e}"),
+        }
+    }
+}
+
+/// **The isolated disagreement, pinned: the port does not run the blender.**
+///
+/// Measured, not inferred. The 60 texrects latch
+/// `SetCombine 0xfcffffff / 0xfffdf6fb`, which decodes to
+/// `(Zero - Zero) * Zero + Primitive` -- a flat `Primitive` program that
+/// reads no texel at all. That is why both sides proved invariant to the
+/// TLUT and to the CI4 texture data: neither is consulted by this packet's
+/// texrect program, and the port's palette invariance is therefore NOT a
+/// sampling defect.
+///
+/// The latched `SetPrimColor` is `0xffffffdf` -- RGB 255,255,255, alpha
+/// `0xdf` = 223. The port writes the combiner output straight to the
+/// destination (its own module doc, `targets/texrect.rs:76-77`: "No
+/// blending, alpha compare, dither, or coverage"), giving 255 -> 5-bit 31
+/// -> `0xffff`. The oracle runs the blender under the latched
+/// `FORCE_BL`/`IM_RD`/`AA_EN` other-mode low word `0x005041c8`, giving
+/// `255 * 223/255 + dst * (1 - 223/255)`: 223 -> 5-bit 27 (`0xdef7`) over
+/// a zero destination, and 224 -> 5-bit 28 (`0xe739`) over the `0x0001`
+/// fill. Both oracle values are reproduced by that arithmetic exactly.
+///
+/// This test pins the two sides' measured outputs. It fails the moment
+/// either implementation changes, which is the point: the disagreement is
+/// a real one and must not drift silently.
+#[test]
+fn wm2000_frame_zero_port_omits_the_blender_the_oracle_runs() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[blend] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    assert_eq!(commands.len(), 366, "WM2000 entry 0 is 366 commands");
+
+    let port = wm2000_port_image_perturbed(&packet, &commands, None, None);
+    let oracle = wm2000_reference_image_perturbed(&packet, &commands, None, None)
+        .expect("the oracle executes this packet");
+
+    assert_eq!(
+        rgba16_histogram(&port),
+        vec![(0xffff, 114_481), (0x0001, 719)],
+        "the port writes the flat Primitive combiner output unblended"
+    );
+    assert_eq!(
+        rgba16_histogram(&oracle),
+        vec![(0xe739, 100_235), (0xdef7, 14_246), (0x0001, 719)],
+        "the oracle blends white at alpha 223/255 over the destination"
+    );
+
+    let differing = port
+        .chunks_exact(2)
+        .zip(oracle.chunks_exact(2))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 114_481,
+        "exactly the texrect pixels differ; the 719 fill pixels agree byte-for-byte"
+    );
+
+    // The blend arithmetic, derived here rather than read off either
+    // implementation: white at alpha 223/255 over destination 0 and over
+    // the fill's 5-bit 0 with LSB set.
+    let alpha = 223.0f32 / 255.0;
+    let over_zero = (255.0 * alpha) as u32 >> 3;
+    assert_eq!(over_zero, 27, "0xdef7's 5-bit red channel is 27");
+    let over_fill = (255.0 * alpha + 8.0 * (1.0 - alpha)).round() as u32 >> 3;
+    assert_eq!(over_fill, 28, "0xe739's 5-bit red channel is 28");
+}
+
+/// **Does either side respond to `SetPrimColor` at all?**
+///
+/// The combiner-constant probe found the oracle's output moves to exactly
+/// the port's output when `Primitive` is forced white, which implicates
+/// `Primitive`. This sweeps `SetPrimColor` across several values and
+/// reports each side's response independently, so "the port ignores
+/// SetPrimColor" is measured rather than inferred from one coincidence.
+#[test]
+fn wm2000_frame_zero_primitive_color_response_sweep() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[prim] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let base_commands = walk_raw_rdp_commands(&packet.words);
+
+    for value in [0x0000_00feu32, 0x0000_0000, 0x8080_80ff, 0xffff_ffff] {
+        let mut words = packet.words.clone();
+        for &(offset, cmd6, _, _) in &base_commands {
+            if cmd6 == 0x3a {
+                words[offset / 4 + 1] = value;
+            }
+        }
+        let edited = CapturedPacket {
+            entry: packet.entry,
+            words,
+            source_pc: packet.source_pc,
+        };
+        let commands = walk_raw_rdp_commands(&edited.words);
+        let port = wm2000_port_image_perturbed(&edited, &commands, None, None);
+        let reference = wm2000_reference_image_perturbed(&edited, &commands, None, None);
+        eprintln!(
+            "[prim] prim={value:#010x} port   -> {:?}",
+            rgba16_histogram(&port)
+        );
+        match reference {
+            Ok(image) => eprintln!(
+                "[prim] prim={value:#010x} oracle -> {:?}",
+                rgba16_histogram(&image)
+            ),
+            Err(e) => eprintln!("[prim] prim={value:#010x} oracle -> refused: {e}"),
+        }
+    }
+}
+
+/// **Mutation test for the comparison harness itself.**
+///
+/// A comparison that cannot fail is worse than none. This perturbs one
+/// pixel of one side and asserts the byte-for-byte comparator catches it,
+/// and separately asserts the comparator reports zero differences for two
+/// identical images. Both directions are needed: an always-differ
+/// comparator would pass the first check alone.
+#[test]
+fn the_wm2000_image_comparator_detects_a_single_perturbed_pixel() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[mutant] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let commands = walk_raw_rdp_commands(&packet.words);
+    let port = wm2000_port_image_perturbed(&packet, &commands, None, None);
+
+    let count_differences = |a: &[u8], b: &[u8]| {
+        a.chunks_exact(2)
+            .zip(b.chunks_exact(2))
+            .filter(|(x, y)| x != y)
+            .count()
+    };
+
+    // Negative control: an image compared against itself must report zero.
+    assert_eq!(
+        count_differences(&port, &port),
+        0,
+        "the comparator must report zero differences for identical images -- a comparator \
+         that always differs would pass the mutation check below vacuously"
+    );
+
+    // The mutant: flip one byte of one pixel, in the middle of the image.
+    let mut mutated = port.clone();
+    let victim = (port.len() / 2) & !1;
+    mutated[victim] ^= 0x01;
+    assert_eq!(
+        count_differences(&port, &mutated),
+        1,
+        "perturbing exactly one pixel must be caught as exactly one difference"
+    );
+
+    // And the histogram summary must move too, since the disagreement
+    // report quotes it.
+    assert_ne!(
+        rgba16_histogram(&port),
+        rgba16_histogram(&mutated),
+        "the histogram the disagreement report quotes must also change"
+    );
+}
+
+/// **Positive control on the fixture: a synthetic stand-in is rejected.**
+///
+/// The comparison tests assert the census identity facts, but that only
+/// helps if those assertions actually fire on a non-WM2000 packet. This
+/// builds a trimmed version of the real packet and confirms the identity
+/// check rejects it, so "the fixture is the real capture" is a measured
+/// property rather than an assumed one.
+#[test]
+fn a_trimmed_wm2000_packet_fails_the_census_identity_control() {
+    let Some(packet) = load_captured_packet() else {
+        eprintln!("[control] {WM2000_PACKET_ENV} unset -- NOT RUN.");
+        return;
+    };
+    let real = walk_raw_rdp_commands(&packet.words);
+    assert_eq!(
+        real.len(),
+        366,
+        "the fixture is the real 366-command packet"
+    );
+
+    // Drop the last quarter of the words: still plausible RDP, not WM2000
+    // entry 0.
+    let trimmed = &packet.words[..packet.words.len() * 3 / 4];
+    let trimmed_commands = walk_raw_rdp_commands(trimmed);
+    assert_ne!(
+        trimmed_commands.len(),
+        366,
+        "a trimmed packet must not satisfy the 366-command identity check -- if it did, the \
+         control could not distinguish the capture from a stand-in"
+    );
+}
