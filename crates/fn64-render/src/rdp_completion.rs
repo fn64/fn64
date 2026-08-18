@@ -30,6 +30,29 @@ const G_NOOP: u8 = 0x00;
 /// notice it has lost the command boundary, so ids are widened when a real
 /// microcode emits them, not because a table lists them.
 const RDP_LOW_NOOP_END: u8 = 0x07;
+/// The one id carved out of that excluded block, on exactly the evidence the
+/// rule above demands: a real microcode emits it.
+///
+/// WM2000 writes `0x1f` to terminate every graphics submission -- 219
+/// occurrences across 383 VI fields, present in 218/218 frames with recorded
+/// deltas, measured over two byte-identical runs of the real ROM
+/// (`docs/RT64-WM2000-CENSUS.md` §3, §4). It is the GBI's `G_ENDDL` (`0xdf`)
+/// masked to its command bits; `ReferenceBackend` reads it as the stream
+/// terminator (`gbi/stream.rs`'s `G_ENDDL => break`).
+///
+/// Widened as **one id, not the block**. `0x10..=0x23` stays rejected around
+/// it precisely so the mis-synchronization detector this comment describes
+/// survives: a scan that has lost the command boundary still lands on a
+/// rejected id with overwhelming probability, and
+/// `undocumented_opcodes_are_still_rejected` pins the remaining region.
+///
+/// Width 8 is the wire fact, not a convenience: this is a one-command-word
+/// id in the same No Operation block as `0x00..=0x07`. Nonclaim: assigning a
+/// width says only how far to advance. It grants `0x1f` no terminator
+/// semantic -- `WgpuBackend`'s decoder is length-delimited
+/// (`raw_dpc/mod.rs`'s `while offset < stream.bytes.len()`), so it must not
+/// choke on a terminator, and must not invent one either.
+const RDP_STREAM_TERMINATOR_NOOP: u8 = 0x1f;
 /// RDP-native command ids (bits 61:56), NOT the `0xc0`-based GBI spellings.
 /// The GBI names differ by exactly that prefix: `G_TEXRECT` is `0xe4` and is
 /// this `0x24` with bits 63:62 set. Widths are matched against the masked
@@ -175,6 +198,9 @@ pub fn raw_rdp_command_width(opcode: u8) -> Option<u32> {
         // public GBI name, which is why 0x00 was accepted long before its
         // seven siblings were.
         G_NOOP..=RDP_LOW_NOOP_END => 8,
+        // Carved out of the otherwise-rejected `0x10..=0x23` block on
+        // measured evidence; see `RDP_STREAM_TERMINATOR_NOOP`.
+        RDP_STREAM_TERMINATOR_NOOP => 8,
         // The eight triangle layouts. The low three bits select shade (4),
         // texture (2) and Z (1), and each enabled group appends coefficient
         // words to the 32-byte edge base.
@@ -254,12 +280,22 @@ mod tests {
         }
     }
 
-    /// The widened map must still be able to say no. `0x10..=0x23` is the
-    /// only unaccepted region left, and it must reject under every prefix --
-    /// masking must not become a way to launder an unknown command.
+    /// The widened map must still be able to say no. `0x10..=0x23` less the
+    /// single measured carve-out is the only unaccepted region left, and it
+    /// must reject under every prefix -- masking must not become a way to
+    /// launder an unknown command.
+    ///
+    /// The `0x1f` exception is skipped here rather than deleted from the
+    /// loop's range: keeping the range whole and naming the one hole makes it
+    /// obvious that exactly one id was widened, and a second carve-out would
+    /// have to be added here explicitly rather than slipping in under a
+    /// shortened bound.
     #[test]
     fn undocumented_opcodes_are_still_rejected() {
         for command in 0x10u8..=0x23 {
+            if command == RDP_STREAM_TERMINATOR_NOOP {
+                continue;
+            }
             for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
                 let opcode = prefix | command;
                 assert_eq!(
@@ -268,6 +304,30 @@ mod tests {
                     "opcode {opcode:#04x} has no public command width and must not be accepted"
                 );
             }
+        }
+    }
+
+    /// The carve-out is exactly one id wide, and it is the measured one.
+    ///
+    /// Two assertions, because "0x1f is accepted" alone would also pass if
+    /// the whole block had been widened -- which is the change this test
+    /// exists to prevent. Its immediate neighbours must still reject.
+    #[test]
+    fn the_stream_terminator_is_widened_without_widening_its_block() {
+        for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+            assert_eq!(
+                raw_rdp_command_width(prefix | RDP_STREAM_TERMINATOR_NOOP),
+                Some(8),
+                "WM2000's measured stream terminator must be accepted under every prefix"
+            );
+        }
+        for neighbour in [0x1eu8, 0x20] {
+            assert_eq!(
+                raw_rdp_command_width(neighbour),
+                None,
+                "widening {neighbour:#04x} alongside it would destroy the mis-synchronization \
+                 detector the carve-out was kept narrow to preserve"
+            );
         }
     }
 
