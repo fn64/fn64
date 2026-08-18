@@ -67,17 +67,18 @@ pub use gpu_projection::{
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
-    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
-    PhysicalTmemTransactionIdentity, StagedTmemTransaction,
+    PendingTmemImage, PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
+    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
 pub use read::{
-    read_committed_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
-    PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
+    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
+    PhysicalTexelReadError, PhysicalTmemSnapshotIdentity, ProposedTmemImageIdentity,
+    TmemByteSource, TmemFirstRowParity, TmemSnapshotIdentity,
 };
 pub use sample::{
     address_point_texel, address_texture_cell, filter_three_nearest_committed_cell,
-    gather_committed_texture_cell, sample_committed_point, AddressedTextureCell,
+    gather_committed_texture_cell, sample_committed_point, sample_point, AddressedTextureCell,
     CommittedTextureCell, PointAddressError, PointSampleCoordinates, PointSampleError,
     PointSampleRequest, TextureAxis, TextureCellCorner, TextureCellFractions,
     TextureCellSampleError, TextureCoordinateS10_5,
