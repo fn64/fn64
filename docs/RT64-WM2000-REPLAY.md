@@ -42,6 +42,13 @@ assert").
 > removed. Entry 0 now clears planning entirely and refuses at the coverage
 > panic quoted immediately below — which restores the original headline's
 > *refusal site*, though not its "366 of 366 admitted" wording (see §1d).
+>
+> **And §5 supersedes that.** The coverage panic §1d handed off to has since
+> been narrowed, on a measured proof that WM2000's latched mode makes the
+> unreadable `memory` term unobservable. **Both blockers are now closed and
+> entry 0 executes and publishes with no bypass** — two independent fixes,
+> one per blocker, neither sufficient alone. Entries 1–3 stop at a third,
+> pre-existing frontier. See §5.
 
 The withdrawn original claim, kept because §1a's correction is written
 against it:
@@ -437,9 +444,12 @@ census's §8 caveat — "the ADMITTED column is classification against that
 decoder's source, not an observed acceptance" — therefore still stands
 unconverted for the remaining 360.
 
-What is not proven, and is the whole distance remaining: **not one pixel of
+~~What is not proven, and is the whole distance remaining: **not one pixel of
 WM2000 has been rendered.** No fill reached its color image, no texel was
-sampled, nothing was published.
+sampled, nothing was published.~~ **Superseded — see "Both blockers are now
+closed" below.** Entry 0 executes end-to-end with no bypass and publishes
+230,400 bytes into its own color image. It took *two independent fixes*, one
+per blocker, and neither alone was sufficient.
 
 **The `LoadTLUT` blocker is closed** (§1d). It was measured against public
 libultra `gbi.h`, found wrong, and removed; the canonical
@@ -453,28 +463,115 @@ count unchanged at 1217 (re-measured both sides, not carried from a brief).
 **A new frontier appeared behind it, in entries 1–3 only.** Those entries now
 refuse at `assert_eq!(source_accesses.len(), 1,
 "v11's admitted TMEM source plan is exactly one journal access wide")`
-(`raw_dpc/production_adapter.rs:1227`). This is a documented v11 adapter
-scope limit — the decoder's own `source_accesses` admits up to
-`MAX_RESOURCE_ACCESSES` ranges — not a decoder defect. It was previously
-masked by the `LoadTLUT` refusal and is recorded here as newly visible, not
-newly introduced. It is an `assert_eq!` rather than a named refusal, so like
-the coverage panic a caller cannot match on it.
+(`raw_dpc/production_adapter.rs:1224-1228`; the panic reports `:1224`, the
+message text sits at `:1227`). This is a documented v11 adapter scope limit —
+the decoder's own `source_accesses` admits up to `MAX_RESOURCE_ACCESSES`
+ranges — not a decoder defect. It was previously masked by the `LoadTLUT`
+refusal and is recorded here as newly visible, not newly introduced. It is an
+`assert_eq!` rather than a named refusal, so like the coverage panic a caller
+cannot match on it.
 
-**Now the first blocker for entry 0, and still architectural:**
-`CoverageDestination::Clamp`/`Wrap` with `image_read_enabled` set, at
-`triangle_pipeline.rs:280`. It is reached on the real packet without any
-guard bypass now (10 consecutive runs, identical), so it is no longer the
-*second* blocker but the standing one. Its size
-assessment stands: the pipeline has no framebuffer-read mechanism, its site
-names it "node 2, a separate unresolved architectural decision", and it needs
-a mechanism rather than a widened constant. Note that §1c's finding does not
-shrink it — the texrect route to that panic cannot simply be removed, because
-the draw is a publication gate.
+**Independently confirmed after the coverage narrowing landed**, with no
+bypass: entries 1, 2 and 3 all stop here, each reporting left `49` right `1`.
+The coverage fix did not move this frontier and does not address it. Entry 0
+alone reaches publication.
+
+### The second blocker: coverage, narrowed on non-observability
+
+The section above correctly reported the coverage refusal as the standing
+blocker for entry 0, and correctly said its size assessment "stands: the
+pipeline has no framebuffer-read mechanism". **That premise was right about
+the mechanism and wrong about what WM2000 needs from it.** The correction is
+measured, and it does *not* retract §1d — the two blockers were independent
+and each needed its own fix.
+
+`CoverageDestination::Clamp`/`Wrap` with `image_read_enabled`
+(`triangle_pipeline.rs`) now refuses only when the unknown `memory` value can
+reach a shader output: `alpha_coverage_select || !force_blend`.
+
+**What the packet actually latches**, read off its own words rather than
+assumed. All 60 of entry 0's texrects latch other-mode low `0x005041c8` —
+`cvg_dst=Wrap`, `IM_RD`, `AA_EN`, `CLR_ON_CVG`, `FORCE_BL`, with
+**`CVG_X_ALPHA` and `ALPHA_CVG_SEL` both clear**. The 60 fillrects latch
+`0x00000000` (no image read at all).
+
+**Why those two clear bits decide it.** `coverage_fragment_fn`'s result
+reaches `FragmentOutput` by exactly two routes
+(`shaders/triangle_pipeline_fragment.wgsl`): `output.color.a`, guarded by
+`alpha_coverage_select`; and `blend_enabled`, which is
+`force_blend || (antialias_enabled && !wraps)`, where `wraps` is the
+`memory`-dependent term. With `ALPHA_CVG_SEL` clear the first route is dead;
+with `FORCE_BL` set the second short-circuits to `true` for every `memory`
+value. `wraps` is otherwise unexported — this pipeline has no
+`clear_on_coverage` discard, the CPU reference's consumer
+(`raster/draw.rs`'s `set_blended`) having no counterpart here.
+
+**The admission rests on non-observability, not on vacuity.** `memory` is
+emphatically *not* a no-op in the accumulation: `destination` genuinely varies
+across `memory` in `0..=8` under this very mode, and a test asserts that it
+does, precisely so this cannot be misread as "the math doesn't matter". What
+is proven is narrower and sufficient — that under this bit combination no
+output the draw produces is a function of the term the pipeline cannot supply.
+
+**Nothing is read and nothing is substituted.** `memory_count` remains the
+shader's `0u` literal; the serialized `coverage_destination` word stays the
+mode's own encoding (Clamp=0/Wrap=1), never a substituted `Full`(2). `Save`
+still refuses unconditionally, since `destination = memory` has no
+`memory`-independent case at all.
+
+**Two refuted hypotheses, recorded because each killed a plausible plan.**
+
+- *"The CPU executor already knows the destination coverage."* False. The CPU
+  texrect executor implements **no coverage at all** — its own module doc says
+  so (`targets/texrect.rs`, "No blending, alpha compare, dither, or
+  coverage"). Only the unwired `fn64-render-reference` rasterizer keeps a
+  coverage buffer.
+- *"A framebuffer-read mechanism must be built from scratch."* Half false, and
+  the useful half is the correction: a framebuffer **color** read already
+  exists and works — `framebuffer_color_snapshot` (binding 9), a
+  `copy_texture_to_buffer` snapshot with per-draw run splitting
+  (`split_fixture_runs`). The real gap is that nothing *writes* coverage:
+  `TriangleDrawOutput` carries color/depth/status only, and
+  `production.rs`'s `BlendRequiresFramebuffer` doc states "no coverage-count
+  GPU write exists anywhere in this crate". So the remaining work is a
+  specific missing attachment, not an absent read path.
+
+### Both blockers are now closed, and entry 0 publishes
+
+**Measured with no bypass of any kind**, on the tip carrying both fixes: entry
+0's 366 commands **execute end-to-end through `WgpuBackend` with no refusal**,
+and the replay's previously-unreached arm — "a packet that executed with no
+refusal must have published something into its own color image" — fires and
+passes.
+
+What landed in guest RDRAM, hand-reconciled against the packet's own words:
+
+| Quantity | Measured | Derived from the packet |
+|---|---|---|
+| Color image | 480x240 RGBA16, 230,400 bytes | `SetColorImage` + `SetScissor` |
+| Bytes differing from poison | 229,496 (99.6%) | — |
+| Distinct pixel values | 2 | — |
+| `0xffff` | 114,481 px (99.4%) | the 60 texrects' output |
+| `0x0001` | 719 px (0.6%) | `SetFillColor 0x00010001`, two RGBA16 `0x0001` |
+
+`114,481 + 719 = 115,200 = 480 x 240` exactly, so every pixel is accounted
+for. The 60 fillrects cover exactly 240 rows (hand-summed from their own
+`(yh - yl + 1)` spans) and the 60 texrects sum to ~7,155 px of area, which is
+why the fill colour survives only where no texrect landed.
+
+**This is the first time WM2000's own bytes have published pixels through the
+Rust port.** It is not a rendered frame: two distinct values is a plausible
+title-screen-shaped result for a packet whose combiner reads a 4-bit CI
+texture, but **no pixel is validated against hardware or against the CPU
+reference**, and a uniform `0xffff` majority is equally consistent with a
+texel decode that saturates. Treat it as "the pipeline is now end-to-end
+reachable", not as "the image is correct".
 
 Two smaller things remain on the path:
 
 - The coverage refusal is a `panic!` rather than a named error variant, so it
   cannot be matched or counted by a caller the way the decode refusals can.
+  The narrowed refusal keeps that shape.
 - ~~The `LoadTLUT` destination check has no test~~ — closed, §1d.
 
 **Nonclaims.** No frame is rendered. No pixel is asserted. No routing was
@@ -485,7 +582,19 @@ neighbouring source-image check was retained and is pinned by the same test.
 Removing it admits `LoadTLUT` to *planning* only — it makes no claim that the
 TLUT is correctly written to TMEM, since nothing executes past the coverage
 panic. The v11 access-count frontier in entries 1–3 is reported as newly
-visible, not diagnosed or fixed. Everything measured is entry 0 of one window of one title and
+visible, not diagnosed or fixed, and it is unchanged by the coverage
+narrowing (re-confirmed on all three entries with no bypass).
+
+**Nonclaims for the coverage narrowing specifically.** No framebuffer-read
+mechanism is implemented and no coverage value is substituted; the refusal was
+*narrowed*, not deleted. `Save`, and `Clamp`/`Wrap` with `ALPHA_CVG_SEL` set
+or `FORCE_BL` clear, still refuse loudly, and a real triangle with
+`image_read_enabled` under those bits is refused exactly as before — four
+tests pin that boundary. **The narrowing is WM2000-shaped: a title that sets
+`ALPHA_CVG_SEL` or clears `FORCE_BL` still hits the same wall**, which needs
+the missing coverage attachment described above, not a wider constant. The
+`0xffff`/`0x0001` pixel values are reported as measured bytes, not as
+validated output. Everything measured is entry 0 of one window of one title and
 says nothing about gameplay, which the `0x1CC` MMIO abort still bounds this
 capture short of. The four captured entries are all triangle-free early
 frames; the 152 of 218 frames the census measured as carrying triangles were
