@@ -905,6 +905,22 @@ pub(crate) struct TmemPrefixSnapshot {
     valid: Box<[bool; TMEM_LEN]>,
 }
 
+impl TmemPrefixSnapshot {
+    /// An all-invalid prefix, for tests that assert on WHICH prefix a
+    /// stream position selects rather than on the texels in it.
+    ///
+    /// Test-only, and deliberately so: production prefixes come from
+    /// [`PhysicalTmemPacketTransaction::capture_prefix`] alone, so no
+    /// caller can fabricate a post-image that no load produced.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            bytes: Box::new([0u8; TMEM_LEN]),
+            valid: Box::new([false; TMEM_LEN]),
+        }
+    }
+}
+
 impl fmt::Debug for TmemPrefixSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
