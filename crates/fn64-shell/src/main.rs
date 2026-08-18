@@ -26,8 +26,19 @@
 //! |---|---|
 //! | F1 | Settings overlay (`overlay.rs`) |
 //! | F2 | Screenshot the game frame to a PNG (`screenshot.rs`) |
+//! | F3 | Stack + framerate HUD (`stack.rs`); `FN64_HUD=1` starts it open |
 //! | F11 | Toggle borderless fullscreen |
 //! | Esc | Close the overlay, or exit when it is closed |
+//!
+//! ## What this build is running on
+//!
+//! The recompiler lane and the renderer are chosen in two places a player
+//! never sees, and both default to the opposite of the intended target stack.
+//! `stack.rs` prints a greppable `[fn64-stack]` block naming both -- plus
+//! whether a game is linked and which -- unconditionally at startup and again
+//! at exit, and F3 puts the same identity on screen with a live framerate.
+//! Paste that block into any symptom report; without it the report has no
+//! cell.
 //!
 //! ## Game intake (same contract as oot-boot)
 //!
