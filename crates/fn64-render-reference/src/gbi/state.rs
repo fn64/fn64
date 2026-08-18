@@ -896,10 +896,34 @@ impl TmemTexture {
         }
 
         let raw = self.raw_texel(x, y);
-        // EN_TLUT is a pipeline mode, not a tile-format property. With it
-        // enabled, every 4-bit texel is palette-relative and every 8-bit
-        // texel is a direct high-TMEM index regardless of the tile's declared
-        // format. WM2000 relies on this for an IA8-declared title image.
+        // EN_TLUT is a pipeline mode, not a tile-format property. The n64brew
+        // RDP pipeline page states it without qualification: "If tlut_en is
+        // set in othermodes the final texel will be sourced from a palette
+        // and the tile format is ignored, for tiles that indicate a 4-bit
+        // texel size the TMEM address for the palette is indicated in the
+        // tile's palette field, the tile size is otherwise ignored."
+        // WM2000 relies on this twice: for an IA8-declared title image, and
+        // -- reached only at gfx task #6146 of the attract loop -- for an
+        // RGBA/16b-declared tile still sampled while G_TT_RGBA16 is latched.
+        //
+        // Size selects only how the eight-bit index is cut out of the
+        // addressed bytes, never whether the lookup happens. 4-bit texels
+        // concatenate the tile's palette bank with the nibble; every wider
+        // size takes the single byte the tile's own addressing lands on and
+        // discards the rest of the texel. Two independent MIT
+        // reimplementations agree on that byte: RT64's `sampleTMEM`
+        // (`shaders/TextureDecoder.hlsli:174-188`) indexes with
+        // `pixelValue0`, the byte at the unincremented address, and
+        // paraLLEl-RDP's `sample_texel_ci32_tlut`
+        // (`shaders/texture.h:201-216`) computes `(word >> 6) & ~3`, which
+        // is that same high byte scaled by the four-bank palette
+        // replication. `raw_texel` assembles a 16-bit texel big-endian from
+        // `base + 2x` and `base + 2x + 1`, so its high byte IS RT64's
+        // `pixelValue0`.
+        //
+        // 32-bit stays a loud refusal: this title never reaches it, and its
+        // index byte would have to be re-derived against the RGBA32 low/high
+        // bank split rather than assumed to follow the 16-bit rule.
         if self.texture_lut != 0 {
             match self.tile.siz {
                 G_IM_SIZ_4B => {
@@ -907,6 +931,7 @@ impl TmemTexture {
                     return self.tlut_color(index);
                 }
                 G_IM_SIZ_8B => return self.tlut_color(raw as usize),
+                G_IM_SIZ_16B => return self.tlut_color((raw >> 8) as usize),
                 _ => crate::render_unsupported_panic(
                     "render.gbi.texture-lut-size",
                     format!(

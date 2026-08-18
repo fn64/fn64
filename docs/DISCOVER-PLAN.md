@@ -2287,6 +2287,8 @@ project's *code* remains disallowed.
 |---|---|---|---|
 | pmret/papermario | none declared | 2026-08-01 | `ver/pal/splat.yaml` segment map for the PAL ROM (sha1 `2111d392…`, matching its `checksum.sha1`): 687 kseg0 ROM→VRAM segment mappings, read as measurements to explain an overlay-recovery failure. No source read into fn64. |
 | bomberhackers/bm64 | none declared | 2026-08-01 | `splat.yaml` segment map only. **Targets a different revision** — sha1 `8f9e1706…`, a 16 MB build whose overlays begin at ROM `0x800000`, while the local ROM is 8 MB (sha1 `8a7648d8…`), so its addresses do not transfer and were not used as such. Read for engine *structure*, which is revision-stable. No source read into fn64. |
+| Themaister/parallel-rdp | MIT | 2026-08-18 | `shaders/texture.h` TLUT sampling behavior ONLY, read as a behavioral citation for `tlut_en` semantics (format-independence, high-byte index selection, `0x7ff` low-half source mask, size-derived stride). Its README explicitly disclaims derivation from the unlicensed Angrylion lineage, so the MIT grant stands. No source read into fn64; the reference lane's own decoder was written against the cited behavior, not adapted from it. |
+| n64brew Wiki, `Reality_Display_Processor/Pipeline` and `/Commands` | CC BY-SA 4.0 | 2026-08-18 | The `tlut_en` prose: "If tlut_en is set in othermodes the final texel will be sourced from a palette and the tile format is ignored ... the tile size is otherwise ignored." Cited as public hardware documentation. |
 
 That measurement disproved a standing hypothesis and identified the real
 cause: Paper Mario maps 687 segments onto only 35 distinct VRAM destinations
