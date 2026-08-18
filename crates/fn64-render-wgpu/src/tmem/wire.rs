@@ -363,22 +363,31 @@ fn decode_load_tlut(
             "LoadTLUT destination tile is outside high TMEM",
         ));
     }
-    // Public libultra `gbi.h` `gDPLoadTLUTCmd`: the macro always programs a
-    // 16-bit-per-entry palette image, and this module's transfer-shape
-    // (`entries.get() * 2` source bytes) and destination projection are
-    // sized for exactly that. Reject any other `SetTextureImage` or tile
-    // descriptor size explicitly rather than silently mis-sizing the
-    // transfer -- see `AGENTS.md`'s "loud traps, no silent shrugs".
+    // Public libultra `gbi.h`, the `gDPLoadTLUT_pal16` / `gDPLoadTLUT_pal256`
+    // / `gDPLoadTLUT` macro bodies: every one emits
+    // `gDPSetTextureImage(..., G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, dram)`, so the
+    // SOURCE image is 16-bit per palette entry and this module's
+    // transfer-shape (`entries.get() * 2` source bytes) is sized for exactly
+    // that. Reject any other `SetTextureImage` size explicitly rather than
+    // silently mis-sizing the transfer -- `AGENTS.md`'s "loud traps, no
+    // silent shrugs".
     if image.size() != PixelSize::Bits16 {
         return Err(TmemWireError::new(
             "LoadTLUT public macro requires a 16-bit SetTextureImage source",
         ));
     }
-    if descriptor.size() != PixelSize::Bits16 {
-        return Err(TmemWireError::new(
-            "LoadTLUT public macro requires a 16-bit destination tile descriptor",
-        ));
-    }
+    // The DESTINATION tile descriptor's `siz` is deliberately NOT constrained
+    // here. The same macro bodies emit `gDPSetTile(pkt, 0, 0, 0, tmem,
+    // G_TX_LOADTILE, ...)`, whose second positional argument is `siz`
+    // (`gDPSetTile(pkt, fmt, siz, line, tmem, tile, ...)`), so the canonical
+    // destination `siz` is `0` == `G_IM_SIZ_4b` -- never 16-bit. A previous
+    // revision required `Bits16` here and refused every canonical
+    // `gDPLoadTLUT_pal16`; the load tile describes a TMEM region for a
+    // quadricated palette write, not the palette's own pixel format, and no
+    // code consumes the field for this kind: `transfer_shape`'s `Tlut` arm
+    // sizes from `entries` and `image.size()`, and
+    // `project_tmem_transfer_word`'s `Tlut` arm reads only `descriptor.tmem()`
+    // and `line_words()`.
     let low_s = (w0 >> 12) & 0x0fff;
     let low_t = w0 & 0x0fff;
     let count_fraction = (w1 >> 12) & 3;
