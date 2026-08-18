@@ -209,6 +209,7 @@ pub(super) fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
         .unwrap_or_else(fresh_decode_state);
     state.admission_raw_window_bytes = admission_policy.raw_window_bytes;
     state.force_branch = admission_policy.force_branch;
+    super::census::note_decode_entry();
     #[cfg(not(test))]
     projdump::reset_frame();
     let mut family = initial_profile.wire_family();
@@ -264,6 +265,7 @@ pub(crate) fn decode_raw_rdp_ops_with_state(
     rdp_state: &mut RdpDecodeState,
 ) -> Result<Vec<RenderOp>, RenderError> {
     let mut state = rdp_state.begin_task();
+    super::census::note_decode_entry();
     let mut family = GeometryWireFamily::F3dex2;
     // No `rdram.to_vec()` scratch copy here (unlike the sibling decoders):
     // raw-RDP tasks always pass `rsp_memory: None` below, and the only
