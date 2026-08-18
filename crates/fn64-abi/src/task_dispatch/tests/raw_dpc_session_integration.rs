@@ -1185,6 +1185,251 @@ fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
     teardown();
 }
 
+/// A `TextureRectangle` at arbitrary whole-pixel bounds, sampling `tile`
+/// with the one-texel-per-pixel step `fill_load_and_copy_texrect_words`
+/// uses. The parameterized sibling of that fixture's inline texrect words.
+fn texrect_words_at(tile: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> [u32; 4] {
+    [
+        word(TEXRECT, ((x1 << 2) << 12) | (y1 << 2)),
+        (tile & 0x7) << 24 | ((x0 << 2) << 12) | (y0 << 2),
+        0,
+        (0x0400u32 << 16) | 0x0400,
+    ]
+}
+
+/// The `SetTextureImage`/`SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock` run
+/// `fill_load_and_copy_texrect_words` stages, factored out so a
+/// multi-command fixture loads TMEM exactly once and every texrect in it
+/// samples the same tile.
+fn composed_tmem_load_words() -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend(set_texture_image(0, 2, 8, TEXTURE_SOURCE_ADDR));
+    words.extend(set_tile(7, 2, 0));
+    words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+    words.extend(load_sync());
+    words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+    words
+}
+
+/// **Three fills and three texrects, interleaved in one packet.**
+///
+/// The multiplicity shape at the e2e seam: command 0 is the whole-target
+/// fill a fresh target requires, then fill/texrect alternate. Each fill
+/// re-stages Fill cycle and each texrect re-stages Copy cycle, because a
+/// fill is admitted only in the former and this texrect executor only in
+/// the latter -- and `PlanCollector` snapshots the mode at each command's
+/// own stream position, which is what lets a fill follow a texrect.
+fn three_fills_and_three_texrects_words() -> Vec<u32> {
+    let mut words = whole_target_fill_words();
+    words.extend(composed_tmem_load_words());
+    // Texrect A: x 0..=3, y 0..=1.
+    words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    words.extend(texrect_words_at(7, 0, 0, 3, 1));
+    // Fill B: the right half of the top rows, a different color.
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_fill_color(MULTI_FILL_COLORS[1]));
+    words.extend(fill_rectangle(8, 0, 15, 3));
+    // Texrect C: x 4..=11, y 2..=4.
+    words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    words.extend(texrect_words_at(7, 4, 2, 11, 4));
+    // Fill D: the bottom-left, a third color.
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_fill_color(MULTI_FILL_COLORS[2]));
+    words.extend(fill_rectangle(0, 5, 7, 7));
+    // Texrect E: x 12..=15, y 6..=7.
+    words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    words.extend(texrect_words_at(7, 12, 6, 15, 7));
+    words
+}
+
+/// The three fill colors, in command order. `[0]` is
+/// `whole_target_fill_words`' own literal, restated here so the three read
+/// from one place; all three differ in BOTH halfwords, so a pixel can be
+/// attributed to its fill on either column parity.
+const MULTI_FILL_COLORS: [u32; 3] = [0x0842_1085, 0x1084_2109, 0x2108_4211];
+
+/// The six commands' half-open rasterized pixel extents
+/// `(x, y, width, height)`, in command order, hand-derived.
+///
+/// **A texrect's extent is not its wire corners.** In Copy cycle the RDP
+/// applies `lrx |= 3` / `lry |= 3` and RT64's `FixedRect` ceil is
+/// `(coord + 3) >> 2`. Worked for texrect C, whose wire fields are
+/// `ulx = 4<<2 = 16, uly = 2<<2 = 8, lrx = 11<<2 = 44, lry = 4<<2 = 16`:
+///
+/// - `lrx |= 3 -> 47`, `lry |= 3 -> 19`; the UL round-down `&= !3` leaves
+///   `16` and `8` unchanged (both already multiples of 4).
+/// - `(16+3)>>2 = 4`, `(8+3)>>2 = 2`, `(47+3)>>2 = 12`, `(19+3)>>2 = 5`.
+/// - Half-open: x 4..12, y 2..5 -- **8 wide, 3 tall**.
+///
+/// Derivation 2, independently: `ceil(coord / 4)` over the four
+/// copy-mutated values `16, 8, 47, 19` is `4, 2, 12, 5`. The two agree.
+///
+/// The same arithmetic gives texrect A `(0, 0, 4, 2)` from wire
+/// `0, 0, 3, 1` (`lrx|3 = 15 -> (15+3)>>2 = 4`; `lry|3 = 7 -> 2`) and
+/// texrect E `(12, 6, 4, 2)` from wire `12, 6, 15, 7`
+/// (`ulx = 48 -> 12`, `uly = 24 -> 6`, `lrx|3 = 63 -> 16`,
+/// `lry|3 = 31 -> 8`).
+///
+/// A fill's extent IS its wire corners inclusive: `resolve_fill_pixel_
+/// rectangle` refuses a fractional edge, so a whole-pixel fill covers
+/// exactly `x0..=x1`.
+const MULTI_EXTENTS: [(u32, u32, u32, u32); 6] = [
+    (0, 0, FILL_TARGET_WIDTH, FILL_TARGET_HEIGHT),
+    (0, 0, 4, 2),
+    (8, 0, 8, 4),
+    (4, 2, 8, 3),
+    (0, 5, 8, 3),
+    (12, 6, 4, 2),
+];
+
+/// Which of the six commands are texrects, in command order.
+const MULTI_IS_TEXRECT: [bool; 6] = [false, true, false, true, false, true];
+
+/// **N fills and N texrects, interleaved in one packet, reach guest RDRAM
+/// through the real `dispatch_dpc_submission` seam, composed in command
+/// order.**
+///
+/// The multiplicity claim at the only seam that proves it: the bytes are
+/// read back out of guest RDRAM in **logical** order, through
+/// `read_fill_target_logical`, so this asserts what the guest can actually
+/// observe rather than what the backend staged.
+///
+/// The expectation is hand-derived two independent ways and reconciled:
+///
+/// 1. **Ownership** -- a painter's-algorithm replay of `MULTI_EXTENTS` in
+///    command order says which command last wrote each pixel. Those
+///    extents are themselves derived twice in that constant's own doc
+///    (RT64's `FixedRect` path and a plain `ceil(coord/4)`), which agreed.
+/// 2. **Value** -- for a fill-owned pixel, the RGBA16 even/odd column rule
+///    over that fill's own `SET_FILL_COLOR` word, cross-checked against
+///    `expected_fill_halfword_via_expansion`'s independent channel-wise
+///    model. For a texrect-owned pixel, the assertion is structural: it
+///    must NOT equal any fill's value there, and the texrect's own rows
+///    must vary in S -- the exact texel identity is proven by the unit
+///    test's committed-TMEM oracle, which this seam cannot reach.
+///
+/// A composition that dropped a command, applied them in the wrong order,
+/// or let an earlier command win an overlap disagrees with derivation 1.
+#[test]
+fn three_fills_and_three_texrects_reach_guest_rdram_in_command_order() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let poisoned = poison_fill_target(&mut rdram);
+    dispatch_words(&mut rdram, &three_fills_and_three_texrects_words());
+    let observed = read_fill_target_logical(&rdram);
+    assert_ne!(
+        observed, poisoned,
+        "the composed packet must change guest bytes -- every byte still carrying the poison \
+         would mean nothing reached RDRAM at all"
+    );
+
+    // Derivation 1: the ownership map, replayed in command order.
+    let mut owner = vec![usize::MAX; (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize];
+    for (command, (x, y, width, height)) in MULTI_EXTENTS.iter().enumerate() {
+        for row in *y..*y + *height {
+            for column in *x..*x + *width {
+                owner[(row * FILL_TARGET_WIDTH + column) as usize] = command;
+            }
+        }
+    }
+    assert!(
+        owner.iter().all(|command| *command != usize::MAX),
+        "command #0 is a whole-target fill, so every pixel must have an owner"
+    );
+
+    // Every command must own at least one pixel of the final image, or its
+    // execution is unobservable here and this test proves nothing about it.
+    let mut owned = [0usize; 6];
+    for command in &owner {
+        owned[*command] += 1;
+    }
+    for (command, count) in owned.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "command #{command} owns no pixel in the final image, so this test cannot observe \
+             whether it executed"
+        );
+    }
+
+    let at = |x: u32, y: u32| -> u16 {
+        let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+        u16::from_be_bytes([observed[offset], observed[offset + 1]])
+    };
+
+    for y in 0..FILL_TARGET_HEIGHT {
+        for x in 0..FILL_TARGET_WIDTH {
+            let command = owner[(y * FILL_TARGET_WIDTH + x) as usize];
+            let actual = at(x, y);
+            if MULTI_IS_TEXRECT[command] {
+                // A texrect-owned pixel must not carry ANY fill's value:
+                // if it did, either the texrect did not draw there or a
+                // fill overpainted it out of order.
+                for (index, color) in MULTI_FILL_COLORS.iter().enumerate() {
+                    assert_ne!(
+                        actual,
+                        expected_fill_halfword(*color, x),
+                        "pixel ({x}, {y}) is owned by texrect command #{command}, so it must \
+                         not still carry fill color #{index}'s value -- a texrect that drew \
+                         nothing, or a later fill that overpainted it, both land here"
+                    );
+                }
+                continue;
+            }
+            // A fill-owned pixel, derived two ways and reconciled.
+            let color = match command {
+                0 => MULTI_FILL_COLORS[0],
+                2 => MULTI_FILL_COLORS[1],
+                4 => MULTI_FILL_COLORS[2],
+                other => panic!("command #{other} is not one of this fixture's three fills"),
+            };
+            let expected = expected_fill_halfword(color, x);
+            assert_eq!(
+                expected,
+                expected_fill_halfword_via_expansion(color, x),
+                "the two independent fill-halfword derivations must agree at column {x}"
+            );
+            assert_eq!(
+                actual, expected,
+                "pixel ({x}, {y}) is owned by fill command #{command}, so it must carry that \
+                 fill's own color -- a different fill's value here means the commands were \
+                 applied out of order"
+            );
+        }
+    }
+
+    // The three fills must be distinguishable in the final image: if two of
+    // them produced the same halfword everywhere, "the right fill won" is
+    // unfalsifiable. Command 2 (color 1) owns the top-right and command 4
+    // (color 2) owns the bottom-left.
+    assert_ne!(
+        at(8, 0),
+        at(0, 5),
+        "fill #2's and fill #4's regions must carry different values, or their ordering is \
+         untestable"
+    );
+    assert_ne!(
+        at(8, 0),
+        expected_fill_halfword(MULTI_FILL_COLORS[0], 8),
+        "fill #2 must have overwritten the whole-target fill in its own rectangle"
+    );
+
+    // A texrect's row must vary in S, or the sampler is not reading S at
+    // all and every "not a fill value" assertion above is satisfiable by a
+    // constant.
+    let row: std::collections::BTreeSet<u16> = (4..12).map(|x| at(x, 2)).collect();
+    assert!(
+        row.len() >= 2,
+        "texrect C's first row must contain at least two distinct texels (S advances two \
+         texels across its 8 pixels) -- got {row:?}"
+    );
+    teardown();
+}
+
 /// A fill composed with a `TextureRectangle` and **no TMEM load** is still
 /// refused by name, and guest RDRAM is left byte-for-byte untouched.
 ///
