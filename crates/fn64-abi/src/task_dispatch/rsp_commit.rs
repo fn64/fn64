@@ -1289,9 +1289,50 @@ fn try_dispatch_raw_dpc_via_session(
 /// Collapsing them into one span would claim far more bytes than the fill
 /// wrote.
 ///
+/// **Byte-lane mapping: the payload is LOGICAL, the storage is PHYSICAL.**
+/// The backend hands over guest-order bytes -- `targets/fill.rs`'s
+/// `write_pixel` emits `packed.to_be_bytes()`, big-endian as the RDP writes
+/// them -- while this crate's RDRAM allocation is N64Recomp native-word
+/// storage, where a logical byte at offset `o` lives at `o ^ 3`
+/// (`crates/fn64-runtime/src/rdram.rs`'s module doc, transcribed from
+/// `recomp.h`'s `MEM_B`/`MEM_H`). So the copy goes through
+/// `RdramViewMut::write_logical_bytes`, which owns that one mapping.
+///
+/// This was a `copy_from_slice` into the raw allocation and that was WRONG,
+/// measured not argued: the VI reads the same memory through
+/// `PhysicalRdramRead::read_u16`'s `^2` lane XOR, so a raw-copied fill
+/// presented with adjacent columns swapped AND each halfword byte-reversed.
+/// The lane-mapped convention is the established one -- the reference
+/// backend's own RDP writeback uses `view.write_u16`
+/// (`crates/fn64-render-reference/src/backend/framebuffer_io.rs:188`) and
+/// `vi_scanout.rs`'s "Byte-lane authority" section names it as the single
+/// authority -- and the raw copy here was the outlier. The two legacy
+/// copybacks in this file stay raw and are NOT the same case: they round-trip
+/// `real` through a whole-RDRAM `image`, so their bytes are already physical.
+///
+/// **Byte granularity, not halfword.** `write_logical_bytes` maps one byte at
+/// a time (`^3`), so it is correct for an arbitrary `CompletedWrite` range
+/// with no alignment or even-length precondition. A `write_u16` loop would
+/// need both and a committed range guarantees neither -- it is a byte range
+/// whose seam is byte-typed, even though a fill's rows happen to be RGBA16.
+///
+/// **What the digest covers: the PAYLOAD, not the memory image.** The
+/// `ir_effect_content_digest` re-check below hashes the backend's logical
+/// bytes exactly as handed over, before any lane mapping. That is the right
+/// domain and not an oversight: the digest is the backend's own commitment
+/// about the content it rendered, and the backend has no opinion about host
+/// storage layout. Hashing the post-mapping image would compare a value the
+/// backend never computed, and would make the self-check pass or fail on
+/// this crate's storage convention rather than on byte transport integrity.
+///
 /// Writes go through `track_rdp_renderer_mutation` for the same reason the
 /// legacy `dispatch_captured_raw_rdp` path does: a guest-visible renderer
-/// write must reach the write-barrier journal, not bypass it.
+/// write must reach the write-barrier journal, not bypass it. The tracker is
+/// handed the WHOLE `real` allocation, not the destination subslice: it
+/// snapshots and diffs watched ranges by absolute physical offset
+/// (`recompiled/snapshots.rs`'s `track_catalog_nested_mutation` reads through
+/// `RdramView::read_u8(RdramAddr::from_offset(physical))`), so a subslice
+/// would have made every watched offset name the wrong byte.
 fn copy_committed_guest_writes(
     real: &mut [u8],
     submission: fn64_render::ir::SubmissionIdentity,
@@ -1355,14 +1396,25 @@ fn copy_committed_guest_writes(
         };
         let start = range.start().get() as usize;
         let end = range.end() as usize;
-        let destination = real.get_mut(start..end).unwrap_or_else(|| {
-            panic!(
-                "committed guest write range [{start:#x}, {end:#x}) is outside the registered \
-                 RDRAM allocation"
-            )
-        });
-        track_rdp_renderer_mutation(destination, |destination| {
-            destination.copy_from_slice(bytes);
+        assert!(
+            start <= end && end <= real.len(),
+            "committed guest write range [{start:#x}, {end:#x}) is outside the registered \
+             RDRAM allocation of {:#x} bytes",
+            real.len()
+        );
+        assert_eq!(
+            end - start,
+            bytes.len(),
+            "committed guest write range [{start:#x}, {end:#x}) spans {} byte(s) but its \
+             payload is {}",
+            end - start,
+            bytes.len()
+        );
+        let addr = fn64_runtime::RdramAddr::from_offset(
+            u32::try_from(start).expect("committed guest write offset exceeds u32"),
+        );
+        track_rdp_renderer_mutation(real, |real| {
+            fn64_runtime::RdramViewMut::from_storage(real).write_logical_bytes(addr, bytes);
         });
     }
 }

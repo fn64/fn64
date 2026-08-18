@@ -837,12 +837,39 @@ fn dram_producer_routes_a_partial_width_fill_through_the_session() {
 /// with the wrong *contents* would still be caught, and a surviving byte can
 /// be attributed to its own offset. The multiplier is odd so the pattern has
 /// period 256 rather than aliasing with the 2-byte pixel stride.
+///
+/// Written and returned in **logical guest byte order**, through
+/// `RdramViewMut::write_logical_bytes` -- the same byte-lane authority
+/// `copy_committed_guest_writes` now uses. Every fill expectation in this
+/// file is a guest-order image, so a raw-indexed poison would compare two
+/// different address spaces and report a lane mapping as a content
+/// difference.
 fn poison_fill_target(rdram: &mut [u8]) -> Vec<u8> {
-    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
-    for (offset, byte) in rdram[target.clone()].iter_mut().enumerate() {
-        *byte = (offset as u8).wrapping_mul(7).wrapping_add(0x5a);
-    }
-    rdram[target].to_vec()
+    let poison: Vec<u8> = (0..FILL_TARGET_BYTES)
+        .map(|offset| (offset as u8).wrapping_mul(7).wrapping_add(0x5a))
+        .collect();
+    fn64_runtime::RdramViewMut::from_storage(rdram).write_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(FILL_TARGET_ADDR),
+        &poison,
+    );
+    poison
+}
+
+/// Read the fill target back out of `rdram` in **logical guest byte order**,
+/// through `RdramView`'s `^3` lane mapping.
+///
+/// This is the readback counterpart to `poison_fill_target`, and it is what
+/// makes these tests independent evidence rather than a restatement of the
+/// copyback: they assert the guest-visible image, derived from the RDP's own
+/// rules, and the storage mapping is applied by `fn64-runtime`'s single
+/// authority on both sides rather than open-coded here.
+fn read_fill_target_logical(rdram: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; FILL_TARGET_BYTES];
+    fn64_runtime::RdramView::from_storage(rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(FILL_TARGET_ADDR),
+        &mut out,
+    );
+    out
 }
 
 /// The hand-derived RGBA16 image a whole-target fill of `fill_color`
@@ -886,7 +913,6 @@ fn an_admitted_whole_target_fill_writes_its_image_into_guest_rdram() {
     let mut rdram = rdram_with_texture_source();
     register_session_backend_for_fills(rdram.len());
 
-    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
     let poisoned = poison_fill_target(&mut rdram);
     let expected = expected_whole_target_image(FILL_COLOR);
     assert_ne!(
@@ -902,25 +928,30 @@ fn an_admitted_whole_target_fill_writes_its_image_into_guest_rdram() {
          because the dispatch failed halfway"
     );
 
+    let observed = read_fill_target_logical(&rdram);
     assert_eq!(
-        rdram[target],
-        expected[..],
+        observed, expected,
         "every guest byte of the target must now equal the hand-derived RDP fill-cycle image"
     );
 
     // The two packed halfwords really are distinct in guest memory, so the
     // assertion above discriminated column parity rather than passing on a
     // uniform image any parity rule would produce.
-    let base = FILL_TARGET_ADDR as usize;
+    //
+    // Read through `RdramView::read_u16`'s `^2` lane XOR -- the SAME accessor
+    // family the VI's `PhysicalRdramRead::read_u16` uses. A raw index would
+    // no longer name these bytes, and that is the defect this file's e2e
+    // test now proves fixed.
+    let view = fn64_runtime::RdramView::from_storage(&rdram);
     assert_eq!(
-        &rdram[base..base + 2],
-        &0x0842u16.to_be_bytes(),
-        "even column, in guest RDRAM"
+        view.read_u16(fn64_runtime::RdramAddr::from_offset(FILL_TARGET_ADDR)),
+        0x0842,
+        "even column, read back through the lane-mapped halfword accessor"
     );
     assert_eq!(
-        &rdram[base + 2..base + 4],
-        &0x1085u16.to_be_bytes(),
-        "odd column, in guest RDRAM"
+        view.read_u16(fn64_runtime::RdramAddr::from_offset(FILL_TARGET_ADDR + 2)),
+        0x1085,
+        "odd column, read back through the lane-mapped halfword accessor"
     );
     teardown();
 }
@@ -980,11 +1011,9 @@ fn an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows() {
         }
     }
 
-    let base = FILL_TARGET_ADDR as usize;
-    let target = base..base + FILL_TARGET_BYTES;
+    let observed = read_fill_target_logical(&rdram);
     assert_eq!(
-        rdram[target],
-        expected[..],
+        observed, expected,
         "the partial fill must write exactly its three disjoint rows and leave every other \
          guest byte at its poisoned value"
     );
@@ -994,26 +1023,26 @@ fn an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows() {
     //
     // Row 1 is entirely above the rectangle: a row-off-by-one that started
     // at y0 - 1 would clobber it.
-    let row1 = base + (FILL_TARGET_WIDTH * 2) as usize;
+    let row1 = (FILL_TARGET_WIDTH * 2) as usize;
     assert_eq!(
-        &rdram[row1..row1 + (FILL_TARGET_WIDTH * 2) as usize],
+        &observed[row1..row1 + (FILL_TARGET_WIDTH * 2) as usize],
         &poisoned[(FILL_TARGET_WIDTH * 2) as usize..(FILL_TARGET_WIDTH * 4) as usize],
         "row 1 is above the rectangle and must be entirely poison"
     );
     // Row 5 is entirely below it: a row-off-by-one that ran to y1 + 1 would
     // clobber this instead.
-    let row5 = base + (FILL_TARGET_WIDTH * 2 * 5) as usize;
+    let row5 = (FILL_TARGET_WIDTH * 2 * 5) as usize;
     assert_eq!(
-        &rdram[row5..row5 + (FILL_TARGET_WIDTH * 2) as usize],
+        &observed[row5..row5 + (FILL_TARGET_WIDTH * 2) as usize],
         &poisoned[(FILL_TARGET_WIDTH * 2 * 5) as usize..(FILL_TARGET_WIDTH * 2 * 6) as usize],
         "row 5 is below the rectangle and must be entirely poison"
     );
     // Columns 0..4 of row 2 are left of x0, and column 15 is right of x1.
     // Both lie INSIDE a collapsed [first_start, last_end) span, so they are
     // exactly what a width-collapsed copy destroys.
-    let row2 = base + (FILL_TARGET_WIDTH * 2 * 2) as usize;
+    let row2 = (FILL_TARGET_WIDTH * 2 * 2) as usize;
     assert_eq!(
-        &rdram[row2..row2 + (X0 * 2) as usize],
+        &observed[row2..row2 + (X0 * 2) as usize],
         &poisoned
             [(FILL_TARGET_WIDTH * 2 * 2) as usize..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize],
         "columns 0..4 of row 2 are left of x0 and must still be poison -- a collapsed \
@@ -1021,7 +1050,7 @@ fn an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows() {
     );
     let row2_last = row2 + ((FILL_TARGET_WIDTH - 1) * 2) as usize;
     assert_eq!(
-        &rdram[row2_last..row2_last + 2],
+        &observed[row2_last..row2_last + 2],
         &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + (FILL_TARGET_WIDTH - 1) * 2) as usize
             ..(FILL_TARGET_WIDTH * 2 * 2 + FILL_TARGET_WIDTH * 2) as usize],
         "column 15 of row 2 is right of x1 and must still be poison"
@@ -1030,12 +1059,12 @@ fn an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows() {
     // cannot pass this test.
     let inside = row2 + (X0 * 2) as usize;
     assert_eq!(
-        &rdram[inside..inside + 2],
+        &observed[inside..inside + 2],
         &expected_fill_halfword(FILL_COLOR, X0).to_be_bytes(),
         "the rectangle's own first pixel must carry the second fill's color"
     );
     assert_ne!(
-        &rdram[inside..inside + 2],
+        &observed[inside..inside + 2],
         &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize
             ..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2 + 2) as usize],
         "that pixel must differ from the poison, or the whole test is vacuous"
@@ -1084,19 +1113,18 @@ fn an_admitted_odd_origin_fill_writes_target_relative_columns_into_guest_rdram()
         }
     }
 
-    let base = FILL_TARGET_ADDR as usize;
+    let observed = read_fill_target_logical(&rdram);
     assert_eq!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        expected[..],
+        observed, expected,
         "an odd-origin fill must write target-relative column parity into guest RDRAM"
     );
 
     // The parity discrimination, made explicit: x0 = 5 is odd, so the
     // rectangle's first pixel takes the LOW halfword. A rectangle-relative
     // decoding would have treated it as column 0 and written the HIGH one.
-    let first = base + ((Y0 * FILL_TARGET_WIDTH + X0) * 2) as usize;
+    let first = ((Y0 * FILL_TARGET_WIDTH + X0) * 2) as usize;
     assert_eq!(
-        &rdram[first..first + 2],
+        &observed[first..first + 2],
         &(FILL_COLOR as u16).to_be_bytes(),
         "target column 5 is odd, so the low packed halfword must land here"
     );
@@ -1105,6 +1133,99 @@ fn an_admitted_odd_origin_fill_writes_target_relative_columns_into_guest_rdram()
         FILL_COLOR as u16,
         "the fill color's two halfwords must differ, or the parity assertion is vacuous"
     );
+    teardown();
+}
+
+thread_local! {
+    /// Every `GuestWriteEvent` the copyback's write barrier publishes during
+    /// `an_admitted_fill_reaches_the_write_barrier_journal`.
+    static OBSERVED_COPYBACK_WRITES: std::cell::RefCell<Vec<fn64_cpu_runtime::GuestWriteEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_copyback_write(event: fn64_cpu_runtime::GuestWriteEvent) {
+    OBSERVED_COPYBACK_WRITES.with(|events| events.borrow_mut().push(event));
+}
+
+/// The copyback's writes reach the write-barrier journal, attributed to the
+/// `RdpRenderer` channel.
+///
+/// **Written to kill a measured surviving mutant.** Deleting
+/// `track_rdp_renderer_mutation` from `copy_committed_guest_writes` and
+/// calling `write_logical_bytes` directly left the whole workspace green
+/// (8211/8211) -- the barrier was load-bearing by argument only, with no test
+/// behind it, both before and after the byte-lane fix. Every other fill test
+/// in this file reads final RDRAM, which the bare write satisfies identically.
+///
+/// So this test observes the journal instead of the bytes: it declares the
+/// fill target as a watched executable range and asserts the copyback
+/// publishes a `RdpRenderer` write over it. A bare `write_logical_bytes`
+/// notifies nobody and this test fails with an empty event list.
+///
+/// The range is watched deliberately. `track_catalog_nested_mutation` only
+/// diffs and notifies bytes inside watched ranges, so an unwatched fill
+/// target would produce no event even with the barrier intact -- which is
+/// why the ordinary fill tests could never have caught this.
+#[cfg(feature = "recomp-rs")]
+#[test]
+fn an_admitted_fill_reaches_the_write_barrier_journal() {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+
+    let _preflight = crate::recompiled::scoped_test_executable_write_preflight_state(
+        vec![(
+            FILL_TARGET_ADDR,
+            FILL_TARGET_ADDR + FILL_TARGET_BYTES as u32,
+        )],
+        Vec::new(),
+    );
+    // Poison first: the tracker notifies CHANGED bytes, so a target already
+    // equal to the fill image would publish nothing and pass vacuously.
+    let poisoned = poison_fill_target(&mut rdram);
+
+    OBSERVED_COPYBACK_WRITES.with(|events| events.borrow_mut().clear());
+    let previous = fn64_cpu_runtime::set_write_observer(Some(record_copyback_write));
+    dispatch_words(&mut rdram, &whole_target_fill_words());
+    fn64_cpu_runtime::set_write_observer(previous);
+
+    let observed = read_fill_target_logical(&rdram);
+    assert_ne!(
+        observed, poisoned,
+        "the fill must have changed bytes, or there would be nothing for the barrier to \
+         report and this test would pass vacuously"
+    );
+
+    let events = OBSERVED_COPYBACK_WRITES.with(|events| events.borrow().clone());
+    let renderer: Vec<_> = events
+        .iter()
+        .filter(|event| event.channel() == fn64_cpu_runtime::WriterChannel::RdpRenderer)
+        .collect();
+    assert!(
+        !renderer.is_empty(),
+        "the copyback must publish its guest-visible writes to the write-barrier journal on \
+         the RdpRenderer channel -- dropping track_rdp_renderer_mutation makes this list \
+         empty while every byte-comparing test in this file still passes. Observed: {events:?}"
+    );
+    // The reported bytes must be the fill target's, not some unrelated
+    // writer's: an event list that happened to carry another channel's
+    // range would otherwise satisfy the assertion above.
+    for event in &renderer {
+        let fn64_cpu_runtime::GuestWriteEvent::Range {
+            physical_offset,
+            len,
+            ..
+        } = event
+        else {
+            panic!("the copyback publishes byte ranges, got {event:?}");
+        };
+        assert!(
+            *physical_offset >= FILL_TARGET_ADDR
+                && physical_offset + len <= FILL_TARGET_ADDR + FILL_TARGET_BYTES as u32,
+            "a reported renderer write [{physical_offset:#x}, +{len:#x}) must lie inside the \
+             fill target [{FILL_TARGET_ADDR:#x}, +{FILL_TARGET_BYTES:#x})"
+        );
+    }
     teardown();
 }
 
@@ -1128,10 +1249,9 @@ fn a_tmem_only_submission_writes_no_guest_target_byte() {
         "the TMEM-only submission must complete"
     );
 
-    let base = FILL_TARGET_ADDR as usize;
     assert_eq!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        poisoned[..],
+        read_fill_target_logical(&rdram),
+        poisoned,
         "a TMEM-only submission stages no guest render-target write, so the copyback must \
          not run and not one target byte may change"
     );
@@ -1863,10 +1983,9 @@ fn a_rejected_guest_commit_leaves_guest_rdram_untouched() {
         "an over-reported guest-write list must be rejected loudly by the commit, not accepted"
     );
 
-    let base = FILL_TARGET_ADDR as usize;
     assert_eq!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        poisoned[..],
+        read_fill_target_logical(&rdram),
+        poisoned,
         "the commit rejected, so the copyback must never have run -- every target byte must \
          still be poison. A copy placed BEFORE the commit fails here."
     );
@@ -2149,29 +2268,33 @@ impl fn64_render::RenderBackend for SharedWgpuBackend {
 /// and the VI lane scans that same guest RDRAM back out. Neither half is
 /// mocked.
 ///
-/// **A measured disagreement this test pins rather than papers over.** The
-/// fill's bytes reach RDRAM through `copy_committed_guest_writes`, which
-/// `copy_from_slice`s them into the raw allocation with **no byte-lane
-/// mapping**. The VI reads them through `PhysicalRdramRead::read_u16`, which
-/// applies the N64Recomp `^2` lane XOR -- the same mapping
-/// `RdramViewMut::write_u16` applies on write and the same one the reference
-/// backend's own RDP writeback (`framebuffer_io.rs`'s `view.write_u16`) uses.
-/// The two conventions disagree, and the presented image is the fill's with
-/// **both** an adjacent-column swap and a per-halfword byte reversal (see
-/// the derivation at the assertion, which corrects an earlier draft that had
-/// only the column half). That is a real defect in the *fill* writeback, not
-/// in this scanout, and it lives outside this change's boundary (`fn64-abi`'s
-/// `rsp_commit.rs` and `fn64-render-wgpu`'s `targets/fill.rs`). It is
-/// asserted here explicitly, with the agreeing-conventions image asserted to
-/// be WRONG, so that fixing the writeback breaks this test loudly instead of
-/// silently changing what "correct" means.
+/// **Recorded supersession: the byte-lane defect this test was written to
+/// pin is FIXED, and its two inverted assertions are inverted back.**
 ///
-/// Which side is wrong, measured not assumed: the reference backend writes
-/// its RDP color image through `RdramViewMut::write_u16`
-/// (`crates/fn64-render-reference/src/backend/framebuffer_io.rs:188`), which
-/// applies the lane mapping. The lane-mapped convention is therefore the
-/// established one and the raw `copy_from_slice` in
-/// `copy_committed_guest_writes` is the outlier.
+/// The predecessor form of this test (same name, at `a9fe65ae`) asserted the
+/// presented image was the fill's with **both** an adjacent-column swap and
+/// a per-halfword byte reversal, AND asserted that the agreeing-conventions
+/// image was WRONG. Both were true when written and both are now false. Its
+/// own doc required that fixing the writeback break it loudly rather than
+/// silently redefine correct; this paragraph is that break, recorded, in the
+/// same convention as the T-17 supersession above.
+///
+/// What was wrong, and what fixed it: `copy_committed_guest_writes`
+/// `copy_from_slice`d the backend's logical guest-order payload into the raw
+/// native-word allocation with **no byte-lane mapping**, while the VI reads
+/// the same memory through `PhysicalRdramRead::read_u16`'s `^2` lane XOR.
+/// The copy now goes through `RdramViewMut::write_logical_bytes`, the same
+/// `fn64-runtime` authority the reference backend's own RDP writeback uses
+/// (`crates/fn64-render-reference/src/backend/framebuffer_io.rs:188`'s
+/// `view.write_u16`) and the one `vi_scanout.rs`'s "Byte-lane authority"
+/// section names. The lane-mapped convention was the established one and the
+/// raw copy was the outlier; that direction was verified before acting on
+/// it, not assumed.
+///
+/// So the two conventions now AGREE, and this test asserts the fill's own
+/// halfword at each column with no swap and no reversal. The transformation
+/// the predecessor asserted is now asserted to be WRONG, so a regression to
+/// the raw copy breaks this test just as loudly in the other direction.
 #[test]
 fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
     const FILL_COLOR: u32 = 0x0842_1085;
@@ -2201,15 +2324,14 @@ fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
 
     // Half 1: the fill really reached guest RDRAM. Hand-derived, and the
     // exact assertion `an_admitted_fill_writes_guest_rdram` already makes.
-    let base = FILL_TARGET_ADDR as usize;
+    let in_memory = read_fill_target_logical(&rdram);
     assert_eq!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        expected_whole_target_image(FILL_COLOR)[..],
+        in_memory,
+        expected_whole_target_image(FILL_COLOR),
         "the admitted fill must have written the whole target"
     );
     assert_ne!(
-        rdram[base..base + FILL_TARGET_BYTES],
-        poisoned[..],
+        in_memory, poisoned,
         "the fill must have displaced the poison"
     );
 
@@ -2254,69 +2376,67 @@ fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
         ]
     };
 
-    // CORRECTION, found by this assertion failing. It was first written as a
-    // bare `x ^ 1` column swap, reasoning that a `^2` byte-address XOR on a
-    // 2-byte pixel grid is exactly a swap of adjacent columns. That is only
-    // HALF of it, and the half that was missing changes every channel.
+    // The derivation, end to end, now that the conventions agree. Both are
+    // `fn64-runtime`'s one mapping, so they compose to the identity on a
+    // guest-order payload:
     //
-    // The measured transformation, derived from the two conventions and
-    // confirmed against the observed pixel:
+    //   write_logical_bytes stores column `x`'s halfword `h` big-endian in
+    //     LOGICAL space -> logical[2x] = h >> 8, logical[2x+1] = h & 0xff,
+    //     landing at storage[(2x) ^ 3] and storage[(2x+1) ^ 3]
+    //   read_u16(2x) reads a native (little-endian) halfword at (2x) ^ 2
+    //     -> storage[2x ^ 2] | (storage[(2x ^ 2) + 1] << 8)
     //
-    //   fill writeback stores column `x`'s halfword `h` big-endian at
-    //     byte `2x`   -> mem[2x] = h >> 8,  mem[2x+1] = h & 0xff
-    //   read_u16(2x) reads little-endian at `(2x) ^ 2`
-    //     -> mem[2x^2] | (mem[2x^2 + 1] << 8)
+    // `2x` is even, so `(2x ^ 2) + 1 == (2x + 1) ^ 2`, and un-mapping each
+    // byte through `^3` gives low = logical[2x ^ 1] = logical[2x + 1] and
+    // high = logical[2x]. That is a big-endian read of the two bytes the
+    // fill wrote there: exactly `h`, at column `x`. No column swap, no byte
+    // reversal.
     //
-    // `2x ^ 2` is `2(x ^ 1)`, so the bytes come from column `x ^ 1` -- and
-    // they are assembled little-endian from big-endian-stored bytes, so the
-    // halfword also arrives byte-reversed. Both effects, not one.
-    //
-    // Worked witness at column 0: the odd-column fill halfword is
-    // `0x1085`; byte-reversed it is `0x8510`, which expands to
-    // `[132, 165, 66, 255]` -- the value this assertion observes.
-    let lane_read_halfword = |x: u32| -> u16 {
-        let source_column = x ^ 1;
-        let stored = expected_fill_halfword(FILL_COLOR, source_column);
+    // Worked witness at column 0: the even-column fill halfword is `0x0842`,
+    // which expands to `[8, 8, 8, 255]` -- the value this assertion now
+    // observes, and precisely the "agreeing conventions" image the
+    // predecessor form of this test asserted was WRONG.
+    let presented_halfword = |x: u32| -> u16 {
+        let stored = expected_fill_halfword(FILL_COLOR, x);
         assert_eq!(
             stored,
-            expected_fill_halfword_via_expansion(FILL_COLOR, source_column),
-            "the two independent fill-halfword derivations must agree at column \
-             {source_column}"
+            expected_fill_halfword_via_expansion(FILL_COLOR, x),
+            "the two independent fill-halfword derivations must agree at column {x}"
         );
-        stored.swap_bytes()
+        stored
     };
 
     // Pin the worked witness before the sweep, so a failure says which half
-    // of the transformation broke rather than only that pixels differ.
+    // of the derivation broke rather than only that pixels differ.
+    assert_eq!(expected_fill_halfword(FILL_COLOR, 0), 0x0842);
     assert_eq!(expected_fill_halfword(FILL_COLOR, 1), 0x1085);
-    assert_eq!(lane_read_halfword(0), 0x8510);
-    assert_eq!(expected_pixel(0x8510), [132, 165, 66, 255]);
+    assert_eq!(expected_pixel(0x0842), [8, 8, 8, 255]);
 
     for y in 0..FILL_TARGET_HEIGHT {
         for x in 0..FILL_TARGET_WIDTH {
             assert_eq!(
                 field.pixel(x, y).unwrap(),
-                expected_pixel(lane_read_halfword(x)),
-                "presented pixel ({x}, {y}) must be column {}'s fill halfword, byte-reversed \
-                 -- the measured disagreement between copy_committed_guest_writes (raw \
-                 big-endian copy, no lane mapping) and PhysicalRdramRead::read_u16 (^2 lane \
-                 XOR, little-endian assembly)",
-                x ^ 1
+                expected_pixel(presented_halfword(x)),
+                "presented pixel ({x}, {y}) must be column {x}'s own fill halfword, with no \
+                 column swap and no byte reversal -- copy_committed_guest_writes \
+                 (write_logical_bytes, ^3) and PhysicalRdramRead::read_u16 (^2) are the same \
+                 fn64-runtime authority and now agree"
             );
         }
     }
 
-    // The disagreement is REAL, not a restatement of the implementation: the
-    // image a matching pair of conventions WOULD have produced is asserted
-    // to be wrong. Fixing the fill writeback's byte order breaks this
-    // assertion loudly, which is the point of writing it.
-    let agreeing = expected_pixel(expected_fill_halfword(FILL_COLOR, 0));
-    assert_eq!(agreeing, [8, 8, 8, 255]);
+    // The predecessor's transformation is asserted to be WRONG, so a
+    // regression to the raw `copy_from_slice` breaks this test loudly rather
+    // than silently redefining correct -- the same guard the predecessor
+    // carried, pointing the other way.
+    let column_swapped_and_reversed =
+        expected_pixel(expected_fill_halfword(FILL_COLOR, 0 ^ 1).swap_bytes());
+    assert_eq!(column_swapped_and_reversed, [132, 165, 66, 255]);
     assert_ne!(
         field.pixel(0, 0).unwrap(),
-        agreeing,
-        "if this ever passes, the fill writeback's byte-lane convention was fixed and this \
-         test's swap must be removed rather than left in place to mask it"
+        column_swapped_and_reversed,
+        "if this ever passes, the byte-lane defect came back: the copyback stopped applying \
+         the lane mapping the VI reads through"
     );
 
     drop(borrowed);
@@ -2339,7 +2459,11 @@ fn a_backend_resident_present_is_refused_by_name_not_generically() {
             fn64_render::ViPresentation::default(),
         ))
         .expect_err("WgpuBackend retains no resident image to present");
-    let fn64_render::RenderError::Backend { backend: name, reason } = &error else {
+    let fn64_render::RenderError::Backend {
+        backend: name,
+        reason,
+    } = &error
+    else {
         panic!("expected a named backend refusal, got {error:?}");
     };
     assert_eq!(*name, "render-wgpu");
@@ -2391,9 +2515,8 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
     };
     let mut words = registers.words();
     words[0] &= !(3 << 8);
-    presentation.scanout = fn64_render::ViScanoutState::Registers(
-        fn64_render::ViScanoutRegisters::from_words(words),
-    );
+    presentation.scanout =
+        fn64_render::ViScanoutState::Registers(fn64_render::ViScanoutRegisters::from_words(words));
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::task_dispatch::present_render_backend(presentation);
