@@ -85,8 +85,7 @@ pub fn paint_field(rdram: &mut [u8], frame: u64) {
                 )
             };
             // Corner markers: 4x4 red squares, one per corner.
-            let corner =
-                !(4..FB_WIDTH - 4).contains(&x) && !(4..FB_HEIGHT - 4).contains(&y);
+            let corner = !(4..FB_WIDTH - 4).contains(&x) && !(4..FB_HEIGHT - 4).contains(&y);
             let px = if corner { rgba5551(255, 0, 0) } else { px };
 
             let offset = (y * FB_WIDTH + x) * 2;
@@ -182,7 +181,11 @@ impl ApplicationHandler for Demo {
                     self.overlay.toggle();
                     println!(
                         "[fn64-demo] settings overlay {}",
-                        if self.overlay.open { "opened" } else { "closed" }
+                        if self.overlay.open {
+                            "opened"
+                        } else {
+                            "closed"
+                        }
                     );
                     return;
                 }
@@ -228,6 +231,10 @@ impl ApplicationHandler for Demo {
                         window.scale_factor() as f32,
                         &mut self.config,
                         &self.gamepads,
+                        // The demo drives a synthetic field with no render
+                        // backend and no pump, so it has no stack to report
+                        // and no framerate that would mean anything.
+                        None,
                     )
                 } else {
                     self.pixels.as_ref().expect("checked above").render()
@@ -276,7 +283,6 @@ impl ApplicationHandler for Demo {
         }
     }
 }
-
 
 /// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames.
 pub fn run() {

@@ -68,6 +68,10 @@ mod overlay;
 mod pump_census;
 #[allow(dead_code)]
 mod screenshot;
+/// What this build is running on: the recompiler lane, the renderer, and
+/// whether a game is linked. Printed unconditionally at startup and exit.
+#[allow(dead_code)]
+mod stack;
 #[allow(dead_code)]
 mod timing;
 
@@ -79,6 +83,9 @@ fn main() {
     // UI stack stays verifiable in a checkout with no game content; without
     // it, report the intake contract honestly rather than opening a window
     // with nothing to boot.
+    // Unconditional, and FIRST: a content-free build is itself a stack fact
+    // worth naming, and the demo path opens a window with no game behind it.
+    println!("{}", stack::banner(None));
     if std::env::args().any(|a| a == "--demo") {
         demo::run();
         return;
@@ -104,6 +111,10 @@ fn main() {
 
 #[cfg(fn64_game_linked)]
 fn main() {
+    // Before the ROM loads and before any backend is constructed: the two
+    // facts that are already fixed (lane, linked game) are printed here so
+    // even a run that dies during boot leaves its cell in the log.
+    println!("{}", stack::banner(None));
     game::run();
 }
 
@@ -282,6 +293,11 @@ mod game {
         /// `FN64_RENDER` would report the REQUEST rather than the fallback
         /// that may have replaced it.
         active_renderer: &'static str,
+        /// The F3 HUD's own rolling timing window. Separate from the
+        /// heartbeat's `TimingWindow`s on purpose: `take_stats()` DRAINS
+        /// those, so sharing would make the two instruments steal each
+        /// other's samples.
+        hud_timing: crate::stack::HudTiming,
     }
 
     /// How many executor steps to run per window pump before yielding back to
@@ -492,6 +508,10 @@ mod game {
                 );
             }
             println!("[fn64-shell] render backend registered ({active_renderer}, 320x240)");
+            // The banner again, now that the renderer is a RESOLVED fact
+            // rather than a request -- this is the copy that answers "what am
+            // I actually running", including a silent fallback.
+            println!("{}", crate::stack::banner(Some(active_renderer)));
 
             // Audio OUTPUT path: a live cpal output stream. This is the
             // shell's audio deliverable -- samples produced by M_AUDTASK and
@@ -578,6 +598,7 @@ mod game {
                 last_audio_late_callbacks: 0,
                 pump_census: crate::pump_census::PumpCensus::new(),
                 active_renderer,
+                hud_timing: crate::stack::HudTiming::default(),
             }
         }
 
@@ -740,15 +761,30 @@ mod game {
             pixels.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
             // pixels/window fields immutably alongside `&mut self.config`.
-            let render_result = if self.overlay.open {
+            let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
+                // Built only when the HUD is actually up: with F3 off this
+                // whole branch is one `bool` test, so the readout cannot
+                // perturb the timings it exists to report.
+                let hud = self.overlay.hud.then(|| {
+                    let live = self
+                        .hud_timing
+                        .sample(std::time::Instant::now())
+                        .map(|sample| sample.line());
+                    crate::overlay::HudReadout {
+                        identity: crate::stack::hud_identity(self.active_renderer),
+                        live,
+                        alarm: self.active_renderer == "reference-fallback",
+                    }
+                });
                 self.overlay.render_over(
                     self.pixels.as_ref().expect("checked above"),
                     (size.width.max(1), size.height.max(1)),
                     window.scale_factor() as f32,
                     &mut self.config,
                     &self.gamepads,
+                    hud.as_ref(),
                 )
             } else {
                 self.pixels.as_ref().expect("checked above").render()
@@ -1047,6 +1083,17 @@ mod game {
                             self.save_screenshot();
                             return;
                         }
+                        if code == KeyCode::F3 && pressed {
+                            self.overlay.toggle_hud();
+                            // Named in the log too: a player who hits F3 by
+                            // accident should learn what it is, and a log
+                            // reader gets the stack line either way.
+                            println!(
+                                "[fn64-shell] stack/fps HUD {} (F3)",
+                                if self.overlay.hud { "on" } else { "off" }
+                            );
+                            return;
+                        }
                         if code == KeyCode::F1 && pressed {
                             self.overlay.toggle();
                             if self.overlay.open {
@@ -1149,12 +1196,20 @@ mod game {
 
             let now_t = std::time::Instant::now();
             if now_t >= self.next_frame_deadline {
+                // Held rather than recorded here: the HUD pairs each pump's
+                // COST with the interval that preceded it, and the cost is
+                // only known below. Keeping the pair together is what lets
+                // the HUD report the two as separate quantities instead of
+                // conflating them -- the exact conflation that produced the
+                // 57.3%-over-budget artifact.
+                let mut hud_interval = None;
                 if let Some(previous) = self.last_pump_started.replace(now_t) {
                     let elapsed = now_t.duration_since(previous);
                     if elapsed > FRAME {
                         self.frame_intervals_over_budget += 1;
                     }
                     self.frame_intervals.record(elapsed);
+                    hud_interval = Some(elapsed);
                 }
                 // Bracket the pump, not its internals: the phase counters
                 // `pump_census` reads are running totals `run_one_step`
@@ -1166,6 +1221,9 @@ mod game {
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
                 self.pump_times.record(pump_wall);
+                if let Some(interval) = hud_interval {
+                    self.hud_timing.record(interval, pump_wall);
+                }
                 if self
                     .pump_census
                     .after_pump(pump_wall, outcome.steps, outcome.swapped)
@@ -1232,7 +1290,7 @@ mod game {
         // hint.
         println!(
             "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into ./{}/, override with \
-             {}=<dir>) · F11 fullscreen · Esc exit",
+             {}=<dir>) · F3 stack/fps HUD · F11 fullscreen · Esc exit",
             crate::screenshot::resolve_dir(None).display(),
             crate::screenshot::DIR_ENV
         );
@@ -1247,6 +1305,10 @@ mod game {
         // Idempotent: the bounded-run path already printed if it fired, and a
         // report printed twice reads as two runs.
         shell.pump_census.report_once(shell.active_renderer);
+        // Reprinted on exit: after twenty minutes of heartbeat lines the
+        // startup banner is far off the top of the scrollback, and the log a
+        // user actually copies is its tail.
+        println!("{}", crate::stack::banner(Some(shell.active_renderer)));
         println!("[fn64-shell] exited cleanly.");
         prepare_clean_exit();
     }
