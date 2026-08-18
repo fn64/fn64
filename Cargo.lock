@@ -932,6 +932,7 @@ version = "0.0.0"
 dependencies = [
  "fn64-render",
  "fn64-render-ir",
+ "fn64-render-reference",
  "fn64-runtime",
  "naga 30.0.0",
  "pollster",
