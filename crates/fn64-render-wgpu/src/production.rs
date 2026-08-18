@@ -884,6 +884,22 @@ enum StagedOutcome {
     /// `execute_raw_dpc_inner` can hand it to the backend only after the
     /// coordinator accepted the completion.
     GuestWritesOnly(BackendEffectReport, StagedFill),
+    /// This plan staged BOTH at least one guest-visible color-target write
+    /// and at least one completed TMEM load, in one packet. Carries what
+    /// each sibling carries and nothing new: the merged
+    /// [`BackendEffectReport`] (both sources' writes, in the journal's own
+    /// order -- see `merged_fill_and_tmem_writes`), the
+    /// `PhysicalTmemState` successor the TMEM half produced, and the fill
+    /// half's staged publication token.
+    ///
+    /// Routes to `complete_execution`, exactly as [`Self::TmemLoads`] does
+    /// and for the same reason: it is the only completion that takes a
+    /// physical successor, and the TMEM half genuinely has one. The
+    /// fill-only sibling's `complete_execution_preserving_physical_with_effects`
+    /// is not a legal destination here -- it never writes a successor slot,
+    /// so the TMEM postimage this packet loaded would be silently discarded
+    /// while its writes were still reported as completed.
+    MixedFillAndTmemLoads(BackendEffectReport, PhysicalTmemState, StagedFill),
 }
 
 /// One fill's execution result, staged inside `stage_and_report` and moved
@@ -1011,13 +1027,36 @@ pub enum WgpuRawDpcExecutionError {
     FillAccessOutsideTarget {
         access_index: u32,
     },
-    /// This packet declared both TMEM loads and an admitted
-    /// `FillRectangle`. The merged `BackendEffectReport` write list would
-    /// have to interleave both sources in the plan's own journal order, and
-    /// no in-tree fixture produces such a stream today -- so rather than
-    /// ship an untested merge, this slice rejects the combination loudly.
-    /// Admitting it is a follow-on slice, not a silent reorder.
-    MixedFillAndTmemLoadPacket,
+    /// More than one admitted `FillRectangle` reached execution in one
+    /// packet. The second fill would need its own candidate against a
+    /// registry the first has not published into yet, so its `predecessor`
+    /// would be stale by construction -- see `stage_fills_and_report`'s own
+    /// doc. A loud rejection, never a silent overwrite of the first fill's
+    /// resident generation.
+    ///
+    /// Previously spelled `MixedFillAndTmemLoadPacket` at this site, which
+    /// was a misnomer even then: a two-fill packet with zero TMEM loads
+    /// reached it. Now that fill+TMEM composition is admitted, reusing that
+    /// name here would have been actively wrong.
+    MultipleFillsInOnePacket {
+        fill_count: usize,
+    },
+    /// A write access this packet's own resource journal declares was not
+    /// claimed by any staged write when `merged_fill_and_tmem_writes` built
+    /// the composed effect list -- the journal declared a write neither the
+    /// fill half nor the TMEM half produced. Rejected by name here rather
+    /// than handed to `BackendEffectReport::try_new` as a short list, whose
+    /// count mismatch would not say *which* access went unproduced.
+    MergedWriteUnclaimed {
+        access_index: u32,
+    },
+    /// A staged write claimed no declared write access -- this backend
+    /// produced an effect the packet's own journal never declared. The
+    /// inverse of [`Self::MergedWriteUnclaimed`], and equally a defect:
+    /// admitting it would publish a write outside the journal's authority.
+    MergedWriteUndeclared {
+        access_index: u32,
+    },
     /// This packet declared both an admitted `FillRectangle` and at least
     /// one admitted triangle. The two run entirely disjoint render paths:
     /// the fill is executed CPU-side into an owned buffer staged behind
@@ -1027,8 +1066,14 @@ pub enum WgpuRawDpcExecutionError {
     /// carrying only the fill while the triangles landed somewhere the
     /// guest can never observe -- with no defined ordering between them.
     /// Composing the two sources is a follow-on slice; this is the loud
-    /// refusal in the meantime, exactly as with
-    /// [`Self::MixedFillAndTmemLoadPacket`].
+    /// refusal in the meantime. Note that the fill+TMEM sibling this
+    /// variant's doc used to point at is no longer a refusal -- that
+    /// composition is admitted (`StagedOutcome::MixedFillAndTmemLoads`).
+    /// Fill+triangle is not, and for a materially different reason: a TMEM
+    /// load and a fill write disjoint declared regions the journal already
+    /// orders, whereas a triangle raster has no declared write access in
+    /// the journal at all and no defined composition onto the fill's
+    /// CPU-side buffer.
     MixedFillAndTrianglePacket,
 }
 
@@ -1091,10 +1136,21 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "FillRectangle access #{access_index} names a range outside its own color \
                  target's full extent"
             ),
-            Self::MixedFillAndTmemLoadPacket => formatter.write_str(
-                "this packet declares both TMEM loads and an admitted FillRectangle; merging \
-                 both write sources into the plan's own journal order is a follow-on slice, \
-                 rejected loudly here rather than reordered silently",
+            Self::MultipleFillsInOnePacket { fill_count } => write!(
+                formatter,
+                "this packet declares {fill_count} admitted FillRectangles; only one is \
+                 admitted per packet, because a second fill's candidate would be built \
+                 against a registry the first has not published into yet",
+            ),
+            Self::MergedWriteUnclaimed { access_index } => write!(
+                formatter,
+                "the packet's journal declares write access #{access_index}, but neither the \
+                 fill nor the TMEM half of this composed packet staged a write claiming it"
+            ),
+            Self::MergedWriteUndeclared { access_index } => write!(
+                formatter,
+                "a staged write claiming access #{access_index} matches no write access this \
+                 packet's own journal declares"
             ),
             Self::MixedFillAndTrianglePacket => formatter.write_str(
                 "this packet declares both an admitted FillRectangle and at least one admitted \
@@ -1934,6 +1990,32 @@ fn execute_raw_dpc_inner(
             });
             prepared
         }
+        // Both sources in one packet. `complete_execution` -- the same arm
+        // a TMEM-only packet takes -- because this packet genuinely has a
+        // physical successor to install, and it is the only completion that
+        // installs one. The fill token is recorded exactly as the fill-only
+        // arm records it, and for the identical reason: only after the
+        // coordinator has accepted the completion, so a rejected completion
+        // leaves nothing a later `publish_raw_dpc` could redeem.
+        //
+        // The two publications this packet produces stay distinct and each
+        // stays gated on its own acceptance -- the physical-TMEM successor
+        // by `complete_execution`'s inactive-slot record, redeemed when
+        // `prepare_publication`/`commit` flips the active slot, and the
+        // resident color generation by this token, redeemed separately in
+        // `publish_raw_dpc`. Composition merged the *write report*; it did
+        // not merge the two publication identities.
+        StagedOutcome::MixedFillAndTmemLoads(effects, next_physical, staged) => {
+            let prepared = coordinator
+                .complete_execution(bound, effects, next_physical)
+                .map_err(WgpuRawDpcExecutionError::Coordinator)?;
+            pending = Some(PendingFillPublication {
+                submission,
+                initialized: staged.initialized,
+                guest_writes: staged.guest_writes,
+            });
+            prepared
+        }
     };
 
     Ok((prepared, triangles, pending))
@@ -1953,25 +2035,22 @@ fn stage_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
-    // Mixed TMEM-load-plus-fill packets are rejected before either source
-    // stages anything: merging both write lists into the plan's own
-    // journal-ordered write-access sequence is a follow-on slice, and
-    // shipping an untested merge would be worse than a loud, named refusal.
-    if !collector.plan.fills.is_empty() && !collector.plan.loads.is_empty() {
-        return Err(WgpuRawDpcExecutionError::MixedFillAndTmemLoadPacket);
-    }
-    // Mixed fill-plus-triangle packets are refused at the same point, in
-    // the same shape, and for the same reason. `stage_fills_and_report`
-    // never inspects `plan.triangles`, and `execute_raw_dpc` draws them
-    // afterwards into a color attachment `draw_admitted_triangles` clears
-    // itself -- disjoint from the CPU-side fill buffer this packet staged.
-    // Admitting the pair would silently drop one of two render results
-    // with no ordering defined between them. Composing them is a follow-on
+    // Mixed fill-plus-triangle packets are still refused, before either
+    // source stages anything. `stage_fills_and_report` never inspects
+    // `plan.triangles`, and `execute_raw_dpc` draws them afterwards into a
+    // color attachment `draw_admitted_triangles` clears itself -- disjoint
+    // from the CPU-side fill buffer this packet staged. Admitting the pair
+    // would silently drop one of two render results with no ordering
+    // defined between them. Unlike the fill+TMEM case below, there is no
+    // journal order to read the composition off: a triangle raster
+    // declares no write access at all. Composing them is a follow-on
     // slice; refusing by name is the honest answer until then.
     if !collector.plan.fills.is_empty() && !collector.plan.triangles.is_empty() {
         return Err(WgpuRawDpcExecutionError::MixedFillAndTrianglePacket);
     }
-    if !collector.plan.fills.is_empty() {
+    // A fill with no TMEM load keeps its own dedicated path: it has no
+    // physical successor to offer, so it must not reach `complete_execution`.
+    if !collector.plan.fills.is_empty() && collector.plan.loads.is_empty() {
         return stage_fills_and_report(collector, packet);
     }
 
@@ -2055,15 +2134,119 @@ fn stage_and_report(
         .into_pending()
         .map_err(WgpuRawDpcExecutionError::Physical)?;
 
-    let writes: Vec<CompletedWrite> = pending.proposed_effects().to_vec();
-    let effects =
-        BackendEffectReport::try_new(packet, writes).map_err(WgpuRawDpcExecutionError::Effect)?;
+    let tmem_writes: Vec<CompletedWrite> = pending.proposed_effects().to_vec();
 
+    // The fill half, staged only now -- after every TMEM load in the packet
+    // has staged successfully. A fill that executed before a TMEM load
+    // failed would leave an `InitializedCandidateColorTarget` built against
+    // a registry generation this packet is about to abandon; staging it
+    // last means a TMEM rejection returns `Err` with no fill token in
+    // existence at all, which is the same "nothing published" outcome the
+    // fill-only path reaches by never storing the token on the error path.
+    //
+    // Nonclaim: this is staging order, not *application* order. Which write
+    // lands where is decided entirely by the journal (below), not by which
+    // of these two blocks ran first -- the two sources write disjoint
+    // declared regions (RDRAM `ColorFramebuffer` vs `Tmem`), so no byte is
+    // written by both and no staging order could reorder a byte.
+    let staged_fill = if collector.plan.fills.is_empty() {
+        None
+    } else {
+        Some(stage_fill(collector, packet)?)
+    };
+
+    let Some(staged_fill) = staged_fill else {
+        let effects = BackendEffectReport::try_new(packet, tmem_writes)
+            .map_err(WgpuRawDpcExecutionError::Effect)?;
+        let next_physical = pending
+            .into_physical_successor(collector.physical, &effects)
+            .map_err(WgpuRawDpcExecutionError::Physical)?;
+        return Ok(StagedOutcome::TmemLoads(effects, next_physical));
+    };
+
+    let merged = merged_fill_and_tmem_writes(packet, &staged_fill.guest_writes, &tmem_writes)?;
+    let effects =
+        BackendEffectReport::try_new(packet, merged).map_err(WgpuRawDpcExecutionError::Effect)?;
+
+    // The TMEM half still vouches for exactly its own proposed writes, and
+    // for them alone: `into_physical_successor`'s `validate_backend_effects`
+    // walks the merged report as an order-preserving SUPERSEQUENCE of
+    // `tmem_writes`, so the fill's interleaved `RenderTarget` writes are
+    // neither vouched for by this transaction nor treated as its omission.
+    // A merged list missing a TMEM write, reordering two of them, or
+    // carrying wrong TMEM content is still rejected by name there.
     let next_physical = pending
         .into_physical_successor(collector.physical, &effects)
         .map_err(WgpuRawDpcExecutionError::Physical)?;
 
-    Ok(StagedOutcome::TmemLoads(effects, next_physical))
+    Ok(StagedOutcome::MixedFillAndTmemLoads(
+        effects,
+        next_physical,
+        staged_fill,
+    ))
+}
+
+/// Merge one packet's fill writes and TMEM writes into the single ordered
+/// list `BackendEffectReport::try_new` requires -- **in the packet's own
+/// resource-journal order, which is neither source's order and is not a
+/// choice this function makes.**
+///
+/// `fn64_render_ir`'s `validate_effects` compares the supplied list against
+/// `journal().write_accesses()` position by position, so the correct order
+/// is fully determined by the journal and any other order is a named
+/// rejection rather than a different-but-valid answer. The journal in turn
+/// is the decoder's own `planned` vector: `raw_dpc::push_access` assigns
+/// each access an `OperationId` equal to its index in that vector, and
+/// `plan_fill` and the TMEM command decoder append into that one vector as
+/// the command stream is walked. So journal order **is** RDP command order,
+/// and this function recovers the interleaving rather than inventing one.
+///
+/// Implemented as a lookup keyed on the exact `ResourceAccess`, driven by
+/// the journal: every declared write access is resolved to the one staged
+/// `CompletedWrite` that claims it. That makes the ordering a *derivation*
+/// from the journal, not a merge policy -- a sort key, a concatenation, or
+/// an `OperationId` comparison would each be a second, independent model of
+/// the same fact, and could drift from it.
+///
+/// Every declared write must be claimed exactly once, and every staged
+/// write must be claimed: an unclaimed staged write would mean this backend
+/// executed something the journal never declared, and an unclaimed journal
+/// access would mean it declared something no source produced. Both are
+/// named errors, never a short list that `try_new` would then reject with a
+/// less specific count mismatch.
+fn merged_fill_and_tmem_writes(
+    packet: &WorkloadPacket,
+    fill_writes: &[CompletedWrite],
+    tmem_writes: &[CompletedWrite],
+) -> Result<Vec<CompletedWrite>, WgpuRawDpcExecutionError> {
+    let mut staged: Vec<(CompletedWrite, bool)> = fill_writes
+        .iter()
+        .chain(tmem_writes)
+        .map(|write| (*write, false))
+        .collect();
+
+    let mut merged = Vec::with_capacity(staged.len());
+    for declared in packet.journal().accesses() {
+        if !declared.mode().writes() {
+            continue;
+        }
+        let claimed = staged
+            .iter_mut()
+            .find(|(write, taken)| !*taken && write.access() == *declared)
+            .ok_or(WgpuRawDpcExecutionError::MergedWriteUnclaimed {
+                access_index: declared.operation().get(),
+            })?;
+        claimed.1 = true;
+        merged.push(claimed.0);
+    }
+
+    if let Some((write, _)) = staged.iter().find(|(_, taken)| !*taken) {
+        return Err(WgpuRawDpcExecutionError::MergedWriteUndeclared {
+            access_index: write.access().operation().get(),
+        });
+    }
+
+    Ok(merged)
 }
 
 /// Executes every admitted `FillRectangle` this plan carried and reports
@@ -2093,8 +2276,31 @@ fn stage_fills_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
+    let staged = stage_fill(collector, packet)?;
+    let effects = BackendEffectReport::try_new(packet, staged.guest_writes.clone())
+        .map_err(WgpuRawDpcExecutionError::Effect)?;
+    Ok(StagedOutcome::GuestWritesOnly(effects, staged))
+}
+
+/// Execute this packet's single admitted `FillRectangle` and return its
+/// staged token -- the candidate's admitted initialization plus the exact
+/// ordered `CompletedWrite`s it contributed.
+///
+/// Split out of [`stage_fills_and_report`] so the mixed fill+TMEM path can
+/// reuse the identical fill execution without also inheriting its
+/// fill-only `BackendEffectReport` construction, which would build a report
+/// naming only the fill's writes and so be rejected by
+/// `validate_effects` against a journal that also declares TMEM writes.
+/// There is exactly one fill executor; the two callers differ only in what
+/// they build around its result.
+fn stage_fill(
+    collector: &mut ExecutionCollector<'_>,
+    packet: &WorkloadPacket,
+) -> Result<StagedFill, WgpuRawDpcExecutionError> {
     if collector.plan.fills.len() > 1 {
-        return Err(WgpuRawDpcExecutionError::MixedFillAndTmemLoadPacket);
+        return Err(WgpuRawDpcExecutionError::MultipleFillsInOnePacket {
+            fill_count: collector.plan.fills.len(),
+        });
     }
     let (_, fill) = collector.plan.fills[0].clone();
 
@@ -2165,16 +2371,10 @@ fn stage_fills_and_report(
     let guest_writes = fill_completed_writes(key, completed.device_bytes(), accesses)?;
     let initialized = candidate.admit_completed_initialization(completed)?;
 
-    let effects = BackendEffectReport::try_new(packet, guest_writes.clone())
-        .map_err(WgpuRawDpcExecutionError::Effect)?;
-
-    Ok(StagedOutcome::GuestWritesOnly(
-        effects,
-        StagedFill {
-            initialized,
-            guest_writes,
-        },
-    ))
+    Ok(StagedFill {
+        initialized,
+        guest_writes,
+    })
 }
 
 /// This fill's own declared access run, located by the
@@ -6667,5 +6867,574 @@ mod tests {
                 .expect("a second create() call must also succeed, not error or no-op");
             assert!(backend.triangle_pipeline.is_some());
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Composed fill + TMEM in one packet.
+    //
+    // Census `docs/RT64-WM2000-CENSUS.md` §4a measures the former
+    // `MixedFillAndTmemLoadPacket` refusal firing on 218/218 WM2000 frames.
+    // These tests are the unit-level evidence for the composition that
+    // replaced it; `fn64-abi`'s `raw_dpc_session_integration` carries the
+    // end-to-end half through the real producer seam.
+    // -----------------------------------------------------------------
+
+    /// A composed packet: the TMEM load first, then the whole-target fill.
+    /// Both halves are the existing single-source fixtures verbatim, so a
+    /// composed packet's halves are provably the same commands the
+    /// single-source tests already pin.
+    fn tmem_then_fill_words() -> Vec<u32> {
+        let mut words = one_load_block_words();
+        words.extend(whole_target_fill_words());
+        words
+    }
+
+    /// The same two halves, swapped: the fill first, then the TMEM load.
+    fn fill_then_tmem_words() -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        words.extend(one_load_block_words());
+        words
+    }
+
+    /// Every write access one word stream's decode declares, as
+    /// `(operation_id, purpose)` in the resource journal's own order.
+    ///
+    /// Reuses `declared_render_target_writes`'s probe-decode technique --
+    /// `PlannedRawDpcSubmission` exposes no journal accessor -- but keeps
+    /// the purpose tag rather than filtering to `RenderTarget`, because the
+    /// interleaving of the two purposes IS the fact under test.
+    fn declared_write_purposes(words: Vec<u32>) -> Vec<(u32, AccessPurpose)> {
+        let capture = capture(words);
+        let layout = capture.memory_layout();
+        let submission = capture.submission().clone();
+        let probe_journal = single_source_probe_journal(&submission, layout).unwrap();
+        let decoded = finalize_with_zero_reads(
+            layout,
+            capture.transaction_sequence(),
+            submission.clone(),
+            capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
+            probe_journal,
+        )
+        .unwrap();
+        let ticket = submit_locally(decoded).unwrap();
+        let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            other => panic!("probe decode must report the real access list, got {other:?}"),
+        };
+        accesses
+            .iter()
+            .filter(|access| access.mode() == AccessMode::Write)
+            .map(|access| (access.operation().get(), access.purpose()))
+            .collect()
+    }
+
+    /// Drives plan -> execute for a composed fixture, supplying the one
+    /// `TmemLoadSource` read its TMEM half declares.
+    fn plan_and_execute_composed(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> (
+        fn64_render_ir::SubmissionIdentity,
+        Result<BackendPreparedRawDpc, RenderError>,
+    ) {
+        let (planned, source_bytes) = plan_with_deterministic_reads(backend, session, words);
+        let capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+        let submission = bound.submission();
+        (submission, backend.execute_raw_dpc(bound))
+    }
+
+    /// Drives plan -> execute -> guest commit -> publish for a composed
+    /// fixture, the full conveyor `publish_one_fill` drives for a fill-only
+    /// one, with the TMEM half's declared read supplied.
+    ///
+    /// Publication matters here and cannot be skipped: `physical_tmem()`
+    /// reads the coordinator's *active* slot, and `complete_execution`
+    /// installs its successor into the *inactive* one. Only `commit` flips
+    /// them. So the TMEM half's effect is unobservable until publish, which
+    /// is exactly why the composed test drives all the way through.
+    fn publish_composed(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> Vec<CompletedWrite> {
+        let (planned, source_bytes) = plan_with_deterministic_reads(backend, session, words);
+        let read_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, read_capture).unwrap();
+        let submission = bound.submission();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("a composed fill+TMEM packet must execute");
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged.clone())
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        staged
+    }
+
+    /// `merged_fill_and_tmem_writes`' two loud arms, tested directly.
+    ///
+    /// Neither is reachable from a legitimately decoded packet -- the
+    /// decoder builds the journal from the same walk that produces the
+    /// staged writes, so the two agree by construction -- which is exactly
+    /// why they are tested at the function. A defensive arm with no test is
+    /// a claim with no evidence; measured, deleting the `Undeclared` arm
+    /// left the whole 4991-test suite green before this test existed.
+    ///
+    /// Both arms are real invariants, not paranoia: `Unclaimed` would
+    /// otherwise hand `BackendEffectReport::try_new` a short list, whose
+    /// count mismatch does not say WHICH access went unproduced, and
+    /// `Undeclared` would silently drop a write this backend actually
+    /// executed from the report that authorizes it.
+    ///
+    /// The packet is a REAL composed packet, built through the same
+    /// probe-decode path `declared_write_purposes` uses, so the journal
+    /// under test is the decoder's own -- not a hand-built stand-in whose
+    /// shape could drift from what the decoder really emits.
+    #[test]
+    fn merging_rejects_a_declared_write_nobody_staged_and_a_staged_write_nobody_declared() {
+        // A real composed packet, carrying the decoder's own journal.
+        let capture = capture(tmem_then_fill_words());
+        let layout = capture.memory_layout();
+        let submission = capture.submission().clone();
+        let probe_journal = single_source_probe_journal(&submission, layout).unwrap();
+        let probe = finalize_with_zero_reads(
+            layout,
+            capture.transaction_sequence(),
+            submission.clone(),
+            capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
+            probe_journal,
+        )
+        .unwrap();
+        let accesses =
+            match crate::decode_raw_dpc(submit_locally(probe).unwrap(), &RdpState::default()) {
+                Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+                other => panic!("probe decode must report the real access list, got {other:?}"),
+            };
+        let declared: u32 = accesses
+            .iter()
+            .map(|access| access.region().declared_bytes())
+            .sum();
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(fn64_render_ir::MAX_RESOURCE_ACCESSES, declared.max(1))
+                .unwrap(),
+            accesses.clone(),
+        )
+        .unwrap();
+        let decoded = finalize_with_zero_reads(
+            layout,
+            capture.transaction_sequence(),
+            submission,
+            capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
+            journal,
+        )
+        .unwrap();
+        let ticket = submit_locally(decoded).unwrap();
+        let packet = ticket.packet();
+
+        // Every write access the real journal declares, as a `CompletedWrite`
+        // with a placeholder digest -- content is irrelevant to this
+        // function, which composes by ACCESS identity alone.
+        let all_writes: Vec<CompletedWrite> = accesses
+            .iter()
+            .filter(|access| access.mode() == AccessMode::Write)
+            .map(|access| {
+                CompletedWrite::try_new(
+                    *access,
+                    access.region().declared_bytes(),
+                    fn64_render_ir::ContentDigest::hash(b"merge-arm-test", &[]),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(
+            all_writes.len() >= 2,
+            "the composed fixture must declare at least a fill write and a TMEM write, got {}",
+            all_writes.len()
+        );
+
+        // The honest, complete case: every declared write is claimed, and
+        // the merge reproduces the journal's own order exactly.
+        let merged = merged_fill_and_tmem_writes(packet, &all_writes, &[])
+            .expect("a complete staged set must merge cleanly");
+        assert_eq!(
+            merged, all_writes,
+            "the merge must reproduce the journal's own write order"
+        );
+
+        // Arm 1: a declared write nobody staged.
+        let short = &all_writes[1..];
+        let error = merged_fill_and_tmem_writes(packet, short, &[])
+            .expect_err("a declared write with no staged producer must be rejected");
+        assert!(
+            matches!(error, WgpuRawDpcExecutionError::MergedWriteUnclaimed { .. }),
+            "the rejection must name the unclaimed declared access, got: {error}"
+        );
+
+        // Arm 2: a staged write the journal never declared, with every
+        // declared write ALSO present -- so the only defect is the extra
+        // one, and arm 1 cannot fire first.
+        // Cloned off a real declared write so its purpose and region are a
+        // legal pairing; only the operation id is foreign, which is exactly
+        // what makes it match no declared access.
+        let template = all_writes
+            .iter()
+            .find(|write| write.access().purpose() == AccessPurpose::RenderTarget)
+            .expect("the composed fixture declares a RenderTarget write");
+        let foreign = CompletedWrite::try_new(
+            fn64_render_ir::ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(9_999),
+                AccessMode::Write,
+                template.access().purpose(),
+                template.access().region(),
+            )
+            .unwrap(),
+            template.byte_count(),
+            template.content(),
+        )
+        .unwrap();
+        let mut with_foreign = all_writes.clone();
+        with_foreign.push(foreign);
+        let error = merged_fill_and_tmem_writes(packet, &with_foreign, &[])
+            .expect_err("a staged write the journal never declared must be rejected");
+        assert!(
+            matches!(
+                error,
+                WgpuRawDpcExecutionError::MergedWriteUndeclared {
+                    access_index: 9_999
+                }
+            ),
+            "the rejection must name the undeclared staged access by id, got: {error}"
+        );
+
+        // Arm 3: one staged write may not satisfy TWO declared accesses.
+        //
+        // `ResourceJournal::try_new` does NOT enforce `OperationId`
+        // uniqueness -- only the decoder's own `push_access`, which assigns
+        // the vector index, makes ids unique in practice. So the claim
+        // "each staged write is consumed once" is a real invariant this
+        // function must enforce, not a fact the type system already
+        // guarantees, and it is enforced by the `!taken` guard.
+        //
+        // Measured: removing that guard left the whole 4992-test suite
+        // green before this case existed. It is pinned here rather than
+        // argued as an equivalent mutant, because the argument would have
+        // been wrong -- uniqueness is a construction convention, not a
+        // validated invariant.
+        // The real command-decode reads (the packet cannot be finalized
+        // without them) plus the SAME write access twice.
+        let mut duplicated: Vec<fn64_render_ir::ResourceAccess> = accesses
+            .iter()
+            .filter(|access| access.purpose() == AccessPurpose::CommandDecode)
+            .copied()
+            .collect();
+        duplicated.push(template.access());
+        duplicated.push(template.access());
+        let duplicate_declared: u32 = duplicated
+            .iter()
+            .map(|access| access.region().declared_bytes())
+            .sum();
+        let duplicate_journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(
+                fn64_render_ir::MAX_RESOURCE_ACCESSES,
+                duplicate_declared.max(1),
+            )
+            .unwrap(),
+            duplicated,
+        )
+        .expect("the journal type does not reject a repeated OperationId -- that is the point");
+        let duplicate_decoded = finalize_with_zero_reads(
+            capture.memory_layout(),
+            capture.transaction_sequence(),
+            capture.submission().clone(),
+            capture.cmd_end(),
+            capture.full_sync_boundaries().to_vec(),
+            duplicate_journal,
+        )
+        .unwrap();
+        let duplicate_ticket = submit_locally(duplicate_decoded).unwrap();
+        let error = merged_fill_and_tmem_writes(duplicate_ticket.packet(), &[*template], &[])
+            .expect_err("one staged write must not satisfy two declared accesses");
+        assert!(
+            matches!(error, WgpuRawDpcExecutionError::MergedWriteUnclaimed { .. }),
+            "the second declared access must go unclaimed, got: {error}"
+        );
+    }
+
+    /// **The card's headline unit test.** A packet carrying both a TMEM load
+    /// and an admitted `FillRectangle` executes and publishes BOTH halves,
+    /// instead of being refused before either could stage.
+    ///
+    /// The two publications are separately asserted, because they are
+    /// separate identities that composition deliberately did not merge:
+    ///
+    /// - the fill's resident color generation, advanced by
+    ///   `publish_raw_dpc`'s registry publication;
+    /// - the TMEM half's physical successor, installed by
+    ///   `complete_execution` into the coordinator's inactive slot and made
+    ///   observable only when `commit` flips the active one.
+    ///
+    /// The TMEM assertion is what discriminates the routing. A composed
+    /// packet routed to the fill-only completion
+    /// (`complete_execution_preserving_physical_with_effects`) would still
+    /// stage the fill, still return `Ok`, and still publish a resident --
+    /// but would never install the successor, leaving the published TMEM
+    /// state at its initial identity with no valid byte anywhere. That is
+    /// mutant (a)/(d) in this card's report, and it dies here.
+    #[test]
+    fn execute_raw_dpc_admits_a_composed_fill_and_tmem_packet() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let identity_before = backend.physical_tmem().identity();
+        assert!(
+            backend.color_targets().is_none(),
+            "no color target may exist before the composed packet"
+        );
+        assert!(
+            (0..64u16).all(|address| !backend.physical_tmem().byte_is_valid(address)),
+            "no TMEM byte may be valid before the composed packet"
+        );
+
+        let staged = publish_composed(&mut backend, &mut session, tmem_then_fill_words());
+
+        // Half one: the fill's guest-visible write, and its resident.
+        assert_eq!(
+            staged.len(),
+            1,
+            "the whole-target fill half declares exactly one collapsed RenderTarget write"
+        );
+        assert_eq!(
+            staged[0].byte_count(),
+            FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2,
+            "the fill half's write must cover the whole RGBA16 target"
+        );
+        let registry = backend
+            .color_targets()
+            .expect("the composed packet's fill half must have built the registry");
+        assert_eq!(
+            registry.residents().len(),
+            1,
+            "the composed packet's fill half must publish exactly one resident"
+        );
+        assert_eq!(
+            registry.residents()[0].generation(),
+            crate::TargetGeneration::FIRST,
+            "the fill half's first publication is generation FIRST"
+        );
+
+        // Half two: the TMEM load's physical successor really became the
+        // published state.
+        assert_ne!(
+            backend.physical_tmem().identity(),
+            identity_before,
+            "the composed packet's TMEM half must install a physical successor -- an unmoved \
+             identity would mean the packet took the fill-only completion and silently \
+             discarded the load"
+        );
+        assert!(
+            (0..64u16).any(|address| backend.physical_tmem().byte_is_valid(address)),
+            "the composed packet's TMEM half must leave real valid bytes in published TMEM"
+        );
+
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "publication must consume the fill token, leaving nothing redeemable"
+        );
+    }
+
+    /// **Constraint 2: ordering is semantics, and the two orders are
+    /// genuinely different.** The same two halves in the two possible stream
+    /// orders declare their write accesses in DIFFERENT sequences, and the
+    /// composed effect report follows each stream's own sequence.
+    ///
+    /// This is the falsifiability the composition rests on. The order is not
+    /// chosen by `merged_fill_and_tmem_writes`: `fn64_render_ir`'s
+    /// `validate_effects` compares the reported write list against
+    /// `journal().write_accesses()` position by position, so any merge that
+    /// did not reproduce the journal's order would be rejected outright with
+    /// `EffectAccessMismatch`. Both orders executing cleanly is therefore
+    /// proof that the composed order IS the journal's order in both cases --
+    /// and the two journals differ, as the first two assertions show.
+    ///
+    /// A merge that always emitted the fill's writes first, always emitted
+    /// the TMEM writes first, or sorted by anything other than journal
+    /// position would satisfy at most one of the two fixtures. That is
+    /// mutant (c) in this card's report, and it is killed here.
+    #[test]
+    fn a_composed_packet_reports_writes_in_the_streams_own_journal_order() {
+        let tmem_first = declared_write_purposes(tmem_then_fill_words());
+        let fill_first = declared_write_purposes(fill_then_tmem_words());
+
+        // Both streams declare the same MULTISET of write purposes...
+        let mut sorted_a: Vec<AccessPurpose> =
+            tmem_first.iter().map(|(_, purpose)| *purpose).collect();
+        let mut sorted_b: Vec<AccessPurpose> =
+            fill_first.iter().map(|(_, purpose)| *purpose).collect();
+        assert_eq!(
+            sorted_a.len(),
+            sorted_b.len(),
+            "both orders must declare the same number of writes -- only their order differs"
+        );
+        sorted_a.sort_by_key(|purpose| format!("{purpose:?}"));
+        sorted_b.sort_by_key(|purpose| format!("{purpose:?}"));
+        assert_eq!(
+            sorted_a, sorted_b,
+            "both orders must declare the same write purposes as a multiset"
+        );
+
+        // ...in genuinely DIFFERENT sequences. Without this, "the merge
+        // respects the order" would be a claim about two identical lists.
+        let sequence_a: Vec<AccessPurpose> =
+            tmem_first.iter().map(|(_, purpose)| *purpose).collect();
+        let sequence_b: Vec<AccessPurpose> =
+            fill_first.iter().map(|(_, purpose)| *purpose).collect();
+        assert_ne!(
+            sequence_a, sequence_b,
+            "the two stream orders must declare their writes in different sequences, or this \
+             test cannot discriminate a journal-ordered merge from a fixed-order one"
+        );
+        assert_eq!(
+            sequence_a.first(),
+            Some(&AccessPurpose::TmemLoadDestination),
+            "the TMEM-first stream must declare its TMEM write before the fill's"
+        );
+        assert_eq!(
+            sequence_b.first(),
+            Some(&AccessPurpose::RenderTarget),
+            "the fill-first stream must declare the fill's write before the TMEM one"
+        );
+
+        // And both execute. Since `validate_effects` rejects any reported
+        // order but the journal's, two clean executions over two different
+        // journal orders is the proof that the merge followed each.
+        for (label, words) in [
+            ("TMEM-first", tmem_then_fill_words()),
+            ("fill-first", fill_then_tmem_words()),
+        ] {
+            let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+            configure_fill_target_height(&mut backend);
+            let (_, result) = plan_and_execute_composed(&mut backend, &mut session, words);
+            let prepared = result.unwrap_or_else(|error| {
+                panic!(
+                    "the {label} composed order must execute -- a merge emitting a fixed \
+                     order would be rejected here by validate_effects: {error}"
+                )
+            });
+            drop(prepared);
+        }
+    }
+
+    /// The still-unadmitted compositions keep failing by NAME, not silently.
+    ///
+    /// Two of them, each a different reason:
+    ///
+    /// - fill + triangle: refused with `MixedFillAndTrianglePacket`, because
+    ///   a triangle raster declares no write access in the journal at all,
+    ///   so unlike fill + TMEM there is no declared order to compose onto.
+    /// - fill + TMEM + triangle: the SAME refusal must win, and must win
+    ///   before either source stages anything -- admitting fill + TMEM must
+    ///   not have opened a back door where a triangle rides along with them.
+    ///
+    /// The refusal is compared against the variant's own `to_string()`, so a
+    /// future rename cannot leave this test asserting a stale literal, and a
+    /// DIFFERENT rejection cannot pass as this one.
+    #[test]
+    fn compositions_this_slice_does_not_admit_still_fail_by_name() {
+        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+
+        // fill + triangle, no TMEM load.
+        let mut fill_and_triangle = whole_target_fill_words();
+        fill_and_triangle.extend(set_other_mode(0, 0));
+        fill_and_triangle.extend(set_combine(0, 0));
+        fill_and_triangle.extend(triangle_base_edge_words(7, 2, 0));
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
+        let error = result.expect_err("fill + triangle must still be refused");
+        assert!(
+            error.to_string().contains(&refused),
+            "the refusal must be the named MixedFillAndTrianglePacket variant, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a refused composition must leave no redeemable fill token behind"
+        );
+
+        // fill + TMEM + triangle: admitting fill + TMEM must not have let a
+        // triangle through alongside them.
+        let mut all_three = one_load_block_words();
+        all_three.extend(whole_target_fill_words());
+        all_three.extend(set_other_mode(0, 0));
+        all_three.extend(set_combine(0, 0));
+        all_three.extend(triangle_base_edge_words(7, 2, 0));
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, result) = plan_and_execute_composed(&mut backend, &mut session, all_three);
+        let error = result.expect_err(
+            "fill + TMEM + triangle must still be refused -- admitting fill + TMEM must not \
+             have opened a path for a triangle to ride along",
+        );
+        assert!(
+            error.to_string().contains(&refused),
+            "the three-way refusal must also be MixedFillAndTrianglePacket, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "the refused three-way composition must leave no redeemable fill token behind"
+        );
+        assert!(
+            backend.color_targets().is_none(),
+            "the refusal must fire before the fill executor ever built the registry"
+        );
+    }
+
+    /// A composed packet whose fill half is rejected leaves NOTHING behind:
+    /// no redeemable fill token, and no advanced physical TMEM generation.
+    ///
+    /// The fill is made unadmittable at execute time by never configuring a
+    /// color-image height, which is `NoColorTargetHeight` -- a rejection
+    /// raised inside `stage_fill`, i.e. AFTER the TMEM half has already
+    /// staged its whole transaction. That is exactly the interleaving where
+    /// a partial publish would be possible, and the assertions below are
+    /// that it does not happen.
+    #[test]
+    fn a_composed_packet_whose_fill_half_is_rejected_publishes_neither_half() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        // Deliberately NOT `configure_fill_target_height`.
+        let generation_before = backend.physical_tmem().generation();
+
+        let (_, result) =
+            plan_and_execute_composed(&mut backend, &mut session, tmem_then_fill_words());
+        let error = result.expect_err(
+            "a composed packet whose fill half has no color-image height must be rejected",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&WgpuRawDpcExecutionError::NoColorTargetHeight.to_string()),
+            "the rejection must be the named NoColorTargetHeight variant, got: {error}"
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a rejected composed packet must leave no redeemable fill token"
+        );
+        assert_eq!(
+            backend.physical_tmem().generation(),
+            generation_before,
+            "a rejected composed packet must not advance the published TMEM generation either \
+             -- the TMEM half staged before the fill half failed, and staging is not publishing"
+        );
     }
 }

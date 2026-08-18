@@ -2413,3 +2413,492 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
     );
     teardown();
 }
+
+// ---------------------------------------------------------------------
+// Composed fill + TMEM in one packet.
+//
+// The census (`docs/RT64-WM2000-CENSUS.md` §4a) measures
+// `MixedFillAndTmemLoadPacket` refusing 218/218 WM2000 frames: every frame
+// the game draws issues both a `G_FILLRECT` and a TMEM load. These tests
+// are the end-to-end evidence that the composition is admitted, that BOTH
+// halves land, and that the order in which they land is the command
+// stream's own -- not a merge policy this backend chose.
+// ---------------------------------------------------------------------
+
+/// The TMEM half of every composed fixture below: `SetTextureImage`,
+/// `SetTile`, `LoadSync`, `LoadBlock` -- byte-for-byte
+/// `one_load_block_words`'s own sequence, reused rather than re-spelled so
+/// a composed packet's TMEM half is provably the same load the TMEM-only
+/// tests already pin.
+fn tmem_half_words() -> Vec<u32> {
+    one_load_block_words()
+}
+
+/// The fill half: fill-cycle `OtherMode`, `SetColorImage`, `SetFillColor`,
+/// and one whole-target `FillRectangle`. Identical to
+/// `whole_target_fill_words`, and reused for the same reason.
+fn fill_half_words(fill_color: u32) -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_color_image_rgba16());
+    words.extend(set_fill_color(fill_color));
+    words.extend(fill_rectangle(
+        0,
+        0,
+        FILL_TARGET_WIDTH - 1,
+        FILL_TARGET_HEIGHT - 1,
+    ));
+    words
+}
+
+/// TMEM load first, then the fill -- one packet.
+fn tmem_then_fill_words(fill_color: u32) -> Vec<u32> {
+    let mut words = tmem_half_words();
+    words.extend(fill_half_words(fill_color));
+    words
+}
+
+/// The fill first, then the TMEM load -- the same two halves, swapped.
+fn fill_then_tmem_words(fill_color: u32) -> Vec<u32> {
+    let mut words = fill_half_words(fill_color);
+    words.extend(tmem_half_words());
+    words
+}
+
+/// The bytes `rdram_with_texture_source` writes at `TEXTURE_SOURCE_ADDR`,
+/// hand-derived from that helper's own
+/// `(0..64u16).flat_map(u16::to_be_bytes)` generator.
+///
+/// This is the SOURCE, not a model of where a `LoadBlock` puts each byte in
+/// TMEM. That mapping is `LoadBlock`'s tile addressing plus the RDP's
+/// odd-line word swizzle, which is `fn64-render-wgpu`'s own pinned
+/// behavior and not this card's claim -- measured, the fixture's load lands
+/// source halfwords 10..12 at TMEM 0..8 and 14..18 at TMEM 24..32. This
+/// card asserts only that every published TMEM byte came from THIS source
+/// (membership) and that the composed packet's TMEM state equals the
+/// TMEM-only packet's exactly (the differential below), never that a
+/// particular byte lands at a particular address.
+fn expected_tmem_source_bytes() -> Vec<u8> {
+    (0..64u16).flat_map(u16::to_be_bytes).collect()
+}
+
+/// The published physical TMEM state a TMEM-ONLY packet leaves behind, for
+/// the composed packet to be compared against.
+///
+/// This is the differential the composition must satisfy: adding a fill to
+/// a packet must not change one byte of what its TMEM half loads. Built by
+/// running the identical TMEM half alone, through the identical producer
+/// seam, in a freshly registered backend.
+fn tmem_only_published_state() -> Vec<Option<u8>> {
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+    dispatch_words(&mut rdram, &tmem_half_words());
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "the TMEM-only reference packet must complete"
+    );
+    let state = published_tmem_bytes(&backend, 128);
+    drop(backend);
+    teardown();
+    assert!(
+        state.iter().any(Option::is_some),
+        "the TMEM-only reference must itself load something, or the differential is vacuous"
+    );
+    state
+}
+
+/// Read back the physical TMEM bytes this backend has published at
+/// `0..len`, as `Option<u8>` per byte so an invalid (never-loaded) lane is
+/// distinguishable from a loaded zero.
+fn published_tmem_bytes(
+    backend: &std::rc::Rc<std::cell::RefCell<fn64_render_wgpu::WgpuBackend>>,
+    len: u16,
+) -> Vec<Option<u8>> {
+    let handle = backend.borrow();
+    let physical = handle.physical_tmem();
+    (0..len)
+        .map(|address| physical.valid_byte(address))
+        .collect()
+}
+
+/// **The card's headline measurement.** One packet carrying BOTH a TMEM
+/// load and an admitted `FillRectangle` is admitted, and both halves land:
+/// the fill's image reaches guest RDRAM and the TMEM load's bytes reach
+/// published physical TMEM.
+///
+/// Before this card, `stage_and_report` refused this exact packet shape with
+/// `MixedFillAndTmemLoadPacket` before either source staged anything, so
+/// completing at all is itself part of the evidence. Both expectations are
+/// hand-derived -- the fill's from `SET_FILL_COLOR`'s word and the RGBA16
+/// even/odd column rule (`expected_fill_halfword`), the TMEM half's from
+/// `rdram_with_texture_source`'s own generator -- never captured from a run.
+///
+/// The two halves are asserted independently and BOTH are nonvacuous: the
+/// fill's target is poisoned first (so "the bytes changed" is falsifiable),
+/// and the TMEM bytes are checked against a source pattern that is not
+/// all-zero and not equal to the poison.
+#[test]
+fn a_composed_fill_and_tmem_packet_lands_both_halves() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    // Nothing is published before the dispatch, on either side -- so
+    // everything read afterwards was produced by this one packet.
+    assert!(
+        backend.borrow().color_targets().is_none(),
+        "no color target may exist before the composed packet"
+    );
+    let tmem_before = published_tmem_bytes(&backend, 128);
+    assert!(
+        tmem_before.iter().all(Option::is_none),
+        "no TMEM byte may be valid before the composed packet"
+    );
+
+    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    let poisoned = poison_fill_target(&mut rdram);
+    let expected_image = expected_whole_target_image(FILL_COLOR);
+    assert_ne!(
+        expected_image, poisoned,
+        "the poison must differ from the expected fill image, or the fill half is unfalsifiable"
+    );
+
+    dispatch_words(&mut rdram, &tmem_then_fill_words(FILL_COLOR));
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "a composed fill+TMEM packet must complete, leaving no pending fabric transaction -- \
+         before this card it was refused outright with MixedFillAndTmemLoadPacket"
+    );
+
+    // Half one: the fill reached guest RDRAM.
+    assert_eq!(
+        rdram[target],
+        expected_image[..],
+        "the fill half of a composed packet must write its hand-derived image into guest RDRAM"
+    );
+
+    // Half two: the TMEM load reached published physical TMEM, and left
+    // EXACTLY what the same load leaves when it runs with no fill beside it.
+    let tmem_after = published_tmem_bytes(&backend, 128);
+    let valid: Vec<(usize, u8)> = tmem_after
+        .iter()
+        .enumerate()
+        .filter_map(|(address, byte)| byte.map(|value| (address, value)))
+        .collect();
+    assert!(
+        !valid.is_empty(),
+        "the TMEM half of a composed packet must leave valid bytes in published physical \
+         TMEM -- an empty set is the signature of a dropped TMEM half"
+    );
+
+    // Every published byte came from this packet's own declared source.
+    // Membership, not placement: where a LoadBlock puts each byte is
+    // `fn64-render-wgpu`'s pinned tile-addressing behavior, not this card's.
+    let source = expected_tmem_source_bytes();
+    for (address, value) in &valid {
+        assert!(
+            source.contains(value),
+            "published TMEM byte {address} = {value} is not one of the LoadBlock source bytes"
+        );
+    }
+    // Nonvacuity: the loaded bytes are not all equal, so a port that
+    // published a constant would fail the differential below.
+    assert!(
+        valid.iter().any(|(_, value)| *value != valid[0].1),
+        "the loaded TMEM bytes must vary, or the TMEM differential is vacuous"
+    );
+
+    drop(backend);
+    teardown();
+
+    // **The differential.** Adding a fill to the packet must not perturb
+    // one byte of what its TMEM half loads. Run last, because it registers
+    // its own backend and tears it down.
+    assert_eq!(
+        tmem_after,
+        tmem_only_published_state(),
+        "a composed packet's published TMEM must be byte-identical to what the same TMEM half \
+         publishes alone -- composition must not perturb the TMEM half at all"
+    );
+}
+
+/// **Constraint 2 at the production seam: ordering is semantics.** The same
+/// two halves in the two possible stream orders both dispatch cleanly, and
+/// each lands both halves.
+///
+/// Why two clean dispatches prove the ordering was respected rather than
+/// ignored: `fn64_render_ir::validate_effects` compares the backend's
+/// reported write list against `journal().write_accesses()` **position by
+/// position**, and the journal's order is the decoder's own `planned`
+/// vector, appended to as the command stream is walked
+/// (`raw_dpc::push_access` assigns each access an `OperationId` equal to its
+/// index there). So a TMEM-then-fill packet declares its TMEM destination
+/// write before the fill's render-target write, and a fill-then-TMEM packet
+/// declares the reverse. A merge that emitted a FIXED order -- always fill
+/// first, always TMEM first, or sorted by anything but journal position --
+/// would satisfy at most one of these two fixtures and would be rejected on
+/// the other with `EffectAccessMismatch`, panicking inside the dispatch.
+///
+/// The two orders are also proven to be genuinely different streams, so
+/// this is not a claim about two identical inputs.
+#[test]
+fn both_composed_orders_dispatch_and_land_both_halves() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+
+    let tmem_first = tmem_then_fill_words(FILL_COLOR);
+    let fill_first = fill_then_tmem_words(FILL_COLOR);
+    assert_ne!(
+        tmem_first, fill_first,
+        "the two fixtures must be genuinely different command streams, or the ordering claim \
+         is about one stream twice"
+    );
+    assert_eq!(
+        tmem_first.len(),
+        fill_first.len(),
+        "the two orders must carry the same commands -- only their order may differ"
+    );
+
+    let expected_image = expected_whole_target_image(FILL_COLOR);
+    let mut published = Vec::new();
+
+    for (label, words) in [("TMEM-first", tmem_first), ("fill-first", fill_first)] {
+        crate::load_rom(Vec::new());
+        let mut rdram = rdram_with_texture_source();
+        let backend = register_observed_session_backend_for_fills(rdram.len());
+        let poisoned = poison_fill_target(&mut rdram);
+        assert_ne!(
+            expected_image, poisoned,
+            "{label}: the poison must differ from the expected image"
+        );
+
+        dispatch_words(&mut rdram, &words);
+        assert!(
+            with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+            "{label}: the composed order must complete -- a fixed-order merge would have been \
+             rejected here with EffectAccessMismatch against this stream's own journal"
+        );
+
+        let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+        assert_eq!(
+            rdram[target],
+            expected_image[..],
+            "{label}: the fill half must still land its hand-derived image"
+        );
+        let tmem = published_tmem_bytes(&backend, 128);
+        assert!(
+            tmem.iter().any(Option::is_some),
+            "{label}: the TMEM half must still land"
+        );
+        published.push(tmem);
+        drop(backend);
+        teardown();
+    }
+
+    // Both orders load the same TMEM content: the halves are the same
+    // commands, so only their declared ORDER differs, never their effect.
+    assert_eq!(
+        published[0], published[1],
+        "both composed orders must load identical TMEM content -- the halves are the same \
+         commands in a different order"
+    );
+}
+
+/// A composition this slice still does NOT admit fails with a named error,
+/// and leaves nothing published on either side.
+///
+/// Fill + TMEM + a triangle is the case: `stage_and_report` still refuses it
+/// with `MixedFillAndTrianglePacket`, because a triangle raster declares no
+/// write access in the journal at all, so unlike the fill+TMEM pair there is
+/// no declared order to compose onto. Admitting fill+TMEM must not have
+/// opened a back door for a triangle to ride along with them.
+///
+/// Driven through the real producer seam, where the refusal surfaces as a
+/// panic inside `dispatch_dpc_submission` (an `execute_raw_dpc` error is not
+/// a recoverable outcome at that seam). The panic message is asserted to
+/// carry the variant's own name, so a DIFFERENT failure cannot pass as this
+/// one -- and guest RDRAM is checked untouched afterwards, which is the
+/// "loud rejection, never a quiet partial publish" half of the claim.
+#[test]
+fn a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam() {
+    const FILL_COLOR: u32 = 0x0842_1085;
+    const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
+    const SET_COMBINE: u8 = 0x3c;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    register_session_backend_for_fills(rdram.len());
+    let poisoned = poison_fill_target(&mut rdram);
+
+    // Fill + TMEM (now admitted on its own) PLUS a triangle (not admitted
+    // in combination with a fill).
+    let mut words = tmem_then_fill_words(FILL_COLOR);
+    words.extend([word(SET_OTHER_MODE, 0), 0]);
+    words.extend([word(SET_COMBINE, 0), 0]);
+    // A minimal non-shade, non-texture, non-Z base-edge triangle: eight
+    // words, all edge coefficients, matching `fn64-render-wgpu`'s own
+    // `triangle_base_edge_words` fixture shape.
+    words.extend([word(RAW_TRIANGLE_BASE_EDGE, 0), 0, 0, 0, 0, 0, 0, 0]);
+
+    let bytes = words_to_rdram_bytes(&words);
+    let start = 0x1000u32;
+    let end = start + bytes.len() as u32;
+    rdram[start as usize..end as usize].copy_from_slice(&bytes);
+    let submission = admit_dram_submission(start, end);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+    }));
+    assert!(
+        outcome.is_err(),
+        "a fill + TMEM + triangle packet must be refused loudly at the producer seam -- \
+         admitting fill + TMEM must not have let a triangle ride along silently"
+    );
+
+    let reason = crate::last_render_error().unwrap_or_default();
+    let panic_text = outcome
+        .err()
+        .map(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_string())
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let named = format!("{reason}{panic_text}");
+    // The exact refusal, not merely "something failed": measured, this is
+    // `MixedFillAndTrianglePacket`'s own Display text, reached through
+    // `render-wgpu/raw-dpc-execute`. Both fragments are asserted so a
+    // DIFFERENT rejection -- a decode failure, a TMEM staging error, a
+    // panic from somewhere else entirely -- cannot pass as this one.
+    assert!(
+        named.contains("render-wgpu/raw-dpc-execute"),
+        "the refusal must come from the raw-DPC executor, got: {named}"
+    );
+    assert!(
+        named
+            .contains("declares both an admitted FillRectangle and at least one admitted triangle"),
+        "the refusal must be MixedFillAndTrianglePacket's own named text, got: {named}"
+    );
+
+    // The loud-rejection half: nothing was half-published into guest memory.
+    let target = FILL_TARGET_ADDR as usize..FILL_TARGET_ADDR as usize + FILL_TARGET_BYTES;
+    assert_eq!(
+        rdram[target],
+        poisoned[..],
+        "a refused composition must leave every guest target byte at its poisoned value -- \
+         never the fill half applied while the triangle half was dropped"
+    );
+    teardown();
+}
+
+/// **Constraint 4: composition must not collapse the partial-width ranges.**
+/// A composed packet whose fill half is partial-width still declares and
+/// writes N **disjoint** per-row ranges, strided by the color image's width.
+///
+/// Measured, not assumed: `fn64-render-wgpu`'s `raw_dpc::plan_fill`
+/// collapses a fill to one access only when `x0 == 0 && x1 + 1 == width`.
+/// `fill_rectangle(4, 2, 14, 4)` satisfies neither, so it declares three
+/// accesses -- one per scanline, 22 bytes each. A composition that merged
+/// the fill's writes into the TMEM report by concatenating a single
+/// `[first_start, last_end)` span would cover 3 * 16 - 5 = 43 pixels instead
+/// of 3 * 11 = 33, a ~30% over-claim, and would clobber the poison at
+/// columns 0..4 and 15 of rows 2..=4.
+///
+/// The surviving poison bytes are what catch it, and they are checked
+/// against the ORIGINAL poison rather than any fill expectation, so nothing
+/// but an exactly-sized set of three disjoint copies can pass. This is the
+/// sibling of `an_admitted_partial_width_fill_writes_only_its_own_disjoint_rows`,
+/// carried into the composed path -- mutant (e) in this card's report.
+#[test]
+fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
+    const FIRST_FILL_COLOR: u32 = 0x0842_1085;
+    const FILL_COLOR: u32 = 0x213c_4d59;
+    // Mirrors `partial_width_fill_words`'s own `fill_rectangle(4, 2, 14, 4)`.
+    const X0: u32 = 4;
+    const X1: u32 = 14;
+    const Y0: u32 = 2;
+    const Y1: u32 = 4;
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    // A fresh target admits only a whole-target rectangle, so the partial
+    // composed fill needs a resident predecessor first.
+    dispatch_words(&mut rdram, &fill_half_words(FIRST_FILL_COLOR));
+    let poisoned = poison_fill_target(&mut rdram);
+
+    // The composed packet: the TMEM half, then a PARTIAL-width fill.
+    let mut words = tmem_half_words();
+    words.extend(fill_cycle_other_mode());
+    words.extend(set_color_image_rgba16());
+    words.extend(set_fill_color(FILL_COLOR));
+    words.extend(fill_rectangle(X0, Y0, X1, Y1));
+
+    dispatch_words(&mut rdram, &words);
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "a composed packet with a partial-width fill must complete"
+    );
+
+    // Hand-derived: the poison everywhere, overwritten ONLY inside the
+    // claimed rectangle, at TARGET-relative column parity.
+    let mut expected = poisoned.clone();
+    for y in Y0..=Y1 {
+        for x in X0..=X1 {
+            let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+            expected[offset..offset + 2]
+                .copy_from_slice(&expected_fill_halfword(FILL_COLOR, x).to_be_bytes());
+        }
+    }
+
+    let base = FILL_TARGET_ADDR as usize;
+    assert_eq!(
+        rdram[base..base + FILL_TARGET_BYTES],
+        expected[..],
+        "a composed packet's partial-width fill must write exactly its three disjoint rows \
+         and leave every other guest byte at its poisoned value"
+    );
+
+    // The discriminators a collapsed span would destroy, named individually.
+    let row2 = base + (FILL_TARGET_WIDTH * 2 * 2) as usize;
+    assert_eq!(
+        &rdram[row2..row2 + (X0 * 2) as usize],
+        &poisoned
+            [(FILL_TARGET_WIDTH * 2 * 2) as usize..(FILL_TARGET_WIDTH * 2 * 2 + X0 * 2) as usize],
+        "columns 0..4 of row 2 lie inside a collapsed [first_start, last_end) span and must \
+         still be poison"
+    );
+    let row2_last = row2 + ((FILL_TARGET_WIDTH - 1) * 2) as usize;
+    assert_eq!(
+        &rdram[row2_last..row2_last + 2],
+        &poisoned[(FILL_TARGET_WIDTH * 2 * 2 + (FILL_TARGET_WIDTH - 1) * 2) as usize
+            ..(FILL_TARGET_WIDTH * 2 * 2 + FILL_TARGET_WIDTH * 2) as usize],
+        "column 15 of row 2 is right of x1 and must still be poison"
+    );
+    // And the rectangle really was written, so 'everything is poison' fails.
+    let inside = row2 + (X0 * 2) as usize;
+    assert_eq!(
+        &rdram[inside..inside + 2],
+        &expected_fill_halfword(FILL_COLOR, X0).to_be_bytes(),
+        "the rectangle's own first pixel must carry the composed fill's color"
+    );
+
+    // And the TMEM half still landed alongside it.
+    assert!(
+        published_tmem_bytes(&backend, 128)
+            .iter()
+            .any(Option::is_some),
+        "the composed packet's TMEM half must land beside its partial-width fill"
+    );
+    drop(backend);
+    teardown();
+}
