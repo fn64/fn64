@@ -15,6 +15,8 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTPUT_BYTES: u64 = crate::FILL_FIXTURE_BYTES as u64;
 const SHADER: &str = include_str!("fill_fixture.wgsl");
 
+pub(crate) mod adapter_selection;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HeadlessBackend {
     #[default]
@@ -26,6 +28,13 @@ pub enum HeadlessBackend {
 
 impl HeadlessBackend {
     pub(crate) fn wgpu_backends(self) -> wgpu::Backends {
+        adapter_selection::backends_for_request(self.native_wgpu_backends())
+    }
+
+    /// The mask this variant names on hardware, before
+    /// `FN64_WGPU_SOFTWARE_ADAPTER` gets a say. Split out so the software
+    /// rewrite has an un-rewritten input to be tested against.
+    pub(crate) fn native_wgpu_backends(self) -> wgpu::Backends {
         match self {
             Self::AnyNative => {
                 wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12
@@ -96,6 +105,7 @@ impl UninitializedRenderer {
             }
             Err(error) => return Err(WgpuRenderError::RequestAdapter(error.to_string())),
         };
+        adapter_selection::assert_expected_adapter(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fn64-render-wgpu-m3.1"),

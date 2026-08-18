@@ -1186,7 +1186,9 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 .collect();
 
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+                backends: crate::device::adapter_selection::backends_for_request(
+                    wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+                ),
                 flags: wgpu::InstanceFlags::VALIDATION,
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
@@ -1202,6 +1204,7 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 }
                 Err(error) => panic!("adapter request failed: {error}"),
             };
+            crate::device::adapter_selection::assert_expected_adapter(&adapter);
             eprintln!(
                 "fn64-alpha-compare-fragment-fn: adapter={:?}",
                 adapter.get_info().name

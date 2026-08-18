@@ -808,6 +808,7 @@ impl UninitializedTrianglePipeline {
             }
             Err(error) => return Err(TrianglePipelineError::RequestAdapter(error.to_string())),
         };
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fn64-triangle-pipeline"),

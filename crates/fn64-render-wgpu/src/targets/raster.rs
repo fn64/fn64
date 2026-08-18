@@ -84,6 +84,7 @@ impl UninitializedNativeRaster {
             }
             Err(error) => return Err(NativeRasterError::RequestAdapter(error.to_string())),
         };
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fn64-render-wgpu-m3.3c"),
