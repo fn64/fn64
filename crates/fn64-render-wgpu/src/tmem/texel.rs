@@ -1182,6 +1182,49 @@ mod tests {
         }
     }
 
+    /// A PINNED DISAGREEMENT between fn64's two renderer lanes, not a
+    /// specification of correct hardware behavior.
+    ///
+    /// `fn64-render-reference` palettizes an `RGBA`/`Bits16` tile whenever
+    /// the TLUT mode is enabled, because WM2000 measurably programs exactly
+    /// that (gfx task #6146 of the attract loop: `fmt: 0, siz: 2, line: 9,
+    /// tmem: 0` sampled under `G_TT_RGBA16`) and both permissively-licensed
+    /// reimplementations of the RDP agree that hardware ignores the tile
+    /// format under `tlut_en` -- RT64's `sampleTMEM`
+    /// (`shaders/TextureDecoder.hlsli:174-188`, MIT) and paraLLEl-RDP's
+    /// `sample_texel_ci32_tlut` (`shaders/texture.h:201-216`, MIT). The
+    /// n64brew RDP pipeline page states it directly: "If tlut_en is set in
+    /// othermodes the final texel will be sourced from a palette and the
+    /// tile format is ignored ... the tile size is otherwise ignored."
+    ///
+    /// This lane still refuses it. The refusal is left standing rather than
+    /// widened here because this lane's typed decoders are structured
+    /// around `resolve_indexed_texel` requiring `ColorIndex`, and
+    /// `exhaustive_format_size_mode_matrix_has_only_six_legal_cells` above
+    /// encodes that requirement as an exhaustive invariant -- correcting the
+    /// model means reshaping the preflight, the address-scope check, and
+    /// that matrix together, which is a change this test refuses to make by
+    /// accident. Pinning the disagreement keeps it a known, cited gap
+    /// instead of an unnoticed one.
+    #[test]
+    fn enabled_tlut_over_a_sixteen_bit_rgba_tile_diverges_from_the_reference_lane() {
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            assert_eq!(
+                resolve_indexed_texel(
+                    ImageFormat::Rgba,
+                    raw(PixelSize::Bits16, 0x42ff),
+                    palette(0),
+                    mode,
+                ),
+                Err(IndexedTexelResolveError::FormatMustBeColorIndex {
+                    format: ImageFormat::Rgba
+                }),
+                "this lane rejects WM2000's measured tile under {mode:?}; \
+                 fn64-render-reference palettizes it through index 0x42"
+            );
+        }
+    }
+
     #[test]
     fn indexed_error_types_render_and_implement_error() {
         let errors: [&dyn std::error::Error; 3] = [

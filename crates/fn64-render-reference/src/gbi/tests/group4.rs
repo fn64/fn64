@@ -1191,6 +1191,110 @@ fn tlut_mode_palettizes_eight_bit_texels_regardless_of_tile_format() {
 
 
 #[test]
+fn tlut_mode_palettizes_sixteen_bit_texels_through_the_high_byte() {
+    // Measured on WM2000: at gfx task #6146 of the attract loop the game
+    // rasterizes a shade+texture triangle whose primitive tile is
+    // `fmt: 0 (RGBA), siz: 2 (16b), line: 9, tmem: 0, palette: 0` while
+    // OtherMode still latches `G_TT_RGBA16` (texture_lut == 2) from the
+    // preceding palettized work. The reference renderer refused that
+    // combination outright; hardware does not.
+    //
+    // n64brew's RDP pipeline page: "If tlut_en is set in othermodes the
+    // final texel will be sourced from a palette and the tile format is
+    // ignored ... the tile size is otherwise ignored." Size therefore
+    // selects only which byte becomes the index. RT64's `sampleTMEM`
+    // (`shaders/TextureDecoder.hlsli:174-188`) and paraLLEl-RDP's
+    // `sample_texel_ci32_tlut` (`shaders/texture.h:201-216`) independently
+    // agree that byte is the one at the unincremented address -- the high
+    // byte of the big-endian 16-bit texel.
+    //
+    // The texel below is 0x42FF. Only 0x42 may reach the palette; a
+    // decoder that took the low byte would look up 0xFF, and one that took
+    // the whole 16-bit word would index out of the 256-entry TLUT and trip
+    // `tlut_color`'s assert. Both wrong answers are distinguishable here
+    // because the two bytes differ and only 0x42 is populated.
+    let mut storage = Tmem::default();
+    let tile = Tile {
+        fmt: G_IM_FMT_RGBA,
+        siz: G_IM_SIZ_16B,
+        line: 9,
+        ..Default::default()
+    };
+    storage.write_texel(tile, 0, 0, false, G_IM_SIZ_16B, 0x42ff);
+    storage.write_tlut(256, 0x42, 0xf801);
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 2);
+    assert_eq!(texture.sample(0, 0), [255, 0, 0, 255]);
+}
+
+#[test]
+fn tlut_mode_sixteen_bit_ignores_the_low_byte_and_the_declared_format() {
+    // The companion to the test above, separating the two claims it makes
+    // jointly. Every tile format sampling the same 16-bit texel must
+    // produce the same palette color -- the format really is ignored --
+    // and swapping ONLY the low byte must not change it. Written as two
+    // sweeps rather than one case so a decoder that happened to be right
+    // for RGBA but wrong for CI cannot pass.
+    for fmt in [G_IM_FMT_RGBA, G_IM_FMT_CI, G_IM_FMT_IA, G_IM_FMT_I] {
+        for low in [0x00u16, 0x7f, 0xff] {
+            let mut storage = Tmem::default();
+            let tile = Tile {
+                fmt,
+                siz: G_IM_SIZ_16B,
+                line: 9,
+                ..Default::default()
+            };
+            storage.write_texel(tile, 0, 0, false, G_IM_SIZ_16B, 0x4200 | u32::from(low));
+            storage.write_tlut(256, 0x42, 0xf801);
+            let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 2);
+            assert_eq!(
+                texture.sample(0, 0),
+                [255, 0, 0, 255],
+                "fmt {fmt} with low byte {low:#04x} must palettize through index 0x42"
+            );
+        }
+    }
+}
+
+#[test]
+fn tlut_mode_sixteen_bit_honors_the_ia16_palette_mode() {
+    // The index selection is orthogonal to how the fetched entry decodes.
+    // `texture_lut == 3` is `G_TT_IA16`, so the same 0x42 index must come
+    // back through `ia16_to_rgba8888` rather than RGBA5551.
+    let mut storage = Tmem::default();
+    let tile = Tile {
+        fmt: G_IM_FMT_RGBA,
+        siz: G_IM_SIZ_16B,
+        line: 9,
+        ..Default::default()
+    };
+    storage.write_texel(tile, 0, 0, false, G_IM_SIZ_16B, 0x42ff);
+    storage.write_tlut(256, 0x42, 0x807f);
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 3);
+    assert_eq!(texture.sample(0, 0), [0x80, 0x80, 0x80, 0x7f]);
+}
+
+#[test]
+#[should_panic(expected = "texture-LUT sampling of a 0-coded 3b tile")]
+fn tlut_mode_still_refuses_thirty_two_bit_texels() {
+    // The 32-bit index byte would have to be re-derived against the RGBA32
+    // low/high bank split, and no title in this corpus reaches it. The
+    // refusal stays loud rather than being widened on the 16-bit
+    // precedent -- a wrong texel here would silently corrupt every
+    // downstream measurement.
+    let mut storage = Tmem::default();
+    let tile = Tile {
+        fmt: G_IM_FMT_RGBA,
+        siz: G_IM_SIZ_32B,
+        line: 9,
+        ..Default::default()
+    };
+    storage.write_texel(tile, 0, 0, false, G_IM_SIZ_32B, 0x42ff_1234);
+    storage.write_tlut(256, 0x42, 0xf801);
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 2);
+    let _ = texture.sample(0, 0);
+}
+
+#[test]
 fn load_tile_uses_settimg_stride_and_tile_coordinate_origin() {
     // A synthetic 4x2 CI8 source. Load the rightmost two texels of row 1
     // as a 2x1 tile whose render coordinates begin at (2, 1).
