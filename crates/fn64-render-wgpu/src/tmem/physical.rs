@@ -459,6 +459,49 @@ impl PhysicalTmemPacketTransaction {
         })
     }
 
+    /// Captures this packet transaction's TMEM post-image **as of every
+    /// load staged so far** -- a `bytes`/`valid` pair copied out mid-loop,
+    /// with no seal, no generation, and no digest of its own.
+    ///
+    /// ## Why this exists, and why it is not a second transaction
+    ///
+    /// A packet may interleave loads and texture rectangles, and the RDP's
+    /// TMEM is durable *within* a packet exactly as it is across packets: a
+    /// texrect samples whatever TMEM holds at its own stream position, not
+    /// what it holds after the packet's last load. Measured on WM2000, the
+    /// sixth gfx packet is a sprite strip of seven `LoadTile`/texrect pairs
+    /// in strict alternation whose loads all write the SAME TMEM range from
+    /// word 0 -- they overwrite each other, so the packet's single sealed
+    /// post-image holds only the seventh load's texels and all seven
+    /// texrects would draw the seventh sprite.
+    ///
+    /// The seal is still once per packet. This is a *prefix* of the very
+    /// same staging arrays `into_pending` will hand to
+    /// [`PendingTmemTransaction`], taken while the loop still owns them, so:
+    ///
+    /// - **No second seal.** `into_pending` still runs once, still requires
+    ///   access-for-access coverage of every journal destination write, and
+    ///   still computes exactly one `proposal_identity`.
+    /// - **No forged generation.** A prefix claims no generation at all;
+    ///   [`PendingTmemPrefixImage`] borrows the sealed transaction and
+    ///   reports *its* identity, so `binding.next_generation` is claimed
+    ///   exactly once, by the one seal.
+    /// - **No new digest.** The prefix's reads answer with the sealed
+    ///   transaction's own `proposal_identity`, the same value
+    ///   `validate_proposal` recomputes at both publication routes.
+    ///
+    /// A prefix therefore cannot publish, cannot advance anything, and
+    /// cannot outlive the seal it names -- [`PendingTmemPrefixImage`] holds
+    /// a shared borrow of the [`PendingTmemTransaction`], so the borrow
+    /// checker enforces that the reads happen before publication, exactly
+    /// as it already does for [`PendingTmemImage`].
+    pub(crate) fn capture_prefix(&self) -> TmemPrefixSnapshot {
+        TmemPrefixSnapshot {
+            bytes: self.bytes.clone(),
+            valid: self.valid.clone(),
+        }
+    }
+
     /// Seals all completed loads and exposes their immutable proposed effects.
     /// Sealing requires exact access-for-access coverage of every packet
     /// journal `TmemLoadDestination` write in journal order.
@@ -747,6 +790,22 @@ impl PendingTmemTransaction {
         PendingTmemImage { pending: self }
     }
 
+    /// Binds a [`TmemPrefixSnapshot`] taken mid-loop to this sealed
+    /// transaction, producing a [`TmemByteSource`] that answers with the
+    /// texels TMEM held at that prefix while naming this proposal.
+    ///
+    /// See [`PhysicalTmemPacketTransaction::capture_prefix`] for why a
+    /// prefix is not a second transaction.
+    pub(crate) fn prefix_image<'a>(
+        &'a self,
+        prefix: &'a TmemPrefixSnapshot,
+    ) -> PendingTmemPrefixImage<'a> {
+        PendingTmemPrefixImage {
+            pending: self,
+            prefix,
+        }
+    }
+
     pub const fn proposal_identity(&self) -> ContentDigest {
         self.proposal_identity
     }
@@ -826,6 +885,75 @@ impl PendingTmemTransaction {
             generation: self.binding.next_generation,
             last_load_epoch: self.last_load_epoch,
         })
+    }
+}
+
+/// TMEM `bytes`/`valid` copied out of an in-progress
+/// [`PhysicalTmemPacketTransaction`] after some prefix of its loads.
+///
+/// Owns its arrays because the transaction it was taken from is move-only
+/// and is consumed by `into_pending` before any texrect executes; borrowing
+/// them would tie the packet's staging loop to its color-staging phase and
+/// reopen the "TMEM rejection leaves no color token in existence" ordering
+/// this backend keeps by running the two as sequential phases.
+///
+/// Carries no identity of its own. Pair it with the sealed transaction via
+/// [`PendingTmemTransaction::prefix_image`] to read it.
+#[derive(Clone)]
+pub(crate) struct TmemPrefixSnapshot {
+    bytes: Box<[u8; TMEM_LEN]>,
+    valid: Box<[bool; TMEM_LEN]>,
+}
+
+impl fmt::Debug for TmemPrefixSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TmemPrefixSnapshot")
+            .field("valid_bytes", &self.valid.iter().filter(|v| **v).count())
+            .finish()
+    }
+}
+
+/// A [`TmemPrefixSnapshot`] bound to the sealed transaction it is a prefix
+/// of, as a [`TmemByteSource`].
+///
+/// Reads answer from the *prefix's* arrays -- what TMEM held at that stream
+/// position -- while the reported snapshot identity is the sealed
+/// transaction's own [`ProposedTmemImageIdentity`], because that is the one
+/// proposal in existence and the one `validate_proposal` recomputes. The
+/// prefix is a position inside that proposal, not a rival to it.
+#[derive(Debug)]
+pub struct PendingTmemPrefixImage<'pending> {
+    pending: &'pending PendingTmemTransaction,
+    prefix: &'pending TmemPrefixSnapshot,
+}
+
+impl PendingTmemPrefixImage<'_> {
+    /// The sealed transaction's identity -- the same value
+    /// [`PendingTmemImage::identity`] reports, deliberately.
+    pub const fn identity(&self) -> ProposedTmemImageIdentity {
+        ProposedTmemImageIdentity::new(
+            self.pending.proposal_identity,
+            self.pending.binding.state,
+            self.pending.binding.transaction,
+            self.pending.binding.next_generation,
+        )
+    }
+}
+
+impl TmemByteSource for PendingTmemPrefixImage<'_> {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Proposed(self.identity())
+    }
+
+    /// Answers from the PREFIX's arrays, with the identical validity gate
+    /// and out-of-range handling `PhysicalTmemState::valid_byte` and
+    /// [`PendingTmemImage::valid_byte`] apply. A byte a later load has not
+    /// yet written reads as whatever the prefix held -- which is the whole
+    /// point: a texrect must not observe a later load's texels.
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        let address = usize::from(address);
+        (address < TMEM_LEN && self.prefix.valid[address]).then(|| self.prefix.bytes[address])
     }
 }
 
