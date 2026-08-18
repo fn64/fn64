@@ -323,3 +323,119 @@ card produced an rs-lane stream to pin beside it.
   It was not booted, and it would hit §6.3's trap if it were.
 - **No block-lane claim.** `FN64_RS_EXECUTION=block` is refused by name for
   WM2000 (it needs a `block_program_pack` and an `FN64_BOOT_CONTEXT` capture).
+
+---
+
+## 7. 2026-08-18 (second pass): the rs lane boots, runs, and stops at bank ambiguity
+
+§6 recorded `osDriveRomInit` as the blocker. That is resolved, along with
+three further blockers found behind it. **The rs lane now executes WM2000's
+boot through libultra init, thread creation, PI overlay streaming, and RSP
+task dispatch**, and stops at a different, architectural place. Every step
+below was measured on this machine; none is inferred from the C lane.
+
+### 7.1 The four blockers, in the order they were found
+
+| # | Blocker | Disposition | Evidence |
+|---|---|---|---|
+| 1 | `osDriveRomInit` and 24 sibling stubs trap by name | `force_recompile` + 3 `[syms.rename]`, per §7.2 | emit moves 2414 clean/25 stubbed -> **2423 clean/16 stubbed**, linkable 98.98% -> **99.34%** |
+| 2 | `[[patches.instruction]]` was parsed and applied by nothing | fixed in `recompile_rom` | `func_800004D0`'s idle spin now emits `pause_self()`; 100% of samples were in that function before |
+| 3 | Function-entry observation history was unbounded | `set_function_execution_destination_history_limit` | RSS 2.5 GB -> OOM kill, now **flat at 200 MB** |
+| 4 | `osSpTaskLoad`/`osSpTaskStartGo` ran as guest bodies and deadlocked | two `host_lookup` rows | `SP_STATUS` pinned at `0x45`, `active_sp_dma = true`, across **5,000,000+** consecutive reads |
+
+Blockers 2 and 3 are defects in **fn64's own code**, not in the game config,
+and both are the silent-no-op class `AGENTS.md` forbids. They are fixed in
+this repo with tests; see the two commits.
+
+Blocker 4 is worth stating precisely because it is not a codegen fault.
+`func_80031CC0`/`func_80031ECC` busy-wait on `__osSpDeviceBusy`
+(`func_800376F0`, `SP_STATUS & 0x1C`) with a backward branch that is not a
+self-branch, so it never becomes `pause_self()`. fn64 models SP DMA with real
+latency on its device event queue, and that queue only advances between
+coroutine yields. A guest that polls without yielding therefore waits forever
+on a DMA that cannot complete. **The C lane emits the identical non-yielding
+`goto` loop** (`RecompiledFuncs/funcs_14.c` `L_80031E88`), so it survives only
+because its runtime completes SP DMA on a different schedule. The fix is to
+host-bind the pair, which is what libultra's own `osSpTaskStart(p)` macro
+(`PR/sptask.h:107-109`) implies they are.
+
+### 7.2 The 25 stub dispositions, grouped
+
+Not one answer; four, each argued from the body rather than from the name.
+Full evidence is in `aki-recomp/games/NWXE/profile.toml`'s comment block.
+
+- **5 COP0 accessor leaves** (`0x80037680`/`6A0`/`6B0`/`6D0`/`6E0`) ->
+  `force_recompile`. Every register they touch (11/12/13/18) is in fn64's
+  MODELLED set. A stub silently drops a real Status/Compare write.
+- **2 TLB routines** (`__osProbeTLB`, `osMapTLBRdb`) -> `force_recompile`.
+  `tlbp`/`tlbr`/`tlbwi` are modelled; neither body uses the one op
+  (`tlbwr`) that traps. No adapter exists for either name.
+- **3 libultra cache routines** (`0x8002F480`/`F530`/`F5B0`) -> `[syms.rename]`
+  + host rows, identified by cache OPCODE and cache GEOMETRY, not by size:
+  8 KB/16 B D-cache vs 16 KB/32 B I-cache, and `osInvalDCache`'s unique
+  write-back-then-invalidate end-casing. Public `os_cache.h` declares exactly
+  these four and the fourth was already verified against OoT ground truth.
+- **`osDriveRomInit`** -> `force_recompile` **plus `FN64_ABSENT_N64DD=1`**, which
+  is part of the disposition and not an optional flag.
+  `crates/fn64-abi/src/pi/timing.rs:55-105` had already disassembled this exact
+  routine and established that the word read from the absent 64DD window is
+  consumed only as packed BCD version nibbles with no branch testing them.
+  Without the flag the read is a loud `abi.pi.absent-domain1-device` trap by
+  design; fn64 refuses to invent an open-bus value, and this card does not
+  either.
+- **The remaining 13 stay stubbed**: 3 exception-core bodies carrying a real
+  `eret`, and 10 that are RSP microcode misparsed as CPU functions. Each of
+  those 10 has **zero** callers and **zero** `lookup()` sites in the emit, so
+  their trap is unreachable by construction.
+
+### 7.3 Where it stops now, and why that is architectural
+
+```
+lookup: no recompiled function or host shim at vram 0x800E1B90
+```
+
+`0x800E1B90` is the base of overlay bank slot A. The bank **is** loaded —
+`note_dma_overlay_load rom=0x0004c160 dest=0x800e1b90 -> exact=Some(2)` fires
+425 log lines before the trap. The failure is not a missing load and not a
+missing body: **both** bodies are emitted (`func_800E1B90` and
+`func_800E1B90_bank4_text`). They are absent from the dispatcher.
+
+`SymbolTable::from_entries` (`crates/fn64-cpu-runtime-codegen/src/module.rs:65-82`)
+drops any vram claimed by two differently-named functions, into an `ambiguous`
+set. That is correct given the shape of what it emits: `LOOKUP_TABLE` is a
+flat `(vram, fn)` array, and a flat array cannot express "which bank is
+resident right now."
+
+**Measured scope: 2,392 bodies emitted, 2,350 in `LOOKUP_TABLE`, so 42 bodies
+(21 vram collisions, each a resident/bank pair) are unreachable.** The 21:
+
+```
+0x800E1B90 0x800EF398 0x800F1924 0x800F23CC 0x8011C900 0x8011C91C 0x8011C938
+0x8011C954 0x8011D964 0x8011DFE4 0x8011E864 0x8011FE78 0x80120B84 0x80120BA0
+0x80120D20 0x80120D60 0x801213E0 0x80121714 0x80127CA0 0x8012A678 0x8012A6A4
+```
+
+The exclusion is currently **silent** — `gap-report.md` does not mention
+ambiguity, so a reader sees "99.34% linkable" and no hint that 42 emitted
+bodies cannot be called. That reporting gap is worth closing regardless of how
+the dispatch question is answered.
+
+Closing it needs a bank-aware dispatch decision (the section registry already
+tracks which section is loaded; `lookup` does not consult it). **This card does
+not guess one.** Picking either twin arbitrarily would run the wrong bank's
+code and produce plausible-looking wrong behaviour — the precise failure mode
+this lane exists to avoid.
+
+## Nonclaims (2026-08-18 second pass)
+
+- **No claim WM2000 renders anything on the rs lane.** It traps before the
+  first VI swap, so there is no framebuffer, no RDP stream, and no pixel
+  comparison. `vi_swaps` was 0 in every run.
+- **No claim the C lane's silent stubs are harmless.** They are a real
+  divergence; §7.1 blocker 4 shows one place where the two lanes' identical
+  emitted loop survives only because the runtimes differ.
+- **No claim about the 21 ambiguous vrams' correct disposition.** Their bodies
+  are emitted and correct as translations; only their dispatch is unresolved.
+- **No claim the four fixed blockers are the last ones.** Each was found by
+  running into it; the next one is behind bank dispatch and has not been seen.
+- **No block-lane claim.** Untouched.
