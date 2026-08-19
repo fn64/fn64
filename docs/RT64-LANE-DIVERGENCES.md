@@ -99,7 +99,76 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
   narrowed to "no load, no triangle, AND no sync", pinned by its own test
   after the over-widening mutant was found to survive the suite. Three of
   three mutants killed. The run now advances to
-  `MixedTexrectAndRawTrianglePacket`.
+  `MixedTexrectAndRawTrianglePacket` (D24, below).
+
+### D24 — raw-DPC execution refused a texrect composed with a raw triangle · **REACHED WM2000: FIFTH ABORT**
+
+- **wgpu** `crates/fn64-render-wgpu/src/production.rs`, `stage_and_report`,
+  surfacing as `WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket`
+  and aborting the all-Rust stack at
+  `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+- **The refused packet, measured — not inferred.** Instrumented at the
+  refusal site and run on the real ROM through the all-Rust lane
+  (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`): **6 texrects, 9 TMEM loads, 1 raw
+  triangle, 0 fills, 0 syncs** — 13 admitted triangles in all (each texrect
+  admits as two). The raw triangle is **strictly last**, at wire command 91,
+  after every texrect (commands 2, 10, 18, 26, 34, 42) and every load (7,
+  15, 23, 31, 39, 54, 58, 81, 88). The texrects are a HUD strip: viewports
+  `336,144–399,192` then five tiles across `80..399` at `y 192–239`. Every
+  one declared a real 47- or 48-access `ColorFramebuffer` write run.
+  **There is no interleaving of the two sources at all.**
+- **Which lane was right: NEITHER — the refusal was wrong on its own
+  terms.** Its message said the pair "have no defined ordering". Both
+  clauses of its reasoning are individually true — a texrect declares
+  journal writes, a raw triangle declares none — but the conclusion does not
+  follow, because the composition it names is never attempted:
+  - A texrect's pixels reach the guest through `stage_color_commands` →
+    `ColorTargetRegistry` → `fn64-abi`'s `copy_committed_guest_writes`.
+  - A raw triangle's raster reaches `triangle_draw_output`, which
+    `last_triangle_draw`'s own doc calls "never an accumulated history,
+    never a persistent framebuffer" and which `present` refuses to scan out
+    by name: "one submission's readback, not a VI-sampled framebuffer".
+    **Nothing copies it into guest RDRAM.**
+
+  So the packet has exactly one guest-visible destination and exactly one
+  source writing to it, and that order was already derived — from the
+  decoder's own `command_index` in `stage_color_commands`, cross-checked by
+  `merged_fill_and_tmem_writes`' independent re-derivation from the journal.
+- **Admitting adds nothing for the journal to order.** A `RawTriangle`
+  pushes no `ResourceAccess` (the decoder's `0x08..=0x0f` arm decodes and
+  pushes the command; unlike `FILL_RECTANGLE`/`TEXRECT` it calls no
+  planner), so it contributes neither a declared write nor a staged
+  `CompletedWrite`. `merged_fill_and_tmem_writes`' two-sided exactness check
+  sees the identical pair of lists it would see with the triangle absent.
+- **What the refusal cost.** It dropped six real guest-visible rectangles in
+  order to withhold one triangle that was never going to be visible — not in
+  this packet and not in a triangle-only one, where
+  `StagedOutcome::NoPhysicalSuccessor`'s own doc already records that "a raw
+  triangle rasters into a GPU attachment and declares no journal write" and
+  the packet is admitted anyway. The missing RDRAM writeback for the GPU
+  raster path is a separate, pre-existing gap that refusing could not close.
+- **Status: FIXED.** The variant is removed. `MixedFillAndTrianglePacket` is
+  **kept and unchanged** — that pair was never measured in WM2000's stream
+  and its own routing question is different. Per-triangle TMEM needed no
+  widening: `project_pending_tmem_per_triangle` selects with `prefix_before`,
+  a fact about stream position and not triangle source, so the raw triangle
+  at command 91 correctly samples the prefix sealed by the load at command
+  88.
+- **Mutants: three of three killed.** (1) restoring the refusal fails the new
+  admission test; (2) deleting the **kept** `MixedFillAndTrianglePacket` arm
+  fails three existing tests, so that arm is genuinely covered; (3)
+  over-widening the kept arm to cover texrects fails the new admission test.
+  The removed arm had **zero** tests before this card — the untested-kept-arm
+  hazard, found by looking.
+- **The run now advances to `TmemSampleFailed { status: 2 }`
+  (`TMEM_SAMPLE_STATUS_INVALID_BYTE`), triangle #0 in plan order, tile format
+  code 3 (`IntensityAlpha`), pixel-size code 0 (`Bits4`), TLUT-mode code 2.**
+  That is the GPU raster half of the very packet this card admitted: the
+  fragment shader addressed a TMEM byte the projection reports invalid, for
+  an IA4-under-TLUT tile. Note the asymmetry — the CPU texel reader composed
+  the same texrects successfully; only the WGSL sampler failed.
+
+---
 
 **Method note for the next lane.** Three descriptions of one guard disagreed,
 and the code was the least accurate of the three. When an error message and
