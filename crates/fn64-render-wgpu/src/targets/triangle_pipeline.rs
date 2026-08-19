@@ -102,7 +102,7 @@
 //! and on the `image_read_enabled` combinations where the unsupplied
 //! `memory` value could reach an output, and admits the rest only under
 //! the proven `!alpha_coverage_select && force_blend` predicate; and no
-//! `AlphaCompare::Reserved`/`Dither` mode, likewise a named panic.
+//! `AlphaCompare::Dither` mode, likewise a named panic.
 //!
 //! Still absent and still nonclaimed: no decal, no backface culling
 //! (`cull_mode: None`, `:1109`), no MSAA
@@ -276,7 +276,7 @@ fn fragment_alpha_compare_params_bytes(
     let mode_wire: u32 = match mode {
         AlphaCompare::None => 0,
         AlphaCompare::Threshold => 1,
-        AlphaCompare::Reserved | AlphaCompare::Dither => unreachable!(
+        AlphaCompare::Dither => unreachable!(
             "submit_admitted_triangle received an alpha-compare mode ({mode:?}) that must have \
              been rejected at retrieval time before reaching the pipeline"
         ),
@@ -726,7 +726,7 @@ pub(crate) fn admitted_triangle_fixture(
 ) -> TriangleFixture {
     let alpha_compare_mode = match other_mode.alpha_compare() {
         mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
-        unsupported @ (AlphaCompare::Reserved | AlphaCompare::Dither) => unreachable!(
+        unsupported @ AlphaCompare::Dither => unreachable!(
             "admitted_triangle_fixture received alpha-compare mode {unsupported:?}, which must \
              have been rejected at retrieval time before reaching the pipeline"
         ),

@@ -605,14 +605,8 @@ impl WgpuBackend {
             // Without this the shader saw `lut_mode = Disabled` for every
             // draw and refused WM2000's IA4-under-`G_TT_RGBA16` tile with
             // `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`, for a format the
-            // hardware ignores while the TLUT is on. The reserved encoding
-            // is propagated by name rather than coerced to Disabled, exactly
-            // as `execute_scheduled_texrect` already does for the CPU
-            // reader's own `lut_mode`.
-            let lut_mode = draw
-                .other_mode
-                .texture_lut_mode()
-                .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+            // hardware ignores while the TLUT is on.
+            let lut_mode = draw.other_mode.texture_lut_mode();
             let tile_binding = draw.tile_binding.with_lut_mode(lut_mode);
             let blend_mode = BlendModeState {
                 other_mode: draw.other_mode,
@@ -1145,14 +1139,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
                     // Retrieval-time admission gate (card §4a), duplicated
                     // from `TriangleDrawStateCollector` per this struct's
-                    // own module doc: `Reserved`/`Dither` never reach
-                    // `submit_admitted_triangle` -- loud, named panics here,
-                    // not a silent None/Threshold coercion.
+                    // own module doc: `Dither` never reaches
+                    // `submit_admitted_triangle` -- a loud, named panic here,
+                    // not a silent None/Threshold coercion. Wire encoding 2
+                    // is not reserved; it decodes to `None` (angrylion
+                    // `src/core/n64video/rdp.c:659-660`).
                     match other_mode.alpha_compare() {
-                        AlphaCompare::Reserved => panic!(
-                            "triangle #{triangle_index} (plan order) selected reserved G_AC \
-                             alpha-compare mode 2"
-                        ),
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
                              alpha-compare, which has no fragment-callable RT64 PRNG binding in \
@@ -1729,7 +1721,6 @@ pub enum WgpuRawDpcExecutionError {
         command_index: u32,
     },
     TexrectExecution(crate::targets::TexrectExecutionError),
-    TextureLutMode(crate::TextureLutModeError),
 }
 
 impl core::fmt::Display for WgpuRawDpcExecutionError {
@@ -1878,7 +1869,6 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                  durable (state, generation) pair to name",
             ),
             Self::TexrectExecution(error) => write!(formatter, "{error}"),
-            Self::TextureLutMode(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -4056,13 +4046,10 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
                 triangle_index: *triangle_index,
             },
         )?;
-        // The reserved TLUT encoding is a named refusal in `OtherMode`'s own
-        // decoder, propagated rather than coerced to Disabled -- which would
-        // silently sample a direct-format texel out of an indexed tile.
-        let lut_mode = draw_state
-            .other_mode
-            .texture_lut_mode()
-            .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+        // High bit 15 is `en_tlut`, bit 14 `tlut_type`; with the enable bit
+        // clear the type bit is dead and the TLUT is simply off (angrylion
+        // `src/core/n64video/rdp.c:630-631`).
+        let lut_mode = draw_state.other_mode.texture_lut_mode();
         // The image this call was handed must answer the identity its CALLER
         // selected: a pending post-image answers `Proposed`, durable state
         // answers `Committed`. Checked here rather than trusted, exactly as
@@ -4186,12 +4173,10 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     let key = candidate.key();
     verify_accesses_inside(&accesses, key)?;
 
-    // The reserved TLUT encoding is a named refusal in `OtherMode`'s own
-    // decoder, propagated rather than coerced to Disabled -- which would
-    // silently sample a direct-format texel out of an indexed tile.
-    let lut_mode = other_mode
-        .texture_lut_mode()
-        .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+    // High bit 15 is `en_tlut`, bit 14 `tlut_type`; with the enable bit clear
+    // the type bit is dead and the TLUT is simply off (angrylion
+    // `src/core/n64video/rdp.c:630-631`).
+    let lut_mode = other_mode.texture_lut_mode();
     // **The committed/pending distinction, asserted where it is crossed.**
     //
     // The image this call was handed must answer the identity its *caller*
@@ -15049,7 +15034,7 @@ mod tests {
                 .other_mode()
                 .expect("packet one set the mode")
                 .texture_lut_mode(),
-            Ok(crate::TextureLutMode::Disabled),
+            crate::TextureLutMode::Disabled,
             "positive control: durable state must really carry the first packet's TLUT-off \
              mode, or this test would pass vacuously against a register that never held it"
         );
@@ -15073,7 +15058,7 @@ mod tests {
                 .other_mode()
                 .expect("packet two set the mode")
                 .texture_lut_mode(),
-            Ok(crate::TextureLutMode::Rgba16),
+            crate::TextureLutMode::Rgba16,
             "positive control: the fold must really have happened, otherwise the walk could \
              read the live registers and still look correct"
         );
@@ -15130,7 +15115,7 @@ mod tests {
             .expect("the admitted triangle retrieves its draw state");
         assert_eq!(
             draw.other_mode.texture_lut_mode(),
-            Ok(crate::TextureLutMode::Disabled),
+            crate::TextureLutMode::Disabled,
             "the triangle stands BEFORE its packet's own SetOtherMode, so it must carry the \
              TLUT-off mode packet ONE set, never the G_TT_RGBA16 one packet two installs \
              after it -- seeding from the already-folded `rdp_state` is what sent WM2000's \
