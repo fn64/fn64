@@ -140,6 +140,23 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 | **B4** | **Triangle composition (V3).** Still the expensive renderer item, and still required for anything to look right. | Large, unchanged. | `RT64-WM2000-REMAINING.md` §3 |
 | **B5** | **`FN64_RENDER=wgpu` refuses general gfx tasks** (`production.rs:1579`), so the all-fn64 target stack cannot run this path at all yet. | Large, unchanged. | Brief; not re-measured here |
 
+> **Update, 2026-08-19 — B5 is stale, and B3 is now diagnosed further.**
+>
+> B5 claimed `FN64_RENDER=wgpu` refuses general gfx tasks at
+> `production.rs:1579`, blocking the all-fn64 stack entirely. No such refusal
+> exists in `production.rs` today, and the ROM disproves it directly: a clean
+> run on `FN64_RENDER=wgpu` with every guard live reaches 2,149 VI swaps and
+> 5,967 gfx tasks, exit 0, no panics. Treat B5 as closed.
+>
+> B3 (raster/VI fidelity) is confirmed in a captured frame from that run,
+> `docs/frames/wm2000-allguards-swap240.png`: the lower field is striped at a
+> one-pixel period. This card already noted the defect appears in attract as
+> well as menus, so it is not menu-specific.
+>
+> B4 (triangle composition) is unchanged and is now tracked as S1 in
+> [`RT64-WM2000-REMAINING.md`](RT64-WM2000-REMAINING.md), with the two
+> approaches that do not work already ruled out.
+
 **The sequencing consequence.** B1 and B2 do *not* reorder B4 — because
 reaching the menu did **not** change what the renderer is asked to do. A census
 taken with input driven through eighteen menu screens counts **21 distinct
