@@ -41,6 +41,9 @@
 //! - `FN64_GBI_CENSUS_OUT=<path>` -- write the census TSV there.
 //! - `FN64_GBI_TEXRECT_CENSUS=1` -- arm the per-`G_TEXRECT` cycle-mode probe.
 //! - `FN64_GBI_TEXRECT_CENSUS_OUT=<path>` -- write that probe's TSV there.
+//! - `FN64_GBI_OTHERMODE_CENSUS=1` -- arm the per-`G_RDPSETOTHERMODE` depth
+//!   mode-bit probe (Z_CMP/Z_UPD/ZMODE tallies).
+//! - `FN64_GBI_OTHERMODE_CENSUS_OUT=<path>` -- write that probe's TSV there.
 //! - `FN64_GBI_PACKET_DUMP=1` -- arm the raw RDP command-word dump.
 //! - `FN64_GBI_PACKET_DUMP_ENTRIES=<list>` -- comma-separated zero-based
 //!   decode entries to dump (default: entry 0 alone).
@@ -411,6 +414,7 @@ fn main() {
             // cycle-mode probe: it has no end-of-run report either, because
             // the run does not reach one.
             fn64_render_reference::gbi::census::texrect::report();
+            fn64_render_reference::gbi::census::othermode::report();
             // And to the packet dump, for the same reason. Its selection is
             // bounded by decode entry, so unlike the two censuses above it
             // stops growing once the selected entries are past -- but it
@@ -543,6 +547,7 @@ fn main() {
     // binary still works as a plain boot harness when it is not.
     fn64_render_reference::gbi::census::report();
     fn64_render_reference::gbi::census::texrect::report();
+    fn64_render_reference::gbi::census::othermode::report();
 }
 
 /// Dump the fb region at the VI's LIVE geometry -- never an assumed one.
