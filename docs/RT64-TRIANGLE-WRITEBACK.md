@@ -722,3 +722,24 @@ not have.** No synthetic fixture had a triangle taller than its target,
 because nobody thought to write one. The ROM run is not a formality after
 the harness work -- it is the only thing that exercises geometry the ROM
 actually emits.
+
+### ROM evidence: 2149 VI swaps, zero panics, exit 0
+
+With the texture rung admitted and the height bound fixed, WM2000 runs the
+full 400,000-step cap and terminates on its own:
+
+```
+steps= 50000  vi_swaps= 280   steps=250000  vi_swaps=1355
+steps=100000  vi_swaps= 555   steps=300000  vi_swaps=1626
+steps=150000  vi_swaps= 825   steps=350000  vi_swaps=1887
+steps=200000  vi_swaps=1087   steps=400000  vi_swaps=2149
+```
+
+Final: `VI swaps observed: 2149`, `gfx tasks submitted: 5967`,
+`last render error: None`, zero panics, exit 0. **Exactly the 2149-swap
+baseline, not merely near it** -- so admitting a million textured triangles
+into the CPU rasterizer costs no frames on this measure.
+
+Every checkpoint is listed because a mid-run checkpoint has been mistaken
+for a final result more than once in this project; the 2149 above is the
+LAST line, and the run's own summary block agrees with it.
