@@ -331,9 +331,267 @@ pub fn emit_module(funcs: &[ModuleFunc], symbols: &SymbolTable) -> String {
     out
 }
 
+
+/// One statically-known call target that the emitted module can never
+/// dispatch: a `JAL`/`J` immediate whose vram carries no function symbol, yet
+/// falls strictly **inside** the span of a function that IS emitted.
+///
+/// Such a target is emitted as `lookup(addr)`, but `addr` reaches neither
+/// `LOOKUP_TABLE` nor `BANKED_LOOKUP_TABLE` (both hold function ENTRY vrams
+/// only), so the call traps at run time via `trap_unsupported` -- arbitrarily
+/// far into the run, whenever the guest first takes that path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndispatchableCallTarget {
+    /// The unreachable target vram (the `lookup()` argument that will trap).
+    pub target: u32,
+    /// Name of the emitted function whose declared span contains `target`.
+    pub containing_function: String,
+    /// Entry vram of that containing function.
+    pub containing_vram: u32,
+    /// Every emitted function that contains a static call to `target`.
+    pub callers: Vec<String>,
+}
+
+/// Audit a module's functions for statically-known call targets that resolve
+/// indirect and are undispatchable (see [`UndispatchableCallTarget`]).
+///
+/// This is a **whole-module** property: neither the per-function emitter nor
+/// the dispatcher emitter can see it, because each half is individually
+/// correct. The emitter is right that an unknown vram must become `lookup()`;
+/// the dispatcher is right that only entry points belong in its tables. What
+/// is wrong is the *symbol table*, which failed to declare a function entry
+/// that the machine code plainly calls -- typically because the upstream
+/// symbol source mislabeled it, so the predecessor's declared size swallowed
+/// it.
+///
+/// Detecting it here converts a nondeterministic mid-run abort into a
+/// deterministic, named build-time finding that points at the exact missing
+/// symbol boundary.
+///
+/// Returns the findings ordered by target vram. An empty vector means every
+/// static call target in `funcs` is dispatchable.
+pub fn audit_undispatchable_call_targets(
+    funcs: &[ModuleFunc],
+    symbols: &SymbolTable,
+) -> Vec<UndispatchableCallTarget> {
+    use fn64_cpu_runtime::decode;
+
+    // Spans of every emitted function, from its declared word count.
+    let spans: Vec<(u32, u32, &str)> = funcs
+        .iter()
+        .map(|f| (f.vram, f.vram + (f.words.len() as u32) * 4, f.name))
+        .collect();
+
+    // target -> (containing function, callers)
+    let mut found: HashMap<u32, (String, u32, Vec<String>)> = HashMap::new();
+
+    for f in funcs {
+        for (i, &w) in f.words.iter().enumerate() {
+            let vram = f.vram + (i as u32) * 4;
+            let instr = decode(w);
+            // Only absolute JAL/J immediates carry a statically-known target.
+            let target = match instr {
+                fn64_cpu_runtime::Instruction::J { target }
+                | fn64_cpu_runtime::Instruction::Jal { target } => {
+                    (vram.wrapping_add(4) & 0xF000_0000) | (target << 2)
+                }
+                _ => continue,
+            };
+            // A target the symbol table resolves is emitted as a direct call.
+            if symbols.resolve(target) != CallTarget::Indirect {
+                continue;
+            }
+            // An ambiguous vram is a real entry reachable via the banked
+            // table; that is dispatchable, not a gap.
+            if symbols.is_ambiguous(target) {
+                continue;
+            }
+            // A target inside a function's span -- but not its entry -- can
+            // never be reached by an entry-keyed table.
+            let Some(&(cv, _, cname)) = spans
+                .iter()
+                .find(|&&(start, end, _)| target > start && target < end)
+            else {
+                continue;
+            };
+            let row = found
+                .entry(target)
+                .or_insert_with(|| (cname.to_string(), cv, Vec::new()));
+            if !row.2.iter().any(|c| c == f.name) {
+                row.2.push(f.name.to_string());
+            }
+        }
+    }
+
+    let mut out: Vec<UndispatchableCallTarget> = found
+        .into_iter()
+        .map(|(target, (containing_function, containing_vram, mut callers))| {
+            callers.sort();
+            UndispatchableCallTarget {
+                target,
+                containing_function,
+                containing_vram,
+                callers,
+            }
+        })
+        .collect();
+    out.sort_unstable_by_key(|f| f.target);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode `JAL <target>` (opcode 3) exactly as the ROM does.
+    fn jal(target: u32) -> u32 {
+        (3u32 << 26) | ((target & 0x0FFF_FFFF) >> 2)
+    }
+
+    /// The WM2000 swap-1901 abort, reduced to its exact shape: a caller makes
+    /// a static `JAL` to an address that is a real function entry in the ROM
+    /// but carries no symbol, so the predecessor's declared size swallows it.
+    /// The emitted call becomes `lookup(target)`, and no table holds a
+    /// non-entry vram, so it traps at run time.
+    #[test]
+    fn interior_static_call_target_is_reported_as_undispatchable() {
+        // The real `func_8012079C_bank3_text` is declared 75 words long, so
+        // its span runs 0x8012079C..0x801208C8 and swallows 0x80120854.
+        let swallower_words = [0u32; 75];
+        // The caller does `JAL 0x80120854` -- inside `swallower`, not its entry.
+        let caller_words = [jal(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "func_8012079C",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "func_801206D0",
+                vram: 0x8012_06D0,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("func_8012079C", 0x8012_079Cu32),
+            ("func_801206D0", 0x8012_06D0u32),
+        ]);
+
+        // The emitter really does render this as an undispatchable lookup.
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            module.contains("lookup(0x80120854)"),
+            "expected the swallowed target to be emitted as a lookup"
+        );
+        assert!(
+            !module.contains("(0x80120854, func_"),
+            "the swallowed target must NOT be in the dispatch table"
+        );
+
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(
+            findings,
+            vec![UndispatchableCallTarget {
+                target: 0x8012_0854,
+                containing_function: "func_8012079C".to_string(),
+                containing_vram: 0x8012_079C,
+                callers: vec!["func_801206D0".to_string()],
+            }]
+        );
+    }
+
+    /// The audit must not fire on the ordinary cases. A call to a declared
+    /// entry is direct; a call to an address outside every emitted span is a
+    /// host shim or a genuinely absent function, not a swallowed entry; and a
+    /// call to a function's own entry is dispatchable by definition.
+    #[test]
+    fn dispatchable_static_call_targets_are_not_reported() {
+        let callee_words = [0u32, 0];
+        // Calls: a declared entry, an address beyond every span, and an entry.
+        let caller_words = [jal(0x8012_0900), jal(0x8000_2000), jal(0x8012_0900)];
+        let funcs = [
+            ModuleFunc {
+                name: "callee",
+                vram: 0x8012_0900,
+                words: &callee_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols =
+            SymbolTable::from_entries([("callee", 0x8012_0900u32), ("caller", 0x8012_0A00u32)]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// A vram claimed by two overlay banks IS dispatchable -- through
+    /// `BANKED_LOOKUP_TABLE` -- so the audit must not confuse a bank
+    /// collision (correctly handled) with a swallowed entry (the defect).
+    #[test]
+    fn bank_ambiguous_interior_target_is_not_reported() {
+        let host_words = [0u32; 8];
+        let caller_words = [jal(0x800E_1B90), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "spanning",
+                vram: 0x800E_1B88,
+                words: &host_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x800E_2000,
+                words: &caller_words,
+            },
+        ];
+        // 0x800E1B90 is a real entry claimed by two banks, and it sits inside
+        // `spanning`'s declared span -- the audit must still let it pass.
+        let symbols = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90_bank4_text", 0x800E_1B90u32),
+            (1usize, "spanning", 0x800E_1B88u32),
+            (1usize, "caller", 0x800E_2000u32),
+        ]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// Every caller of one swallowed target is reported, de-duplicated and
+    /// sorted, so the finding names the whole repair surface at once.
+    #[test]
+    fn all_callers_of_one_swallowed_target_are_collected() {
+        let swallower_words = [0u32; 75];
+        let a_words = [jal(0x8012_0854), 0, jal(0x8012_0854)];
+        let b_words = [jal(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "zeta_caller",
+                vram: 0x8012_0900,
+                words: &a_words,
+            },
+            ModuleFunc {
+                name: "alpha_caller",
+                vram: 0x8012_0A00,
+                words: &b_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("swallower", 0x8012_079Cu32),
+            ("zeta_caller", 0x8012_0900u32),
+            ("alpha_caller", 0x8012_0A00u32),
+        ]);
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].callers,
+            vec!["alpha_caller".to_string(), "zeta_caller".to_string()]
+        );
+    }
 
     #[test]
     fn ambiguous_vram_is_left_indirect() {
