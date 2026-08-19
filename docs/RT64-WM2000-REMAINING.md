@@ -96,19 +96,35 @@ to re-check once the window reaches real play.
 - Whether the two recompiler lanes emit identical RDP streams is **unmeasured**.
 - Whether WM2000 latches VI filters beyond V1 is **unmeasured** — the census counts opcodes and does not decode `G_RDPSETOTHERMODE` payload bits or scissor rect values.
 
-## S1 — GPU triangles never reach guest memory (top card after the walls)
+## S1: GPU triangles never reach guest memory
 
-Verified by reading the crate, not inferred. `production.rs` says it in its
-own words near `stage_and_report`: the missing RDRAM writeback for the GPU
+This comes from reading the crate, not from inference. Near `stage_and_report`,
+`production.rs` states it directly: the missing RDRAM writeback for the GPU
 raster path "is a separate, pre-existing gap that this arm never closed."
 
-A `RawTriangle` pushes no `ResourceAccess`, so it declares no journal write
-and stages no `CompletedWrite`; its raster lands in `triangle_draw_output`,
-which `present` refuses to scan out by name ("one submission's readback, not
-a VI-sampled framebuffer").
+A `RawTriangle` pushes no `ResourceAccess`, so it declares no journal write and
+stages no `CompletedWrite`. Its raster lands in `triangle_draw_output`, which
+`present` refuses to scan out by name: "one submission's readback, not a
+VI-sampled framebuffer."
 
-Consequence, stated plainly: texrects are guest-visible, raw triangles are
-not. WM2000's title and HUD are texrects (2,520 measured), so clearing the
-seven walls yields a real frame -- and no 3D geometry at all. This is the
-ceiling on "playable", and it is a design change rather than a guard fix, so
-it does not parallelize with the wall cards.
+Texrects reach guest memory; raw triangles do not. WM2000's title and HUD are
+texrects (2,520 measured), so the ROM renders a real frame while no 3D geometry
+appears at all. A capture from a clean run with every guard live confirms this:
+see `docs/frames/wm2000-allguards-swap240.png`, which shows flat 2D bands and
+blocks and no geometry.
+
+S1 sets the ceiling on playable gameplay. Closing it requires a design change
+rather than a guard fix, so it does not parallelize with the guard cards.
+
+To close S1, write a CPU triangle rasterizer inside `fn64-render-wgpu`. Reading
+the GPU result back does not work: `TriangleDrawOutput.color_rgba8` is
+`Rgba8Unorm` against an RGBA16 guest framebuffer, and its extent comes from
+`RenderConfig` rather than `SetColorImage`. Rastering into the color target
+reduces to the same CPU work, because `ColorTargetRegistry`'s `device_bytes` is
+a CPU `Vec<u8>`. For the full analysis, see
+[the triangle writeback findings](RT64-TRIANGLE-WRITEBACK.md).
+
+`fn64-render-reference` already has a rasterizer, but it is a dev-dependency
+whose functions are `pub(super)`. Promoting it to a production dependency puts
+the software reference renderer back into the stack that this goal excludes, so
+the rasterizer has to be written fresh in-crate.
