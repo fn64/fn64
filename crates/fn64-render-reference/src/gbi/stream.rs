@@ -1375,6 +1375,20 @@ pub(super) fn decode_stream_impl(
                     combiner: state.combiner,
                     blender: active_blender(state),
                     scissor: state.scissor,
+                    // **`max_level` is 0 here deliberately, not for want of a
+                    // value to read.** `state.tex.tex_max_level` IS latched
+                    // (`G_TEXTURE`'s own field(w0,11,3), above), and the
+                    // TRIANGLE path passes it (`geometry.rs`'s
+                    // `active_texture`). A texture rectangle must not: it is
+                    // an RDP-side command that names its own tile in wire
+                    // word 1 bits 26:24 (`tile`, decoded just above), so it
+                    // deliberately consumes NONE of `G_TEXTURE`'s three
+                    // RSP-side fields -- not the on-bit (field(w0,1,7),
+                    // which gates only `active_texture`), not the tile
+                    // (field(w0,8,3), overridden by the wire tile here), and
+                    // therefore not max-level (field(w0,11,3)) either. All
+                    // three live in one word; honoring one while ignoring
+                    // the other two would be the inconsistency.
                     texture: bind_texture_set(&state.tex, tile, 0, state.other_mode.texture_lut()),
                     texture1: texture_for_tile(
                         &state.tex,
