@@ -84,3 +84,24 @@ correctly. Check the caller before concluding the feature is missing.
 correct guards protecting a real invariant, and admitting the input would have
 combined against a fabricated value. Establish what the hardware does, with a
 citation, before widening anything.
+
+**A guard's stated reason can expire without the guard noticing.** Three
+refusals in this crate have now been removed after measurement showed their
+justification described the file at the commit that wrote it rather than the
+file today: `TexrectWithoutTmemLoad`, `MixedTexrectAndRawTrianglePacket`, and
+`MixedFillAndTrianglePacket`. Each was correct when written, each carried a
+carefully argued comment, and each was outlived by a seam that landed later --
+the N-command accumulation in `stage_color_commands`, which made Fill, Texrect
+and RawTriangle peer citizens of one journal-ordered CPU buffer. So when a
+guard's comment asserts two things are "disjoint with no defined ordering",
+check whether that is still true of the current call graph before accepting it.
+Read the executors the guard names, not only the guard.
+
+**Prefer a per-access invariant to a per-packet shape gate.** All three of those
+refusals approximated, at packet granularity, something the journal already
+enforces exactly: every declared write claimed once, every staged write declared
+(`MergedWriteUnclaimed`/`MergedWriteUndeclared`), every range inside its target
+(`FillAccessOutsideTarget`). The shape gate could only be conservative, and each
+time it was conservative in a way that dropped real guest-visible commands to
+withhold one that was invisible anyway. When retargeting such a test, point it
+at the per-access invariant rather than deleting it.
