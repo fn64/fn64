@@ -458,3 +458,110 @@ fn the_attribute_sample_point_follows_the_checkerboard_too() {
     // 7/8 px = 57344; major edge = 49152. 57344 - 49152 = 8192 = 0.125 px.
     assert_eq!(delta_x, 8192);
 }
+
+
+// ---------------------------------------------------------------------------
+// Coefficient block decode: the split integer/fraction layout
+// ---------------------------------------------------------------------------
+
+/// Builds one 8-word coefficient block from four (integer, fraction) byte
+/// pairs, each carrying four Q16.16 components.
+///
+/// Written from the WIRE layout, independently of the decoder: the block is
+/// 64 bytes = 16 u32 halves, half `n` is byte `4n`, and each component's
+/// high 16 bits go at the integer offset while its low 16 bits go at the
+/// fraction offset sixteen bytes later.
+fn coefficient_block(
+    value: [i32; 4],
+    dx: [i32; 4],
+    de: [i32; 4],
+    dy: [i32; 4],
+) -> super::super::triangle::CoefficientWords {
+    let mut halves = [0u32; 16];
+    let mut put = |integer_byte: usize, fraction_byte: usize, components: [i32; 4]| {
+        for (index, component) in components.iter().enumerate() {
+            let half_index = integer_byte / 4 + index / 2;
+            let fraction_index = fraction_byte / 4 + index / 2;
+            // Component 0 and 2 sit in their u32's HIGH half; 1 and 3 in the low.
+            let shift = if index % 2 == 0 { 16 } else { 0 };
+            halves[half_index] |= (((*component >> 16) as u32) & 0xffff) << shift;
+            halves[fraction_index] |= ((*component as u32) & 0xffff) << shift;
+        }
+    };
+    put(0, 16, value);
+    put(8, 24, dx);
+    put(32, 48, de);
+    put(40, 56, dy);
+
+    // Round-tripped through the REAL decoder rather than by constructing
+    // `RawWord` directly (whose fields are private, and rightly so): a
+    // shaded triangle carries exactly this block after its four base-edge
+    // words, so `RawTriangle::decode` hands back the same `CoefficientWords`
+    // the stream would produce.
+    let mut bytes = Vec::with_capacity(96);
+    for word in [(1u32 << 23) | 12, 12u32 << 16, 0, 0, 0, 0, 0, 0] {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    for half in halves {
+        bytes.extend_from_slice(&half.to_be_bytes());
+    }
+    *RawTriangle::decode(0x0c, &bytes)
+        .expect("a shaded triangle is 32 + 64 bytes")
+        .shade()
+        .expect("opcode 0x0c carries a shade block")
+}
+
+#[test]
+fn shade_planes_pair_each_components_integer_with_its_own_fraction() {
+    // Four distinct Q16.16 values whose integer AND fraction halves are all
+    // different, so pairing any component's integer with another's fraction
+    // is visible.
+    let value = [0x0001_1111, 0x0002_2222, 0x0003_3333, 0x0004_4444];
+    let dx = [0x0011_00aa, 0x0012_00bb, 0x0013_00cc, 0x0014_00dd];
+    let de = [0x0021_0101, 0x0022_0202, 0x0023_0303, 0x0024_0404];
+    let dy = [0x0031_1001, 0x0032_2002, 0x0033_3003, 0x0034_4004];
+    let planes = shade_planes(&coefficient_block(value, dx, de, dy));
+    for component in 0..4 {
+        assert_eq!(planes[component].base, value[component], "base {component}");
+        assert_eq!(planes[component].dx, dx[component], "dx {component}");
+        assert_eq!(planes[component].de, de[component], "de {component}");
+        assert_eq!(planes[component].dy, dy[component], "dy {component}");
+    }
+}
+
+#[test]
+fn texture_planes_read_s_t_and_w_from_the_same_layout() {
+    // The texture block carries only three components; the fourth slot of
+    // each pair is unused. Filling it with a distinctive value proves the
+    // decode does not read it into S, T or W.
+    let value = [0x0005_5555, 0x0006_6666, 0x0007_7777, 0x7fff_ffffu32 as i32];
+    let dx = [0x0015_00ee, 0x0016_00ff, 0x0017_0011, 0x7fff_ffffu32 as i32];
+    let de = [0x0025_0505, 0x0026_0606, 0x0027_0707, 0x7fff_ffffu32 as i32];
+    let dy = [0x0035_5005, 0x0036_6006, 0x0037_7007, 0x7fff_ffffu32 as i32];
+    let planes = texture_planes(&coefficient_block(value, dx, de, dy));
+    assert_eq!(planes.len(), 3, "S, T and W only");
+    for component in 0..3 {
+        assert_eq!(planes[component].base, value[component], "base {component}");
+        assert_eq!(planes[component].dx, dx[component], "dx {component}");
+        assert_eq!(planes[component].de, de[component], "de {component}");
+        assert_eq!(planes[component].dy, dy[component], "dy {component}");
+    }
+}
+
+#[test]
+fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
+    // The integer half is signed and the fraction half is NOT: a value of
+    // -1.5 is integer 0xFFFE with fraction 0x8000, and reassembling it must
+    // give 0xFFFE_8000 -- not 0xFFFF_8000, which sign-extending the whole
+    // 32 bits would produce.
+    let negative = 0xFFFE_8000u32 as i32;
+    let planes = shade_planes(&coefficient_block(
+        [negative, 0, 0, 0],
+        [0; 4],
+        [0; 4],
+        [0; 4],
+    ));
+    assert_eq!(planes[0].base, negative);
+    assert_eq!(planes[0].base >> 16, -2, "the integer part is -2");
+    assert_eq!(planes[0].base as u32 & 0xffff, 0x8000, "the fraction is 0.5");
+}
