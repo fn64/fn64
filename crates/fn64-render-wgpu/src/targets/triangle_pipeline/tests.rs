@@ -666,17 +666,16 @@ fn fragment_combine_params_byte_layout_is_16_bytes_with_low_high_and_texture_ref
 /// and `Threshold` boundary values 0/255.
 #[test]
 fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold_alpha() {
-    let none_bytes = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::None, Color4::from_wire(0));
+    let none_bytes =
+        fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::None, Color4::from_wire(0));
     assert_eq!(none_bytes.len(), ALPHA_COMPARE_PARAMS_BYTES as usize);
     assert_eq!(&none_bytes[0..4], &0u32.to_le_bytes());
     assert_eq!(&none_bytes[4..8], &0u32.to_le_bytes());
     assert_eq!(&none_bytes[8..16], &[0u8; 8]);
 
     let blend_color = crate::state::Color4::from_wire(0x1122_33AA);
-    let threshold_bytes = fragment_alpha_compare_params_bytes(
-        crate::state::AlphaCompare::Threshold,
-        blend_color,
-    );
+    let threshold_bytes =
+        fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Threshold, blend_color);
     assert_eq!(&threshold_bytes[0..4], &1u32.to_le_bytes());
     assert_eq!(&threshold_bytes[4..8], &0xAAu32.to_le_bytes());
     assert_eq!(&threshold_bytes[8..16], &[0u8; 8]);
@@ -697,13 +696,19 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
 #[test]
 #[should_panic(expected = "must have been rejected at retrieval time")]
 fn fragment_alpha_compare_params_bytes_rejects_reserved_mode_defensively() {
-    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Reserved, Color4::from_wire(0));
+    let _ = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Reserved,
+        Color4::from_wire(0),
+    );
 }
 
 #[test]
 #[should_panic(expected = "must have been rejected at retrieval time")]
 fn fragment_alpha_compare_params_bytes_rejects_dither_mode_defensively() {
-    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Dither, Color4::from_wire(0));
+    let _ = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Dither,
+        Color4::from_wire(0),
+    );
 }
 
 /// Byte-offset proof for `FragmentCoverageParams` (production coverage node
@@ -958,7 +963,8 @@ fn fragment_coverage_params_bytes_allows_clamp_and_wrap_without_image_read_enabl
 /// known-wire `Color4`/`PrimColor` pair.
 #[test]
 fn fragment_material_params_byte_layout_is_48_bytes_with_env_prim_and_lod_frac() {
-    let none_bytes = fragment_material_params_bytes(Color4::from_wire(0), PrimColor::from_wire(0, 0));
+    let none_bytes =
+        fragment_material_params_bytes(Color4::from_wire(0), PrimColor::from_wire(0, 0));
     assert_eq!(none_bytes.len(), MATERIAL_PARAMS_BYTES as usize);
     assert_eq!(&none_bytes[0..16], &[0u8; 16]);
     assert_eq!(&none_bytes[16..32], &[0u8; 16]);
@@ -1342,8 +1348,7 @@ fn tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_the_cpu_reader_palettizes() 
         (0u16, tlut_fixture::PACKED_ROW0 >> 4),
         (1, tlut_fixture::PACKED_ROW0 & 0x0f),
     ] {
-        let addressed =
-            crate::AddressedTmemTexel::new(column, 0, crate::TmemFirstRowParity::Even);
+        let addressed = crate::AddressedTmemTexel::new(column, 0, crate::TmemFirstRowParity::Even);
         let decoded = crate::read_texel(
             &source,
             descriptor,
@@ -1375,7 +1380,6 @@ fn tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_the_cpu_reader_palettizes() 
         assert_ne!(expected_value, decoy_value);
     }
 }
-
 
 // ===================================================================
 // CPU-vs-GPU texel-path pins.
@@ -1426,8 +1430,7 @@ fn tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_the_cpu_reader_palettizes() 
 #[test]
 fn a_sixteen_bit_tlut_texel_with_an_invalid_low_byte_splits_the_two_lanes() {
     let descriptor = tlut_fixture::descriptor_sixteen_bit();
-    let addressed =
-        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+    let addressed = crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
 
     // Byte 0 (the high byte, the index) valid; byte 1 (the low byte,
     // discarded by both sides' arithmetic) removed.
@@ -1515,8 +1518,7 @@ fn an_out_of_range_palette_is_refused_by_the_cpu_and_masked_by_the_shader() {
          nothing about the CPU guard"
     );
 
-    let addressed =
-        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+    let addressed = crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
 
     // The CPU refuses by name, before any byte is read.
     assert!(
@@ -1772,8 +1774,7 @@ fn an_enabled_tlut_tile_in_the_high_half_wraps_on_both_lanes() {
          not testing the boundary"
     );
 
-    let addressed =
-        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+    let addressed = crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
     let source = tlut_fixture::source();
 
     // The byte at 0x0800 is valid TLUT data, so nothing here can be an
@@ -1883,9 +1884,9 @@ mod host_gpu_tests {
                 EXTENT,
                 projection,
                 tile_binding,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::default(),
                 ResolvedFragmentBlendParams::NO_OP,
                 false,
             )
@@ -2270,11 +2271,10 @@ mod host_gpu_tests {
 
         let descriptor = tlut_fixture::descriptor();
         let size = tlut_fixture::size();
-        let tile_binding = TileBindingParams::bound(descriptor, size)
-            .with_lut_mode(crate::TextureLutMode::Rgba16);
+        let tile_binding =
+            TileBindingParams::bound(descriptor, size).with_lut_mode(crate::TextureLutMode::Rgba16);
         assert_ne!(
-            tile_binding.format,
-            0,
+            tile_binding.format, 0,
             "the fixture must NOT be RGBA -- an RGBA16 tile would pass \
              through the pre-existing direct arm without exercising the fix"
         );
@@ -2332,9 +2332,9 @@ mod host_gpu_tests {
                     EXTENT,
                     tlut_fixture::projection(),
                     tile_binding,
-                    None,
-                    None,
-                    None,
+                    Color4::from_wire(0),
+                    Color4::from_wire(0),
+                    PrimColor::default(),
                     ResolvedFragmentBlendParams::NO_OP,
                     false,
                 )
@@ -2385,8 +2385,6 @@ mod host_gpu_tests {
             );
         }
     }
-
-
 
     /// WM2000's OWN sprite-strip tile, rebuilt from its measured wire
     /// fields -- the shape `tlut_fixture` above cannot express, because
@@ -2584,10 +2582,7 @@ mod host_gpu_tests {
     #[test]
     fn the_uploaded_low_t_carries_the_same_first_row_parity_the_cpu_reader_is_given() {
         for (size, expected) in [
-            (
-                wm2000_strip_fixture::size(),
-                crate::TmemFirstRowParity::Odd,
-            ),
+            (wm2000_strip_fixture::size(), crate::TmemFirstRowParity::Odd),
             (tlut_fixture::size(), crate::TmemFirstRowParity::Even),
         ] {
             // `targets/texrect.rs`'s derivation, the CPU reader's input.
@@ -2638,8 +2633,8 @@ mod host_gpu_tests {
         let mut renderer = tlut_renderer();
         let descriptor = wm2000_strip_fixture::descriptor();
         let size = wm2000_strip_fixture::size();
-        let tile_binding = TileBindingParams::bound(descriptor, size)
-            .with_lut_mode(crate::TextureLutMode::Rgba16);
+        let tile_binding =
+            TileBindingParams::bound(descriptor, size).with_lut_mode(crate::TextureLutMode::Rgba16);
         assert_eq!(
             (tile_binding.low_t >> 2) & 1,
             1,
@@ -2669,9 +2664,9 @@ mod host_gpu_tests {
                     EXTENT,
                     wm2000_strip_fixture::projection(),
                     tile_binding,
-                    None,
-                    None,
-                    None,
+                    Color4::from_wire(0),
+                    Color4::from_wire(0),
+                    PrimColor::default(),
                     ResolvedFragmentBlendParams::NO_OP,
                     false,
                 )
@@ -3238,7 +3233,7 @@ mod host_gpu_tests {
     fn uniform_alpha_fixture(
         alpha: f32,
         alpha_compare_mode: crate::state::AlphaCompare,
-        blend_color: Option<crate::state::Color4>,
+        blend_color: crate::state::Color4,
     ) -> TriangleFixture {
         let mut fixture = covering_triangle_fixture();
         for vertex in &mut fixture.vertices {
@@ -3278,7 +3273,8 @@ mod host_gpu_tests {
         // byte 26) must still write, proving None never gates on alpha at
         // all, not merely that this particular alpha happens to pass a
         // threshold.
-        let none_fixture = uniform_alpha_fixture(0.1, crate::state::AlphaCompare::None, None);
+        let none_fixture =
+            uniform_alpha_fixture(0.1, crate::state::AlphaCompare::None, Color4::from_wire(0));
         let none_output = renderer
             .submit_triangle(none_fixture)
             .unwrap()
@@ -3302,11 +3298,8 @@ mod host_gpu_tests {
         // (`Color4::rgba8`'s big-endian doc), so `0x0000_00C8` (200) is the
         // threshold-only wire value; R/G/B are irrelevant to alpha compare.
         let blend_color = crate::state::Color4::from_wire(0x0000_00C8);
-        let threshold_fixture = uniform_alpha_fixture(
-            0.1,
-            crate::state::AlphaCompare::Threshold,
-            Some(blend_color),
-        );
+        let threshold_fixture =
+            uniform_alpha_fixture(0.1, crate::state::AlphaCompare::Threshold, blend_color);
         assert_eq!(blend_color.rgba8()[3], 200);
         let threshold_output = renderer
             .submit_triangle(threshold_fixture)
@@ -3820,7 +3813,7 @@ mod host_gpu_tests {
         // is not the property being measured, and the depth matrix has its
         // own dedicated tests.
         fixture.depth_compare_enabled = false;
-        fixture.blend_color = Some(blend_color);
+        fixture.blend_color = blend_color;
         fixture.force_blend = force_blend;
         fixture.blend_params = ResolvedFragmentBlendParams {
             cycle_count: 1,
@@ -3831,8 +3824,8 @@ mod host_gpu_tests {
                 m: crate::blend::BlendColorInput::Combined,
                 b: crate::blend::BlendBInput::Zero,
             },
-            blend_color: Some(blend_color),
-            fog_color: Some(fog_color),
+            blend_color: blend_color,
+            fog_color: fog_color,
             reads_framebuffer_color: true,
         };
         fixture
@@ -3853,7 +3846,7 @@ mod host_gpu_tests {
         for vertex in &mut fixture.vertices {
             vertex.color = shade_color;
         }
-        fixture.blend_color = Some(blend_color);
+        fixture.blend_color = blend_color;
         fixture.force_blend = true;
         fixture.blend_params = ResolvedFragmentBlendParams {
             cycle_count: 1,
@@ -3864,8 +3857,8 @@ mod host_gpu_tests {
                 m: crate::blend::BlendColorInput::Combined,
                 b: crate::blend::BlendBInput::Zero,
             },
-            blend_color: Some(blend_color),
-            fog_color: Some(fog_color),
+            blend_color: blend_color,
+            fog_color: fog_color,
             reads_framebuffer_color: false,
         };
         fixture
