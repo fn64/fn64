@@ -465,3 +465,47 @@ was right that ~1900 "is not a fact about the guest"; it is a fact about which
 function the guest happens to reach, and different input schedules reach it at
 different swaps. Reaching the plateau needs that lookup gap closed, or a lead-in
 that routes around `0x80120854`.
+
+### The ~1900 abort, diagnosed: a mid-function indirect jump target
+
+The card above refuted three explanations for the swap-1901 abort and left the
+cause open. It is now named, from the emitted crate rather than by inference.
+
+The trap is `lookup: no recompiled function or host shim at vram 0x80120854`.
+Grepping the emitted crate for that address finds three sites:
+
+```
+src/part_013.rs:3688:            lookup(0x80120854)(ctx, mem);
+src/part_001.rs:5857:            pc = 0x80120854;
+src/part_001.rs:5859:        0x80120854 => {
+```
+
+The third line is the decisive one. `0x80120854` **is** emitted -- as an
+ordinary instruction inside a function body:
+
+```
+0x80120854: Addiu { rt: 3, rs: 2, imm: 8 }
+```
+
+It is not a function entry. The nearest emitted symbol below it is
+`func_8012079C` and the next one above is `func_801208C8`, so `0x80120854` sits
+**mid-body inside `func_8012079C`**. The guest computes a jump target that lands
+part-way into a function, and `lookup` resolves against `LOOKUP_TABLE`, which by
+construction holds function ENTRY points only. There is no body at that vram
+because a body is not what lives there.
+
+So this is neither a missing function (the code is emitted and reachable as a
+`pc` case at part_001.rs:5859) nor a stub disposition (`0x80120854` appears in
+none of the gap report's stubbed, runtime-trap, or bank-ambiguous tables). It is
+an **indirect dispatch to a mid-function address**, which the flat entry-point
+lookup cannot express. The gap report's own framing covers the neighbouring
+case -- "a flat `vram -> fn` array cannot say which bank is resident" -- and this
+is the adjacent limitation: a flat entry-point array cannot say which function
+CONTAINS an address.
+
+This is an R1/R2-class recompiler item and not a renderer defect. It is also
+why the plateau is out of reach on this lead-in: the abort lands at swap 1901
+and the plateau starts at 2500. Closing it needs either a containing-function
+resolution for indirect targets (`vram -> (function, offset)` rather than
+`vram -> function`), or a lead-in that never routes through `func_8012079C`'s
+computed jump. Which of those is right is **not** determined here.
