@@ -85,9 +85,9 @@ fn covering_triangle_fixture() -> TriangleFixture {
         tmem,
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
-        blend_color: None,
-        env_color: None,
-        prim_color: None,
+        blend_color: Color4::from_wire(0),
+        env_color: Color4::from_wire(0),
+        prim_color: PrimColor::from_wire(0, 0),
         blend_params: ResolvedFragmentBlendParams::NO_OP,
         // (Z_CMP, Z_UPD) = (set, set): the pipeline's prior sole state
         // (`depth_pipeline_index((true, true)) == 0`, `Less`/write-always)
@@ -666,7 +666,7 @@ fn fragment_combine_params_byte_layout_is_16_bytes_with_low_high_and_texture_ref
 /// and `Threshold` boundary values 0/255.
 #[test]
 fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold_alpha() {
-    let none_bytes = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::None, None);
+    let none_bytes = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::None, Color4::from_wire(0));
     assert_eq!(none_bytes.len(), ALPHA_COMPARE_PARAMS_BYTES as usize);
     assert_eq!(&none_bytes[0..4], &0u32.to_le_bytes());
     assert_eq!(&none_bytes[4..8], &0u32.to_le_bytes());
@@ -675,7 +675,7 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
     let blend_color = crate::state::Color4::from_wire(0x1122_33AA);
     let threshold_bytes = fragment_alpha_compare_params_bytes(
         crate::state::AlphaCompare::Threshold,
-        Some(blend_color),
+        blend_color,
     );
     assert_eq!(&threshold_bytes[0..4], &1u32.to_le_bytes());
     assert_eq!(&threshold_bytes[4..8], &0xAAu32.to_le_bytes());
@@ -683,13 +683,13 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
 
     let zero_threshold = fragment_alpha_compare_params_bytes(
         crate::state::AlphaCompare::Threshold,
-        Some(crate::state::Color4::from_wire(0)),
+        crate::state::Color4::from_wire(0),
     );
     assert_eq!(&zero_threshold[4..8], &0u32.to_le_bytes());
 
     let max_threshold = fragment_alpha_compare_params_bytes(
         crate::state::AlphaCompare::Threshold,
-        Some(crate::state::Color4::from_wire(0xFFFF_FFFF)),
+        crate::state::Color4::from_wire(0xFFFF_FFFF),
     );
     assert_eq!(&max_threshold[4..8], &255u32.to_le_bytes());
 }
@@ -697,13 +697,13 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
 #[test]
 #[should_panic(expected = "must have been rejected at retrieval time")]
 fn fragment_alpha_compare_params_bytes_rejects_reserved_mode_defensively() {
-    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Reserved, None);
+    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Reserved, Color4::from_wire(0));
 }
 
 #[test]
 #[should_panic(expected = "must have been rejected at retrieval time")]
 fn fragment_alpha_compare_params_bytes_rejects_dither_mode_defensively() {
-    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Dither, None);
+    let _ = fragment_alpha_compare_params_bytes(crate::state::AlphaCompare::Dither, Color4::from_wire(0));
 }
 
 /// Byte-offset proof for `FragmentCoverageParams` (production coverage node
@@ -958,7 +958,7 @@ fn fragment_coverage_params_bytes_allows_clamp_and_wrap_without_image_read_enabl
 /// known-wire `Color4`/`PrimColor` pair.
 #[test]
 fn fragment_material_params_byte_layout_is_48_bytes_with_env_prim_and_lod_frac() {
-    let none_bytes = fragment_material_params_bytes(None, None);
+    let none_bytes = fragment_material_params_bytes(Color4::from_wire(0), PrimColor::from_wire(0, 0));
     assert_eq!(none_bytes.len(), MATERIAL_PARAMS_BYTES as usize);
     assert_eq!(&none_bytes[0..16], &[0u8; 16]);
     assert_eq!(&none_bytes[16..32], &[0u8; 16]);
@@ -967,7 +967,7 @@ fn fragment_material_params_byte_layout_is_48_bytes_with_env_prim_and_lod_frac()
 
     let env_color = crate::state::Color4::from_wire(0x1122_33AA);
     let prim_color = crate::state::PrimColor::from_wire(0x0000_0080, 0x4455_66BB);
-    let material_bytes = fragment_material_params_bytes(Some(env_color), Some(prim_color));
+    let material_bytes = fragment_material_params_bytes(env_color, prim_color);
     assert_eq!(
         &material_bytes[0..16],
         &bytemuck_f32x4(env_color.normalized())
@@ -1063,9 +1063,9 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
         tmem,
         tile_binding,
         alpha_compare_mode: crate::state::AlphaCompare::None,
-        blend_color: None,
-        env_color: None,
-        prim_color: None,
+        blend_color: Color4::from_wire(0),
+        env_color: Color4::from_wire(0),
+        prim_color: PrimColor::from_wire(0, 0),
         blend_params: ResolvedFragmentBlendParams::NO_OP,
         depth_compare_enabled: true,
         depth_update_enabled: true,
