@@ -406,6 +406,8 @@ mod tmem;
 mod vi;
 mod vi_scanout;
 #[cfg(test)]
+mod rdp_harness;
+#[cfg(test)]
 mod wire_words;
 
 pub use alpha_compare::{
