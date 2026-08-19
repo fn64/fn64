@@ -304,3 +304,48 @@ consumer-side mutant — PASSED it, because the test never exercised the call
 site. That is the same trap f2c52822's own first draft hit, and the reason
 `execute_raw_dpc_seeds_other_mode_from_the_pre_delta_snapshot` exists as a
 source-level call-site pin. Recorded here rather than quietly fixed.
+
+## Verification
+
+Both suite configurations, in this worktree, with the fix:
+
+- `cargo nextest run --workspace --offline` — **8505 passed, 13 skipped**
+  (baseline 8502/13, plus the three tests this card adds).
+- `cargo nextest run -p fn64-render-wgpu --features host-gpu-tests --offline`
+  — **4793 passed, 3 skipped** (baseline 4790/3, same three tests). GPU
+  results are one-adapter (Apple Metal, M5 Pro).
+
+## ROM result — the point of the card
+
+Two runs, each with a FRESH scratch dir, and **they agree exactly**:
+
+| run | log | scratch | VI swaps | failure |
+|---|---|---|---|---|
+| A | `/private/tmp/fix-a.log` | `/private/tmp/fix-a` | **1887** | combiner slot admission |
+| B | `/private/tmp/fix-b.log` | `/private/tmp/fix-b` | **1887** | combiner slot admission |
+
+**280 → 1887 VI swaps, a 6.7x advance past the baseline.**
+
+The 0x080 TMEM abort is gone. The new wall is a different refusal in a
+different subsystem:
+
+```
+crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202
+execute_raw_dpc: render-wgpu/raw-dpc-execute backend error:
+execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO
+color inputs (plus COMBINED in a two-cycle program's second cycle);
+slot B selects Combined
+```
+
+That is `TexrectExecutionError::UnsupportedColorInput`
+(`crates/fn64-render-wgpu/src/targets/texrect.rs`) — a declared unimplemented
+combiner input, not a correctness guard tripping. Out of scope for this card;
+NOT fixed here.
+
+## What was NOT fixed
+
+- `combine`, the constant colors and `color_image` are still seeded from the
+  post-fold `rdp_state` in `execute_raw_dpc`. The same time-travel argument
+  applies to all of them, but no measurement implicates them, and f2c52822's
+  rule (do not widen without evidence) is deliberately kept.
+- The new combiner-input wall at 1887 swaps.
