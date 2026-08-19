@@ -127,3 +127,53 @@ and the body is 378 instructions (`378 * 4 = 0x5E8`) beginning
 * The uncovered-entry check is not WM2000-specific and should be run across the
   corpus; SM64's 332 swallowed entries suggest this class may also be present
   at scale.
+
+## Verification
+
+| suite | result | baseline |
+|---|---|---|
+| `cargo nextest run --workspace --offline` | **8637 passed, 13 skipped** | 8627 / 13 |
+| `cargo nextest run -p fn64-render-wgpu --features host-gpu-tests --offline` | **4872 passed, 3 skipped** | 4872 / 3 |
+
+The +10 on the workspace suite is this card's new tests.
+
+### Tests, with fail-before / pass-after
+
+All in `crates/fn64-cpu-runtime-codegen/src/swallowed_entries.rs`. Fail-before
+was verified by restoring the silent `continue` in `cross_check_region`; each
+of these then FAILS, and PASSES with the change in place.
+
+| test | what it pins |
+|---|---|
+| `a_jal_proven_root_in_a_gap_is_reported_as_uncovered_and_adopted` | the WM2000 shape: reported, adopted, neighbours undisturbed |
+| `a_jal_target_inside_no_declared_function_is_reported_but_not_swallowed` | rewrite of the test that asserted the OLD silent-skip behaviour |
+| `an_uncovered_gap_that_never_returns_is_refused` | the terminator precondition |
+| `an_uncovered_root_that_is_not_at_the_gap_start_is_refused` | the real `0x800400CC` refusal shape |
+| `a_gap_whose_trailing_words_are_live_instructions_is_refused` | nop-tail-padding, at the one reachable shape |
+| `the_gap_ends_at_the_nearest_declared_function_not_the_farthest` | `gap_end` uses `min` |
+| `the_gap_starts_at_the_nearest_declared_function_below_the_root` | `gap_start` uses `max` |
+| `adoption_declines_when_the_range_is_already_claimed` | the overlap guard |
+| `a_root_inside_a_declared_function_is_swallowed_not_uncovered` | the two repair classes stay disjoint |
+| `the_diagnostic_names_uncovered_entries_and_their_evidence` | the build-time report |
+
+### Mutation results
+
+Seven mutants, all KILLED: drop `NotAtGapStart`; always-accept; tail-padding
+check -> `true`; adopt refused entries; `gap_end` `min` -> `max`; `gap_start`
+`max` -> `min`; drop the overlap guard.
+
+Four of those survived the first test pass, every one because the fixture
+sampled a point where the correct and incorrect answers coincide:
+
+* the tail-padding mutant was never even evaluated -- an earlier guard already
+  refused each fixture. The reachable shape (return at `gap_end - 12`, a live
+  word after its delay slot) was found by exhaustively comparing the real and
+  mutated classifier over all small gaps built from `{jr $ra, nop, live}`.
+* the `gap_end` and `gap_start` mutants needed two declared neighbours on the
+  relevant side; every fixture had one, so `min` and `max` agreed.
+
+One mutant is EQUIVALENT and was removed rather than papered over: the second
+"only nop may precede the end" guard in `classify_gap_adoption` could not
+change any answer (same exhaustive comparison). Untestable code that looks
+load-bearing is its own hazard, so it is deleted with the reasoning kept in a
+comment.
