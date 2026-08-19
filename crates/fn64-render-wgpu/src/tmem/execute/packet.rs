@@ -1568,12 +1568,15 @@ mod tests {
             }
         }
 
+        // The offset palette must not be rebased onto lower indices: index
+        // 0 resolves to word 0x800, which this fixture never loaded, so the
+        // read still refuses. The refusal is now the file-wide
+        // `InvalidTexelByte` naming lane 0's own first byte, which is the
+        // rule that survived the wall-4/5 narrowing -- an unwritten byte is
+        // never invented, only lanes 1..3's validity stopped being consulted.
         assert_eq!(
             read_committed_texel(&state, unloaded_ci8, even, TextureLutMode::Rgba16),
-            Err(PhysicalTexelReadError::IncompleteTlutEntry {
-                byte_address: 0x800,
-                valid_mask: 0,
-            }),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x800 }),
             "an offset partial palette must not be rebased onto lower indices"
         );
     }
@@ -1622,8 +1625,17 @@ mod tests {
         assert_eq!(observe_durable(&state), before);
     }
 
+    /// Renamed from `committed_reader_rejects_partial_and_unequal_tlut_words`.
+    /// The reader no longer rejects either shape: RT64's palette read
+    /// (`src/shaders/TextureDecoder.hlsli:28,179`, pinned port source
+    /// `5473732a`) addresses lane 0's two bytes and nothing else, and
+    /// `fn64-render-reference`'s `read_tlut` (`src/gbi/state.rs:853-869`)
+    /// agrees. Both fixtures below still exercise the same TMEM states
+    /// this test always built; only the expected answer changed, and each
+    /// expected color is hand-derived from the fixture's own bytes rather
+    /// than read back from the reader.
     #[test]
-    fn committed_reader_rejects_partial_and_unequal_tlut_words() {
+    fn committed_reader_resolves_partial_and_unequal_tlut_words_from_lane_zero() {
         let ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
 
         let (words, ranges) = ci_and_hostile_tlut_word_words(2);
@@ -1646,14 +1658,18 @@ mod tests {
         );
         let size = reader_size(0, 0, 0, 0);
         let partial_before = observe_durable(&partial);
+        // `ci_and_hostile_tlut_word_words(2)` loads exactly two high-half
+        // bytes, so word 0x800 carries validity mask 0x03: lane 0 valid,
+        // lanes 1..3 never written. The fixture's RDRAM at 0x300 counts up
+        // from zero, so those two bytes are `00 01` and lane 0 is 0x0001.
+        // RGBA16 5/5/5/1 reads 0x0001 as r=0 g=0 b=0 a=1 -> [0, 0, 0, 255],
+        // derived here from the bit layout, not from the decoder.
         assert_eq!(
-            sample_committed_point(&partial, ci8, size, request, TextureLutMode::Rgba16,),
-            Err(crate::PointSampleError::Read(
-                PhysicalTexelReadError::IncompleteTlutEntry {
-                    byte_address: 0x800,
-                    valid_mask: 0x03,
-                }
-            ))
+            sample_committed_point(&partial, ci8, size, request, TextureLutMode::Rgba16,)
+                .expect("lanes 1..3's validity is not addressed by the RDP")
+                .texel()
+                .rgba8888(),
+            [0, 0, 0, 255]
         );
         assert_eq!(observe_durable(&partial), partial_before);
 
@@ -1666,20 +1682,34 @@ mod tests {
         let mut unequal = state;
         publish(&mut unequal, fixture, pending);
         let unequal_before = observe_durable(&unequal);
+        // `ci_and_hostile_tlut_word_words(8)` fills all eight bytes with
+        // `00 01 02 03 04 05 06 07`, so the four lanes are
+        // [0x0001, 0x0203, 0x0405, 0x0607] -- maximally non-canonical, and
+        // every lane distinct, so reading any lane but 0 gives a different
+        // answer. Lane 0 is 0x0001; IA16 splits it as intensity 0x00 and
+        // alpha 0x01, giving [0, 0, 0, 1]. Hand-derived.
         assert_eq!(
-            sample_committed_point(&unequal, ci8, size, request, TextureLutMode::Ia16),
-            Err(crate::PointSampleError::Read(
-                PhysicalTexelReadError::NonCanonicalTlutEntry {
-                    byte_address: 0x800,
-                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
-                }
-            ))
+            sample_committed_point(&unequal, ci8, size, request, TextureLutMode::Ia16)
+                .expect("an unequal TLUT word resolves from lane 0")
+                .texel()
+                .rgba8888(),
+            [0, 0, 0, 1],
+            "lane 0 is 0x0001; lane 1 (0x0203) would give [2, 2, 2, 3] and \
+             lane 3 (0x0607) would give [6, 6, 6, 7]"
         );
         assert_eq!(observe_durable(&unequal), unequal_before);
     }
 
+    /// Renamed from
+    /// `committed_texture_cell_locates_nonfirst_partial_and_unequal_tlut_errors`.
+    /// Both hostile TLUT words are now READ, from lane 0, so the cell
+    /// resolves instead of locating a corner error. The fixture is
+    /// unchanged: the second entry (0x808) is still the hostile one and
+    /// still differs from the canonical first entry, so a reader that
+    /// silently fell back to entry 0 would still be caught by the
+    /// upper-left/upper-right colors disagreeing.
     #[test]
-    fn committed_texture_cell_locates_nonfirst_partial_and_unequal_tlut_errors() {
+    fn committed_texture_cell_resolves_nonfirst_partial_and_unequal_tlut_words() {
         let indices = [0x00, 0x01];
         let canonical = [0xf8, 0x01];
         let request = PointSampleRequest::new(
@@ -1704,15 +1734,33 @@ mod tests {
             ],
         );
         let before = observe_durable(&partial);
+        // Entry 0 at 0x800 is the canonical `[0xf8, 0x01]`: RGBA16 0xf801
+        // is r=0b11111 g=0 b=0 a=1, and 5-bit replication (v << 3 | v >> 2)
+        // sends 0b11111 to 0xff, so opaque red.
+        //
+        // Entry 1 at 0x808 is the hostile partial `[0xaa, 0xbb]`, only two
+        // bytes valid (mask 0x03). Lane 0 is 0xaabb == 1010101010111011:
+        // r=0b10101 (21), g=0b01010 (10), b=0b11101 (29), a=1. Replication
+        // gives 21 -> 168|5 = 173, 10 -> 80|2 = 82, 29 -> 232|7 = 239.
+        // Every number here is derived from the RGBA16 bit layout by hand.
+        const RED: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
+        const HOSTILE_PARTIAL: [u8; 4] = [173, 82, 239, 255];
+        assert_ne!(
+            RED, HOSTILE_PARTIAL,
+            "the two entries must differ, or the cell cannot show that the \
+             upper-right corner read its OWN entry"
+        );
+        let cell = gather_committed_texture_cell(
+            &partial,
+            tile,
+            size,
+            request,
+            TextureLutMode::Rgba16,
+        )
+        .expect("a partially valid TLUT word resolves from lane 0");
         assert_eq!(
-            gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16,),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::IncompleteTlutEntry {
-                    byte_address: 0x808,
-                    valid_mask: 0x03,
-                },
-            })
+            cell.texels().map(|texel| texel.texel().rgba8888()),
+            [RED, RED, HOSTILE_PARTIAL, HOSTILE_PARTIAL],
         );
         assert_eq!(observe_durable(&partial), before);
 
@@ -1728,15 +1776,28 @@ mod tests {
             ],
         );
         let before = observe_durable(&unequal);
+        // Entry 0 at 0x800 is again `[0xf8, 0x01]`, read here as IA16:
+        // intensity 0xf8, alpha 0x01 -> [248, 248, 248, 1].
+        //
+        // Entry 1 at 0x808 is `00 01 02 03 04 05 06 07`, four distinct
+        // lanes. Lane 0 is 0x0001 -> intensity 0x00, alpha 0x01 ->
+        // [0, 0, 0, 1]. Lane 1 (0x0203) would give [2, 2, 2, 3] and lane 3
+        // (0x0607) would give [6, 6, 6, 7], so picking the wrong lane is
+        // detectable. Hand-derived from the IA16 split.
+        const CANONICAL_IA: [u8; 4] = [0xf8, 0xf8, 0xf8, 0x01];
+        const HOSTILE_UNEQUAL_IA: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+        assert_ne!(CANONICAL_IA, HOSTILE_UNEQUAL_IA);
+        let cell =
+            gather_committed_texture_cell(&unequal, tile, size, request, TextureLutMode::Ia16)
+                .expect("an unequal TLUT word resolves from lane 0");
         assert_eq!(
-            gather_committed_texture_cell(&unequal, tile, size, request, TextureLutMode::Ia16),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::NonCanonicalTlutEntry {
-                    byte_address: 0x808,
-                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
-                },
-            })
+            cell.texels().map(|texel| texel.texel().rgba8888()),
+            [
+                CANONICAL_IA,
+                CANONICAL_IA,
+                HOSTILE_UNEQUAL_IA,
+                HOSTILE_UNEQUAL_IA
+            ],
         );
         assert_eq!(observe_durable(&unequal), before);
     }
