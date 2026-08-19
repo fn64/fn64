@@ -164,10 +164,18 @@ The same watch, inside the plateau (state 18, entered at swap 2102):
 |---|---|---|---|
 | 2102 | `0x8000` | `0x8000` | 17 -> **18** |
 | **2202** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2302** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2402** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2462** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2522** | **`0x8000`** | **`0x8000`** | **still 18** |
 
-At swap 2202 port 0's pressed word carries A exactly as it did at 1202, 1302,
-1402, ... 2002, every one of which advanced the screen. The screen does not
-move. **The press is delivered and refused.**
+Five presses inside the plateau. Port 0's pressed word carries A on every one
+of them, exactly as it did at 1202, 1302, 1402, ... 2002, each of which
+advanced the screen. The screen does not move. **The press is delivered and
+refused.** Zero traps and zero panics across the whole run.
+
+Two runs (`run3`, `run4`) produced this identical state ladder swap for swap,
+so the sequence is deterministic and not a sampling artefact.
 
 ## CONFIRMED: why it is refused -- the menu graph is data-driven
 
