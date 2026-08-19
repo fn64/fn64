@@ -679,10 +679,19 @@ Two things a triangle needed that the texrect path did not supply:
 
 1. **The tile index.** `execute_scheduled_raw_triangle` reads
    `RawTriangle::tile()` -- wire word 0 bits 18:16. `PlanCollector`'s
-   `bound_tile_index` freezes a raw triangle's tile to 0 for the GPU uniform
-   path, with a comment claiming "it carries no tile field of its own to
-   read". That comment is wrong; the field exists and the CPU executor reads
-   it. The GPU path was left alone -- correcting it is a separate card.
+   `bound_tile_index` originally froze a raw triangle's tile to 0 for the
+   GPU uniform path, with a comment claiming "it carries no tile field of
+   its own to read". That comment was wrong: the field exists, the CPU
+   executor reads it, and the GPU path silently bound tile 0's descriptor
+   for any triangle naming another tile. **Corrected in a follow-up:** the
+   `RawTriangle` arm now reads `(raw_words[0] >> 16) & 0x7` from the
+   command's own retained wire words, the same one-field read the
+   `TextureRectangle` arm beside it already performed on word 1 bits 26:24,
+   so both paths resolve the same tile for the same draw.
+   `plan_collector_binds_the_tile_a_raw_triangle_s_own_wire_word_names`
+   pins it adapterlessly, with
+   `plan_collector_binds_tile_zero_when_a_raw_triangle_s_wire_word_names_it`
+   holding the tile-0 arm.
 2. **The opcode.** `execute_scheduled_raw_triangle` decoded with a frozen
    `0x08`, which sizes the optional coefficient blocks. Harmless until a
    textured triangle was admitted, then a hard length refusal. It now reads
