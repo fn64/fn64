@@ -498,6 +498,25 @@ impl WgpuBackend {
                 screen_scale,
                 screen_offset,
             };
+            // **`tlut_en` is a `SetOtherModes` bit, not a `SetTile` field.**
+            // Neither `TileBindingParams` constructor can know it, so the
+            // TLUT mode is stamped here from the SAME `RetrievedTriangleDraw`
+            // snapshot the combiner/blend/coverage state above came from --
+            // the `OtherMode` current at THIS triangle's own stream
+            // position, never the walk's running final value.
+            //
+            // Without this the shader saw `lut_mode = Disabled` for every
+            // draw and refused WM2000's IA4-under-`G_TT_RGBA16` tile with
+            // `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`, for a format the
+            // hardware ignores while the TLUT is on. The reserved encoding
+            // is propagated by name rather than coerced to Disabled, exactly
+            // as `execute_scheduled_texrect` already does for the CPU
+            // reader's own `lut_mode`.
+            let lut_mode = draw
+                .other_mode
+                .texture_lut_mode()
+                .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+            let tile_binding = draw.tile_binding.with_lut_mode(lut_mode);
             let blend_mode = BlendModeState {
                 other_mode: draw.other_mode,
                 blend_color_register: draw.blend_color.map_or([0u8; 4], |color| color.rgba8()),
@@ -537,7 +556,7 @@ impl WgpuBackend {
                 raster_params,
                 extent,
                 tmem,
-                draw.tile_binding,
+                tile_binding,
                 draw.blend_color,
                 draw.env_color,
                 draw.prim_color,
@@ -565,7 +584,38 @@ impl WgpuBackend {
             .iter()
             .find(|&&status| status != TMEM_SAMPLE_STATUS_OK)
         {
-            return Err(WgpuRawDpcExecutionError::TmemSampleFailed { status });
+            // **Measure the tile, do not infer it.** The status attachment
+            // is per-pixel over the whole batch, so a status code alone
+            // names no triangle. Attribution is exact for the format
+            // refusal specifically: `tmem_sample.wgsl` raises
+            // `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT` from a pure predicate
+            // over `TileBindingParams` alone, before any addressing runs,
+            // so re-evaluating that same predicate over this batch's own
+            // fixtures identifies exactly the fixtures that could have
+            // written it. For the other statuses (which depend on the
+            // fragment's UVs, not only its tile) the first bound fixture is
+            // reported instead, and the triangle index is the only field
+            // that is then approximate.
+            let culprit = fixtures
+                .iter()
+                .position(|fixture| {
+                    fixture.tile_binding.bound != 0
+                        && !fixture.tile_binding.is_supported_direct_format()
+                })
+                .or_else(|| {
+                    fixtures
+                        .iter()
+                        .position(|fixture| fixture.tile_binding.bound != 0)
+                })
+                .unwrap_or(0);
+            let tile = fixtures[culprit].tile_binding;
+            return Err(WgpuRawDpcExecutionError::TmemSampleFailed {
+                status,
+                triangle_index: culprit,
+                tile_format: tile.format,
+                tile_pixel_size: tile.pixel_size,
+                tile_lut_mode: tile.lut_mode,
+            });
         }
         self.triangle_draw_output = Some(output);
         Ok(())
@@ -1291,8 +1341,17 @@ pub enum WgpuRawDpcExecutionError {
     /// triangle's UV footprint, or an unsupported production format.
     /// `status` is the first such code found, in row-major fragment order;
     /// never silently accepted as a successful textured draw.
+    /// `tile_format`/`tile_pixel_size`/`tile_lut_mode` are the wire codes
+    /// this triangle's own `TileBindingParams` uniform carried into the
+    /// shader -- measured at the abort, not inferred from the CPU-side
+    /// tile. A status-4 abort naming a format is actionable; one naming
+    /// only `4` sent a prior lane looking at the wrong tile.
     TmemSampleFailed {
         status: u32,
+        triangle_index: usize,
+        tile_format: u32,
+        tile_pixel_size: u32,
+        tile_lut_mode: u32,
     },
     /// A triangle's resolved blend cycle selected
     /// [`crate::blend::BlendBInput::FramebufferAlpha`] on an active cycle
@@ -1499,10 +1558,18 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "a triangle-bearing plan reached execution with no successful prior \
                  RenderBackend::create call",
             ),
-            Self::TmemSampleFailed { status } => write!(
+            Self::TmemSampleFailed {
+                status,
+                triangle_index,
+                tile_format,
+                tile_pixel_size,
+                tile_lut_mode,
+            } => write!(
                 formatter,
                 "a triangle draw's fragment shader reported a non-OK tmem_sample.wgsl status: \
-                 {status}"
+                 {status} (triangle #{triangle_index} in plan order, tile format code \
+                 {tile_format}, pixel-size code {tile_pixel_size}, TLUT-mode code \
+                 {tile_lut_mode})"
             ),
             Self::BlendRequiresFramebuffer { triangle_index } => write!(
                 formatter,
