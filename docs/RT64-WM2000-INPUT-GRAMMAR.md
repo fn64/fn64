@@ -656,3 +656,23 @@ Note the callers column in the generated report matters for prioritising:
 more likely to be reached than `0x80120854`, which has 3. The swap number an
 abort lands on is a property of which of these the input schedule reaches
 first, which is exactly why it moved between runs.
+
+### The audit is not WM2000-specific
+
+Run over two other configs in the same corpus, with every finding checked
+against the emitted crate itself:
+
+| ROM | functions | undispatchable targets | false positives |
+|---|---|---|---|
+| WM2000 (NWXE) | 2471 | 12 | 0 |
+| SM64 (SM64U) | 3893 | 332 | 0 |
+| OoT (OOTU) | 13358 | 2 | 0 |
+
+"False positive" is checked mechanically and two ways: is the target present
+in the emitted `LOOKUP_TABLE`, and is there actually an emitted `lookup(...)`
+call for it? For all 346 findings across the three ROMs the answers are no
+and yes respectively -- every row is a real, reachable trap.
+
+The spread is itself informative. OoT's 2 reflect a heavily curated symbol
+set; SM64's 332 say that lane carries the same latent defect class at much
+larger scale, undetected until now because nothing looked for it.
