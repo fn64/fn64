@@ -1024,3 +1024,114 @@ fn a_textured_triangle_samples_the_tile_its_own_wire_word_names() {
         "the two tiles must differ at the column this test reads"
     );
 }
+
+/// **The XOR4 first-row parity comes from the tile's own T origin.**
+///
+/// TMEM's odd rows carry a 32-bit bank exchange, and the READER must apply
+/// the same parity the WRITER did. The writer's rule is
+/// `(low_t.integer() + row) & 1`; the reader's is `first_is_odd ^ (row & 1)`,
+/// so the two agree exactly when `first_is_odd == low_t.integer() & 1`.
+///
+/// A frozen `Even` is correct only for an EVEN T origin. Every other texture
+/// fixture in this file uses `low_t = 0`, where correct and incorrect coincide
+/// -- so a mutant freezing the parity survived all of them. WM2000's own
+/// measured sprite-strip tile has `low_t == 47`, an odd origin, and that
+/// frozen constant already shipped once in this crate.
+///
+/// This tile is two rows tall with an ODD low T, and the triangle samples the
+/// SECOND row, where the exchange applies. The two rows carry different
+/// texels, so reading the wrong bank is visible as the wrong colour rather
+/// than as a subtly wrong one.
+#[test]
+fn a_tile_with_an_odd_t_origin_reads_the_xor4_bank_its_load_wrote() {
+    // T must land in the tile's second row. `low_t = 1` puts the tile's rows
+    // at T = 1 and T = 2; sampling T = 2 reads the second row, whose write-
+    // side exchange is `(1 + 1) & 1 = 0` -- i.e. NOT exchanged -- while a
+    // reader frozen at `Even` computes `false ^ (1 & 1) = true` and exchanges
+    // it. The two disagree, which is the whole point.
+    const LOW_T: u32 = 1;
+    let t_texel = LOW_T + 1;
+    let (mut value, dx, de, dy) = non_perspective_texture_planes();
+    value[1] = PLANE_HALF_TEXEL + (t_texel as i32) * PLANE_PER_TEXEL;
+
+    let rows: Vec<u16> = TEXELS
+        .iter()
+        .copied()
+        .chain(SECOND_TEXELS.iter().copied())
+        .collect();
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_texel_passthrough()
+        .texture(0, 4, 2, rows)
+        .with_low_t(LOW_T)
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 6.0)
+                .rows(0..3)
+                .texture_planes(value, dx, de, dy),
+        )
+        .run();
+
+    // The second row of the staged image is SECOND_TEXELS, and reading it
+    // through the wrong bank parity yields a different value -- asserted per
+    // column so a single coincidental match cannot carry the test.
+    for (index, expected) in SECOND_TEXELS.iter().enumerate() {
+        assert_eq!(
+            frame.pixel(2 + index as u32, 0),
+            *expected,
+            "column {} samples the tile's second row through the parity its own \
+             odd T origin implies",
+            2 + index
+        );
+    }
+}
+
+/// **An S10.5 coordinate that overflows `i16` SATURATES; it does not wrap.**
+///
+/// The `w <= 0` rule guarantees the perspective divide never faults, which
+/// means it can and does produce coordinates far outside S10.5's range -- so
+/// the narrowing to `i16` must have a defined, correct answer for one. The
+/// difference is directly visible: a saturated coordinate clamps to the
+/// tile's LAST texel, while a wrapped one (`as i32 as i16`) folds back to the
+/// FIRST. On a real frame that is the difference between a stretched edge and
+/// a tear.
+///
+/// The fixture drives it there with a tiny positive W (1), the shape a
+/// near-plane crossing actually produces. Hand-derived from the cited rule
+/// alone: S is 16384 at column 2, so `(S / 1) * 1024 = 16,777,216` in S10.5 --
+/// four orders of magnitude past `i16::MAX`. Saturating gives 32767, which
+/// the tile's clamp addressing (mask 0) folds to texel 3; wrapping gives
+/// `16777216 & 0xffff = 0`, i.e. texel 0.
+///
+/// Every fixture above keeps its coordinates comfortably in range, which is
+/// why a wrapping mutant survived all of them.
+#[test]
+fn an_overflowing_texture_coordinate_saturates_to_the_last_texel_not_the_first() {
+    let (mut value, dx, de, dy) = perspective_texture_planes();
+    value[2] = 1;
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .texture_perspective()
+        .combine_texel_passthrough()
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 6.0)
+                .rows(0..3)
+                .texture_planes(value, dx, de, dy),
+        )
+        .run();
+
+    for column in 2..6 {
+        assert_eq!(
+            frame.pixel(column, 0),
+            TEXELS[3],
+            "column {column}'s coordinate overflows S10.5 and must clamp to the tile's \
+             LAST texel {:#06x}, not wrap to its first {:#06x}",
+            TEXELS[3],
+            TEXELS[0]
+        );
+    }
+}
