@@ -62,17 +62,26 @@
 //! exactly two combiner programs between them, reading only `Texel0`,
 //! `Primitive`, `Environment`, `Zero` and `One`
 //! (`docs/RT64-WM2000-CYCLE-MODES.md` §§1-2). Every other selector --
-//! `Shade`, `Texel1`, `Combined`, the LOD fractions, noise, the chroma key
-//! -- is refused **by name** at [`TexrectShading::try_new`], before any
-//! pixel is produced, so a title that needs one gets a loud error rather
-//! than pixels combined against a zero this executor invented.
+//! `Shade`, `Texel1`, the LOD fractions, noise, the chroma key -- is
+//! refused **by name** at [`TexrectShading::validate_combiner_program`],
+//! before any pixel is produced, so a title that needs one gets a loud
+//! error rather than pixels combined against a zero this executor invented.
+//! `Combined` is admitted in exactly one place, a two-cycle program's
+//! second slice, where a first-cycle result exists for it to read.
 //!
 //! ## Nonclaims
 //!
-//! - **No two-cycle, no Fill cycle.** Both refused by name
-//!   ([`TexrectExecutionError::UnsupportedCycleType`]); two-cycle needs the
-//!   `Combined` carry and a second texel, neither of which this executor
-//!   supplies. Measured absent from the window above.
+//! - **Two-cycle runs; Fill cycle does not.** Two-cycle evaluates through
+//!   [`crate::combiner::run_two_cycle`] -- cycle 0's bitfield slice, then
+//!   cycle 1's over the accumulator cycle 0 wrote, with the cross-cycle
+//!   carry wrap between them. Its second slice is the one place `Combined`
+//!   is an admitted selector, matching the reference lane's rule that
+//!   `COMBINED` before a first-cycle result exists is a refusal. `Texel1`
+//!   stays refused in both slices: a rectangle binds one tile, so there is
+//!   no decoded tile+1 to sample -- the reference refuses it for that same
+//!   reason (`backend/validate.rs:479-483`). Fill cycle remains refused
+//!   by name ([`TexrectExecutionError::UnsupportedCycleType`]); it samples
+//!   no texture at all and draws from the fill-colour register instead.
 //! - **Three of the four post-combiner stages now run**, each through
 //!   this crate's already-landed port rather than a second copy:
 //!   the **blender** (`crate::blend::blend_fragment`), **alpha compare**
@@ -192,8 +201,8 @@ use crate::blend::{
     blend_fragment, BlendFramebufferSample, BlendImageReadError, BlendModeState, BlendedFragment,
 };
 use crate::combiner::{
-    combiner_inputs_from_fragment_registers, run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput,
-    ColorInputSlot, CombineParams, CombinerInputs,
+    combiner_inputs_from_fragment_registers, run_one_cycle, run_two_cycle, AlphaInput,
+    AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams, CombinerInputs,
 };
 use crate::coverage::{apply_coverage_alpha, coverage_result, Coverage, CoverageModeBits};
 use crate::state::{AlphaCompare, AlphaDither, Color4, PrimColor, RgbDither};
@@ -361,11 +370,26 @@ impl core::fmt::Display for TexrectAxis {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TexrectExecutionError {
     /// Copy cycle blits the texel; one-cycle runs it through the color
-    /// combiner. Both are executed. Two-cycle needs the `Combined` carry
-    /// and a second texel, and Fill cycle samples no texture at all --
-    /// both refused by name rather than approximated. Measured: WM2000's
-    /// boot-through-attract window issues 2,520 texrects, all one-cycle,
-    /// none two-cycle or Fill (`docs/RT64-WM2000-CYCLE-MODES.md` §1).
+    /// combiner; two-cycle runs both passes through
+    /// [`crate::combiner::run_two_cycle`], carry and all. All three are
+    /// executed. **Only Fill cycle reaches this variant**, and it does so
+    /// because Fill samples no texture at all -- the RDP's fill-colour path,
+    /// which this executor does not own.
+    ///
+    /// The previous text here claimed two-cycle "needs the `Combined` carry
+    /// and a second texel, neither of which this executor supplies." That
+    /// was wrong about its own crate on the first count -- `combiner.rs`'s
+    /// `CyclePass::SecondOfTwoCycles` has modeled the carry since the port
+    /// landed -- and wrong about the requirement on the second: `Texel1` is
+    /// refused for texrects by [`Self::UnsupportedColorInput`] because a
+    /// rectangle binds one tile, which is the reference lane's rule too, and
+    /// a two-cycle program that reads only `Texel0` needs no second texel.
+    ///
+    /// The measurement that used to be cited here ("2,520 texrects, all
+    /// one-cycle") is a boot-through-attract window
+    /// (`docs/RT64-WM2000-CYCLE-MODES.md` §1). It says two-cycle was not
+    /// seen there; it never said two-cycle does not occur, and gameplay has
+    /// not been reached on either lane.
     UnsupportedCycleType {
         cycle_type: CycleType,
     },
@@ -515,18 +539,20 @@ impl core::fmt::Display for TexrectExecutionError {
         match self {
             Self::UnsupportedCycleType { cycle_type } => write!(
                 formatter,
-                "execute_texture_rectangle admits Copy cycle (direct blit) and OneCycle \
-                 (combiner-evaluated); got {cycle_type:?}"
+                "execute_texture_rectangle admits Copy cycle (direct blit), OneCycle and \
+                 TwoCycle (both combiner-evaluated); got {cycle_type:?}"
             ),
             Self::UnsupportedColorInput { slot, input } => write!(
                 formatter,
                 "execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO \
-                 color inputs; one-cycle slot {slot:?} selects {input:?}"
+                 color inputs (plus COMBINED in a two-cycle program's second cycle); slot \
+                 {slot:?} selects {input:?}"
             ),
             Self::UnsupportedAlphaInput { slot, input } => write!(
                 formatter,
                 "execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO \
-                 alpha inputs; one-cycle slot {slot:?} selects {input:?}"
+                 alpha inputs (plus COMBINED in a two-cycle program's second cycle); slot \
+                 {slot:?} selects {input:?}"
             ),
             Self::UnsetConstantRegister { register } => write!(
                 formatter,
@@ -765,6 +791,82 @@ const ADMITTED_ALPHA_INPUTS: [AlphaInput; 5] = [
     AlphaInput::Zero,
 ];
 
+/// Which combiner bitfield slices a program's cycle mode actually
+/// evaluates, and therefore which ones must be validated.
+///
+/// Validating a slice that never runs would refuse programs the RDP
+/// executes; skipping one that does run would admit a program and then
+/// evaluate selectors nothing checked. The mapping is RT64's own: one-cycle
+/// mode reads the *second*-cycle slice (`run`:
+/// `runCycle(inputs, twoCycle ? 0 : 1, twoCycle, ...)`), so the first slice
+/// of a one-cycle program is dead bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombinerProgramCycles {
+    /// One-cycle mode: only the second-cycle slice runs.
+    OnlySecondSlice,
+    /// Two-cycle mode: the first slice runs, then the second over its
+    /// result.
+    BothSlices,
+}
+
+impl CombinerProgramCycles {
+    /// The slices this mode evaluates, in evaluation order.
+    fn evaluated_slices(self) -> &'static [CombinerProgramSlice] {
+        match self {
+            Self::OnlySecondSlice => &[CombinerProgramSlice::OnlyCycleOfOneCycleMode],
+            Self::BothSlices => &[
+                CombinerProgramSlice::FirstOfTwoCycles,
+                CombinerProgramSlice::SecondOfTwoCycles,
+            ],
+        }
+    }
+}
+
+/// One evaluated pass, named the same way
+/// [`crate::combiner`]'s own private `CyclePass` is -- this is the
+/// admission-side mirror of that evaluation-side enum, and the two must
+/// agree on which bitfield slice each pass reads or the gate would check a
+/// program the combiner never runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CombinerProgramSlice {
+    OnlyCycleOfOneCycleMode,
+    FirstOfTwoCycles,
+    SecondOfTwoCycles,
+}
+
+impl CombinerProgramSlice {
+    /// `decodeColorInput`/`decodeAlphaInput`'s `secondCycleInputs` selector,
+    /// identical to `combiner::CyclePass::bitfield_second_cycle`.
+    const fn reads_second_bitfield_slice(self) -> bool {
+        !matches!(self, Self::FirstOfTwoCycles)
+    }
+
+    /// Whether a first-cycle combiner result exists for this pass to read.
+    /// Only two-cycle mode's second pass has one; one-cycle mode's single
+    /// pass reads the zero-initialized accumulator, which is not a result.
+    const fn carries_a_first_cycle_result(self) -> bool {
+        matches!(self, Self::SecondOfTwoCycles)
+    }
+
+    fn admits_color(self, input: ColorInput) -> bool {
+        if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
+            return self.carries_a_first_cycle_result();
+        }
+        ADMITTED_COLOR_INPUTS
+            .iter()
+            .any(|admitted| core::mem::discriminant(admitted) == core::mem::discriminant(&input))
+    }
+
+    fn admits_alpha(self, input: AlphaInput) -> bool {
+        if matches!(input, AlphaInput::Combined) {
+            return self.carries_a_first_cycle_result();
+        }
+        ADMITTED_ALPHA_INPUTS
+            .iter()
+            .any(|admitted| core::mem::discriminant(admitted) == core::mem::discriminant(&input))
+    }
+}
+
 impl TexrectShading {
     /// Validates that `combine`'s one-cycle program reads only selectors
     /// this executor evaluates, and that every constant register it does
@@ -792,51 +894,70 @@ impl TexrectShading {
     /// this executor evaluates, and that every constant register it does
     /// read is actually set.
     ///
-    /// Called by the executor **only in one-cycle**. Copy cycle consults no
-    /// combiner program on real hardware, so gating a Copy rectangle on the
-    /// program that happens to be latched would refuse rectangles the RDP
-    /// draws -- measured, not reasoned: the existing composed Copy fixture
-    /// latches `SetCombine(0, 0)`, whose slot A decodes to `COMBINED`, and
-    /// validating it unconditionally refused a packet that had executed
-    /// correctly for the whole life of the Copy path.
+    /// Thin alias for [`Self::validate_combiner_program`] at
+    /// [`CombinerProgramCycles::OnlySecondSlice`], kept because one-cycle is
+    /// the mode every existing caller and fixture names.
     pub fn validate_one_cycle(self) -> Result<Self, TexrectExecutionError> {
+        self.validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+    }
+
+    /// Validates every bitfield slice `cycles` says will actually be
+    /// evaluated, and that every constant register any of them reads is set.
+    ///
+    /// Called by the executor **only when a combiner runs**. Copy cycle
+    /// consults no combiner program on real hardware, so gating a Copy
+    /// rectangle on the program that happens to be latched would refuse
+    /// rectangles the RDP draws -- measured, not reasoned: the existing
+    /// composed Copy fixture latches `SetCombine(0, 0)`, whose slot A
+    /// decodes to `COMBINED`, and validating it unconditionally refused a
+    /// packet that had executed correctly for the whole life of the Copy
+    /// path.
+    ///
+    /// `Combined`/`CombinedAlpha` is admitted **only in the second slice of
+    /// a two-cycle program**, which is the one place a first-cycle result
+    /// exists to carry. That is the reference lane's own rule
+    /// (`fn64-render-reference/src/backend/validate.rs:476-478`: "selects
+    /// COMBINED before a first-cycle result exists"), and it is why the
+    /// admitted set is a function of the slice rather than a constant.
+    pub fn validate_combiner_program(
+        self,
+        cycles: CombinerProgramCycles,
+    ) -> Result<Self, TexrectExecutionError> {
         let Self {
             combine,
             env_color,
             prim_color,
         } = self;
-        const SECOND_CYCLE: bool = true;
         let mut reads_env = false;
         let mut reads_prim = false;
-        for slot in [
-            ColorInputSlot::A,
-            ColorInputSlot::B,
-            ColorInputSlot::C,
-            ColorInputSlot::D,
-        ] {
-            let input = combine.decode_color(slot, SECOND_CYCLE);
-            if !ADMITTED_COLOR_INPUTS.iter().any(|admitted| {
-                core::mem::discriminant(admitted) == core::mem::discriminant(&input)
-            }) {
-                return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
+        for slice in cycles.evaluated_slices() {
+            let second_cycle = slice.reads_second_bitfield_slice();
+            for slot in [
+                ColorInputSlot::A,
+                ColorInputSlot::B,
+                ColorInputSlot::C,
+                ColorInputSlot::D,
+            ] {
+                let input = combine.decode_color(slot, second_cycle);
+                if !slice.admits_color(input) {
+                    return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
+                }
+                reads_env |= matches!(input, ColorInput::Environment);
+                reads_prim |= matches!(input, ColorInput::Primitive);
             }
-            reads_env |= matches!(input, ColorInput::Environment);
-            reads_prim |= matches!(input, ColorInput::Primitive);
-        }
-        for slot in [
-            AlphaInputSlot::A,
-            AlphaInputSlot::B,
-            AlphaInputSlot::C,
-            AlphaInputSlot::D,
-        ] {
-            let input = combine.decode_alpha(slot, SECOND_CYCLE);
-            if !ADMITTED_ALPHA_INPUTS.iter().any(|admitted| {
-                core::mem::discriminant(admitted) == core::mem::discriminant(&input)
-            }) {
-                return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
+            for slot in [
+                AlphaInputSlot::A,
+                AlphaInputSlot::B,
+                AlphaInputSlot::C,
+                AlphaInputSlot::D,
+            ] {
+                let input = combine.decode_alpha(slot, second_cycle);
+                if !slice.admits_alpha(input) {
+                    return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
+                }
+                reads_env |= matches!(input, AlphaInput::Environment);
+                reads_prim |= matches!(input, AlphaInput::Primitive);
             }
-            reads_env |= matches!(input, AlphaInput::Environment);
-            reads_prim |= matches!(input, AlphaInput::Primitive);
         }
         if reads_env && env_color.is_none() {
             return Err(TexrectExecutionError::UnsetConstantRegister {
@@ -973,20 +1094,19 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     // Copy cycle blits the texel to the destination with no combiner, which
     // is what the RDP itself does in that mode. One-cycle runs the texel
-    // through the color combiner per fragment, which `run_one_cycle`
-    // evaluates below. Two-cycle needs the `Combined` carry and a second
-    // texel; Fill cycle samples no texture at all. Both refused by name
-    // rather than drawing an approximation and calling it a rendered frame.
-    let combined = admitted_cycle_evaluates_combiner(other_mode.cycle_type())?;
+    // through the color combiner once per fragment; two-cycle runs it twice
+    // with the cross-cycle carry, both through `crate::combiner`'s own
+    // evaluators. Fill cycle samples no texture at all and is refused by
+    // name rather than drawn as an approximation.
+    let evaluation = admitted_cycle_evaluation(other_mode.cycle_type())?;
     // Selector admission runs before any pixel is produced, so an
     // unevaluatable program refuses with an untouched target rather than a
     // half-drawn one. Skipped in Copy cycle, where the RDP consults no
     // combiner program at all and gating on one would refuse a rectangle
     // the hardware draws.
-    let base_inputs = if combined {
-        Some(shading.validate_one_cycle()?.base_inputs())
-    } else {
-        None
+    let base_inputs = match evaluation.validated_cycles() {
+        Some(cycles) => Some(shading.validate_combiner_program(cycles)?.base_inputs()),
+        None => None,
     };
     // The blender's own admission, run at the same point and for the same
     // reason as the combiner's: before any pixel is produced, so a mode
@@ -1098,9 +1218,12 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
                 // after `wrap_clamp`: clamping a rounded value and
                 // rounding a clamped one differ at the boundary, and RT64
                 // clamps in float before any quantization.
-                Some(base) => {
-                    combine_one_texel(shading.combine(), base, decoded.texel().rgba8888())
-                }
+                Some(base) => combine_one_texel(
+                    shading.combine(),
+                    base,
+                    decoded.texel().rgba8888(),
+                    evaluation,
+                ),
             };
             let pixel_x = draw.left() + column;
             let pixel_y = draw.top() + row;
@@ -1168,28 +1291,59 @@ fn union_rectangle(
         .expect("a union of two in-bounds rectangles is in bounds")
 }
 
-/// This executor's cycle-type admission, as one decision: `Ok(true)` when
-/// the mode evaluates the color combiner, `Ok(false)` when it blits the
-/// texel unchanged, and a named refusal otherwise.
+/// How this executor evaluates a texel for a given cycle type, or a named
+/// refusal.
 ///
 /// Copy cycle blits, which is the RDP's own behavior in that mode.
-/// One-cycle runs `(A-B)*C+D` per fragment. Two-cycle needs the `Combined`
-/// cross-cycle carry and a second texel, neither of which this executor
-/// supplies; Fill cycle samples no texture at all. Measured: WM2000's
-/// boot-through-attract window issues 2,520 texrects, **all one-cycle**,
-/// none two-cycle and none Fill (`docs/RT64-WM2000-CYCLE-MODES.md` §1).
+/// One-cycle runs `(A-B)*C+D` once, over the *second*-cycle bitfield slice
+/// (RT64's `runCycle(inputs, twoCycle ? 0 : 1, ...)`). Two-cycle runs it
+/// twice, cycle 0's slice then cycle 1's, threading the accumulator between
+/// them with the cross-cycle-carry wrap -- exactly
+/// [`crate::combiner::run_two_cycle`], which this crate has always had.
+///
+/// Fill cycle samples no texture at all and is still refused here.
 ///
 /// A named function rather than an inline match so the decision is
 /// reachable from a unit test -- reaching `execute_texture_rectangle`
 /// itself requires a live pending TMEM transaction. Measured, not
 /// stylistic: while this match was inline, widening it to admit two-cycle
-/// left the entire suite green.
-fn admitted_cycle_evaluates_combiner(cycle_type: CycleType) -> Result<bool, TexrectExecutionError> {
+/// left the entire suite green, because nothing observed the *arithmetic*
+/// the widened arm selects. [`two_cycle_carries_the_accumulator_one_cycle_cannot`]
+/// is the observation that closes that gap.
+fn admitted_cycle_evaluation(
+    cycle_type: CycleType,
+) -> Result<TexrectCombinerEvaluation, TexrectExecutionError> {
     match cycle_type {
-        CycleType::Copy => Ok(false),
-        CycleType::OneCycle => Ok(true),
-        CycleType::TwoCycle | CycleType::Fill => {
-            Err(TexrectExecutionError::UnsupportedCycleType { cycle_type })
+        CycleType::Copy => Ok(TexrectCombinerEvaluation::BlitsTheTexel),
+        CycleType::OneCycle => Ok(TexrectCombinerEvaluation::OneCycle),
+        CycleType::TwoCycle => Ok(TexrectCombinerEvaluation::TwoCycle),
+        CycleType::Fill => Err(TexrectExecutionError::UnsupportedCycleType { cycle_type }),
+    }
+}
+
+/// [`admitted_cycle_evaluation`]'s three outcomes, as one typed value rather
+/// than the `bool` this decision used to be: a `bool` could distinguish
+/// "combines" from "blits" but had nowhere to put "combines *twice*".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TexrectCombinerEvaluation {
+    /// Copy cycle. The sampled texel's own RGBA8888, unchanged; the RDP
+    /// consults no combiner program in this mode.
+    BlitsTheTexel,
+    /// One pass of `(A-B)*C+D` over the second-cycle bitfield slice.
+    OneCycle,
+    /// Two passes: cycle 0's slice, then cycle 1's over the accumulator
+    /// cycle 0 wrote, with `wrapInputC`/`wrapInputABD` applied to the carry.
+    TwoCycle,
+}
+
+impl TexrectCombinerEvaluation {
+    /// The combiner-program validation this evaluation requires, or `None`
+    /// in Copy cycle where no program is consulted.
+    const fn validated_cycles(self) -> Option<CombinerProgramCycles> {
+        match self {
+            Self::BlitsTheTexel => None,
+            Self::OneCycle => Some(CombinerProgramCycles::OnlySecondSlice),
+            Self::TwoCycle => Some(CombinerProgramCycles::BothSlices),
         }
     }
 }
@@ -1215,10 +1369,29 @@ fn admitted_cycle_evaluates_combiner(cycle_type: CycleType) -> Result<bool, Texr
 /// truncating cast left the entire suite green, because every unit test
 /// reached the arithmetic through the test module's own copy of it.
 ///
-/// `alphaCompareValue`, [`run_one_cycle`]'s second return, is deliberately
+/// `alphaCompareValue`, the combiner's second return, is deliberately
 /// discarded: alpha compare is a separate stage this executor does not run
 /// (see this module's Nonclaims).
-fn combine_one_texel(combine: CombineParams, base: CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+///
+/// `evaluation` selects [`run_one_cycle`] or [`run_two_cycle`]. Both are
+/// `crate::combiner`'s own public entry points -- the triangle pipeline's
+/// evaluators, not a second copy of the arithmetic. Two-cycle is **not**
+/// one-cycle run twice: `run_two_cycle` reads the cycle-0 bitfield slice on
+/// its first pass and applies `wrapInputC`/`wrapInputABD` to the
+/// accumulator before the second pass reads it as `COMBINED`, neither of
+/// which one-cycle mode does. `two_cycle_carries_the_accumulator_one_cycle_cannot`
+/// pins a program where the two answers differ.
+///
+/// [`TexrectCombinerEvaluation::BlitsTheTexel`] never reaches here: Copy
+/// cycle short-circuits at the call site with the texel's own bytes, and
+/// admitting it to a combiner call would evaluate a latched program the RDP
+/// ignores in that mode.
+fn combine_one_texel(
+    combine: CombineParams,
+    base: CombinerInputs,
+    texel: [u8; 4],
+    evaluation: TexrectCombinerEvaluation,
+) -> [u8; 4] {
     let [red, green, blue, alpha] = texel;
     let inputs = CombinerInputs {
         tex_val0: [
@@ -1229,7 +1402,12 @@ fn combine_one_texel(combine: CombineParams, base: CombinerInputs, texel: [u8; 4
         ],
         ..base
     };
-    let (combined_color, _alpha_compare) = run_one_cycle(combine, inputs);
+    let (combined_color, _alpha_compare) = match evaluation {
+        TexrectCombinerEvaluation::OneCycle | TexrectCombinerEvaluation::BlitsTheTexel => {
+            run_one_cycle(combine, inputs)
+        }
+        TexrectCombinerEvaluation::TwoCycle => run_two_cycle(combine, inputs),
+    };
     combined_color.map(|channel| (channel * 255.0).round() as u8)
 }
 
@@ -1912,6 +2090,63 @@ mod one_cycle_tests {
         pack_second_cycle([5, 1, 3, 1], [1, 7, 3, 7])
     }
 
+    /// [`pack_second_cycle`]'s first-cycle twin, hand-derived from the same
+    /// `parse_color_*`/`parse_alpha_*` functions at `second_cycle = false`
+    /// (`combiner.rs:189-250`): color A `low >> 20 & 0xF`,
+    /// B `high >> 28 & 0xF`, C `low >> 15 & 0x1F`, D `high >> 15 & 0x7`;
+    /// alpha A `low >> 12 & 0x7`, B `high >> 12 & 0x7`, C `low >> 9 & 0x7`,
+    /// D `high >> 9 & 0x7`.
+    ///
+    /// Every one of those fields is disjoint from every field
+    /// [`pack_second_cycle`] writes, which is what lets the two be OR'd into
+    /// one `CombineParams` to build a genuine two-cycle program.
+    /// `two_cycle_wire_program_decodes_to_both_slices` asserts that by
+    /// decoding rather than by inspection.
+    fn pack_first_cycle(color: [u32; 4], alpha: [u32; 4]) -> CombineParams {
+        let [ca, cb, cc, cd] = color;
+        let [aa, ab, ac, ad] = alpha;
+        let low = (ca << 20) | (cc << 15) | (aa << 12) | (ac << 9);
+        let high = (cb << 28) | (cd << 15) | (ab << 12) | (ad << 9);
+        CombineParams::from_wire(low, high)
+    }
+
+    /// Merges a first-cycle and a second-cycle packing into one program.
+    fn merge_cycles(first: CombineParams, second: CombineParams) -> CombineParams {
+        CombineParams::from_wire(first.low() | second.low(), first.high() | second.high())
+    }
+
+    /// A two-cycle program whose two cycles cannot be collapsed into one.
+    ///
+    /// **Cycle 0** (RGB and alpha alike): `(Zero - Zero) * Zero + Primitive`
+    /// -- the accumulator becomes the primitive colour. Slot indices are
+    /// each slot's own out-of-table `Zero` (`A = 8`, `B = 8`, `C = 16`,
+    /// alpha `= 7`) with `D = 3` (`Primitive` in `colorInputD` and
+    /// `alphaInputABD` alike), exactly as [`flat_primitive_program`] does
+    /// for the second slice.
+    ///
+    /// **Cycle 1** (RGB and alpha alike): `(Zero - Zero) * Zero + Combined`
+    /// -- `D = 0`, which is `Combined` in `colorInputD` and
+    /// `alphaInputABD`. So cycle 1 emits, verbatim, whatever cycle 0 put in
+    /// the accumulator.
+    ///
+    /// Under two-cycle evaluation the result is the primitive colour.
+    /// Under one-cycle evaluation **only the second slice runs**, against
+    /// the zero-initialized accumulator, so `D = Combined` resolves to zero
+    /// and the result is transparent black. The two answers differ in all
+    /// four channels, which is the point: no reading of the second slice
+    /// alone can produce the two-cycle answer.
+    ///
+    /// Deliberately `Texel0`-free in both slices. This executor binds one
+    /// tile, so `Texel1` is refused (the reference lane refuses it for the
+    /// same reason), and a program needing a second texel would prove
+    /// nothing about the carry.
+    fn carry_program() -> CombineParams {
+        merge_cycles(
+            pack_first_cycle([8, 8, 16, 3], [7, 7, 7, 3]),
+            pack_second_cycle([8, 8, 16, 0], [7, 7, 7, 0]),
+        )
+    }
+
     /// Program 2 (420 of 2,520): RGB and Alpha both
     /// `(Zero - Zero) * Zero + Primitive`.
     ///
@@ -1953,7 +2188,12 @@ mod one_cycle_tests {
     /// executor actually *calls* it is the composed and end-to-end tests,
     /// which is the right place for that claim.
     fn combine_texel(shading: TexrectShading, texel: [u8; 4]) -> [u8; 4] {
-        combine_one_texel(shading.combine(), shading.base_inputs(), texel)
+        combine_one_texel(
+            shading.combine(),
+            shading.base_inputs(),
+            texel,
+            TexrectCombinerEvaluation::OneCycle,
+        )
     }
 
     /// **Positive control for every assertion below**: the two wire words
@@ -2333,8 +2573,18 @@ mod one_cycle_tests {
     fn combine_one_texel_consults_the_program_it_is_given() {
         let texel = [0x18, 0x40, 0xC8, 0xFF];
         let base = measured_shading(env_lerp_program()).base_inputs();
-        let lerp = combine_one_texel(env_lerp_program(), base, texel);
-        let flat = combine_one_texel(flat_primitive_program(), base, texel);
+        let lerp = combine_one_texel(
+            env_lerp_program(),
+            base,
+            texel,
+            TexrectCombinerEvaluation::OneCycle,
+        );
+        let flat = combine_one_texel(
+            flat_primitive_program(),
+            base,
+            texel,
+            TexrectCombinerEvaluation::OneCycle,
+        );
         assert_ne!(
             lerp, flat,
             "the same texel and the same registers must combine differently under the two \
@@ -2586,67 +2836,282 @@ mod one_cycle_tests {
         );
     }
 
-    /// **Two-cycle and Fill are refused at the EXECUTOR, not only in the
-    /// error type's prose** -- mutant (f), and this test exists because
-    /// that mutant SURVIVED its first draft.
-    ///
-    /// Widening the executor's cycle match to admit `TwoCycle` alongside
-    /// `OneCycle` left the whole suite green: the sibling test below
-    /// asserts only the error's *message*, which a widened gate never
-    /// constructs, and no fixture executes a two-cycle texrect.
+    /// **Which evaluation each cycle type selects at the EXECUTOR, not only
+    /// in the error type's prose** -- mutant (f), and this test exists
+    /// because that mutant SURVIVED its first draft.
     ///
     /// Reaching `execute_texture_rectangle` needs a live pending TMEM
     /// transaction, which no unit test can build. What this test pins
     /// instead is the decision the executor makes, extracted as
-    /// [`admitted_cycle_evaluates_combiner`] -- the same match, called by
-    /// the executor, so widening it here is caught. Exhaustive over all
-    /// four `CycleType` variants, so a fifth added later cannot be
-    /// silently admitted either.
+    /// [`admitted_cycle_evaluation`] -- the same match, called by the
+    /// executor. Exhaustive over all four `CycleType` variants, so a fifth
+    /// added later cannot be silently admitted either.
+    ///
+    /// Note what this test does **not** prove and never did: that the
+    /// evaluation it names is the arithmetic that runs. Naming
+    /// `TexrectCombinerEvaluation::TwoCycle` here would still pass if
+    /// `combine_one_texel` ignored it and called `run_one_cycle` anyway.
+    /// [`two_cycle_carries_the_accumulator_one_cycle_cannot`] is the test
+    /// that closes that, and it is the reason the widening was allowed to
+    /// land at all.
     #[test]
-    fn the_executor_admits_exactly_copy_and_one_cycle() {
+    fn the_executor_admits_copy_one_cycle_and_two_cycle() {
         assert_eq!(
-            admitted_cycle_evaluates_combiner(CycleType::Copy),
-            Ok(false),
+            admitted_cycle_evaluation(CycleType::Copy),
+            Ok(TexrectCombinerEvaluation::BlitsTheTexel),
             "Copy is admitted and evaluates NO combiner"
         );
         assert_eq!(
-            admitted_cycle_evaluates_combiner(CycleType::OneCycle),
-            Ok(true),
-            "OneCycle is admitted and DOES evaluate the combiner"
+            admitted_cycle_evaluation(CycleType::OneCycle),
+            Ok(TexrectCombinerEvaluation::OneCycle),
+            "OneCycle is admitted and evaluates ONE combiner pass"
         );
-        for refused in [CycleType::TwoCycle, CycleType::Fill] {
+        assert_eq!(
+            admitted_cycle_evaluation(CycleType::TwoCycle),
+            Ok(TexrectCombinerEvaluation::TwoCycle),
+            "TwoCycle is admitted and evaluates BOTH combiner passes"
+        );
+        assert_eq!(
+            admitted_cycle_evaluation(CycleType::Fill),
+            Err(TexrectExecutionError::UnsupportedCycleType {
+                cycle_type: CycleType::Fill
+            }),
+            "Fill samples no texture and must still be refused by name"
+        );
+    }
+
+    /// **Positive control for [`carry_program`]**: the merged wire words
+    /// really do decode to two *different* programs in the two slices.
+    ///
+    /// Without this, a packing slip could put the same selectors in both
+    /// slices, and the witness test below would compare one-cycle against a
+    /// two-cycle run of the same formula -- which could pass for the wrong
+    /// reason.
+    #[test]
+    fn two_cycle_wire_program_decodes_to_both_slices() {
+        let program = carry_program();
+        assert_eq!(
+            [
+                program.decode_color(ColorInputSlot::A, false),
+                program.decode_color(ColorInputSlot::B, false),
+                program.decode_color(ColorInputSlot::C, false),
+                program.decode_color(ColorInputSlot::D, false),
+            ],
+            [
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Primitive,
+            ],
+            "cycle 0's RGB must be (Zero - Zero) * Zero + Primitive"
+        );
+        assert_eq!(
+            [
+                program.decode_color(ColorInputSlot::A, true),
+                program.decode_color(ColorInputSlot::B, true),
+                program.decode_color(ColorInputSlot::C, true),
+                program.decode_color(ColorInputSlot::D, true),
+            ],
+            [
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Zero,
+                ColorInput::Combined,
+            ],
+            "cycle 1's RGB must be (Zero - Zero) * Zero + Combined"
+        );
+        assert_eq!(
+            [
+                program.decode_alpha(AlphaInputSlot::A, false),
+                program.decode_alpha(AlphaInputSlot::B, false),
+                program.decode_alpha(AlphaInputSlot::C, false),
+                program.decode_alpha(AlphaInputSlot::D, false),
+            ],
+            [
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Primitive,
+            ],
+            "cycle 0's alpha must be (Zero - Zero) * Zero + Primitive"
+        );
+        assert_eq!(
+            [
+                program.decode_alpha(AlphaInputSlot::A, true),
+                program.decode_alpha(AlphaInputSlot::B, true),
+                program.decode_alpha(AlphaInputSlot::C, true),
+                program.decode_alpha(AlphaInputSlot::D, true),
+            ],
+            [
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Zero,
+                AlphaInput::Combined,
+            ],
+            "cycle 1's alpha must be (Zero - Zero) * Zero + Combined"
+        );
+    }
+
+    /// **Two-cycle evaluation carries cycle 0's result into cycle 1, and
+    /// one-cycle evaluation of the same program cannot** -- the observation
+    /// the previous draft of this module was missing.
+    ///
+    /// The refusal that used to sit at [`admitted_cycle_evaluation`] recorded
+    /// its own blind spot: "while this match was inline, widening it to
+    /// admit two-cycle left the entire suite green." A green suite proved
+    /// nothing was broken, not that anything was evaluated. Nothing in the
+    /// suite ever ran two-cycle *arithmetic*, so the widened arm was
+    /// unobserved either way.
+    ///
+    /// This test observes it. [`carry_program`]'s two slices are different
+    /// formulas by construction (asserted above), and the hand derivation
+    /// is:
+    ///
+    /// - cycle 0: `(0 - 0) * 0 + Primitive` = the primitive colour,
+    ///   `0x80/0xFF/0x40/0x80` normalized, written into the accumulator;
+    /// - cycle 1: `(0 - 0) * 0 + Combined` = that accumulator verbatim.
+    ///
+    /// So two-cycle must give back the primitive colour's own bytes. The
+    /// same program run as one-cycle evaluates **only** the second slice
+    /// against the zero-initialized accumulator, where `Combined` is `0.0`,
+    /// so it must give transparent black. Both are asserted, and asserted to
+    /// differ -- the inequality alone would be satisfied by two equally
+    /// wrong answers.
+    ///
+    /// `wrap_clamp` is the identity on both: every channel of both answers
+    /// is already inside `[0, 1]`.
+    #[test]
+    fn two_cycle_carries_the_accumulator_one_cycle_cannot() {
+        let program = carry_program();
+        let base = TexrectShading::new(
+            program,
+            Some(Color4::from_wire(ENV_WIRE)),
+            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+        )
+        .base_inputs();
+        // The texel is deliberately non-zero and unlike the primitive
+        // colour: neither slice reads TEXEL0, so a two-cycle answer that
+        // leaked the texel would be caught here rather than mistaken for
+        // the carry.
+        let texel = [0x18, 0x40, 0xC8, 0xFF];
+
+        let two_cycle =
+            combine_one_texel(program, base, texel, TexrectCombinerEvaluation::TwoCycle);
+        let one_cycle =
+            combine_one_texel(program, base, texel, TexrectCombinerEvaluation::OneCycle);
+
+        assert_eq!(
+            two_cycle,
+            [0x80, 0xFF, 0x40, 0x80],
+            "cycle 0 writes the primitive colour into the accumulator and cycle 1 emits it \
+             verbatim through D = COMBINED"
+        );
+        assert_eq!(
+            one_cycle,
+            [0x00, 0x00, 0x00, 0x00],
+            "one-cycle mode runs ONLY the second slice, whose D = COMBINED reads the \
+             zero-initialized accumulator"
+        );
+        assert_ne!(
+            two_cycle, one_cycle,
+            "if these agree, the two-cycle arm is not running two cycles"
+        );
+    }
+
+    /// **Two-cycle's second slice is the only place `Combined` is admitted**
+    /// -- the widening admits the carry where a first-cycle result exists
+    /// and nowhere else.
+    ///
+    /// This is the reference lane's own rule
+    /// (`fn64-render-reference/src/backend/validate.rs:476-478`, "selects
+    /// COMBINED before a first-cycle result exists"), and without it the
+    /// widening would admit a one-cycle program reading a zero the executor
+    /// invented -- exactly the failure mode `UnsupportedColorInput` exists
+    /// to prevent.
+    #[test]
+    fn combined_is_admitted_only_in_the_second_slice_of_two_cycles() {
+        let shading = TexrectShading::new(
+            carry_program(),
+            Some(Color4::from_wire(ENV_WIRE)),
+            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+        );
+        shading
+            .validate_combiner_program(CombinerProgramCycles::BothSlices)
+            .expect("cycle 1 has a first-cycle result for COMBINED to read");
+        assert_eq!(
+            shading.validate_combiner_program(CombinerProgramCycles::OnlySecondSlice),
+            Err(TexrectExecutionError::UnsupportedColorInput {
+                slot: ColorInputSlot::D,
+                input: ColorInput::Combined,
+            }),
+            "the same program in one-cycle mode reads COMBINED with no first cycle behind it"
+        );
+        assert_eq!(
+            shading.validate_one_cycle(),
+            shading.validate_combiner_program(CombinerProgramCycles::OnlySecondSlice),
+            "validate_one_cycle must stay an exact alias for the one-slice admission"
+        );
+    }
+
+    /// **`Texel1` stays refused in BOTH slices of a two-cycle program.**
+    ///
+    /// A rectangle binds one tile ([`TexrectTileBinding`] carries a single
+    /// descriptor), so there is no decoded tile+1 to sample. The reference
+    /// lane refuses `Texel1` for a rectangle for exactly that reason
+    /// (`fn64-render-reference/src/backend/validate.rs:479-483`). Widening
+    /// the cycle admission must not widen this one.
+    #[test]
+    fn texel1_is_refused_in_both_slices_of_a_two_cycle_program() {
+        // Color slot A index 2 is TEXEL0's neighbour TEXEL1 in
+        // `colorInputCommon`; placed in cycle 0 first, then in cycle 1.
+        let in_first = merge_cycles(
+            pack_first_cycle([2, 8, 16, 3], [7, 7, 7, 3]),
+            pack_second_cycle([8, 8, 16, 0], [7, 7, 7, 0]),
+        );
+        let in_second = merge_cycles(
+            pack_first_cycle([8, 8, 16, 3], [7, 7, 7, 3]),
+            pack_second_cycle([2, 8, 16, 0], [7, 7, 7, 0]),
+        );
+        for (program, slice) in [(in_first, "cycle 0"), (in_second, "cycle 1")] {
+            let shading = TexrectShading::new(
+                program,
+                Some(Color4::from_wire(ENV_WIRE)),
+                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            );
             assert_eq!(
-                admitted_cycle_evaluates_combiner(refused),
-                Err(TexrectExecutionError::UnsupportedCycleType {
-                    cycle_type: refused
+                shading.validate_combiner_program(CombinerProgramCycles::BothSlices),
+                Err(TexrectExecutionError::UnsupportedColorInput {
+                    slot: ColorInputSlot::A,
+                    input: ColorInput::Texel1,
                 }),
-                "{refused:?} must be refused by name at the executor's own gate"
+                "TEXEL1 in {slice} has no decoded tile+1 behind it and must be refused"
             );
         }
     }
 
-    /// **Two-cycle and Fill remain refused by name** -- the admission
-    /// widened by exactly one mode, not into a blanket acceptance.
+    /// **Fill remains refused by name** -- the admission widened by exactly
+    /// one mode, not into a blanket acceptance.
     ///
     /// Checked at the enum rather than through the executor because
     /// reaching the executor needs a live pending TMEM transaction, which
     /// the end-to-end tests supply; what is pinned here is that the mode
-    /// set this module claims is `{Copy, OneCycle}` and its complement is
-    /// named.
+    /// set this module claims is `{Copy, OneCycle, TwoCycle}` and its
+    /// complement is named.
     #[test]
-    fn the_admitted_cycle_set_is_exactly_copy_and_one_cycle() {
-        for cycle_type in [CycleType::TwoCycle, CycleType::Fill] {
-            let error = TexrectExecutionError::UnsupportedCycleType { cycle_type };
-            let message = error.to_string();
-            assert!(
-                message.contains(&format!("{cycle_type:?}")),
-                "the refusal must name the mode it refused: {message}"
-            );
-            assert!(
-                message.contains("Copy") && message.contains("OneCycle"),
-                "the refusal must state which modes ARE admitted: {message}"
-            );
-        }
+    fn the_admitted_cycle_set_is_copy_one_cycle_and_two_cycle() {
+        let cycle_type = CycleType::Fill;
+        let error = TexrectExecutionError::UnsupportedCycleType { cycle_type };
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{cycle_type:?}")),
+            "the refusal must name the mode it refused: {message}"
+        );
+        assert!(
+            message.contains("Copy")
+                && message.contains("OneCycle")
+                && message.contains("TwoCycle"),
+            "the refusal must state which modes ARE admitted: {message}"
+        );
     }
 }
 
