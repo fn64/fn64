@@ -238,3 +238,58 @@ to "what does this screen actually want", and the next probe is a watch on
 
 The furthest state reached remains the two-wrestler versus screen. The game
 walks eight menu states on scripted A presses and stops at state 18.
+
+## CONFIRMED: on the rs lane the pad seam is the PIF buffer, not fn64's shim
+
+The prior card attributed port 1-3's absence to
+`osContGetReadData_recomp` (`crates/fn64-abi/src/si/mod.rs:1113+`). On the
+**rs lane that shim does not run.** `recompile_rom`'s emitted table binds the
+address to the game's own code:
+
+```
+scratch/emit1/src/lib.rs:822:    (0x8002F788, func_8002F788 as RecompFunc),
+```
+
+`func_8002F788` is stock libultra `osContGetReadData`
+(`aki-recomp/games/NWXE/disasm/asm/1050.s`, `0x8002F788`), and reading it
+settles two things the shim's doc comment can only assert:
+
+- It loops **`D_800974B0` (`__osMaxControllers`) times**, and
+  `__osContInit` sets that to a literal **4** (`addiu $v0, $zero, 0x4` at
+  `0x8002F9C4`) with no dependence on how many ports answered. All four ports
+  are always visited.
+- Per port it reads the PIF output buffer `D_80090250` at **stride 8** and
+  computes `errno = (byte@+2 & 0xC0) >> 4` (`0x8002F7CC..0x8002F7D8`), then
+  fills `button`/`stick` **only when that errno is zero**
+  (`bnez $v0, .L8002F7F8`). `CHNL_ERR_NORESP = 0x80` shifted right by 4 is
+  `0x08` -- the same `CONT_NO_RESPONSE_ERROR` fn64 names.
+
+So the seam that decides ports 1-3 on this lane is **fn64's `PifModel`
+writing the SI/PIF output buffer**, and the game's own libultra derives
+`errno` from those bytes exactly as hardware does. Any claim about port 1-3
+`errno` on the rs lane has to be measured at `D_80057210`/`D_80057214`
+(where the game lands it) or at `D_80090250` (the wire), not at the shim.
+
+## CONFIRMED: the port field the ready check reads is TABLE data, not input
+
+`func_801456C8`'s `lhu $v0, 0x16($a0)` reads a halfword written by
+`func_801445BC` (`0x801445BC`), the match-setup fill:
+
+```
+80144680  addiu $s0, $s2, 0x4A      # $s2 = D_8017016C, the entry array
+80144684  lhu   $v0, 0x0($s3)       # $s3 = D_80167CE0[D_8009EAA0 >> 6]
+80144688  sh    $v0, 0x16($s0)      # <-- the ready check's port field
+...
+80144708  addiu $s2, $s2, 0x88      # stride 0x88, $s4 = table-supplied count
+```
+
+and `func_801455BC` computes the same array as `D_801702A4_val + 0x4C8`
+(`0x801455C8`), whose `+0x4A` is `D_801702A4_val + 0x512` -- the ready
+check's own base. **The two agree: one array, one field.**
+
+The consequence for this investigation: the `0x16 & 0xF` field is populated
+from a per-match-type ROM table selected by `D_8009EAA0`, and the number of
+entries filled is that table's own count. It is NOT derived from how many
+controllers fn64 reports. So "every entry skipped" and "entries visited but no
+A" have to be told apart by measurement -- neither is predictable from the
+controller model.
