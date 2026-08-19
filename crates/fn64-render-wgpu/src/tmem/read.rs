@@ -907,6 +907,11 @@ mod tests {
         ));
     }
 
+    /// The RGBA32 base refusal still preempts validity, and the
+    /// enabled-TLUT CI tile at the same base no longer refuses at all --
+    /// it wraps, and then reports the WRAPPED address as the unwritten
+    /// byte. The two arms are deliberately kept side by side: they used
+    /// to give the same answer, and now they must not.
     #[test]
     fn address_scope_is_rejected_before_empty_state_validity() {
         let state = PhysicalTmemState::try_new().unwrap();
@@ -923,6 +928,7 @@ mod tests {
                 byte_address: 0x800,
             })
         );
+        // 0x800 & 0x7ff == 0x000: the wrap target, hand-computed.
         assert_eq!(
             read_committed_texel(
                 &state,
@@ -930,9 +936,7 @@ mod tests {
                 addressed,
                 TextureLutMode::Rgba16,
             ),
-            Err(PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf {
-                byte_address: 0x800,
-            })
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x000 })
         );
     }
 
