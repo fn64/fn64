@@ -488,3 +488,29 @@ and the guest commit. Only `CombinerInputs::tex_val0` is still zero.
 
 Depth (bit 0) remains out and is a separate, larger piece: it needs a depth
 image, a depth journal declaration, and the RDP's own Z encoding.
+
+### The texture rung's two non-obvious constants, recorded before they are needed
+
+`fn64-render-reference`'s `draw_raw_rdp_triangle_impl` (`raster/draw.rs:898`)
+carries two scale factors that are EMPIRICAL, derived against WM2000's own
+title screen, and that a fresh implementation will get wrong by default:
+
+1. **Perspective path.** Hardware `tcdiv` is not a bare S/W ratio: it feeds
+   the high bits of the s15.16 attribute planes to a 2^15-normalized
+   reciprocal of W, so the output is `(S/W) * 2^10` texels in S10.5 units.
+   The reference records that without the `* 1024.0` "the whole title-screen
+   quad collapsed onto texel (0,0) -- every pixel sampled the image's corner
+   and the presented frame was a uniform field."
+2. **Non-perspective path (`G_TP_NONE`).** The divide is skipped and the
+   plane's own value converts s15.16 -> S10.5 by dividing by `2^21`
+   (`2^16 * 2^5`).
+
+And one robustness rule, also earned from real content: **w <= 0 must not
+fault.** A perspective triangle crossing the near plane legitimately presents
+non-positive W at edge pixels; real RDP hardware derives 1/w from the
+operand's top bits with no sign trap, so the pixel samples garbage texels and
+the chip keeps going. The reference divides by `w.unsigned_abs().max(1)`.
+It records that a loud assert here was correct until real content (WM2000 gfx
+task ~#27) hit it.
+
+Cite these; do not re-derive them.
