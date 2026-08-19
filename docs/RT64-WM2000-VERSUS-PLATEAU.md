@@ -392,3 +392,25 @@ So the plateau is: **the game is set up as a two-player match (entries on
 ports 0 and 1), the console it is running on has one controller, and player 2
 can never press anything.** That is the correct behaviour of the modeled
 hardware, not a defect in it.
+
+## Why the earlier second-controller test could not have settled this
+
+`RT64-WM2000-INPUT-GRAMMAR.md:889-905` closes the second-controller
+hypothesis on 431 byte-identical frames. That test did plug port 1 in --
+`WM2000_PORTS=2` called `fn64_abi::set_controller_port_state`, and the
+divergence it reports (`sim_time` 895,926,191 vs 895,940,131 at step 50,000)
+proves the port really was live.
+
+But the harness's scripted-input block only ever called
+`fn64_abi::set_controller_state(**0**, ...)`. **Port 1 was plugged in and
+never pressed anything.** Against `func_801456C8` that is not a two-player
+console, it is a console with a second controller nobody is holding: entry 1
+still reads `D_80095186 + 12`, which is still zero, so `D_8011BF50[1]` still
+never clears and the loop still returns `-1`.
+
+So "431 frames byte-identical" is a true statement about the SCREEN that
+carries no information about the ready check. It is exactly the conflation
+this card warns about -- the screen not changing was read as the second
+controller not mattering, when the experiment never exercised the thing the
+second controller is for. The measurement that distinguishes them is
+`D_8011BF50[1]`, and it needs pad 1 to be DRIVEN, not merely attached.
