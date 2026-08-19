@@ -202,17 +202,15 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     let combine_params = self
                         .current_combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
-                    // Retrieval-time admission gate (card §4a): the natural
-                    // `require_supported_alpha_compare` call site this
-                    // module was always documented to need. `Reserved`/
-                    // `Dither` never reach `submit_admitted_triangle` --
-                    // loud, named panics here, not a silent None/Threshold
-                    // coercion (AGENTS.md "loud traps, no silent shrugs").
+                    // Retrieval-time admission gate (card §4a): `Dither`
+                    // never reaches `submit_admitted_triangle` -- a loud,
+                    // named panic here, not a silent None/Threshold coercion
+                    // (AGENTS.md "loud traps, no silent shrugs"). There is no
+                    // reserved encoding to gate: other-mode low bits 1:0 are
+                    // two independent hardware bits and wire 2 decodes to
+                    // `None` (angrylion `src/core/n64video/rdp.c:659-660`;
+                    // `docs/RT64-GUARD-AUDIT.md` A3).
                     match other_mode.alpha_compare() {
-                        AlphaCompare::Reserved => panic!(
-                            "triangle #{triangle_index} (plan order) selected reserved G_AC \
-                             alpha-compare mode 2"
-                        ),
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
                              alpha-compare, which has no fragment-callable RT64 PRNG binding in \
