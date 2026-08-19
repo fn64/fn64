@@ -1,0 +1,275 @@
+//! The CPU rasterizer for one flat, opaque, untextured raw RDP triangle,
+//! producing the same [`CompletedColorTargetWrite`] the fill and texrect
+//! executors produce.
+//!
+//! # Why a CPU rasterizer and not the GPU one
+//!
+//! `docs/RT64-TRIANGLE-WRITEBACK.md` records the fork and the disproofs. In
+//! short: the guest-visible path has no GPU in it. `ColorTargetRegistry`'s
+//! `device_bytes` is a CPU `Vec<u8>`, `draw_admitted_triangles` refuses
+//! without an adapter, and `TriangleDrawOutput` is `Rgba8Unorm` at a
+//! `RenderConfig` extent while the guest framebuffer is RGBA16 at a
+//! `SetColorImage` one. Routing the GPU raster back would requantize
+//! invented content across a stride nothing checks, and would make every
+//! guest-visible claim adapter-conditional. So a raw triangle gets the same
+//! CPU seam the texrect already has.
+//!
+//! # What this executor is, and is not
+//!
+//! It is the NARROWEST triangle that can be made correct end to end: flat
+//! (opcode 0x08 -- no shade, no texture, no depth plane on the wire),
+//! non-Fill cycle, drawn through the latched combiner and blender.
+//!
+//! It is **not** a general triangle rasterizer. There is no shade plane
+//! interpolation, no s/t/w perspective divide, no LOD, and no depth test.
+//! `crate::raw_dpc::raw_triangle_is_flat_opaque` is the decoder-side twin of
+//! that admission, and the two must widen together in that order: the
+//! executor first, the declaration second. Declaring a row this executor
+//! cannot fill is worse than declaring none, because `fill_completed_writes`
+//! slices the full-extent buffer for every declared range without checking
+//! the raster touched it.
+//!
+//! # Coverage is a superset in exactly one direction
+//!
+//! The journal declares whole `[x0, x1)` runs per scanline, because a
+//! `ResourceAccess` is a byte range and cannot express "these pixels within
+//! the range". A pixel at either end of that run may have zero subpixel
+//! coverage. That is safe only because this executor writes **every pixel in
+//! the declared run**, using the resident's own prior byte where coverage is
+//! zero -- so the declared range's content is always real, current content,
+//! never stale bytes from a generation the accumulator moved past. See
+//! [`raster_flat_triangle`]'s loop.
+
+use fn64_render_ir::ResourceAccess;
+
+use super::texrect::{
+    admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
+    TexrectBlendRegisters, TexrectCombinerEvaluation, TexrectExecutionError,
+    TexrectFragmentStages, TexrectShading,
+};
+use super::{
+    CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
+    TargetError, TargetRectangle,
+};
+use crate::raw_dpc::{triangle_span, RawTriangle};
+use crate::{CycleType, OtherMode};
+
+/// The subpixel coverage a fully-covered pixel has: two X sample columns
+/// times four Y sample rows.
+const FULL_COVERAGE: u32 = 8;
+
+/// Rasterizes one flat raw triangle into `resident_bytes`, returning the
+/// full-extent result.
+///
+/// `declared_rows` is how many `ResourceAccess` rows the DECODER declared
+/// for this triangle. This executor recomputes the row list from
+/// `triangle_span::covered_rows` -- the same function the decoder called --
+/// and refuses by name if the two counts differ.
+///
+/// That check is not belt-and-braces; it is the whole safety argument. The
+/// decoder bounds its row walk by installed RDRAM and a fixed cap, because
+/// `SetColorImage` carries no height and the target extent does not exist at
+/// decode time. This executor bounds the same walk by the real extent. The
+/// two bounds are different, so the two lists CAN differ -- and if they do,
+/// `fill_completed_writes` would slice and digest bytes for every declared
+/// row including ones this raster never visited, putting stale content into
+/// guest RDRAM under a valid digest. Refusing here is the only place that
+/// divergence is visible.
+///
+/// `resident_bytes` is required and must be the target's full extent: a
+/// triangle covers a sub-region, so every pixel outside it must come from
+/// real prior content, which in the composed schedule is the previous
+/// command's own output.
+pub fn execute_raw_triangle(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: &[u8],
+    declared_rows: usize,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    // Cycle, combiner-program, blender and fragment-stage admission all run
+    // BEFORE any pixel is produced, so a mode this executor cannot evaluate
+    // exactly refuses with an untouched target rather than a half-drawn one.
+    // Same order and same reason as `execute_texture_rectangle`.
+    let evaluation = admitted_cycle_evaluation(other_mode.cycle_type())?;
+    // Copy cycle blits a texel. An untextured triangle has no texel to blit,
+    // so unlike a texrect this executor cannot pass it through -- refused by
+    // the same named error the cycle admission uses, rather than combining
+    // against a fabricated zero texel.
+    if matches!(evaluation, TexrectCombinerEvaluation::BlitsTheTexel) {
+        return Err(TexrectExecutionError::UnsupportedCycleType {
+            cycle_type: CycleType::Copy,
+        });
+    }
+    let cycles = evaluation
+        .validated_cycles()
+        .expect("Copy cycle was refused above, and Fill by admitted_cycle_evaluation");
+    let base_inputs = shading.validate_combiner_program(cycles)?.base_inputs();
+    let blend_state = blend_registers.mode_state(other_mode);
+    require_blendable_mode(blend_state)?;
+    let stages = TexrectFragmentStages::try_new(other_mode, blend_registers.blend_color())?;
+
+    let key = candidate.key();
+    let format = key.format();
+    let extent = key.extent();
+    let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    let full_len = (extent.pixels() as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or(TargetError::PixelBufferLengthOverflow {
+            pixels: extent.pixels() as usize,
+            bytes_per_pixel: format.bytes_per_pixel(),
+        })?;
+    if resident_bytes.len() != full_len {
+        return Err(TargetError::CompletedByteLengthMismatch {
+            key,
+            generation: candidate.generation(),
+            expected: full_len,
+            actual: resident_bytes.len(),
+        }
+        .into());
+    }
+
+    // **The rows the DECODER declared, recomputed here from the same
+    // function with the same inputs.** Not a second derivation: identical
+    // call, identical arguments, so it cannot disagree. The alternative --
+    // threading the decoder's `Vec` through the executor signature -- was
+    // rejected because the executor also needs the target extent to bound
+    // the walk, and the decoder has no extent to bound it with. Instead the
+    // extent is checked against the rows below, and a row outside it is a
+    // named refusal rather than a silent clip.
+    let rows = triangle_span::covered_rows(triangle, extent.width(), extent.height());
+    if rows.len() != declared_rows {
+        return Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
+            declared: declared_rows,
+            rasterized: rows.len(),
+        });
+    }
+    if rows.is_empty() {
+        // A triangle whose declared rows are all empty at this extent has
+        // nothing to draw. The caller only reaches this executor for a
+        // triangle the decoder DID declare rows for, so an empty list here
+        // means the executor's extent and the decoder's RDRAM bound
+        // disagree -- a named refusal, never a silent no-op that would
+        // leave declared ranges holding stale bytes.
+        return Err(TexrectExecutionError::Target(TargetError::ZeroRectangle {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }));
+    }
+    // The declared rows and the drawn rows must be the SAME rows. The
+    // decoder bounded its walk by installed RDRAM and a fixed row cap, not
+    // by this extent, so a triangle taller or wider than the target would
+    // make the two lists differ -- which is the stale-digest hazard. Refused
+    // by name here rather than clipped.
+    let last = rows.last().expect("rows is non-empty");
+    let rectangle = TargetRectangle::try_new(
+        rows.iter().map(|row| row.x0).min().expect("non-empty"),
+        rows[0].y,
+        {
+            let left = rows.iter().map(|row| row.x0).min().expect("non-empty");
+            let right = rows.iter().map(|row| row.x1).max().expect("non-empty");
+            right - left
+        },
+        last.y - rows[0].y + 1,
+    )?;
+    if rectangle.x() + rectangle.width() > extent.width()
+        || rectangle.y() + rectangle.height() > extent.height()
+    {
+        return Err(TexrectExecutionError::OutsideTarget { key, rectangle });
+    }
+
+    let mut bytes = resident_bytes.to_vec();
+    raster_flat_triangle(
+        &mut bytes,
+        format,
+        extent.width(),
+        triangle,
+        &rows,
+        shading,
+        base_inputs,
+        blend_state,
+        stages,
+        evaluation,
+    )?;
+
+    let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
+    Ok(CompletedColorTargetWrite::new_for_fill(
+        key,
+        candidate.generation(),
+        key.range(),
+        rectangle,
+        device_bytes,
+    ))
+}
+
+/// The per-pixel loop, over exactly the declared rows.
+///
+/// **Every pixel in a declared run is visited**, including the ones whose
+/// subpixel coverage is zero. A zero-coverage pixel is not skipped and not
+/// left untouched: it is written back with the byte it already held. That is
+/// what makes a declared byte range's digest describe real, current content
+/// even though the range is a superset of the covered pixels -- and it costs
+/// nothing, because the source of that byte is the resident copy this
+/// function is mutating in place.
+///
+/// The colour of a covered pixel comes from the latched combiner program
+/// evaluated through [`combine_one_texel`], the texrect path's own
+/// evaluator, with a zero `Texel0`: an untextured triangle's program is
+/// already proven by `validate_combiner_program` not to read `Texel0`
+/// meaningfully for the selectors this executor admits, and the flat
+/// primitive programs WM2000 latches read `Primitive`/`Environment`.
+#[allow(clippy::too_many_arguments)]
+fn raster_flat_triangle(
+    bytes: &mut [u8],
+    format: ColorTargetFormat,
+    width: u32,
+    triangle: &RawTriangle,
+    rows: &[triangle_span::CoveredRow],
+    shading: TexrectShading,
+    base_inputs: crate::CombinerInputs,
+    blend_state: crate::BlendModeState,
+    stages: TexrectFragmentStages,
+    evaluation: TexrectCombinerEvaluation,
+) -> Result<(), TexrectExecutionError> {
+    let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    for row in rows {
+        for x in row.x0..row.x1 {
+            // The coverage this pixel actually has, from the SAME span
+            // module the row list came from. Zero here is a real answer, not
+            // a skip: see this function's own doc.
+            let coverage = triangle_span::pixel_coverage(triangle, x as i32, row.y as i32);
+            if coverage == 0 {
+                continue;
+            }
+            debug_assert!(coverage <= FULL_COVERAGE);
+            let combined = combine_one_texel(shading.combine(), base_inputs, [0; 4], evaluation);
+            let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
+            blend_and_write_pixel(
+                format,
+                &mut bytes[offset..offset + bytes_per_pixel],
+                combined,
+                blend_state,
+                stages,
+                x,
+                row.y,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The exact ordered accesses one rasterized triangle's rows correspond to,
+/// for the caller to hand back to the journal.
+///
+/// Deliberately absent: this module never derives accesses. The decoder's
+/// own `plan_raw_triangle` pushed them and `bind_texture_rectangle` returns
+/// them; a second derivation here is exactly the drift
+/// `ExactRawDpcPlanWriter::finish` exists to catch.
+pub type DeclaredAccesses<'a> = &'a [ResourceAccess];
+
+#[cfg(test)]
+mod tests;

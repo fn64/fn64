@@ -6,7 +6,7 @@ mod triangle;
 #[cfg(test)]
 mod triangle_composition;
 mod triangle_draw_data;
-mod triangle_span;
+pub(crate) mod triangle_span;
 mod triangle_vertices;
 
 pub use production_adapter::{

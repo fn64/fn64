@@ -609,6 +609,24 @@ pub enum TexrectExecutionError {
         row: u32,
         source: BlendImageReadError,
     },
+    /// **The raw-triangle rasterizer's own row list disagrees with the row
+    /// count the decoder declared into the journal.**
+    ///
+    /// The two walks bound themselves differently and must: the decoder has
+    /// no target height (`SetColorImage` carries only a width) so it bounds
+    /// by installed RDRAM, while the executor bounds by the real extent. A
+    /// disagreement means some declared row would never be rasterized --
+    /// and `fill_completed_writes` slices and digests the full-extent buffer
+    /// for EVERY declared range without checking the raster touched it, so
+    /// that row would reach guest RDRAM holding stale bytes under a
+    /// perfectly valid digest.
+    ///
+    /// Refused loudly rather than clipped. This is the single check that
+    /// makes the declared-vs-drawn contract enforced rather than assumed.
+    TriangleRowCountDisagreesWithJournal {
+        declared: usize,
+        rasterized: usize,
+    },
     Target(TargetError),
 }
 
@@ -693,6 +711,15 @@ impl core::fmt::Display for TexrectExecutionError {
                 "{consumer} needs the destination coverage count, which is 3 bits split between \
                  RGBA16's visible LSB and a 2-bit hidden sidecar fn64-render-wgpu does not \
                  maintain; only 1 of the 3 bits is recoverable"
+            ),
+            Self::TriangleRowCountDisagreesWithJournal {
+                declared,
+                rasterized,
+            } => write!(
+                formatter,
+                "the raw triangle's journal declares {declared} scanline write(s) but the \
+                 rasterizer covers {rasterized}; a declared row the raster never visits would \
+                 be digested from stale resident bytes"
             ),
             Self::ReservedAlphaCompare => formatter
                 .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),
@@ -1164,7 +1191,7 @@ impl TexrectShading {
     /// them (see this type's own doc). A program reading `Environment`
     /// before any `SetEnvColor` therefore combines against the register's
     /// actual power-on value rather than aborting.
-    fn base_inputs(self) -> CombinerInputs {
+    pub(super) fn base_inputs(self) -> CombinerInputs {
         combiner_inputs_from_fragment_registers(
             CombinerInputs {
                 tex_val0: [0.0; 4],
@@ -1479,7 +1506,7 @@ fn union_rectangle(
 /// left the entire suite green, because nothing observed the *arithmetic*
 /// the widened arm selects. [`two_cycle_carries_the_accumulator_one_cycle_cannot`]
 /// is the observation that closes that gap.
-fn admitted_cycle_evaluation(
+pub(super) fn admitted_cycle_evaluation(
     cycle_type: CycleType,
 ) -> Result<TexrectCombinerEvaluation, TexrectExecutionError> {
     match cycle_type {
@@ -1494,7 +1521,7 @@ fn admitted_cycle_evaluation(
 /// than the `bool` this decision used to be: a `bool` could distinguish
 /// "combines" from "blits" but had nowhere to put "combines *twice*".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TexrectCombinerEvaluation {
+pub(super) enum TexrectCombinerEvaluation {
     /// Copy cycle. The sampled texel's own RGBA8888, unchanged; the RDP
     /// consults no combiner program in this mode.
     BlitsTheTexel,
@@ -1508,7 +1535,7 @@ enum TexrectCombinerEvaluation {
 impl TexrectCombinerEvaluation {
     /// The combiner-program validation this evaluation requires, or `None`
     /// in Copy cycle where no program is consulted.
-    const fn validated_cycles(self) -> Option<CombinerProgramCycles> {
+    pub(super) const fn validated_cycles(self) -> Option<CombinerProgramCycles> {
         match self {
             Self::BlitsTheTexel => None,
             Self::OneCycle => Some(CombinerProgramCycles::OnlySecondSlice),
@@ -1555,7 +1582,7 @@ impl TexrectCombinerEvaluation {
 /// cycle short-circuits at the call site with the texel's own bytes, and
 /// admitting it to a combiner call would evaluate a latched program the RDP
 /// ignores in that mode.
-fn combine_one_texel(
+pub(super) fn combine_one_texel(
     combine: CombineParams,
     base: CombinerInputs,
     texel: [u8; 4],
@@ -1615,7 +1642,16 @@ impl TexrectBlendRegisters {
     /// `Fog` before any `SetBlendColor`/`SetFogColor` reads the power-on
     /// zero, which is what both other lanes do. The bytes here are the
     /// register's real contents, not a substitution.
-    fn mode_state(self, other_mode: OtherMode) -> BlendModeState {
+    /// The `SetBlendColor` register this texrect/triangle observes.
+    ///
+    /// An accessor rather than a public field so the two executors read the
+    /// register through one name, and so a future refusal for an unset
+    /// register has one place to live.
+    pub(super) const fn blend_color(self) -> Color4 {
+        self.blend_color
+    }
+
+    pub(super) fn mode_state(self, other_mode: OtherMode) -> BlendModeState {
         BlendModeState {
             other_mode,
             blend_color_register: self.blend_color.rgba8(),
@@ -1943,7 +1979,7 @@ impl TexrectFragmentStages {
 /// returns 0 for it and [`blend_fragment`] then returns the source
 /// unchanged, which is the RDP's own blender bypass in that mode, not an
 /// approximation.
-fn require_blendable_mode(state: BlendModeState) -> Result<(), TexrectExecutionError> {
+pub(super) fn require_blendable_mode(state: BlendModeState) -> Result<(), TexrectExecutionError> {
     let cycle_count = state.cycle_count();
     if cycle_count == 0 {
         return Ok(());
@@ -2116,7 +2152,7 @@ fn blend_texrect_fragment(
 /// # Errors
 /// [`TexrectExecutionError::Blend`], propagated from
 /// [`blend_texrect_fragment`].
-fn blend_and_write_pixel(
+pub(super) fn blend_and_write_pixel(
     format: ColorTargetFormat,
     dest: &mut [u8],
     combined: [u8; 4],
