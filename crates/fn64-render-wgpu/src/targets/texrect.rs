@@ -627,6 +627,18 @@ pub enum TexrectExecutionError {
         declared: usize,
         rasterized: usize,
     },
+    /// The rasterizer's row at `position` covers a different byte range than
+    /// the journal declared at that position.
+    ///
+    /// The count check above catches a walk that stopped early; this catches
+    /// one that walked the same number of rows over different geometry.
+    /// Comparing ranges rather than trusting equal counts is what turns
+    /// "the two walks cannot disagree" from an inference into a check.
+    TriangleRowRangeDisagreesWithJournal {
+        position: usize,
+        declared: (u32, u32),
+        rasterized: (u32, u32),
+    },
     Target(TargetError),
 }
 
@@ -720,6 +732,15 @@ impl core::fmt::Display for TexrectExecutionError {
                 "the raw triangle's journal declares {declared} scanline write(s) but the \
                  rasterizer covers {rasterized}; a declared row the raster never visits would \
                  be digested from stale resident bytes"
+            ),
+            Self::TriangleRowRangeDisagreesWithJournal {
+                position,
+                declared,
+                rasterized,
+            } => write!(
+                formatter,
+                "the raw triangle's scanline #{position} is declared at \
+                 {declared:?} but rasterizes {rasterized:?} (start, len)"
             ),
             Self::ReservedAlphaCompare => formatter
                 .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),
