@@ -238,3 +238,49 @@ mode instead of its carried-in TLUT-disabled one — the identical class of
 defect, one register over.
 
 Measurement in flight to confirm or refute.
+
+## PROVEN: the same time-travel defect, one register over (run 6, `/private/tmp/tr6.log`)
+
+The failing texrect is `idx=0 tri=0 cmd=6` — the FIRST texrect of its packet.
+Its packet's own fold, dumped at `plan_raw_dpc` immediately around
+`rdp_state.apply(&delta)`:
+
+```
+FN64DUMP plan othermode_high pre=Some("0x00000cef") post=Some("0x0008acef")
+FN64DUMP texrect idx=0 tri=0 cmd=6 seeded_other_high=0x0008acef n_tris=6
+```
+
+Hand-decoded, `G_MDSFT_TEXTLUT` = bits 15:14:
+
+| | high word | TEXTLUT | meaning |
+|---|---|---|---|
+| carried in (pre-fold) | `0x00000cef` | 0 | **`G_TT_NONE` — TLUT OFF** |
+| packet-final (post-fold) | `0x0008acef` | 2 | `G_TT_RGBA16` — TLUT ON |
+
+The executor was seeded with the post-fold word, so the texrect at command
+index 6 ran under a `SetOtherMode` its own packet issued LATER. Under the
+carried-in mode the read is `ReadKind::Direct` at `AddressScope::FullTmem`:
+
+- `0x884 & 0x0fff = 0x884`, XOR4 → `0x880`, and **`0x884`/`0x880` are measured
+  VALID in the bitmap.**
+
+Under the time-travelled mode it is `ReadKind::Indexed` at `LowHalf`:
+
+- `0x884 & 0x07ff = 0x084`, XOR4 → `0x080`, **measured INVALID** — the abort.
+
+That is the whole chain, and every link is measured or hand-derived:
+wrong stream position → wrong TLUT bit → wrong `ReadKind` → wrong address
+scope → an address the load never wrote → the guard correctly refuses.
+
+**Class: the SAME defect as f2c52822 (time-travelled register state from the
+plan/execute fold), on the register that commit explicitly declined to widen
+to for want of a measurement. This is that measurement.**
+
+The briefed wrong-tile-binding hypothesis is refuted; the tile was fine. The
+guard, the low-half mask, and both samplers are all correct and untouched.
+
+### The fix
+
+Extend f2c52822's pre-delta snapshot to `other_mode`, exactly as it was done
+for the tiles: snapshot in `plan_raw_dpc` before the fold, consume in
+`execute_raw_dpc`. Narrow, and now evidence-backed.
