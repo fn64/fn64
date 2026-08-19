@@ -36,6 +36,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use fn64_cpu_runtime::{decode, Instruction};
+use fn64_cpu_runtime_codegen::swallowed_entries::{
+    apply_repairs, cross_check_region, CodeRegion, CrossCheck, DumpFunction,
+};
 use fn64_cpu_runtime_codegen::{
     emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
 };
@@ -94,6 +97,27 @@ fn main() -> std::process::ExitCode {
         },
         None => HashSet::new(),
     };
+
+    // Cross-check the pre-baked symbol dump against the ROM's own `jal`
+    // evidence BEFORE recompiling. A dump that swallowed a real function
+    // entry inside a preceding function's declared size produces a runtime
+    // `lookup: no recompiled function ... at vram` trap with no build-time
+    // signal at all; this turns that into a named build-time diagnostic, and
+    // repairs the entries whose containing function provably returned first.
+    let mut cfg = cfg;
+    let check = cross_check_symbol_dump(&cfg, &rom);
+    if !check.is_clean() {
+        eprint!("{}", check.render_diagnostic());
+        let applied = repair_symbol_dump(&mut cfg, &check);
+        eprintln!(
+            "swallowed-entry cross-check: {} proven root(s) examined, {} missing entry/entries, \
+             {} repaired by splitting, {} reported only",
+            check.proven_roots,
+            check.swallowed.len(),
+            applied,
+            check.refused().count(),
+        );
+    }
 
     let report = run(&cfg, &rom, &force_recompile);
 
@@ -988,6 +1012,102 @@ fn outcome_label(o: Outcome) -> &'static str {
 /// into `pause_self()`. Unapplied, the emitted body is a tight non-yielding
 /// `loop` and cooperative scheduling never resumes another thread — measured
 /// on WM2000: 100% of samples inside `func_800004D0`, no VI swap ever.
+/// Cross-check every configured section's function list against the `jal`
+/// evidence in the section's own ROM bytes.
+///
+/// Reuses the exact rule `fn64-discover`'s CFG builder applies to promote a
+/// `jal` target to a `proven_root`. `fn64-discover` depends on this crate, so
+/// the rule is applied through `fn64_cpu_runtime_codegen::swallowed_entries`
+/// rather than by importing the analysis back the other way.
+fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
+    let mut combined = CrossCheck::default();
+    for section in &cfg.sections {
+        let Some(words) = read_section_words(rom, section) else {
+            continue;
+        };
+        let region = CodeRegion {
+            name: section.name.clone(),
+            vram: section.vram,
+            words: &words,
+        };
+        let functions: Vec<DumpFunction> = section
+            .functions
+            .iter()
+            .map(|f| DumpFunction {
+                name: f.name.clone(),
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+        let mut section_check = cross_check_region(&region, &functions);
+        combined.proven_roots += section_check.proven_roots;
+        combined.swallowed.append(&mut section_check.swallowed);
+    }
+    combined
+}
+
+/// Apply the repairable splits from `check` to `cfg`'s function lists.
+///
+/// A split shrinks the containing entry's declared `size` to end exactly at
+/// the proven root and inserts a new entry covering the remainder. Every
+/// downstream stage — `read_func_words`, `SymbolTable`, `LOOKUP_TABLE`, and
+/// body emission — derives from this list, so the proven entry becomes
+/// dispatchable without any other change. Refused entries are left alone.
+fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> usize {
+    let mut applied = 0usize;
+    for section in &mut cfg.sections {
+        let mut functions: Vec<DumpFunction> = section
+            .functions
+            .iter()
+            .map(|f| DumpFunction {
+                name: f.name.clone(),
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+        let scoped = CrossCheck {
+            swallowed: check
+                .swallowed
+                .iter()
+                .filter(|e| e.region == section.name)
+                .cloned()
+                .collect(),
+            proven_roots: check.proven_roots,
+        };
+        let count = apply_repairs(&mut functions, &scoped);
+        if count == 0 {
+            continue;
+        }
+        applied += count;
+        section.functions = functions
+            .into_iter()
+            .map(|f| Function {
+                name: f.name,
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+    }
+    applied
+}
+
+/// Read one whole section's big-endian words, or `None` when the section's
+/// declared ROM range does not fit the image.
+fn read_section_words(rom: &[u8], section: &Section) -> Option<Vec<u32>> {
+    let start = section.rom as usize;
+    let len = (section.size as usize) & !0x3;
+    let end = start.checked_add(len)?;
+    if end > rom.len() {
+        return None;
+    }
+    Some(
+        rom[start..end]
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
 fn read_func_words(
     rom: &[u8],
     section: &Section,
@@ -1519,5 +1639,185 @@ mod tests {
         }]);
 
         let _ = run(&cfg, &rom, &HashSet::new());
+    }
+
+    /// Hand-built fixture reproducing the WM2000 defect shape:
+    ///
+    ///   0x80000000 jal 0x80000010   <- proves 0x80000010 is a real entry
+    ///   0x80000004 nop              (delay slot)
+    ///   0x80000008 jr $ra           <- head RETURNS here
+    ///   0x8000000C nop              (delay slot)
+    ///   0x80000010 nop              <- swallowed entry
+    ///   0x80000014 jr $ra
+    ///   0x80000018 nop
+    ///
+    /// The dump declares ONE function spanning 0x80000000..0x8000001C, so
+    /// 0x80000010 is absent from `LOOKUP_TABLE` and `jal 0x80000010` traps at
+    /// runtime. This is the exact shape of `func_8012079C_bank3_text`
+    /// swallowing `0x80120854` in WWF No Mercy.
+    fn swallowed_entry_config() -> (RecompConfig, Vec<u8>) {
+        let words = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,    // nop (delay slot)
+            0x03E0_0008,    // jr $ra
+            0x0000_0000,    // nop (delay slot)
+            0x0000_0000,    // 0x80000010: the swallowed entry
+            0x03E0_0008,    // jr $ra
+            0x0000_0000,    // nop (delay slot)
+        ];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "boot".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "head".to_string(),
+                    vram: 0x8000_0000,
+                    // Declared size swallows the 0x80000010 entry.
+                    size: 0x1C,
+                }],
+            }],
+            patches: Patches::default(),
+        };
+        (cfg, rom)
+    }
+
+    /// Before the cross-check existed, the swallowed entry was simply absent
+    /// from the emitted dispatch table and every call to it trapped at
+    /// runtime. This pins that the un-repaired config really does omit it,
+    /// so the repair test below is not asserting a coincidence.
+    #[test]
+    fn an_unrepaired_swallowed_entry_is_absent_from_the_lookup_table() {
+        let (cfg, rom) = swallowed_entry_config();
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        // No LOOKUP_TABLE row exists for it...
+        assert!(
+            !report.module.contains("(0x80000010, "),
+            "the swallowed entry must have no dispatch row before repair"
+        );
+        // ...yet the `jal` to it is emitted as a `lookup(0x80000010)` call,
+        // which is precisely the call that traps at runtime.
+        assert!(
+            report.module.contains("lookup(0x80000010)"),
+            "the call site must route through lookup, proving the trap path"
+        );
+    }
+
+    #[test]
+    fn the_cross_check_names_the_swallowed_entry_and_its_jal_evidence() {
+        let (cfg, rom) = swallowed_entry_config();
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert_eq!(check.swallowed.len(), 1, "{:?}", check.swallowed);
+        let entry = &check.swallowed[0];
+        assert_eq!(entry.vram, 0x8000_0010);
+        assert_eq!(entry.containing_name, "head");
+        // Derived by hand: the only jal in the fixture is at 0x80000000.
+        assert_eq!(entry.jal_sites, vec![0x8000_0000]);
+        assert!(entry.is_repairable(), "{:?}", entry.refusal);
+        let text = check.render_diagnostic();
+        assert!(text.contains("SWALLOWED-FUNCTION-ENTRY"), "{text}");
+        assert!(text.contains("0x80000010"), "{text}");
+    }
+
+    #[test]
+    fn repairing_the_config_puts_the_swallowed_entry_in_the_lookup_table() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        let applied = repair_symbol_dump(&mut cfg, &check);
+
+        assert_eq!(applied, 1);
+        // By hand: head shrinks to 0x80000000..0x80000010, tail covers
+        // 0x80000010..0x8000001C. The two must tile the original range exactly.
+        let shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+
+        let report = run(&cfg, &rom, &HashSet::new());
+        assert!(
+            report
+                .module
+                .contains("(0x80000010, func_80000010_split as RecompFunc)"),
+            "the repaired entry must reach LOOKUP_TABLE"
+        );
+        // And the repaired config is itself clean: nothing is swallowed twice.
+        assert!(cross_check_symbol_dump(&cfg, &rom).is_clean());
+    }
+
+    /// MUTATION GUARD: the same fixture, but the head does NOT return before
+    /// the proven root. The entry is still REPORTED, and the config is left
+    /// exactly as-is -- a split here would redirect the `jal` into the middle
+    /// of a live body.
+    ///
+    /// This is the case that actually occurs in WM2000's `main_1050` section,
+    /// where words inside an embedded data table decode as `jal` and
+    /// "prove" roots that are really mid-instruction (e.g. the low half of a
+    /// lui/addiu address pair). Dropping the `jr $ra` precondition would
+    /// corrupt those functions.
+    #[test]
+    fn a_swallowed_entry_whose_head_never_returns_is_reported_but_not_split() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        // Replace the head's `jr $ra` at 0x80000008 with an ordinary
+        // `addiu $sp, $sp, -0x20`, so the head is still live at 0x80000010.
+        let rom: Vec<u8> = {
+            let mut bytes = rom;
+            bytes[8..12].copy_from_slice(&0x27BD_FFE0u32.to_be_bytes());
+            bytes
+        };
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert_eq!(check.swallowed.len(), 1, "still reported");
+        assert!(!check.swallowed[0].is_repairable());
+        assert_eq!(check.refused().count(), 1);
+        assert!(check.render_diagnostic().contains("REFUSED"));
+
+        let before = cfg.sections[0].functions.clone();
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), 0);
+        assert_eq!(
+            cfg.sections[0].functions, before,
+            "config must be untouched"
+        );
+    }
+
+    /// A dump with no swallowed entries must produce an empty diagnostic and
+    /// leave the config byte-identical -- the check must not be a source of
+    /// churn on healthy configs.
+    #[test]
+    fn a_healthy_dump_is_clean_and_unchanged() {
+        let (cfg, rom) = swallowed_entry_config();
+        let mut cfg = cfg;
+        // Declare the entry the evidence proves, as a correct dump would.
+        cfg.sections[0].functions[0].size = 0x10;
+        cfg.sections[0].functions.push(Function {
+            name: "tail".to_string(),
+            vram: 0x8000_0010,
+            size: 0x0C,
+        });
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert!(check.is_clean(), "{:?}", check.swallowed);
+        assert_eq!(check.render_diagnostic(), "");
+        let before = cfg.sections[0].functions.clone();
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), 0);
+        assert_eq!(cfg.sections[0].functions, before);
     }
 }
