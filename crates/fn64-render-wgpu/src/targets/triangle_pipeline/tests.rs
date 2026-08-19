@@ -1376,6 +1376,452 @@ fn tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_the_cpu_reader_palettizes() 
     }
 }
 
+
+// ===================================================================
+// CPU-vs-GPU texel-path pins.
+//
+// Both known lane defects (palette handling, fixed at `4c412a96` /
+// `48cde862`; row parity, at `72bb2664`) had the same shape: a quantity
+// the CPU reader derives and the WGSL sampler hardcodes, or a guard one
+// side runs and the other does not. Each was discovered one abort at a
+// time. The tests below pin the rest of that class against each other so
+// the whole class fails as one suite instead.
+//
+// Each test names the quantity, the two sides' file:line, and whether
+// WM2000's measured tiles reach it.
+// ===================================================================
+
+/// **D-LOWBYTE: a 16-bit texel under an enabled TLUT.**
+///
+/// The CPU reader takes the whole big-endian 16-bit texel through
+/// `read_linear_bytes::<2>` (`tmem/read.rs:527-531`) and only then
+/// narrows to the high byte in `resolve_indexed_texel`
+/// (`tmem/texel.rs:376-378`). It therefore REQUIRES the low byte to be
+/// valid, even though the low byte's value is discarded. The WGSL
+/// sampler reads only the high byte
+/// (`shaders/tmem_sample.wgsl`, `tmem_sample_tlut_texel`'s
+/// `pixel_size == TMEM_PIXEL_SIZE_BITS16` arm) and never touches the
+/// low byte at all.
+///
+/// So on a tile whose 16-bit texel has a valid high byte and an INVALID
+/// low byte, the CPU refuses (`InvalidTexelByte`) and the GPU samples
+/// happily. This test pins the disagreement rather than picking a
+/// winner: it asserts the CPU's own refusal, which is the arm the GPU
+/// lacks, so a future widening of either side has to confront it.
+///
+/// **Hardware ruling needed.** The RDP fetches TMEM in 64-bit words, so
+/// the physical read almost certainly covers both bytes regardless; but
+/// "was this byte ever written" is this crate's own validity model, not
+/// a silicon property, and public documentation does not say whether a
+/// partially-loaded 16-bit texel's palette index is well-defined. Until
+/// that is settled, both behaviours are defensible and neither refusal
+/// is weakened here.
+///
+/// **Not in WM2000's path**: WM2000's measured tiles are IA4 under
+/// `G_TT_RGBA16` (4-bit, one byte per two texels) and RGBA16 with the
+/// TLUT disabled. Neither is 16-bit-under-enabled-TLUT.
+///
+/// Adapter-free: this is the CPU half of the divergence, and it is the
+/// half that has an assertable behaviour today.
+#[test]
+fn a_sixteen_bit_tlut_texel_with_an_invalid_low_byte_splits_the_two_lanes() {
+    let descriptor = tlut_fixture::descriptor_sixteen_bit();
+    let addressed =
+        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+
+    // Byte 0 (the high byte, the index) valid; byte 1 (the low byte,
+    // discarded by both sides' arithmetic) removed.
+    let mut bytes = tlut_fixture::bytes();
+    assert!(
+        bytes.remove(&1u16).is_some(),
+        "the fixture must have had a low byte to remove, or this test \
+         asserts nothing"
+    );
+    let source = tlut_fixture::FixtureTmem { bytes };
+
+    // Control: with the low byte present the CPU reader succeeds, so
+    // the refusal below is caused by the low byte and nothing else.
+    assert!(
+        crate::read_texel(
+            &tlut_fixture::source(),
+            descriptor,
+            addressed,
+            crate::TextureLutMode::Rgba16,
+        )
+        .is_ok(),
+        "control: the same tile with a valid low byte must read"
+    );
+
+    // The CPU arm the shader does not have.
+    assert!(
+        matches!(
+            crate::read_texel(
+                &source,
+                descriptor,
+                addressed,
+                crate::TextureLutMode::Rgba16,
+            ),
+            Err(crate::PhysicalTexelReadError::InvalidTexelByte { address: 1 }),
+        ),
+        "the CPU reader requires the discarded low byte to be valid; \
+         `tmem_sample.wgsl` never reads it. Pinned disagreement, not a \
+         fixed defect -- see this test's doc for the hardware ruling."
+    );
+}
+
+/// **D-PALETTE-WIDTH: an out-of-range palette selector.**
+///
+/// The CPU reader routes the tile's `palette` field through
+/// `Ci4Palette::try_new` (`tmem/texel.rs:198-204`), which REFUSES any
+/// value above `0x0f` with `Ci4PaletteError`; `preflight`
+/// (`tmem/read.rs:472`) runs that check before a single byte is read.
+/// The WGSL sampler instead MASKS -- `(tile.palette & 0x0fu) << 4u`
+/// in `tmem_sample_tlut_texel` -- and samples entry `(palette & 0x0f)`
+/// as if nothing were wrong.
+///
+/// This is exactly the two known defects' shape inverted: a guard on
+/// one side, silent normalization on the other. It is LATENT, not live:
+/// `fn64-render-reference`'s `SetTile` decode narrows the field with
+/// `((w1 >> 20) & 0x0f)` (`gbi/state.rs:1311`), so no wire path reaches
+/// a wider value today. But `TileDescriptor::from_neutral_parts`
+/// (`tmem/types.rs:194-210`) is PUBLIC and takes a bare `u8` with no
+/// narrowing of its own, so the CPU refusal is the only remaining
+/// guard, and the GPU has no counterpart to it.
+///
+/// **Not in WM2000's path**: the measured tile's palette is a legal
+/// 4-bit value.
+///
+/// Adapter-free, and it MUTATION-KILLS the kept refusal: deleting the
+/// `Ci4Palette::try_new` bound check makes this test fail.
+#[test]
+fn an_out_of_range_palette_is_refused_by_the_cpu_and_masked_by_the_shader() {
+    let wide = crate::TileDescriptor::from_neutral_parts(
+        crate::ImageFormat::IntensityAlpha,
+        crate::PixelSize::Bits4,
+        tlut_fixture::LINE_WORDS,
+        crate::TmemWordAddress::try_new(tlut_fixture::TMEM_WORD_ADDRESS).unwrap(),
+        0x15, // masks to 5 -- the fixture's own legal palette
+        crate::TileAddressMode::default(),
+        0,
+        0,
+        crate::TileAddressMode::default(),
+        0,
+        0,
+    );
+    assert_eq!(
+        wide.palette(),
+        0x15,
+        "the public constructor must NOT narrow, or this test asserts \
+         nothing about the CPU guard"
+    );
+
+    let addressed =
+        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+
+    // The CPU refuses by name, before any byte is read.
+    assert!(
+        matches!(
+            crate::read_texel(
+                &tlut_fixture::source(),
+                wide,
+                addressed,
+                crate::TextureLutMode::Rgba16,
+            ),
+            Err(crate::PhysicalTexelReadError::Ci4Palette(_)),
+        ),
+        "an out-of-range palette selector must be refused, not masked"
+    );
+
+    // The host-side uniform mirror carries the unnarrowed value
+    // straight through to the shader, where `& 0x0f` silently turns it
+    // into the legal palette below. That is the divergence: the two
+    // lanes disagree about whether this tile is samplable at all.
+    let binding = TileBindingParams::bound(wide, tlut_fixture::size())
+        .with_lut_mode(crate::TextureLutMode::Rgba16);
+    assert_eq!(
+        binding.palette, 0x15,
+        "the uniform carries the raw field; the shader's own `& 0x0f` \
+         is where the two lanes part"
+    );
+    assert_eq!(
+        binding.palette & 0x0f,
+        u32::from(tlut_fixture::PALETTE),
+        "and it masks to a DIFFERENT, entirely legal palette -- so the \
+         shader would paint a plausible wrong color, never an error"
+    );
+}
+
+/// **D-NEGATIVE-COLUMN: an unclamped, unmasked negative coordinate --
+/// INVESTIGATED AND REFUTED, pinned so it stays refuted.**
+///
+/// `address_axis_texel` returns the coordinate unchanged when the axis
+/// neither clamps nor masks. The CPU narrows that `i64` with
+/// `coordinate as u16` (`tmem/sample.rs:566`); the WGSL sampler narrows
+/// the same value from `i32` with `u32(coordinate)`
+/// (`shaders/tmem_sample.wgsl`, `address_axis_texel`'s `mask == 0u`
+/// return). Those two narrowings genuinely differ -- coordinate `-1`
+/// gives `0xffff` on the CPU and `0xffff_ffff` on the GPU -- which has
+/// exactly the shape of the two known lane defects, so it looked like a
+/// third instance.
+///
+/// **It is not one.** The difference cannot survive into a byte address.
+/// Both narrowings agree on the low sixteen bits by construction, every
+/// column multiplier is a power of two no larger than two (`column / 2`
+/// at 4 bits, `column` at 8, `column * 2` at 16), and both lanes then mask
+/// the linear address with the same twelve-bit `TMEM_ADDRESS_MASK`. Twelve
+/// bits of result can only depend on the low thirteen bits of the column,
+/// which the two narrowings share. The exhaustive check below confirms it
+/// over every column both lanes can produce, at all three ported sizes.
+///
+/// Kept as a pin rather than deleted, because the refutation is
+/// conditional on facts a later change could break: it holds only while
+/// every multiplier stays a power of two `<= 2` and the mask stays at
+/// twelve bits. Widen the mask, or add a size whose stride is not a power
+/// of two, and this test fails and the divergence becomes real.
+///
+/// Adapter-free. **Not in WM2000's path** either way: its measured tile
+/// has `mask_s == mask_t == 0`, so both axes clamp and the coordinate is
+/// pinned into `0..dimension` before any narrowing happens.
+#[test]
+fn the_two_lanes_column_narrowings_differ_but_cannot_reach_a_different_byte() {
+    // The two narrowings really are different values.
+    let cpu_column = u32::from((-1_i64) as u16);
+    let gpu_column = (-1_i32) as u32;
+    assert_eq!(cpu_column, 0x0000_ffff);
+    assert_eq!(gpu_column, 0xffff_ffff);
+    assert_ne!(
+        cpu_column, gpu_column,
+        "if these ever agree the refutation below is vacuous"
+    );
+
+    // `linear_byte_address` (`tmem/read.rs:614-628`) and
+    // `tmem_indexed_linear_base` (`shaders/tmem_sample.wgsl`), each in its
+    // own lane's integer width, then each lane's own twelve-bit mask.
+    let cpu_address = |column: u32, size_bits: u32| -> u32 {
+        let column = u64::from(column);
+        let offset = match size_bits {
+            4 => column / 2,
+            8 => column,
+            _ => column * 2,
+        };
+        (offset & 0x0fff) as u32
+    };
+    let gpu_address = |column: u32, size_bits: u32| -> u32 {
+        let offset = match size_bits {
+            4 => column / 2,
+            8 => column,
+            _ => column.wrapping_mul(2),
+        };
+        offset & 0x0fff
+    };
+
+    // Exhaustive over every column the CPU lane can hold, at all three
+    // sizes the shader ports. The GPU column for the same source
+    // coordinate is the CPU column sign-extended, which is what the
+    // `| 0xffff_0000` branch below reconstructs.
+    for size_bits in [4u32, 8, 16] {
+        for narrow in 0..=u16::MAX {
+            let cpu_column = u32::from(narrow);
+            for gpu_column in [cpu_column, cpu_column | 0xffff_0000] {
+                assert_eq!(
+                    cpu_address(cpu_column, size_bits),
+                    gpu_address(gpu_column, size_bits),
+                    "column {narrow:#06x} at {size_bits} bits: the two \
+                     narrowings must land on the same TMEM byte"
+                );
+            }
+        }
+    }
+}
+
+/// **D-DIRECT-FORMATS: which formats each lane admits with the TLUT
+/// off.**
+///
+/// `decode_direct_texel` (`tmem/texel.rs:494-511`) admits SEVEN direct
+/// pairs -- RGBA16, RGBA32, IA4, IA8, IA16, I4, I8 -- plus the CI4/CI8
+/// TLUT-disabled alias to I8. `tmem_sample.wgsl`'s disabled arm
+/// (`sample_committed_rgba16_three_nearest`) admits exactly ONE:
+/// `format == RGBA && size == Bits16`.
+///
+/// This gap is deliberate and documented in the shader's header ("RGBA32,
+/// IA4/IA8/IA16, I4/I8, and YUV direct decodes are still not ported
+/// here"), so it is a port frontier, not a defect. It is pinned anyway
+/// because it is the largest single CPU/GPU disagreement in the texel
+/// path and it is silent: nothing else asserts its size, so a lane
+/// widening one side would not learn that the other is behind.
+///
+/// The pin is against `is_supported_direct_format`
+/// (`tmem/gpu_projection.rs:281-286`) -- the host-side mirror of the
+/// shader's own condition -- so it fails the moment the mirror and the
+/// CPU decoder's admitted set drift further apart or closer together
+/// without the other being updated.
+///
+/// **Reaches WM2000**: WM2000's second measured tile is RGBA16 with the
+/// TLUT disabled, which is the one pair BOTH lanes admit. Every other
+/// direct pair in this table is refused by the shader and accepted by
+/// the CPU reader.
+#[test]
+fn the_disabled_tlut_arm_admits_seven_pairs_on_the_cpu_and_one_on_the_gpu() {
+    use crate::{ImageFormat, PixelSize};
+
+    // The CPU's seven direct pairs, hand-listed from
+    // `decode_direct_texel`'s own match arms.
+    let direct_pairs = [
+        (ImageFormat::Rgba, PixelSize::Bits16),
+        (ImageFormat::Rgba, PixelSize::Bits32),
+        (ImageFormat::IntensityAlpha, PixelSize::Bits4),
+        (ImageFormat::IntensityAlpha, PixelSize::Bits8),
+        (ImageFormat::IntensityAlpha, PixelSize::Bits16),
+        (ImageFormat::Intensity, PixelSize::Bits4),
+        (ImageFormat::Intensity, PixelSize::Bits8),
+    ];
+
+    let mut gpu_admitted = Vec::new();
+    for (format, size) in direct_pairs {
+        let descriptor = crate::TileDescriptor::from_neutral_parts(
+            format,
+            size,
+            tlut_fixture::LINE_WORDS,
+            crate::TmemWordAddress::try_new(0).unwrap(),
+            0,
+            crate::TileAddressMode::default(),
+            0,
+            0,
+            crate::TileAddressMode::default(),
+            0,
+            0,
+        );
+
+        // CPU: every one of the seven decodes, with no TLUT.
+        let raw_value = 0u32;
+        let raw = crate::RawTexel::try_new(size, raw_value).unwrap();
+        assert!(
+            crate::decode_direct_texel(format, raw).is_ok(),
+            "{format:?}/{size:?} must be one of the CPU's seven direct \
+             pairs, or this table is wrong"
+        );
+
+        // GPU: the host-side mirror of the shader's own condition.
+        let binding = TileBindingParams::bound(descriptor, tlut_fixture::size());
+        assert_eq!(
+            binding.lut_mode,
+            crate::tmem::TLUT_MODE_DISABLED,
+            "`bound` must default to a disabled TLUT, or this asserts \
+             the wrong arm"
+        );
+        if binding.is_supported_direct_format() {
+            gpu_admitted.push((format, size));
+        }
+    }
+
+    assert_eq!(
+        gpu_admitted,
+        vec![(ImageFormat::Rgba, PixelSize::Bits16)],
+        "the shader's disabled arm ports exactly the RGBA16 pair; the \
+         CPU reader admits seven. If either set changes, the other must \
+         be re-checked -- that is the whole point of this pin."
+    );
+}
+
+/// **D-LOWHALF: the enabled-TLUT canonical-source guard.**
+///
+/// `validate_address_scope` (`tmem/read.rs:490-497`) refuses an
+/// enabled-TLUT read whose CI source byte lands at or above `0x0800`,
+/// by name (`EnabledCiSourceOutsideLowHalf`): the TLUT itself occupies
+/// the high 2 KiB from `0x0800`, so a tile sourcing its indexes from
+/// there would be reading the palette as image data. `tmem_sample.wgsl`
+/// has NO counterpart -- its only address gate is
+/// `tmem_byte_valid`'s `address >= TMEM_BYTES` bound, which `0x0800`
+/// passes.
+///
+/// A tile placed in the high half under an enabled TLUT therefore
+/// aborts on the CPU texrect lane and silently samples palette bytes as
+/// indexes on the GPU triangle lane. This is the single most consequential
+/// unpinned divergence found: it is a REFUSAL the shader does not have,
+/// and it fails open.
+///
+/// **Not in WM2000's measured path** -- its tile's `tmem_word_address`
+/// is in the low half -- but it is reachable by any title that packs a
+/// small palettized tile above `0x0800`, and nothing today would report
+/// the two lanes disagreeing about it.
+///
+/// Adapter-free: it asserts the CPU refusal (the arm the shader lacks)
+/// and that the shader's own only address gate lets the same address
+/// through. This MUTATION-KILLS the kept CPU refusal -- deleting the
+/// `EnabledCiSourceOutsideLowHalf` arm makes this test fail.
+#[test]
+fn an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_cpu_only() {
+    // Same fixture tile, moved to TMEM word 0x100 == byte 0x0800.
+    const HIGH_HALF_WORD: u16 = 0x0100;
+    let high = crate::TileDescriptor::from_neutral_parts(
+        crate::ImageFormat::IntensityAlpha,
+        crate::PixelSize::Bits4,
+        tlut_fixture::LINE_WORDS,
+        crate::TmemWordAddress::try_new(HIGH_HALF_WORD).unwrap(),
+        tlut_fixture::PALETTE,
+        crate::TileAddressMode::default(),
+        0,
+        0,
+        crate::TileAddressMode::default(),
+        0,
+        0,
+    );
+    assert_eq!(
+        u32::from(HIGH_HALF_WORD) * 8,
+        0x0800,
+        "the fixture must land exactly on the TLUT's own base, or it is \
+         not testing the boundary"
+    );
+
+    let addressed =
+        crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
+
+    // Make the byte at 0x0800 valid, so the refusal below cannot be an
+    // invalid-byte refusal wearing the wrong name. 0x0800 is the first
+    // lane of TLUT entry 0, which `tlut_fixture::bytes()` writes.
+    let source = tlut_fixture::source();
+    assert!(
+        crate::TmemByteSource::valid_byte(&source, 0x0800).is_some(),
+        "the boundary byte must be valid, or this test proves nothing"
+    );
+
+    assert!(
+        matches!(
+            crate::read_texel(
+                &source,
+                high,
+                addressed,
+                crate::TextureLutMode::Rgba16,
+            ),
+            Err(crate::PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf {
+                byte_address: 0x0800,
+            }),
+        ),
+        "an enabled-TLUT tile sourcing indexes from the palette's own \
+         half must be refused by name"
+    );
+
+    // The shader's only address gate. `0x0800` is well inside TMEM, so
+    // the shader reads it as ordinary image data and returns a color.
+    assert!(
+        0x0800u32 < 4096,
+        "`tmem_byte_valid`'s bound is TMEM_BYTES == 4096; 0x0800 passes \
+         it, which is exactly why the shader has no equivalent refusal"
+    );
+
+    // And the host-side binding carries the high-half tile through
+    // without complaint -- there is no host-side mirror of this guard
+    // either, so nothing between the plan and the shader catches it.
+    let binding = TileBindingParams::bound(high, tlut_fixture::size())
+        .with_lut_mode(crate::TextureLutMode::Rgba16);
+    assert_eq!(binding.tmem_word_address, u32::from(HIGH_HALF_WORD));
+    assert!(
+        binding.is_supported_direct_format(),
+        "and the one host-side predicate that exists answers only the \
+         DIRECT arm's question, so it cannot catch this either"
+    );
+}
+
 #[cfg(feature = "host-gpu-tests")]
 mod host_gpu_tests {
     use super::*;
