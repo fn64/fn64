@@ -2134,3 +2134,97 @@ fn this_lanes_rgba16_low_bit_is_alpha_not_a_coverage_msb() {
     // the "coverage" silhouette AA would consume is a thresholded alpha.
     assert_ne!(BLACK_ALPHA_LOW, BLACK_ALPHA_HIGH);
 }
+
+/// **WM2000's measured scanout geometry, pinned.**
+///
+/// Measured on the real ROM through the all-Rust stack: `vi_width()` reports
+/// **480** and `vi_output_height()` reports **237**, while the RDP renders
+/// into that same 480-pixel-wide RGBA5551 image (39,543 probed rectangles,
+/// every one `img_width=480`, `bpp=2`).
+///
+/// This is the configuration that was misread as a rendering defect. A
+/// harness that captured the framebuffer as 320 wide read a 480-stride
+/// buffer at a 320 stride and sheared every row, producing a period-3
+/// pattern that looked like interlace striping. The bytes in RDRAM were
+/// always coherent; only the reading of them was wrong.
+///
+/// Nothing else in this file exercises a source stride that is wider than
+/// the output window *at WM2000's real ratio*, so this pins it: the scanout
+/// must advance one source row by `VI_WIDTH` pixels regardless of how many
+/// of them the active window actually shows.
+///
+/// Expectations are derived BY HAND from the wire layout, not from the code
+/// under test: source row `r` begins at `ORIGIN + r * STRIDE * 2` bytes, and
+/// the active window shows columns `0..OUT_WIDTH` of it. Each row is filled
+/// with a single colour keyed by the row index, so a row that advanced by
+/// the wrong stride lands on a different colour rather than on a
+/// coincidentally-equal pixel.
+#[test]
+fn the_wm2000_480_wide_stride_advances_rows_by_vi_width_not_the_output_width() {
+    const ORIGIN: u32 = 0x1000;
+    /// VI_WIDTH as WM2000 programs it, measured.
+    const STRIDE: u32 = 480;
+    /// A narrower active window, so stride and output width genuinely differ.
+    const OUT_WIDTH: u32 = 320;
+    const ROWS: u32 = 8;
+
+    // Row r is a solid colour keyed by r. Columns past OUT_WIDTH carry a
+    // DIFFERENT colour so that a scanout advancing by the output width
+    // (320) instead of the stride (480) lands on them and is caught.
+    let mut rdram = fresh_rdram();
+    for row in 0..ROWS {
+        for column in 0..STRIDE {
+            let pixel = if column < OUT_WIDTH {
+                // Visible band: five-bit red ramp keyed by the row.
+                pack_rgba5551((row * 3 + 1) as u8, 0, 0, 1)
+            } else {
+                // Off-window tail: unmistakably green, never a valid answer.
+                pack_rgba5551(0, 31, 0, 1)
+            };
+            write_rgba16(&mut rdram, ORIGIN + (row * STRIDE + column) * 2, pixel);
+        }
+    }
+
+    let registers = live_registers(
+        rgba16_replicate_status(),
+        ORIGIN,
+        STRIDE,
+        0,
+        OUT_WIDTH,
+        0,
+        ROWS * 2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(presentation(registers), &memory)
+        .expect("a 480-wide WM2000 scanout must not be refused");
+
+    assert_eq!(
+        (field.width, field.height),
+        (OUT_WIDTH, ROWS),
+        "the active window, not VI_WIDTH, sets the presented geometry"
+    );
+
+    for row in 0..ROWS {
+        // Hand-derived: five-bit value (row*3+1) expanded to eight bits by
+        // the truncated infinite bit repetition -- repeat the five-bit
+        // pattern four times into a twenty-bit word and keep its top eight
+        // bits, exactly as `five_bit_expansion_is_the_truncated_infinite_bit_repetition`
+        // pins. NOT `(v*255+15)/31`, which rounds and disagrees on four of
+        // the thirty-two values.
+        let five = u32::from(row * 3 + 1);
+        let repeated = (five << 15) | (five << 10) | (five << 5) | five;
+        let expected_red = (repeated >> 12) as u8;
+        for column in [0u32, 1, OUT_WIDTH / 2, OUT_WIDTH - 1] {
+            let pixel = field.pixel(column, row).unwrap();
+            assert_eq!(
+                pixel,
+                [expected_red, 0, 0, 255],
+                "row {row} column {column}: green here means the scanout advanced a row by \
+                 the output width ({OUT_WIDTH}) instead of VI_WIDTH ({STRIDE}); a different \
+                 red means it advanced by the wrong number of rows"
+            );
+        }
+    }
+}
