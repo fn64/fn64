@@ -285,3 +285,62 @@ look exactly like this, live and frozen at the same time.
 grammar past the plateau is A, that A restores full-rate composition, and that
 the reason no new picture appears is downstream of the button. Identifying the
 screen probeA is composing needs the render path, not another button.
+
+## Summary, and what is still untried
+
+**What changed.** The plateau was recorded as an unread button grammar. It is
+now read from the ROM, and measured: **A is the confirm past the plateau**, it
+takes effect four swaps after the press, and it moves the guest out of a
+one-display-list idle state into sustained three-lists-per-field composition
+that persists for the rest of the run. B is inert there. START, which drives
+the earlier menus through `func_800FD184`, is not a confirm on the select
+screen at all.
+
+**What did not change.** No frame in any run has been shown to be in-match. The
+scanned-out framebuffer stays on the single plateau hash even in the run whose
+guest is composing at full rate, so the picture never advances.
+
+**Where that puts the blocker.** Not on input. A guest submitting three display
+lists per field into a frozen scanned-out image is a render-path result, and it
+is the shape the standing S1 triangle-composition item predicts. The next
+useful step is to inspect what probeA's display lists contain, not to press
+more buttons.
+
+### Untried, in the order worth trying
+
+1. **What probeA composes.** Dump the display lists from the recovered
+   3.00-lists/field state and compare them against the plateau's single list.
+   This is the direct question and nothing else answers it.
+2. **A second controller.** Ports 1-3 are hardwired `Absent` and the frontend
+   ORs input across active ports while counting present controllers. A screen
+   gating on player 2 is unreachable by any button schedule. Needs a
+   `WM2000_PORTS` knob calling `fn64_abi::set_controller_port_state`; cheap.
+3. **The analog stick.** Read at 6 sites in the select-screen overlay,
+   including inside `func_8012C9E4`. `WM2000_INPUT_SCRIPT` already accepts
+   `:<sx>:<sy>`; no code change needed.
+4. **The paging grammar.** L (`0x20`), R (`0x10`), the C-buttons, and the
+   `0x1004` START|C-Down combo `func_8015733C` tests. Wave 2 covers these; its
+   results belong in this section when it lands.
+5. **Longer runs on A.** Wave 1 used 8 taps and 700k steps. Whether sustained A
+   past swap 3000 carries the guest further is unmeasured.
+
+### What each wave-1 run actually did
+
+Reproduce with `docs/tools/wm2000-run-probe.sh`; judge with
+`docs/tools/wm2000-gfx-rate.py` and the hash diff in
+`docs/tools/wm2000-input-probe.py`. Lead-in for every run:
+
+```
+1100..1110:1000;1200..1210:8000;1300..1310:8000;1400..1410:8000;1500..1510:8000;
+1600..1610:8000;1700..1710:8000;1800..1810:8000;1900..1910:8000;2000..2010:8000;
+2100..2110:8000;2200..2210:8000;2300..2310:8000;2400..2410:8000
+```
+
+| Run | Appended to the lead-in |
+|---|---|
+| control | *(nothing)* |
+| probeA | `2500..2510:8000` and 7 more A taps at 2560, 2620, 2680, 2740, 2800, 2900, 3000 |
+| probeDR_A | D-Right at 2500/2600/2700 each followed by A 30 swaps later, then A at 2800, 2900 |
+| probeB | `2500..2510:4000` and B taps at 2600, 2700, 2800 |
+
+Run one or two at a time, never four: see the swap-1901 note above.
