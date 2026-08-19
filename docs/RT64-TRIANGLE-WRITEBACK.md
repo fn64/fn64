@@ -300,3 +300,86 @@ without checking the raster touched it) is closed by construction if and only
 if the decoder's row derivation and the executor's raster derive their covered
 X range from ONE function. That is the single most load-bearing constraint in
 this lane, so the span math lives in one module used by both.
+
+## RESULT: a flat raw triangle's bytes now reach guest RDRAM
+
+The prior lane's chosen design (ii) is implemented, at the narrowest rung of
+the widening ladder: flat (opcode 0x08 -- no shade plane, no texture plane,
+no depth plane on the wire), non-Fill cycle, RGBA16/32 target, drawn through
+the latched combiner and blender.
+
+### Seams
+
+- `raw_dpc/triangle_span.rs` -- span geometry, written fresh in-crate. ONE
+  function (`covered_rows`) is called by both the decoder and the raster, so
+  a declared row can never be a row the raster skipped.
+- `raw_dpc/mod.rs` `plan_raw_triangle` -- one exact `ColorFramebuffer` write
+  access per covered scanline. NOT via `plan_render_target_rows`, which takes
+  a single rectangle: a triangle's covered X range differs per scanline.
+- `raw_dpc/production_adapter.rs` -- pushes the decoder's own access slice
+  and carries the span, replacing `texrect_accesses: None`.
+- `targets/raw_triangle.rs` -- the CPU rasterizer, reusing the texrect
+  executor's `combine_one_texel` and `blend_and_write_pixel` rather than a
+  second copy of the combiner/blender/dither arithmetic.
+- `production.rs` -- `ColorCommandKind::RawTriangle` in the same schedule,
+  sorted on the decoder's own `command_index`, composing into the same
+  accumulated buffer, digested by the same single `fill_completed_writes`.
+
+### The lft polarity, resolved
+
+Wire bit 23 set means **LEFT-major**. `RawTriangle::right_major()`'s name is
+inverted; `triangle_span::left_major` is the single place the polarity is
+decided, and it reads the accessor as left-major.
+
+Evidence: `fn64-render-reference`'s
+`real_stream_left_major_rect_split_triangle_rasterizes_interior`
+(`raster/tests/group2.rs:1336`) carries byte-exact coefficients from WM2000's
+live title-scene XBUS stream with bit 23 SET, `xh == 770048` (11.75px) and
+`dxhdy == 0` -- a vertical edge -- while `xm == 701940` with
+`dxmdy == 272435` marches right at +4.157px/line. The H edge is
+unambiguously the left one. RT64 has no ground truth for this bit (it never
+decodes raw edge coefficients).
+
+The accessor was NOT renamed: renaming a `pub` accessor is a wider change,
+and it has other (test-only) callers. The correction lives at the one call
+site that matters.
+
+### Two hazards closed by construction, one by a named refusal
+
+1. Declared-but-undrawn ROWS: closed by the shared `covered_rows` call, AND
+   enforced by `TexrectExecutionError::TriangleRowCountDisagreesWithJournal`
+   -- because the decoder bounds its walk by installed RDRAM (SetColorImage
+   carries no height) while the executor bounds it by the real extent, so
+   the two lists genuinely CAN differ.
+2. Declared-but-undrawn PIXELS: a declared `[x0, x1)` run is the union over
+   a scanline's four subpixel sample rows, so a pixel inside it may have
+   zero coverage. Closed by writing nothing for those pixels, leaving the
+   resident's own current byte -- so the range's digest always describes
+   real current content.
+
+### Mutation results (five mutants, one survivor, fixed)
+
+| mutant | result |
+| --- | --- |
+| M1 drop the flat-opaque admission gate | KILLED (1 failure) |
+| M2 invert wire bit 23's polarity | KILLED (8+ failures) |
+| M3 collapse the per-row declaration | KILLED (4 failures) |
+| M4 drop the row-count-vs-journal guard | KILLED (3 failures) |
+| M5 remove the `coverage == 0` skip | **SURVIVED** -> fixed |
+
+M5 is an arm the lane KEPT and it survived for the brief's own named reason:
+the existing test read a partially-covered pixel (coverage 4), never a
+zero-coverage one, so it did not reach the arm. The killing case needs a
+SLOPED edge. `a_declared_pixel_with_no_subpixel_coverage_is_not_painted`
+builds one, asserts the precondition (the run is [2,8), pixel (2,1) has
+coverage 0), and carries a positive control so it cannot pass by the raster
+doing nothing.
+
+### The routing gap the journal caught
+
+A triangle-only packet declared its three per-row writes and then took the
+no-colour-command branch, so `stage_color_commands` never ran: "backend
+effect count is 0; exact journal requires 3". `stage_and_report`'s routing
+condition counted fills and writing texrects but not writing raw triangles.
+The exact-journal check refusing the packet rather than committing a partial
+one is the design working as intended.
