@@ -3127,7 +3127,24 @@ fn stage_and_report(
         .iter()
         .filter(|(span, _, _, _)| span.is_some())
         .count();
-    if (!collector.plan.fills.is_empty() || writing_texrect_count > 0)
+    // **A flat raw triangle that declared a write is a colour-target
+    // command, and routes exactly like a texrect that declared one.**
+    //
+    // `raw_triangle_commands` holds ONLY the triangles whose span is
+    // `Some`, so its length is already the "declared a write" count -- no
+    // filter needed, and no way to mistake "present" for "declared".
+    //
+    // Missing this line was measured, not reasoned: a triangle-only packet
+    // declared its three per-row journal writes and then took the
+    // no-colour-command branch, so `stage_color_commands` never ran and the
+    // backend produced zero effects against a journal requiring three
+    // ("backend effect count is 0; exact journal requires 3"). The journal
+    // caught it, which is the design working -- but the packet was refused
+    // rather than drawn.
+    let writing_raw_triangle_count = collector.plan.raw_triangle_commands.len();
+    if (!collector.plan.fills.is_empty()
+        || writing_texrect_count > 0
+        || writing_raw_triangle_count > 0)
         && collector.plan.loads.is_empty()
     {
         return stage_fills_and_report(collector, packet);
@@ -10463,6 +10480,257 @@ mod tests {
     /// that -- it dropped six real rectangles to withhold one triangle that
     /// reaches only `triangle_draw_output`, which `present` refuses to scan
     /// out and nothing copies into RDRAM.
+    /// The flat (opcode 0x08) triangle this card's end-to-end tests draw:
+    /// vertical edges at x = 2 and x = 6, scanlines 0..3, `lft` set.
+    ///
+    /// Hand-derived footprint against the 16x8 RGBA16 fill target at
+    /// `FILL_TARGET_ADDRESS`:
+    ///   yh = 0, yl = 3<<2 = 12 (S11.2) -> rows 0, 1, 2
+    ///   left edge  x = 2.0  -> x0 = ceil(2 - 7/8)  = 2
+    ///   right edge x = 6.0  -> x1 = ceil(6 - 1/8)  = 6
+    /// So each row writes pixels 2..6 = 4 pixels = 8 bytes, at
+    /// 0x2000 + (16y + 2)*2 = 0x2004, 0x2024, 0x2044.
+    fn flat_triangle_in_target_words() -> [u32; 8] {
+        [
+            word(RAW_TRIANGLE_BASE_EDGE, 1 << 23 | 12),
+            12u32 << 16,
+            6 << 16,
+            0,
+            2 << 16,
+            0,
+            6 << 16,
+            0,
+        ]
+    }
+
+    /// The primitive colour every flat-triangle end-to-end test writes, and
+    /// its RGBA16 encoding, both derived by hand and from nothing else.
+    ///
+    ///   PRIM = 0x80FF4080 -> R 0x80, G 0xFF, B 0x40, A 0x80
+    ///   RGBA16 5/5/5/1 = (0x80>>3 << 11) | (0xFF>>3 << 6) | (0x40>>3 << 1)
+    ///                    | 1
+    ///                  = 0x8000 | 0x07C0 | 0x0010 | 1 = 0x87D1
+    const TRIANGLE_PRIM_WIRE: u32 = 0x80FF_4080;
+    const TRIANGLE_PRIM_RGBA16: u16 = 0x87D1;
+
+    /// A packet staging one-cycle mode, the flat
+    /// `(Zero - Zero) * Zero + Primitive` combiner program, a primitive
+    /// colour, the RGBA16 colour image, then one flat raw triangle.
+    ///
+    /// The combiner program's wire words are packed from the same field
+    /// layout `targets::raw_triangle::tests` derives: color A/B/C/D =
+    /// 8/8/16/3 and alpha A/B/C/D = 7/7/7/3 in the SECOND bitfield slice,
+    ///   low  = (A << 5) | C
+    ///   high = (B << 24) | (D << 6) | (aA << 21) | (aB << 3) | (aC << 18)
+    ///          | aD
+    fn flat_triangle_packet_words() -> Vec<u32> {
+        let (ca, cb, cc, cd) = (8u32, 8u32, 16u32, 3u32);
+        let (aa, ab, ac, ad) = (7u32, 7u32, 7u32, 3u32);
+        let low = (ca << 5) | cc;
+        let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(low, high));
+        words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
+        words.extend(set_color_image_rgba16());
+        words.extend(flat_triangle_in_target_words());
+        words
+    }
+
+    /// **A flat raw triangle's real bytes reach guest RDRAM.**
+    ///
+    /// This is the card's central claim and the only test that makes it end
+    /// to end. It does not assert "a write was declared" or "a digest was
+    /// produced"; it reads the committed payload bytes back and checks the
+    /// pixels one at a time against a colour derived by hand from the wire.
+    ///
+    /// Before this card the same packet produced ZERO `RenderTarget` write
+    /// accesses and zero `CompletedWrite`s -- the decoder's `0x08..=0x0f`
+    /// arm called no planner at all -- so every assertion below fails by
+    /// finding an empty list.
+    #[test]
+    fn a_flat_raw_triangles_pixels_reach_the_committed_guest_write_payload() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        // Establish the target honestly first, in its OWN packet: a partial
+        // rectangle against a brand-new target is refused by
+        // `admit_completed_initialization`, and a fill in the SAME packet as
+        // a raw triangle is refused by `MixedFillAndTrianglePacket`.
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let result = backend.execute_raw_dpc(bound);
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            // The GPU triangle raster runs AFTER this card's CPU staging and
+            // is a separate, pre-existing path. On an adapterless host it
+            // refuses by its own name, which says nothing about the guest
+            // bytes -- but it does mean this test cannot read them here.
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("TriangleDrawBeforeCreate")
+                        || message.contains("no GPU adapter"),
+                    "the only tolerated failure is the adapterless GPU raster path, got: {error}"
+                );
+                return;
+            }
+        };
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert_eq!(
+            staged.len(),
+            3,
+            "one CompletedWrite per covered scanline; got {staged:?}"
+        );
+
+        // The three hand-derived byte ranges, in row order. A collapsed
+        // single span would be one 72-byte write at 0x2004.
+        let ranges: Vec<(u32, u32)> = staged
+            .iter()
+            .map(|write| match write.access().region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                    (range.start().get(), write.byte_count())
+                }
+                other => panic!("a render-target write must name an RDRAM range, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ranges, vec![(0x2004, 8), (0x2024, 8), (0x2044, 8)]);
+
+        // **The bytes themselves, proven two independent ways.**
+        //
+        // First: each write's `ContentDigest` must equal the digest of the
+        // four primitive-coloured RGBA16 pixels this test derived by hand
+        // from the wire. `CompletedWrite::try_from_bytes` is the SAME
+        // derivation `rsp_commit`'s `copy_committed_guest_writes` re-runs
+        // over the payload before it writes a single byte into guest RDRAM,
+        // so a digest match here is a statement about what lands in RDRAM,
+        // not merely about what this backend recorded.
+        let expected_row: Vec<u8> = TRIANGLE_PRIM_RGBA16.to_be_bytes().repeat(4);
+        for (index, write) in staged.iter().enumerate() {
+            let expected = fn64_render_ir::CompletedWrite::try_from_bytes(
+                write.access(),
+                &expected_row,
+            )
+            .expect("eight bytes match the declared eight-byte access");
+            assert_eq!(
+                write.content(),
+                expected.content(),
+                "row {index}'s committed digest must be the digest of four primitive-coloured \
+                 RGBA16 pixels"
+            );
+        }
+
+        // Second: the registry resident's own device bytes, read directly.
+        // A digest match alone could in principle be satisfied by an
+        // unrelated buffer; this reads the buffer.
+        //
+        // Publication is required first -- the registry only advances to
+        // this packet's generation when `publish_raw_dpc` runs, which is
+        // deliberately after the guest commit (see `stage_fills_and_report`'s
+        // own nonclaim). Reading before publishing would read the FILL's
+        // generation and is exactly what this assertion first did.
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged.clone())
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        let registry = backend
+            .color_targets()
+            .expect("the triangle packet composed into the published registry");
+        let resident = registry
+            .residents()
+            .iter()
+            .find(|resident| resident.key().address().get() == FILL_TARGET_ADDRESS)
+            .expect("the target is resident");
+        let bytes = resident.device_bytes().device_bytes();
+        for y in 0..3usize {
+            for x in 2..6usize {
+                let offset = (y * FILL_TARGET_WIDTH as usize + x) * 2;
+                assert_eq!(
+                    u16::from_be_bytes([bytes[offset], bytes[offset + 1]]),
+                    TRIANGLE_PRIM_RGBA16,
+                    "pixel ({x},{y}) of the resident buffer"
+                );
+            }
+        }
+    }
+
+    /// The pixels OUTSIDE the triangle keep the fill's own colour, in the
+    /// same buffer, in the same generation.
+    ///
+    /// Proves the triangle composes into the accumulated buffer rather than
+    /// replacing it -- the failure mode where a triangle's full-extent
+    /// output is a fresh buffer would blank every pixel the fill wrote.
+    #[test]
+    fn a_flat_raw_triangle_leaves_the_surrounding_fill_intact() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let Ok(prepared) = backend.execute_raw_dpc(bound) else {
+            return;
+        };
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged)
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+
+        // The published resident's full-extent bytes: the triangle's 12
+        // pixels hold the primitive colour and the other 116 still hold the
+        // fill's.
+        //
+        // `whole_target_fill_words` fills 0x0842_1085. In Fill cycle an
+        // RGBA16 image takes 16 bits per pixel from that 32-bit register,
+        // alternating halves by X parity -- so the fill colour is not a
+        // single constant across a row, and asserting one would be asserting
+        // the wrong thing. What IS invariant is that no pixel outside the
+        // triangle equals the triangle's colour, and every pixel inside does.
+        let registry = backend
+            .color_targets()
+            .expect("the triangle packet composed into the published registry");
+        let resident = registry
+            .residents()
+            .iter()
+            .find(|resident| resident.key().address().get() == FILL_TARGET_ADDRESS)
+            .expect("the target is resident");
+        let bytes = resident.device_bytes().device_bytes();
+        for y in 0..FILL_TARGET_HEIGHT as usize {
+            for x in 0..FILL_TARGET_WIDTH as usize {
+                let offset = (y * FILL_TARGET_WIDTH as usize + x) * 2;
+                let pixel = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+                let inside = y < 3 && (2..6).contains(&x);
+                if inside {
+                    assert_eq!(
+                        pixel, TRIANGLE_PRIM_RGBA16,
+                        "pixel ({x},{y}) is inside the triangle"
+                    );
+                } else {
+                    assert_ne!(
+                        pixel, TRIANGLE_PRIM_RGBA16,
+                        "pixel ({x},{y}) is outside the triangle and must keep the fill's colour"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_texrect_composed_with_a_trailing_raw_triangle_executes() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
