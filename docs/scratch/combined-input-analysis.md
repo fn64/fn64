@@ -98,3 +98,42 @@ evaluator both read the SECOND slice for one-cycle mode. The two lanes model
 one-cycle differently; RT64's pinned source is the authority this crate ports
 against, and it is unambiguous. The reference's rule is not evidence that
 hardware refuses this -- it is that lane's own unsupported-feature boundary.
+
+## Result on the ROM
+
+Recompiler rebuilt in-worktree at the fix HEAD. Two runs, fresh scratch each:
+
+| run | scratch | vi_swaps | panics | render errors | ended on |
+|-----|---------|----------|--------|---------------|----------|
+| A | /private/tmp/cl-A | 2149 | 0 | 0 | 400,000-step cap |
+| B | /private/tmp/cl-B | 2149 | 0 | 0 | 400,000-step cap |
+
+They agree exactly. Baseline was 1,887 swaps aborting on the combiner
+refusal; the run now passes that point and reaches the harness's own step
+cap with `last render error: None`, so the wall is cleared rather than
+moved. Audio keeps flowing (3,951 buffers / 4,142,576 samples).
+
+### On the reported "825 regression"
+
+An earlier reading of the post-fix log as 825 swaps was a mid-run PROGRESS
+line, not a failure point: the harness prints `progress:` every 50,000
+steps, and that run had been killed mid-flight when the session ended. The
+same truncated log's last line already read `vi_swaps=1887` with zero
+panics. The two clean runs above supersede it. No regression exists.
+
+## What was NOT fixed
+
+- **`combine` is still seeded post-fold** (`production.rs`'s
+  `execute_raw_dpc` passes `self.rdp_state.combine()` after
+  `plan_raw_dpc` applied the delta). This is a real latent instance of the
+  same time-travel defect `f2c52822` and `d53e4835` repaired for the tiles
+  and `other_mode`, and the struct doc still says so. It is NOT this wall:
+  the failing draw was measured as one-cycle (`slices=OnlySecondSlice`), so
+  no seeding change affects which selector it names. Left alone rather than
+  changed speculatively -- the same standard the `other_mode` fix was held
+  to, which waited for a measurement before widening.
+- **`COMBINED` in cycle 0 of a TWO-cycle program** stays refused. RT64
+  evaluates it (against the same zero-init), but no measurement in this
+  repo covers that shape.
+- **Fill cycle, RGB dither, two-cycle texrects in the wild** -- untouched
+  pre-existing gaps, each already refused by name.
