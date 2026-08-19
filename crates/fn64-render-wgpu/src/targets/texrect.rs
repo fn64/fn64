@@ -3502,9 +3502,24 @@ mod one_cycle_tests {
              same SetPrimColor word as Primitive and must be admitted"
         );
 
-        // STILL REFUSED: each reads a `base_inputs` field left at zero.
-        // Admitting these would combine against an invented value, which is
-        // the failure the Shade refusal exists to prevent.
+        // STILL REFUSED: each reads a `base_inputs` field this executor
+        // leaves at zero *with no authority saying zero is what the
+        // hardware produces*. There is no `SetConvert`/`SetKey` plumbing,
+        // no LOD stage, no noise seed, and no decoded tile+1 -- so
+        // admitting one would combine against an invented value.
+        //
+        // `Shade`/`ShadeAlpha` is deliberately NOT in this list any more,
+        // and the distinction is the whole point of the list. Its zero is
+        // not "a field we left at zero": a texture rectangle carries no
+        // shade words and the rasterizer clears the entire shade block when
+        // it synthesizes the primitive (angrylion `rasterizer.c:2665`,
+        // block decoded at `:2088-2105`), so zero is the value real
+        // hardware feeds the combiner. See
+        // [`a_texrects_shade_evaluates_to_the_hardwares_zero_not_a_neighbouring_register`]
+        // and [`TexrectShading::base_inputs`]. The unshaded-*triangle*
+        // refusal, where the hardware really does interpolate a value this
+        // executor cannot reconstruct, is pinned by
+        // [`an_unshaded_raw_triangle_still_refuses_shade`].
         for target in [
             ColorInput::LodFraction,
             ColorInput::Noise,
@@ -3514,8 +3529,6 @@ mod one_cycle_tests {
             ColorInput::KeyScale,
             ColorInput::Texel1,
             ColorInput::Texel1Alpha,
-            ColorInput::Shade,
-            ColorInput::ShadeAlpha,
         ] {
             let (slot, params) = color_probe_for(target);
             assert_eq!(
@@ -3534,8 +3547,10 @@ mod one_cycle_tests {
         // registers, which hold their power-on zero until the guest writes
         // them, so reading one before any wire command is a legal read of a
         // real value -- not a substitution. This is the opposite assertion
-        // to the loop above, and the difference is the point: `Shade` has
-        // no register behind it at all, while `EnvAlpha` does.
+        // to the loop above, and the difference is the point: `LodFraction`
+        // has no authority behind its zero at all, while `EnvAlpha` reads a
+        // real RDP register and `Shade` reads a value the rasterizer
+        // demonstrably clears.
         for target in [
             ColorInput::EnvAlpha,
             ColorInput::PrimitiveAlpha,
