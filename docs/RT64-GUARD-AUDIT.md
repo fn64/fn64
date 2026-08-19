@@ -621,7 +621,30 @@ enforce.
 
 ## Where angrylion and RT64 disagree
 
-Only one disagreement surfaced, and it does not change any verdict:
+### The structural one: RT64 is not a reference for anything downstream of coverage
+
+This is the most important cross-cutting result, and it should govern future
+cards. RT64 has **no coverage sidecar** (`hidden` appears nowhere in the tree),
+**no memory-alpha blender input** (hardcoded `return 1.0f`,
+`hle/rt64_blender.h:355-357`), and **no `AA_EN` / `ALPHA_CVG_SEL` / `CLR_ON_CVG`
+modelling** (their only consumers are debugger text and a `#if 0`,
+`gui/rt64_debugger_inspector.cpp:1314`, `shaders/RasterPS.hlsl:194`). It decides
+blending purely from whether the blender references framebuffer colour
+(`hle/rt64_raster_shader.cpp:228`), approximates blender overflow with `fmod`
+(`hle/rt64_blender.h:434-437`) where angrylion uses a hardware division LUT
+(`blender.c:396-424`), applies dither only at writeback by frame-wide majority
+vote, and snaps rectangle edges outward.
+
+That is coherent for a GPU HLE renderer rather than a set of bugs. But it means
+**RT64 must not be cited for C4, C5, C6, U1, U2 or B6** — for those, angrylion
+is the only available authority, and its own accuracy is the ceiling. Where the
+two agree (the dither *tables*, `lrx |= 3`, alpha-compare value 2) the agreement
+is meaningful; where RT64 is silent or constant, its silence is not evidence.
+
+### The specific ones
+
+Beyond the structural divergence above, one point-disagreement surfaced that
+does not change any verdict:
 
 **Alpha-compare value 2.** Both conclude "behaves as `G_AC_NONE`", but by
 different mechanisms — angrylion because it never assembles a 2-bit field
