@@ -531,16 +531,41 @@ pub enum TexrectExecutionError {
         stage: TexrectNoiseStage,
     },
     /// The other-mode word selects an ordered dither tile
-    /// (`MagicSquare`/`Bayer`), whose threshold this crate's two ports
-    /// **disagree** about for `Bayer`:
-    /// `crate::rgb_dither`'s RT64 table and `fn64-render-reference`'s differ
-    /// at documented cells, and the crate already pins that disagreement
-    /// rather than resolving it
-    /// (`rgb_dither.rs`'s `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`).
-    /// The two ports' *arithmetic* also differs -- RT64 adds the threshold
-    /// then truncates, the reference bumps to the next bucket
-    /// conditionally. Refused by name rather than picking a side no
+    /// (`MagicSquare`/`Bayer`), whose threshold this crate's port and
+    /// `fn64-render-reference`'s **disagree** about for `Bayer` at
+    /// documented cells, pinned rather than resolved by `rgb_dither.rs`'s
+    /// `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`.
+    /// For the *RGB* stage the two ports' arithmetic also differs -- RT64
+    /// adds the threshold then truncates, the reference bumps to the next
+    /// bucket conditionally. Refused by name rather than picking a side no
     /// evidence settles.
+    ///
+    /// **This applies to the alpha-dither stage too, and that is a fact
+    /// about the current tree rather than about the RGB stage.**
+    /// `docs/RT64-LANE-DIVERGENCES.md` D7 scored this refusal a wgpu defect
+    /// on the ground that the disputed table lived only in the RGB path,
+    /// while `alpha_compare.rs` carried a *second* Bayer table
+    /// byte-identical to the reference's -- so, the argument went, the
+    /// stage being refused already agreed with the reference cell-for-cell.
+    /// That was true at the audit's pin `4371d57a`
+    /// (`alpha_compare.rs:175-176` held the duplicate), and **`51b4e184`
+    /// deleted it.** libultra defines `G_AD_PATTERN`'s threshold as *the
+    /// currently selected RGB dither matrix* (`gbi.h:674-678`), so carrying
+    /// two tables for one hardware quantity was itself the defect; the
+    /// alpha path now reads `crate::rgb_dither::ordered_tile_value`, pinned
+    /// at every cell by `rgb_dither.rs`'s
+    /// `the_alpha_dither_path_reads_this_modules_tables`.
+    ///
+    /// The consequence is that the alpha stage is now downstream of the
+    /// disputed tile by construction, and its rounding
+    /// (`(alpha & 7) > threshold`, `alpha_compare.rs`'s
+    /// `apply_alpha_dither`) reads the threshold directly, so the eight
+    /// disputed cells are observable in its output. **The refusal is
+    /// therefore correct as it stands, and D7's verdict is superseded, not
+    /// unimplemented.** It is blocked on D19 -- which Bayer arrangement the
+    /// RDP uses -- which the audit itself scores UNKNOWN and which nothing
+    /// in this repo settles. Pinned by
+    /// `the_alpha_dither_refusal_is_downstream_of_the_one_disputed_tile`.
     OrderedDitherAuthorityUnsettled {
         stage: TexrectNoiseStage,
         pattern: RgbDither,
@@ -1681,6 +1706,14 @@ impl TexrectFragmentStages {
             // pins 8 cells where they do not. Refusing an agreed table
             // would decline work no evidence disputes; admitting a
             // disputed one would pick a side.
+            //
+            // The tile this reads is `crate::rgb_dither`'s -- since
+            // `51b4e184` there is exactly one, and `alpha_compare.rs`'s
+            // former duplicate is gone. That is what makes the split by
+            // table (rather than by stage) the right axis, and it is why
+            // `docs/RT64-LANE-DIVERGENCES.md` D7's "the alpha stage already
+            // agrees with the reference" argument no longer holds. See
+            // `TexrectExecutionError::OrderedDitherAuthorityUnsettled`.
             AlphaDither::Pattern | AlphaDither::InversePattern => {
                 let pattern = match rgb_dither {
                     RgbDither::MagicSquare | RgbDither::Bayer => rgb_dither,
@@ -4546,6 +4579,108 @@ mod fragment_stage_tests {
         assert_eq!(magic.alpha_dither(), AlphaDither::Pattern);
         assert_eq!(magic.rgb_dither(), RgbDither::MagicSquare);
         assert!(TexrectFragmentStages::try_new(magic, None).is_ok());
+    }
+
+    /// **D7's premise, re-measured — and the refusal kept.**
+    ///
+    /// `docs/RT64-LANE-DIVERGENCES.md` D7 scored
+    /// [`TexrectExecutionError::OrderedDitherAuthorityUnsettled`] a wgpu
+    /// defect on the ground that the Bayer dispute lives in the *RGB*
+    /// module while the alpha-dither stage read a separate,
+    /// reference-identical table in `alpha_compare.rs` — so the cited
+    /// authority conflict did not apply to the stage being refused.
+    ///
+    /// That premise was true at the audit's pin and is false now.
+    /// `51b4e184` deleted the duplicate, because libultra defines
+    /// `G_AD_PATTERN`'s threshold as *the currently selected RGB dither
+    /// matrix* (`gbi.h:674-678`) and one hardware quantity must have one
+    /// table. The alpha path now reads the disputed tile by construction.
+    ///
+    /// This test pins that, so the refusal cannot be re-litigated from the
+    /// stale premise: it asserts (a) the alpha-dither threshold IS
+    /// `rgb_dither`'s Bayer value, (b) that value differs from the
+    /// reference's at the documented cells, and (c) the difference is
+    /// observable in `apply_alpha_dither`'s own output — which is the only
+    /// thing that makes the refusal load-bearing rather than fussy.
+    ///
+    /// Every expectation is hand-derived from the two tables and the
+    /// published rounding rule, never captured.
+    #[test]
+    fn the_alpha_dither_refusal_is_downstream_of_the_one_disputed_tile() {
+        // `fn64-render-reference`'s BAYER (`raster/blend.rs:30`), as a
+        // literal so this test needs no cross-crate dependency. Same
+        // constant `rgb_dither.rs`'s own disagreement test uses.
+        const REFERENCE_BAYER: [[u8; 4]; 4] =
+            [[0, 4, 1, 5], [6, 2, 7, 3], [1, 5, 0, 4], [7, 3, 6, 2]];
+
+        let mut disputed_cells = Vec::new();
+        for y in 0..4i32 {
+            for x in 0..4i32 {
+                let ours = crate::alpha_compare::alpha_dither_pattern_threshold_for_tests(
+                    RgbDither::Bayer,
+                    x,
+                    y,
+                );
+                // (a) The alpha path reads `rgb_dither`'s tile, not a
+                // private copy. If the duplicate ever returns, this fails.
+                assert_eq!(
+                    ours,
+                    crate::rgb_dither::ordered_tile_value(
+                        RgbDither::Bayer,
+                        x,
+                        y
+                    ),
+                    "the alpha-dither path must read rgb_dither's tile at ({x}, {y})"
+                );
+                if ours != REFERENCE_BAYER[y as usize][x as usize] {
+                    disputed_cells.push((x, y, ours, REFERENCE_BAYER[y as usize][x as usize]));
+                }
+            }
+        }
+
+        // (b) The dispute is real and reaches the alpha stage's own tile.
+        assert!(
+            !disputed_cells.is_empty(),
+            "D7's refusal presumes a live disagreement; if the Bayer phase \
+             has been settled, resolve the refusal rather than this test"
+        );
+
+        // (c) It is observable in alpha dither's output. The rounding rule
+        // is `(alpha >> 3) + ((alpha & 7) > threshold)`, so for any two
+        // thresholds t_ours != t_ref there is an alpha whose low three bits
+        // fall strictly between them and which therefore rounds differently
+        // under the two tables. Pick it, do not search for it: with
+        // low = min(t_ours, t_ref), the alpha with low-three-bits
+        // `low + 1` exceeds the smaller threshold and not the larger.
+        let (x, y, ours, theirs) = disputed_cells[0];
+        let low = ours.min(theirs);
+        let alpha = (16u8 << 3) | (low + 1);
+        assert!(
+            (alpha & 7) > low && (alpha & 7) <= ours.max(theirs),
+            "the probe alpha must separate the two thresholds"
+        );
+        let dithered_ours = crate::alpha_compare::apply_alpha_dither(
+            alpha,
+            AlphaDither::Pattern,
+            RgbDither::Bayer,
+            x,
+            y,
+            crate::alpha_compare::AlphaCompareNoise(0),
+        );
+        // Hand-derived expectation under each table, from the same rule.
+        let expand = |five: u8| (five << 3) | (five >> 2);
+        let round = |threshold: u8| expand(16 + u8::from((alpha & 7) > threshold));
+        assert_eq!(
+            dithered_ours,
+            round(ours),
+            "alpha dither follows this crate's tile"
+        );
+        assert_ne!(
+            round(ours),
+            round(theirs),
+            "the two tables give different alpha at ({x}, {y}); refusing \
+             Bayer is therefore a real choice, not a formality"
+        );
     }
 
     /// The alpha-dither stage really runs, and its ordered arm really
