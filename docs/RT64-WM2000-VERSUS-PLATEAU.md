@@ -574,3 +574,45 @@ WM2000_PORTS=2 WM2000_INPUT_SCRIPT=<the lead-in> WM2000_READY_PROBE=2090-3000
 ```
 
 which reaches it deterministically at swap ~2483.
+
+## Reproducing this card
+
+Everything above comes from three solo runs on an otherwise idle host, each
+with its own scratch root and its own log; `rc` is recorded for every one,
+because a SIGKILL at a repeatable swap is indistinguishable from a plateau
+without it.
+
+| run | configuration | rc | outcome |
+|---|---|---|---|
+| `run1` | one pad | **137** | killed by the host at swap ~1910 -- discarded, see the INPUT-GRAMMAR note |
+| `run3` | one pad | **0** | 511 samples, swaps 2090-2600, screen 17 -> 18 and never past |
+| `run4` | two pads (`WM2000_PORTS=2`) | 134 | screen 17 -> 18 -> **34** at swap 2312, then the `0x801226A0` gap at swap 2483 |
+
+Build (fn64's own recompiler, `fn64-render-*` of your choice, **no**
+`--features rt64`):
+
+```
+cargo build --release --bin recompile_rom --offline
+recompile_rom --config $AKI/games/NWXE/wm2000.toml \
+              --rom    $AKI/games/NWXE/wm2000.z64 --out $SCRATCH/emit1
+# apply docs/tools/wm2000-ready-probe.patch to a COPY of
+# ~/Code/recomps/wm2000's packages/wm2000-boot/src/main.rs, then
+cargo build --manifest-path packages/wm2000-boot/rs/Cargo.toml --release
+```
+
+Run (the lead-in that reaches the plateau: START at 1100, A every 100 swaps to
+2400, then A every 60):
+
+```
+WM2000_PORTS=2 \
+WM2000_INPUT_SCRIPT="1100..1110:1000;1200..1210:8000;...;2400..2410:8000;2460..2470:8000;..." \
+WM2000_READY_PROBE=2090-3000 WM2000_STOP_AT_SWAP=3000 \
+WM2000_NO_TRACE=1 FN64_ABSENT_N64DD=1 FN64_NO_AUDIO=1 \
+  ./packages/wm2000-boot/rs/target/release/wm2000-boot
+```
+
+Drop `WM2000_PORTS=2` to reproduce the plateau instead of breaking it.
+
+Verification for the one code change (the `fn64-runtime` port-presence test):
+`cargo nextest run --workspace --offline` -> **8627 passed, 13 skipped**
+(baseline 8626/13; the +1 is this test).
