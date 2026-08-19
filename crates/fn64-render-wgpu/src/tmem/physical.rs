@@ -2456,9 +2456,7 @@ mod tests {
         // ignores the identity argument (see its `_source` parameter's own
         // comment), so any well-formed one serves.
         let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
-        let submitted = queue
-            .submit(DecodedTicket::new(planned_packet(1)))
-            .unwrap();
+        let submitted = queue.submit(DecodedTicket::new(planned_packet(1))).unwrap();
         let identity = TmemLoadSourceIdentity::new(
             submitted.packet().identity(),
             submitted.packet().journal().identity(),
@@ -2490,7 +2488,6 @@ mod tests {
         );
         assert_eq!(wide_binding.source_first_access_index, 1);
     }
-
 
     fn load_tile_words(load_count: usize) -> Vec<u32> {
         let mut words = vec![
