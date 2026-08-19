@@ -162,27 +162,74 @@ pub const fn copy_alpha_compare_value(
 }
 
 /// Screen-registered three-bit thresholds for the two ordered RGB dither
-/// tiles, shared by the alpha-dither `Pattern`/`InversePattern`
-/// substitution rule below. Literal port of `ordered_rgb_dither_threshold`
-/// (`blend.rs:28-38`).
+/// tiles, consumed by the alpha-dither `Pattern`/`InversePattern`
+/// substitution rule below.
+///
+/// **Reads [`crate::rgb_dither`]'s tables; does not carry its own.** This
+/// function used to duplicate the tables as local `MAGIC_SQUARE`/`BAYER`
+/// constants ported from `ordered_rgb_dither_threshold` (`blend.rs:28-38`),
+/// while [`crate::rgb_dither`] carried RT64's `DitherPatternBayer`
+/// (`Formats.hlsli:9-14`). The two Bayer tiles disagree at rows 1 and 2,
+/// so this crate carried **two different Bayer tables for one hardware
+/// quantity**, and whichever is right, at most one of the two sites could
+/// have been.
+///
+/// The split is a defect independent of which tile matches silicon, because
+/// libultra defines the alpha-dither `G_AD_PATTERN` threshold as *the
+/// currently selected RGB dither matrix* (`gbi.h:674-678`; the substitution
+/// rule is restated at [`apply_alpha_dither`]). The two paths are therefore
+/// required to read the **same** tile by definition, whatever it contains.
+///
+/// [`crate::rgb_dither`] is the site kept, and the reason is that same
+/// definition rather than a judgement about the tables: it *is* this
+/// crate's RGB dither module, so "the currently selected RGB dither matrix"
+/// is the thing it owns, and alpha dither is downstream of it. Deleting the
+/// duplicate here removes the possibility of the two drifting again;
+/// keeping this side instead would have inverted the dependency libultra
+/// states.
+///
+/// **This resolves no hardware question and claims none.** Which Bayer
+/// arrangement the RDP actually uses is the open frontier
+/// [`crate::rgb_dither`]'s module header records and
+/// `docs/RT64-LANE-DIVERGENCES.md` D19 scores UNKNOWN -- `gbi.h` publishes
+/// the `G_CD_BAYER` selector bit and no table, and RT64 is one of the two
+/// disputants, not an adjudicator. If that question is ever settled against
+/// RT64's arrangement, exactly one table changes and both paths follow it,
+/// which is the whole point of removing the copy.
 ///
 /// # Panics
 /// If `mode` is `Noise` or `Disabled` -- both lack an ordered tile and must
 /// be resolved to `MagicSquare`/`Bayer` by the caller (see
 /// [`apply_alpha_dither`]'s substitution rule) before reaching this
-/// function.
+/// function. [`crate::rgb_dither::dither_pattern_value`] answers those two
+/// modes rather than panicking, so this narrowing is enforced here and the
+/// noise byte it would otherwise need is deliberately not threaded in.
 const fn ordered_dither_threshold(mode: RgbDitherMode, x: i32, y: i32) -> u8 {
-    const MAGIC_SQUARE: [[u8; 4]; 4] = [[0, 6, 1, 7], [4, 2, 5, 3], [3, 5, 2, 4], [7, 1, 6, 0]];
-    const BAYER: [[u8; 4]; 4] = [[0, 4, 1, 5], [6, 2, 7, 3], [1, 5, 0, 4], [7, 3, 6, 2]];
-    let row = y.rem_euclid(4) as usize;
-    let column = x.rem_euclid(4) as usize;
     match mode {
-        RgbDitherMode::MagicSquare => MAGIC_SQUARE[row][column],
-        RgbDitherMode::Bayer => BAYER[row][column],
+        RgbDitherMode::MagicSquare | RgbDitherMode::Bayer => {
+            crate::rgb_dither::ordered_tile_value(mode, x, y)
+        }
         RgbDitherMode::Noise | RgbDitherMode::Disabled => {
             panic!("ordered dither threshold requested for a non-ordered RgbDitherMode")
         }
     }
+}
+
+/// [`ordered_dither_threshold`], reachable from `rgb_dither`'s
+/// cross-module agreement test.
+///
+/// A `#[cfg(test)]` accessor rather than making the function itself
+/// `pub(crate)`: the production surface of this module is
+/// [`apply_alpha_dither`], and widening the private helper's visibility to
+/// serve a test would invite a caller that bypasses the substitution rule.
+/// The test needs the tile lookup specifically, so that is what is exposed.
+#[cfg(test)]
+pub(crate) const fn alpha_dither_pattern_threshold_for_tests(
+    mode: RgbDitherMode,
+    x: i32,
+    y: i32,
+) -> u8 {
+    ordered_dither_threshold(mode, x, y)
 }
 
 /// Pre-blend alpha dither: reduce post-combiner pixel alpha to the
