@@ -405,6 +405,8 @@ mod texture_lod;
 mod tmem;
 mod vi;
 mod vi_scanout;
+#[cfg(test)]
+mod wire_words;
 
 pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
