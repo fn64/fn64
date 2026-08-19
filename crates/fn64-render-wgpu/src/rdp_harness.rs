@@ -26,13 +26,15 @@
 //! constructs `RawTriangle` or `ResourceAccess` directly -- the moment it
 //! shortcuts past the decoder it stops testing the thing that breaks.
 
-use crate::wire_words::{
-    line, set_combine, set_other_mode, set_prim_color, word, EdgeWords,
-    D_SLOT_PRIMITIVE, D_SLOT_SHADE, RAW_TRIANGLE_BASE_EDGE,
-};
 use crate::production::{WgpuBackend, WgpuCreateError};
+use crate::wire_words::{
+    line, set_combine, set_other_mode, set_prim_color, word, EdgeWords, D_SLOT_PRIMITIVE,
+    D_SLOT_SHADE, RAW_TRIANGLE_BASE_EDGE,
+};
 use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
-use fn64_render_ir::{CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary};
+use fn64_render_ir::{
+    CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
+};
 
 const LAYOUT_BYTES: u32 = 0x4000;
 const COMMAND_START: u32 = 0x1000;
@@ -59,6 +61,11 @@ pub(crate) const CLEAR_COLOR_WIRE: u32 =
 
 /// The RDP cycle type staged into `SetOtherMode`'s bits 21..20.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "all four RDP cycle types are named; TwoCycle has no \
+    harness fixture yet and is exactly the case a future test must be able to state"
+)]
 pub(crate) enum CycleType {
     One = 0,
     Two = 1,
@@ -87,12 +94,23 @@ pub(crate) struct Tri {
     left_slope: f64,
     /// dX/dy for the right (XL/XM) edges, in pixels per scanline.
     right_slope: f64,
+    /// The upper minor (XM) edge, when it differs from XL. `None` parks XM on
+    /// XL, which is what a two-edge triangle wants; `Some` splits them so the
+    /// YM crossover between them is observable.
+    upper_right_x: Option<f64>,
     /// First and last scanline, in whole pixels.
     y_start: i16,
     y_end: i16,
-    /// Optional per-component shade planes: (value, d/dx, d/de, d/dy).
-    shade: Option<([i32; 4], [i32; 4], [i32; 4], [i32; 4])>,
+    /// The scanline at which the minor edge switches from XM to XL. `None`
+    /// puts it at `y_end`, so XM governs the whole triangle.
+    ym_row: Option<i16>,
+    /// Optional per-component shade planes.
+    shade: Option<ShadePlanes>,
 }
+
+/// One shaded triangle's four coefficient groups: (value, d/dx, d/de, d/dy),
+/// each carrying the four RGBA components.
+pub(crate) type ShadePlanes = ([i32; 4], [i32; 4], [i32; 4], [i32; 4]);
 
 /// Q16.16 from a pixel coordinate that may carry a fraction.
 ///
@@ -102,6 +120,12 @@ pub(crate) fn px_frac(pixels: f64) -> i32 {
     (pixels * 65536.0).round() as i32
 }
 
+#[allow(
+    dead_code,
+    reason = "the builder states the whole wire surface; not every \
+    field has a caller yet, and a builder that can only express today's fixtures \
+    is the gap this harness exists to close"
+)]
 impl Tri {
     /// A flat (non-shaded, non-textured, non-depth) triangle, opcode 0x08.
     pub(crate) fn flat() -> Self {
@@ -114,8 +138,10 @@ impl Tri {
             right_x: 0.0,
             left_slope: 0.0,
             right_slope: 0.0,
+            upper_right_x: None,
             y_start: 0,
             y_end: 0,
+            ym_row: None,
             shade: None,
         }
     }
@@ -143,10 +169,26 @@ impl Tri {
         self
     }
 
+    /// Parks the upper minor (XM) edge at its own X, distinct from XL.
+    ///
+    /// The RDP switches the minor edge from XM to XL at YM, so a triangle
+    /// whose XM and XL differ makes that crossover visible; one where they
+    /// coincide cannot see it at all.
+    pub(crate) fn upper_right(mut self, x: f64) -> Self {
+        self.upper_right_x = Some(x);
+        self
+    }
+
     /// Gives the edges per-scanline slopes, in pixels per scanline.
     pub(crate) fn slopes(mut self, left: f64, right: f64) -> Self {
         self.left_slope = left;
         self.right_slope = right;
+        self
+    }
+
+    /// The scanline where the minor edge switches from XM to XL.
+    pub(crate) fn ym_row(mut self, row: i16) -> Self {
+        self.ym_row = Some(row);
         self
     }
 
@@ -181,13 +223,13 @@ impl Tri {
             // triangle spans scanlines 0, 1 and 2, so YL is line 3 in S11.2
             // and the raster's `y < yl` bound stops after row 2.
             yl: line(self.y_end),
-            ym: line(self.y_end),
+            ym: line(self.ym_row.unwrap_or(self.y_end)),
             yh: line(self.y_start),
             xl: px_frac(self.right_x),
             dxldy: px_frac(self.right_slope),
             xh: px_frac(self.left_x),
             dxhdy: px_frac(self.left_slope),
-            xm: px_frac(self.right_x),
+            xm: px_frac(self.upper_right_x.unwrap_or(self.right_x)),
             dxmdy: px_frac(self.right_slope),
         };
         let mut words = edges.words(0, self.opcode).to_vec();
@@ -210,6 +252,11 @@ pub(crate) struct Rdp {
     triangles: Vec<Tri>,
 }
 
+#[allow(
+    dead_code,
+    reason = "see Tri's own allow: the staged-state surface is \
+    complete by design, ahead of its callers"
+)]
 impl Rdp {
     /// A frame targeting a `width` x `height` RGBA16 colour image.
     pub(crate) fn new(width: u32, height: u32) -> Self {
@@ -285,10 +332,7 @@ impl Rdp {
         words.extend([word(SET_FILL_COLOR, 0), CLEAR_COLOR_WIRE]);
         let (x1, y1) = (self.width - 1, self.height - 1);
         // FillRectangle's coordinates are 10.2 fixed point.
-        words.extend([
-            word(FILL_RECTANGLE, ((x1 << 2) << 12) | (y1 << 2)),
-            0,
-        ]);
+        words.extend([word(FILL_RECTANGLE, ((x1 << 2) << 12) | (y1 << 2)), 0]);
         words
     }
 
@@ -381,6 +425,18 @@ pub(crate) struct Frame {
     writes: Vec<CompletedWrite>,
 }
 
+/// Summarizes rather than dumping the whole buffer: a failed `expect_err`
+/// should print what the frame covered, not several hundred bytes.
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("write_ranges", &self.write_ranges())
+            .finish()
+    }
+}
+
 impl Frame {
     /// The RGBA16 pixel at `(x, y)`, read from the published resident's own
     /// device bytes.
@@ -421,6 +477,13 @@ impl Frame {
     /// The draw packet's committed guest writes, as `(start_address, bytes)`
     /// in declaration order -- the same list `copy_committed_guest_writes`
     /// re-derives before writing a byte into guest RDRAM.
+    ///
+    /// Reports the write's STORED `byte_count` rather than its declared
+    /// range's length. For a well-formed write the two agree (pinned by
+    /// `each_committed_writes_stored_byte_count_matches_its_declared_range_length`),
+    /// so swapping them here is an equivalent mutation and no test can tell
+    /// them apart -- deliberately so: the stored count is what the guest copy
+    /// actually trusts, which makes it the honest one to report.
     pub(crate) fn write_ranges(&self) -> Vec<(u32, u32)> {
         self.writes
             .iter()
