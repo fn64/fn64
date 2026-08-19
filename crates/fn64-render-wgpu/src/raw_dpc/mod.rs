@@ -1713,7 +1713,7 @@ fn plan_texture_rectangle(
 ///
 /// The subset widens by widening the executor first, then this predicate --
 /// never the other way round.
-fn raw_triangle_is_flat_opaque(triangle: &triangle::RawTriangle) -> bool {
+fn raw_triangle_is_executable(triangle: &triangle::RawTriangle) -> bool {
     let flags = triangle.flags();
     !flags.textured() && !flags.depth()
 }
@@ -1750,7 +1750,7 @@ fn plan_raw_triangle(
     planned: &mut Vec<ResourceAccess>,
     fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
-    if !raw_triangle_is_flat_opaque(triangle) {
+    if !raw_triangle_is_executable(triangle) {
         return Ok(());
     }
     // A triangle before any `SetOtherMode` has no defined blend or cycle
