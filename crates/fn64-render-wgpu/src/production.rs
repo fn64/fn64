@@ -1010,7 +1010,36 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // names its own tile in its wire word and this file cannot
                 // know which until it reads that word at execute time.
                 self.triangle_neutral_tiles.push(self.current_tiles);
-                self.triangle_commands.push(command_index);
+                // **A texture rectangle's two triangles take the FIRST
+                // half's command index, not their own.**
+                //
+                // The adapter assigns each half its own index -- measured
+                // on the sprite-strip fixture, the halves are (11, 12),
+                // (20, 21), ... -- so pushing `command_index` unchanged
+                // would let the two halves select prefixes independently.
+                // In that fixture no load falls between 11 and 12, so it
+                // happens to be harmless; that is an accident of the
+                // spacing, not a guarantee. A rectangle whose halves
+                // straddled a load would tear along its own diagonal, one
+                // triangle carrying texels the other never saw.
+                //
+                // The pairing rule is `texrect_commands`' own
+                // `previous_was_first_half`, applied here rather than
+                // re-derived, so one fact about "which triangles are one
+                // rectangle" has one implementation.
+                let second_half = *source == TriangleSource::TextureRectangle
+                    && self
+                        .texrect_commands
+                        .last()
+                        .is_some_and(|(_, first, _, _)| *first + 1 == triangle_index);
+                self.triangle_commands.push(if second_half {
+                    *self
+                        .triangle_commands
+                        .last()
+                        .expect("a second half always follows a first half that pushed its own")
+                } else {
+                    command_index
+                });
                 // One texture rectangle is admitted as TWO
                 // `TriangleSource::TextureRectangle` triangles sharing one
                 // originating wire command, and the adapter pushes them
@@ -3740,8 +3769,8 @@ fn verify_tmem_identity<S: crate::TmemByteSource + ?Sized>(
     }
 }
 
-/// [`project_pending_tmem_for_draw`]'s body, generic over the source, so the
-/// forgery refusal can be exercised by a test.
+/// [`project_pending_tmem_per_triangle`]'s per-entry body, generic over the
+/// source, so the forgery refusal can be exercised by a test.
 ///
 /// Split out for exactly one reason: `PendingTmemImage`'s own `snapshot()`
 /// impl is correct, so no *real* pending image can drive the refusal, and a
@@ -3750,7 +3779,7 @@ fn verify_tmem_identity<S: crate::TmemByteSource + ?Sized>(
 /// the function for the same reason). A test source that answers
 /// `Committed` is the only way to reach the arm, and it is reachable only
 /// through this generic seam, never from production code: the sole
-/// production caller above passes a real `PendingTmemImage`.
+/// production caller above passes a real `PendingTmemPrefixImage`.
 fn project_proposed_image<S: crate::TmemByteSource + ?Sized>(
     image: &S,
 ) -> Result<TmemGpuProjection, WgpuRawDpcExecutionError> {
@@ -10167,6 +10196,416 @@ mod tests {
                 index - 1
             );
         }
+    }
+
+    /// **The GPU half of the same property: the per-triangle projection
+    /// list carries a DIFFERENT TMEM image for each sprite in the strip.**
+    ///
+    /// `each_sprite_in_a_strip_draws_the_load_that_precedes_it` above
+    /// proves the CPU texel reader picks per position, by reading published
+    /// pixels. It cannot see the GPU half at all: the raster path samples
+    /// `draw_tmem`, a separate list built by
+    /// `project_pending_tmem_per_triangle`, and a single shared projection
+    /// there would leave that test entirely green while every triangle
+    /// rastered the last load's texels.
+    ///
+    /// So this asserts on the projection list itself, taken straight off
+    /// `execute_raw_dpc_inner`'s return. That seam is used rather than a
+    /// real draw because the draw needs a GPU adapter and the property
+    /// under test is *which image each triangle is handed*, which is fully
+    /// determined before any adapter is touched.
+    ///
+    /// # What is asserted, and why each part is load bearing
+    ///
+    /// **One entry per triangle.** A texrect is admitted as two triangles,
+    /// so seven pairs give fourteen. A list of one -- the shape before this
+    /// change -- fails here first.
+    ///
+    /// **Both halves of one texrect agree.** They share a wire command and
+    /// so share a `plan.triangle_commands` entry; a rectangle whose two
+    /// triangles straddled a load would tear along its own diagonal.
+    ///
+    /// **Consecutive texrects differ.** This is the discriminator, and it
+    /// is the same one the CPU test uses: under a single shared projection
+    /// all fourteen entries are equal, and under per-position selection the
+    /// seven sprite loads all write TMEM from word zero, so each texrect's
+    /// image differs from its neighbour's.
+    ///
+    /// **The differences are in TMEM's loaded range.** Comparing whole
+    /// projections would also pass if they differed only in some untouched
+    /// region, so the assertion is narrowed to bytes 0..48 -- the 24 RGBA16
+    /// texels every load in this fixture writes.
+    #[test]
+    fn the_gpu_projection_list_gives_each_sprite_its_own_tmem_image() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (planned, per_read_bytes) = plan_with_deterministic_reads_for_every_load(
+            &mut backend,
+            &session,
+            sprite_strip_words(SPRITE_STRIP_PAIRS),
+        );
+        let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+
+        let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+            &mut backend.coordinator,
+            bound,
+            backend.rdp_state.other_mode(),
+            backend.rdp_state.combine(),
+            backend.rdp_state.blend_color(),
+            backend.rdp_state.env_color(),
+            backend.rdp_state.prim_color(),
+            backend.rdp_state.fog_color(),
+            backend.rdp_state.color_image(),
+            durable_neutral_tiles(&backend.rdp_state),
+            &mut backend.color_targets,
+            backend.configured_target_extent,
+        )
+        .expect("the sprite strip must execute");
+
+        let projections =
+            draw_tmem.expect("a load-bearing packet must carry per-triangle TMEM projections");
+        assert_eq!(
+            projections.len(),
+            SPRITE_STRIP_PAIRS * 2,
+            "one projection per admitted triangle, two per texrect -- a single shared projection \
+             is exactly the defect this test exists to catch"
+        );
+
+        // The range every load in this fixture writes: 24 RGBA16 texels
+        // from TMEM word 0. Narrowed deliberately -- whole-projection
+        // inequality could be satisfied by an untouched region differing.
+        const LOADED: std::ops::Range<usize> = 0..48;
+
+        for pair in 0..SPRITE_STRIP_PAIRS {
+            let first = &projections[pair * 2];
+            let second = &projections[pair * 2 + 1];
+            assert_eq!(
+                first.bytes[LOADED], second.bytes[LOADED],
+                "texrect {pair}'s two triangles come from one wire command and must be handed \
+                 the same image; a rectangle straddling a load would tear along its diagonal"
+            );
+        }
+
+        // **The discriminator.** Under one shared projection all seven of
+        // these are equal.
+        for pair in 1..SPRITE_STRIP_PAIRS {
+            assert_ne!(
+                projections[pair * 2].bytes[LOADED],
+                projections[(pair - 1) * 2].bytes[LOADED],
+                "sprite {pair} must be handed load {pair}'s texels and sprite {} load {}'s; they \
+                 are equal, which is what one projection shared across the draw produces",
+                pair - 1,
+                pair - 1
+            );
+        }
+
+        // Anti-vacuity: the loaded range is actually populated. All-invalid
+        // projections would compare equal above and make the pair
+        // assertions pass for the wrong reason.
+        assert!(
+            projections[0].bytes[LOADED].iter().any(|byte| *byte != 0),
+            "the first projection's loaded range must carry real texels, or the comparisons \
+             above are over zeroes"
+        );
+    }
+
+    /// **A texture rectangle's two triangles carry ONE command index --
+    /// the rectangle's, not each half's own.**
+    ///
+    /// Measured, and the reason this pairing is code rather than a comment:
+    /// the adapter hands the two halves *different* indices. On the
+    /// sprite-strip fixture the raw pairs are (11, 12), (20, 21), (29, 30)
+    /// and so on. Pushing each half's own index would let the two select
+    /// prefixes independently, and a rectangle whose halves straddled a
+    /// load would tear along its own diagonal -- one triangle carrying
+    /// texels the other never saw.
+    ///
+    /// In this fixture no load falls between 11 and 12, so the defect is
+    /// invisible in pixels here. That is exactly why it is asserted
+    /// structurally: the property must hold for spacings this fixture does
+    /// not produce, and a pixel test over this fixture cannot express that.
+    ///
+    /// The anti-vacuity control is the second assertion: the seven
+    /// rectangles must carry seven *distinct* indices. Without it, a
+    /// `triangle_commands` that collapsed every entry to one constant would
+    /// satisfy the pairing check perfectly.
+    #[test]
+    fn a_texture_rectangles_two_triangles_share_one_command_index() {
+        let commands = plan_triangle_commands(sprite_strip_words(SPRITE_STRIP_PAIRS));
+        assert_eq!(
+            commands.len(),
+            SPRITE_STRIP_PAIRS * 2,
+            "two admitted triangles per texrect"
+        );
+
+        for pair in 0..SPRITE_STRIP_PAIRS {
+            assert_eq!(
+                commands[pair * 2],
+                commands[pair * 2 + 1],
+                "texrect {pair}'s halves must share one command index, or they can select \
+                 different TMEM prefixes and tear along the rectangle's diagonal"
+            );
+        }
+
+        // Anti-vacuity: distinct rectangles keep distinct positions. A
+        // constant would pass the pairing check above and destroy
+        // per-position selection entirely.
+        let firsts: Vec<u32> = (0..SPRITE_STRIP_PAIRS).map(|i| commands[i * 2]).collect();
+        let mut sorted = firsts.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            SPRITE_STRIP_PAIRS,
+            "the seven rectangles must sit at seven distinct stream positions, got {firsts:?}"
+        );
+    }
+
+    /// The `plan.triangle_commands` one word stream's decode produces,
+    /// read through the same plan walk execution uses rather than
+    /// re-derived from the wire words.
+    fn plan_triangle_commands(words: Vec<u32>) -> Vec<u32> {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (planned, per_read_bytes) =
+            plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
+        let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+        let mut plan_visitor =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+        let mut color_targets = None;
+        let configured_target_extent = backend.configured_target_extent;
+        let coordinator = &backend.coordinator;
+        let mut view = ExecutionCollector {
+            physical: coordinator.physical(),
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            plan: PlanCollector::seeded(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [(None, None); 8],
+            ),
+            reads: Vec::new(),
+            outcome: None,
+            color_targets: &mut color_targets,
+            configured_target_extent,
+            draw_tmem: None,
+        };
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+        view.plan.triangle_commands
+    }
+
+    /// **The projection-count guard, tested at the function.**
+    ///
+    /// Unreachable from a legitimately decoded packet:
+    /// `project_pending_tmem_per_triangle` walks `plan.triangle_commands`
+    /// and `execute_raw_dpc` draws `plan.triangles`, two vectors pushed at
+    /// one site in one loop, so they agree by construction. That is exactly
+    /// why it is tested here -- a defensive arm with no test is a claim
+    /// with no evidence, this crate's own convention (see
+    /// `merged_fill_and_tmem_writes`' two loud arms). Measured: deleting
+    /// the guard left the whole suite green before this test existed.
+    ///
+    /// It is a real invariant, not paranoia. A short list would panic on
+    /// the index rather than name the cause, and padding it could only pad
+    /// with another triangle's image or the whole-packet post-image --
+    /// precisely the two images per-position selection exists to withhold.
+    ///
+    /// One triangle is supplied against zero projections: the draw is
+    /// reached only when `triangles` is non-empty, so a zero-length list is
+    /// the smallest honest mismatch. The triangle carries an unresolved
+    /// draw state, which fails *later* in the same function -- so a guard
+    /// that did not fire would surface as
+    /// `MissingTriangleDrawState`, and the assertion below distinguishes
+    /// the two by name rather than accepting "some error".
+    #[test]
+    fn a_short_per_triangle_projection_list_is_refused_by_name() {
+        let (mut backend, _session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        let refused = backend.draw_admitted_triangles(
+            vec![Err(MissingTriangleDrawState::NoCombine {
+                triangle_index: 0,
+            })],
+            Some(Vec::new()),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(WgpuRawDpcExecutionError::TmemProjectionCountMismatch {
+                    projections: 0,
+                    triangles: 1,
+                })
+            ),
+            "a projection list shorter than the draw must be refused by name, never padded from \
+             another triangle's image; got {refused:?}"
+        );
+
+        // The control that makes the refusal mean something: the SAME
+        // triangle with a matching-length list gets past the guard and
+        // fails on its own unresolved draw state instead. Without this, the
+        // assertion above could be satisfied by a guard that rejected every
+        // list.
+        let one = crate::project_committed_tmem(backend.physical_tmem());
+        let past = backend.draw_admitted_triangles(
+            vec![Err(MissingTriangleDrawState::NoCombine {
+                triangle_index: 0,
+            })],
+            Some(vec![one]),
+        );
+        assert!(
+            matches!(
+                past,
+                Err(WgpuRawDpcExecutionError::MissingTriangleDrawState(_))
+            ),
+            "a matching-length list must pass the count guard and fail on the draw state \
+             instead; got {past:?}"
+        );
+    }
+
+    /// **The GPU projector's committed arm: a triangle standing before its
+    /// packet's first load is handed DURABLE TMEM, not the packet's
+    /// post-image.**
+    ///
+    /// This is the arm `prefix_before` returns `None` for, and it is the
+    /// same answer `stage_color_commands` gives a texrect in the same
+    /// position -- both paths reading durable state from the same fact
+    /// about the stream. Handing that triangle the sealed post-image
+    /// instead would let it observe texels a *later* command loaded, which
+    /// is the exact defect the whole per-position change exists to prevent,
+    /// now on the GPU side.
+    ///
+    /// Measured: replacing this arm with `pending.pending_image()` left the
+    /// entire suite green before this test existed, so the arm's
+    /// correctness rested on nothing.
+    ///
+    /// The discriminator is that the two images genuinely differ, and both
+    /// are real. An EARLIER packet publishes a load into TMEM word zero
+    /// first, so durable state carries actual texels -- without that the
+    /// pre-load texrect has nothing to sample and the CPU reader refuses
+    /// `InvalidTexelByte` before any projection can be compared, which is
+    /// how this fixture's need for a published predecessor was found. The
+    /// second packet then loads DIFFERENT bytes over the same range, so the
+    /// durable image and the packet's own prefix disagree everywhere in it.
+    #[test]
+    fn a_triangle_before_the_first_load_projects_durable_tmem_not_the_post_image() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+
+        // Packet 1: publish a load into TMEM word 0, so durable TMEM holds
+        // real texels for the pre-load texrect of packet 2 to sample.
+        let mut first = Vec::new();
+        first.extend(set_texture_image(0, 2, 8, 0x200));
+        first.extend(set_tile(7, 2, 0));
+        first.extend(load_sync());
+        first.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+        let (planned, per_read) =
+            plan_with_deterministic_reads_for_every_load(&mut backend, &session, first);
+        let capture = guest_read_capture_per_read(&planned, &per_read);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+        let prepared = backend
+            .execute_raw_dpc(bound)
+            .expect("the seeding load executes");
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        let durable = crate::project_committed_tmem(backend.physical_tmem());
+
+        // Packet 2: a texrect BEFORE any load of its own, then a load, then
+        // a second texrect after it. Both are admitted; only the second has
+        // a prefix.
+        let mut words = whole_target_fill_words();
+        words.extend(set_texture_image(0, 2, 8, 0x400));
+        words.extend(set_tile(7, 2, 0));
+        words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        // Texrect #1 -- no load precedes it in this packet.
+        words.extend(texrect_words_in_target_stepping_at(7, 0, 2, 1, 3));
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+        words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        // Texrect #2 -- the load above precedes it.
+        words.extend(texrect_words_in_target_stepping_at(7, 4, 2, 5, 3));
+
+        let (planned, per_read_bytes) =
+            plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
+        assert_eq!(
+            per_read_bytes.len(),
+            1,
+            "the fixture must carry exactly one load, or 'before the first load' names nothing"
+        );
+        // Explicitly different content from packet 1's.
+        // `plan_with_deterministic_reads_for_every_load` keys its bytes on
+        // the READ INDEX within a packet, which is 0 in both packets, so a
+        // different source *address* alone leaves the two loads
+        // byte-identical -- measured, and the reason this override exists.
+        let distinct: Vec<Vec<u8>> = per_read_bytes
+            .iter()
+            .map(|bytes| {
+                (0..bytes.len())
+                    .map(|index| 0xA0u8.wrapping_add(index as u8))
+                    .collect()
+            })
+            .collect();
+        let capture = guest_read_capture_per_read(&planned, &distinct);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+
+        let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+            &mut backend.coordinator,
+            bound,
+            backend.rdp_state.other_mode(),
+            backend.rdp_state.combine(),
+            backend.rdp_state.blend_color(),
+            backend.rdp_state.env_color(),
+            backend.rdp_state.prim_color(),
+            backend.rdp_state.fog_color(),
+            backend.rdp_state.color_image(),
+            durable_neutral_tiles(&backend.rdp_state),
+            &mut backend.color_targets,
+            backend.configured_target_extent,
+        )
+        .expect("a texrect before the packet's own load reads durable TMEM and executes");
+
+        let projections = draw_tmem.expect("a load-bearing packet carries projections");
+        assert_eq!(projections.len(), 4, "two texrects, two triangles each");
+
+        const LOADED: std::ops::Range<usize> = 0..48;
+        // Triangle 0 stands before this packet's load: it must be handed
+        // the DURABLE image packet 1 published, byte for byte.
+        assert_eq!(
+            projections[0].bytes[LOADED], durable.bytes[LOADED],
+            "the pre-load triangle must be handed durable TMEM; any other bytes mean it was \
+             handed this packet's own post-image, observing a load that had not run at its \
+             position"
+        );
+        // Triangle 2 stands after it: the packet's own prefix, which loaded
+        // DIFFERENT bytes over the same range. The two must disagree, or
+        // the assertion above is satisfied by two images that happen to
+        // match and proves nothing.
+        assert_ne!(
+            projections[2].bytes[LOADED], durable.bytes[LOADED],
+            "the post-load triangle must be handed this packet's own prefix, which overwrote \
+             the durable texels; equal bytes mean the fixture's two loads are indistinguishable"
+        );
+        // And durable is not vacuously empty.
+        assert!(
+            durable.bytes[LOADED].iter().any(|byte| *byte != 0),
+            "the seeding packet must have published real texels, or both comparisons above are \
+             over zeroes"
+        );
     }
 
     /// **WM2000's own measured sixth packet, run through `prefix_before`.**
