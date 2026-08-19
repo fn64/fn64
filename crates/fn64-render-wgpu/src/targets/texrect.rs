@@ -965,16 +965,54 @@ impl CombinerProgramSlice {
         !matches!(self, Self::FirstOfTwoCycles)
     }
 
-    /// Whether a first-cycle combiner result exists for this pass to read.
-    /// Only two-cycle mode's second pass has one; one-cycle mode's single
-    /// pass reads the zero-initialized accumulator, which is not a result.
-    const fn carries_a_first_cycle_result(self) -> bool {
-        matches!(self, Self::SecondOfTwoCycles)
+    /// Whether `Combined`/`CombinedAlpha` names a value this executor can
+    /// resolve in this pass.
+    ///
+    /// **True everywhere except a two-cycle program's FIRST pass.** The
+    /// authority is RT64's pinned `5473732a`,
+    /// `src/shared/rt64_color_combiner.h`:
+    ///
+    /// - `fromColorInput`'s `case C_COMBINED: return combinerColor.rgb;`
+    ///   (lines 470-471) and `fromAlphaInput`'s `case A_COMBINED: return
+    ///   combinerAlpha;` (lines 517-518) are **unconditional**. RT64 has no
+    ///   refusal, no cycle guard and no special case for the selector.
+    /// - `run()` (line 611) zero-initializes `combinerColor = float4(0, 0,
+    ///   0, 0)` (line 612) and then, for a one-cycle program
+    ///   (`twoCycle == false`), makes exactly one
+    ///   `runCycle(inputs, 1, false, combinerColor)` call (line 620). So a
+    ///   one-cycle program's `COMBINED` reads that zero.
+    /// - The input wrap that turns the accumulator into a genuine *carry*
+    ///   is gated on
+    ///   `const bool secondCycle = twoCycle && secondCycleInputs` (line
+    ///   577) and runs only in lines 580-601. A one-cycle program skips it,
+    ///   leaving the zero untouched.
+    ///
+    /// So `COMBINED` in one-cycle mode is **defined behaviour reading a
+    /// hardware zero**, not undefined behaviour and not a value this
+    /// executor invents. [`crate::combiner::run_one_cycle`] has always
+    /// evaluated it that way (`combiner.rs`'s `combiner_color_in =
+    /// [0.0; 3]` / `combiner_alpha_in = 0.0`, citing the same RT64
+    /// zero-init), and `two_cycle_carries_the_accumulator_one_cycle_cannot`
+    /// pins the arithmetic. This predicate was the only thing refusing a
+    /// program the evaluator behind it already handled correctly.
+    ///
+    /// Measured on the real WM2000 ROM on the all-Rust stack: a texrect
+    /// latches `combine` = `low 0xfc15fea3` / `high 0xf00ff23f` and runs it
+    /// in ONE-cycle mode. `parseColorInputB`'s second-cycle field is
+    /// `(high >> 24) & 0xF` = `0`, and selector `0` is `C_COMBINED`
+    /// (`rt64_color_combiner.h:23`). The run aborted at 1,887 VI swaps on
+    /// this predicate.
+    ///
+    /// **`FirstOfTwoCycles` stays refused**, and that is not conservatism:
+    /// this executor's two-cycle arithmetic for a `COMBINED` read in cycle
+    /// 0 is covered by no measurement in this repo.
+    const fn resolves_the_combined_selector(self) -> bool {
+        !matches!(self, Self::FirstOfTwoCycles)
     }
 
     fn admits_color(self, input: ColorInput) -> bool {
         if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
-            return self.carries_a_first_cycle_result();
+            return self.resolves_the_combined_selector();
         }
         ADMITTED_COLOR_INPUTS
             .iter()
@@ -983,7 +1021,7 @@ impl CombinerProgramSlice {
 
     fn admits_alpha(self, input: AlphaInput) -> bool {
         if matches!(input, AlphaInput::Combined) {
-            return self.carries_a_first_cycle_result();
+            return self.resolves_the_combined_selector();
         }
         ADMITTED_ALPHA_INPUTS
             .iter()
@@ -3356,39 +3394,87 @@ mod one_cycle_tests {
         );
     }
 
-    /// **Two-cycle's second slice is the only place `Combined` is admitted**
-    /// -- the widening admits the carry where a first-cycle result exists
-    /// and nowhere else.
+    /// **`Combined` is admitted everywhere except a two-cycle program's
+    /// FIRST slice**, and in one-cycle mode it resolves to RT64's
+    /// zero-initialized accumulator rather than to a value this executor
+    /// invents.
     ///
-    /// This is the reference lane's own rule
-    /// (`fn64-render-reference/src/backend/validate.rs:476-478`, "selects
-    /// COMBINED before a first-cycle result exists"), and without it the
-    /// widening would admit a one-cycle program reading a zero the executor
-    /// invented -- exactly the failure mode `UnsupportedColorInput` exists
-    /// to prevent.
+    /// See [`CombinerProgramSlice::resolves_the_combined_selector`] for the
+    /// RT64 citation (`rt64_color_combiner.h:470-471`, `611-620`, `577`)
+    /// and the ROM measurement.
+    ///
+    /// This asserts the ADMISSION rule and the ARITHMETIC together, because
+    /// admitting the selector is only correct if the value behind it is the
+    /// hardware's. Hand-derived from [`carry_program`]'s second slice,
+    /// `(Zero - Zero) * Zero + Combined` over a zero accumulator, which is
+    /// transparent black.
     #[test]
-    fn combined_is_admitted_only_in_the_second_slice_of_two_cycles() {
+    fn combined_is_admitted_outside_the_first_slice_of_two_cycles() {
+        let program = carry_program();
         let shading = TexrectShading::new(
-            carry_program(),
+            program,
             Color4::from_wire(ENV_WIRE),
             PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
         );
         shading
             .validate_combiner_program(CombinerProgramCycles::BothSlices)
             .expect("cycle 1 has a first-cycle result for COMBINED to read");
-        assert_eq!(
-            shading.validate_combiner_program(CombinerProgramCycles::OnlySecondSlice),
-            Err(TexrectExecutionError::UnsupportedColorInput {
-                slot: ColorInputSlot::D,
-                input: ColorInput::Combined,
-            }),
-            "the same program in one-cycle mode reads COMBINED with no first cycle behind it"
-        );
+        shading
+            .validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+            .expect(
+                "one-cycle COMBINED reads RT64's zero-initialized accumulator, which is \
+                 defined behaviour",
+            );
         assert_eq!(
             shading.validate_one_cycle(),
             shading.validate_combiner_program(CombinerProgramCycles::OnlySecondSlice),
             "validate_one_cycle must stay an exact alias for the one-slice admission"
         );
+
+        // The admitted program must also EVALUATE to the hardware's answer,
+        // not merely get past the gate.
+        let base = shading.base_inputs();
+        assert_eq!(
+            combine_one_texel(
+                program,
+                base,
+                [0x18, 0x40, 0xC8, 0xFF],
+                TexrectCombinerEvaluation::OneCycle
+            ),
+            [0x00, 0x00, 0x00, 0x00],
+            "one-cycle D = COMBINED reads the zero-initialized accumulator"
+        );
+    }
+
+    /// **A two-cycle program's FIRST slice still refuses `Combined`.**
+    ///
+    /// The widening above is not "admit COMBINED everywhere". This pins the
+    /// arm the repair KEEPS: no measurement in this repo covers a
+    /// `COMBINED` read in cycle 0 of a two-cycle program.
+    #[test]
+    fn combined_in_the_first_slice_of_two_cycles_is_still_refused() {
+        // Cycle 0 slot A = COMBINED (index 0); cycle 1 is an
+        // all-Zero/Primitive program that admits cleanly on its own.
+        let program = merge_cycles(
+            pack_first_cycle([0, 8, 16, 3], [7, 7, 7, 3]),
+            pack_second_cycle([8, 8, 16, 3], [7, 7, 7, 3]),
+        );
+        let shading = TexrectShading::new(
+            program,
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        );
+        assert_eq!(
+            shading.validate_combiner_program(CombinerProgramCycles::BothSlices),
+            Err(TexrectExecutionError::UnsupportedColorInput {
+                slot: ColorInputSlot::A,
+                input: ColorInput::Combined,
+            }),
+            "cycle 0 of a two-cycle program has no first-cycle result behind COMBINED"
+        );
+        shading
+            .validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+            .expect("the same wire word read as one-cycle names no COMBINED at all");
     }
 
     /// **`Texel1` stays refused in BOTH slices of a two-cycle program.**
