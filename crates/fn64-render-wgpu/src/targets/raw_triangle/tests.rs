@@ -580,3 +580,215 @@ fn the_claimed_rectangle_is_the_bounding_box_of_the_covered_rows() {
         "x 2..6 over rows 0..3"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shade plane interpolation
+// ---------------------------------------------------------------------------
+
+/// `(Zero - Zero) * Zero + Shade` in the second bitfield slice: the combined
+/// colour IS the interpolated shade colour, verbatim.
+///
+/// Slot indices: colour A/B/C at their own out-of-table `Zero` (8/8/16) and
+/// D = 4, which is `Shade` in `colorInputD`'s shared common table; alpha
+/// A/B/C at `Zero` (7) and D = 4, `Shade` in `alphaInputABD`.
+fn shade_passthrough_program() -> CombineParams {
+    let (ca, cb, cc, cd) = (8u32, 8u32, 16u32, 4u32);
+    let (aa, ab, ac, ad) = (7u32, 7u32, 7u32, 4u32);
+    let low = (ca << 5) | cc;
+    let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+    CombineParams::from_wire(low, high)
+}
+
+/// Builds one SHADED (opcode 0x0c) triangle: the box triangle's edges plus
+/// eight shade coefficient words carrying the four RGBA planes.
+///
+/// The shade block's wire layout is NOT eight consecutive Q16.16 values --
+/// each coefficient's high 16 bits live in the block's first half and its
+/// low 16 bits sixteen bytes later. As sixteen u32 halves (half `n` is byte
+/// `4n`):
+///   half  0,1  colour integer  (R:G, B:A)
+///   half  2,3  d/dx    integer
+///   half  4..7 unused by this fixture
+///   half  8,9  colour fraction
+///   half 10,11 d/dx    fraction
+///   half 12,13 d/de    integer   (byte 32)
+///   half 14,15 d/de    fraction? -- no: d/de fraction is byte 48, which is
+///              half 12 of the SECOND 32 bytes. The block is 64 bytes = 16
+///              halves, so byte 48 IS half 12. Recomputed below from the
+///              byte offsets directly rather than from this list.
+///
+/// Byte offsets, from the RDP command summary and matched against
+/// `fn64-render-reference`'s `decode_rdp_shade_coefficients`:
+///   colour (0, 16)  d/dx (8, 24)  d/de (32, 48)  d/dy (40, 56)
+fn shaded_triangle(red: (i32, i32, i32)) -> RawTriangle {
+    let (base, dcdx, dcde) = red;
+    let mut halves = [0u32; 16];
+    let put = |halves: &mut [u32; 16], integer_byte: usize, fraction_byte: usize, value: i32| {
+        // R occupies the HIGH half of the first u32 of each pair.
+        halves[integer_byte / 4] |= ((value >> 16) as u32 & 0xffff) << 16;
+        halves[fraction_byte / 4] |= (value as u32 & 0xffff) << 16;
+    };
+    put(&mut halves, 0, 16, base);
+    put(&mut halves, 8, 24, dcdx);
+    put(&mut halves, 32, 48, dcde);
+
+    let mut bytes = Vec::with_capacity(64);
+    // The eight base-edge words: same box triangle, opcode 0x0c.
+    for word in [
+        (1u32 << 23) | 12,
+        12u32 << 16,
+        6 << 16,
+        0,
+        2 << 16,
+        0,
+        6 << 16,
+        0,
+    ] {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    for half in halves {
+        bytes.extend_from_slice(&half.to_be_bytes());
+    }
+    RawTriangle::decode(0x0c, &bytes).expect("a shaded triangle is 32 + 64 bytes")
+}
+
+fn shaded_shading() -> TexrectShading {
+    TexrectShading::new(
+        shade_passthrough_program(),
+        Color4::from_wire(ENV_WIRE),
+        PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+    )
+}
+
+fn run_shaded(
+    key: ColorTargetKey,
+    triangle: &RawTriangle,
+    resident: &[u8],
+) -> Result<Vec<u8>, TexrectExecutionError> {
+    let declared = declared_accesses(key, triangle, None);
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let completed = execute_raw_triangle(
+        &candidate,
+        one_cycle_other_mode(),
+        triangle,
+        shaded_shading(),
+        TexrectBlendRegisters::default(),
+        resident,
+        &declared,
+    )?;
+    Ok(completed.device_bytes().device_bytes().to_vec())
+}
+
+/// **A shaded triangle's colour varies ACROSS the triangle, per pixel.**
+///
+/// The whole point of the shade rung, and the one assertion a constant-colour
+/// implementation cannot pass.
+///
+/// Hand-derived, from the wire and the plane arithmetic alone. With
+/// `dcdx = 32 << 16` (+32 red per pixel of X), `base = 0`, `dcde = 0`:
+///
+/// `attribute_sample` takes the FIRST covered subsample -- Y offset 1/8,
+/// X offset 1/8 -- so for pixel x on any row:
+///   sample_x      = (8x + 1)/8 px, and the major edge is parked at 2.0 px
+///   edge_delta_x  = (8x + 1)/8 - 2  px
+///   red           = 0 + 0 + 32 * edge_delta_x
+/// giving  x=2 -> 32 * 0.125  =  4
+///         x=3 -> 32 * 1.125  = 36
+///         x=4 -> 32 * 2.125  = 68
+///         x=5 -> 32 * 3.125  = 100
+/// and the same four values on every row, because `dcde` is zero.
+///
+/// RGBA16 packs red >> 3 into bits 15:11 with G = B = 0, and the alpha bit
+/// SET. The alpha bit is 1 even though the alpha shade plane is zero: with
+/// blending disabled (`FORCE_BL` and `AA_EN` both clear at other_mode 0),
+/// `blend_fragment`'s last-cycle bypass sets `final_alpha = 1.0` unless the
+/// cycle's P input is the framebuffer -- the RDP's own behaviour, and the
+/// same reason the flat fixture's 0x87D1 carries a set low bit.
+///   4   >> 3 = 0  -> 0x0001
+///   36  >> 3 = 4  -> 0x2001
+///   68  >> 3 = 8  -> 0x4001
+///   100 >> 3 = 12 -> 0x6001
+#[test]
+fn a_shaded_triangles_colour_is_interpolated_across_its_pixels() {
+    let key = key_at(8, 4);
+    let resident = sentinel_resident(key);
+    let triangle = shaded_triangle((0, 32 << 16, 0));
+    let bytes = run_shaded(key, &triangle, &resident).expect("a shaded triangle rasterizes");
+    let at = |x: usize, y: usize| {
+        let offset = (y * 8 + x) * 2;
+        u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+    };
+    for y in 0..3usize {
+        assert_eq!(at(2, y), 0x0001, "row {y}, x=2");
+        assert_eq!(at(3, y), 0x2001, "row {y}, x=3");
+        assert_eq!(at(4, y), 0x4001, "row {y}, x=4");
+        assert_eq!(at(5, y), 0x6001, "row {y}, x=5");
+    }
+    // Four DISTINCT values across the span: a constant-colour implementation
+    // produces one, and this is the assertion it fails.
+    let across: std::collections::BTreeSet<u16> = (2..6).map(|x| at(x, 0)).collect();
+    assert_eq!(across.len(), 4, "the shade colour must vary across X");
+    // Outside the triangle the resident survives, as ever.
+    assert_eq!(at(1, 0), 0x5A5A);
+    assert_eq!(at(6, 0), 0x5A5A);
+}
+
+/// The along-edge derivative is evaluated too, not just d/dx.
+///
+/// With `dcde = 8 << 16` and `dcdx = 0`, red depends only on the sample's Y
+/// distance below the triangle's high origin, in EIGHTHS:
+///   red = 8 * (8y + 1) / 8 = 8y + 1
+/// giving 1, 9, 17 on rows 0, 1, 2 -- constant across each row.
+/// and the alpha bit set, as above:
+///   1  >> 3 = 0 -> 0x0001
+///   9  >> 3 = 1 -> 0x0801
+///   17 >> 3 = 2 -> 0x1001
+#[test]
+fn the_along_edge_derivative_varies_the_shade_colour_down_the_triangle() {
+    let key = key_at(8, 4);
+    let resident = sentinel_resident(key);
+    let triangle = shaded_triangle((0, 0, 8 << 16));
+    let bytes = run_shaded(key, &triangle, &resident).expect("rasterizes");
+    let at = |x: usize, y: usize| {
+        let offset = (y * 8 + x) * 2;
+        u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+    };
+    for x in 2..6usize {
+        assert_eq!(at(x, 0), 0x0001, "row 0, x={x}");
+        assert_eq!(at(x, 1), 0x0801, "row 1, x={x}");
+        assert_eq!(at(x, 2), 0x1001, "row 2, x={x}");
+    }
+    let down: std::collections::BTreeSet<u16> = (0..3).map(|y| at(3, y)).collect();
+    assert_eq!(down.len(), 3, "the shade colour must vary down Y");
+}
+
+/// An UNSHADED triangle whose program reads `Shade` is still refused.
+///
+/// The widening is per-triangle, driven by the wire opcode's own shade bit,
+/// not a blanket admission -- so the substitution `base_inputs`' zeroed
+/// shade field would make is still prevented where there is nothing to read.
+#[test]
+fn an_unshaded_triangle_reading_shade_is_still_refused() {
+    let key = key_at(8, 4);
+    let resident = sentinel_resident(key);
+    let declared = declared_accesses(key, &box_triangle(), None);
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let result = execute_raw_triangle(
+        &candidate,
+        one_cycle_other_mode(),
+        &box_triangle(),
+        shaded_shading(),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TexrectExecutionError::UnsupportedColorInput { .. })
+        ),
+        "an unshaded triangle reading Shade must refuse, got {result:?}"
+    );
+}
