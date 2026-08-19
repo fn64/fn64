@@ -1,0 +1,13 @@
+[wm2000-boot] progress: steps=50000 sim_time=895940131 vi_swaps=280 gfx_tasks=280 audio_tasks=527
+[wm2000-boot] progress: steps=100000 sim_time=1757449399 vi_swaps=555 gfx_tasks=1079 audio_tasks=1031
+[wm2000-boot] progress: steps=150000 sim_time=2600205911 vi_swaps=825 gfx_tasks=1889 audio_tasks=1524
+[wm2000-boot] progress: steps=200000 sim_time=3421072111 vi_swaps=1087 gfx_tasks=2705 audio_tasks=2006
+[wm2000-boot] progress: steps=250000 sim_time=4623448713 vi_swaps=1472 gfx_tasks=3152 audio_tasks=2710
+[wm2000-boot] progress: steps=300000 sim_time=5821133391 vi_swaps=1855 gfx_tasks=3587 audio_tasks=3413
+[wm2000-boot] progress: steps=350000 sim_time=6843702823 vi_swaps=2182 gfx_tasks=4568 audio_tasks=4013
+[wm2000-boot] progress: steps=400000 sim_time=7858452715 vi_swaps=2506 gfx_tasks=5540 audio_tasks=4608
+[wm2000-boot] progress: steps=450000 sim_time=8865492132 vi_swaps=2828 gfx_tasks=6506 audio_tasks=5198
+[wm2000-boot] progress: steps=500000 sim_time=9862931321 vi_swaps=3147 gfx_tasks=7463 audio_tasks=5782
+[wm2000-boot] === BOOT SUMMARY ===
+[wm2000-boot] VI swaps observed: 3147
+[wm2000-boot] gfx tasks submitted: 7463
