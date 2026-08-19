@@ -262,7 +262,7 @@ fn fragment_combine_params_bytes(
 /// existing pad-to-16-byte-multiple convention).
 fn fragment_alpha_compare_params_bytes(
     mode: AlphaCompare,
-    blend_color: Option<Color4>,
+    blend_color: Color4,
 ) -> [u8; ALPHA_COMPARE_PARAMS_BYTES as usize] {
     let mode_wire: u32 = match mode {
         AlphaCompare::None => 0,
@@ -272,7 +272,7 @@ fn fragment_alpha_compare_params_bytes(
              been rejected at retrieval time before reaching the pipeline"
         ),
     };
-    let threshold_alpha = u32::from(blend_color.map_or(0, |color| color.rgba8()[3]));
+    let threshold_alpha = u32::from(blend_color.rgba8()[3]);
     let mut bytes = [0u8; ALPHA_COMPARE_PARAMS_BYTES as usize];
     bytes[0..4].copy_from_slice(&mode_wire.to_le_bytes());
     bytes[4..8].copy_from_slice(&threshold_alpha.to_le_bytes());
@@ -402,13 +402,14 @@ fn fragment_coverage_params_bytes(
 /// `SetPrimColor` before this triangle) serializes as all-zero, matching
 /// `CombinerInputs`'s pre-Slice-B hardcoded default exactly.
 fn fragment_material_params_bytes(
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
+    env_color: Color4,
+    prim_color: PrimColor,
 ) -> [u8; MATERIAL_PARAMS_BYTES as usize] {
-    let env = env_color.map_or([0.0f32; 4], Color4::normalized);
-    let (prim_rgba, prim_lod_frac) = prim_color.map_or(([0.0f32; 4], 0.0f32), |pc| {
-        (pc.color().normalized(), pc.lod().lod_frac_normalized())
-    });
+    let env = env_color.normalized();
+    let (prim_rgba, prim_lod_frac) = (
+        prim_color.color().normalized(),
+        prim_color.lod().lod_frac_normalized(),
+    );
     let mut bytes = [0u8; MATERIAL_PARAMS_BYTES as usize];
     bytes[0..16].copy_from_slice(&bytemuck_f32x4(env));
     bytes[16..32].copy_from_slice(&bytemuck_f32x4(prim_rgba));
@@ -476,13 +477,16 @@ pub struct ResolvedFragmentBlendParams {
     pub cycle0: crate::blend::ResolvedBlendCycle,
     /// Cycle 1's four selectors, meaningful only when `cycle_count == 2`.
     pub cycle1: crate::blend::ResolvedBlendCycle,
-    /// `G_SETBLENDCOLOR`, needed whenever an active cycle's `P`/`M` selects
-    /// [`crate::blend::BlendColorInput::Blend`].
-    pub blend_color: Option<Color4>,
-    /// `G_SETFOGCOLOR`, needed whenever an active cycle's `P`/`M` selects
+    /// `G_SETBLENDCOLOR`, read whenever an active cycle's `P`/`M` selects
+    /// [`crate::blend::BlendColorInput::Blend`]. Not an `Option`: the RDP
+    /// register always holds a value, zero until the guest writes one (see
+    /// `crate::state::RdpState`'s constant-color field doc).
+    pub blend_color: Color4,
+    /// `G_SETFOGCOLOR`, read whenever an active cycle's `P`/`M` selects
     /// [`crate::blend::BlendColorInput::Fog`] or `A` selects
-    /// [`crate::blend::BlendAlphaInput::Fog`].
-    pub fog_color: Option<Color4>,
+    /// [`crate::blend::BlendAlphaInput::Fog`]. Same power-on-register
+    /// reasoning as `blend_color`.
+    pub fog_color: Color4,
     /// Framebuffer-blend Slice B: `true` when this fixture's active cycle(s)
     /// select [`crate::blend::BlendColorInput::Framebuffer`] on `P` or `M`
     /// -- computed once in `production.rs`'s `draw_admitted_triangles` from
@@ -516,8 +520,8 @@ impl ResolvedFragmentBlendParams {
             m: crate::blend::BlendColorInput::Combined,
             b: crate::blend::BlendBInput::Zero,
         },
-        blend_color: None,
-        fog_color: None,
+        blend_color: Color4::from_wire(0),
+        fog_color: Color4::from_wire(0),
         reads_framebuffer_color: false,
     };
 }
@@ -564,8 +568,8 @@ fn fragment_blend_params_bytes(
     bytes[36..40].copy_from_slice(&u32::from(params.reads_framebuffer_color).to_le_bytes());
     bytes[40..44].copy_from_slice(&row_stride_words.to_le_bytes());
     // bytes[44..48] left zero: _reserved_2.
-    let blend_color = params.blend_color.map_or([0.0f32; 4], Color4::normalized);
-    let fog_color = params.fog_color.map_or([0.0f32; 4], Color4::normalized);
+    let blend_color = params.blend_color.normalized();
+    let fog_color = params.fog_color.normalized();
     bytes[48..64].copy_from_slice(&bytemuck_f32x4(blend_color));
     bytes[64..80].copy_from_slice(&bytemuck_f32x4(fog_color));
     bytes
@@ -661,9 +665,9 @@ pub struct TriangleFixture {
     pub tmem: TmemGpuProjection,
     pub tile_binding: TileBindingParams,
     pub alpha_compare_mode: AlphaCompare,
-    pub blend_color: Option<Color4>,
-    pub env_color: Option<Color4>,
-    pub prim_color: Option<PrimColor>,
+    pub blend_color: Color4,
+    pub env_color: Color4,
+    pub prim_color: PrimColor,
     /// Production blend wiring slice 1: the admitted-subset resolved
     /// blend-cycle parameters this triangle's real `OtherMode` decoded to.
     /// Always present (never `Option`) -- a `cycle_count == 0` value (built
@@ -705,9 +709,9 @@ pub(crate) fn admitted_triangle_fixture(
     extent: TriangleTargetExtent,
     tmem: TmemGpuProjection,
     tile_binding: TileBindingParams,
-    blend_color: Option<Color4>,
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
+    blend_color: Color4,
+    env_color: Color4,
+    prim_color: PrimColor,
     blend_params: ResolvedFragmentBlendParams,
     is_rect: bool,
 ) -> TriangleFixture {
@@ -1348,9 +1352,9 @@ impl TrianglePipelineRenderer {
         extent: TriangleTargetExtent,
         tmem: TmemGpuProjection,
         tile_binding: TileBindingParams,
-        blend_color: Option<Color4>,
-        env_color: Option<Color4>,
-        prim_color: Option<PrimColor>,
+        blend_color: Color4,
+        env_color: Color4,
+        prim_color: PrimColor,
         blend_params: ResolvedFragmentBlendParams,
         is_rect: bool,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
