@@ -627,3 +627,22 @@ That agrees exactly with the execution-seam count: 1,314,648 raw triangles
 reach the admission check and 0 reach the rasterizer, so there is no path by
 which a triangle could have appeared. The frames confirm the measurement
 rather than merely illustrating it.
+
+## ROM verification tally
+
+Six runs, all on this lane's worktree, all reading the LAST `vi_swaps` line
+and confirming termination (the harness prints a checkpoint every 50,000
+steps, and a mid-run 825/1087/1355 has fooled a sibling lane before):
+
+| run | cap | swaps | panics | render error | terminated |
+| --- | --- | --- | --- | --- | --- |
+| C | 400k | 2149 | 0 | None | step budget |
+| D | 400k | 2149 | 0 | None | step budget |
+| E | 400k | 2149 | 0 | None | step budget |
+| HEAD | 400k | 2149 | 0 | None | step budget |
+| frame-dump | 400k | 2149 | 0 | None | step budget |
+| FINAL (true HEAD) | 400k | 2149 | 0 | None | step budget |
+| exec probe | 200k | 1087 | 0 | None | step budget |
+
+2149 is the baseline. No run regressed it, and none introduced a panic. The
+probe's 1087 is correct for half the step budget.
