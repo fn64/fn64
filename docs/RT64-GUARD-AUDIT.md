@@ -309,6 +309,17 @@ fill/copy (`hle/rt64_rdp.cpp:1043-1047`), and `RDP::drawRect` does
 `ulx &= ~3; uly &= ~3;` (`:1164-1169`). Neither returns an error for a
 fractional edge.
 
+**The two references disagree on the remedy, and it matters here.** angrylion
+*preserves* the subpixel bits and lets the edgewalker use them, giving genuine
+partial-pixel coverage; RT64 *snaps outward*, applying `(x + 3) >> 2` ceil to
+all four edges (`common/rt64_common.cpp:93-121`, every caller passing
+`ceil = true`) for a half-open integer extent with no partial coverage. That is
+coherent for a GPU HLE renderer but is not the silicon behaviour. **Trust
+angrylion on what the RDP does; RT64's snap is the cheaper approximation.**
+Either is a strict improvement on refusing, so the fix can start with RT64's
+rounding and move to angrylion's subpixel coverage later — but the doc should
+not claim the rounded version is exact.
+
 fn64's own module doc already concedes this — `targets/fill.rs:40-42`: fractional
 edges are something "real RDP hardware and this decoder both permit on the wire
 but wgpu's decoder chooses not to admit". And the reference renderer handles the
@@ -449,20 +460,53 @@ declared range without checking the raster touched it, so a disagreement would
 publish stale bytes under a valid digest. **Keep.**
 
 ### C4. `DestinationCoverageUnavailable { consumer: "cvg_dst = Save" }`
-The RDP stores a 3-bit coverage count split between the RGBA16 halfword's
-visible LSB and a 2-bit hidden sidecar (`fbuffer.c` `fbread_*`/`fbwrite_*`
-tables at `:22`, `:32`). fn64 maintains no sidecar, so only 1 of 3 bits is
-recoverable and the value cannot be reconstructed. **Keep until the sidecar
-exists** (see B6, which is the same underlying gap).
+The RDP stores a genuine 3-bit coverage count split between the RGBA16
+halfword's visible LSB and a 2-bit hidden sidecar. `fbuffer.c:96-97` writes the
+split explicitly:
+
+```c
+rval = finalcolor | (uint16_t)(finalcvg >> 2);
+hval = finalcvg & 3;
+```
+
+with the sidecar backed by `rdram.c:30` and a third `HB_CLEAN` state deriving it
+from the colour LSB for CPU-written buffers (`rdram.c:125-127`). fn64 maintains
+no sidecar, so only 1 of 3 bits is recoverable and the value cannot be
+reconstructed. **Keep until the sidecar exists** (see B6, the same underlying
+gap).
+
+**RT64 is not usable as a reference here**: it has no hidden bits at all, and
+approximates coverage as `8 * combiner_alpha` in the shader
+(`shaders/RasterPS.hlsl:218`), losing all but the LSB on readback
+(`shaders/Formats.hlsli:96-102`). angrylion is the only authority for C4-C6.
 
 ### C5. `UnsupportedBlendFramebufferAlpha`
 Same root cause as C4: `B = FramebufferAlpha` is the destination coverage
-*count*, not the stored alpha. **Keep.**
+*count*, not the stored alpha. angrylion resolves it as the stored 3-bit count
+rescaled (`blender.c:65` -> `fbuffer.c:232`, `lowbits << 5`) and then
+dz-shifted whenever it is the B input (`blender.c:103-107`) — so it is neither
+the stored alpha nor `1 - coverage`. RGBA32 uses the same coverage-in-the-alpha-
+byte scheme (`fbuffer.c:288-289`, `:112-113`), so **even a 32-bit target does
+not carry a real 8-bit alpha here**. RT64 hardcodes it to `1.0` with a comment
+saying so (`hle/rt64_blender.h:355-357`: "Coverage is not emulated"), which is
+exactly the manufactured constant this refusal exists to prevent. **Keep.**
 
 ### C6. `BlendEnabledNotDerivable`
-`targets/texrect.rs:2165-2168`. Refuses only the one case where the reference's
+`targets/texrect.rs:2165-2168`. Refuses only the one case where the
 `blend_enabled` disjunction genuinely does not settle without the coverage-wrap
-term: `FORCE_BL` clear **and** `AA_EN` set **and** `IM_RD` set. The other two
+term: `FORCE_BL` clear **and** `AA_EN` set **and** `IM_RD` set. angrylion
+confirms the dependency exactly — `zbuffer.c:291-293`:
+
+```c
+int overflow = (curpixel_memcvg + *curpixel_cvg) & 8;
+*blend_en = wstate->other_modes.force_blend || (!overflow && wstate->other_modes.antialias_en && farther);
+```
+
+The `!overflow` term is the coverage wrap, and it is live precisely when
+`force_blend` is clear and `antialias_en` is set. RT64 models none of this —
+`AA_EN`'s only consumer is a debugger text line
+(`gui/rt64_debugger_inspector.cpp:1314`) — so it cannot settle the question
+either. The other two
 `FORCE_BL`-clear cases are correctly *not* refused. Guessing either way is
 wrong — `true` runs a blender the RDP bypasses, `false` bypasses one it runs.
 Narrowly scoped and honest. **Keep.**
@@ -478,8 +522,14 @@ legally exists. Substituting a zero destination draws a plausible wrong pixel.
 
 ### U1. `NoiseThresholdUnavailable` — UNKNOWN
 `targets/texrect.rs:1946`, `:2429`. angrylion uses `irand(&wstate->rseed)`
-(`blender.c:82`, `rasterizer.c:1985`), but nothing in that source claims it is
-the silicon sequence, and the two generators already in this workspace
+(`blender.c:82`, `rasterizer.c:1985`) — a stock MSVC LCG,
+`state * 0x343fd + 0x269ec3`, of which 3 bits are used (`dither.c:90`). Nothing
+in that source claims it is the silicon sequence, and its output even varies
+with worker count. RT64's is a *different* generic PRNG (a TEA-style `initRand`
+plus `1664525u * s + 1013904223u`, `shaders/Random.hlsli:7-33`) carrying a
+self-flagged `// TODO: Review seed.`. So all four sequences now in view are
+substitutions and none claims fidelity. The two generators already in this
+workspace
 (`crate::random`'s RT64 shader PRNG and `fn64-render-reference`'s SplitMix64,
 whose own source says it is "deliberately not described as the silicon
 sequence") are a third and fourth different sequence. **Evidence missing:** a
@@ -494,8 +544,23 @@ resolved by `rgb_dither.rs`'s
 `bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`. The variant's
 own doc comment is a careful, accurate history and supersedes D7 of
 `docs/RT64-LANE-DIVERGENCES.md`. **Evidence missing:** which Bayer arrangement
-the RDP actually uses (divergence D19). Comparing against `dither.c`'s tables
-would give a third opinion, not an authority. **Note this blocks A5's dithered
+the RDP actually uses (divergence D19).
+
+Checking `dither.c` does **not** settle it, and the reason is worth recording so
+a later lane does not repeat the attempt. angrylion's tables live at
+`dither.c:3-18`, and RT64 carries both matrices **byte-identically**
+(`shaders/Formats.hlsli:9-21`, same index `((y&3)<<2)+(x&3)` at `:23-25`) — so
+the *tables* are not in dispute between the references at all. What differs is
+the arithmetic, and there the two references disagree with each other: angrylion
+applies RGB dither as a branchless **conditional bump** (`dither.c:53-56`) and
+alpha dither as **add-then-saturate** (`combiner.c:266-268`) — genuinely
+different arithmetic per stage, and the alpha path reuses the RGB matrix in only
+some of the 16 modes (cases 8/9/12/13 invert the roles). RT64 compiles its alpha
+dither out entirely (`shaders/RasterPS.hlsl:186-201`, `#if 0`) and applies RGB
+dither not at raster time but at framebuffer writeback, via a per-framebuffer
+**majority vote** across the frame (`shaders/FbWriteColorCS.hlsl:19-21`,
+`hle/rt64_framebuffer.cpp:189-191`). Neither is a per-cell authority for the
+disputed arrangement. **Note this blocks A5's dithered
 half.**
 
 ### U3. `MixedFillAndTrianglePacket` — UNKNOWN (architectural, not hardware)
