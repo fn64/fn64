@@ -20,6 +20,48 @@ V1/V4/V5/V7 rows are the predecessor to this table),
 
 ---
 
+## 0. Since this audit was taken
+
+**A twenty-second divergence, found at an abort rather than by grepping, and
+already fixed.** Not renumbered into the table below, which stays as measured
+at `4371d57a`.
+
+### D22 — GPU triangle sampler refused a non-RGBA16 tile under an enabled TLUT · **REACHED WM2000: FIRST TEXTURED TRIANGLE**
+
+- **wgpu** `crates/fn64-render-wgpu/src/shaders/tmem_sample.wgsl`,
+  `sample_committed_rgba16_three_nearest`'s format gate, surfacing as
+  `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT` (4) and aborting the all-Rust stack
+  at `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+- **reference** implements the palettized path; so, since `4c412a96`, does
+  wgpu's own CPU reader (`tmem/texel.rs`'s `resolve_indexed_texel`).
+- **Disagreement.** The shader consulted `tile.format` unconditionally. Under
+  `tlut_en` the RDP sources the texel from a palette and the tile format is
+  ignored (n64brew `Reality_Display_Processor/Pipeline`; RT64's `sampleTMEM`,
+  `TextureDecoder.hlsli:149-208`, branches on `usesTlut` before any format
+  dispatch and never reads `fmt` in that arm).
+- **Which lane was right: REFERENCE.** This is §1's structural cause 2
+  (*wiring gaps described as capability gaps*) in its purest form: a sibling
+  module in the same crate — the CPU reader the texrect path already uses —
+  had implemented the rule hours earlier. The shader could not even ask the
+  question, because `TileBindingParams` carried no `lut_mode` and no
+  `palette`.
+- **WM2000 reach.** Measured at the abort, not inferred: `tile format code 3`
+  (`IntensityAlpha`), `pixel-size code 0` (`Bits4`), `TLUT-mode code 2`
+  (`Rgba16`).
+- **Status: FIXED.** `lut_mode` is consulted before `format`; 4/8/16-bit
+  texels palettize (4-bit through the tile's `palette` field); 32-bit stays
+  refused on both arms, matching `4c412a96`, which deliberately did not widen
+  there. Pinned by five tests, four adapter-gated; ten of ten shader mutants
+  killed. The run now advances to a different refusal
+  (`NoCompletedLoads`), one layer up in raw-DPC plan admission.
+
+**Method note for the next lane.** The abort named only a status code, which
+sent an earlier reader to the CPU-side tile to guess the shape.
+`WgpuRawDpcExecutionError::TmemSampleFailed` now carries the triangle index
+and the tile's format/size/TLUT codes, so the shape is measured at the abort.
+
+---
+
 ## 1. Headline
 
 **Twenty-one pinned divergences. Fifteen are wgpu-side defects — the reference
