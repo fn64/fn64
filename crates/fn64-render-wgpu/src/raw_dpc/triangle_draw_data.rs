@@ -612,17 +612,32 @@ mod tests {
         );
     }
 
+    /// Retargeted from `a_reserved_alpha_compare_triangle_panics_loudly_at_
+    /// retrieval_time`. Other-mode low bits 1:0 are two independent hardware
+    /// bits (angrylion `src/core/n64video/rdp.c:659-660`); wire 2 clears
+    /// `alpha_compare_en`, so `rdp/blender.c`'s `alpha_compare` returns 1 and
+    /// the triangle is ordinary no-compare content, not a refusal.
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     #[test]
-    #[should_panic(expected = "selected reserved G_AC alpha-compare mode 2")]
-    fn a_reserved_alpha_compare_triangle_panics_loudly_at_retrieval_time() {
+    fn an_alpha_compare_wire_two_triangle_is_retrieved_as_no_compare() {
         let mut collector = TriangleDrawStateCollector::default();
-        let other_mode = other_mode_command(0, 0, 2); // Reserved
+        let other_mode = other_mode_command(0, 0, 2);
         let combine = combine_command(1, 1, 2);
         let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
 
         collector.command(RawDpcSemanticCommandRef::State(&other_mode));
         collector.command(RawDpcSemanticCommandRef::State(&combine));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("wire encoding 2 is admitted, not refused");
+        let draw = draws.into_iter().next().expect("one triangle was staged");
+        assert_eq!(draw.other_mode.alpha_compare(), AlphaCompare::None);
+        // Distinguishing check: wire 3 still panics, so the retrieval above
+        // cannot be produced by a collector that stopped gating entirely.
+        // (`a_dither_alpha_compare_triangle_panics_loudly_naming_the_frame_
+        // count_gap` below is that assertion.)
     }
 
     #[test]
