@@ -411,8 +411,8 @@ mod vi_scanout;
 mod wire_words;
 
 pub use alpha_compare::{
-    alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
-    require_supported_alpha_compare, AlphaCompareNoise, CopyCycleSourceFormat,
+    alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value, AlphaCompareNoise,
+    CopyCycleSourceFormat,
     ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_FRAGMENT_FN_WGSL, ALPHA_COMPARE_WGSL,
 };
 pub use blend::{

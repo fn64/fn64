@@ -361,7 +361,6 @@ fn every_texrect_execution_error_variant_is_classified_as_reachable_or_not() {
         ("NoiseThresholdUnavailable", "requires a noise-enabled other-mode this harness does not stage"),
         ("OrderedDitherAuthorityUnsettled", "requires an ordered-dither other-mode this harness does not stage"),
         ("DestinationCoverageUnavailable", "requires a coverage-reading blend mode"),
-        ("ReservedAlphaCompare", "requires a reserved alpha-compare mode"),
         ("UnsupportedBlendShadeAlpha", "requires a blend program reading shade alpha"),
         ("UnsupportedBlendFramebufferAlpha", "requires a blend program reading framebuffer alpha"),
         ("BlendEnabledNotDerivable", "requires an other-mode whose blend enable is ambiguous"),
