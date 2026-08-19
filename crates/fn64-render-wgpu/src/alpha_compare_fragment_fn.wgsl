@@ -14,10 +14,12 @@
 // transcription of `alpha_compare_value`/`copy_alpha_compare_value`
 // (`fn64-render-reference/src/raster/blend.rs:105-149`): mode 0=None always
 // passes, mode 1=Threshold passes iff `alpha >= threshold_alpha`, mode
-// 3=Dither cross-multiplies `alpha*256 > noise_byte*255`. Mode 2 (Reserved)
-// is a host-side decode-time rejection (see `require_supported_alpha_compare`
-// in `alpha_compare.rs`); this function never receives it and returns
-// `false` defensively if it somehow does. When `copy_cycle_rgba16` is
+// 3=Dither cross-multiplies `alpha*256 > noise_byte*255`. Mode 2 is NOT a
+// reserved encoding: other-mode low bits 1:0 are two independent hardware
+// bits (angrylion `src/core/n64video/rdp.c:659-660`), and `rdp/blender.c`'s
+// `alpha_compare` returns 1 whenever bit 0 (`alpha_compare_en`) is clear.
+// Mode 2 is `alpha_compare_en = 0`, so it always PASSES, exactly like mode 0
+// (`docs/RT64-GUARD-AUDIT.md` finding A3). When `copy_cycle_rgba16` is
 // nonzero and mode is Threshold or Dither, the RGBA16 copy-cycle
 // hard-alpha-bit special case applies instead of the general arithmetic.
 //
@@ -36,16 +38,16 @@
 // crate's README for the wiring's exact scope).
 
 fn alpha_compare_general(mode: u32, alpha: u32, threshold_alpha: u32, noise_byte: u32) -> bool {
-    if (mode == 0u) {
+    // Bit 0 is `alpha_compare_en`: clear (modes 0 and 2) means no compare.
+    if ((mode & 1u) == 0u) {
         return true;
     }
-    if (mode == 1u) {
-        return alpha >= threshold_alpha;
-    }
-    if (mode == 3u) {
+    // Bit 1 is `dither_alpha_en`: mode 3 dithers the threshold, mode 1 uses
+    // the blend-colour alpha.
+    if ((mode & 2u) != 0u) {
         return alpha * 256u > noise_byte * 255u;
     }
-    return false;
+    return alpha >= threshold_alpha;
 }
 
 fn alpha_compare_fragment_fn(
