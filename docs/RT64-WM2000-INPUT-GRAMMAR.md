@@ -179,3 +179,46 @@ Note that `WM2000_NO_TRACE=1` is not the fix, because the harness computes
 `dumps_disabled = trace_disabled || ...` -- turning off the trace also turns off
 the framebuffer dumps the probes are judged by. Per-run trace paths are the
 only way to have isolation and pictures at once.
+
+## Measured: the plateau screen reads input, and does not advance on it
+
+Wave 1 of the matrix, four runs to ~700k steps (VI swap ~4200), each with its
+own trace sink. Lead-in is the proven chain from the gameplay-gap card (START
+at 1100, then A every 100 swaps to 2400). The control adds nothing at the
+plateau; each probe taps one button from swap 2500.
+
+Every probe is judged against the **set of every hash the control produced
+anywhere**, so a screen that changes on its own cannot be credited to a button.
+
+| Run | Input at plateau | Max swap | Novel frames (>=2500) | Which swaps |
+|---|---|---|---|---|
+| control | none | 4216 | -- | -- |
+| **probeA** | **A, 8 taps** | 4156 | **17** | 2504-2513, 2520-2526 |
+| **probeDR_A** | **D-Right then A** | 4431 | **7** | 2550-2556 |
+| probeB | B, 4 taps | 4216 | **0** | -- |
+
+Two things follow, and they point in opposite directions.
+
+**The screen is live.** A produces frames the control never produces, and it
+produces them **four swaps after the press** (press at 2500, first novel frame
+at 2504) -- the same four-swap latency the gameplay-gap card measured for the
+Start press that left attract. The input seam reaches this screen. Pixel-wise
+the novel frames differ from the control across essentially the whole image
+(76,640 of 76,800 captured pixels), as a palette/fade shift rather than a new
+layout.
+
+**It does not advance.** Every novel frame is inside a press window, and the
+screen returns to the plateau hash `5d29bcadf69b` as soon as the button is
+released. All four runs -- including the ones that produced novel frames -- sit
+at **98% plateau hash** across the 1,700+ swaps after 2500, and every run's
+late tail (swap >= 3500) is that one hash and nothing else.
+
+So this is the "the button does something but does not transition" case, not
+the "the button does nothing" case, and it is now distinguished by measurement
+rather than assumed. **B is inert here** (0 novel frames), which is itself
+informative: on `func_8015733C` B is the cancel, so a screen that answers A and
+ignores B is not that function's select screen, or is in a state where cancel
+is suppressed.
+
+**No frame in any run has been shown to be in-match.** The novel frames are a
+recoloured plateau, not a new screen.
