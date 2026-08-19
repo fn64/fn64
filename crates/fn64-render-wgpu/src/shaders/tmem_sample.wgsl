@@ -31,6 +31,28 @@
 //    TLUT stays REFUSED, matching that same CPU fix, which deliberately did
 //    not widen there (the index byte would have to be re-derived against the
 //    RGBA32 low/high bank split, and no title in this corpus reaches it).
+//    `validate_address_scope`'s canonical low-half requirement is mirrored
+//    here too (`TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF`); it was
+//    missing until a CPU-vs-GPU sweep found it, and its absence made the
+//    shader silently sample palette bytes as indexes where the CPU reader
+//    aborted by name.
+//
+//    Two known differences from the CPU reader remain on this arm, both
+//    pinned by tests in `targets/triangle_pipeline/tests.rs` rather than
+//    resolved here:
+//
+//      * At 16 bits the CPU reads BOTH bytes of the big-endian texel and
+//        then discards the low one, so it refuses when the low byte is
+//        invalid; this shader reads only the high byte. Public documentation
+//        does not say whether a partially-loaded 16-bit texel's palette index
+//        is well-defined, so neither behaviour is corrected on the other's
+//        authority. See
+//        `a_sixteen_bit_tlut_texel_with_an_invalid_low_byte_splits_the_two_lanes`.
+//      * The CPU refuses a palette selector wider than four bits
+//        (`Ci4Palette::try_new`); this shader masks with `& 0x0f`. Latent --
+//        the reference `SetTile` decode narrows the field -- but
+//        `TileDescriptor::from_neutral_parts` is public and does not. See
+//        `an_out_of_range_palette_is_refused_by_the_cpu_and_masked_by_the_shader`.
 //  * **TLUT disabled**: RGBA16 direct-format texels only (`ImageFormat::Rgba`,
 //    `PixelSize::Bits16`). RGBA32, IA4/IA8/IA16, I4/I8, and YUV direct
 //    decodes are still not ported here; a disabled-TLUT footprint requiring
@@ -160,6 +182,16 @@ const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1u;
 const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2u;
 const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3u;
 const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4u;
+// The enabled-TLUT canonical-source refusal, mirroring `tmem/read.rs`'s
+// `validate_address_scope` -> `PhysicalTexelReadError::
+// EnabledCiSourceOutsideLowHalf`. Under `tlut_en` the palette occupies the
+// high 2 KiB of TMEM from `TMEM_TLUT_BASE`, so a tile whose index source
+// lands at or above that address would be reading the palette as image
+// data. Deliberately NOT folded into `INVALID_BYTE`: the bytes at `0x0800`
+// are usually perfectly valid TLUT bytes, so a validity failure would never
+// fire and the wrong color would be painted silently -- which is exactly
+// what this shader did before this status existed.
+const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5u;
 
 struct TmemSampleResult {
     status: u32,
@@ -376,8 +408,22 @@ fn tmem_sample_tlut_texel(
     column: u32,
     row: u32,
     out_ok: ptr<function, bool>,
+    out_low_half_violation: ptr<function, bool>,
 ) -> vec4<f32> {
     let linear = tmem_indexed_linear_base(tile, column, row);
+
+    // `validate_address_scope` (`tmem/read.rs`): under an enabled TLUT the
+    // CI source byte must lie in the canonical low half. The CPU reader
+    // checks the FULLY addressed byte -- post twelve-bit wrap, post odd-row
+    // XOR4 exchange -- via `first_physical_byte`, so this must too; checking
+    // the unwrapped `linear` instead would disagree with the oracle exactly
+    // at the wrap boundary and across the exchange.
+    if tmem_rgba16_byte_address(linear, row) >= TMEM_TLUT_BASE {
+        *out_low_half_violation = true;
+        *out_ok = false;
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
     var index: u32;
     if tile.pixel_size == TMEM_PIXEL_SIZE_BITS16 {
         // The high byte of the big-endian 16-bit texel: the first byte at
@@ -433,9 +479,10 @@ fn tmem_sample_texel(
     column: u32,
     row: u32,
     out_ok: ptr<function, bool>,
+    out_low_half_violation: ptr<function, bool>,
 ) -> vec4<f32> {
     if tile.lut_mode != TMEM_TLUT_MODE_DISABLED {
-        return tmem_sample_tlut_texel(tile, column, row, out_ok);
+        return tmem_sample_tlut_texel(tile, column, row, out_ok, out_low_half_violation);
     }
     return tmem_sample_rgba16_texel(tile, column, row, out_ok);
 }
@@ -658,10 +705,22 @@ fn sample_committed_rgba16_three_nearest(
     var ok_ll = false;
     var ok_ur = false;
     var ok_lr = false;
-    let c_ul = tmem_sample_texel(tile, cell.s0, cell.t0, &ok_ul);
-    let c_ll = tmem_sample_texel(tile, cell.s0, cell.t1, &ok_ll);
-    let c_ur = tmem_sample_texel(tile, cell.s1, cell.t0, &ok_ur);
-    let c_lr = tmem_sample_texel(tile, cell.s1, cell.t1, &ok_lr);
+    // One shared violation flag across the four corners: the low-half rule
+    // is a property of the tile's placement, so any corner tripping it means
+    // the whole draw is sourcing indexes from the palette's own half.
+    var low_half_violation = false;
+    let c_ul = tmem_sample_texel(tile, cell.s0, cell.t0, &ok_ul, &low_half_violation);
+    let c_ll = tmem_sample_texel(tile, cell.s0, cell.t1, &ok_ll, &low_half_violation);
+    let c_ur = tmem_sample_texel(tile, cell.s1, cell.t0, &ok_ur, &low_half_violation);
+    let c_lr = tmem_sample_texel(tile, cell.s1, cell.t1, &ok_lr, &low_half_violation);
+    // Checked BEFORE the validity verdict, mirroring the CPU reader's own
+    // order: `validate_address_scope` runs before the first byte is read, so
+    // a high-half tile is refused by placement even when its bytes happen to
+    // be invalid too.
+    if low_half_violation {
+        result.status = TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF;
+        return result;
+    }
     if !ok_ul || !ok_ll || !ok_ur || !ok_lr {
         result.status = TMEM_SAMPLE_STATUS_INVALID_BYTE;
         return result;
