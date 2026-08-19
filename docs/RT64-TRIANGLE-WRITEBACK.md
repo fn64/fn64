@@ -743,3 +743,36 @@ into the CPU rasterizer costs no frames on this measure.
 Every checkpoint is listed because a mid-run checkpoint has been mistaken
 for a final result more than once in this project; the 2149 above is the
 LAST line, and the run's own summary block agrees with it.
+
+### Frame evidence: textured geometry now appears
+
+A `WM2000_FB_DUMP_DIR` run dumps guest framebuffer PNGs (only when
+non-uniform). Measured against the 2D-only baseline
+`docs/frames/wm2000-swap240-true-geometry-480x237.png`:
+
+| frame | dims | distinct colours |
+| --- | --- | --- |
+| baseline, 2D only (swap 240) | 480x237 | **12** |
+| post-fix (swap 371) | 320x240 | **961** |
+| post-fix (swap 579) | 320x240 | **1017** |
+
+`docs/frames/wm2000-swap579-textured-triangles-320x240.png` is kept as the
+post-fix reference. **Yes, 3D geometry now appears**: the baseline is a
+handful of flat black/white/blue rectangles, and the post-fix frames carry
+a thousand distinct colours across recognizable textured surfaces. A
+hundredfold rise in colour count is not something a 2D blitter produces.
+
+Two things this comparison must NOT be read as saying:
+
+1. **It is not a pixel diff.** The dumped frames are 320x240 and the
+   baseline is 480x237 -- a different scene phase, not a stride bug. The
+   comparison tool reads both dimensions from each file's own IHDR and
+   REFUSES to diff mismatched sizes, precisely because a prior lane
+   hardcoded 320x240 against a 480x237 frame and manufactured a "striping"
+   defect out of the mismatch. Do not re-derive that mistake in reverse.
+2. **The visible horizontal striping is not this rung's.** It is the
+   known VI interlace artifact (`lane/vi-interlace-stripes` exists for it)
+   and it appears on every dumped frame including untextured ones. This
+   rung's claim is that TEXELS reach guest RDRAM, which the colour counts
+   and the surfaces establish; the scanline interleave is a separate defect
+   one layer downstream, in scanout.
