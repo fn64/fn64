@@ -3176,8 +3176,7 @@ mod one_cycle_tests {
             .expect("a texrect reading SHADE is admitted");
         let inputs = shading.base_inputs();
         assert_eq!(
-            inputs.shade_color,
-            [0.0; 4],
+            inputs.shade_color, [0.0; 4],
             "a texture rectangle's shade is zero on hardware: the command carries no shade \
              coefficient words and the rasterizer zeroes the block"
         );
@@ -3195,8 +3194,7 @@ mod one_cycle_tests {
         );
         // And zero is distinguishable from the other obvious wrong answer.
         assert_ne!(
-            inputs.shade_color,
-            [1.0; 4],
+            inputs.shade_color, [1.0; 4],
             "zero must be distinguishable from ONE, or a mutant feeding a full-scale shade \
              survives"
         );
@@ -3216,10 +3214,7 @@ mod one_cycle_tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0)
             )
-            .validate_combiner_program_with_shade(
-                CombinerProgramCycles::OnlySecondSlice,
-                false,
-            ),
+            .validate_combiner_program_with_shade(CombinerProgramCycles::OnlySecondSlice, false,),
             Err(TexrectExecutionError::UnsupportedColorInput {
                 slot: ColorInputSlot::A,
                 input: ColorInput::Shade,
@@ -5343,8 +5338,7 @@ mod fragment_stage_tests {
             "wire 2 sets dither_alpha_en but clears alpha_compare_en"
         );
         assert!(
-            TexrectFragmentStages::try_new(dither_bit_without_enable, Color4::from_wire(0))
-                .is_ok(),
+            TexrectFragmentStages::try_new(dither_bit_without_enable, Color4::from_wire(0)).is_ok(),
             "no compare is not a refusal"
         );
         // Distinguishing check: wire 3 (both bits set) IS still refused, so
