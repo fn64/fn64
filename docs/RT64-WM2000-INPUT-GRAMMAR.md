@@ -509,3 +509,37 @@ and the plateau starts at 2500. Closing it needs either a containing-function
 resolution for indirect targets (`vram -> (function, offset)` rather than
 `vram -> function`), or a lead-in that never routes through `func_8012079C`'s
 computed jump. Which of those is right is **not** determined here.
+
+## Update, 2026-08-19 -- the swap-1901 abort's cause, and where the fix lives
+
+The census dispatched to scope this refuted its own premise, which is the
+finding. There is no indirect jump. All five references to `0x80120854` are
+plain static `jal` immediates. The address is a real function entry that
+`splat` mislabeled `alabel` instead of `glabel`, so the symbol scanner never
+emitted it and the predecessor's declared size swallowed it -- the same
+"alabel defect" already named in `RT64-WM2000-RECOMP-LANES.md` and already
+being fixed, in a currently uncommitted 30-entry `split_functions` sweep in
+`~/Code/aki-recomp/games/NWXE/profile.toml`.
+
+That sweep is real and correct as far as it goes, but a hand-verified check
+against the live disassembly found it stops one link short of a four-entry
+sub-chain at exactly this address: `func_80120840`, `func_80120854`,
+`func_8012087C`, `func_80120884`, each ending `jr $ra` with an `alabel`
+immediately after, same shape as every entry the sweep already accepts. A
+second address the census flagged, `0x8013F998` in bank4_text, is absent
+from the sweep entirely and is a separate, less-verified gap.
+
+**This is not a recompiler architecture problem.** Both candidate fixes named
+in the prior update -- a `vram -> (function, offset)` lookup redesign, or a
+small workaround routing around the jump -- solve a problem this code does
+not have, since nothing computes an address. The real fix is four more
+`split_functions` entries, using machinery that already exists and already
+hard-fails on a wrong boundary.
+
+**Not applied here.** The fix lives entirely in `~/Code/aki-recomp`, a
+separate repository, and that repo is currently dirty with another session's
+in-progress work on the very sweep this gap extends -- the "rt64 port
+takeover" session, busy at the time this was found. Handed back rather than
+edited, per this project's rule against touching another session's dirty
+tree. The precise four entries and their boundary evidence are recorded for
+whoever picks this up.
