@@ -588,3 +588,25 @@ One measurement worth keeping from the same observation: the census that
 established WM2000's real triangle mix cost a single instrumented ROM run and
 was done LAST in this session rather than first. Measuring what the ROM emits
 before scoping which rung to build would have reordered the whole session.
+
+## The three arithmetic `expect`s are provably unreachable
+
+Checked rather than assumed, because a panic on hostile wire input from a
+real ROM stream would be a crash, not a refusal. Bounds come from the wire
+field widths alone:
+
+- `yh`/`yl` are 16-bit, so `sample_y_eighth - high_origin_eighth` is at most
+  ~131,072 eighths.
+- `fixed_mul_ratio(i32::MIN, 131072, 8)` = 3.52e13 -- four orders of
+  magnitude inside i64.
+- The worst `attribute_plane` X term is `|i32::MIN| * (4096px + that)` / 2^16
+  = **1.15e18**, against i64's 9.22e18. An 8x margin.
+
+So none of the three can fire for any 32-byte (or 96-byte) triangle the
+decoder accepts. They are assertions of a proven invariant, not latent
+panics.
+
+**If the texture rung widens the coordinate range** -- and a perspective
+divide by a near-zero W is exactly the shape that would -- this proof must be
+redone. The reference's own `w <= 0` tolerance rule (divide by
+`unsigned_abs().max(1)`) exists for that reason.
