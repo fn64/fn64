@@ -1262,3 +1262,100 @@ rather than building for one.
 3. **Only then, if the evidence calls for it, build depth** -- and decide
    the hidden-bit question explicitly and in writing before the first line
    of the rasterizer, because it is not recoverable later by testing.
+
+---
+
+# The othermode Z bits, now decoded: measured
+
+Closes the gap named above ("The genuine gap: nobody has ever decoded the
+othermode Z bits"). Measurement only -- no renderer behaviour changed.
+
+## The instrument
+
+`crates/fn64-render-reference/src/gbi/census.rs`, module `othermode` -- an
+env-gated aggregate tally hooked at the decoder's `G_RDPSETOTHERMODE` arm
+(`gbi/stream.rs`, immediately after the `state.other_mode` latch). Armed by
+`FN64_GBI_OTHERMODE_CENSUS`, sink `FN64_GBI_OTHERMODE_CENSUS_OUT`, gated the
+same way `texrect` already is (inert under `cfg(test)`; one relaxed load and
+return when off). Fixed-size atomics, no per-command rows, so it is safe to
+leave armed across a multi-million-command run.
+
+**Bit positions were not re-derived.** The probe takes the latched
+`OtherMode` by value and reports through this crate's own accessors, so a
+census row and a rasterizer decision cannot disagree:
+
+| field | accessor | bits | site |
+| --- | --- | --- | --- |
+| Z_CMP | `depth_compare_enabled` | `low & 0x0010` | `gbi/types.rs:445` |
+| Z_UPD | `depth_update_enabled` | `low & 0x0020` | `gbi/types.rs:449` |
+| ZMODE | `depth_mode` | `(low >> 10) & 3` | `gbi/types.rs:490` |
+| ZSRCSEL | `primitive_depth_source` | `low & (1 << 2)` | `gbi/types.rs:437` |
+
+These agree with RT64's `src/shared/rt64_f3d_defines.h:84-101`
+(`Z_CMP 0x10`, `Z_UPD 0x20`, `ZMODE_MASK 0xc00`), but the in-tree accessor is
+the authority cited, per section 2c's finding that RT64 is the wrong
+reference for CPU-side depth work. Four unit tests pin the positions as
+literals against the accessors.
+
+## The tallies
+
+Both lead-ins, real ROM (`aki-recomp/games/NWXE/wm2000.z64`), via
+`examples/wm2000-census`.
+
+| | attract loop | 18-menu-screen script |
+| --- | --- | --- |
+| `G_RDPSETOTHERMODE` writes | **2,033,550** | **622,102** |
+| Z_CMP set | **0 (0.0000%)** | **0 (0.0000%)** |
+| Z_UPD set | **0 (0.0000%)** | **0 (0.0000%)** |
+| neither set | 2,033,550 (100%) | 622,102 (100%) |
+| ZSRCSEL = primitive | **0 (0.0000%)** | **0 (0.0000%)** |
+| ZMODE OPA / INTER / XLU / DEC | **2,033,550 / 0 / 0 / 0** | **622,102 / 0 / 0 / 0** |
+
+The menu run used the same lead-in `docs/tools/wm2000-input-probe.py`'s
+`prefix_script` produces (START at swap 1100, then A every 100 swaps),
+translated to this harness's `first:end:buttons` comma grammar; it armed 14
+phases and ran to swap 2624, past the full lead-in.
+
+**Coverage is total, not sampled.** `G_RDPSETOTHERMODE` (`0xef`) is the
+*only* othermode-writing opcode WM2000 issues -- the opcode census over the
+same run shows no `G_SETOTHERMODE_H` and no `G_SETOTHERMODE_L` at all, so
+there is no path by which a Z bit could be set unobserved. The probe's write
+total also matches the opcode census's `0xef` row exactly at every sample
+point, confirming no occurrence is missed.
+
+## What this does and does not establish
+
+It establishes that across 2,655,652 othermode writes over two lead-ins,
+**WM2000 never once arms the RDP depth pipeline** -- not Z_CMP, not Z_UPD,
+not primitive-Z, and never a ZMODE other than OPA (which is also the
+all-zeroes value, consistent with the depth fields simply never being
+programmed). Combined with the five prior censuses' zero `G_SETZIMG` and
+zero Z-variant triangles, the absence is now positive rather than merely
+unobserved: the earlier "the census does not decode othermode payload bits,
+absence is not absence" caveat no longer applies.
+
+It still does not prove depth is unneeded for a **match**, for the unchanged
+reason section 1 gives: no match has ever been reached. What changed is that
+the one place the evidence was *absent rather than negative* is now negative
+too.
+
+**Recommendation: depth's priority is unchanged and stays low.** 0 of
+2,655,652 is the number that justifies it. Revisit only when a window
+reaches actual gameplay.
+
+## Secondary finding, recorded to avoid a later contradiction
+
+Two-cycle mode is **not** absent from othermode writes: 342,471 of 2,033,550
+(16.84%) on the attract loop and 214,969 of 622,102 (34.56%) through the
+menus. This does not contradict `RT64-PLAYABLE-PLAN-REVIEW.md:71`'s "zero
+two-cycle programs" or `RT64-WM2000-GAMEPLAY-GAP.md:188`'s "zero two-cycle"
+-- those are the `texrect` probe's scope (combiner programs on `G_TEXRECT`
+rectangles), a strictly smaller population than all othermode writes. The
+two measurements are compatible, but a reader comparing them without this
+note would reasonably think otherwise.
+
+Note also that the attract loop's two-cycle count *freezes* at 342,471 while
+its one-cycle count keeps climbing -- those writes happen during boot and do
+not recur in the steady-state attract loop -- whereas the menu run's keeps
+rising throughout. Menu screens use two-cycle continuously; the attract
+plateau does not.
