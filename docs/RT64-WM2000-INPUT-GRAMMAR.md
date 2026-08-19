@@ -121,3 +121,37 @@ the **D-pad** (never the analog stick -- no grid navigator reads
 `D_8011C382/83`), back is **B**, and paging is **L**/**R** or a C-button. That
 is the matrix `docs/tools/wm2000-input-probe.py` drives, and the measured
 results of driving it are recorded alongside it.
+
+## Two harness collisions that must be cleared before any probe matrix
+
+Both were measured, and both produce failures that look like guest behaviour.
+
+**The scratch tree.** `run-rs-lane.sh` re-emits the whole-ROM crate and rsyncs a
+scratch sibling tree on every invocation. Four parallel probes raced on it and
+all four died on `cp: .../recomps/wm2000: File exists`, with zero frames
+dumped. A probe matrix runs one fixed binary many times, so the build has to
+come out of the loop; `docs/tools/wm2000-run-probe.sh` runs the prebuilt binary
+only.
+
+**The trace file.** The harness's trace sink defaults to one hardcoded path,
+`/tmp/wm2000-boot-trace.jsonl`. Four concurrent runs wrote to that single file
+and all four aborted at an **identical swap 1901**:
+
+```
+_osRecvMesg_recomp
+core::panicking::panic_cannot_unwind
+core::ptr::drop_in_place<Box<fn64_runtime::thread::GameThread>>
+core::ptr::drop_in_place<fn64_runtime::executor::Executor>
+thread caused non-unwinding panic. aborting.
+```
+
+Identical-across-runs is exactly the shape a real plateau has, which is what
+makes this worth writing down: **an infrastructure collision can counterfeit
+the very evidence a plateau claim rests on.** What separated them was a solo
+run of the same script reaching swap 2397 without incident. `WM2000_TRACE_PATH`
+gives each run its own sink.
+
+Note that `WM2000_NO_TRACE=1` is not the fix, because the harness computes
+`dumps_disabled = trace_disabled || ...` -- turning off the trace also turns off
+the framebuffer dumps the probes are judged by. Per-run trace paths are the
+only way to have isolation and pictures at once.
