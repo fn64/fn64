@@ -596,6 +596,44 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         }
         Err(e) => eprintln!("[wm2000-census] failed to write {path}: {e}"),
     }
+
+    // Additive, env-gated companion capture at the VI's LIVE geometry, never
+    // an assumed one. The 320x240 dump above is retained unchanged so both
+    // readings of the SAME bytes at the SAME swap can be compared directly;
+    // that is the whole point of this probe, since reading a 480-stride
+    // buffer at a 320 stride shears every row and can manufacture a
+    // convincing "horizontal duplication" artifact out of coherent memory.
+    if std::env::var("WM2000_TRUE_GEOMETRY_DUMP").is_err() {
+        return;
+    }
+    let (Some(vi_w), Some(vi_h)) = (fn64_abi::vi_width(), fn64_abi::vi_output_height()) else {
+        eprintln!(
+            "[wm2000-census] swap #{swap_index}: VI geometry not programmed yet -- refusing to \
+             guess a true-geometry stride"
+        );
+        return;
+    };
+    let (true_w, true_h) = (vi_w as usize, vi_h as usize);
+    let true_bytes = true_w * true_h * 2;
+    if start + true_bytes > rdram.len() {
+        eprintln!(
+            "[wm2000-census] swap #{swap_index}: true geometry {true_w}x{true_h} exceeds rdram \
+             bounds -- skipping"
+        );
+        return;
+    }
+    let true_path = format!(
+        "{}/fn64-fb-true-{true_w}x{true_h}-{swap_index}.png",
+        std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string())
+    );
+    println!(
+        "[wm2000-census] swap #{swap_index}: live VI geometry is {true_w}x{true_h} (fb \
+         {fb_offset:#010x})"
+    );
+    match dump_rgba5551_as_png(rdram, start, true_w, true_h, &true_path) {
+        Ok(()) => println!("[wm2000-census] *** TRUE-GEOMETRY FRAMEBUFFER DUMPED: {true_path} ***"),
+        Err(e) => eprintln!("[wm2000-census] failed to write {true_path}: {e}"),
+    }
 }
 
 /// Convert logical N64 RGBA5551 halfwords (RRRRRGGGGGBBBBBA) from fn64's
