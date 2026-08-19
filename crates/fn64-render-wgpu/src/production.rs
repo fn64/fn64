@@ -1478,13 +1478,6 @@ pub enum WgpuRawDpcExecutionError {
     TexrectDeclaredNoWrite {
         triangle_index: usize,
     },
-    /// A composed packet carried both a `TextureRectangle` and a
-    /// `RawTriangle`. The texrect composes onto the CPU-side color buffer
-    /// through its own declared journal writes; a raw triangle declares no
-    /// write access at all and rasters into a disjoint GPU attachment. The
-    /// pair has no defined ordering, exactly as `MixedFillAndTrianglePacket`
-    /// states for fill+triangle -- refused rather than half-executed.
-    MixedTexrectAndRawTrianglePacket,
     /// A `TextureRectangle` was admitted in a packet with no TMEM load, so
     /// there is no pending post-image for it to sample. Census-measured,
     /// this shape does not occur in WM2000 (0 of 219 decode entries carry a
@@ -1664,12 +1657,6 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "texture-rectangle triangle #{triangle_index} (plan order) declared no journal \
                  write access, so executing it would write bytes this packet never declared"
-            ),
-            Self::MixedTexrectAndRawTrianglePacket => formatter.write_str(
-                "this packet declares both an admitted TextureRectangle and an admitted \
-                 RawTriangle; the texrect composes onto the CPU-side color buffer through its \
-                 own declared journal writes while a raw triangle declares no write access at \
-                 all, so the two have no defined ordering and the combination is refused",
             ),
             Self::PendingTmemImageClaimedCommitted { triangle_index } => write!(
                 formatter,
@@ -2716,64 +2703,92 @@ fn stage_and_report(
                 .unwrap_or(false)
         })
         .count();
-    let texrect_count = collector.plan.texrect_commands.len();
     if !collector.plan.fills.is_empty() && raw_triangle_count > 0 {
         return Err(WgpuRawDpcExecutionError::MixedFillAndTrianglePacket);
     }
-    // A texrect composes onto the CPU-side color buffer; a raw triangle
-    // rasters into a disjoint GPU attachment. Same absence of a defined
-    // ordering as fill+triangle, named separately so the diagnosis names
-    // the pair that actually collided.
-    if texrect_count > 0 && raw_triangle_count > 0 {
-        if std::env::var_os("FN64_DUMP_MIXED_TEXRECT_TRI").is_some() {
-            let mut report = String::new();
-            report.push_str(&format!(
-                "MIXEDPKT texrects={texrect_count} raw_triangles={raw_triangle_count} \
-                 loads={} fills={} triangles={} syncs={}\n",
-                collector.plan.loads.len(),
-                collector.plan.fills.len(),
-                collector.plan.triangles.len(),
-                collector.plan.full_sync_sites.len(),
-            ));
-            for (index, draw) in collector.plan.triangles.iter().enumerate() {
-                let command = collector
-                    .plan
-                    .triangle_commands
-                    .get(index)
-                    .copied()
-                    .unwrap_or(u32::MAX);
-                match draw {
-                    Ok(draw) => {
-                        let ys: Vec<i32> =
-                            draw.vertices.iter().map(|v| v.y as i32).collect();
-                        let xs: Vec<i32> =
-                            draw.vertices.iter().map(|v| v.x as i32).collect();
-                        report.push_str(&format!(
-                            "MIXEDPKT  tri[{index}] cmd={command} src={:?} vp={:?} \
-                             x={xs:?} y={ys:?}\n",
-                            draw.source, draw.viewport
-                        ));
-                    }
-                    Err(error) => report.push_str(&format!(
-                        "MIXEDPKT  tri[{index}] cmd={command} MISSING {error:?}\n"
-                    )),
-                }
-            }
-            for (index, entry) in collector.plan.texrect_commands.iter().enumerate() {
-                report.push_str(&format!(
-                    "MIXEDPKT  texrect[{index}] span={:?} first_tri={} tile={} cmd={}\n",
-                    entry.0, entry.1, entry.2, entry.3
-                ));
-            }
-            for (index, (command, load)) in collector.plan.loads.iter().enumerate() {
-                report.push_str(&format!(
-                    "MIXEDPKT  load[{index}] cmd={command} {load:?}\n"
-                ));
-            }
-            eprint!("{report}");
-        }
-        return Err(WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket);
-    }
+    // **A texrect composed with a raw triangle is admitted, and the
+    // ordering the refusal asked for already exists.**
+    //
+    // This was a `MixedTexrectAndRawTrianglePacket` refusal reading "the
+    // texrect composes onto the CPU-side color buffer through its own
+    // declared journal writes while a raw triangle declares no write access
+    // at all, so the two have no defined ordering". Both halves of that
+    // sentence are true. The conclusion does not follow, and measuring the
+    // packet is what showed why.
+    //
+    // **The measured packet.** Instrumented at this site and run on the real
+    // ROM through the all-Rust lane (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`),
+    // the packet WM2000 aborts on is **6 texrects, 9 TMEM loads, 1 raw
+    // triangle, 0 fills** -- and the raw triangle is **strictly last**, at
+    // wire command 91, after every texrect (commands 2, 10, 18, 26, 34, 42)
+    // and every load (7, 15, 23, 31, 39, 54, 58, 81, 88). There is no
+    // interleaving to order: the shape is "all the texrects, then one
+    // triangle".
+    //
+    // **Why no ordering is missing.** The two sources do not write the same
+    // thing, and only one of them writes anything the guest can observe:
+    //
+    // - A texrect's pixels reach the guest through `stage_color_commands`'s
+    //   accumulation buffer, then `ColorTargetRegistry`, then `fn64-abi`'s
+    //   `copy_committed_guest_writes` -- gated on the journal's declared
+    //   `ColorFramebuffer` writes.
+    // - A raw triangle's raster reaches `triangle_draw_output`, which
+    //   `last_triangle_draw` describes as "the most recent triangle draw's
+    //   real GPU-observed color/depth output ... never an accumulated
+    //   history, never a persistent framebuffer", and which `present`
+    //   refuses to scan out by name: it is "one submission's readback, not a
+    //   VI-sampled framebuffer". **Nothing copies it into guest RDRAM.**
+    //
+    // So "the two have no defined ordering" describes a composition that is
+    // not attempted. There is exactly one guest-visible destination in this
+    // packet and exactly one source writing to it, and the order among
+    // *those* writes is already derived -- `stage_color_commands` sorts the
+    // schedule on the decoder's own `command_index`, and
+    // `merged_fill_and_tmem_writes` independently re-derives the same order
+    // from the resource journal.
+    //
+    // **Admitting the triangle adds nothing for the journal to order.** A
+    // `RawTriangle` pushes no `ResourceAccess` at all (the decoder's
+    // `0x08..=0x0f` arm decodes the triangle and pushes the command; unlike
+    // `FILL_RECTANGLE` and `TEXRECT` it calls no planner). It therefore
+    // contributes neither a declared journal write nor a staged
+    // `CompletedWrite`, and `merged_fill_and_tmem_writes`'s two-sided
+    // exactness check -- every declared write claimed exactly once, every
+    // staged write claimed -- sees the identical pair of lists it would see
+    // with the triangle absent. The effect report this packet produces is
+    // byte-for-byte the one the same packet minus its last command produces.
+    //
+    // **This is not the fill+triangle sibling, and that one stays refused.**
+    // `MixedFillAndTrianglePacket` is kept, unchanged, immediately above.
+    // Its stated defect is real and different: a fill packet with no
+    // texrect reaches `stage_fills_and_report`, whose `StagedOutcome`
+    // routing turns on whether a color command declared a write, and the
+    // fill+triangle pair was never measured in WM2000's stream. The pair
+    // measured here is the one the ROM actually issues, and it is refused
+    // for a property -- "a raw triangle declares no write" -- that is not a
+    // conflict with a texrect but the precondition that makes the two
+    // independent.
+    //
+    // **What is NOT claimed.** Admitting this packet does not make the raw
+    // triangle guest-visible. It is not visible today in a triangle-only
+    // packet either: `StagedOutcome::NoPhysicalSuccessor`'s own doc already
+    // records that "a raw triangle rasters into a GPU attachment and
+    // declares no journal write", and that packet shape is admitted. The
+    // missing RDRAM writeback for the GPU raster path is a separate,
+    // pre-existing gap that this arm never closed and could not have
+    // closed by refusing -- refusing dropped the texrects too, which DO
+    // reach the guest. The refusal cost six real guest-visible rectangles
+    // to withhold one triangle that was never going to be visible either
+    // way.
+    //
+    // **Per-triangle TMEM still resolves correctly for the raw triangle.**
+    // `project_pending_tmem_per_triangle` walks `plan.triangle_commands`
+    // and selects each entry with `prefix_before`, which is a fact about
+    // stream position and not about triangle source. The raw triangle at
+    // command 91 therefore samples the prefix sealed by the load at command
+    // 88 -- the last load before it -- exactly as a texrect in that position
+    // would. No arm of that function distinguishes the two sources, so
+    // nothing there needed widening.
     // **A texrect in a packet with no TMEM load samples durable committed
     // TMEM, and that is the RDP's own semantics, not a fallback.**
     //
@@ -9989,6 +10004,250 @@ mod tests {
         words.extend(set_combine(0, 0));
         words.extend(texrect_words_in_target_stepping(7));
         words
+    }
+
+    /// **WM2000's measured mixed shape: texrects and a raw triangle in one
+    /// packet, the triangle strictly last.**
+    ///
+    /// Modelled on the packet the all-Rust lane actually aborted on
+    /// (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`, instrumented at the refusal
+    /// site): **texrects, TMEM loads, one raw triangle at the END, zero
+    /// fills**. The real packet carried 6 texrects and 9 loads; the shape
+    /// that matters is the *pairing*, so this fixture carries one of each
+    /// plus the trailing raw triangle. A fill is deliberately absent -- the
+    /// real packet had none, and adding one would instead exercise the
+    /// separate `MixedFillAndTrianglePacket` refusal, which is kept.
+    ///
+    /// Built by taking `fill_load_and_copy_texrect_words`' load-and-texrect
+    /// half verbatim (its `SetColorImage` supplied by
+    /// `set_color_image_rgba16` instead of a whole-target fill, so the
+    /// texrect still declares its journal write) and appending one
+    /// `RawTriangle`. The trailing `set_other_mode(0, 0)` is not decoration:
+    /// the texrect ran in Copy cycle (2) and a raw triangle is not admitted
+    /// there, so a real stream switches back exactly as this one does.
+    fn load_texrect_and_trailing_raw_triangle_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(set_color_image_rgba16());
+        words.extend(set_texture_image(0, 2, 8, 0x200));
+        words.extend(set_tile(7, 2, 0));
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 0), 7 << 24 | 23 << 12 | 0]);
+        words.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        words.extend(set_other_mode(2, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(texrect_words_in_target_stepping(7));
+        // Back out of Copy cycle for the raw triangle, then the triangle
+        // itself -- the last command in the packet, exactly as measured.
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words.extend(triangle_base_edge_words(7, 2, 0));
+        words
+    }
+
+    /// **Positive control.** The fixture really does carry BOTH an admitted
+    /// `TextureRectangle` and an admitted `RawTriangle`.
+    ///
+    /// Without this, the admission test below would pass vacuously against
+    /// a texrect-only packet -- the exact way a mixed-shape test fools
+    /// itself. Both counts are read through the same plan walk execution
+    /// uses, never re-derived from the wire words.
+    #[test]
+    fn the_mixed_fixture_really_carries_a_texrect_and_a_raw_triangle() {
+        let words = load_texrect_and_trailing_raw_triangle_words();
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &mut session, words);
+        let read_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, read_capture).unwrap();
+
+        let mut plan_visitor =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+        let mut color_targets = None;
+        let configured_target_extent = backend.configured_target_extent;
+        let coordinator = &backend.coordinator;
+        let mut view = ExecutionCollector {
+            plan: PlanCollector::seeded(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [(None, None); 8],
+            ),
+            reads: Vec::new(),
+            outcome: None,
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            physical: coordinator.physical(),
+            color_targets: &mut color_targets,
+            configured_target_extent,
+            draw_tmem: None,
+        };
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+
+        let raw_triangles = view
+            .plan
+            .triangles
+            .iter()
+            .filter(|draw| {
+                draw.as_ref()
+                    .map(|draw| draw.source == TriangleSource::RawTriangle)
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            raw_triangles, 1,
+            "the fixture must admit exactly one RawTriangle, or the admission test proves \
+             nothing about the mixed shape"
+        );
+        assert_eq!(
+            view.plan.texrect_commands.len(),
+            1,
+            "the fixture must admit exactly one TextureRectangle wire command"
+        );
+        assert!(
+            view.plan
+                .texrect_commands
+                .iter()
+                .all(|(span, _, _, _)| span.is_some()),
+            "the texrect must DECLARE its journal write, or this is not the composed shape \
+             the removed refusal named"
+        );
+        assert!(
+            view.plan.fills.is_empty(),
+            "the fixture must carry no fill -- a fill would exercise the separate \
+             MixedFillAndTrianglePacket refusal instead, which is kept"
+        );
+        assert_eq!(
+            view.plan.loads.len(),
+            1,
+            "the fixture must carry the TMEM load its texrect samples"
+        );
+        // The triangle is LAST, which is the ordering WM2000 measured.
+        let last = view
+            .plan
+            .triangle_commands
+            .last()
+            .copied()
+            .expect("the fixture admits triangles");
+        let texrect_command = view.plan.texrect_commands[0].3;
+        assert!(
+            last > texrect_command,
+            "the raw triangle must follow the texrect in stream order (got triangle at \
+             {last}, texrect at {texrect_command})"
+        );
+    }
+
+    /// **The admission this card exists for.** A packet carrying both an
+    /// admitted `TextureRectangle` and an admitted `RawTriangle` executes,
+    /// and the texrect's guest-visible pixels survive.
+    ///
+    /// This packet was `MixedTexrectAndRawTrianglePacket` -- refused on the
+    /// reasoning that "the two have no defined ordering". Measuring the
+    /// packet showed the ordering was never missing: the raw triangle
+    /// contributes no `ResourceAccess` and no staged `CompletedWrite`, so
+    /// the journal it must be ordered against is the one the texrect alone
+    /// produces, and `stage_color_commands` already derives that order from
+    /// the decoder's own `command_index`.
+    ///
+    /// The load-bearing assertion is the second one: the texrect's declared
+    /// write is present in the staged writes, so admitting the triangle did
+    /// not cost the packet its guest-visible half. The refusal did exactly
+    /// that -- it dropped six real rectangles to withhold one triangle that
+    /// reaches only `triangle_draw_output`, which `present` refuses to scan
+    /// out and nothing copies into RDRAM.
+    #[test]
+    fn a_texrect_composed_with_a_trailing_raw_triangle_executes() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        // Establish the color target honestly first, in its OWN packet: a
+        // partial rectangle against a brand-new target is refused by
+        // `admit_completed_initialization` (`PartialNewTargetInitialization`)
+        // for a reason unrelated to this card -- a fresh target has no prior
+        // device bytes for the rows outside the rectangle. This is the same
+        // "a title clears its framebuffer before filling sub-rectangles into
+        // it" order `whole_target_fill_words` already documents, and it is
+        // deliberately a SEPARATE submission: putting the fill in the mixed
+        // packet would exercise the still-kept `MixedFillAndTrianglePacket`
+        // refusal instead of this one.
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+
+        let words = load_texrect_and_trailing_raw_triangle_words();
+        let (planned, source_bytes) =
+            plan_with_deterministic_reads(&mut backend, &mut session, words);
+        let read_capture = guest_read_capture(&planned, &source_bytes);
+        let bound = session.finalize_and_submit(planned, read_capture).unwrap();
+        let submission = bound.submission();
+
+        let result = backend.execute_raw_dpc(bound);
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            // A host with no GPU adapter cannot raster the triangle half.
+            // That is a different, already-named refusal and not this
+            // card's subject -- but it must never be the mixed refusal.
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("TriangleDrawBeforeCreate")
+                        || message.contains("no GPU adapter"),
+                    "a mixed texrect+raw-triangle packet must not be refused for being \
+                     mixed; the only tolerated failure here is the adapterless triangle \
+                     path, got: {error}"
+                );
+                return;
+            }
+        };
+        let _ = prepared;
+
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert!(
+            !staged.is_empty(),
+            "the texrect's guest-visible writes must survive the triangle's presence -- \
+             this is what the refusal was costing"
+        );
+        // Derived, not captured: `texrect_words_in_target_stepping` covers
+        // x 4..=11, y 2..=4 (see `composed_fixture_rectangle`'s two
+        // reconciled derivations), so the declared run is three disjoint
+        // rows of 8 RGBA16 pixels each -- one write per row, never one
+        // collapsed range spanning the untouched bytes between them.
+        assert_eq!(
+            staged.len(),
+            TEXRECT_HEIGHT as usize,
+            "the texrect declares one write per covered row"
+        );
+        for (row, write) in staged.iter().enumerate() {
+            assert_eq!(
+                write.byte_count(),
+                TEXRECT_WIDTH * 2,
+                "row {row}'s write covers its own 8 RGBA16 pixels and no more"
+            );
+        }
+
+        // The same rows, checked as declared ranges through the decoder's
+        // own journal -- a second, independent derivation of the identical
+        // fact, hand-derived from the extent rather than read back from the
+        // writes above.
+        let ranges =
+            declared_render_target_ranges(load_texrect_and_trailing_raw_triangle_words());
+        assert_eq!(
+            ranges.len(),
+            TEXRECT_HEIGHT as usize,
+            "the mixed packet's journal declares exactly the texrect's rows -- the raw \
+             triangle contributes no ResourceAccess at all, which is what makes admitting \
+             it change nothing the journal must order"
+        );
+        for (index, row) in (TEXRECT_Y0..TEXRECT_Y0 + TEXRECT_HEIGHT).enumerate() {
+            let start = FILL_TARGET_ADDRESS + (row * FILL_TARGET_WIDTH + TEXRECT_X0) * 2;
+            assert_eq!(
+                ranges[index],
+                (start, start + TEXRECT_WIDTH * 2),
+                "row {row}'s declared range, hand-derived from the rectangle's extent"
+            );
+        }
     }
 
     /// The `SET_FILL_COLOR` word `whole_target_fill_words` stages.
