@@ -256,6 +256,57 @@ mod tests {
         }
     }
 
+    /// The property WM2000's four-player ready check
+    /// (`func_801456C8`, `docs/RT64-WM2000-VERSUS-PLATEAU.md`) actually
+    /// depends on: a port's presence is what decides the `errno` a game
+    /// computes, and attaching a controller must flip it.
+    ///
+    /// libultra derives `OSContPad.errno` from the channel status as
+    /// `(status & 0xC0) >> 4`, so `CONT_ABSENT`/`CHNL_ERR_NORESP` (`0x80`)
+    /// yields `0x08` (`CONT_NO_RESPONSE_ERROR`) and a populated port yields
+    /// `0`. WM2000's own linked libultra does exactly this at `0x8002F7CC`,
+    /// and skips any port whose errno is nonzero -- which is why an empty
+    /// port 1 makes a two-player match unstartable.
+    #[test]
+    fn attaching_a_controller_clears_the_no_response_errno() {
+        // The errno a game computes from this port's channel status byte.
+        fn guest_errno(pif: &PifModel, port: usize) -> u8 {
+            (pif.query_response(port)[2] & 0xC0) >> 4
+        }
+
+        let mut pif = PifModel::new();
+        // Default console: one controller, in port 0.
+        assert_eq!(guest_errno(&pif, 0), 0, "port 0 is populated");
+        for port in 1..4 {
+            assert_eq!(
+                guest_errno(&pif, port),
+                0x08,
+                "an empty port must report CONT_NO_RESPONSE_ERROR, port {port}"
+            );
+        }
+
+        // Plugging a second controller in must make port 1 answer as present,
+        // and must not disturb the ports left empty.
+        pif.set_port_state(1, PortState::StandardControllerNoPak);
+        assert_eq!(guest_errno(&pif, 1), 0, "an attached controller responds");
+        assert_eq!(
+            pif.query_response(1),
+            [0x05, 0x00, 0x00],
+            "an attached standard controller identifies as CONT_TYPE_STANDARD"
+        );
+        for port in 2..4 {
+            assert_eq!(
+                guest_errno(&pif, port),
+                0x08,
+                "attaching port 1 must not populate port {port}"
+            );
+        }
+
+        // And it must be reversible: unplugging restores the no-response answer.
+        pif.set_port_state(1, PortState::Absent);
+        assert_eq!(guest_errno(&pif, 1), 0x08, "unplugged again");
+    }
+
     #[test]
     fn idle_read_data_is_all_neutral() {
         let pif = PifModel::new();
