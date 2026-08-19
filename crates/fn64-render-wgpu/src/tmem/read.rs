@@ -1042,6 +1042,35 @@ mod tests {
             "this test is only meaningful while WM2000's low_t really is odd"
         );
 
+        // **The footprint is load-bearing, so pin it.** The sweep below
+        // only addresses tile rows 1..=48, so a fixture whose row count
+        // drifted by one would still sweep clean and prove nothing about
+        // the load's real extent. These two assertions make the declared
+        // footprint falsifiable on its own terms: the load writes exactly
+        // `words_per_row * rows` transfer words, of which every row's last
+        // is only partly defined, so the valid-byte total is exact.
+        let expected_valid_bytes = u32::from(WM2000_ROWS)
+            * (u32::from(WM2000_WORDS_PER_ROW - 1) * 8 + u32::from(WM2000_DEFINED_TAIL_BYTES));
+        let loaded_bytes = (0..0x0800_u16)
+            .filter(|address| source.valid_byte(*address).is_some())
+            .count() as u32;
+        assert_eq!(
+            loaded_bytes, expected_valid_bytes,
+            "the fixture's own valid set must equal the footprint its constants declare"
+        );
+        assert_eq!(
+            loaded_bytes, 1_700,
+            "WM2000's cmd-39 LoadTile validates exactly 1,700 low-TMEM bytes: 50 rows of 34"
+        );
+        // The load's last written row must be the last row the tile can
+        // address, so the sweep cannot be silently reading a shortened
+        // fixture that happens to cover the rows it touches.
+        assert_eq!(
+            u32::from(WM2000_ROWS),
+            u32::from((WM2000_HIGH_T_RAW >> 2) - (WM2000_LOW_T_RAW >> 2) + 1),
+            "the load's row count must equal the tile's own addressable T extent"
+        );
+
         let mut even_failures = 0_u32;
         let mut odd_failures = 0_u32;
         for row in 0..48 {
