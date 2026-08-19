@@ -163,7 +163,11 @@ pub(crate) fn row_span(triangle: &RawTriangle, sample_y_eighth: i32) -> (i64, i6
 /// covers vertically reports the union of the sample lines it actually
 /// reaches -- never a range derived from a sample line above YH or at/below
 /// YL.
-pub(crate) fn row_pixel_range(triangle: &RawTriangle, y: i32, clamp_width: u32) -> Option<(u32, u32)> {
+pub(crate) fn row_pixel_range(
+    triangle: &RawTriangle,
+    y: i32,
+    clamp_width: u32,
+) -> Option<(u32, u32)> {
     let yh_eighth = i32::from(triangle.yh()) * 2;
     let yl_eighth = i32::from(triangle.yl()) * 2;
     let mut min_left = i64::MAX;
@@ -186,7 +190,8 @@ pub(crate) fn row_pixel_range(triangle: &RawTriangle, y: i32, clamp_width: u32) 
     // columns: a pixel is entered as soon as its LAST sample column (x + 7/8)
     // reaches the left edge, and left as soon as its FIRST (x + 1/8) passes
     // the right edge.
-    let x0 = ceil_ratio(min_left - 7 * Q16_ONE / 8, Q16_ONE).clamp(0, i64::from(clamp_width)) as u32;
+    let x0 =
+        ceil_ratio(min_left - 7 * Q16_ONE / 8, Q16_ONE).clamp(0, i64::from(clamp_width)) as u32;
     let x1 = ceil_ratio(max_right - Q16_ONE / 8, Q16_ONE).clamp(0, i64::from(clamp_width)) as u32;
     if x1 <= x0 {
         return None;
@@ -375,11 +380,7 @@ pub(crate) fn major_edge_x(triangle: &RawTriangle, sample_y_eighth: i32) -> i64 
 /// RDP's own scan order -- Y rows 1,3,5,7 eighths, and on each the two X
 /// columns [`COVERAGE_SAMPLES`] gives that row -- and returns `None` when
 /// the pixel has no covered subsample at all.
-pub(crate) fn attribute_sample(
-    triangle: &RawTriangle,
-    x: i32,
-    y: i32,
-) -> Option<(i32, i64)> {
+pub(crate) fn attribute_sample(triangle: &RawTriangle, x: i32, y: i32) -> Option<(i32, i64)> {
     let yh_eighth = i32::from(triangle.yh()) * 2;
     let yl_eighth = i32::from(triangle.yl()) * 2;
     let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;

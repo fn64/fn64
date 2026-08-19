@@ -1471,11 +1471,78 @@ fn plan_fill(
     planned: &mut Vec<ResourceAccess>,
     fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
-    if state.other_mode().map(OtherMode::cycle_type) != Some(CycleType::Fill) {
+    // **A non-Fill cycle type declares no write; it does not fail the
+    // decode.** This is the same "decode succeeds, journal stays silent"
+    // shape `plan_raw_triangle` (Fill cycle) and `plan_texture_rectangle`
+    // (every case its executor cannot produce content for) already use, and
+    // it is applied here for the identical reason.
+    //
+    // The cycle type selects how a rectangle's *content* is produced, not
+    // whether the command is legal. Three independent authorities agree:
+    //
+    // - **fn64's own reference lane.** `fn64-render-reference`'s
+    //   `raster/draw.rs:113-128` dispatches `G_FILLRECT` on cycle type and
+    //   sends one/two-cycle rectangles to `draw_combined_fill_rectangle`
+    //   (`draw.rs:223`), which runs them through the colour combiner with
+    //   `shade`/`texel0`/`texel1` all zero. Only the `CycleType::Fill` arm
+    //   uses the fill colour. This module's own doc already said so:
+    //   `targets/fill.rs`'s module header states one- and two-cycle
+    //   `G_FILLRECT` "need the combiner ... not ported here".
+    //
+    // - **RT64.** `RDP::fillRect` (`rt64_rdp.cpp:1033-1050`, pinned
+    //   `5473732a`) reads `otherMode` only to decide the `lrx |= 3`/
+    //   `lry |= 3` COPY/FILL rounding, then unconditionally calls
+    //   `drawRect(ulx, uly, lrx, lry, 0, 0, 0, 0, false, extAlignment)`.
+    //   The fill-colour *clear* is selected far downstream, at
+    //   `rt64_framebuffer_renderer.cpp:1518-1519`, and only when
+    //   `cycleType == G_CYC_FILL`; every other cycle type falls through to
+    //   the ordinary raster shader. RT64 never refuses the command.
+    //
+    // - **The guest.** Measured on the real ROM at VI swap 2522
+    //   (`docs/WM2000-FILLRECT-EVIDENCE.txt`): WM2000 stages four
+    //   `SetOtherMode`s, all one-cycle, then issues 60 full-width
+    //   `FillRectangle`s and **no `SetFillColor` at all**. It stages
+    //   `SetCombine`/`SetPrimColor`/`SetEnvColor` instead. There is no
+    //   fill colour because none is wanted; the rectangle's colour comes
+    //   from the combiner.
+    //
+    // Declaring nothing rather than erroring is not "skipping the command":
+    // the command is still decoded, still pushed, and still admitted. What
+    // is absent is only the journal's write entry -- which must be absent,
+    // because this backend's sole fill executor
+    // (`targets/fill.rs`'s `execute_fill_rectangle`) implements the
+    // fill-cycle branch alone and refuses any other by name
+    // (`FillExecutionError::NotFillCycle`). Declaring a write it will not
+    // fill is the specific hazard `raw_triangle_is_executable`'s doc names:
+    // `fill_completed_writes` slices the full-extent buffer for every
+    // declared range without checking the raster touched it, so a
+    // declared-but-undrawn row publishes a real digest of STALE bytes that
+    // passes `validate_effects` and reaches guest RDRAM. Convincing garbage
+    // beats a loud error nowhere.
+    //
+    // Honest nonclaim, and the rung that is still missing: declaring
+    // nothing means WM2000's one-cycle rectangles are admitted but produce
+    // no pixels on this backend yet. That is a *narrower* gap than refusing
+    // the whole packet -- the other 15 commands in the measured packet now
+    // decode and execute -- but it is not parity. Closing it needs the
+    // combiner-driven rectangle executor `targets/fill.rs` names as absent,
+    // and by this crate's own rule the executor widens first and this
+    // planner second, never the other way round.
+    //
+    // **Scope: a STAGED non-Fill cycle type only.** A `FillRectangle`
+    // before any `SetOtherMode` at all is a different case and keeps its
+    // existing loud refusal below -- the cycle type is not merely "not
+    // Fill", it is unknown, so there is no wire fact saying which content
+    // producer the guest asked for. `state_order_table_rejects_each_missing_precondition`
+    // pins that arm, and it is deliberately untouched here.
+    let Some(other_mode) = state.other_mode() else {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
             reason: "FillRectangle requires staged fill-cycle OtherMode",
         });
+    };
+    if other_mode.cycle_type() != CycleType::Fill {
+        return Ok(());
     }
     let Some(image) = state.color_image() else {
         return Err(RawDpcDecodeError::InvalidCommand {
@@ -1727,7 +1794,6 @@ fn raw_triangle_is_executable(triangle: &triangle::RawTriangle) -> bool {
     !triangle.flags().depth()
 }
 
-
 /// **Diagnostic-only.** Counts, per named reason, every raw triangle
 /// `plan_raw_triangle` declines to declare a write for -- the eight
 /// `return Ok(())` arms that are silent by design. Nothing in the render
@@ -1752,9 +1818,15 @@ pub mod raw_triangle_drop_stats {
     ];
 
     static COUNTS: [AtomicU64; 9] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
     ];
 
     static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -1806,7 +1878,11 @@ pub mod raw_triangle_drop_stats {
                 eprintln!("[fn64-tri-drop]   {name} = {count}");
             }
         }
-        if let Some(map) = ADDRESSES.lock().expect("address histogram poisoned").as_ref() {
+        if let Some(map) = ADDRESSES
+            .lock()
+            .expect("address histogram poisoned")
+            .as_ref()
+        {
             for (address, count) in map.iter() {
                 eprintln!("[fn64-tri-drop]   admitted_target {address:#010x} = {count}");
             }
@@ -3240,33 +3316,182 @@ mod tests {
         }
     }
 
-    /// The decode-time gate this card removes was strictly redundant with
-    /// `plan_fill`'s own independent fill-cycle check (card Section 1/5):
-    /// a `FillRectangle` preceded by a non-`Fill` `SetOtherMode` must still
-    /// be rejected -- just later, at `plan_fill`, with its existing
-    /// `"FillRectangle requires staged fill-cycle OtherMode"` reason, not at
-    /// decode.
+    /// **Replaces the card that asserted a non-Fill cycle type is
+    /// *rejected*.** That assertion pinned scaffolding, not hardware: the
+    /// RDP defines `G_FILLRECT` in every cycle type, and cycle type selects
+    /// how the rectangle's content is produced, not whether the command is
+    /// legal. See `plan_fill`'s own doc for the three authorities
+    /// (fn64's reference lane `raster/draw.rs:113-128`, RT64
+    /// `rt64_rdp.cpp:1033-1050`, and the measured WM2000 packet in
+    /// `docs/WM2000-FILLRECT-EVIDENCE.txt`).
+    ///
+    /// FAILS BEFORE this change (`decode` returned `Err(InvalidCommand {
+    /// reason: "FillRectangle requires staged fill-cycle OtherMode" })`),
+    /// PASSES AFTER (the whole stream decodes and the fill is admitted).
+    ///
+    /// Both halves are asserted, and the second is the one that matters:
+    /// it is not enough that the decode stops failing, the `FillRectangle`
+    /// must actually be present as a decoded command. A change that
+    /// silently dropped the command would satisfy the first assertion
+    /// alone.
     #[test]
-    fn non_fill_cycle_other_mode_is_rejected_at_plan_fill_not_at_decode() {
-        let words = vec![
-            word(0, SET_OTHER_MODE, 2 << 20), // TwoCycle, not Fill
-            0,
-            word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
-            0,
-            word(0, SET_FILL_COLOR, 0),
-            0x213c_4d59,
-            word(0, FILL_RECTANGLE, 4 << 12 | 4),
-            0,
-        ];
-        let error = decode(words).unwrap_err();
-        let RawDpcDecodeError::InvalidCommand { location, reason } = error else {
-            panic!("expected FillRectangle to be rejected by plan_fill's own check");
+    fn a_non_fill_cycle_fill_rectangle_decodes_and_is_admitted() {
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1), ("Copy", 2)] {
+            let words = vec![
+                word(0, SET_OTHER_MODE, cycle_bits << 20),
+                0,
+                word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
+                0,
+                word(0, SET_FILL_COLOR, 0),
+                0x213c_4d59,
+                word(0, FILL_RECTANGLE, 4 << 12 | 4),
+                0,
+            ];
+            let decoded = decode(words).unwrap_or_else(|error| {
+                panic!("{name}: a non-Fill cycle FillRectangle must decode, got {error:?}")
+            });
+            assert!(
+                decoded
+                    .commands()
+                    .iter()
+                    .any(|command| matches!(
+                        command.kind(),
+                        RawDpcCommandKind::FillRectangle(_)
+                    )),
+                "{name}: the FillRectangle must be admitted as a decoded command,                  not silently dropped"
+            );
+        }
+    }
+
+    /// The other half of the same contract, and the arm a mutation that
+    /// merely deleted the cycle-type check would break: a non-Fill cycle
+    /// fill declares **no** journal write.
+    ///
+    /// This is load-bearing, not bookkeeping. `targets/fill.rs`'s
+    /// `execute_fill_rectangle` implements only the fill-cycle branch and
+    /// refuses any other by name (`FillExecutionError::NotFillCycle`), so a
+    /// declared write here would be a range nothing fills --
+    /// `fill_completed_writes` would slice the full-extent buffer for it
+    /// and publish a real digest of stale bytes into guest RDRAM.
+    ///
+    /// FAILS BEFORE (the stream did not decode at all, so there was no plan
+    /// to inspect), PASSES AFTER.
+    ///
+    /// Derived by hand from the wire, not from the code under test: the
+    /// Fill-cycle control below stages an RGBA16 (`3 << 19 | 1`) colour
+    /// image and a 4x4-quarter-pixel rectangle (`4 << 12 | 4` = lrx 4,
+    /// lry 4, ulx/uly 0), i.e. exactly one whole pixel at (0, 0) with
+    /// `x0 == 0` and `x1 + 1 == 1 == image.width()` -- the whole-width case
+    /// `plan_render_target_rows` collapses to a single access. So the
+    /// Fill-cycle expectation is 1 declared write and the non-Fill
+    /// expectation is 0.
+    #[test]
+    fn a_non_fill_cycle_fill_rectangle_declares_no_write_but_a_fill_cycle_one_does() {
+        let stream = |cycle_bits: u32| {
+            vec![
+                word(0, SET_OTHER_MODE, cycle_bits << 20),
+                0,
+                word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
+                0,
+                word(0, SET_FILL_COLOR, 0),
+                0x213c_4d59,
+                word(0, FILL_RECTANGLE, 4 << 12 | 4),
+                0,
+            ]
         };
+        // The plan's OWN access list, read the way `plan_raw_dpc_inner`
+        // reads it in production: decode against a journal the packet does
+        // not carry, and take the planner's list off the resulting
+        // `JournalMismatch::expected`. Going through `decode`'s success
+        // path instead would require guessing the journal in advance --
+        // which is the very number under test.
+        let render_target_writes = |cycle_bits: u32| {
+            let submitted = submit(packet(7, stream(cycle_bits), &[]));
+            let accesses = match decode_raw_dpc(submitted, &RdpState::default()) {
+                Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+                Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+                Err(error) => panic!("every cycle type must decode or mismatch, got {error:?}"),
+            };
+            accesses
+                .iter()
+                .filter(|access| {
+                    access.mode() == AccessMode::Write
+                        && access.purpose() == AccessPurpose::RenderTarget
+                })
+                .count()
+        };
+
+        // The control arm. Fill cycle (bits 3) still declares its write --
+        // this is what makes the fixture non-degenerate: without it, a
+        // planner that declared nothing for EVERY cycle type would pass the
+        // zero-write assertions below.
         assert_eq!(
-            reason, "FillRectangle requires staged fill-cycle OtherMode",
-            "rejection must carry plan_fill's own reason, not a decode-time gate's"
+            render_target_writes(3),
+            1,
+            "a Fill-cycle FillRectangle must still declare its one whole-width write"
         );
-        assert_eq!(location.wire_opcode() & 0x3f, FILL_RECTANGLE);
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1), ("Copy", 2)] {
+            assert_eq!(
+                render_target_writes(cycle_bits),
+                0,
+                "{name}: a FillRectangle this backend has no executor for must declare                  no write -- a declared-but-unfilled range publishes stale bytes"
+            );
+        }
+    }
+
+    /// The real WM2000 packet, replayed from the measured wire bytes.
+    ///
+    /// Not a synthesized approximation: these are the first commands of the
+    /// 600-byte stream captured at VI swap 2522 on the real ROM and
+    /// recorded verbatim in `docs/WM2000-FILLRECT-EVIDENCE.txt`. The
+    /// `SetOtherMode` words are the guest's own
+    /// (`0xef08acff 0x00504240`, cycle bits 0 = one cycle), and the
+    /// `FillRectangle` is the guest's own first band
+    /// (`0xf677c010 0x00000000`).
+    ///
+    /// Hand-decoded from the wire, independently of any fn64 code: word 0
+    /// is `0xf677c010`, so `lrx = (0x77c010 >> 12) & 0xfff = 0x77c = 1916`
+    /// and `lry = 0x010 = 16`; word 1 is zero, so `ulx = uly = 0`. Divided
+    /// by 4 that is x 0..=478 (inclusive edges) and y 0..=4 -- a full-width
+    /// four-scanline band, one of the 60 that tile a 480x240 screen.
+    ///
+    /// FAILS BEFORE with the exact production error string, PASSES AFTER.
+    #[test]
+    fn the_measured_wm2000_swap_2522_packet_decodes() {
+        // The guest's own SetOtherMode: 0xef08acff / 0x00504240.
+        // Cycle bits are (0x08acff >> 20) & 3 == 0 -- one cycle.
+        let other_mode_high = 0x0008_acffu32;
+        assert_eq!(
+            (other_mode_high >> 20) & 3,
+            0,
+            "hand-check of the measured wire word: WM2000 stages ONE-cycle here"
+        );
+        let words = vec![
+            0xef00_0000 | other_mode_high,
+            0x0050_4240,
+            word(0, SET_COLOR_IMAGE, 3 << 19 | 479),
+            0,
+            // The guest's own first band, verbatim.
+            0xf677_c010,
+            0x0000_0000,
+        ];
+        let decoded = decode(words).expect(
+            "the measured WM2000 packet must decode; before this change it failed with              \"FillRectangle requires staged fill-cycle OtherMode\"",
+        );
+        let fill = decoded
+            .commands()
+            .iter()
+            .find_map(|command| match command.kind() {
+                RawDpcCommandKind::FillRectangle(rectangle) => Some(rectangle),
+                _ => None,
+            })
+            .expect("the guest's FillRectangle must be admitted");
+        // Hand-derived above from 0xf677c010, never read back from the
+        // decoder's own extraction.
+        assert_eq!(fill.lower_right_x(), 1916);
+        assert_eq!(fill.lower_right_y(), 16);
+        assert_eq!(fill.upper_left_x(), 0);
+        assert_eq!(fill.upper_left_y(), 0);
     }
 
     #[test]

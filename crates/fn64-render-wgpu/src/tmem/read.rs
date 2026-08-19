@@ -320,7 +320,10 @@ impl fmt::Display for PhysicalTexelReadError {
             Self::Raw(error) => error.fmt(formatter),
             Self::TlutEntry(error) => error.fmt(formatter),
             Self::InvalidTexelByte { address } => {
-                write!(formatter, "physical TMEM texel byte {address:#05x} is invalid")
+                write!(
+                    formatter,
+                    "physical TMEM texel byte {address:#05x} is invalid"
+                )
             }
             Self::Rgba32BaseOutsideLowHalf { byte_address } => write!(
                 formatter,
@@ -1028,11 +1031,7 @@ mod tests {
     /// without a GPU): the rectangle steps exactly one texel per pixel on
     /// both axes, so `s = 2048 + 32 * column` and `t = 1536 + 32 * row` in
     /// S10.5, and `mask == 0` forces the clamp arm of `address_axis_texel`.
-    fn wm2000_addressed(
-        column: u32,
-        row: u32,
-        parity: TmemFirstRowParity,
-    ) -> AddressedTmemTexel {
+    fn wm2000_addressed(column: u32, row: u32, parity: TmemFirstRowParity) -> AddressedTmemTexel {
         let dimension_s = i64::from((WM2000_HIGH_S_RAW >> 2) - (WM2000_LOW_S_RAW >> 2) + 1);
         let dimension_t = i64::from((WM2000_HIGH_T_RAW >> 2) - (WM2000_LOW_T_RAW >> 2) + 1);
         let s = 2048_i64 + 32 * i64::from(column) - i64::from(WM2000_LOW_S_RAW) * 8;
@@ -1370,5 +1369,4 @@ mod tests {
             Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x801 })
         );
     }
-
 }
