@@ -44,7 +44,29 @@
 //! either) matches real hardware is out of this slice's scope -- both
 //! `blend.rs`'s own comment and this module cite no silicon measurement for
 //! the exact Bayer phase, only that the tile must contain each threshold
-//! twice.
+//! twice. libultra publishes the `G_CD_BAYER` selector bit and no table
+//! (`gbi.h:661-671`), and RT64 is one of the two disputants rather than an
+//! adjudicator, so nothing available here settles it.
+//!
+//! ## These tables are this crate's only ordered tiles
+//!
+//! `alpha_compare.rs` used to carry a second `MAGIC_SQUARE`/`BAYER` pair,
+//! ported from the reference lane, for the `G_AD_PATTERN` alpha-dither
+//! substitution rule. `MagicSquare` agreed at every cell; `Bayer` disagreed
+//! at rows 1 and 2 -- so this one crate answered "what is the Bayer tile"
+//! two different ways, and at most one of them could have been right.
+//!
+//! libultra defines the alpha-dither `PATTERN` threshold as *the currently
+//! selected RGB dither matrix* (`gbi.h:674-678`), so the alpha path is a
+//! consumer of these tables by definition. `alpha_compare.rs` now reads
+//! [`ordered_tile_value`] instead of transcribing its own, and
+//! [`tests::the_alpha_dither_path_reads_this_modules_tables`] pins the
+//! agreement at every cell of both tiles.
+//!
+//! That resolves the self-inconsistency and **only** the
+//! self-inconsistency. The frontier above is unchanged: if the Bayer phase
+//! is ever settled against RT64's arrangement, one table changes here and
+//! both paths follow it.
 
 /// One eight-bit pseudo-random sample. RT64's shaders derive this from a
 /// per-fragment `initRand(...)` PRNG seeded by screen position
@@ -210,6 +232,41 @@ pub const fn dither_pattern_index(x: i32, y: i32) -> usize {
     let wrapped_x = x.rem_euclid(4) as u32;
     let wrapped_y = y.rem_euclid(4) as u32;
     dither_pattern_index_from_wrapped(wrapped_x, wrapped_y)
+}
+
+/// The ordered-tile threshold for one screen pixel, for the two selectors
+/// that *have* an ordered tile.
+///
+/// This is [`dither_pattern_value`]'s `MagicSquare`/`Bayer` arms with no
+/// noise byte to thread through, and it exists so that
+/// [`crate::alpha_compare`]'s `G_AD_PATTERN` substitution rule can read
+/// **these** tables rather than a second copy of them. libultra defines
+/// that rule's threshold as the currently selected RGB dither matrix
+/// (`gbi.h:674-678`), so the alpha-dither path is a consumer of this
+/// module's tables by definition, not a peer transcription of them.
+///
+/// Before this existed, `alpha_compare.rs` carried its own
+/// `MAGIC_SQUARE`/`BAYER` pair ported from the reference lane while this
+/// module carried RT64's. `MagicSquare` agreed; `Bayer` disagreed at rows 1
+/// and 2, so one crate held two Bayer tiles for one hardware quantity.
+/// Which tile the silicon uses is still the open frontier this module's
+/// header records -- **that question is not answered by this function and
+/// is not answered anywhere in this crate**. What this function fixes is
+/// only that the two paths can no longer answer it differently.
+///
+/// # Panics
+/// If `pattern` is `Noise` or `Disabled`. Both are real, handled selectors
+/// -- [`dither_pattern_value`] answers them -- but neither has an ordered
+/// tile, and the alpha-dither substitution rule resolves them to
+/// `MagicSquare`/`Bayer` before reaching here.
+pub const fn ordered_tile_value(pattern: RgbDither, x: i32, y: i32) -> u8 {
+    match pattern {
+        RgbDither::MagicSquare => DITHER_PATTERN_MAGIC_SQUARE[dither_pattern_index(x, y)],
+        RgbDither::Bayer => DITHER_PATTERN_BAYER[dither_pattern_index(x, y)],
+        RgbDither::Noise | RgbDither::Disabled => {
+            panic!("ordered tile value requested for a selector with no ordered tile")
+        }
+    }
 }
 
 /// Literal port of `DitherPatternValue` (`Formats.hlsli:27-39`): selects a
@@ -412,6 +469,45 @@ mod tests {
                     rt64_value, reference_value,
                     "x={x} y={y}: RT64 and reference oracle must agree for MagicSquare"
                 );
+            }
+        }
+    }
+
+    /// **The alpha-dither path and the RGB-dither path read the same
+    /// ordered tiles, at every cell of both.**
+    ///
+    /// libultra defines `G_AD_PATTERN`'s threshold as the currently
+    /// selected RGB dither matrix (`gbi.h:674-678`), so this is a
+    /// definitional requirement, not a convention: the two paths cannot
+    /// legally hold different tiles no matter which tile is correct.
+    ///
+    /// This crate held different ones until this test existed.
+    /// `alpha_compare.rs` transcribed the reference lane's tables and this
+    /// module transcribed RT64's; `MagicSquare` matched, `Bayer` did not, at
+    /// eight of sixteen cells. The `Bayer` half of this test fails against
+    /// that older code, which is what makes it a pin rather than a
+    /// restatement.
+    ///
+    /// Reached through [`crate::alpha_compare::alpha_dither_pattern_threshold_for_tests`],
+    /// the alpha path's own consumer of the tile, so a future reintroduced
+    /// duplicate is caught here and not merely a re-exported constant that
+    /// nothing dithers with. Both selectors and all sixteen cells, not a
+    /// sample.
+    #[test]
+    fn the_alpha_dither_path_reads_this_modules_tables() {
+        for pattern in [RgbDither::MagicSquare, RgbDither::Bayer] {
+            for y in 0..4i32 {
+                for x in 0..4i32 {
+                    assert_eq!(
+                        crate::alpha_compare::alpha_dither_pattern_threshold_for_tests(
+                            pattern, x, y
+                        ),
+                        ordered_tile_value(pattern, x, y),
+                        "{pattern:?} at x={x} y={y}: the alpha-dither substitution rule must \
+                         read this module's tile, since gbi.h defines it AS the selected RGB \
+                         dither matrix"
+                    );
+                }
             }
         }
     }
