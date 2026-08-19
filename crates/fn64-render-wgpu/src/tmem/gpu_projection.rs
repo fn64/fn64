@@ -40,6 +40,11 @@ pub const TMEM_VALIDITY_WORDS: usize = TMEM_LEN / 32;
 /// `PixelSize::Bits16` = 2) -- this module's own host-side encoder for the
 /// same codes, since `format_code`/`size_code` are `#[cfg(test)]`-only and
 /// this is production code.
+/// The one direct-format pair `tmem_sample.wgsl` ports, in the wire codes
+/// [`format_code`]/[`size_code`] produce.
+pub const IMAGE_FORMAT_RGBA_CODE: u32 = 0;
+pub const PIXEL_SIZE_BITS16_CODE: u32 = 2;
+
 const fn format_code(format: ImageFormat) -> u32 {
     match format {
         ImageFormat::Rgba => 0,
@@ -113,14 +118,45 @@ pub struct TileBindingParams {
     pub bound: u32,
     pub format: u32,
     pub pixel_size: u32,
+    /// `SetTile`'s own four-bit palette selector, the field the RDP uses as
+    /// the TMEM palette address for a 4-bit texel under an enabled TLUT
+    /// (n64brew `Reality_Display_Processor/Pipeline`: "for tiles that
+    /// indicate a 4-bit texel size the TMEM address for the palette is
+    /// indicated in the tile's palette field"). Zero and unread when
+    /// `lut_mode` is [`TLUT_MODE_DISABLED`] or the size is not 4-bit,
+    /// exactly as `tmem/texel.rs`'s `resolve_indexed_texel` treats it.
+    pub palette: u32,
+    /// `OtherMode::texture_lut_mode()`'s wire code
+    /// ([`TLUT_MODE_DISABLED`]/[`TLUT_MODE_RGBA16`]/[`TLUT_MODE_IA16`]) --
+    /// a *pipeline* mode, not a tile-format property, which is precisely
+    /// why the shader must consult it before it consults `format`.
+    pub lut_mode: u32,
     pub reserved_zero: u32,
+}
+
+/// `TextureLutMode` wire codes shared with `tmem_sample.wgsl`'s own
+/// `TMEM_TLUT_MODE_*` constants. The reserved encoding never reaches this
+/// struct: `OtherMode::texture_lut_mode()` refuses it by name upstream
+/// (`TextureLutModeError::ReservedEncoding`).
+pub const TLUT_MODE_DISABLED: u32 = 0;
+pub const TLUT_MODE_RGBA16: u32 = 2;
+pub const TLUT_MODE_IA16: u32 = 3;
+
+/// Maps the typed decode onto the wire codes above -- the single Rust-side
+/// producer of the shader's `lut_mode` field.
+pub const fn tlut_mode_code(mode: crate::TextureLutMode) -> u32 {
+    match mode {
+        crate::TextureLutMode::Disabled => TLUT_MODE_DISABLED,
+        crate::TextureLutMode::Rgba16 => TLUT_MODE_RGBA16,
+        crate::TextureLutMode::Ia16 => TLUT_MODE_IA16,
+    }
 }
 
 /// Field count in `TileBindingParams` (and its WGSL twin) -- `4 *
 /// TILE_BINDING_PARAMS_FIELDS` is the exact uniform-buffer byte size
 /// `to_bytes` produces and `triangle_pipeline.rs`'s bind-group-layout entry
 /// must request.
-pub const TILE_BINDING_PARAMS_FIELDS: usize = 18;
+pub const TILE_BINDING_PARAMS_FIELDS: usize = 20;
 pub const TILE_BINDING_PARAMS_BYTES: u64 = TILE_BINDING_PARAMS_FIELDS as u64 * 4;
 
 impl TileBindingParams {
@@ -148,6 +184,8 @@ impl TileBindingParams {
             bound: 0,
             format: 0,
             pixel_size: 0,
+            palette: 0,
+            lut_mode: TLUT_MODE_DISABLED,
             reserved_zero: 0,
         }
     }
@@ -177,6 +215,8 @@ impl TileBindingParams {
             bound: 1,
             format: format_code(descriptor.format()),
             pixel_size: size_code(descriptor.size()),
+            palette: u32::from(descriptor.palette()),
+            lut_mode: TLUT_MODE_DISABLED,
             reserved_zero: 0,
         }
     }
@@ -212,8 +252,41 @@ impl TileBindingParams {
             bound: 1,
             format: neutral_format_code(descriptor.format),
             pixel_size: neutral_size_code(descriptor.size),
+            palette: u32::from(descriptor.palette),
+            // `SetTile` carries no TLUT bit -- `tlut_en` lives in
+            // `SetOtherModes`. Neither constructor can know it, so both
+            // default to Disabled and the *draw* caller overwrites it from
+            // its own `OtherMode` via `with_lut_mode` below. Defaulting to
+            // Disabled rather than to some enabled mode keeps the
+            // unset case behaving exactly as it did before this field
+            // existed.
+            lut_mode: TLUT_MODE_DISABLED,
             reserved_zero: 0,
         }
+    }
+
+    /// Returns this binding with its `lut_mode` set from the `OtherMode`
+    /// current at the *draw's* own stream position. Separate from the two
+    /// constructors because `tlut_en` is a `SetOtherModes` bit, not a
+    /// `SetTile` field: the tile snapshot genuinely does not carry it.
+    #[must_use]
+    pub const fn with_lut_mode(mut self, mode: crate::TextureLutMode) -> Self {
+        self.lut_mode = tlut_mode_code(mode);
+        self
+    }
+
+    /// Whether `tmem_sample.wgsl`'s direct (non-palettized) arm accepts this
+    /// binding's `(format, size)` pair. The shader ports the RGBA16 direct
+    /// decode only, so every other direct pair is
+    /// `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`. **Not consulted at all when
+    /// the TLUT is enabled** -- under `tlut_en` the tile format is ignored,
+    /// so this predicate answers the direct arm's question only. Mirrors the
+    /// shader's own condition so `production.rs`'s abort diagnostic can name
+    /// the offending fixture without reaching into the WGSL source.
+    #[must_use]
+    pub const fn is_supported_direct_format(self) -> bool {
+        self.lut_mode != TLUT_MODE_DISABLED
+            || (self.format == IMAGE_FORMAT_RGBA_CODE && self.pixel_size == PIXEL_SIZE_BITS16_CODE)
     }
 
     /// Little-endian `u32`-per-field encoding, in the struct's own
@@ -238,6 +311,8 @@ impl TileBindingParams {
             self.bound,
             self.format,
             self.pixel_size,
+            self.palette,
+            self.lut_mode,
             self.reserved_zero,
         ];
         let mut bytes = [0u8; TILE_BINDING_PARAMS_BYTES as usize];
@@ -526,7 +601,7 @@ mod tests {
         let params = TileBindingParams::bound(test_tile_descriptor(), test_tile_size());
         let bytes = params.to_bytes();
         assert_eq!(bytes.len(), TILE_BINDING_PARAMS_BYTES as usize);
-        assert_eq!(TILE_BINDING_PARAMS_FIELDS, 18);
+        assert_eq!(TILE_BINDING_PARAMS_FIELDS, 20);
 
         let word_at = |index: usize| -> u32 {
             let start = index * 4;
@@ -541,7 +616,7 @@ mod tests {
         // field-for-field: tmem_word_address, line_words, mask_s, shift_s,
         // mode_s_mirror, mode_s_clamp, mask_t, shift_t, mode_t_mirror,
         // mode_t_clamp, low_s, low_t, high_s, high_t, bound, format,
-        // pixel_size, reserved_zero.
+        // pixel_size, palette, lut_mode, reserved_zero.
         assert_eq!(word_at(0), params.tmem_word_address);
         assert_eq!(word_at(1), params.line_words);
         assert_eq!(word_at(2), params.mask_s);
@@ -559,11 +634,72 @@ mod tests {
         assert_eq!(word_at(14), params.bound);
         assert_eq!(word_at(15), params.format);
         assert_eq!(word_at(16), params.pixel_size);
-        assert_eq!(word_at(17), params.reserved_zero);
+        assert_eq!(word_at(17), params.palette);
+        assert_eq!(word_at(18), params.lut_mode);
+        assert_eq!(word_at(19), params.reserved_zero);
 
         assert_eq!(params.bound, 1);
         assert_eq!(params.format, 0, "ImageFormat::Rgba must encode to 0");
         assert_eq!(params.pixel_size, 2, "PixelSize::Bits16 must encode to 2");
+        // Neither constructor can know `tlut_en` -- it is a
+        // `SetOtherModes` bit, not a `SetTile` field. `with_lut_mode` at
+        // the draw site is the only producer of a nonzero value here.
+        assert_eq!(params.lut_mode, TLUT_MODE_DISABLED);
+    }
+
+    /// `with_lut_mode` is the ONLY way a nonzero `lut_mode` reaches the
+    /// uniform, and it changes nothing else about the binding.
+    #[test]
+    fn with_lut_mode_stamps_only_the_lut_mode_field() {
+        let base = TileBindingParams::bound(test_tile_descriptor(), test_tile_size());
+        for (mode, code) in [
+            (crate::TextureLutMode::Disabled, TLUT_MODE_DISABLED),
+            (crate::TextureLutMode::Rgba16, TLUT_MODE_RGBA16),
+            (crate::TextureLutMode::Ia16, TLUT_MODE_IA16),
+        ] {
+            let stamped = base.with_lut_mode(mode);
+            assert_eq!(stamped.lut_mode, code, "{mode:?}");
+            assert_eq!(
+                TileBindingParams {
+                    lut_mode: base.lut_mode,
+                    ..stamped
+                },
+                base,
+                "{mode:?} changed a field other than lut_mode"
+            );
+        }
+    }
+
+    /// The direct arm accepts only RGBA16; under ANY enabled TLUT mode the
+    /// predicate is vacuously true because the shader never consults
+    /// `format` on that arm. This is the exact predicate `production.rs`'s
+    /// status-4 diagnostic re-evaluates to name the offending fixture, so a
+    /// drift from the shader's own gate would misattribute the abort.
+    #[test]
+    fn direct_format_support_is_rgba16_only_and_tlut_bypasses_it() {
+        let rgba16 = TileBindingParams::bound(test_tile_descriptor(), test_tile_size());
+        assert!(rgba16.is_supported_direct_format());
+        for format in 0u32..5 {
+            for size in 0u32..4 {
+                let tile = TileBindingParams {
+                    format,
+                    pixel_size: size,
+                    ..rgba16
+                };
+                assert_eq!(
+                    tile.is_supported_direct_format(),
+                    format == IMAGE_FORMAT_RGBA_CODE && size == PIXEL_SIZE_BITS16_CODE,
+                    "direct arm, format {format} size {size}"
+                );
+                for mode in [crate::TextureLutMode::Rgba16, crate::TextureLutMode::Ia16] {
+                    assert!(
+                        tile.with_lut_mode(mode).is_supported_direct_format(),
+                        "{mode:?} must bypass the direct format gate for \
+                         format {format} size {size}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
