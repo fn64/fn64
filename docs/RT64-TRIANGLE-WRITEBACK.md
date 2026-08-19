@@ -785,3 +785,22 @@ Two things this comparison must NOT be read as saying:
    rung's claim is that TEXELS reach guest RDRAM, which the colour counts
    and the surfaces establish; the scanline interleave is a separate defect
    one layer downstream, in scanout.
+
+## A second, latent copy of the frozen-tile bug (not fixed, recorded)
+
+Found while fixing `PlanCollector`'s frozen raw-triangle tile index (the
+commit reading `RawTriangle::tile()` instead of hardcoding 0). A second,
+separate collector -- `TriangleDrawStateCollector` in
+`raw_dpc/triangle_draw_data.rs` -- carries the identical pattern: it still
+tracks only tile 0 for a raw triangle, and its own doc comment still claims
+the triangle "carries no tile index of its own to read," which is the same
+false claim `PlanCollector`'s comment made.
+
+Left alone because it is not on the GPU execution path today --
+`production.rs` drives `PlanCollector`, not this collector, so nothing
+currently reads a wrong tile through it. But the defect is real and latent:
+if anything ever routes the GPU path through `TriangleDrawStateCollector`
+instead, it will silently bind tile 0 for every raw triangle again, the same
+failure `PlanCollector`'s fix just closed.
+
+Not a card today. Recorded so it is not rediscovered as if it were new.
