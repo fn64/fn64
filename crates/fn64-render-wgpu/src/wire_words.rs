@@ -227,5 +227,11 @@ pub(crate) const fn passthrough_combine(d_slot: u32) -> (u32, u32) {
 
 /// The `Primitive` slot in `colorInputD` / `alphaInputABD`.
 pub(crate) const D_SLOT_PRIMITIVE: u32 = 3;
+/// The `Texel0` slot in `colorInputD` / `alphaInputABD`.
+///
+/// Index 1 of `color_input_common` and of the alpha D table alike -- the two
+/// tables agree at this index, which is why one constant serves both halves
+/// of `passthrough_combine`.
+pub(crate) const D_SLOT_TEXEL0: u32 = 1;
 /// The `Shade` slot in `colorInputD` / `alphaInputABD`.
 pub(crate) const D_SLOT_SHADE: u32 = 4;
