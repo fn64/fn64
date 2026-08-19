@@ -1929,6 +1929,102 @@ mod tests {
         }
     }
 
+    /// MUTATION GUARD for the per-section repair filter.
+    ///
+    /// Overlay banks share a VRAM window by design (WM2000's `bank2_text` and
+    /// `bank3_text` are both based at 0x8011C900), so two sections can hold
+    /// functions with the SAME name at the SAME vram whose bytes differ. Here
+    /// only `alpha` swallows an entry; `beta` declares the identical
+    /// name/vram but its bytes make the split unsafe, and it is correctly
+    /// reported as refused.
+    ///
+    /// Without the `e.region == section.name` filter, alpha's repairable
+    /// entry is offered to beta as well, and beta's function -- which does
+    /// NOT return before that point -- gets split anyway, cutting a live body
+    /// in half. That is the exact corruption the safety check exists to
+    /// prevent, so the filter must not be removed.
+    #[test]
+    fn a_repair_proven_in_one_bank_is_not_applied_to_its_vram_twin() {
+        // alpha: head returns before the entry -> repairable.
+        let alpha = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,
+            0x03E0_0008, // jr $ra
+            0x0000_0000,
+            0x0000_0000, // 0x80000010: swallowed entry
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        // beta: identical layout EXCEPT the head never returns, so a split at
+        // 0x80000010 would cut it in half.
+        let beta = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,
+            0x27BD_FFE0, // addiu $sp, $sp, -0x20 -- NOT a return
+            0x0000_0000,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let mut rom: Vec<u8> = alpha.into_iter().flat_map(u32::to_be_bytes).collect();
+        let beta_bytes: Vec<u8> = beta.into_iter().flat_map(u32::to_be_bytes).collect();
+        let beta_rom = rom.len() as u32;
+        rom.extend_from_slice(&beta_bytes);
+
+        // Both sections base at the SAME vram with the SAME function name,
+        // exactly as two overlay banks sharing a window do.
+        let bank = |name: &str, rom_off: u32| Section {
+            name: name.to_string(),
+            rom: rom_off,
+            vram: 0x8000_0000,
+            size: 0x1C,
+            functions: vec![Function {
+                name: "shared_name".to_string(),
+                vram: 0x8000_0000,
+                size: 0x1C,
+            }],
+        };
+        let mut cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![bank("alpha", 0), bank("beta", beta_rom)],
+            patches: Patches::default(),
+        };
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        // Exactly one repair: alpha's. Beta's identical-looking entry is
+        // reported but refused.
+        assert!(
+            diagnostic.contains("1 repaired by splitting"),
+            "only alpha may be repaired: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("1 reported only"),
+            "beta must be reported and refused: {diagnostic}"
+        );
+        // alpha split; beta untouched.
+        let alpha_shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(alpha_shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+        let beta_shape: Vec<(u32, u32)> = cfg.sections[1]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(
+            beta_shape,
+            vec![(0x8000_0000, 0x1C)],
+            "beta's live body must not be split"
+        );
+    }
+
     /// A dump with no swallowed entries must produce an empty diagnostic and
     /// leave the config byte-identical -- the check must not be a source of
     /// churn on healthy configs.
