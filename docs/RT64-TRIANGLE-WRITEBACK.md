@@ -610,3 +610,20 @@ panics.
 divide by a near-zero W is exactly the shape that would -- this proof must be
 redone. The reference's own `w <= 0` tolerance rule (divide by
 `unsigned_abs().max(1)`) exists for that reason.
+
+## Frame evidence: no 3D geometry in any captured frame
+
+A full 400,000-step run with `WM2000_FB_DUMP_DIR` set (2149 VI swaps, zero
+panics) dumped **2,147 guest framebuffer PNGs**, of which **133 are
+distinct**. So the capture is live and varied, not a stuck buffer -- which
+is what makes the negative result meaningful.
+
+Sampled across the run (frames 3, 403, 803, 1203, 1603, 2003, 2100, and the
+three most frequent hashes covering 1,745 of the 2,147): every one shows
+flat 2D content -- bands, blocks, and thin rules -- and none shows rendered
+3D geometry.
+
+That agrees exactly with the execution-seam count: 1,314,648 raw triangles
+reach the admission check and 0 reach the rasterizer, so there is no path by
+which a triangle could have appeared. The frames confirm the measurement
+rather than merely illustrating it.
