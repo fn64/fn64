@@ -33,7 +33,7 @@ use crate::wire_words::{
 };
 use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
 use fn64_render_ir::{
-    CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
+    CapturedGuestRead, CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
 };
 
 const LAYOUT_BYTES: u32 = 0x4000;
@@ -44,6 +44,15 @@ const COMMAND_START: u32 = 0x1000;
 pub(crate) const TARGET_ADDRESS: u32 = 0x2000;
 
 const SET_COLOR_IMAGE: u8 = 0x3f;
+const SET_TEXTURE_IMAGE: u8 = 0x3d;
+const SET_TILE: u8 = 0x35;
+const SET_TILE_SIZE: u8 = 0x32;
+const LOAD_SYNC: u8 = 0x26;
+const LOAD_BLOCK: u8 = 0x33;
+
+/// Where a staged texture's source pixels live in the harness's layout.
+/// Clear of both the command stream (0x1000) and the colour target (0x2000).
+const TEXTURE_ADDRESS: u32 = 0x3000;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 
@@ -106,7 +115,15 @@ pub(crate) struct Tri {
     ym_row: Option<i16>,
     /// Optional per-component shade planes.
     shade: Option<ShadePlanes>,
+    /// Optional S/T/W texture planes, in the same four coefficient groups.
+    texture: Option<TexturePlanes>,
 }
+
+/// One textured triangle's four coefficient groups: (value, d/dx, d/de,
+/// d/dy). Each carries `[S, T, W, unused]` -- the texture block's own layout,
+/// which is the SHADE block's layout with the fourth component ignored, so
+/// the same [`crate::wire_words::coefficient_halves`] encoder emits both.
+pub(crate) type TexturePlanes = ([i32; 4], [i32; 4], [i32; 4], [i32; 4]);
 
 /// One shaded triangle's four coefficient groups: (value, d/dx, d/de, d/dy),
 /// each carrying the four RGBA components.
@@ -143,6 +160,7 @@ impl Tri {
             y_end: 0,
             ym_row: None,
             shade: None,
+            texture: None,
         }
     }
 
@@ -207,13 +225,47 @@ impl Tri {
         de: [i32; 4],
         dy: [i32; 4],
     ) -> Self {
-        self.opcode = crate::wire_words::RAW_TRIANGLE_SHADE;
         self.shade = Some((value, dx, de, dy));
+        self.opcode = self.opcode_for_flags();
         self
     }
 
+    /// Attaches three S/T/W texture planes, promoting the opcode's texture
+    /// bit. Composes with [`Tri::shade`]: a triangle carrying both is opcode
+    /// 0x0e, which is the ONLY opcode WM2000 issues.
+    ///
+    /// Each array is `[S, T, W, unused]`, in the plane's own Q16.16 units --
+    /// stated raw rather than in texels, because the two scale factors
+    /// between a plane value and a texel are exactly what a texture test
+    /// must be able to observe rather than assume.
+    pub(crate) fn texture_planes(
+        mut self,
+        value: [i32; 4],
+        dx: [i32; 4],
+        de: [i32; 4],
+        dy: [i32; 4],
+    ) -> Self {
+        self.texture = Some((value, dx, de, dy));
+        self.opcode = self.opcode_for_flags();
+        self
+    }
+
+    /// Re-derives the wire opcode from which coefficient blocks are attached.
+    ///
+    /// Bit 2 is shade, bit 1 is texture -- so flat is 0x08, shaded 0x0c,
+    /// textured 0x0a, and shaded+textured 0x0e. Derived rather than assigned
+    /// per builder method, so `shade().texture_planes()` and
+    /// `texture_planes().shade()` cannot produce different opcodes for the
+    /// same triangle.
+    fn opcode_for_flags(&self) -> u8 {
+        RAW_TRIANGLE_BASE_EDGE
+            | if self.shade.is_some() { 0x4 } else { 0 }
+            | if self.texture.is_some() { 0x2 } else { 0 }
+    }
+
     /// The triangle's own wire words: four base-edge words, plus eight
-    /// coefficient words when shaded.
+    /// coefficient words per attached coefficient block, in the RDP's own
+    /// block order -- shade first, then texture.
     pub(crate) fn words(&self) -> Vec<u32> {
         let edges = EdgeWords {
             lft: self.lft,
@@ -236,7 +288,65 @@ impl Tri {
         if let Some((value, dx, de, dy)) = self.shade {
             words.extend(crate::wire_words::coefficient_halves(value, dx, de, dy));
         }
+        // **Texture follows shade**, which is `RawTriangle::decode`'s own
+        // cursor order. Emitting them the other way round would hand the
+        // texture block's words to `shade_planes` and vice versa -- and both
+        // blocks decode without error, so the swap would be silent.
+        if let Some((value, dx, de, dy)) = self.texture {
+            words.extend(crate::wire_words::coefficient_halves(value, dx, de, dy));
+        }
         words
+    }
+}
+
+
+impl StagedTexture {
+    /// The load sequence's wire words: `SetTextureImage`, `SetTile`,
+    /// `SetTileSize`, `LoadSync`, `LoadBlock`.
+    ///
+    /// Field placements are the existing `production::tests` fixtures'
+    /// (`set_tile`, `set_tile_size_words`, `one_load_block_words`), which are
+    /// each `tmem::wire`'s own decode read backwards. RGBA16 throughout:
+    /// `SetTextureImage` format 0 size 2, and `SetTile` the same.
+    fn words(&self) -> Vec<u32> {
+        let texel_count = self.width * self.height;
+        // A tile LINE is measured in 64-bit TMEM words: an RGBA16 row of
+        // `width` texels is `width * 2` bytes = `width / 4` words.
+        let line_words = self.width.div_ceil(4);
+        let mut words = Vec::new();
+        words.extend([
+            word(SET_TEXTURE_IMAGE, 2 << 19 | (self.width - 1)),
+            TEXTURE_ADDRESS,
+        ]);
+        words.extend([
+            word(SET_TILE, 2 << 19 | line_words << 9),
+            self.tile << 24,
+        ]);
+        // `SetTileSize`'s high S/T are 10.2 fixed point and INCLUSIVE, so a
+        // `width`-texel tile's high S is `(width - 1) << 2`. Off by one here
+        // clamps the last column onto its neighbour -- visible only at the
+        // tile's own right edge, which is why a fixture must sample there.
+        words.extend([
+            word(SET_TILE_SIZE, 0),
+            self.tile << 24 | ((self.width - 1) << 2) << 12 | ((self.height - 1) << 2),
+        ]);
+        words.extend([word(LOAD_SYNC, 0), 0]);
+        // `LoadBlock`'s texel count field is INCLUSIVE of the last texel, so
+        // a `texel_count`-texel block names `texel_count - 1`.
+        words.extend([
+            word(LOAD_BLOCK, 0),
+            self.tile << 24 | (texel_count - 1) << 12,
+        ]);
+        words
+    }
+
+    /// The source bytes the load reads, big-endian RGBA16 in row-major order
+    /// -- what the guest would have written to `TEXTURE_ADDRESS`.
+    fn source_bytes(&self) -> Vec<u8> {
+        self.texels
+            .iter()
+            .flat_map(|texel| texel.to_be_bytes())
+            .collect()
     }
 }
 
@@ -250,6 +360,25 @@ pub(crate) struct Rdp {
     combine: Option<(u32, u32)>,
     prim_color: Option<u32>,
     triangles: Vec<Tri>,
+    textures: Vec<StagedTexture>,
+}
+
+/// One RGBA16 texture staged into TMEM by a real `SetTextureImage` /
+/// `SetTile` / `LoadSync` / `LoadBlock` sequence, with its source pixels
+/// supplied through the guest-read capture the plan itself declares.
+///
+/// **The load is a real wire command through the real decoder**, not a TMEM
+/// state poke: which load a draw observes is the whole question this
+/// harness's texture tests exist to answer, and a poked TMEM has no stream
+/// position at all.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedTexture {
+    tile: u32,
+    /// Texels per row, and rows -- the tile's own clamp extent.
+    width: u32,
+    height: u32,
+    /// The RGBA16 texels, row-major, big-endian, exactly `width * height`.
+    texels: Vec<u16>,
 }
 
 #[allow(
@@ -268,6 +397,7 @@ impl Rdp {
             combine: None,
             prim_color: None,
             triangles: Vec::new(),
+            textures: Vec::new(),
         }
     }
 
@@ -309,6 +439,27 @@ impl Rdp {
         self
     }
 
+    /// Stages one RGBA16 texture into `tile`, loaded BEFORE every triangle in
+    /// the same packet, so `prefix_before` selects it for all of them.
+    ///
+    /// Several calls stage several loads in call order, each preceded by its
+    /// own `LoadSync` so the epoch strictly advances -- which is what makes a
+    /// "which load did this draw see" test possible at all.
+    pub(crate) fn texture(mut self, tile: u32, width: u32, height: u32, texels: Vec<u16>) -> Self {
+        assert_eq!(
+            texels.len() as u32,
+            width * height,
+            "a staged texture's texel count must be exactly width * height"
+        );
+        self.textures.push(StagedTexture {
+            tile,
+            width,
+            height,
+            texels,
+        });
+        self
+    }
+
     fn set_color_image(&self) -> [u32; 2] {
         // Wire `format` 0 (Rgba), `size` 2 (Bits16), and a width field of
         // width-1 which the decoder adds one back to.
@@ -346,6 +497,13 @@ impl Rdp {
         if let Some(color) = self.prim_color {
             words.extend(set_prim_color(0, 0, color));
         }
+        // **Every load precedes every triangle**, so `prefix_before` gives
+        // each triangle the last staged texture. A test that needs a load
+        // BETWEEN two draws states that itself; this default is the shape
+        // WM2000's own packets have (nine loads, then the geometry).
+        for texture in &self.textures {
+            words.extend(texture.words());
+        }
         words.extend(self.set_color_image());
         for triangle in &self.triangles {
             words.extend(triangle.words());
@@ -369,11 +527,21 @@ impl Rdp {
 
         // The clear is its own packet: a fill in the SAME packet as a raw
         // triangle is refused by `MixedFillAndTrianglePacket`.
-        publish_packet(&mut backend, &mut session, self.clear_words())
+        publish_packet(&mut backend, &mut session, self.clear_words(), &[])
             .map_err(HarnessRefusal::Clear)?;
 
-        let staged = publish_packet(&mut backend, &mut session, self.draw_words())
-            .map_err(HarnessRefusal::Draw)?;
+        let source_bytes: Vec<Vec<u8>> = self
+            .textures
+            .iter()
+            .map(StagedTexture::source_bytes)
+            .collect();
+        let staged = publish_packet(
+            &mut backend,
+            &mut session,
+            self.draw_words(),
+            &source_bytes,
+        )
+        .map_err(HarnessRefusal::Draw)?;
 
         let bytes = backend
             .color_targets()
@@ -560,15 +728,41 @@ fn publish_packet(
     backend: &mut WgpuBackend,
     session: &mut RawDpcAbiSession,
     words: Vec<u32>,
+    source_bytes: &[Vec<u8>],
 ) -> Result<Vec<CompletedWrite>, String> {
     let request = session.plan_request(capture(words));
     let planned = backend.plan_raw_dpc(request).map_err(|e| e.to_string())?;
-    assert!(
-        planned.guest_read_plan().reads().is_empty(),
-        "a fill/triangle-only plan must declare zero TmemLoadSource reads"
+    // **The plan's own declared reads, satisfied from the staged textures in
+    // declaration order.** A count mismatch is an assertion rather than a
+    // silent zip-truncation: a harness that quietly dropped a load's source
+    // bytes would stage a texture of zeros and every texel assertion after it
+    // would be measuring the harness, not the pipeline.
+    let reads = planned.guest_read_plan().reads();
+    assert_eq!(
+        reads.len(),
+        source_bytes.len(),
+        "the plan declared {} TmemLoadSource reads but the harness staged {} textures",
+        reads.len(),
+        source_bytes.len()
+    );
+    let capture = DeferredGuestReadCapture::new(
+        reads
+            .iter()
+            .zip(source_bytes)
+            .map(|(read, bytes)| {
+                // The declared read may be LONGER than the texels a fixture
+                // supplied (a `LoadBlock` reads whole 64-bit words). Padded
+                // with zeros rather than refused, so a fixture states the
+                // texels it cares about instead of the load's word rounding.
+                let mut padded = bytes.clone();
+                padded.resize(read.range().len() as usize, 0);
+                CapturedGuestRead::try_new(*read, padded)
+                    .expect("a capture sized to its own declared read is well formed")
+            })
+            .collect(),
     );
     let bound = session
-        .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        .finalize_and_submit(planned, capture)
         .map_err(|e| e.to_string())?;
     let submission = bound.submission();
     let prepared = backend.execute_raw_dpc(bound).map_err(|e| e.to_string())?;

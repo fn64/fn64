@@ -1694,12 +1694,22 @@ fn plan_texture_rectangle(
 }
 
 /// The raw triangles this backend can produce guest bytes for, and
-/// therefore the only ones it declares a write for: **opaque, untextured,
-/// no depth plane** -- shaded or not.
+/// therefore the only ones it declares a write for: **opaque, with no depth
+/// plane** -- shaded or not, textured or not.
 ///
 /// Shaded was admitted after the executor gained per-pixel shade plane
-/// interpolation, in that order. Widening this predicate first would
-/// declare rows the executor cannot fill.
+/// interpolation; TEXTURED after it gained per-pixel S/T/W plane
+/// interpolation, the perspective divide and the TMEM fetch -- each time in
+/// that order. Widening this predicate first would declare rows the executor
+/// cannot fill.
+///
+/// Admitting the texture bit is what makes WM2000's geometry reachable at
+/// all: every one of the 1,314,648 raw triangles measured on the real ROM is
+/// opcode 0x0e, shaded AND textured, and this predicate refused all of them.
+///
+/// Depth (bit 0) stays out. It is not a rung this predicate can widen alone:
+/// it needs a depth image, its own journal declaration and the RDP's Z
+/// encoding, none of which exist here.
 ///
 /// This is an *admission*, not an approximation. A triangle outside the
 /// subset declares nothing and behaves exactly as it did before this
@@ -1714,8 +1724,7 @@ fn plan_texture_rectangle(
 /// The subset widens by widening the executor first, then this predicate --
 /// never the other way round.
 fn raw_triangle_is_executable(triangle: &triangle::RawTriangle) -> bool {
-    let flags = triangle.flags();
-    !flags.textured() && !flags.depth()
+    !triangle.flags().depth()
 }
 
 /// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
@@ -5561,31 +5570,89 @@ mod tests {
         }
     }
 
+    /// One triangle of `opcode`, with the right number of zeroed
+    /// coefficient words for its own flag bits, decoded through the real
+    /// planner -- returning how many accesses the plan declared.
+    ///
+    /// A plan with no triangle declares exactly ONE access (the state
+    /// commands' own), so "declared nothing" is `1` and "declared its rows"
+    /// is more.
+    fn declared_access_count_for_opcode(opcode: u8) -> usize {
+        let mut words = flat_triangle_state_words(0);
+        let mut triangle = flat_triangle_words(0);
+        triangle[0] = word(0, opcode, 1 << 23 | 12);
+        let extra_words = 8 * u32::from(opcode & 0x4 != 0)
+            + 8 * u32::from(opcode & 0x2 != 0)
+            + 2 * u32::from(opcode & 0x1 != 0);
+        triangle.extend(core::iter::repeat_n(0u32, (extra_words * 2) as usize));
+        words.extend(triangle);
+        // The journal the packet is submitted with must be the one the
+        // decoder produces, or `decode_raw_dpc` refuses with
+        // `JournalMismatch` before this helper can count anything. The three
+        // ranges are `flat_triangle_words`' own footprint, hand-derived the
+        // same way `a_flat_raw_triangle_declares_one_exact_access_per_
+        // covered_row` derives them -- and they are shared by every opcode
+        // here BECAUSE the footprint is a function of the edges alone, which
+        // is the very claim this helper's callers assert.
+        //
+        // A depth-bearing opcode declares none of them, so it is submitted
+        // with an empty journal instead.
+        let expected: &[(u32, u32)] = if opcode & 0x1 != 0 {
+            &[]
+        } else {
+            &[(4, 12), (20, 28), (36, 44)]
+        };
+        let submitted = submit(packet(7, words, expected));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        decoded.resource_plan().accesses().len()
+    }
+
     #[test]
-    fn a_textured_or_depth_triangle_declares_no_write() {
-        // Textured and depth-bearing triangles are still outside the
-        // executor's subset -- there is no s/t/w perspective divide and no
-        // depth test -- so they must declare nothing. Declaring a row the
+    fn a_depth_bearing_triangle_declares_no_write() {
+        // Depth is still outside the executor's subset -- there is no depth
+        // image, no depth journal declaration and no Z encoding -- so a
+        // depth-bearing triangle must declare nothing. Declaring a row the
         // executor cannot fill would digest stale resident bytes into guest
         // RDRAM.
         //
-        // Opcodes: bit 0 = depth, bit 1 = textured, bit 2 = shaded. So the
-        // refused set is every opcode with bit 0 or bit 1 set, and the
-        // ADMITTED set is exactly {0x08, 0x0c}.
-        for opcode in [0x09u8, 0x0a, 0x0b, 0x0d, 0x0e, 0x0f] {
-            let mut words = flat_triangle_state_words(0);
-            let mut triangle = flat_triangle_words(0);
-            triangle[0] = word(0, opcode, 1 << 23 | 12);
-            let extra_words = 8 * u32::from(opcode & 0x4 != 0)
-                + 8 * u32::from(opcode & 0x2 != 0)
-                + 2 * u32::from(opcode & 0x1 != 0);
-            triangle.extend(core::iter::repeat_n(0u32, (extra_words * 2) as usize));
-            words.extend(triangle);
-            let submitted = submit(packet(7, words, &[]));
-            let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
-            assert!(
-                decoded.resource_plan().accesses().len() == 1,
-                "opcode {opcode:#04x} declared a write it cannot fill"
+        // Opcodes: bit 0 = depth, bit 1 = textured, bit 2 = shaded. The
+        // refused set is now exactly the four with bit 0 set.
+        for opcode in [0x09u8, 0x0b, 0x0d, 0x0f] {
+            assert_eq!(
+                declared_access_count_for_opcode(opcode),
+                1,
+                "opcode {opcode:#04x} carries a depth plane and declared a write it cannot fill"
+            );
+        }
+    }
+
+    /// **The texture rung's decoder half.** Every depth-free opcode --
+    /// including 0x0a and 0x0e, the textured ones -- now declares its own
+    /// per-row run.
+    ///
+    /// This is the change WM2000's geometry needs: all 1,314,648 raw
+    /// triangles measured on the real ROM are opcode 0x0e, and this
+    /// predicate previously refused every one of them, so the ROM's entire
+    /// 3D scene declared nothing and drew nothing.
+    ///
+    /// Asserted as an EQUALITY against the flat opcode's own count, not as
+    /// "more than one": the footprint is a function of the edge
+    /// coefficients alone, and every opcode here carries identical edges, so
+    /// a textured triangle declaring a DIFFERENT number of rows than a flat
+    /// one would mean the coefficient-block length changed the geometry.
+    #[test]
+    fn every_depth_free_opcode_including_the_textured_ones_declares_its_rows() {
+        let flat = declared_access_count_for_opcode(0x08);
+        assert!(
+            flat > 1,
+            "the flat opcode must declare rows for this comparison to mean anything"
+        );
+        for opcode in [0x0au8, 0x0c, 0x0e] {
+            assert_eq!(
+                declared_access_count_for_opcode(opcode),
+                flat,
+                "opcode {opcode:#04x} is depth-free and must declare the same per-row run \
+                 the identically-edged flat triangle does"
             );
         }
     }
