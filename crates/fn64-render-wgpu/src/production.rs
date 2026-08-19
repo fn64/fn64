@@ -115,18 +115,53 @@ pub struct WgpuBackend {
     /// live tiles in that case, exactly as it did before this field
     /// existed.
     ///
-    /// Only the *tile* registers need this. Every other seeded register
-    /// (`other_mode`, `combine`, the constant colors, `color_image`) is
-    /// also folded early, and the same reasoning applies to them -- but
-    /// they are not what this repair measured, and widening the snapshot
-    /// to registers no measurement implicates would be a change with no
-    /// evidence behind it. The narrow field is deliberate.
+    /// `combine`, the constant colors and `color_image` are also folded
+    /// early and the same reasoning applies to them, but no measurement
+    /// implicates them yet, so they are deliberately still seeded live.
+    /// `other_mode` WAS measured and has its own snapshot below.
     tiles_before_last_plan: Option<
         [(
             Option<fn64_render::NeutralTileDescriptor>,
             Option<fn64_render::NeutralTileSize>,
         ); 8],
     >,
+    /// **`OtherMode` as it stood BEFORE this submission's own
+    /// `SetOtherMode` commands were applied** -- the sibling of
+    /// `tiles_before_last_plan`, for the same reason and by the same
+    /// mechanism.
+    ///
+    /// `f2c52822` repaired the plan/execute fold's time travel for the
+    /// tile registers only, and said in this struct's own doc that
+    /// widening to `other_mode` would be "a change with no evidence behind
+    /// it". This field is that evidence, measured on the real WM2000 ROM
+    /// on the all-Rust stack:
+    ///
+    /// A packet folded `other_mode.high` from `0x00000cef` to `0x0008acef`.
+    /// `G_MDSFT_TEXTLUT` is bits 15:14, so the carried-in word selects
+    /// `G_TT_NONE` (TLUT off) and the packet-final word selects
+    /// `G_TT_RGBA16` (TLUT on). The packet's FIRST texrect, at command
+    /// index 6, stood before that `SetOtherMode` and so should have run
+    /// TLUT-off -- but was seeded with the folded word.
+    ///
+    /// Under an enabled TLUT the RDP indexes *any* format through the
+    /// palette and confines the index read to half of TMEM (RT64
+    /// `TextureDecoder.hlsli:162-163`, `or(isRgba32, usesTlut)` selecting
+    /// `RDP_TMEM_MASK16`; fn64 implements this in `AddressScope::of` and in
+    /// `tmem_sample.wgsl`). So the texrect's `Rgba`/`Bits16` tile, whose
+    /// row 16 column 2 texel is at linear byte `0x884`, was masked to
+    /// `0x084` and XOR4'd to `0x080` instead of being masked to `0x884` and
+    /// XOR4'd to `0x880`. `0x880` was loaded; `0x080` never was, and the
+    /// `InvalidTexelByte` guard correctly aborted the run at 280 VI swaps.
+    ///
+    /// The guard, the low-half mask and both samplers were right
+    /// throughout. The defect was which stream position the mode came
+    /// from.
+    ///
+    /// Snapshotted and consumed exactly like `tiles_before_last_plan`:
+    /// taken in `plan_raw_dpc` before `RdpState::apply`, on the success
+    /// path only, and falling back to the live register when no plan has
+    /// run yet.
+    other_mode_before_last_plan: Option<Option<OtherMode>>,
     /// `Some` only after a successful `RenderBackend::create`; `try_new`
     /// never populates it. Always `Some` together with
     /// `triangle_target_extent`, never one without the other.
@@ -262,6 +297,7 @@ impl WgpuBackend {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
                 tiles_before_last_plan: None,
+                other_mode_before_last_plan: None,
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
@@ -2119,6 +2155,10 @@ impl RenderBackend for WgpuBackend {
         // previous submission's snapshot in place rather than replacing it
         // with one for a packet that never executes.
         self.tiles_before_last_plan = Some(durable_neutral_tiles(&self.rdp_state));
+        // Same rule, same instant, same success-path-only guard as the
+        // tile snapshot above: see `other_mode_before_last_plan`'s doc for
+        // the measurement that made this register non-hypothetical.
+        self.other_mode_before_last_plan = Some(self.rdp_state.other_mode());
         self.rdp_state.apply(&delta);
         Ok(planned)
     }
@@ -2130,7 +2170,8 @@ impl RenderBackend for WgpuBackend {
         let (prepared, triangles, pending, draw_tmem) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
-            self.rdp_state.other_mode(),
+            self.other_mode_before_last_plan
+                .unwrap_or_else(|| self.rdp_state.other_mode()),
             self.rdp_state.combine(),
             self.rdp_state.blend_color(),
             self.rdp_state.env_color(),
@@ -14152,6 +14193,277 @@ mod tests {
              Recording it before `plan_raw_dpc_inner` would stamp a boundary for a packet \
              that never executes, and the next execute_raw_dpc would seed its tile walk \
              from it"
+        );
+    }
+
+    /// **A draw standing before its packet's own `SetOtherMode` must carry
+    /// the PREVIOUS packet's mode, not this packet's later one.**
+    ///
+    /// The sibling of
+    /// `a_draw_before_its_packets_first_set_tile_carries_the_previous_packets_tile`,
+    /// on the register `f2c52822` explicitly declined to widen its repair
+    /// to for want of a measurement. This is that measurement, taken on the
+    /// real WM2000 ROM on the all-Rust stack.
+    ///
+    /// A packet folded `other_mode.high` from `0x00000cef` to `0x0008acef`.
+    /// `G_MDSFT_TEXTLUT` is bits 15:14, so the carried-in word selects
+    /// `G_TT_NONE` and the packet-final word selects `G_TT_RGBA16`. The
+    /// packet's FIRST texrect, at command index 6, stood before that
+    /// `SetOtherMode` and was nonetheless seeded with the folded word.
+    ///
+    /// Under an enabled TLUT the RDP indexes any format through the palette
+    /// and confines that read to half of TMEM (RT64
+    /// `TextureDecoder.hlsli:162-163`). So the texrect's `Rgba`/`Bits16`
+    /// texel at linear byte `0x884` was masked to `0x084` and XOR4'd to
+    /// `0x080` instead of staying at `0x884`/`0x880`. `0x880` was loaded;
+    /// `0x080` never was, and `InvalidTexelByte` correctly aborted the run
+    /// at 280 VI swaps.
+    ///
+    /// **Behavioural, not field-reading.** The assertion drives
+    /// `execution_view` and reads the mode off the CONSUMER's retrieved
+    /// draw state, seeding exactly the way `execute_raw_dpc` does. A mutant
+    /// that records the right snapshot while the executor still reads the
+    /// live register is therefore caught -- the trap the tile-side test's
+    /// first draft fell into.
+    ///
+    /// The two `TEXTLUT` encodings are DIFFERENT and hand-chosen (`0`
+    /// carried in, `2` set later) so the assertion distinguishes the two
+    /// words rather than passing against either.
+    #[test]
+    fn a_draw_before_its_packets_first_set_other_mode_carries_the_previous_packets_mode() {
+        // `G_MDSFT_TEXTLUT` is bits 15:14 of `G_SETOTHERMODE_H`.
+        const TEXTLUT_SHIFT: u32 = 14;
+        const CARRIED_IN_TEXTLUT: u32 = 0; // G_TT_NONE
+        const SET_LATER_IN_PACKET_TEXTLUT: u32 = 2; // G_TT_RGBA16
+
+        // `set_other_mode`'s own helper only writes the cycle-type field,
+        // so the high word is built here from the same `word()` encoder it
+        // uses, with TEXTLUT placed by its documented shift.
+        fn other_mode_with_textlut(textlut: u32) -> [u32; 2] {
+            [
+                word(SET_OTHER_MODE, textlut << TEXTLUT_SHIFT),
+                0,
+            ]
+        }
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+
+        // Packet one: establish the carried-in mode (TLUT off).
+        let mut first = Vec::new();
+        first.extend(other_mode_with_textlut(CARRIED_IN_TEXTLUT));
+        first.extend(set_combine(0, 0));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(first)))
+            .expect("the mode-establishing submission plans cleanly");
+
+        assert_eq!(
+            backend
+                .rdp_state
+                .other_mode()
+                .expect("packet one set the mode")
+                .texture_lut_mode(),
+            Ok(crate::TextureLutMode::Disabled),
+            "positive control: durable state must really carry the first packet's TLUT-off \
+             mode, or this test would pass vacuously against a register that never held it"
+        );
+
+        // Packet two: a triangle FIRST, then a `SetOtherMode` turning the
+        // TLUT on. Planning folds that `SetOtherMode` into `rdp_state`
+        // immediately, so the live register no longer describes the
+        // triangle's own stream position.
+        let mut second = Vec::new();
+        second.extend(triangle_base_edge_words(0, 2, 0));
+        second.extend(other_mode_with_textlut(SET_LATER_IN_PACKET_TEXTLUT));
+        let planned = backend
+            .plan_raw_dpc(session.plan_request(capture(second)))
+            .expect("the triangle-then-SetOtherMode submission plans cleanly");
+
+        // The discriminator: if the walk seeded from the live registers,
+        // the triangle would come back TLUT-enabled.
+        assert_eq!(
+            backend
+                .rdp_state
+                .other_mode()
+                .expect("packet two set the mode")
+                .texture_lut_mode(),
+            Ok(crate::TextureLutMode::Rgba16),
+            "positive control: the fold must really have happened, otherwise the walk could \
+             read the live registers and still look correct"
+        );
+
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        // **Driven through `execute_raw_dpc_inner`, the function
+        // `execute_raw_dpc` delegates to**, with every seed taken from
+        // `backend`'s own fields exactly as that method takes them. The
+        // retrieved draws it returns are the consumer's own output, so a
+        // mutant that records a faithful snapshot and then passes
+        // `self.rdp_state.other_mode()` at the call site changes THIS
+        // value and is caught.
+        //
+        // Reading `backend.other_mode_before_last_plan` in the test instead
+        // and handing it to a locally-built `PlanCollector` does NOT catch
+        // that mutant -- measured: the first draft did exactly that and the
+        // consumer-side mutant passed. This is the trap the tile-side
+        // sibling documents at
+        // `execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot`.
+        let mut color_targets = None;
+        let (_, triangles, _, _) = execute_raw_dpc_inner(
+            &mut backend.coordinator,
+            bound,
+            backend
+                .other_mode_before_last_plan
+                .unwrap_or_else(|| backend.rdp_state.other_mode()),
+            backend.rdp_state.combine(),
+            backend.rdp_state.blend_color(),
+            backend.rdp_state.env_color(),
+            backend.rdp_state.prim_color(),
+            backend.rdp_state.fog_color(),
+            backend.rdp_state.color_image(),
+            backend
+                .tiles_before_last_plan
+                .unwrap_or_else(|| durable_neutral_tiles(&backend.rdp_state)),
+            &mut color_targets,
+            backend.configured_target_extent,
+        )
+        .expect("the triangle-then-SetOtherMode submission executes cleanly");
+
+        assert_eq!(
+            triangles.len(),
+            1,
+            "positive control: the packet must admit its one raw triangle -- if it admitted \
+             none, the mode assertion below would be vacuous"
+        );
+        let draw = triangles
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("the admitted triangle retrieves its draw state");
+        assert_eq!(
+            draw.other_mode.texture_lut_mode(),
+            Ok(crate::TextureLutMode::Disabled),
+            "the triangle stands BEFORE its packet's own SetOtherMode, so it must carry the \
+             TLUT-off mode packet ONE set, never the G_TT_RGBA16 one packet two installs \
+             after it -- seeding from the already-folded `rdp_state` is what sent WM2000's \
+             first texrect down the enabled-TLUT half-TMEM address path and made it read \
+             byte 0x080, which its own load never wrote"
+        );
+    }
+
+    /// **`execute_raw_dpc` must seed `other_mode` from the SNAPSHOT, never
+    /// from the live register.**
+    ///
+    /// The sibling of
+    /// `execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot`,
+    /// and it exists for the identical measured reason.
+    ///
+    /// The behavioural test above proves the snapshot holds the right word
+    /// and that a walk seeded from it retrieves the right mode. It cannot
+    /// prove `execute_raw_dpc` is the thing doing the seeding:
+    /// `RetrievedTriangleDraw` is not reachable through the
+    /// `RenderBackend` trait, so a mutant that records the snapshot
+    /// faithfully and then passes `self.rdp_state.other_mode()` -- exactly
+    /// the pre-repair line -- SURVIVES it. **Measured: it did.** The first
+    /// draft of the test above passed unchanged against that mutant.
+    ///
+    /// Pinned at the source instead, because the fact under test is which
+    /// expression appears at one call site.
+    ///
+    /// Both halves are asserted for the same reason the tile sibling
+    /// asserts both: `contains` alone would pass a body that read the
+    /// snapshot *and* also read the live register unconditionally, and the
+    /// count pins that the only bare `self.rdp_state.other_mode()` in this
+    /// function is the `unwrap_or_else` fallback reached before any plan
+    /// has run.
+    #[test]
+    fn execute_raw_dpc_seeds_other_mode_from_the_pre_delta_snapshot() {
+        let source = include_str!("production.rs");
+        let body_start = source
+            .find("    fn execute_raw_dpc(")
+            .expect("execute_raw_dpc must exist in this file");
+        let next_fn = source[body_start + 1..]
+            .find("\n    fn ")
+            .map(|offset| body_start + 1 + offset)
+            .unwrap_or(source.len());
+        let body = &source[body_start..next_fn];
+        assert!(
+            body.contains("self.other_mode_before_last_plan"),
+            "execute_raw_dpc must seed `other_mode` from the pre-delta snapshot \
+             `other_mode_before_last_plan`. Reading `rdp_state` directly reads the packet's \
+             own already-folded SetOtherModes, which ran WM2000's first texrect under a \
+             G_TT_RGBA16 the guest had not set yet and sent it down the enabled-TLUT \
+             half-TMEM address path"
+        );
+        assert_eq!(
+            body.matches("self.rdp_state.other_mode()").count(),
+            1,
+            "the only `self.rdp_state.other_mode()` in execute_raw_dpc must be the \
+             `unwrap_or_else` fallback for the no-plan-yet case -- a second, unconditional \
+             one would reintroduce the live-register read the snapshot exists to replace"
+        );
+        assert!(
+            body.contains(".unwrap_or_else(|| self.rdp_state.other_mode())"),
+            "that one call must be the fallback arm specifically, so a backend that has \
+             executed before it ever planned still resolves a mode rather than panicking \
+             on an empty Option"
+        );
+    }
+
+    /// **A REJECTED plan must not replace the `other_mode` snapshot.**
+    ///
+    /// The arm the repair KEEPS, pinned for the same reason the tile
+    /// sibling `a_rejected_plan_leaves_the_previous_submissions_tile_snapshot_in_place`
+    /// pins its own: `other_mode_before_last_plan` is assigned after
+    /// `plan_raw_dpc_inner` returns `Ok`, and hoisting it above that
+    /// fallible call would stamp a boundary for a packet that never
+    /// executes.
+    ///
+    /// The surviving and the rejected packets select DIFFERENT TEXTLUT
+    /// encodings, so a snapshot taken from the wrong side is
+    /// distinguishable from the surviving value.
+    #[test]
+    fn a_rejected_plan_leaves_the_previous_submissions_other_mode_snapshot_in_place() {
+        const TEXTLUT_SHIFT: u32 = 14;
+
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+
+        let mut first = Vec::new();
+        first.extend([word(SET_OTHER_MODE, 0 << TEXTLUT_SHIFT), 0]);
+        first.extend(set_combine(0, 0));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(first)))
+            .expect("the mode-establishing submission plans cleanly");
+        let after_success = backend
+            .other_mode_before_last_plan
+            .expect("a successful plan records the pre-delta other-mode snapshot");
+
+        // A submission that is rejected at plan time -- `FullSync`
+        // alongside a fill, the same refusal the tile sibling uses. It also
+        // carries its own `SetOtherMode` with a TEXTLUT encoding that
+        // appears nowhere else, so a snapshot taken from the wrong side of
+        // the fallible call is distinguishable from the surviving one.
+        let mut bad = partial_width_fill_words();
+        bad.extend([word(SET_OTHER_MODE, 3 << TEXTLUT_SHIFT), 0]);
+        bad.extend([word(FULL_SYNC, 0), 0]);
+        assert!(
+            backend
+                .plan_raw_dpc(session.plan_request(capture(bad)))
+                .is_err(),
+            "positive control: this submission must really be rejected, or the assertion \
+             below would be testing the success path twice"
+        );
+
+        assert_eq!(
+            backend
+                .other_mode_before_last_plan
+                .expect("the snapshot must still be present after a rejected plan"),
+            after_success,
+            "a rejected plan must leave the last SUCCESSFUL submission's other-mode \
+             snapshot untouched. Recording it before `plan_raw_dpc_inner` would stamp a \
+             boundary for a packet that never executes, and the next execute_raw_dpc \
+             would seed its walk from it"
         );
     }
 
