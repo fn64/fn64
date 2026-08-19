@@ -13930,7 +13930,7 @@ mod tests {
     ///
     /// `plan_raw_dpc` and `execute_raw_dpc` are two trait calls for one
     /// submission, and the first folds the whole packet's `RdpStateDelta`
-    /// into `rdp_state`. Seeding the executor's in-order walk from
+    /// into `rdp_state`. Seeding `PlanCollector`'s in-order walk from
     /// `rdp_state` at that point starts it from the packet's FINAL tile
     /// table, so every command before the packet's first `SetTile` reads a
     /// register the guest had not set yet -- time-travelled state.
@@ -13944,6 +13944,21 @@ mod tests {
     /// 40-byte-stride image, and hit the load's undefined row-tail padding
     /// -- `TMEM_SAMPLE_STATUS_INVALID_BYTE`, the abort this repairs.
     ///
+    /// **Asserted on the binding the walk actually produced, never on the
+    /// snapshot field itself.** An earlier draft read
+    /// `backend.tiles_before_last_plan` directly; a mutant that recorded
+    /// the snapshot correctly and then had the executor ignore it (reading
+    /// the live, already-folded `rdp_state` instead -- exactly the
+    /// pre-repair behaviour) SURVIVED that draft. Seeding the collector
+    /// from `WgpuBackend`'s own choice of table, and reading the resulting
+    /// `RetrievedTriangleDraw`, is what kills it: that is the value the
+    /// shader is handed.
+    ///
+    /// A **raw triangle** is the draw, not a texrect: a raw triangle binds
+    /// tile 0 and declares no journal write access, so the packet needs no
+    /// resident color target and the assertion is not gated behind fill
+    /// bookkeeping this defect has nothing to do with.
+    ///
     /// The two `line` values are DIFFERENT and hand-chosen (`3` carried in,
     /// `6` set later) so the assertion distinguishes the two tables rather
     /// than passing against either. `set_tile`'s own wire layout puts
@@ -13953,7 +13968,8 @@ mod tests {
         const CARRIED_IN_LINE: u32 = 3;
         const SET_LATER_IN_PACKET_LINE: u32 = 6;
 
-        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
 
         // Packet one: establish tile 0 with the carry-in `line`.
         let mut first = Vec::new();
@@ -13971,46 +13987,157 @@ mod tests {
                 .expect("packet one bound tile 0")
                 .line_words,
             CARRIED_IN_LINE as u16,
-            "positive control: durable state must really carry the first packet's tile,              or this test would pass vacuously against a table that never held it"
+            "positive control: durable state must really carry the first packet's tile, \
+             or this test would pass vacuously against a table that never held it"
         );
 
-        // Packet two: a `SetTile` for tile 0 with a DIFFERENT `line`, and
-        // nothing before it that reads a tile. Planning folds it into
-        // `rdp_state` immediately.
+        // Packet two, in the WM2000 order that exposed the defect: the
+        // TRIANGLE COMES FIRST, before this packet's own `SetTile`. Its
+        // only tile binding at its own stream position is packet one's.
         let mut second = Vec::new();
+        second.extend(set_other_mode(0, 0));
+        second.extend(set_combine(0, 0));
+        second.extend(triangle_base_edge_words(0, 2, 0));
         second.extend(set_tile(0, SET_LATER_IN_PACKET_LINE, 0));
         second.extend(set_tile_size_words(0, 7 << 2, 2 << 2));
-        backend
+        let planned = backend
             .plan_raw_dpc(session.plan_request(capture(second)))
-            .expect("the tile-changing submission plans cleanly");
+            .expect("the triangle-then-SetTile submission plans cleanly");
 
-        // After the fold, the live registers hold the NEW value...
+        // After the fold, the LIVE registers hold the new value. This is
+        // the discriminator: if the walk seeded from here, the triangle
+        // would come back bound to `SET_LATER_IN_PACKET_LINE`.
         assert_eq!(
             durable_neutral_tiles(&backend.rdp_state)[0]
                 .0
                 .expect("packet two bound tile 0")
                 .line_words,
             SET_LATER_IN_PACKET_LINE as u16,
-            "positive control: the fold must really have happened, otherwise the snapshot              below would agree with the live registers for the wrong reason"
+            "positive control: the fold must really have happened, otherwise the walk \
+             could read the live registers and still look correct"
         );
 
-        // ...but the snapshot the executor seeds from must still hold the
-        // value that was current at the packet's FIRST command. That is the
-        // whole repair: the two must disagree here.
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        // Seeded from `WgpuBackend`'s OWN choice of table -- the same
+        // expression `execute_raw_dpc` uses -- so a mutant that leaves the
+        // snapshot correct but has the executor ignore it is still caught.
         let seed = backend
             .tiles_before_last_plan
-            .expect("a successful plan records the pre-delta tile snapshot");
+            .unwrap_or_else(|| durable_neutral_tiles(&backend.rdp_state));
+        let mut plan_visitor = PlanCollector::seeded(
+            backend.rdp_state.other_mode(),
+            backend.rdp_state.combine(),
+            backend.rdp_state.blend_color(),
+            backend.rdp_state.env_color(),
+            backend.rdp_state.prim_color(),
+            backend.rdp_state.fog_color(),
+            backend.rdp_state.color_image(),
+            seed,
+        );
+        let mut color_targets = None;
+        let configured_target_extent = backend.configured_target_extent;
+        let coordinator = &backend.coordinator;
+        let mut view = ExecutionCollector {
+            physical: coordinator.physical(),
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            plan: PlanCollector::seeded(
+                backend.rdp_state.other_mode(),
+                backend.rdp_state.combine(),
+                backend.rdp_state.blend_color(),
+                backend.rdp_state.env_color(),
+                backend.rdp_state.prim_color(),
+                backend.rdp_state.fog_color(),
+                backend.rdp_state.color_image(),
+                seed,
+            ),
+            reads: Vec::new(),
+            outcome: None,
+            color_targets: &mut color_targets,
+            configured_target_extent,
+            draw_tmem: None,
+        };
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+
         assert_eq!(
-            seed[0]
-                .0
-                .expect("the carried-in tile must still be bound in the snapshot")
-                .line_words,
-            CARRIED_IN_LINE as u16,
-            "a draw at command index 0 of packet two must see the tile packet ONE set \
-             (line {CARRIED_IN_LINE}), never the one packet two installs later \
-             (line {SET_LATER_IN_PACKET_LINE}) -- seeding from the already-folded \
-             `rdp_state` is what time-travelled WM2000's orphaned strip triangle onto a \
-             stride its own load never wrote"
+            view.plan.triangles.len(),
+            1,
+            "positive control: the packet must admit its one raw triangle -- if it admitted \
+             none, the binding assertion below would be vacuous"
+        );
+        let draw = view.plan.triangles.into_iter().next().unwrap();
+        let draw = draw.expect("the admitted triangle retrieves its draw state");
+        assert_eq!(
+            draw.tile_binding.bound, 1,
+            "the triangle must resolve a tile at all"
+        );
+        assert_eq!(
+            draw.tile_binding.line_words, CARRIED_IN_LINE,
+            "the triangle stands BEFORE its packet's own SetTile, so it must carry the tile \
+             packet ONE set (line {CARRIED_IN_LINE}), never the one packet two installs after \
+             it (line {SET_LATER_IN_PACKET_LINE}) -- seeding from the already-folded \
+             `rdp_state` is what time-travelled WM2000's orphaned strip triangle onto a stride \
+             its own load never wrote"
+        );
+    }
+
+    /// **`execute_raw_dpc` must seed the walk from the SNAPSHOT, never
+    /// from the live registers.**
+    ///
+    /// The behavioural test above proves the snapshot holds the right
+    /// table and that a walk seeded from it binds the right tile. It
+    /// cannot prove `execute_raw_dpc` is the thing doing the seeding:
+    /// `RetrievedTriangleDraw` is not reachable through the
+    /// `RenderBackend` trait, so a mutant that records the snapshot
+    /// faithfully and then passes `durable_neutral_tiles(&self.rdp_state)`
+    /// -- exactly the pre-repair line -- SURVIVES it. Measured: it did.
+    ///
+    /// Pinned at the source instead, the same way
+    /// `plan_raw_dpc_inner_decodes_both_passes_against_durable_state_not_default`
+    /// pins its own two-pass choice, because the fact under test is which
+    /// expression appears at one call site.
+    ///
+    /// Both halves are asserted. The `contains` alone would pass a body
+    /// that read the snapshot *and* also fell back to the live table
+    /// unconditionally; the count of bare `durable_neutral_tiles(&self`
+    /// calls pins that the ONLY such call in this function is the
+    /// `unwrap_or_else` fallback, which is reached only before any plan
+    /// has run.
+    #[test]
+    fn execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot() {
+        let source = include_str!("production.rs");
+        let body_start = source
+            .find("    fn execute_raw_dpc(")
+            .expect("execute_raw_dpc must exist in this file");
+        let next_fn = source[body_start + 1..]
+            .find("\n    fn ")
+            .map(|offset| body_start + 1 + offset)
+            .unwrap_or(source.len());
+        let body = &source[body_start..next_fn];
+        assert!(
+            body.contains("self.tiles_before_last_plan"),
+            "execute_raw_dpc must seed its tile walk from the pre-delta snapshot \
+             `tiles_before_last_plan`. Reading `rdp_state` directly reads the packet's own \
+             already-folded SetTiles, which binds every draw standing before the packet's \
+             first SetTile to a register the guest had not set yet"
+        );
+        assert_eq!(
+            body.matches("durable_neutral_tiles(&self").count(),
+            1,
+            "the only `durable_neutral_tiles(&self.rdp_state)` in execute_raw_dpc must be \
+             the `unwrap_or_else` fallback for the no-plan-yet case -- a second, \
+             unconditional one would reintroduce the live-register read the snapshot exists \
+             to replace"
+        );
+        assert!(
+            body.contains(".unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state))"),
+            "that one call must be the fallback arm specifically, so a backend that has \
+             executed before it ever planned still resolves a tile table rather than \
+             panicking on an empty Option"
         );
     }
 
