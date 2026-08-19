@@ -664,7 +664,14 @@ pub(super) fn emit_lld(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg
     }
 }
 
-pub(super) fn emit_sc(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16, double: bool) {
+pub(super) fn emit_sc(
+    out: &mut String,
+    mem_fault: MemFault,
+    rt: Reg,
+    base: Reg,
+    off: i16,
+    double: bool,
+) {
     let addr = format!("Rdram::eff_addr({}, {})", r(base), off);
     let (value, width, store, checked_store) = if double {
         (ru64(rt), 8, "store_d", "try_store_d_translated")
@@ -752,7 +759,12 @@ pub(super) fn emit_bank_fpu_trap(
 }
 
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
-pub(super) fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &MemFault) {
+pub(super) fn emit_straight(
+    out: &mut String,
+    instr: Instruction,
+    _vram: u32,
+    mem_fault: &MemFault,
+) {
     use Instruction::*;
     let line = |out: &mut String, s: String| {
         let _ = writeln!(out, "            {}", s);

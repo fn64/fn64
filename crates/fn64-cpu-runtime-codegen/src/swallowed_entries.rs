@@ -631,6 +631,43 @@ mod tests {
         assert_eq!(check.proven_roots, 1);
     }
 
+    /// MUTATION GUARD for the "already declared" filter specifically.
+    ///
+    /// The fixture above cannot distinguish the filter from the containment
+    /// test, because its declared entry sits exactly at a function boundary
+    /// and so falls strictly inside nobody. Here the proven root is BOTH
+    /// declared as its own entry AND strictly inside an overlapping
+    /// declaration -- the shape a partially-corrected dump has. Only the
+    /// "already declared" filter can keep this clean; dropping it reports a
+    /// function that is already perfectly dispatchable.
+    #[test]
+    fn a_declared_entry_inside_an_overlapping_declaration_is_still_clean() {
+        let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let functions = vec![
+            // Declared size still spans the whole region...
+            DumpFunction {
+                name: "outer".into(),
+                vram: 0x8000_0000,
+                size: 0x1C,
+            },
+            // ...but 0x80000010 is ALSO declared in its own right, so it
+            // already reaches LOOKUP_TABLE and nothing is swallowed.
+            DumpFunction {
+                name: "inner".into(),
+                vram: 0x8000_0010,
+                size: 0xC,
+            },
+        ];
+        let check = cross_check_region(&region, &functions);
+        assert!(check.is_clean(), "{:?}", check.swallowed);
+        assert_eq!(check.proven_roots, 1);
+    }
+
     #[test]
     fn a_jal_target_inside_no_declared_function_is_not_this_defect() {
         // The target falls in a gap between declared functions: a different
