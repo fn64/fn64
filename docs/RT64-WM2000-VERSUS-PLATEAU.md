@@ -120,3 +120,38 @@ leaves the state unchanged.
   *game* array the game fills from those pads, so the question is whether the
   game's own fill loop runs for more than port 0.
 - No claim is made here that a match was reached. It was not.
+
+## CONFIRMED: fn64's controller path is NOT the defect
+
+The array `func_801456C8` reads, `D_80095186`, is filled by the game's own
+per-frame pad poll `func_80004628` (`0x80004628`), which:
+
+- loops all four ports unconditionally (`sltiu $s1, 4` at `0x800049BC`),
+- strides **12** bytes per port into `D_80095180` (`addiu $a1, $a1, 0xC` at
+  `0x800049C4`) and 6 bytes per port through the `OSContPad[]` at
+  `D_80057210`,
+- lays out `+0x4` = held, **`+0x6` = pressed-this-frame**, `+0x8` = released,
+- and **skips a port whose `OSContPad.errno` is nonzero** -- `lbu $v0,
+  %lo(D_80057214)($v0)` at `0x80004928`, which zeroes that port's entry.
+
+Watching `D_80095186` (port 0's pressed word) directly against the merged
+global `D_8011C37E`:
+
+| swap | `D_8011C37E` | `D_80095186` | script |
+|---|---|---|---|
+| 1102 | `0x1000` | **`0x1000`** | START press |
+| 1103 | 0 | 0 | released |
+| 1202 | `0x8000` | **`0x8000`** | A press |
+| 1203 | 0 | 0 | released |
+| 1302 | `0x8000` | **`0x8000`** | A press |
+
+Port 0's pressed word is populated correctly, at the right stride, with the
+right edge semantics, in the exact array the ready check reads. fn64's
+`osContGetReadData_recomp` (`crates/fn64-abi/src/si/mod.rs:1113+`) models
+`errno` deliberately: port 0 reports `errno == 0` with live input, ports 1-3
+report `CONT_NO_RESPONSE_ERROR`, which is the correct emulation of a console
+with one controller plugged in and is what makes the game's own poll zero
+ports 1-3.
+
+**So the plateau is not an input-delivery defect.** A is reaching the guest,
+in the right place, in the right format, every time it is pressed.
