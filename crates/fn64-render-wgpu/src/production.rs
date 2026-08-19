@@ -85,6 +85,48 @@ pub struct WgpuBackend {
     /// prior submission set (e.g. a `SetTile` from submission N read by a
     /// `LoadBlock` in submission N+1).
     rdp_state: RdpState,
+    /// **The tile registers as they stood BEFORE this submission's own
+    /// `SetTile`/`SetTileSize` commands were applied.**
+    ///
+    /// `plan_raw_dpc` and `execute_raw_dpc` are two separate trait calls
+    /// for one submission, and `plan_raw_dpc` folds the whole packet's
+    /// `RdpStateDelta` into `rdp_state` before `execute_raw_dpc` ever runs.
+    /// Seeding the executor's `PlanCollector` from `rdp_state` at that
+    /// point therefore starts the in-order walk from the packet's **final**
+    /// tile table, not its carry-in: every triangle standing before the
+    /// packet's first `SetTile` is then bound to a tile the guest set
+    /// later in the same packet.
+    ///
+    /// Measured on the real ROM: WM2000 draws each sprite strip as
+    /// `SetTile(tile7) -> LoadTile -> SetTile(tile0) -> 2 triangles`, and a
+    /// packet boundary fell between one strip's two triangles. The orphaned
+    /// second triangle sat at command index 0, before its packet's first
+    /// `SetTile`, so it should have carried the previous packet's tile
+    /// (`line_words = 5`). It was bound to `line_words = 4` -- the value
+    /// the packet's own later `SetTile` installed -- and read its rows at a
+    /// 32-byte stride through an image the load had written at a 40-byte
+    /// stride, landing in the undefined row-tail padding and aborting with
+    /// `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
+    ///
+    /// Snapshotted in `plan_raw_dpc` before `RdpState::apply`, consumed by
+    /// the matching `execute_raw_dpc`. `None` until the first successful
+    /// plan, which is also the only state in which no `execute_raw_dpc`
+    /// can legitimately arrive; the executor falls back to `rdp_state`'s
+    /// live tiles in that case, exactly as it did before this field
+    /// existed.
+    ///
+    /// Only the *tile* registers need this. Every other seeded register
+    /// (`other_mode`, `combine`, the constant colors, `color_image`) is
+    /// also folded early, and the same reasoning applies to them -- but
+    /// they are not what this repair measured, and widening the snapshot
+    /// to registers no measurement implicates would be a change with no
+    /// evidence behind it. The narrow field is deliberate.
+    tiles_before_last_plan: Option<
+        [(
+            Option<fn64_render::NeutralTileDescriptor>,
+            Option<fn64_render::NeutralTileSize>,
+        ); 8],
+    >,
     /// `Some` only after a successful `RenderBackend::create`; `try_new`
     /// never populates it. Always `Some` together with
     /// `triangle_target_extent`, never one without the other.
@@ -219,6 +261,7 @@ impl WgpuBackend {
             Self {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
+                tiles_before_last_plan: None,
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
@@ -2071,6 +2114,11 @@ impl RenderBackend for WgpuBackend {
                 backend: "render-wgpu/raw-dpc-plan",
                 reason,
             })?;
+        // BEFORE the fold, not after: see `tiles_before_last_plan`'s doc.
+        // Taken only on the success path, so a rejected plan leaves the
+        // previous submission's snapshot in place rather than replacing it
+        // with one for a packet that never executes.
+        self.tiles_before_last_plan = Some(durable_neutral_tiles(&self.rdp_state));
         self.rdp_state.apply(&delta);
         Ok(planned)
     }
@@ -2089,7 +2137,8 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.prim_color(),
             self.rdp_state.fog_color(),
             self.rdp_state.color_image(),
-            durable_neutral_tiles(&self.rdp_state),
+            self.tiles_before_last_plan
+                .unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state)),
             &mut self.color_targets,
             self.configured_target_extent,
         )
@@ -13873,6 +13922,95 @@ mod tests {
         assert!(
             seeded.current_tiles[0].0.is_none(),
             "seeding must carry only the tiles the guest actually set, never widen to all eight"
+        );
+    }
+
+    /// **A draw standing before its packet's own `SetTile` must carry the
+    /// PREVIOUS packet's tile, not this packet's later one.**
+    ///
+    /// `plan_raw_dpc` and `execute_raw_dpc` are two trait calls for one
+    /// submission, and the first folds the whole packet's `RdpStateDelta`
+    /// into `rdp_state`. Seeding the executor's in-order walk from
+    /// `rdp_state` at that point starts it from the packet's FINAL tile
+    /// table, so every command before the packet's first `SetTile` reads a
+    /// register the guest had not set yet -- time-travelled state.
+    ///
+    /// Measured on WM2000: the ROM emits each sprite strip as
+    /// `SetTile(7) -> LoadTile -> SetTile(0) -> triangle -> triangle`, and
+    /// a packet boundary fell between one strip's two triangles. The
+    /// orphaned triangle, at command index 0, was bound to the packet's
+    /// later `line_words = 4` tile instead of the carried-in
+    /// `line_words = 5`, walked its rows at a 32-byte stride through a
+    /// 40-byte-stride image, and hit the load's undefined row-tail padding
+    /// -- `TMEM_SAMPLE_STATUS_INVALID_BYTE`, the abort this repairs.
+    ///
+    /// The two `line` values are DIFFERENT and hand-chosen (`3` carried in,
+    /// `6` set later) so the assertion distinguishes the two tables rather
+    /// than passing against either. `set_tile`'s own wire layout puts
+    /// `line` in w0 bits 17:9, so these are the values that field carries.
+    #[test]
+    fn a_draw_before_its_packets_first_set_tile_carries_the_previous_packets_tile() {
+        const CARRIED_IN_LINE: u32 = 3;
+        const SET_LATER_IN_PACKET_LINE: u32 = 6;
+
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+
+        // Packet one: establish tile 0 with the carry-in `line`.
+        let mut first = Vec::new();
+        first.extend(set_other_mode(0, 0));
+        first.extend(set_combine(0, 0));
+        first.extend(set_tile(0, CARRIED_IN_LINE, 0));
+        first.extend(set_tile_size_words(0, 7 << 2, 2 << 2));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(first)))
+            .expect("the tile-establishing submission plans cleanly");
+
+        assert_eq!(
+            durable_neutral_tiles(&backend.rdp_state)[0]
+                .0
+                .expect("packet one bound tile 0")
+                .line_words,
+            CARRIED_IN_LINE as u16,
+            "positive control: durable state must really carry the first packet's tile,              or this test would pass vacuously against a table that never held it"
+        );
+
+        // Packet two: a `SetTile` for tile 0 with a DIFFERENT `line`, and
+        // nothing before it that reads a tile. Planning folds it into
+        // `rdp_state` immediately.
+        let mut second = Vec::new();
+        second.extend(set_tile(0, SET_LATER_IN_PACKET_LINE, 0));
+        second.extend(set_tile_size_words(0, 7 << 2, 2 << 2));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(second)))
+            .expect("the tile-changing submission plans cleanly");
+
+        // After the fold, the live registers hold the NEW value...
+        assert_eq!(
+            durable_neutral_tiles(&backend.rdp_state)[0]
+                .0
+                .expect("packet two bound tile 0")
+                .line_words,
+            SET_LATER_IN_PACKET_LINE as u16,
+            "positive control: the fold must really have happened, otherwise the snapshot              below would agree with the live registers for the wrong reason"
+        );
+
+        // ...but the snapshot the executor seeds from must still hold the
+        // value that was current at the packet's FIRST command. That is the
+        // whole repair: the two must disagree here.
+        let seed = backend
+            .tiles_before_last_plan
+            .expect("a successful plan records the pre-delta tile snapshot");
+        assert_eq!(
+            seed[0]
+                .0
+                .expect("the carried-in tile must still be bound in the snapshot")
+                .line_words,
+            CARRIED_IN_LINE as u16,
+            "a draw at command index 0 of packet two must see the tile packet ONE set \
+             (line {CARRIED_IN_LINE}), never the one packet two installs later \
+             (line {SET_LATER_IN_PACKET_LINE}) -- seeding from the already-folded \
+             `rdp_state` is what time-travelled WM2000's orphaned strip triangle onto a \
+             stride its own load never wrote"
         );
     }
 
