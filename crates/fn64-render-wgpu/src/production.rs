@@ -4266,16 +4266,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // Quarter-pixels, because that is the domain `RdpScissorRect` latches
     // in (angrylion `rasterizer.c:2779-2784`); `extent` is in pixels, so it
     // is scaled by four.
-    let scissor = draw_state.scissor.unwrap_or_else(|| {
-        let extent = candidate.key().extent();
-        crate::targets::RdpScissorRect::from_wire_quarter_pixels(
-            0,
-            0,
-            0,
-            u16::try_from(extent.width().saturating_mul(4)).unwrap_or(u16::MAX),
-            u16::try_from(extent.height().saturating_mul(4)).unwrap_or(u16::MAX),
-        )
-    });
+    let scissor = texrect_scissor_or_full_target(draw_state.scissor, candidate.key().extent());
     let completed = crate::targets::execute_texture_rectangle(
         candidate,
         other_mode,
@@ -4290,6 +4281,42 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
         already_initialized,
     )?;
     Ok((completed, accesses))
+}
+
+/// The scissor one texrect is clipped against: the rect latched at its own
+/// stream position, or the whole colour target when the plan has issued
+/// none.
+///
+/// **The fallback is the target's own extent, not an empty rect and not a
+/// refusal.** The RDP's clip registers hold a value from reset onward, so a
+/// display list that never writes them draws unscissored; refusing such a
+/// stream would refuse every one that relies on the boot-time rect. The
+/// target extent is this consumer's honest widest bound -- which is exactly
+/// why `RetrievedTriangleDraw::scissor` leaves the fallback to the
+/// consumer rather than defaulting in the collector, which does not know
+/// the extent.
+///
+/// Quarter-pixels, because that is the domain `RdpScissorRect` latches in
+/// (angrylion `rdp_set_scissor`, `rasterizer.c:2779-2784`), while `extent`
+/// is in pixels -- hence the factor of four on each axis.
+///
+/// A named function rather than an inline closure so a mutation that
+/// derives the height bound from the width is reachable from a unit test;
+/// while it was inline, exactly that mutation left the whole suite green.
+fn texrect_scissor_or_full_target(
+    latched: Option<crate::targets::RdpScissorRect>,
+    extent: crate::targets::ColorTargetExtent,
+) -> crate::targets::RdpScissorRect {
+    latched.unwrap_or_else(|| {
+        let quarter = |pixels: u32| u16::try_from(pixels.saturating_mul(4)).unwrap_or(u16::MAX);
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+            0,
+            0,
+            0,
+            quarter(extent.width()),
+            quarter(extent.height()),
+        )
+    })
 }
 
 /// **One TMEM projection per admitted triangle, each taken at that
@@ -7564,6 +7591,44 @@ mod tests {
             "triangle A must NOT be retroactively affected by a SetFogColor after it in plan \
              order"
         );
+    }
+
+    /// The fallback's two axes come from their OWN extent dimensions.
+    ///
+    /// A DELIBERATELY NON-SQUARE extent: 320x240 is the classic N64 frame,
+    /// and its two axes give different quarter-pixel bounds (1280 vs 960),
+    /// so a fallback deriving the height from the width -- or transposing
+    /// the two -- fails here. A square fixture would pass either way, which
+    /// is exactly the coincidence this case exists to avoid.
+    ///
+    /// Hand-derived: 320 pixels * 4 = 1280 quarter-pixels;
+    /// 240 * 4 = 960. Origin is (0, 0) on both axes.
+    #[test]
+    fn the_texrect_scissor_fallback_is_the_full_target_on_each_axis_separately() {
+        let extent = crate::targets::ColorTargetExtent::try_new(320, 240).unwrap();
+        let scissor = texrect_scissor_or_full_target(None, extent);
+        assert_eq!(scissor.mode(), 0);
+        assert_eq!(scissor.upper_left_x(), 0);
+        assert_eq!(scissor.upper_left_y(), 0);
+        assert_eq!(scissor.lower_right_x(), 1280);
+        assert_eq!(scissor.lower_right_y(), 960);
+        assert_ne!(
+            scissor.lower_right_x(),
+            scissor.lower_right_y(),
+            "the two axes must not collapse onto one dimension"
+        );
+    }
+
+    /// A latched rect wins over the fallback outright -- the fallback is
+    /// only for a plan that issued no `SetScissor` at all. The latched rect
+    /// here is deliberately looser on one axis and tighter on the other
+    /// than the extent's fallback would be, so neither "always fallback"
+    /// nor "min of the two" passes.
+    #[test]
+    fn a_latched_scissor_wins_over_the_full_target_fallback() {
+        let extent = crate::targets::ColorTargetExtent::try_new(320, 240).unwrap();
+        let latched = crate::targets::RdpScissorRect::from_wire_quarter_pixels(1, 8, 12, 400, 2000);
+        assert_eq!(texrect_scissor_or_full_target(Some(latched), extent), latched);
     }
 
     fn fixture_set_scissor(
