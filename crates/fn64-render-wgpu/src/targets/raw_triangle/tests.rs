@@ -114,11 +114,73 @@ fn box_triangle() -> RawTriangle {
 ///   = 0x8000 | 0x07C0 | 0x0010 | 1 = 0x87D1
 const PRIM_RGBA16: [u8; 2] = [0x87, 0xD1];
 
+/// The `ResourceAccess` run a DECODER would declare for `triangle` against
+/// `key`, built here by the same arithmetic `plan_raw_triangle` uses, then
+/// truncated or extended to `declared_rows` so a test can hand the executor
+/// a run that deliberately disagrees.
+///
+/// `declared_rows == None` means "exactly what the decoder would declare".
+fn declared_accesses(
+    key: ColorTargetKey,
+    triangle: &RawTriangle,
+    declared_rows: Option<usize>,
+) -> Vec<fn64_render_ir::ResourceAccess> {
+    let extent = key.extent();
+    let mut rows = crate::raw_dpc::triangle_span::covered_rows(
+        triangle,
+        extent.width(),
+        // The decoder's own bound: installed RDRAM and a fixed row cap, NOT
+        // this target's height. Using the height here would make the two
+        // walks agree by construction and the guard untestable.
+        4096,
+    );
+    if let Some(count) = declared_rows {
+        while rows.len() > count {
+            rows.pop();
+        }
+        while rows.len() < count {
+            let mut extra = *rows.last().expect("at least one row");
+            extra.y += 1;
+            rows.push(extra);
+        }
+    }
+    let layout = layout();
+    let base = key.address().get();
+    let bpp = key.format().bytes_per_pixel();
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let start = base + (row.y * extent.width() + row.x0) * bpp;
+            let end = start + (row.x1 - row.x0) * bpp;
+            fn64_render_ir::ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(index as u32),
+                fn64_render_ir::AccessMode::Write,
+                fn64_render_ir::AccessPurpose::RenderTarget,
+                fn64_render_ir::ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+                    range: layout.range(start, end).expect("inside the fixture layout"),
+                },
+            )
+            .expect("a well-formed render-target write")
+        })
+        .collect()
+}
+
 fn run(
     key: ColorTargetKey,
     triangle: &RawTriangle,
     resident: &[u8],
     declared_rows: usize,
+) -> Result<Vec<u8>, TexrectExecutionError> {
+    let declared = declared_accesses(key, triangle, Some(declared_rows));
+    run_with(key, triangle, resident, &declared)
+}
+
+fn run_with(
+    key: ColorTargetKey,
+    triangle: &RawTriangle,
+    resident: &[u8],
+    declared: &[fn64_render_ir::ResourceAccess],
 ) -> Result<Vec<u8>, TexrectExecutionError> {
     let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
     let candidate = registry.begin_candidate(key).unwrap();
@@ -129,7 +191,7 @@ fn run(
         flat_shading(),
         TexrectBlendRegisters::default(),
         resident,
-        declared_rows,
+        declared,
     )?;
     Ok(completed.device_bytes().device_bytes().to_vec())
 }
@@ -197,7 +259,7 @@ fn the_written_colour_comes_from_the_latched_program_not_a_constant() {
         shading,
         TexrectBlendRegisters::default(),
         &resident,
-        3,
+        &declared_accesses(key, &box_triangle(), Some(3)),
     )
     .expect("a flat triangle rasterizes");
     let bytes = completed.device_bytes().device_bytes();
@@ -339,6 +401,49 @@ fn a_row_count_disagreeing_with_the_journal_is_refused_by_name() {
     ));
 }
 
+/// **The same number of rows over different geometry is still a
+/// disagreement.**
+///
+/// The count check alone would pass a journal that declares three rows at
+/// the wrong X ranges -- and `fill_completed_writes` would then digest those
+/// wrong ranges from the buffer, putting the resident's untouched bytes into
+/// guest RDRAM under a valid digest for pixels the triangle never covered.
+///
+/// Shifting one declared row two pixels left is exactly that shape: same
+/// count, same target, different bytes.
+#[test]
+fn a_declared_row_at_the_wrong_range_is_refused_even_when_the_count_matches() {
+    let key = key_at(8, 4);
+    let resident = sentinel_resident(key);
+    let mut declared = declared_accesses(key, &box_triangle(), None);
+    assert_eq!(declared.len(), 3);
+    // Row 1's real range is 0x400 + (1*8 + 2)*2 = 0x414 .. 0x41c. Shift it
+    // two pixels (four bytes) left.
+    let layout = layout();
+    declared[1] = fn64_render_ir::ResourceAccess::try_new(
+        fn64_render_ir::OperationId::new(1),
+        fn64_render_ir::AccessMode::Write,
+        fn64_render_ir::AccessPurpose::RenderTarget,
+        fn64_render_ir::ResourceRegion::Rdram {
+            resource: fn64_render_ir::RdramResource::ColorFramebuffer,
+            range: layout.range(0x410, 0x418).unwrap(),
+        },
+    )
+    .unwrap();
+    let result = run_with(key, &box_triangle(), &resident, &declared);
+    assert!(
+        matches!(
+            result,
+            Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                position: 1,
+                declared: (0x410, 8),
+                rasterized: (0x414, 8),
+            })
+        ),
+        "a shifted declared row must be refused by name, got {result:?}"
+    );
+}
+
 #[test]
 fn a_short_target_makes_the_row_counts_disagree_rather_than_clipping() {
     // The real-world shape of the guard: the decoder bounded its walk by
@@ -370,7 +475,7 @@ fn fill_and_copy_cycle_are_both_refused_by_name() {
             flat_shading(),
             TexrectBlendRegisters::default(),
             &resident,
-            3,
+            &declared_accesses(key, &box_triangle(), Some(3)),
         );
         assert!(
             matches!(
@@ -407,7 +512,7 @@ fn a_program_reading_shade_is_refused_rather_than_combined_against_zero() {
         ),
         TexrectBlendRegisters::default(),
         &resident,
-        3,
+        &declared_accesses(key, &box_triangle(), Some(3)),
     );
     assert!(
         matches!(
@@ -460,7 +565,7 @@ fn the_claimed_rectangle_is_the_bounding_box_of_the_covered_rows() {
         flat_shading(),
         TexrectBlendRegisters::default(),
         &resident,
-        3,
+        &declared_accesses(key, &box_triangle(), Some(3)),
     )
     .unwrap();
     let rectangle = completed.rectangle();
