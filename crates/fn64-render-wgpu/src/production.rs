@@ -14085,6 +14085,76 @@ mod tests {
         );
     }
 
+    /// **A REJECTED plan must not replace the snapshot.**
+    ///
+    /// `tiles_before_last_plan` is recorded on `plan_raw_dpc`'s success
+    /// path only, after `plan_raw_dpc_inner` returns `Ok`. Moving it above
+    /// that call would record a snapshot for a packet that never executes,
+    /// so the next `execute_raw_dpc` -- which belongs to whichever
+    /// submission planned last SUCCESSFULLY -- would be seeded from the
+    /// wrong boundary.
+    ///
+    /// This is the arm the repair KEEPS rather than the one it changed, and
+    /// it had no test: the mutant that hoists the assignment above the
+    /// fallible call survived every other assertion in this file.
+    ///
+    /// The rejected packet's `SetTile` uses a `line` that appears nowhere
+    /// else, so a snapshot taken from the wrong side is distinguishable
+    /// from both the surviving value and any default.
+    #[test]
+    fn a_rejected_plan_leaves_the_previous_submissions_tile_snapshot_in_place() {
+        const SURVIVING_LINE: u32 = 3;
+
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+
+        // One submission that plans cleanly and sets tile 0.
+        let mut good = Vec::new();
+        good.extend(set_other_mode(0, 0));
+        good.extend(set_combine(0, 0));
+        good.extend(set_tile(0, SURVIVING_LINE, 0));
+        good.extend(set_tile_size_words(0, 7 << 2, 2 << 2));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(good)))
+            .expect("the tile-establishing submission plans cleanly");
+
+        let after_success = backend
+            .tiles_before_last_plan
+            .expect("a successful plan records a snapshot");
+        assert!(
+            after_success[0].0.is_none(),
+            "positive control: this FIRST plan's own snapshot is the state before it ran, \
+             which bound no tile -- if it already carried one, the comparison below could \
+             not tell a preserved snapshot from a re-taken one"
+        );
+
+        // A submission that is rejected at plan time. `FullSync` alongside
+        // a fill is refused (see the T-13 test above), and this stream also
+        // carries a `SetTile` -- so a snapshot taken before the fallible
+        // call would still differ from the one above, by now holding the
+        // tile the FIRST submission set.
+        let mut bad = partial_width_fill_words();
+        bad.extend(set_tile(0, SURVIVING_LINE + 1, 0));
+        bad.extend([word(FULL_SYNC, 0), 0]);
+        assert!(
+            backend
+                .plan_raw_dpc(session.plan_request(capture(bad)))
+                .is_err(),
+            "positive control: this submission must really be rejected, or the assertion \
+             below would be testing the success path twice"
+        );
+
+        assert_eq!(
+            backend
+                .tiles_before_last_plan
+                .expect("the snapshot must still be present after a rejected plan"),
+            after_success,
+            "a rejected plan must leave the last SUCCESSFUL submission's snapshot untouched. \
+             Recording it before `plan_raw_dpc_inner` would stamp a boundary for a packet \
+             that never executes, and the next execute_raw_dpc would seed its tile walk \
+             from it"
+        );
+    }
+
     /// **`execute_raw_dpc` must seed the walk from the SNAPSHOT, never
     /// from the live registers.**
     ///
