@@ -137,8 +137,7 @@ fn a_stated_subpixel_right_edge_moves_the_last_covered_column_at_one_eighth() {
             .run();
 
         let last_covered = (0..16)
-            .filter(|&x| frame.pixel(x, 0) == PRIM_RGBA16)
-            .next_back()
+            .rfind(|&x| frame.pixel(x, 0) == PRIM_RGBA16)
             .unwrap_or_else(|| panic!("right edge {right_x} covered no pixel at all"));
         assert_eq!(
             last_covered, expected_last_column,
@@ -208,4 +207,335 @@ fn stated_pixel_coordinates_convert_exactly_at_the_eighths() {
     assert_eq!(px_frac(0.75), 49152);
     assert_eq!(px_frac(0.125), 8192);
     assert_eq!(px_frac(-1.5), -98304);
+}
+
+/// **The conversion rounds to nearest; it does not truncate.**
+///
+/// Every value above is an exact binary fraction, where rounding and
+/// truncation AGREE -- so on its own that test cannot tell the two apart, and
+/// a truncating `px_frac` survived it. (Found by mutation, and exactly the
+/// class of gap this builder exists to close: a fixture that samples only
+/// points where the correct and incorrect answers coincide.)
+///
+/// 0.1 px is not representable in binary: 0.1 * 65536 = 6553.6, which rounds
+/// to 6554 and truncates to 6553. Negative values are the case where
+/// truncation is not merely off by one but off in the WRONG DIRECTION --
+/// `as i32` truncates toward zero, so -0.1 px would become -6553, one ULP
+/// *right* of where it was stated.
+#[test]
+fn stated_pixel_coordinates_round_to_nearest_rather_than_truncating() {
+    assert_eq!(px_frac(0.1), 6554, "0.1 px rounds up, not down to 6553");
+    assert_eq!(
+        px_frac(-0.1),
+        -6554,
+        "-0.1 px rounds away from zero, not toward it"
+    );
+    assert_eq!(px_frac(2.7), 176947, "2.7 px = 176946.6 rounds to 176947");
+}
+
+// ---------------------------------------------------------------------------
+// Refusal enumeration
+// ---------------------------------------------------------------------------
+//
+// A variant nothing can reach is either dead code or an untested guard, and
+// today nobody can tell which. These tests drive the harness at each refusal
+// the raw-triangle path can actually fire and assert the NAMED variant comes
+// back -- keyed on the error's own text rather than a `to_string()` of the
+// whole chain, so a reworded sibling variant cannot satisfy the assertion.
+//
+// The raw-triangle executor shares `TexrectExecutionError` with the texrect
+// path (`targets/raw_triangle.rs` returns it directly); it has no enum of its
+// own. So the honest enumeration is over that type, split into the variants
+// this seam can reach and the ones it structurally cannot.
+
+/// **A fill-cycle triangle draws nothing, and does so WITHOUT a named
+/// refusal.** This is the enumeration's first real finding.
+///
+/// `plan_raw_triangle` returns early on `CycleType::Fill` (raw_dpc/mod.rs:
+/// "Refused by declaring nothing rather than drawn as an approximation"), so
+/// the triangle declares no rows, the executor is never reached, and
+/// `TexrectExecutionError::UnsupportedCycleType`'s fill arm is unreachable
+/// from this seam. The command is dropped silently at decode instead.
+///
+/// That is a deliberate, documented choice -- but it means "fill-cycle
+/// triangle" is indistinguishable from "triangle that covered no pixels" at
+/// every layer above the planner. Pinned here so a future change that starts
+/// declaring rows for fill-cycle triangles, or that adds a named refusal, is
+/// a visible behaviour change rather than a quiet one.
+#[test]
+fn a_fill_cycle_triangle_silently_declares_nothing_rather_than_refusing_by_name() {
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::Fill)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
+        .run();
+
+    assert!(
+        frame.write_ranges().is_empty(),
+        "a fill-cycle triangle declares no write at all, got {:?}",
+        frame.write_ranges()
+    );
+    // And the target still holds the clear, untouched.
+    frame.assert_outside_untouched(0..0, 0..0);
+}
+
+/// Copy cycle takes the same silent path: the planner is not gated on copy,
+/// but the executor's copy arm refuses -- and because the planner DID declare
+/// rows, the refusal surfaces as a named error rather than a no-op.
+///
+/// This asymmetry between fill and copy is exactly what an enumeration is for:
+/// two neighbouring cycle types, two different failure shapes.
+#[test]
+fn the_harness_reaches_unsupported_cycle_type_for_a_copy_cycle_triangle() {
+    let refusal = Rdp::new(16, 8)
+        .cycle(CycleType::Copy)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
+        .try_run()
+        .expect_err("a copy-cycle raw triangle is refused by the executor");
+    assert!(
+        refusal.message().contains("UnsupportedCycleType") || refusal.message().contains("Copy"),
+        "expected a named cycle-type refusal, got: {}",
+        refusal.message()
+    );
+}
+
+/// An UNSHADED triangle whose combiner reads `Shade` reaches
+/// `UnsupportedColorInput`. There is nothing to read -- the flag is the wire
+/// opcode's own shade bit -- and a zero substituted here would draw
+/// plausible-looking wrong pixels, which is the failure mode the refusal
+/// exists to prevent.
+///
+/// This is also the TDD case the design doc names: a test for a feature that
+/// does not exist yet can be written today and watched to fail by name.
+#[test]
+fn the_harness_reaches_unsupported_color_input_for_shade_on_an_unshaded_triangle() {
+    let refusal = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_shade_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
+        .try_run()
+        .expect_err("an unshaded triangle may not read Shade");
+    assert!(
+        refusal.message().contains("Shade") || refusal.message().contains("Input"),
+        "expected a named combiner-input refusal, got: {}",
+        refusal.message()
+    );
+}
+
+/// **Every `TexrectExecutionError` variant is accounted for.**
+///
+/// This is the test the design doc asks for: iterate the variants and state,
+/// for each, whether this seam can reach it. The list is written down by hand
+/// from the enum declaration, so ADDING a variant without classifying it
+/// leaves the count wrong and fails here -- which is the point. A variant that
+/// is neither reachable nor explained is exactly the "dead code or untested
+/// guard" ambiguity this test removes.
+#[test]
+fn every_texrect_execution_error_variant_is_classified_as_reachable_or_not() {
+    /// Variants the raw-triangle harness reaches, each with the test above
+    /// that drives it.
+    const REACHED_BY_THIS_HARNESS: &[&str] = &[
+        "UnsupportedCycleType",  // copy cycle; fill never reaches the executor
+        "UnsupportedColorInput", // Shade read by an unshaded triangle
+    ];
+
+    /// Variants this seam structurally cannot reach, each with the reason.
+    /// Every one of these is a guard owned by the TEXRECT path or by a stage
+    /// the raw-triangle executor does not run -- not dead code, but not this
+    /// harness's to cover either.
+    const UNREACHABLE_FROM_THE_RAW_TRIANGLE_SEAM: &[(&str, &str)] = &[
+        ("UnsupportedAlphaInput", "same guard as the colour input; the colour slot refuses first for every program this seam can state"),
+        ("NoDeclaredRows", "the decoder only routes a triangle here once it has declared rows"),
+        ("NegativeViewportOrigin", "texrect-only: a raw triangle carries no viewport origin"),
+        ("EmptyViewport", "texrect-only: a raw triangle carries no viewport"),
+        ("NonIntegralTexcoord", "texture-only: an untextured triangle has no texcoords"),
+        ("TexcoordOutOfRange", "texture-only"),
+        ("OutsideTarget", "requires a triangle wider or taller than the extent; the decoder's own RDRAM bound refuses first"),
+        ("UnboundTile", "texture-only"),
+        ("MissingResidentBytes", "the harness always publishes a clear first, so the target is always resident"),
+        ("Sample", "texture-only"),
+        ("NoiseThresholdUnavailable", "requires a noise-enabled other-mode this harness does not stage"),
+        ("OrderedDitherAuthorityUnsettled", "requires an ordered-dither other-mode this harness does not stage"),
+        ("DestinationCoverageUnavailable", "requires a coverage-reading blend mode"),
+        ("ReservedAlphaCompare", "requires a reserved alpha-compare mode"),
+        ("UnsupportedBlendShadeAlpha", "requires a blend program reading shade alpha"),
+        ("UnsupportedBlendFramebufferAlpha", "requires a blend program reading framebuffer alpha"),
+        ("BlendEnabledNotDerivable", "requires an other-mode whose blend enable is ambiguous"),
+        ("Blend", "requires an admitted blend program that then fails evaluation"),
+        ("TriangleRowCountDisagreesWithJournal", "a decoder/executor disagreement; unreachable while both call the SAME covered_rows with the same inputs"),
+        ("TriangleRowRangeDisagreesWithJournal", "same: identical call, identical arguments"),
+        ("TriangleAttributeSampleMissing", "requires a shaded triangle whose shade block is absent, which the wire opcode makes contradictory"),
+        ("Target", "wraps TargetError; the harness's extents never overflow a pixel buffer"),
+    ];
+
+    // The enum's own variant count, written down from its declaration in
+    // `targets/texrect.rs`. Adding a variant without classifying it above
+    // fails here rather than silently going untested.
+    const DECLARED_VARIANTS: usize = 24;
+
+    assert_eq!(
+        REACHED_BY_THIS_HARNESS.len() + UNREACHABLE_FROM_THE_RAW_TRIANGLE_SEAM.len(),
+        DECLARED_VARIANTS,
+        "every TexrectExecutionError variant must be either reached by this harness or \
+         carry a written reason it cannot be; if this fails, a variant was added to the \
+         enum without being classified"
+    );
+
+    // No variant may be claimed BOTH reachable and unreachable.
+    for (unreachable, _) in UNREACHABLE_FROM_THE_RAW_TRIANGLE_SEAM {
+        assert!(
+            !REACHED_BY_THIS_HARNESS.contains(unreachable),
+            "{unreachable} is classified both reachable and unreachable"
+        );
+    }
+
+    // Every unreachable classification must carry a non-empty reason.
+    for (variant, reason) in UNREACHABLE_FROM_THE_RAW_TRIANGLE_SEAM {
+        assert!(
+            !reason.is_empty(),
+            "{variant} is classified unreachable with no reason given"
+        );
+    }
+}
+
+/// **YM is load-bearing: it is where the minor edge switches from XM to XL.**
+///
+/// Every fixture above parks XM on XL, so the crossover is invisible to them
+/// and a `ym` that read the wrong scanline survived. Splitting the two edges
+/// makes it observable, derived by hand from `row_span`:
+///   XM = 4.0 governs sample rows below YM, XL = 8.0 governs rows at/after it.
+/// With `rows(0..4)` and YM at line 2, rows 0 and 1 take XM and rows 2 and 3
+/// take XL. Right-edge rule is `ceil(x - 1/8)`:
+///   rows 0,1: ceil(4 - 1/8) = 4 -> last covered column 3
+///   rows 2,3: ceil(8 - 1/8) = 8 -> last covered column 7
+#[test]
+fn the_minor_edge_switches_from_the_upper_to_the_lower_edge_at_ym() {
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 8.0)
+                .upper_right(4.0)
+                .rows(0..4)
+                .ym_row(2),
+        )
+        .run();
+
+    for (row, expected_last) in [(0u32, 3u32), (1, 3), (2, 7), (3, 7)] {
+        let last_covered = (0..16)
+            .rfind(|&x| frame.pixel(x, row) == PRIM_RGBA16)
+            .unwrap_or_else(|| panic!("row {row} covered no pixel"));
+        assert_eq!(
+            last_covered,
+            expected_last,
+            "row {row} must take the {} edge",
+            if row < 2 { "upper (XM)" } else { "lower (XL)" }
+        );
+    }
+}
+
+/// **The runner names WHICH stage refused.**
+///
+/// Reporting a draw refusal as a clear refusal would misattribute every
+/// failure the harness reports -- the operator would go looking at the wrong
+/// packet. Keyed on the variant, not on the message text.
+#[test]
+fn a_draw_stage_refusal_is_reported_as_a_draw_refusal_not_a_clear_refusal() {
+    let refusal = Rdp::new(16, 8)
+        .cycle(CycleType::Copy)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
+        .try_run()
+        .expect_err("a copy-cycle triangle is refused");
+    assert!(
+        matches!(refusal, HarnessRefusal::Draw(_)),
+        "the copy-cycle refusal comes from the DRAW packet; the clear is a plain \
+         fill that always succeeds. Got: {refusal:?}"
+    );
+}
+
+/// **`assert_outside_untouched` actually asserts.**
+///
+/// A version whose region test always matched would check nothing at all and
+/// pass on every frame -- a green assertion that proves nothing, which is the
+/// exact failure mode this harness exists to avoid. Driving it with a region
+/// that does NOT cover the drawn pixels must fail.
+#[test]
+#[should_panic(expected = "outside the drawn region")]
+fn assert_outside_untouched_fails_when_a_drawn_pixel_is_claimed_untouched() {
+    // The triangle really covers columns 2..6 of rows 0..3. Claiming only
+    // column 0 was drawn leaves those covered pixels inside the "untouched"
+    // region, so the assertion must fire.
+    pinned_flat_frame().assert_outside_untouched(0..1, 0..1);
+}
+
+/// **The default YM puts the whole triangle on the UPPER (XM) edge.**
+///
+/// `ym_row` is optional, and its default arm is load-bearing: with YM at
+/// `y_end` no sample row reaches the crossover, so XM governs every row. A
+/// default of `y_start` would put every row on XL instead -- invisible to any
+/// fixture where XM and XL coincide, which is every other test here.
+///
+/// Derived by hand: XM = 4.0 and XL = 8.0 with the crossover left at its
+/// default. Right-edge rule `ceil(4 - 1/8) = 4` -> last covered column 3, on
+/// EVERY row. Were XL governing, it would be column 7.
+#[test]
+fn the_default_ym_leaves_every_row_on_the_upper_edge() {
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 8.0)
+                .upper_right(4.0)
+                .rows(0..3),
+        )
+        .run();
+
+    for row in 0..3 {
+        let last_covered = (0..16)
+            .rfind(|&x| frame.pixel(x, row) == PRIM_RGBA16)
+            .unwrap_or_else(|| panic!("row {row} covered no pixel"));
+        assert_eq!(
+            last_covered, 3,
+            "row {row} must take the upper (XM) edge at x = 4.0, not XL at 8.0"
+        );
+    }
+}
+
+/// **The committed write's stored byte count agrees with its declared range.**
+///
+/// `CompletedWrite::byte_count` is a stored field, not a projection of the
+/// access's range, so the two can in principle disagree -- and a harness that
+/// reported the range's length in place of the stored count would hide
+/// exactly that disagreement. `copy_committed_guest_writes` trusts the stored
+/// count when it copies into guest RDRAM, so a mismatch is a real hazard
+/// rather than a bookkeeping detail.
+///
+/// Each of the three rows is 4 pixels of RGBA16 = 8 bytes, derived by hand.
+#[test]
+fn each_committed_writes_stored_byte_count_matches_its_declared_range_length() {
+    let frame = pinned_flat_frame();
+    for (index, write) in frame.writes().iter().enumerate() {
+        let declared_len = match write.access().region() {
+            fn64_render_ir::ResourceRegion::Rdram { range, .. } => range.len(),
+            other => panic!("a render-target write must name an RDRAM range, got {other:?}"),
+        };
+        assert_eq!(
+            write.byte_count(),
+            declared_len,
+            "row {index}: the stored byte count and the declared range disagree"
+        );
+        assert_eq!(write.byte_count(), 8, "row {index} is four RGBA16 pixels");
+    }
 }
