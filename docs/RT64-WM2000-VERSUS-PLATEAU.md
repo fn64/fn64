@@ -513,3 +513,55 @@ not sound: it rested on a second-controller test that never pressed pad 1, and
 it left the deciding question -- which loop exit -- explicitly unmeasured. The
 loop exit is now measured (entries VISITED, fields `[1, 2, 0, 0]`), and the
 conclusion now rests on a counterfactual that moves the game.
+
+## NEW, and only reachable past the plateau: a missing entry point at 0x801226A0
+
+With the plateau broken, `run4` ran **171 further swaps of previously
+unreached game code** (state 34, swaps 2312-2483) and then stopped on a real
+fn64 gap:
+
+```
+panicked at crates/fn64-cpu-runtime/src/runtime/host.rs:549:
+lookup: no recompiled function or host shim at vram 0x801226A0
+```
+
+(The `rc=134` that followed is a *teardown* abort -- `run_dtors` -> `Executor`
+drop -> `force_unwind_slow` on a live coroutine, visible in the backtrace at
+frames 21-25. It is a consequence of aborting mid-coroutine, not a second
+defect, but it does mean a guest trap on this lane surfaces as SIGABRT rather
+than a clean exit.)
+
+**What 0x801226A0 is.** It is not a function start. In
+`aki-recomp/games/NWXE/disasm/asm/73390.s:6610` it is an **`alabel`** -- a
+mid-function branch target -- inside a loop body:
+
+```
+8012269C  lw    $v0, 0x2FC($s2)
+alabel func_801226A0
+801226A0  andi  $v0, $v0, 0x80        # <-- the jal target
+801226A4  bnez  $v0, .L801226B4
+```
+
+and the SAME address is a different instruction in a different overlay bank
+(`asm/809D0.s:6716`, `func_801226A0_bank3_text`, `beqz $v0, .L801226B8`).
+Meanwhile `asm/D2720.s:103` calls it as a function outright:
+
+```
+800E1CD0  jal   func_801226A0
+```
+
+So this is the **bank-overlaid interior-entry** class: `recompile_rom` emits
+whole functions, and a `jal` into another bank's function *interior* has no
+emitted entry point to bind. The address is genuinely ambiguous across banks,
+so the fix is not a one-line symbol addition -- it needs the bank the caller
+is running under to select which of the two `0x801226A0` bodies to enter.
+
+This is left as a measured, reproducible next card rather than fixed here: it
+is a recompiler-coverage question, not a controller question, and this card's
+scope is the controller/SI path. **Reproduce it with:**
+
+```
+WM2000_PORTS=2 WM2000_INPUT_SCRIPT=<the lead-in> WM2000_READY_PROBE=2090-3000
+```
+
+which reaches it deterministically at swap ~2483.
