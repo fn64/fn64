@@ -687,8 +687,10 @@ three-way split of `func_8012079C_bank3_text` in a scratch `dump.toml`.
 | unsplit (as shipped) | 2 | **both aborted at VI swap 1901**, `lookup: no recompiled function or host shim at vram 0x80120854` |
 | split | see below | **cleared swap 1901 with zero traps** |
 
-The split lane reached swap 1907 and beyond with `traps=0`, i.e. past the
-exact swap where both unsplit runs died. In the split crate every call site
+The split lane cleared swap 1901 with `traps=0` and kept going, reaching
+swap **2424** and beyond -- past the exact swap where both unsplit runs
+died, and past the 2397 that was the best any unsplit solo run had ever
+managed. In the split crate every call site
 is now a direct call --
 `call_host_or_recompiled(0x80120854, func_80120854_bank3_text, ctx, mem)` --
 and `0x80120854` is a row in `LOOKUP_TABLE`, so the trap is removed
