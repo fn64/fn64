@@ -953,3 +953,36 @@ thing the screen waits on is reachable in principle, and is not port presence.
    every model is untextured flat-shaded. This does not block the transition
    -- the guest is composing correctly -- but it means a reached match would
    still not be readable, so it is on the path to the headline goal.
+
+## CONFIRMED (2026-08-19): the concurrency artefact is a SIGKILL, host-wide
+
+A ready-check probe run with its OWN scratch tree, its OWN built binary and
+`WM2000_NO_TRACE=1` -- so neither documented collision mode (shared sibling
+tree, shared `WM2000_TRACE_PATH`) could apply -- still died at swap ~1910 with
+**`rc=137` (SIGKILL)**, having logged a clean state ladder up to that point:
+
+```
+[wm2000-boot] progress: steps=300000 sim_time=5821133391 vi_swaps=1855 ...
+[wm2000-input] swap #1900: pad0 -> buttons=0x8000
+[wm2000-input] swap #1910: pad0 -> buttons=0x0000
+<killed>
+```
+
+At that moment **eight** `wm2000-boot` processes were resident (this lane's
+one plus another lane's four, each near 100% CPU on a 15-core host). Every one
+of them disappeared together; immediately afterwards `pgrep -f
+release/wm2000-boot` returned nothing at all, including the other lane's runs
+that this lane never touched.
+
+So the failure is not `cp: File exists` and not a shared trace file: it is the
+**host** reclaiming every large-RDRAM process at once. That matters for the
+diagnosis discipline because a SIGKILL at a fixed-looking swap is exactly the
+shape of a "plateau" -- a run that stops advancing at a repeatable swap -- and
+the only thing separating the two is the exit code. **Record `rc` for every
+probe run**; a plateau claim from a run whose `rc` was never read is not
+evidence.
+
+Ownership, when clearing runs: `pgrep -f release/wm2000-boot` lists every
+lane's PIDs identically. Distinguish them by working directory --
+`lsof -a -p <pid> -d cwd -Fn` -- and kill only PIDs whose cwd is this lane's
+scratch root. `pkill -f wm2000-boot` destroys other sessions' runs.
