@@ -8275,6 +8275,68 @@ mod tests {
         );
     }
 
+    /// **The arm the sync fix deliberately KEPT, pinned so it cannot be
+    /// widened away.**
+    ///
+    /// Admitting the sync-only packet above narrowed `NoCompletedLoads` to
+    /// "no load, no triangle, AND no sync". Without this test, deleting the
+    /// refusal outright -- routing every load-free plan to
+    /// `NoPhysicalSuccessor` -- passes the whole suite, so nothing would
+    /// distinguish the correct narrowing from simply dropping the guard.
+    /// (Measured: that exact mutant survives the suite without this test.)
+    ///
+    /// The fixture is a packet of `SetOtherMode`/`SetCombine` and nothing
+    /// else: pure durable RDP register writes, which `PlanCollector` folds
+    /// into `current_other_mode`/`current_combine` and pushes onto no
+    /// command list at all. It therefore carries zero loads, zero
+    /// triangles, zero texrects, zero fills and zero `SYNC_FULL` sites --
+    /// the one shape that genuinely has no command whose completion this
+    /// backend could account for, and the only shape this refusal still
+    /// names.
+    #[test]
+    fn a_plan_with_no_load_no_triangle_and_no_sync_is_still_refused_by_name() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+
+        let planned = plan_with_no_reads(&mut backend, &session, state_only_words());
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        match backend.execute_raw_dpc(bound) {
+            Err(RenderError::Backend { reason, .. }) => assert_eq!(
+                reason,
+                WgpuRawDpcExecutionError::NoCompletedLoads.to_string(),
+                "a plan carrying only durable register writes has no completable command;                  admitting it would mean the sync fix widened the refusal away instead of                  narrowing it"
+            ),
+            other => panic!(
+                "a plan with no load, no triangle and no sync must be refused by name, got                  {other:?}"
+            ),
+        }
+    }
+
+    /// **Positive control for the refusal fixture above.** Proves the
+    /// state-only packet really carries none of the three completable
+    /// command kinds -- otherwise the refusal it asserts could be firing
+    /// for some other reason entirely.
+    #[test]
+    fn the_state_only_fixture_really_carries_no_completable_command() {
+        let plan = plan_of_no_reads(state_only_words());
+
+        assert!(plan.loads.is_empty(), "no TMEM loads");
+        assert!(plan.triangles.is_empty(), "no admitted triangles");
+        assert!(plan.texrect_commands.is_empty(), "no texrects");
+        assert!(plan.fills.is_empty(), "no fills");
+        assert!(plan.full_sync_sites.is_empty(), "no SYNC_FULL sites");
+        assert_eq!(
+            plan.next_command_index, 2,
+            "the packet is exactly two wire commands -- SetOtherMode and SetCombine -- so the              emptiness asserted above is emptiness of COMPLETABLE work, not an empty stream"
+        );
+        assert!(
+            plan.current_other_mode.is_some() && plan.current_combine.is_some(),
+            "both register writes must have been folded into durable state, or the fixture is              not the shape this test claims"
+        );
+    }
+
     /// Ordering: a submission whose triangle draw FAILS must leave no
     /// redeemable fill token behind.
     ///
@@ -11230,6 +11292,18 @@ mod tests {
     /// word -- every RDP command in this module's fixtures is two words.
     fn sync_only_words() -> Vec<u32> {
         vec![word(FULL_SYNC, 0), 0]
+    }
+
+    /// A packet of nothing but durable RDP register writes: `SetOtherMode`
+    /// and `SetCombine`, which `PlanCollector` folds into
+    /// `current_other_mode`/`current_combine` and pushes onto no command
+    /// list. Two real wire commands, zero completable ones -- the only
+    /// shape `NoCompletedLoads` still refuses.
+    fn state_only_words() -> Vec<u32> {
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(0, 0));
+        words
     }
 
     /// [`plan_of`] for a fixture that declares no `TmemLoadSource` reads
