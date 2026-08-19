@@ -70,8 +70,9 @@
 //    decodes are still not ported here; a disabled-TLUT footprint requiring
 //    any of them reports `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`.
 //
-// `TmemFirstRowParity::Even` is frozen for every sample this slice
-// issues (card §6) -- see `TMEM_FIRST_ROW_PARITY_EVEN` below.
+// First-row parity is DERIVED PER TILE from the bound tile's own `low_t`,
+// never frozen -- see `tmem_first_row_parity_odd` below, which carries the
+// same rule `targets/texrect.rs` applies on the CPU side.
 //
 // GPU-side validity-sentinel encoding (card §6, matching
 // `tmem/gpu_projection.rs`'s own doc verbatim): a parallel bitmap, one bit
@@ -99,10 +100,37 @@ const TMEM_BYTES: u32 = 4096u;
 const TMEM_VALIDITY_WORDS: u32 = 128u;
 const TMEM_ADDRESS_MASK: u32 = 0x0fffu;
 
-// Card §6: `TmemFirstRowParity::Even` is frozen for every sample this slice
-// issues. `false` here means "first row is even" (no XOR4 exchange bias),
-// matching `tmem/read.rs`'s `TmemFirstRowParity::Even` variant exactly.
-const TMEM_FIRST_ROW_PARITY_ODD: bool = false;
+// **First-row parity is derived per tile, never frozen.**
+// `tmem/read.rs`'s `TmemFirstRowParity` is explicit caller input -- the
+// reader never infers it -- so this shader owes the reader the same parity
+// the *writer* used, exactly as `targets/texrect.rs`'s
+// `execute_scheduled_texrect` does on the CPU side (fixed at `aa6f644e`).
+// The writer's rule is `tmem/types.rs`'s `project_tmem_transfer_word`,
+// `TmemLoadKind::Tile` arm: `odd_row_exchange = (bounds.low_t().integer()
+// + row) & 1`. The reader's rule is `tmem/read.rs`'s `odd_row_exchange`:
+// `first_is_odd ^ (row & 1)`. The two agree exactly when `first_is_odd ==
+// low_t.integer() & 1`, and `tmem_first_row_parity_odd` below is that
+// equality -- the SAME one-line expression `targets/texrect.rs:1237` uses,
+// over the SAME `low_t` this tile binding already uploads.
+//
+// A frozen `false` ("first row even") was previously used here. That is
+// correct only for a tile whose T origin is even. Measured on the real ROM,
+// WM2000's sprite-strip tile has `low_t.integer() == 47`, an ODD origin, so
+// the frozen constant inverted the exchange for every row and each
+// rectangle row's last texel addressed a byte the load never wrote --
+// surfacing as `TMEM_SAMPLE_STATUS_INVALID_BYTE` on the GPU triangle path
+// while the CPU texel reader, which had already been fixed, sampled the
+// same tile cleanly.
+//
+// The low-half TLUT guard below depends on this too: its own doc requires
+// the FULLY addressed byte, "post odd-row XOR4 exchange", so a frozen
+// parity would have had it testing the wrong address as well.
+//
+// `TileCoordinate::integer()` is `raw >> 2` (S10.2), so the parity bit is
+// bit 2 of the raw field.
+fn tmem_first_row_parity_odd(tile: TileBindingParams) -> bool {
+    return ((tile.low_t >> 2u) & 1u) != 0u;
+}
 
 const TEXEL_FRACTION_BITS: i32 = 5;
 const TEXEL_FRACTION_SCALE: i32 = 32; // 1 << TEXEL_FRACTION_BITS
@@ -298,9 +326,9 @@ fn tmem_rgba16_linear_base(
 // Masks and, if this row's parity triggers the odd-row exchange, XORs ONE
 // already-offset linear address -- called independently per byte (see
 // `tmem_rgba16_linear_base`'s doc above).
-fn tmem_rgba16_byte_address(linear: u32, row: u32) -> u32 {
+fn tmem_rgba16_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
     let address = linear & TMEM_ADDRESS_MASK;
-    let first_is_odd = TMEM_FIRST_ROW_PARITY_ODD;
+    let first_is_odd = tmem_first_row_parity_odd(tile);
     let row_is_odd = (row & 1u) != 0u;
     let exchange = first_is_odd != row_is_odd;
     if exchange {
@@ -316,8 +344,8 @@ fn tmem_sample_rgba16_texel(
     out_ok: ptr<function, bool>,
 ) -> vec4<f32> {
     let linear = tmem_rgba16_linear_base(tile, column, row);
-    let hi_address = tmem_rgba16_byte_address(linear, row);
-    let lo_address = tmem_rgba16_byte_address(linear + 1u, row);
+    let hi_address = tmem_rgba16_byte_address(tile, linear, row);
+    let lo_address = tmem_rgba16_byte_address(tile, linear + 1u, row);
     var ok_hi = false;
     var ok_lo = false;
     let hi = tmem_read_byte(hi_address, &ok_hi);
@@ -430,7 +458,7 @@ fn tmem_sample_tlut_texel(
     // XOR4 exchange -- via `first_physical_byte`, so this must too; checking
     // the unwrapped `linear` instead would disagree with the oracle exactly
     // at the wrap boundary and across the exchange.
-    if tmem_rgba16_byte_address(linear, row) >= TMEM_TLUT_BASE {
+    if tmem_rgba16_byte_address(tile, linear, row) >= TMEM_TLUT_BASE {
         *out_low_half_violation = true;
         *out_ok = false;
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -441,7 +469,7 @@ fn tmem_sample_tlut_texel(
         // The high byte of the big-endian 16-bit texel: the first byte at
         // this texel's address, not the second.
         var ok_hi = false;
-        let hi = tmem_read_byte(tmem_rgba16_byte_address(linear, row), &ok_hi);
+        let hi = tmem_read_byte(tmem_rgba16_byte_address(tile, linear, row), &ok_hi);
         if !ok_hi {
             *out_ok = false;
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -449,7 +477,7 @@ fn tmem_sample_tlut_texel(
         index = hi;
     } else {
         var ok_byte = false;
-        let byte = tmem_read_byte(tmem_rgba16_byte_address(linear, row), &ok_byte);
+        let byte = tmem_read_byte(tmem_rgba16_byte_address(tile, linear, row), &ok_byte);
         if !ok_byte {
             *out_ok = false;
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
