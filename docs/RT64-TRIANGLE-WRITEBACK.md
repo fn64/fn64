@@ -514,3 +514,76 @@ It records that a loud assert here was correct until real content (WM2000 gfx
 task ~#27) hit it.
 
 Cite these; do not re-derive them.
+
+## The feedback loop is the real bottleneck, and what would fix it
+
+Measured on this session, not asserted. The renderer work was not the slow
+part; the round trip between "I changed something" and "I know what WM2000's
+stream does to it" was. Five ROM runs at ~15 minutes each, and each one
+rebuilds the whole workspace from `FN64=<worktree>` into a fresh `SCRATCH`,
+so they do not even share a target directory.
+
+Worse, the ordering was wrong. The census that answered the session's most
+important question -- "WM2000 issues 826,056 raw triangles and 100% of them
+are shaded AND textured" -- cost one instrumented run and would have taken
+ten minutes at the START. Instead the entire flat rung was built and the ROM
+run twice before anything measured what the ROM actually emits. The flat rung
+was still the right first increment (it validated decoder -> adapter ->
+collector -> schedule -> executor -> digest -> guest commit end to end), but
+the session would have been scoped around the texture rung from hour one.
+
+### What a replay harness should be
+
+**1. Capture the stream once; replay it forever.** A committed corpus of real
+raw-DPC packets -- wire words, staged RDP state, captured guest reads. This
+is the piece that changes the economics: the ROM run stops being a per-change
+feedback loop and becomes a weekly corpus refresh.
+
+**2. Make it QUERYABLE, not merely replayable.** The questions that actually
+needed answering here: which opcodes and in what proportion; which combiner
+programs the triangles latch; which cycle types, colour-image formats and
+tile bindings appear; and -- the highest-value one -- for each packet, does
+it decode, declare, and execute, and if not, **which named refusal fired**.
+A per-refusal histogram over the corpus turns "widen the renderer" from
+guesswork into a worklist sorted by real frequency. Today the only way to
+learn a refusal fires is to hit it at runtime.
+
+**3. Report coverage as a share of real frames, not a test count.** "4797
+tests pass" says nothing about whether WM2000 renders. "0 of 826,056
+triangles are executable" says everything, and it took a throwaway worktree
+to learn.
+
+**4. Golden-hash each replayed packet's framebuffer bytes.** Then a renderer
+change either preserves every packet's output or names exactly which packets
+moved -- the feedback mutation testing had to substitute for here.
+
+### What makes it effective rather than merely existing
+
+- **It must run in the default suite with no GPU.** The whole reason the CPU
+  seam won this design is that guest-visible correctness must not be
+  adapter-conditional; a harness needing Metal reintroduces the problem.
+- **The corpus must be committed and small** -- a few hundred packets
+  deduplicated by shape, not 800k triangles. Honest enough to trust, fast
+  enough to run per-change.
+- **Refusals must be keyed on the error ENUM variant, not `to_string()`.**
+- **It must take a ROM name**, so a widening can be scored across the AKI
+  titles rather than only WM2000.
+
+**The trap to avoid:** faithful capture is the whole bet. Getting it wrong
+gives fast, confident, wrong answers -- strictly worse than the slow loop.
+Validate it by proving a replayed corpus reproduces the live run's swap count
+AND its refusal set exactly, before trusting a single query.
+
+### Two other feedback gaps this session exposed
+
+- **The focused suite (`-p fn64-render-wgpu`) is systematically misleading
+  here.** Half A landed "green" only because no fixture happened to be a
+  flat triangle in one-cycle mode. The prior lane recorded the mirror image:
+  a present-path mutant that survived the focused suite and died in the
+  workspace. Neither run alone is a gate.
+- **Nothing detects a doc comment its own commit falsified.** Five commits
+  in this lane exist only to fix comments the lane made false, including one
+  that described the exact OPPOSITE of the code (claiming the raster writes
+  every pixel in a declared run, when it skips zero-coverage pixels -- which
+  is mutant M5, the one that survived). These were found by re-reading, which
+  does not scale.
