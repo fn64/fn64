@@ -168,6 +168,200 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
   an IA4-under-TLUT tile. Note the asymmetry — the CPU texel reader composed
   the same texrects successfully; only the WGSL sampler failed.
 
+### D25 — the WGSL sampler hardcoded the tile's first-row parity · **REACHED WM2000: SIXTH ABORT**
+
+- **wgpu** `crates/fn64-render-wgpu/src/shaders/tmem_sample.wgsl:71`,
+  `const TMEM_FIRST_ROW_PARITY_ODD: bool = false;`, consumed by
+  `tmem_rgba16_byte_address` (`:257-268`) and surfacing as
+  `WgpuRawDpcExecutionError::TmemSampleFailed { status: 2 }`
+  (`TMEM_SAMPLE_STATUS_INVALID_BYTE`) at
+  `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+- **This is `aa6f644e`'s reader/writer parity inversion, one layer over.**
+  The CPU reader takes `TmemFirstRowParity` as explicit caller input
+  (`tmem/read.rs:65-72`: "This is explicit caller input. The reader never
+  infers it"), and `aa6f644e` fixed `targets/texrect.rs:1237` to derive it
+  from the tile's own T origin so the reader matches the *writer's* rule
+  (`tmem/types.rs`'s `project_tmem_transfer_word`, `Tile` arm:
+  `odd_row_exchange = (bounds.low_t().integer() + row) & 1`). The WGSL
+  sampler was never given the same derivation: it froze `Even`.
+- **The measured delta, hand-derived from the wire fields, not captured.**
+  WM2000's strip tile is `tmem = 0`, `line_words = 5`, `low_t_raw = 188`, so
+  `low_t.integer() == 47`, **odd**. For the failing texel (tile column 64,
+  tile row 1, 4-bit) the linear address is
+  `0*8 + 1*5*8 + 64/2 == 0x048`. The writer's own rule exchanges that row
+  (`(47 + 1) & 1 == 0` → no exchange on row 1, exchange on row 0), so
+  `0x048` is a byte the `LoadTile` at cmd 39 really wrote. The frozen `Even`
+  parity computes `first_is_odd(false) ^ (row&1 == 1) == true` and XOR4s it
+  to **`0x04c`** — a byte inside the 6-byte per-row tail gap that the load
+  never wrote. **Shader read `0x04c`; CPU reader reads `0x048`.** Both
+  addresses are already pinned by
+  `tmem::read::tests::wm2000_texrect_pixel_sixty_three_reproduces_the_production_invalid_byte`,
+  which asserts `valid_byte(0x048).is_some()` and
+  `valid_byte(0x04c).is_none()` — i.e. the delta is a pure XOR-4 parity
+  inversion, not a stride, a base offset, or a projection gap. The
+  projection is innocent: `TileBindingParams` already uploads `low_t`
+  (`gpu_projection.rs:212`), so the shader had the information and did not
+  read it.
+- **Why the existing GPU-vs-CPU pinning test could not catch it.**
+  `48cde862` added
+  `required_host_enabled_tlut_over_an_ia4_tile_samples_and_matches_the_cpu_reader`,
+  which does compare the shader against `crate::read_texel` over the same
+  bytes — but it passes `TmemFirstRowParity::Even` to the CPU side, and its
+  `tlut_fixture` tile has `low_t == 0` (**even**) with only two rows. Both
+  lanes therefore agreed on parity vacuously. **The fixture and the real
+  tile differ in exactly the axis that broke**, which is itself the finding:
+  a differential test pinned against a hardcoded constant only pins the
+  constant.
+- **The general hazard, stated once for every differential in this crate.**
+  A CPU/GPU differential proves the two lanes agree only over the inputs the
+  fixture actually varies. Where the shader hardcodes a value and the test
+  hands the CPU oracle *that same value*, the comparison is a tautology: it
+  cannot fail no matter what either lane does with it. Both of this crate's
+  enabled-TLUT differentials had that shape for first-row parity. **When
+  adding or reviewing one, list the inputs the shader treats as constants
+  and check the fixture varies at least one of them off the constant** —
+  otherwise the test pins the constant rather than the behaviour.
+- **Status: FIXED.** No new wire field was needed: `TileBindingParams`
+  already uploads `low_t`, and `TileCoordinate::integer()` is `raw >> 2`,
+  so `tmem_first_row_parity_odd` reads `(low_t >> 2) & 1` — the same one
+  rule `targets/texrect.rs:1237` applies, over the same word, rather than
+  two constants that can drift. No refusal was weakened: `INVALID_BYTE`
+  still fires for a genuinely unwritten byte; the shader now asks about the
+  right byte.
+- **Composes with `D-LOWHALF` (`852d20e9`), which landed alongside it in the
+  same file.** That guard refuses an enabled-TLUT CI source at or above
+  `0x0800`, and its own doc requires the check to run on the FULLY addressed
+  byte, "post twelve-bit wrap, post odd-row XOR4 exchange". It was therefore
+  testing a wrong address for an odd-origin tile too — its call site is the
+  fifth `tmem_rgba16_byte_address` caller and now takes the tile like the
+  other four. The guard itself is unchanged and is not this card's to
+  revisit; D14 holds its open ruling. The new GPU test asserts every
+  fragment is `STATUS_OK` rather than merely "not `INVALID_BYTE`", so a
+  wrongly-tripped low-half guard fails it as well.
+- **`TRIANGLE_PIPELINE_FRAGMENT_*` digests were recomputed over the MERGED
+  shader** (100,427 → 102,101 bytes). Both this fix and `852d20e9` refroze
+  them after editing the same file, so *neither* lane's frozen value was
+  right once both edits were present — resolving that conflict by keeping
+  either side leaves a digest inconsistent with the shader, which surfaces
+  as `a_composed_packet_reports_writes_in_the_streams_own_journal_order` and
+  `a_failed_triangle_draw_leaves_no_redeemable_fill_token` failing. The
+  recomputation, not either side, is the resolution.
+
+### D26 — the raw-DPC triangle path pairs a tile descriptor with the wrong TMEM prefix · **REACHED WM2000: SEVENTH ABORT**
+
+- **wgpu** `crates/fn64-render-wgpu/src/production.rs`, `stage_and_report`'s
+  triangle batch, surfacing (still) as
+  `WgpuRawDpcExecutionError::TmemSampleFailed { status: 2 }` at
+  `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+- **The abort survives D25's parity fix, and the packet is NOT the one D24
+  measured.** Instrumented with a temporary `eprintln!` at the refusal site
+  (`stage_and_report`, `production.rs`) and at
+  `project_pending_tmem_per_triangle`'s call site, run on the real ROM
+  through the all-Rust lane (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`). That
+  instrumentation was removed before commit, so every figure below is a
+  measurement this doc records, not one the tree still prints. The failing
+  batch is **five triangles, all texrect-sourced, no raw triangle at all**,
+  and **every one of the five has `low_t == 0` — an EVEN T origin**. The
+  odd-origin `low_t.integer() == 47` tile D25 names is a *texrect-lane* fact
+  (`tmem::read::tests`'s fixtures); the GPU batch that aborts carries
+  different tiles. D25's fix is correct and necessary but is not this
+  abort's cause.
+- **The measured divergence is the row stride, and it is a PAIRING defect,
+  not an addressing one.** Per-fixture, replaying the shader's own
+  addressing over every texel the tile can address:
+
+  | tri | declared `line_words` | projection valid bytes | texels hitting an invalid byte | `line_words` values that fit the projection |
+  |-----|----|------|-----------|-----------|
+  | 0 | **4** | 1828 | **473 of 3185** | **[5]** |
+  | 1 | 5 | 1828 | 0 of 3234 | [5] |
+  | 2 | 5 | 1828 | 0 of 3234 | [5] |
+  | 3 | 4 | 2055 | 0 of 3185 | [1, 2, 3, 4] |
+  | 4 | 4 | 2055 | 0 of 3185 | [1, 2, 3, 4] |
+
+  Triangle 0 declares a **4-word (32-byte)** row stride while the TMEM
+  prefix it was handed was written with a **5-word (40-byte)** one. The
+  projection's valid set is a clean repeating 80-byte (two-row) figure —
+  `0x0000..=0x0021` (34 bytes), gap, `0x0028..=0x0047` (32), gap,
+  `0x004c..=0x004d` (2), gap — which is exactly a 5-word-per-row `LoadTile`
+  writing 34 defined bytes per 40-byte row with the XOR4 exchange on
+  alternating rows. At stride 4 the shader reads row 1 at
+  `1 * 4 * 8 == 0x20`, XOR4s to `0x24`, and lands in the `0x22..=0x27` gap.
+  **Shader read `0x24`; the byte the same texel has under the stride its own
+  data was written with is `0x28`.**
+- **Tris 3 and 4 are the control.** They declare the same `line_words = 4`
+  and sample cleanly — because their projection (2055 valid bytes) is a
+  *different, later* prefix that genuinely fits stride 4. So `line_words = 4`
+  is not wrong in itself, and the descriptor is not corrupt. Triangle 0's
+  descriptor and triangle 0's TMEM prefix simply come from different points
+  in the stream.
+- **Which triangle takes which image, measured.** `triangle_commands` for
+  the failing packet is `[0, 7, 8, 15, 16]` and the packet's two completed
+  loads capture prefixes at command indices `[4, 12]`. Applying
+  `prefix_before`:
+
+  | tri | command | image `prefix_before` selects | valid bytes | stride the image really has | tile's declared `line_words` |
+  |-----|---------|-------------------------------|-------------|------------------------------|------|
+  | 0 | **0** | **committed** (no load precedes it) | 1828 | **5** | **4** |
+  | 1 | 7 | prefix@4 | 1828 | 5 | 5 |
+  | 2 | 8 | prefix@4 | 1828 | 5 | 5 |
+  | 3 | 15 | prefix@12 | 2055 | 4 | 4 |
+  | 4 | 16 | prefix@12 | 2055 | 4 | 4 |
+
+  Four of the five agree. **Triangle 0 is the packet's very first command**,
+  so no load in this packet precedes it and `prefix_before` returns `None` —
+  the durable committed arm. That arm is not a fallback; the absence of a
+  preceding load genuinely is the stream fact that makes committed correct.
+  But the committed state here still holds the *previous* packet's
+  5-word-stride image, while triangle 0's own tile descriptor declares
+  `line_words = 4`.
+- **The committed slot is NOT stale — measured, not assumed.** The two
+  strides alternate *within* packets, and every other pairing is right, so
+  the selection rule is working. Instrumenting each prefix image and the
+  committed slot side by side:
+
+  ```
+  packet N-1: prefix#0 @cmd  6: valid=2055   (stride 4)
+              prefix#1 @cmd 14: valid=1828   (stride 5)
+              prefix#2 @cmd 22: valid=1828   (stride 5)
+              committed (on entry): valid=2055
+              triangle_commands = [9, 10, 17, 18, 25]
+              tile line_words    = [4, 4, 5, 5, 5]
+  packet N:   prefix#0 @cmd  4: valid=1828   (stride 5)
+              prefix#1 @cmd 12: valid=2055   (stride 4)
+              committed (on entry): valid=1828
+              triangle_commands = [0, 7, 8, 15, 16]
+              tile line_words    = [4, 5, 5, 4, 4]
+  ```
+
+  In packet N-1 the tri at cmd 9/10 declares stride 4 and takes prefix@6
+  (2055, stride 4) — correct. The tris at 17/18/25 declare 5 and take
+  prefix@14/@22 (1828, stride 5) — correct. Packet N's committed slot is
+  `1828`, exactly packet N-1's last load. **Publication is working and the
+  slot is current.** Five of the six pairings across the two packets agree.
+- **The one that does not is packet N's triangle 0, and it is a
+  cross-packet fact, not an intra-packet one.** It sits at command index
+  **0** — the very first command in its packet — and declares
+  `line_words = 4`, so the stride-4 image it wants is the one packet N-1
+  loaded at its command 6 and then *overwrote twice*. `prefix_before`
+  cannot reach it: it is not in packet N, and it is no longer what
+  committed holds. The rule is correct within a packet and blind across
+  the boundary.
+- **Status: OPEN, and the next lane must separate two readings this lane
+  did not.**
+  1. **The packet boundary is drawn in the wrong place** — these two
+     "packets" are one guest drawing sequence split by the task-dispatch
+     seam, and triangle 0 belongs with packet N-1's stride-4 load. If so
+     the fix is upstream of `fn64-render-wgpu` entirely.
+  2. **The guest genuinely re-draws a sprite whose TMEM was overwritten**,
+     and hardware samples the gap bytes as undefined-but-not-fatal while
+     this lane refuses them.
+  Reading 2 would put the `INVALID_BYTE` refusal itself in scope — but
+  **not to be weakened blind**: `3a1a6a73` measured that exact status
+  catching a genuinely missed load, and D25's mutation run (below)
+  confirmed the arm is live and covered by
+  `required_host_a_non_canonical_tlut_entry_is_refused_not_guessed`.
+  Nothing was changed for D26.
+
 ---
 
 **Method note for the next lane.** Three descriptions of one guard disagreed,
