@@ -451,3 +451,65 @@ invariant across all 511 samples of run3.
 So the three descriptions -- hardware, the game's own libultra, and fn64's
 model -- coincide exactly. **fn64 is not reporting the wrong thing for ports
 1-3. It is correctly reporting a console with one controller plugged in.**
+
+## THE PLATEAU IS BROKEN: state 18 -> 34 at swap 2312
+
+Counterfactual run `run4`, solo, identical schedule, one change: **port 1 has
+a controller plugged in AND the scripted presses are mirrored onto it**
+(`WM2000_PORTS=2`). Nothing is fabricated -- pad 1 is a modeled standard
+controller receiving the same button schedule a second human would press.
+
+| | one pad (`run3`) | two pads (`run4`) |
+|---|---|---|
+| `pad_errno` | `[0, 8, 8, 8]` | **`[0, 0, 8, 8]`** |
+| `pressed` at 2102 | `[8000, 0, 0, 0]` | **`[8000, 8000, 0, 0]`** |
+| entry port fields | `[1, 2, 0, 0]` | `[1, 2, 0, 0]` (same) |
+| `D_8011BF50` after A at 2202 | `[0, **1**, 0, 0]` | **`[0, 0, 0, 0]`** |
+| entry `+0x00` after A at 2202 | `[2, **0**, 1, 1]` | **`[2, 2, 1, 1]`** |
+| screen | **18 forever** (to 2600, and 5021 in earlier lanes) | **18 -> 34 at swap 2312** |
+
+With player 2 able to press, entry 1 takes the same two steps entry 0 always
+took -- join, then confirm -- `D_8011BF50[1]` finally clears, `$a2` reaches 2,
+`func_801456C8` stops returning `-1`, and the state machine advances on the
+next A press with the usual ~10-swap latency (press at 2302, transition at
+2312).
+
+**State 34 is `0x22`**, the top of the value range `func_801255E4`
+bounds-checks at `0x80125AB4` -- i.e. the game left the versus screen through
+the front door, not into an invalid state.
+
+## VERDICT: this is not an fn64 defect
+
+Every fn64 mechanism on this path was measured behaving correctly, and the
+plateau is explained without invoking a defect in any of them:
+
+- **Port 0's input is delivered, formatted and edge-detected correctly**, into
+  the exact array the ready check reads (`pressed[0] = 0x8000` on press swaps,
+  clearing the next swap).
+- **The ready check consumes it** -- `D_8011BF50[0]: 1 -> 0` and entry 0's
+  `+0x00: 0 -> 2` are the loop's own stores at `0x80145754`/`0x80145768`.
+- **Ports 1-3 report `errno = 8`**, which is what hardware reports for an
+  empty port, what the game's own libultra computes from the PIF status bits,
+  and what fn64's `PifModel` is documented and unit-tested to produce.
+- **Plugging port 1 in advances the game**, so nothing upstream was broken or
+  missing -- the single missing ingredient was a second player.
+
+The plateau is the game correctly refusing to start a **two-player match**
+(entries on ports 0 and 1, `D_8009EAA0 = 0x12`) on a console with **one
+controller**. fn64 modelled that console faithfully; the harness simply never
+plugged in the second pad and pressed it.
+
+**What a "fix" is and is not.** There is no fn64 code change to make here --
+proposing one would mean making fn64 report a controller in a port that has
+none, which is precisely the fabrication this card forbids. The change that
+belongs in the repo is the one made: a harness knob
+(`WM2000_PORTS`) that ATTACHES real modeled controllers and drives them, so
+two-player content is reachable. That is console configuration, not
+fabricated input.
+
+**The correction this card owed.** The previous entry's conclusion ("fn64's
+controller path is NOT the defect") is upheld, but its supporting argument was
+not sound: it rested on a second-controller test that never pressed pad 1, and
+it left the deciding question -- which loop exit -- explicitly unmeasured. The
+loop exit is now measured (entries VISITED, fields `[1, 2, 0, 0]`), and the
+conclusion now rests on a counterfactual that moves the game.
