@@ -38,7 +38,7 @@
 //! the declared run**, using the resident's own prior byte where coverage is
 //! zero -- so the declared range's content is always real, current content,
 //! never stale bytes from a generation the accumulator moved past. See
-//! [`raster_flat_triangle`]'s loop.
+//! [`raster_triangle`]'s loop.
 
 use fn64_render_ir::ResourceAccess;
 
@@ -221,7 +221,7 @@ pub fn execute_raw_triangle(
     let shade = triangle.shade().map(triangle_span::shade_planes);
 
     let mut bytes = resident_bytes.to_vec();
-    raster_flat_triangle(
+    raster_triangle(
         &mut bytes,
         format,
         extent.width(),
@@ -257,12 +257,20 @@ pub fn execute_raw_triangle(
 ///
 /// The colour of a covered pixel comes from the latched combiner program
 /// evaluated through [`combine_one_texel`], the texrect path's own
-/// evaluator, with a zero `Texel0`: an untextured triangle's program is
-/// already proven by `validate_combiner_program` not to read `Texel0`
-/// meaningfully for the selectors this executor admits, and the flat
-/// primitive programs WM2000 latches read `Primitive`/`Environment`.
+/// evaluator.
+///
+/// `Texel0` is passed as zero and it is never read: this executor admits
+/// only UNTEXTURED triangles, so there is no texel, and a program selecting
+/// `Texel0` would be combining against a value nothing produced. That is
+/// the one selector the admission cannot currently refuse, because
+/// `ADMITTED_COLOR_INPUTS` admits it for the texrect path that shares the
+/// table -- see this module's `Nonclaim` below.
+///
+/// A SHADED triangle's `Shade` comes from real per-pixel interpolation of
+/// its own coefficient planes; an unshaded one's stays zero and is refused
+/// by `validate_combiner_program_with_shade` before any pixel is produced.
 #[allow(clippy::too_many_arguments)]
-fn raster_flat_triangle(
+fn raster_triangle(
     bytes: &mut [u8],
     format: ColorTargetFormat,
     width: u32,
