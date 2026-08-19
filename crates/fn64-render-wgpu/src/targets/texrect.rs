@@ -576,10 +576,6 @@ pub enum TexrectExecutionError {
     DestinationCoverageUnavailable {
         consumer: &'static str,
     },
-    /// The reserved `G_AC` alpha-compare encoding 2. Refused here rather
-    /// than reaching `alpha_compare_value`'s panic, so the caller gets a
-    /// typed executor error naming the texrect instead of an unwind.
-    ReservedAlphaCompare,
     /// A blender cycle selects `A = Shade`, which this executor cannot
     /// resolve: it has no vertex-interpolated color to supply, exactly as
     /// its combiner refuses a `Shade`-reading program. Named rather than
@@ -785,8 +781,6 @@ impl core::fmt::Display for TexrectExecutionError {
                  binding is present={binding_present}; a textured triangle needs a bound tile \
                  and an untextured one has no S/T/W planes to sample with"
             ),
-            Self::ReservedAlphaCompare => formatter
-                .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),
             Self::UnsupportedBlendShadeAlpha => formatter.write_str(
                 "the blender cycle selects A = Shade, and execute_texture_rectangle has no \
                  vertex-interpolated shade alpha to resolve it with",
@@ -1929,9 +1923,7 @@ impl TexrectFragmentStages {
     /// `G_AC_DITHER`, alpha dither `Noise`, RGB dither `Noise`
     /// ([`TexrectExecutionError::NoiseThresholdUnavailable`]); the ordered
     /// `Pattern`/`InversePattern`/`MagicSquare`/`Bayer` tiles
-    /// ([`TexrectExecutionError::OrderedDitherAuthorityUnsettled`]); the
-    /// reserved alpha-compare encoding
-    /// ([`TexrectExecutionError::ReservedAlphaCompare`]); and every mode
+    /// ([`TexrectExecutionError::OrderedDitherAuthorityUnsettled`]); and every mode
     /// reading the destination coverage count
     /// ([`TexrectExecutionError::DestinationCoverageUnavailable`]).
     pub fn try_new(
@@ -1940,8 +1932,14 @@ impl TexrectFragmentStages {
     ) -> Result<Self, TexrectExecutionError> {
         let alpha_compare = other_mode.alpha_compare();
         match alpha_compare {
+            // Wire encoding 2 is not a reserved mode: other-mode low bits
+            // 1:0 are two independent hardware bits, and `alpha_compare_en`
+            // (bit 0) clear means no compare at all (angrylion
+            // `src/core/n64video/rdp.c:659-660`, `rdp/blender.c`'s
+            // `alpha_compare`; copy path likewise `rdp/rasterizer.c:1971`).
+            // It therefore arrives here already decoded as `None`.
+            // See `docs/RT64-GUARD-AUDIT.md` finding A3.
             AlphaCompare::None | AlphaCompare::Threshold => {}
-            AlphaCompare::Reserved => return Err(TexrectExecutionError::ReservedAlphaCompare),
             AlphaCompare::Dither => {
                 return Err(TexrectExecutionError::NoiseThresholdUnavailable {
                     stage: TexrectNoiseStage::AlphaCompareDither,
@@ -2408,14 +2406,11 @@ pub(super) fn blend_and_write_pixel(
 /// silent-by-design non-write (the RDP's own behaviour, not a refusal).
 ///
 /// Reached only for modes [`TexrectFragmentStages::try_new`] admitted, so
-/// the noise byte is never consulted and `alpha_compare_value`'s
-/// `Reserved` panic is unreachable -- that encoding was refused by name
-/// before any pixel was produced.
+/// the noise byte is never consulted.
 ///
 /// # Errors
-/// [`TexrectExecutionError::NoiseThresholdUnavailable`] for the dither and
-/// reserved encodings, which [`TexrectFragmentStages::try_new`] already
-/// refused; kept here so the invariant holds at the point it is relied on
+/// [`TexrectExecutionError::NoiseThresholdUnavailable`] for `Dither`, which
+/// [`TexrectFragmentStages::try_new`] already refused; kept here so the invariant holds at the point it is relied on
 /// rather than only where it was checked. `Threshold` needs no error of its
 /// own -- `G_SETBLENDCOLOR.a` is always a real byte.
 fn alpha_compare_texrect_fragment(
@@ -2425,7 +2420,7 @@ fn alpha_compare_texrect_fragment(
     let threshold_alpha = match stages.alpha_compare {
         AlphaCompare::None => 0,
         AlphaCompare::Threshold => stages.threshold_alpha,
-        AlphaCompare::Reserved | AlphaCompare::Dither => {
+        AlphaCompare::Dither => {
             return Err(TexrectExecutionError::NoiseThresholdUnavailable {
                 stage: TexrectNoiseStage::AlphaCompareDither,
             })
@@ -5335,13 +5330,31 @@ mod fragment_stage_tests {
     /// from every other refusal.
     #[test]
     fn every_unevaluatable_stage_mode_is_refused_by_name() {
-        // Reserved G_AC encoding 2.
-        let reserved = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
-        assert_eq!(reserved.alpha_compare(), AlphaCompare::Reserved);
+        // G_AC wire encoding 2 is NOT refused: `alpha_compare_en` (low bit
+        // 0) is clear, so hardware performs no compare at all -- angrylion
+        // `src/core/n64video/rdp.c:659-660` plus `rdp/blender.c`'s
+        // `alpha_compare` early return. Retargeted from the assertion that
+        // this encoding raised `ReservedAlphaCompare`; see
+        // `docs/RT64-GUARD-AUDIT.md` finding A3.
+        let dither_bit_without_enable = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
         assert_eq!(
-            TexrectFragmentStages::try_new(reserved, Color4::from_wire(0)),
-            Err(TexrectExecutionError::ReservedAlphaCompare)
+            dither_bit_without_enable.alpha_compare(),
+            AlphaCompare::None,
+            "wire 2 sets dither_alpha_en but clears alpha_compare_en"
         );
+        assert!(
+            TexrectFragmentStages::try_new(dither_bit_without_enable, Color4::from_wire(0))
+                .is_ok(),
+            "no compare is not a refusal"
+        );
+        // Distinguishing check: wire 3 (both bits set) IS still refused, so
+        // the `is_ok` above cannot be produced by an executor that admits
+        // every alpha-compare mode.
+        assert!(TexrectFragmentStages::try_new(
+            mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x3),
+            Color4::from_wire(0)
+        )
+        .is_err());
 
         // G_AC_DITHER (encoding 3) needs the per-pixel random value.
         let ac_dither = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x3);

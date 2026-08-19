@@ -693,13 +693,25 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
     assert_eq!(&max_threshold[4..8], &255u32.to_le_bytes());
 }
 
+/// Retargeted from `..._rejects_reserved_mode_defensively`. Other-mode low
+/// bits 1:0 are two independent hardware bits (angrylion
+/// `src/core/n64video/rdp.c:659-660`), so wire encoding 2 decodes to `None`
+/// and reaches the pipeline as an admitted mode carrying wire 0 -- there is
+/// no reserved mode to reject. See `docs/RT64-GUARD-AUDIT.md` finding A3.
 #[test]
-#[should_panic(expected = "must have been rejected at retrieval time")]
-fn fragment_alpha_compare_params_bytes_rejects_reserved_mode_defensively() {
-    let _ = fragment_alpha_compare_params_bytes(
-        crate::state::AlphaCompare::Reserved,
-        Color4::from_wire(0),
+fn alpha_compare_wire_two_reaches_the_pipeline_as_no_compare() {
+    let decoded = crate::state::OtherMode::from_wire(0, 2).alpha_compare();
+    assert_eq!(decoded, crate::state::AlphaCompare::None);
+    let bytes = fragment_alpha_compare_params_bytes(decoded, Color4::from_wire(0xFFFF_FFFF));
+    // Mode word 0 = no compare. Wire 1 would be Threshold; asserting the
+    // difference keeps this from passing under a decoder that returns a
+    // constant.
+    assert_eq!(&bytes[0..4], &0u32.to_le_bytes());
+    let threshold_bytes = fragment_alpha_compare_params_bytes(
+        crate::state::AlphaCompare::Threshold,
+        Color4::from_wire(0xFFFF_FFFF),
     );
+    assert_eq!(&threshold_bytes[0..4], &1u32.to_le_bytes());
 }
 
 #[test]
