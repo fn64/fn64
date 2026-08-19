@@ -675,7 +675,10 @@ fn a_textured_triangles_committed_writes_digest_the_sampled_texels() {
             .texture_planes(value, dx, de, dy),
     );
 
-    let expected_row: Vec<u8> = TEXELS.iter().flat_map(|texel| texel.to_be_bytes()).collect();
+    let expected_row: Vec<u8> = TEXELS
+        .iter()
+        .flat_map(|texel| texel.to_be_bytes())
+        .collect();
     assert_eq!(expected_row.len(), 8, "four RGBA16 texels are eight bytes");
     // **The write list is asserted before it is walked.** Measured: with the
     // admission predicate reverted this test PASSED, because the triangle
