@@ -197,10 +197,14 @@
 //!
 //! `step_axis`'s truncating division is a preserved convention, not a
 //! verified silicon tie-break; public documentation does not establish the
-//! RDP's rounding for interpolated texture coordinates. Likewise
-//! `TmemFirstRowParity::Even` is passed unconditionally, which is correct
-//! for every tile whose first row is even (all this crate's fixtures) and
-//! is a frontier for a tile loaded at an odd row parity.
+//! RDP's rounding for interpolated texture coordinates.
+//!
+//! `TmemFirstRowParity` is **derived per tile, never frozen** -- see
+//! `execute_texture_rectangle`'s own derivation from
+//! `tile.size().low_t().integer() & 1` and the comment above it. This
+//! paragraph previously claimed `Even` was passed unconditionally; that was
+//! true before that fix and is no longer, so the odd-row-parity frontier it
+//! named is closed rather than open.
 
 use crate::alpha_compare::{alpha_compare_value, apply_alpha_dither, AlphaCompareNoise};
 use crate::blend::{
