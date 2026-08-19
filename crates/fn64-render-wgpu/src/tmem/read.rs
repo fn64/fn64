@@ -721,15 +721,19 @@ mod tests {
                 IndexedTexelResolveError::UnsupportedIndexSize { .. }
             ))
         ));
+        // A non-CI tile under a DISABLED TLUT still refuses by format: the
+        // CI-to-I8 alias is genuinely format-specific. Under an ENABLED
+        // TLUT the format is ignored instead, covered by
+        // `enabled_tlut_over_a_non_ci_tile_reaches_the_tlut_lookup` below.
         assert!(matches!(
             read_committed_texel(
                 &state,
-                tile(ImageFormat::Intensity, PixelSize::Bits8, 0, 0),
+                tile(ImageFormat::ColorIndex, PixelSize::Bits32, 0, 0),
                 addressed,
                 TextureLutMode::Rgba16,
             ),
             Err(PhysicalTexelReadError::Indexed(
-                IndexedTexelResolveError::FormatMustBeColorIndex { .. }
+                IndexedTexelResolveError::UnsupportedIndexSize { .. }
             ))
         ));
     }
