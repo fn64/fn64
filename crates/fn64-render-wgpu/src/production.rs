@@ -4521,9 +4521,7 @@ mod tests {
     const SET_PRIM_COLOR: u8 = 0x3a;
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
-    fn word(opcode: u8, payload: u32) -> u32 {
-        u32::from(opcode) << 24 | payload
-    }
+    use crate::wire_words::word;
 
     /// A transfer word's `source_access_byte_offset` is relative to **its
     /// own** source access, never to a flattened concatenation of the
@@ -4636,13 +4634,9 @@ mod tests {
         assert!(word_source_bytes(&source_bytes, 1, past_run).is_none());
     }
 
-    fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
-        [word(SET_OTHER_MODE, cycle_type << 20), low]
-    }
+    use crate::wire_words::set_other_mode;
 
-    fn set_combine(payload: u32, high: u32) -> [u32; 2] {
-        [word(SET_COMBINE, payload & 0x00ff_ffff), high]
-    }
+    use crate::wire_words::set_combine;
 
     /// Mirrors `raw_dpc::production_adapter::tests::set_env_color` exactly
     /// (that helper is private to its own module's tests, so this is a
@@ -4652,32 +4646,22 @@ mod tests {
         [word(SET_ENV_COLOR, 0), color]
     }
 
-    /// Mirrors `raw_dpc::production_adapter::tests::set_prim_color` exactly,
-    /// same local-copy convention.
-    fn set_prim_color(lod_frac: u32, lod_min: u32, color: u32) -> [u32; 2] {
-        [word(SET_PRIM_COLOR, lod_min << 8 | lod_frac), color]
-    }
+    use crate::wire_words::set_prim_color;
 
     /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
-    /// eight raw wire words -- mirrors
-    /// `raw_dpc::production_adapter::tests::triangle_base_edge_words`
-    /// exactly (that helper is private to its own module's tests, so this
-    /// is a local, identical copy, not a shared import).
+    /// eight raw wire words, from the crate's shared `wire_words` builder.
     fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
-        let w0 = word(
-            RAW_TRIANGLE_BASE_EDGE,
-            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
-        );
-        [
-            w0,
-            0,
-            0x0010_0000,
-            0,
-            0x0020_0000,
-            0x0000_8000,
-            0x0005_0000,
-            0,
-        ]
+        let mut words = crate::wire_words::EdgeWords {
+            tile,
+            level,
+            yl: yl as i16,
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(0, RAW_TRIANGLE_BASE_EDGE);
+        // This fixture's own edge payload, unchanged: an arbitrary but fixed
+        // set of slopes that exercises decode without naming a footprint.
+        words[2..].copy_from_slice(&[0x0010_0000, 0, 0x0020_0000, 0x0000_8000, 0x0005_0000, 0]);
+        words
     }
 
     fn set_texture_image(format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
@@ -10495,16 +10479,17 @@ mod tests {
     /// So each row writes pixels 2..6 = 4 pixels = 8 bytes, at
     /// 0x2000 + (16y + 2)*2 = 0x2004, 0x2024, 0x2044.
     fn flat_triangle_in_target_words() -> [u32; 8] {
-        [
-            word(RAW_TRIANGLE_BASE_EDGE, 1 << 23 | 12),
-            12u32 << 16,
-            6 << 16,
-            0,
-            2 << 16,
-            0,
-            6 << 16,
-            0,
-        ]
+        crate::wire_words::EdgeWords {
+            lft: true,
+            yl: crate::wire_words::line(3),
+            ym: crate::wire_words::line(3),
+            yh: 0,
+            xl: crate::wire_words::px(6),
+            xh: crate::wire_words::px(2),
+            xm: crate::wire_words::px(6),
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(0, RAW_TRIANGLE_BASE_EDGE)
     }
 
     /// The primitive colour every flat-triangle end-to-end test writes, and
@@ -10528,10 +10513,8 @@ mod tests {
     ///   high = (B << 24) | (D << 6) | (aA << 21) | (aB << 3) | (aC << 18)
     ///          | aD
     fn flat_triangle_packet_words() -> Vec<u32> {
-        let (ca, cb, cc, cd) = (8u32, 8u32, 16u32, 3u32);
-        let (aa, ab, ac, ad) = (7u32, 7u32, 7u32, 3u32);
-        let low = (ca << 5) | cc;
-        let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+        let (low, high) =
+            crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);
         let mut words = Vec::new();
         words.extend(set_other_mode(0, 0));
         words.extend(set_combine(low, high));

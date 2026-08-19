@@ -2034,9 +2034,7 @@ mod tests {
     const LAYOUT_BYTES: u32 = 0x4000;
     const COMMAND_START: u32 = 0x1000;
 
-    fn word(prefix: u8, opcode: u8, payload: u32) -> u32 {
-        u32::from(prefix | opcode) << 24 | payload
-    }
+    use crate::wire_words::word_with_prefix as word;
 
     fn state_words(prefix: u8) -> Vec<u32> {
         vec![
@@ -4570,11 +4568,13 @@ mod tests {
     // --- triangle decode wired into the real command stream ---
 
     fn triangle_base_word0(prefix: u8, opcode: u8, tile: u32, level: u32, yl: u16) -> u32 {
-        word(
-            prefix,
-            opcode,
-            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
-        )
+        crate::wire_words::EdgeWords {
+            tile,
+            level,
+            yl: yl as i16,
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .word0(prefix, opcode)
     }
 
     /// A base-edge (0x08) triangle decoded from a real command stream, with
@@ -5509,21 +5509,18 @@ mod tests {
     /// So each row covers pixels 2..6 = 4 pixels = 8 bytes at RGBA16, and
     /// row y starts at byte (y*8 + 2)*2 = 16y + 4: bytes 4, 20, 36.
     fn flat_triangle_words(prefix: u8) -> Vec<u32> {
-        vec![
-            // lft (bit 23) set, tile 0, level 0, YL = 12.
-            word(prefix, 0x08, 1 << 23 | 12),
-            // YM = 12, YH = 0.
-            12u32 << 16,
-            // XL, dXLdy
-            6 << 16,
-            0,
-            // XH, dXHdy
-            2 << 16,
-            0,
-            // XM, dXMdy
-            6 << 16,
-            0,
-        ]
+        crate::wire_words::EdgeWords {
+            lft: true,
+            yl: crate::wire_words::line(3),
+            ym: crate::wire_words::line(3),
+            yh: 0,
+            xl: crate::wire_words::px(6),
+            xh: crate::wire_words::px(2),
+            xm: crate::wire_words::px(6),
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(prefix, 0x08)
+        .to_vec()
     }
 
     #[test]
