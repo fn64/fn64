@@ -1843,9 +1843,10 @@ mod tests {
         let (mut cfg, rom) = swallowed_entry_config();
         let check = cross_check_symbol_dump(&cfg, &rom);
 
-        let applied = repair_symbol_dump(&mut cfg, &check);
+        let (applied, adopted) = repair_symbol_dump(&mut cfg, &check);
 
         assert_eq!(applied, 1);
+        assert_eq!(adopted, 0, "this fixture is the swallowed class, not uncovered");
         // By hand: head shrinks to 0x80000000..0x80000010, tail covers
         // 0x80000010..0x8000001C. The two must tile the original range exactly.
         let shape: Vec<(u32, u32)> = cfg.sections[0]
@@ -1895,7 +1896,7 @@ mod tests {
         assert!(check.render_diagnostic().contains("REFUSED"));
 
         let before = cfg.sections[0].functions.clone();
-        assert_eq!(repair_symbol_dump(&mut cfg, &check), 0);
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), (0, 0));
         assert_eq!(
             cfg.sections[0].functions, before,
             "config must be untouched"
@@ -2139,7 +2140,7 @@ mod tests {
         assert!(check.is_clean(), "{:?}", check.swallowed);
         assert_eq!(check.render_diagnostic(), "");
         let before = cfg.sections[0].functions.clone();
-        assert_eq!(repair_symbol_dump(&mut cfg, &check), 0);
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), (0, 0));
         assert_eq!(cfg.sections[0].functions, before);
     }
 }
