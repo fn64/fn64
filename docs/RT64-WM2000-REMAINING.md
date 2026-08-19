@@ -95,3 +95,20 @@ to re-check once the window reaches real play.
 - **Gameplay has never been reached** on either lane. The C lane's deep window is uniform white — a blank-frame loop, not content.
 - Whether the two recompiler lanes emit identical RDP streams is **unmeasured**.
 - Whether WM2000 latches VI filters beyond V1 is **unmeasured** — the census counts opcodes and does not decode `G_RDPSETOTHERMODE` payload bits or scissor rect values.
+
+## S1 — GPU triangles never reach guest memory (top card after the walls)
+
+Verified by reading the crate, not inferred. `production.rs` says it in its
+own words near `stage_and_report`: the missing RDRAM writeback for the GPU
+raster path "is a separate, pre-existing gap that this arm never closed."
+
+A `RawTriangle` pushes no `ResourceAccess`, so it declares no journal write
+and stages no `CompletedWrite`; its raster lands in `triangle_draw_output`,
+which `present` refuses to scan out by name ("one submission's readback, not
+a VI-sampled framebuffer").
+
+Consequence, stated plainly: texrects are guest-visible, raw triangles are
+not. WM2000's title and HUD are texrects (2,520 measured), so clearing the
+seven walls yields a real frame -- and no 3D geometry at all. This is the
+ceiling on "playable", and it is a design change rather than a guard fix, so
+it does not parallelize with the wall cards.
