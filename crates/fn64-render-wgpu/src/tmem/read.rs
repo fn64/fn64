@@ -654,6 +654,100 @@ mod tests {
     use super::*;
     use crate::{TileAddressMode, TmemWordAddress};
 
+    /// A sparse byte source for end-to-end reader tests. Only the bytes
+    /// explicitly written are valid; every other address reads as undefined,
+    /// exactly like untouched physical TMEM.
+    struct SparseSource(std::collections::BTreeMap<u16, u8>);
+
+    impl SparseSource {
+        fn new() -> Self {
+            Self(std::collections::BTreeMap::new())
+        }
+
+        fn write(&mut self, address: u16, value: u8) {
+            self.0.insert(address, value);
+        }
+
+        /// Writes all four big-endian lanes of one canonical quadricated
+        /// TLUT entry, which the reader requires to be valid and to agree.
+        fn write_quadricated_entry(&mut self, index: u8, value: u16) {
+            let base = 0x0800 + u16::from(index) * 8;
+            let [high, low] = value.to_be_bytes();
+            for lane in 0..4 {
+                self.write(base + lane * 2, high);
+                self.write(base + lane * 2 + 1, low);
+            }
+        }
+    }
+
+    impl TmemByteSource for SparseSource {
+        fn snapshot(&self) -> TmemSnapshotIdentity {
+            PhysicalTmemState::try_new().unwrap().snapshot()
+        }
+
+        fn valid_byte(&self, address: u16) -> Option<u8> {
+            self.0.get(&address).copied()
+        }
+    }
+
+    /// POSITIVE CONTROL for WM2000's failing texrect, end to end through the
+    /// physical reader rather than the pure value layer.
+    ///
+    /// The tile below is genuinely `IntensityAlpha`/`Bits8` -- asserted, not
+    /// assumed -- and the mode is genuinely an enabled TLUT. Before the
+    /// tlut_en fix this exact call returned
+    /// `FormatMustBeColorIndex { format: IntensityAlpha }`, which is the
+    /// error that aborted the all-Rust stack.
+    ///
+    /// The expected color is hand-derived from the RGBA16 (5/5/5/1) bit
+    /// layout, never captured: entry `0xF801` is
+    /// `r=0b11111, g=0b00000, b=0b00000, a=1`, and 5-bit replication
+    /// (`v << 3 | v >> 2`) sends `0b11111` to `0xFF` and `0b00000` to `0x00`,
+    /// giving opaque red.
+    #[test]
+    fn enabled_tlut_over_a_non_ci_tile_reaches_the_tlut_lookup() {
+        let subject = tile(ImageFormat::IntensityAlpha, PixelSize::Bits8, 0, 0);
+        assert_eq!(
+            subject.format(),
+            ImageFormat::IntensityAlpha,
+            "positive control must bind a genuinely IntensityAlpha tile"
+        );
+        assert_eq!(subject.size(), PixelSize::Bits8);
+
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let mut source = SparseSource::new();
+        source.write(0, 0x42);
+        source.write_quadricated_entry(0x42, 0xf801);
+
+        let decoded = read_texel(&source, subject, addressed, TextureLutMode::Rgba16)
+            .expect("enabled TLUT ignores the tile format");
+        assert_eq!(decoded.texel().rgba8888(), [0xff, 0x00, 0x00, 0xff]);
+    }
+
+    /// The companion refutation: the SAME tile and bytes with the TLUT
+    /// DISABLED must still refuse by format, so the test above cannot pass
+    /// by the format check having been deleted outright.
+    #[test]
+    fn disabled_tlut_over_the_same_non_ci_tile_still_refuses_by_format() {
+        let subject = tile(ImageFormat::IntensityAlpha, PixelSize::Bits8, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let mut source = SparseSource::new();
+        source.write(0, 0x42);
+
+        // IA8 is a legal direct pair, so a disabled TLUT decodes it
+        // directly rather than refusing -- the refusal below is the CI
+        // alias's, reached only by a format with no direct decode.
+        assert!(read_texel(&source, subject, addressed, TextureLutMode::Disabled).is_ok());
+
+        let ci16 = tile(ImageFormat::ColorIndex, PixelSize::Bits16, 0, 0);
+        assert!(matches!(
+            read_texel(&source, ci16, addressed, TextureLutMode::Disabled),
+            Err(PhysicalTexelReadError::Indexed(
+                IndexedTexelResolveError::UnsupportedIndexSize { .. }
+            ))
+        ));
+    }
+
     fn tile(format: ImageFormat, size: PixelSize, tmem: u16, palette: u8) -> TileDescriptor {
         TileDescriptor::from_wire(
             format,
