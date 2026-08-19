@@ -40,7 +40,9 @@ use fn64_cpu_runtime_codegen::swallowed_entries::{
     apply_repairs, cross_check_region, CodeRegion, CrossCheck, DumpFunction,
 };
 use fn64_cpu_runtime_codegen::{
-    emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
+    emit_function_resolved, emit_lookup_dispatcher,
+    module::{audit_undispatchable_call_targets, SymbolTable, UndispatchableCallTarget},
+    FuncInput, ModuleFunc,
 };
 use fn64_recomp::{load_config, Function, InstructionPatch, RecompConfig, Section};
 
@@ -284,6 +286,10 @@ struct Report {
     /// by construction; the report names them so a run that reads
     /// "99%+ linkable" cannot hide bodies that no direct call can reach.
     banked_claimants: Vec<(u32, Vec<(usize, String)>)>,
+    /// Static call targets that no emitted table can dispatch (see
+    /// `audit_undispatchable_call_targets`). Non-empty means the generated
+    /// crate contains a `lookup()` that WILL trap if the guest takes it.
+    undispatchable: Vec<UndispatchableCallTarget>,
 }
 
 /// Enough buckets to keep generated codegen units balanced without producing
@@ -371,6 +377,9 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
 
     let mut results = Vec::new();
     let mut lookup_sites = 0usize;
+    // Every body actually emitted, retained so the undispatchable-target
+    // audit can test each static call against the emitted span set.
+    let mut emitted_bodies: Vec<(String, u32, Vec<u32>)> = Vec::new();
     let mut part_bodies = vec![String::new(); RECOMPILED_PART_COUNT];
 
     for section in &cfg.sections {
@@ -451,6 +460,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                     .expect("RECOMPILED_PART_COUNT is non-zero");
                 part_bodies[bucket].push_str(&body);
                 part_bodies[bucket].push('\n');
+                emitted_bodies.push((func.name.clone(), func.vram, words.clone()));
             }
 
             let mut trap_kinds = trap_kinds;
@@ -501,11 +511,24 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
         render_generated_lib(&symbols, &cfg.sections),
     ));
 
+    let undispatchable = {
+        let funcs: Vec<ModuleFunc> = emitted_bodies
+            .iter()
+            .map(|(name, vram, words)| ModuleFunc {
+                name,
+                vram: *vram,
+                words,
+            })
+            .collect();
+        audit_undispatchable_call_targets(&funcs, &symbols)
+    };
+
     Report {
         module,
         crate_files,
         results,
         lookup_sites,
+        undispatchable,
         recompiled_symbols: symbols.len(),
         banked_claimants: symbols
             .ambiguous_claimants()
@@ -709,6 +732,56 @@ impl Report {
         s
     }
 
+    /// Name every static call target the emitted crate cannot dispatch.
+    ///
+    /// A row here is a latent mid-run abort: the body at that vram IS emitted,
+    /// but only as an interior `match` arm of the function whose declared size
+    /// covers it, so the entry-keyed dispatch tables cannot name it and the
+    /// emitted `lookup()` traps the first time the guest takes that call.
+    /// It is a symbol-boundary defect, and this table is where it becomes
+    /// visible at build time rather than at an arbitrary VI swap.
+    fn render_undispatchable_targets(&self) -> String {
+        let mut s = String::new();
+        s.push_str("## Undispatchable static call targets (latent runtime traps)\n\n");
+        if self.undispatchable.is_empty() {
+            s.push_str(
+                "None. Every static `JAL`/`J` target in this config is either a declared \
+                 function entry, a bank-ambiguous entry reachable through overlay residency, \
+                 or an address outside every emitted body (a host shim).\n\n",
+            );
+            return s;
+        }
+        s.push_str(&format!(
+            "**{} targets.** Each is the destination of a plain static `JAL`/`J` immediate \
+             whose vram carries NO function symbol, yet falls strictly inside the declared \
+             span of a function that is emitted. The instructions at that address are \
+             therefore emitted only as interior `match` arms, and neither `LOOKUP_TABLE` nor \
+             `BANKED_LOOKUP_TABLE` can hold the address because both are keyed on function \
+             ENTRY vrams. The emitted `lookup()` will call \
+             `trap_unsupported` the first time the guest takes this path -- an abort whose \
+             timing depends entirely on guest input, not on the build.\n\n\
+             The repair is upstream, in the symbol source: declare the target as its own \
+             function entry so the containing function's size no longer swallows it.\n\n",
+            self.undispatchable.len(),
+        ));
+        s.push_str("| target | swallowed by | callers |\n|---|---|---|\n");
+        for f in &self.undispatchable {
+            s.push_str(&format!(
+                "| `{:#010X}` | `{}` @ `{:#010X}` | {} |\n",
+                f.target,
+                f.containing_function,
+                f.containing_vram,
+                f.callers
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        s.push('\n');
+        s
+    }
+
     /// Name every vram two or more overlay banks claim.
     ///
     /// The "linkable" percentage above counts a body as linkable when it
@@ -786,6 +859,7 @@ impl Report {
             100.0 * (clean + trap) as f64 / total as f64
         ));
         s.push_str(&self.render_bank_ambiguity());
+        s.push_str(&self.render_undispatchable_targets());
 
         // Runtime-trap breakdown by kind.
         s.push_str("## Runtime-trap functions (host-bound; panic bodies are not emitted)\n\n");

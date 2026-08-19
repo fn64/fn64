@@ -390,9 +390,23 @@ pub fn audit_undispatchable_call_targets(
             let vram = f.vram + (i as u32) * 4;
             let instr = decode(w);
             // Only absolute JAL/J immediates carry a statically-known target.
+            //
+            // A `J` whose target lands inside the SAME function is a local
+            // branch: the emitter lowers it to `pc = <target>; continue 'run`
+            // and never calls `lookup()`. Only a `J` that leaves the function
+            // is a tail call, while every `JAL` is a call. Counting local
+            // jumps here would report thousands of ordinary intra-function
+            // branches as defects.
+            let func_end = f.vram + (f.words.len() as u32) * 4;
             let target = match instr {
-                fn64_cpu_runtime::Instruction::J { target }
-                | fn64_cpu_runtime::Instruction::Jal { target } => {
+                fn64_cpu_runtime::Instruction::J { target } => {
+                    let t = (vram.wrapping_add(4) & 0xF000_0000) | (target << 2);
+                    if t >= f.vram && t < func_end {
+                        continue;
+                    }
+                    t
+                }
+                fn64_cpu_runtime::Instruction::Jal { target } => {
                     (vram.wrapping_add(4) & 0xF000_0000) | (target << 2)
                 }
                 _ => continue,
