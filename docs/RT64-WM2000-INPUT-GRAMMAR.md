@@ -222,3 +222,51 @@ is suppressed.
 
 **No frame in any run has been shown to be in-match.** The novel frames are a
 recoloured plateau, not a new screen.
+
+## The frame hash was the wrong instrument: A *does* advance the game
+
+Frame hashes say all four wave-1 runs are equally stuck. The **gfx-task rate**
+says they are not, and it is the measurement that changes the conclusion.
+
+Per-swap graphics tasks, from the harness's own `task_counts()` progress lines:
+
+| swaps | control | probeA | probeB | probeDR_A |
+|---|---|---|---|---|
+| ..2460 | 3.01 | 3.01 | 3.01 | 3.01 |
+| ~2800 | 1.50 | 1.28 | 1.50 | 1.43 |
+| ~3200 | **1.00** | 1.87 | **1.00** | **1.00** |
+| ~3500 | **1.00** | **3.00** | **1.00** | **1.00** |
+| ~3850 | **1.00** | **3.00** | **1.00** | **1.00** |
+| ~4200 | **1.00** | **3.00** | **1.00** | **1.00** |
+
+Every run enters the plateau the same way: the rate collapses from a steady
+~3.0 display lists per field to exactly **1.00**, which is the signature of one
+static list being re-presented rather than a screen composing itself.
+
+**Only probeA comes back out.** After its last A press (swaps 3000-3010) the
+rate climbs 1.28 -> 1.87 -> **3.00** and holds 3.00 for the remaining ~650
+swaps. The control, which pressed nothing, never leaves 1.00. Neither does B,
+nor D-Right+A.
+
+So A is not merely "doing something": it moves the guest from a one-list idle
+state back into a three-lists-per-field composing state, and the guest stays
+there. Audio is flat at 1.83 tasks/swap throughout and does not distinguish the
+runs, so this is specifically the graphics pipeline waking up.
+
+**And the framebuffer still does not change.** probeA's dumped frames from
+swap 3000 to 4156 are 100% the single plateau hash `5d29bcadf69b`, while it
+submits three display lists per field. Both framebuffers (`0x0038f800` and
+`0x003c7c00`) remain in the swap rotation in every run, so this is not a
+stalled buffer flip.
+
+That combination -- guest composing at full rate, scanned-out image frozen --
+is not an input problem. **The remaining gap is downstream of input**, in what
+those display lists produce. Which is consistent with the standing renderer
+blocker (S1 triangle composition in `RT64-WM2000-REMAINING.md`): a screen whose
+content is drawn entirely from triangles the rasterizer cannot compose would
+look exactly like this, live and frozen at the same time.
+
+**Nonclaim.** This does not show a match was reached. It shows the input
+grammar past the plateau is A, that A restores full-rate composition, and that
+the reason no new picture appears is downstream of the button. Identifying the
+screen probeA is composing needs the render path, not another button.
