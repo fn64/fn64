@@ -210,8 +210,18 @@ pub(crate) const ZERO_ABC_ALPHA: [u32; 3] = [7, 7, 7];
 /// `(Zero - Zero) * Zero + D` for the D slot named, in both colour and alpha.
 pub(crate) const fn passthrough_combine(d_slot: u32) -> (u32, u32) {
     combine_wire(
-        [ZERO_ABC_COLOR[0], ZERO_ABC_COLOR[1], ZERO_ABC_COLOR[2], d_slot],
-        [ZERO_ABC_ALPHA[0], ZERO_ABC_ALPHA[1], ZERO_ABC_ALPHA[2], d_slot],
+        [
+            ZERO_ABC_COLOR[0],
+            ZERO_ABC_COLOR[1],
+            ZERO_ABC_COLOR[2],
+            d_slot,
+        ],
+        [
+            ZERO_ABC_ALPHA[0],
+            ZERO_ABC_ALPHA[1],
+            ZERO_ABC_ALPHA[2],
+            d_slot,
+        ],
     )
 }
 
