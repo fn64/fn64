@@ -172,10 +172,20 @@ pub fn execute_raw_triangle(
     for (position, (row, access)) in rows.iter().zip(declared.iter()).enumerate() {
         let start = base + (row.y * extent.width() + row.x0) * bpp;
         let len = (row.x1 - row.x0) * bpp;
-        let declared_range = match access.region() {
-            fn64_render_ir::ResourceRegion::Rdram { range, .. } => (range.start().get(), range.len()),
-            _ => (0, 0),
+        // A non-RDRAM region is refused outright rather than mapped to a
+        // sentinel: `(0, 0)` would be indistinguishable from a legitimate
+        // zero-length range at address zero, and "this access names the
+        // wrong RESOURCE" is a different fault from "it names the wrong
+        // bytes". `verify_accesses_inside` already proved the resource
+        // upstream, which is exactly why this arm must not quietly agree.
+        let fn64_render_ir::ResourceRegion::Rdram { range, .. } = access.region() else {
+            return Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                position,
+                declared: (0, 0),
+                rasterized: (start, len),
+            });
         };
+        let declared_range = (range.start().get(), range.len());
         if declared_range != (start, len) {
             return Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
                 position,
