@@ -99,6 +99,13 @@
 const TMEM_BYTES: u32 = 4096u;
 const TMEM_VALIDITY_WORDS: u32 = 128u;
 const TMEM_ADDRESS_MASK: u32 = 0x0fffu;
+// RT64's `RDP_TMEM_MASK16` (`src/shaders/TextureDecoder.hlsli:15`, pinned
+// port source `5473732a`): the mask a read scoped to one 2 KiB half uses.
+// `TextureDecoder.hlsli:162-163` selects it for RGBA32 *or* an enabled
+// TLUT -- "When using RGBA32 or TLUT, each sample only addresses half of
+// TMEM" -- and `implLoadTMEM` (`:17-25`) applies it as a mask, never as a
+// refusal. Mirrors `tmem/read.rs`'s `AddressScope::LowHalf`.
+const TMEM_LOW_HALF_MASK: u32 = 0x07ffu;
 
 // **First-row parity is derived per tile, never frozen.**
 // `tmem/read.rs`'s `TmemFirstRowParity` is explicit caller input -- the
@@ -326,6 +333,24 @@ fn tmem_rgba16_linear_base(
 // Masks and, if this row's parity triggers the odd-row exchange, XORs ONE
 // already-offset linear address -- called independently per byte (see
 // `tmem_rgba16_linear_base`'s doc above).
+// The enabled-TLUT index source's own address: identical to
+// `tmem_rgba16_byte_address` except that it wraps within the low 2 KiB
+// (RT64 `TextureDecoder.hlsli:162-163`), so an index read can never reach
+// the palette's own half. XOR4 only touches bit 2, so masking before or
+// after the exchange is the same address; the CPU oracle
+// (`tmem/read.rs`'s `first_physical_byte` under `AddressScope::LowHalf`)
+// masks first, and this matches it.
+fn tmem_indexed_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
+    let address = linear & TMEM_LOW_HALF_MASK;
+    let first_is_odd = tmem_first_row_parity_odd(tile);
+    let row_is_odd = (row & 1u) != 0u;
+    let exchange = first_is_odd != row_is_odd;
+    if exchange {
+        return address ^ 4u;
+    }
+    return address;
+}
+
 fn tmem_rgba16_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
     let address = linear & TMEM_ADDRESS_MASK;
     let first_is_odd = tmem_first_row_parity_odd(tile);
@@ -397,35 +422,32 @@ fn tmem_indexed_linear_base(
         + column_offset;
 }
 
-// `read_canonical_tlut_entry` (`tmem/read.rs`): the eight bytes at
-// `0x800 + index * 8` are four identical big-endian 16-bit lanes. All eight
-// must be valid, and all four lanes must agree -- both are the CPU
-// reader's own requirements (`IncompleteTlutEntry`/`NonCanonicalTlutEntry`),
-// carried here as `out_ok = false` rather than dropped, since a
-// disagreeing entry means the TLUT was never fully loaded and inventing a
-// lane would silently paint the wrong palette color.
-fn tmem_read_canonical_tlut_entry(index: u32, out_ok: ptr<function, bool>) -> u32 {
+// `read_tlut_entry` (`tmem/read.rs`): the FIRST quadricated lane at
+// `0x800 + index * 8`, and only that lane.
+//
+// RT64 `src/shaders/TextureDecoder.hlsli:179` is the whole palette read:
+// `loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8)` over
+// `#define loadTLUT(a) TMEM.Load(uint2((a) & RDP_TMEM_MASK8, 0))` (`:28`).
+// Lanes 1..3 are never addressed, so neither their contents nor their
+// validity can gate the read. `fn64-render-reference`'s `read_tlut`
+// (`src/gbi/state.rs:853-869`) reads the same two bytes.
+//
+// Lane 0's own two bytes are still required to be valid: `out_ok = false`
+// here still means an unwritten palette byte, which the RDP's TMEM would
+// never have and which this shader must not invent -- the same rule
+// `tmem_read_byte` enforces everywhere else.
+fn tmem_read_tlut_entry(index: u32, out_ok: ptr<function, bool>) -> u32 {
     let base = TMEM_TLUT_BASE + index * TMEM_TLUT_ENTRY_STRIDE;
-    var lane0 = 0u;
-    for (var lane = 0u; lane < 4u; lane = lane + 1u) {
-        var ok_hi = false;
-        var ok_lo = false;
-        let hi = tmem_read_byte(base + lane * 2u, &ok_hi);
-        let lo = tmem_read_byte(base + lane * 2u + 1u, &ok_lo);
-        if !ok_hi || !ok_lo {
-            *out_ok = false;
-            return 0u;
-        }
-        let value = (hi << 8u) | lo;
-        if lane == 0u {
-            lane0 = value;
-        } else if value != lane0 {
-            *out_ok = false;
-            return 0u;
-        }
+    var ok_hi = false;
+    var ok_lo = false;
+    let hi = tmem_read_byte(base, &ok_hi);
+    let lo = tmem_read_byte(base + 1u, &ok_lo);
+    if !ok_hi || !ok_lo {
+        *out_ok = false;
+        return 0u;
     }
     *out_ok = true;
-    return lane0;
+    return (hi << 8u) | lo;
 }
 
 // The enabled-TLUT texel path, mirroring `tmem/read.rs`'s `read_texel`
@@ -448,28 +470,15 @@ fn tmem_sample_tlut_texel(
     column: u32,
     row: u32,
     out_ok: ptr<function, bool>,
-    out_low_half_violation: ptr<function, bool>,
 ) -> vec4<f32> {
     let linear = tmem_indexed_linear_base(tile, column, row);
-
-    // `validate_address_scope` (`tmem/read.rs`): under an enabled TLUT the
-    // CI source byte must lie in the canonical low half. The CPU reader
-    // checks the FULLY addressed byte -- post twelve-bit wrap, post odd-row
-    // XOR4 exchange -- via `first_physical_byte`, so this must too; checking
-    // the unwrapped `linear` instead would disagree with the oracle exactly
-    // at the wrap boundary and across the exchange.
-    if tmem_rgba16_byte_address(tile, linear, row) >= TMEM_TLUT_BASE {
-        *out_low_half_violation = true;
-        *out_ok = false;
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
 
     var index: u32;
     if tile.pixel_size == TMEM_PIXEL_SIZE_BITS16 {
         // The high byte of the big-endian 16-bit texel: the first byte at
         // this texel's address, not the second.
         var ok_hi = false;
-        let hi = tmem_read_byte(tmem_rgba16_byte_address(tile, linear, row), &ok_hi);
+        let hi = tmem_read_byte(tmem_indexed_byte_address(tile, linear, row), &ok_hi);
         if !ok_hi {
             *out_ok = false;
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -477,7 +486,7 @@ fn tmem_sample_tlut_texel(
         index = hi;
     } else {
         var ok_byte = false;
-        let byte = tmem_read_byte(tmem_rgba16_byte_address(tile, linear, row), &ok_byte);
+        let byte = tmem_read_byte(tmem_indexed_byte_address(tile, linear, row), &ok_byte);
         if !ok_byte {
             *out_ok = false;
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -496,7 +505,7 @@ fn tmem_sample_tlut_texel(
     }
 
     var entry_ok = false;
-    let entry = tmem_read_canonical_tlut_entry(index, &entry_ok);
+    let entry = tmem_read_tlut_entry(index, &entry_ok);
     if !entry_ok {
         *out_ok = false;
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -519,10 +528,9 @@ fn tmem_sample_texel(
     column: u32,
     row: u32,
     out_ok: ptr<function, bool>,
-    out_low_half_violation: ptr<function, bool>,
 ) -> vec4<f32> {
     if tile.lut_mode != TMEM_TLUT_MODE_DISABLED {
-        return tmem_sample_tlut_texel(tile, column, row, out_ok, out_low_half_violation);
+        return tmem_sample_tlut_texel(tile, column, row, out_ok);
     }
     return tmem_sample_rgba16_texel(tile, column, row, out_ok);
 }
@@ -745,22 +753,10 @@ fn sample_committed_rgba16_three_nearest(
     var ok_ll = false;
     var ok_ur = false;
     var ok_lr = false;
-    // One shared violation flag across the four corners: the low-half rule
-    // is a property of the tile's placement, so any corner tripping it means
-    // the whole draw is sourcing indexes from the palette's own half.
-    var low_half_violation = false;
-    let c_ul = tmem_sample_texel(tile, cell.s0, cell.t0, &ok_ul, &low_half_violation);
-    let c_ll = tmem_sample_texel(tile, cell.s0, cell.t1, &ok_ll, &low_half_violation);
-    let c_ur = tmem_sample_texel(tile, cell.s1, cell.t0, &ok_ur, &low_half_violation);
-    let c_lr = tmem_sample_texel(tile, cell.s1, cell.t1, &ok_lr, &low_half_violation);
-    // Checked BEFORE the validity verdict, mirroring the CPU reader's own
-    // order: `validate_address_scope` runs before the first byte is read, so
-    // a high-half tile is refused by placement even when its bytes happen to
-    // be invalid too.
-    if low_half_violation {
-        result.status = TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF;
-        return result;
-    }
+    let c_ul = tmem_sample_texel(tile, cell.s0, cell.t0, &ok_ul);
+    let c_ll = tmem_sample_texel(tile, cell.s0, cell.t1, &ok_ll);
+    let c_ur = tmem_sample_texel(tile, cell.s1, cell.t0, &ok_ur);
+    let c_lr = tmem_sample_texel(tile, cell.s1, cell.t1, &ok_lr);
     if !ok_ul || !ok_ll || !ok_ur || !ok_lr {
         result.status = TMEM_SAMPLE_STATUS_INVALID_BYTE;
         return result;
