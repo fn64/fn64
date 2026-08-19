@@ -652,6 +652,18 @@ pub enum TexrectExecutionError {
         column: u32,
         row: u32,
     },
+    /// The wire opcode's texture bit and the caller's TMEM binding disagree.
+    ///
+    /// Both directions are refused, not just one. A TEXTURED triangle with no
+    /// binding would have to combine against a fabricated zero texel -- the
+    /// silent-wrong-answer shape this crate has already shipped once. An
+    /// UNTEXTURED one with a binding has no S/T/W coefficient block to
+    /// evaluate, so there is no coordinate to sample at and any texel
+    /// produced would be invented.
+    TriangleTextureBindingDisagreesWithOpcode {
+        opcode_textured: bool,
+        binding_present: bool,
+    },
     Target(TargetError),
 }
 
@@ -759,6 +771,15 @@ impl core::fmt::Display for TexrectExecutionError {
                 formatter,
                 "raw-triangle pixel ({column}, {row}) has subpixel coverage but no covered \
                  subsample to evaluate its attribute planes at"
+            ),
+            Self::TriangleTextureBindingDisagreesWithOpcode {
+                opcode_textured,
+                binding_present,
+            } => write!(
+                formatter,
+                "the raw triangle's wire opcode says textured={opcode_textured} but its TMEM \
+                 binding is present={binding_present}; a textured triangle needs a bound tile \
+                 and an untextured one has no S/T/W planes to sample with"
             ),
             Self::ReservedAlphaCompare => formatter
                 .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),

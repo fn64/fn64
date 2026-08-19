@@ -5,6 +5,14 @@ use super::super::{
     ColorTargetExtent, ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, TargetError,
 };
 use super::*;
+
+/// Every fixture in this module draws an UNTEXTURED triangle, so each names
+/// the absent binding through one alias rather than repeating a turbofish.
+/// The type parameter must still be named -- `None` alone leaves `S`
+/// unconstrained -- and `PhysicalTmemState` is the natural witness: it is the
+/// image a load-free packet's triangle would actually be handed.
+const NO_TEXTURE: Option<RawTriangleTexture<'static, crate::tmem::PhysicalTmemState>> = None;
+
 use crate::raw_dpc::RawTriangle;
 use crate::{Color4, CombineParams, PrimColor};
 
@@ -192,6 +200,7 @@ fn run_with(
         TexrectBlendRegisters::default(),
         resident,
         declared,
+        NO_TEXTURE,
     )?;
     Ok(completed.device_bytes().device_bytes().to_vec())
 }
@@ -260,6 +269,7 @@ fn the_written_colour_comes_from_the_latched_program_not_a_constant() {
         TexrectBlendRegisters::default(),
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
+        NO_TEXTURE,
     )
     .expect("a flat triangle rasterizes");
     let bytes = completed.device_bytes().device_bytes();
@@ -476,6 +486,7 @@ fn fill_and_copy_cycle_are_both_refused_by_name() {
             TexrectBlendRegisters::default(),
             &resident,
             &declared_accesses(key, &box_triangle(), Some(3)),
+            NO_TEXTURE,
         );
         assert!(
             matches!(
@@ -513,6 +524,7 @@ fn a_program_reading_shade_is_refused_rather_than_combined_against_zero() {
         TexrectBlendRegisters::default(),
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
+        NO_TEXTURE,
     );
     assert!(
         matches!(
@@ -566,6 +578,7 @@ fn the_claimed_rectangle_is_the_bounding_box_of_the_covered_rows() {
         TexrectBlendRegisters::default(),
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
+        NO_TEXTURE,
     )
     .unwrap();
     let rectangle = completed.rectangle();
@@ -669,6 +682,7 @@ fn run_shaded(
         TexrectBlendRegisters::default(),
         resident,
         &declared,
+        NO_TEXTURE,
     )?;
     Ok(completed.device_bytes().device_bytes().to_vec())
 }
@@ -776,6 +790,7 @@ fn an_unshaded_triangle_reading_shade_is_still_refused() {
         TexrectBlendRegisters::default(),
         &resident,
         &declared,
+        NO_TEXTURE,
     );
     assert!(
         matches!(
@@ -821,6 +836,7 @@ fn an_untextured_triangle_reading_texel0_is_refused() {
         TexrectBlendRegisters::default(),
         &resident,
         &declared,
+        NO_TEXTURE,
     );
     assert!(
         matches!(
