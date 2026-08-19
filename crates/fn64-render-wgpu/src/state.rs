@@ -724,9 +724,42 @@ pub struct RdpState {
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
     tmem: TmemState,
+    /// The HOST-configured colour-target height, in scanlines.
+    ///
+    /// **Not RDP state.** `SetColorImage` carries a width and no height, and
+    /// the RDP has no register that supplies one -- the height comes from
+    /// `RenderConfig`, the same value `configured_target_extent` records at
+    /// `create` time. It lives here because the DECODER needs it and has no
+    /// other route to it: `plan_raw_triangle` declares one write access per
+    /// covered scanline, and a triangle whose YL reaches past the target's
+    /// last row would otherwise declare byte ranges the target cannot hold.
+    ///
+    /// `None` means no `create` has run yet, in which case a raw triangle
+    /// declares nothing at all rather than guessing a height -- the same
+    /// "decode succeeds, journal stays silent" shape every other unavailable
+    /// precondition in `plan_raw_triangle` takes.
+    ///
+    /// Measured, not reasoned: with the decoder capped only by installed
+    /// RDRAM, WM2000 aborted after 280 VI swaps with "FillRectangle access
+    /// #59 names a range outside its own color target's full extent". The
+    /// defect predates the texture rung -- it was simply unreachable while
+    /// the decoder refused every triangle the ROM emits.
+    color_target_height: Option<u32>,
 }
 
 impl RdpState {
+    /// Records the host-configured colour-target height. Called once from
+    /// `create_inner`, from the same `RenderConfig` that fills
+    /// `configured_target_extent`, so the decoder's row bound and the
+    /// executor's extent cannot disagree.
+    pub(crate) fn set_color_target_height(&mut self, height: u32) {
+        self.color_target_height = Some(height);
+    }
+
+    pub(crate) const fn color_target_height(&self) -> Option<u32> {
+        self.color_target_height
+    }
+
     pub const fn other_mode(&self) -> Option<OtherMode> {
         self.other_mode
     }
@@ -783,6 +816,10 @@ impl RdpState {
             prim_depth: self.prim_depth,
             combine: self.combine,
             tmem: self.tmem.clone(),
+            // Carried into the decode fork: it is what bounds
+            // `plan_raw_triangle`'s row walk, and a fork that dropped it
+            // would declare rows past the target's end.
+            color_target_height: self.color_target_height,
         }
     }
 
