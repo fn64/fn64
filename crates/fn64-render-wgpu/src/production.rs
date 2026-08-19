@@ -937,6 +937,22 @@ struct PlanCollector {
     /// here. Counting triangles instead would double every texrect and
     /// reject a single legal one as two.
     texrect_commands: Vec<(Option<fn64_render::TriangleAccessSpan>, usize, u8, u32)>,
+    /// One entry per admitted **flat raw triangle** that declared a
+    /// destination write: its declared access span, its index into
+    /// `triangles`, and its own stream command index.
+    ///
+    /// Separate from `texrect_commands` even though the tuple rhymes,
+    /// because the two are scheduled through different executors and the
+    /// pairing rule that collapses a texrect's two halves has no analogue
+    /// here: a raw triangle is exactly one triangle. Merging them would
+    /// mean re-deriving "which kind is this" at execute time from a field
+    /// the collector already knows at push time.
+    ///
+    /// A raw triangle that declared NO write is absent from this list
+    /// entirely -- `None` and "not present" would be the same value, and
+    /// this list's only consumer is the schedule, which must not schedule
+    /// an undeclared triangle.
+    raw_triangle_commands: Vec<(fn64_render::TriangleAccessSpan, usize, u32, Box<[u32]>)>,
 }
 
 impl PlanCollector {
@@ -980,6 +996,7 @@ impl PlanCollector {
             triangle_neutral_tiles: Vec::new(),
             triangle_commands: Vec::new(),
             texrect_commands: Vec::new(),
+            raw_triangle_commands: Vec::new(),
         }
     }
 }
@@ -1181,6 +1198,30 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // *commands*, which is what the declared-write span is
                 // keyed on -- counting triangles would double every
                 // texrect and reject a single legal one as "two".
+                // A raw triangle carries its own declared span in the same
+                // field a texrect uses, because the adapter pushes both
+                // through one `RdpTriangleCommand`. `None` means it declared
+                // no write -- outside the flat-opaque subset, no staged
+                // colour image, Fill cycle, or a row outside installed RDRAM
+                // -- and it is simply absent here, so the schedule cannot
+                // reach it.
+                if *source == TriangleSource::RawTriangle {
+                    if let Some(span) = *texrect_accesses {
+                        // The triangle's own wire words, retained so the
+                        // executor re-decodes THE SAME bytes the decoder
+                        // decoded rather than reconstructing edge
+                        // coefficients from the projected
+                        // `NeutralTriangleVertex` triple -- which is a lossy
+                        // screen-space projection and could not recover
+                        // dxhdy/dxmdy/dxldy at all.
+                        self.raw_triangle_commands.push((
+                            span,
+                            triangle_index,
+                            command_index,
+                            raw_words.clone(),
+                        ));
+                    }
+                }
                 if *source == TriangleSource::TextureRectangle {
                     let previous_was_first_half = self
                         .texrect_commands
@@ -1570,6 +1611,29 @@ pub enum WgpuRawDpcExecutionError {
     TexrectDeclaredNoWrite {
         triangle_index: usize,
     },
+    /// A raw triangle the schedule reached carries a recorded access span
+    /// that no longer resolves to a non-empty slice of the plan's own
+    /// access list.
+    ///
+    /// Unreachable by construction -- `PlanCollector` only records a raw
+    /// triangle at all when its span is `Some`, and the span was written by
+    /// `plan_raw_triangle` at the moment it pushed those very accesses --
+    /// which is exactly why it is a named error rather than an `expect`:
+    /// if the invariant ever breaks, the failure must name the triangle,
+    /// not abort the process.
+    RawTriangleDeclaredNoWrite {
+        triangle_index: usize,
+    },
+    /// A raw triangle's own retained wire words did not re-decode as a
+    /// base-edge (0x08) triangle.
+    ///
+    /// Also unreachable by construction: `plan_raw_triangle` only declares
+    /// a write for a flat triangle, whose wire form is exactly the 32 bytes
+    /// `RawTriangle::decode` already accepted once during decode. Named
+    /// rather than `expect`ed for the same reason as the variant above.
+    RawTriangleWireWordsUndecodable {
+        triangle_index: usize,
+    },
     /// A `TextureRectangle` was admitted in a packet with no TMEM load, so
     /// there is no pending post-image for it to sample. Census-measured,
     /// this shape does not occur in WM2000 (0 of 219 decode entries carry a
@@ -1749,6 +1813,16 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "texture-rectangle triangle #{triangle_index} (plan order) declared no journal \
                  write access, so executing it would write bytes this packet never declared"
+            ),
+            Self::RawTriangleDeclaredNoWrite { triangle_index } => write!(
+                formatter,
+                "raw triangle #{triangle_index} (plan order) was scheduled with a recorded \
+                 access span that resolves to no accesses"
+            ),
+            Self::RawTriangleWireWordsUndecodable { triangle_index } => write!(
+                formatter,
+                "raw triangle #{triangle_index} (plan order) retained wire words that do not \
+                 re-decode as a base-edge triangle"
             ),
             Self::PendingTmemImageClaimedCommitted { triangle_index } => write!(
                 formatter,
@@ -3380,6 +3454,10 @@ fn stage_fills_and_report(
 enum ColorCommandKind {
     Fill(usize),
     Texrect(usize),
+    /// A flat raw triangle that declared a per-scanline write run. Indexes
+    /// `plan.raw_triangle_commands`, which holds only the triangles that
+    /// declared one.
+    RawTriangle(usize),
 }
 
 /// **Which TMEM image this packet's texrects sample, chosen once per packet
@@ -3500,6 +3578,16 @@ fn stage_color_commands(
         .chain(collector.plan.texrect_commands.iter().enumerate().map(
             |(index, (_, _, _, command_index))| (*command_index, ColorCommandKind::Texrect(index)),
         ))
+        .chain(
+            collector
+                .plan
+                .raw_triangle_commands
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, command_index, _))| {
+                    (*command_index, ColorCommandKind::RawTriangle(index))
+                }),
+        )
         .collect();
     if schedule.is_empty() {
         return Ok(None);
@@ -3591,6 +3679,15 @@ fn stage_color_commands(
                         collector, &candidate, state, false, index, resident, claimed,
                     )?,
                 }
+            }
+            ColorCommandKind::RawTriangle(index) => {
+                // Same resident-bytes requirement as a texrect and for the
+                // same reason: a triangle writes a sub-region, so every
+                // pixel outside it must come from real prior content.
+                let resident = accumulated
+                    .as_deref()
+                    .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+                execute_scheduled_raw_triangle(collector, &candidate, index, resident)?
             }
         };
         // This command's own output becomes the next command's resident
@@ -3765,6 +3862,81 @@ fn execute_scheduled_fill(
         accumulated,
     )?;
     let accesses = fill_accesses(&collector.plan.accesses, fill)?.to_vec();
+    Ok((completed, accesses))
+}
+
+/// Executes the flat raw triangle at `index` of the plan's own
+/// `raw_triangle_commands` list against the accumulated buffer, returning
+/// its completion and its declared accesses.
+///
+/// Every geometric fact is taken from the decoder, never re-derived: the
+/// edge coefficients from re-decoding the command's OWN retained wire words,
+/// and the declared write run from the span the decoder recorded when it
+/// pushed those accesses. The one number this function computes itself is
+/// the declared row COUNT, which it hands the executor so the executor can
+/// prove its own raster covers exactly those rows.
+fn execute_scheduled_raw_triangle(
+    collector: &ExecutionCollector<'_>,
+    candidate: &CandidateColorTarget,
+    index: usize,
+    resident_bytes: &[u8],
+) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
+    let (span, triangle_index, _, raw_words) = &collector.plan.raw_triangle_commands[index];
+    let draw_state = collector.plan.triangles[*triangle_index]
+        .as_ref()
+        .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
+
+    // **Re-decoded from this command's own retained wire words**, not
+    // reconstructed from the projected `NeutralTriangleVertex` triple. The
+    // projection is screen-space and lossy; it cannot recover dxhdy/dxmdy/
+    // dxldy at all, and the rasterizer needs exactly those. Re-decoding the
+    // same bytes through the same `RawTriangle::decode` is not a second
+    // derivation -- it is the identical function over the identical input.
+    let mut bytes = Vec::with_capacity(raw_words.len() * 4);
+    for word in raw_words.iter() {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    let triangle = crate::raw_dpc::RawTriangle::decode(0x08, &bytes)
+        .map_err(|_| WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
+            triangle_index: *triangle_index,
+        })?;
+
+    // Locate the declared run by the decoder's own recorded span.
+    let start = span.first_access_index as usize;
+    let end = start
+        .checked_add(span.access_count as usize)
+        .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
+            triangle_index: *triangle_index,
+        })?;
+    let accesses = collector
+        .plan
+        .accesses
+        .get(start..end)
+        .filter(|slice| !slice.is_empty())
+        .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
+            triangle_index: *triangle_index,
+        })?
+        .to_vec();
+
+    // Cross-check, not an assumption: every declared access must fall inside
+    // the candidate key's own range, which was derived from the packet's
+    // `SetColorImage` by a path independent of the decoder's row planner.
+    let key = candidate.key();
+    verify_accesses_inside(&accesses, key)?;
+
+    let completed = crate::targets::execute_raw_triangle(
+        candidate,
+        draw_state.other_mode,
+        &triangle,
+        crate::targets::TexrectShading::new(
+            draw_state.combine_params,
+            draw_state.env_color,
+            draw_state.prim_color,
+        ),
+        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color),
+        resident_bytes,
+        accesses.len(),
+    )?;
     Ok((completed, accesses))
 }
 
