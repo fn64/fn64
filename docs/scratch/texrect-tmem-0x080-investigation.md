@@ -284,3 +284,23 @@ guard, the low-half mask, and both samplers are all correct and untouched.
 Extend f2c52822's pre-delta snapshot to `other_mode`, exactly as it was done
 for the tiles: snapshot in `plan_raw_dpc` before the fold, consume in
 `execute_raw_dpc`. Narrow, and now evidence-backed.
+
+## Mutation results (all against the three new tests plus f2c52822's three)
+
+| # | mutant | arm | verdict | killed by |
+|---|---|---|---|---|
+| M1 | consumer reads `self.rdp_state.other_mode()` (the pre-repair line) | CHANGED | KILLED | `execute_raw_dpc_seeds_other_mode_from_the_pre_delta_snapshot` |
+| M2 | snapshot taken AFTER `rdp_state.apply(&delta)` | CHANGED | KILLED | `a_draw_before_its_packets_first_set_other_mode_carries_the_previous_packets_mode` |
+| M3 | snapshot hoisted ABOVE the fallible `plan_raw_dpc_inner` | **KEPT** | KILLED | rejected-plan test + behavioural test |
+| M4 | tile consumer reads the live table (f2c52822's own kept arm) | **KEPT** | KILLED | `execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot` |
+| M5 | never record the snapshot, always fall back | **KEPT** | KILLED | behavioural test + rejected-plan test |
+
+5/5 killed, 0 survived.
+
+**One mutant DID survive an earlier draft, exactly as the brief predicted.**
+The first version of the behavioural test built its own `PlanCollector` from
+`backend.other_mode_before_last_plan` read directly in the test body. M1 — the
+consumer-side mutant — PASSED it, because the test never exercised the call
+site. That is the same trap f2c52822's own first draft hit, and the reason
+`execute_raw_dpc_seeds_other_mode_from_the_pre_delta_snapshot` exists as a
+source-level call-site pin. Recorded here rather than quietly fixed.
