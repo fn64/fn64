@@ -3446,6 +3446,87 @@ mod one_cycle_tests {
         );
     }
 
+    /// **The alpha `Combined` and the colour `CombinedAlpha` selectors go
+    /// through the same slice gate as the plain colour `Combined`.**
+    ///
+    /// Both are distinct decode paths --
+    /// `alphaInputABD` index `0` is `AlphaInput::Combined`
+    /// (`combiner.rs`'s `alpha_input_abd`), and `colorInputC` index `7` is
+    /// `ColorInput::CombinedAlpha` (`color_input_c`) -- and RT64 resolves
+    /// both from the same accumulator (`rt64_color_combiner.h:486-487`
+    /// `C_COMBINED_ALPHA -> combinerColor.a`, `517-518` `A_COMBINED ->
+    /// combinerAlpha`). A gate that admitted the plain colour selector but
+    /// left either of these unguarded would let a two-cycle cycle-0
+    /// program through the one door this repair deliberately keeps shut.
+    ///
+    /// Written because mutants that bypassed `admits_alpha`'s gate and that
+    /// dropped `CombinedAlpha` from `admits_color`'s guarded set both
+    /// SURVIVED the admission tests above.
+    #[test]
+    fn the_alpha_and_combined_alpha_selectors_share_the_slice_gate() {
+        // Alpha slot A = COMBINED (index 0) in cycle 0 of a two-cycle
+        // program; every colour slot and the rest of alpha are Zero.
+        let alpha_combined_first = merge_cycles(
+            pack_first_cycle([8, 8, 16, 7], [0, 7, 7, 7]),
+            pack_second_cycle([8, 8, 16, 7], [7, 7, 7, 7]),
+        );
+        let shading = TexrectShading::new(
+            alpha_combined_first,
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        );
+        assert_eq!(
+            shading.validate_combiner_program(CombinerProgramCycles::BothSlices),
+            Err(TexrectExecutionError::UnsupportedAlphaInput {
+                slot: AlphaInputSlot::A,
+                input: AlphaInput::Combined,
+            }),
+            "alpha COMBINED in cycle 0 of a two-cycle program must be refused"
+        );
+        shading
+            .validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+            .expect("the same word read as one-cycle names no COMBINED at all");
+
+        // Colour slot C = COMBINED_ALPHA (index 7) in cycle 0.
+        let combined_alpha_first = merge_cycles(
+            pack_first_cycle([8, 8, 7, 7], [7, 7, 7, 7]),
+            pack_second_cycle([8, 8, 16, 7], [7, 7, 7, 7]),
+        );
+        let shading = TexrectShading::new(
+            combined_alpha_first,
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        );
+        assert_eq!(
+            shading.validate_combiner_program(CombinerProgramCycles::BothSlices),
+            Err(TexrectExecutionError::UnsupportedColorInput {
+                slot: ColorInputSlot::C,
+                input: ColorInput::CombinedAlpha,
+            }),
+            "COMBINED_ALPHA in cycle 0 of a two-cycle program must be refused"
+        );
+
+        // ...and both are ADMITTED in one-cycle mode, where the zero
+        // accumulator is the hardware's own answer.
+        let alpha_combined_one_cycle = pack_second_cycle([8, 8, 16, 7], [0, 7, 7, 7]);
+        TexrectShading::new(
+            alpha_combined_one_cycle,
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        )
+        .validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+        .expect("one-cycle alpha COMBINED reads the zero-initialized accumulator");
+
+        let combined_alpha_one_cycle = pack_second_cycle([8, 8, 7, 7], [7, 7, 7, 7]);
+        TexrectShading::new(
+            combined_alpha_one_cycle,
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        )
+        .validate_combiner_program(CombinerProgramCycles::OnlySecondSlice)
+        .expect("one-cycle COMBINED_ALPHA reads the zero-initialized accumulator");
+    }
+
     /// **A two-cycle program's FIRST slice still refuses `Combined`.**
     ///
     /// The widening above is not "admit COMBINED everywhere". This pins the
