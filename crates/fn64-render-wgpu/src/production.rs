@@ -2725,6 +2725,53 @@ fn stage_and_report(
     // ordering as fill+triangle, named separately so the diagnosis names
     // the pair that actually collided.
     if texrect_count > 0 && raw_triangle_count > 0 {
+        if std::env::var_os("FN64_DUMP_MIXED_TEXRECT_TRI").is_some() {
+            let mut report = String::new();
+            report.push_str(&format!(
+                "MIXEDPKT texrects={texrect_count} raw_triangles={raw_triangle_count} \
+                 loads={} fills={} triangles={} syncs={}\n",
+                collector.plan.loads.len(),
+                collector.plan.fills.len(),
+                collector.plan.triangles.len(),
+                collector.plan.full_sync_sites.len(),
+            ));
+            for (index, draw) in collector.plan.triangles.iter().enumerate() {
+                let command = collector
+                    .plan
+                    .triangle_commands
+                    .get(index)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                match draw {
+                    Ok(draw) => {
+                        let ys: Vec<i32> =
+                            draw.vertices.iter().map(|v| v.y as i32).collect();
+                        let xs: Vec<i32> =
+                            draw.vertices.iter().map(|v| v.x as i32).collect();
+                        report.push_str(&format!(
+                            "MIXEDPKT  tri[{index}] cmd={command} src={:?} vp={:?} \
+                             x={xs:?} y={ys:?}\n",
+                            draw.source, draw.viewport
+                        ));
+                    }
+                    Err(error) => report.push_str(&format!(
+                        "MIXEDPKT  tri[{index}] cmd={command} MISSING {error:?}\n"
+                    )),
+                }
+            }
+            for (index, entry) in collector.plan.texrect_commands.iter().enumerate() {
+                report.push_str(&format!(
+                    "MIXEDPKT  texrect[{index}] span={:?} first_tri={} tile={} cmd={}\n",
+                    entry.0, entry.1, entry.2, entry.3
+                ));
+            }
+            for (index, (command, load)) in collector.plan.loads.iter().enumerate() {
+                report.push_str(&format!(
+                    "MIXEDPKT  load[{index}] cmd={command} {load:?}\n"
+                ));
+            }
+            eprint!("{report}");
+        }
         return Err(WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket);
     }
     // **A texrect in a packet with no TMEM load samples durable committed
