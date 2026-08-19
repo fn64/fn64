@@ -587,3 +587,80 @@ AND its refusal set exactly, before trusting a single query.
   every pixel in a declared run, when it skips zero-coverage pixels -- which
   is mutant M5, the one that survived). These were found by re-reading, which
   does not scale.
+
+### Better: a ROM-INDEPENDENT harness (revises the corpus proposal above)
+
+The corpus proposal has a flaw worth stating plainly: it makes the loop
+faster but keeps it coupled to a capture pipeline whose faithfulness must be
+continually re-proven. A synthetic harness has no capture step to be wrong
+about.
+
+The layer under test takes **wire words plus staged RDP state and produces
+guest bytes**. Neither end needs a ROM. What a ROM tells you is *which* wire
+words are realistic -- and that is a question you answer ONCE, with a census,
+not a dependency of the inner loop.
+
+**The measured waste, counted in this tree:** NINE hand-rolled wire-word
+encoders for the same RDP command set, three of them predating this lane.
+
+```
+production.rs               triangle_base_edge_words, flat_triangle_in_target_words
+raw_dpc/production_adapter  triangle_base_edge_words
+raw_dpc/mod.rs              triangle_base_word0, flat_triangle_words
+raw_dpc/triangle_span/tests wire, coefficient_block
+targets/raw_triangle/tests  triangle, shaded_triangle
+```
+
+Each re-derives the same bit layouts; each is a place to get a shift wrong.
+This duplication is entirely ROM-independent and removing it needs no new
+capability.
+
+**Shape:**
+
+```rust
+let frame = Rdp::new(16, 8)                  // colour-image extent
+    .other_mode(OneCycle)
+    .combine(shade_passthrough())
+    .prim_color(0x80FF_4080)
+    .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
+    .run();                                   // plan -> execute -> commit -> publish
+frame.assert_pixel(3, 1, 0x87D1);
+frame.assert_outside_untouched();
+```
+
+**Why this beats the corpus for the INNER loop:**
+
+1. **You can write the failing test before the feature exists.** A ROM corpus
+   only tests what the ROM emits. Here a textured-triangle test can be
+   written today and watched to fail with `UnsupportedColorInput` -- the TDD
+   the brief asks for, and which was not possible this session.
+2. **It makes the two mutation survivors preventable rather than luck.** M5
+   and M10 both survived because a fixture sampled the arm at a point where
+   the correct and incorrect answers coincide. With explicit subpixel
+   positioning, "put the edge at 0.75 px" is a one-liner -- this session it
+   took a throwaway Python search, twice.
+3. **Refusal coverage becomes enumerable.** Iterate every
+   `TexrectExecutionError` variant and assert the harness can produce it. A
+   variant nothing can reach is either dead or untested, and today you cannot
+   tell which.
+
+**Where the ROM still earns its keep, and ONLY there:** answering "is the
+subset I admit the subset the hardware actually emits?" That is the census --
+one run, occasionally, producing a committed table of opcode/cycle/format
+frequencies. Not a loop; a fact sheet. It is what revealed flat triangles are
+0% of WM2000, and it would have reordered this entire session.
+
+**Least-waste build order:**
+1. The wire-word builder alone, replacing the nine encoders. Pure refactor,
+   no new capability, and verifiable because every existing test must still
+   pass unchanged.
+2. The one-call pipeline runner returning guest bytes.
+3. A `Tri::` geometry builder in pixel/subpixel coordinates, so edge cases
+   are STATED rather than searched for.
+4. The refusal-enumeration test.
+
+**The trap:** the builder must emit WIRE WORDS and go through the real
+decoder -- never construct `RawTriangle` or `ResourceAccess` directly. The
+moment it shortcuts past the decoder it stops testing the thing that breaks.
+That is exactly why `coefficient_block` here round-trips through
+`RawTriangle::decode` rather than building `RawWord` values.
