@@ -842,6 +842,15 @@ struct PlanCollector {
     /// exactly. Needed by the production blend-cycle wiring's `Fog`
     /// selector.
     current_fog_color: Color4,
+    /// `G_SETSCISSOR` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable latched rect at
+    /// construction time (`Self::seeded`) and updated on every
+    /// `SetScissor` command in plan order, exactly like
+    /// `current_fog_color`. Seeding matters more here than for the color
+    /// registers: a display list commonly sets the scissor once per frame
+    /// and then submits several packets, so a per-packet reset would
+    /// unscissor every packet after the first.
+    current_scissor: Option<crate::targets::RdpScissorRect>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -982,6 +991,7 @@ impl PlanCollector {
         env_color: Color4,
         prim_color: PrimColor,
         fog_color: Color4,
+        scissor: Option<crate::targets::RdpScissorRect>,
         color_image: Option<ColorImage>,
         tiles: [(
             Option<fn64_render::NeutralTileDescriptor>,
@@ -999,6 +1009,7 @@ impl PlanCollector {
             current_env_color: env_color,
             current_prim_color: prim_color,
             current_fog_color: fog_color,
+            current_scissor: scissor,
             current_color_image: color_image,
             triangles: Vec::new(),
             fills: Vec::new(),
@@ -1042,6 +1053,18 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
+                }
+                // Latched verbatim in wire quarter-pixels, matching
+                // `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`).
+                RdpStateCommand::SetScissor { scissor, .. } => {
+                    self.current_scissor =
+                        Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                            scissor.mode,
+                            scissor.upper_left_x,
+                            scissor.upper_left_y,
+                            scissor.lower_right_x,
+                            scissor.lower_right_y,
+                        ));
                 }
                 RdpStateCommand::SetColorImage { image, .. } => {
                     self.current_color_image = Some(ColorImage::from_wire(
@@ -1172,6 +1195,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         env_color: self.current_env_color,
                         prim_color: self.current_prim_color,
                         fog_color: self.current_fog_color,
+                        scissor: self.current_scissor,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -1454,6 +1478,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
                 Color4::default(),
                 PrimColor::default(),
                 Color4::default(),
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -2269,6 +2294,7 @@ impl RenderBackend for WgpuBackend {
             self.rdp_state.env_color(),
             self.rdp_state.prim_color(),
             self.rdp_state.fog_color(),
+            self.rdp_state.scissor(),
             self.rdp_state.color_image(),
             self.tiles_before_last_plan
                 .unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state)),
@@ -2722,6 +2748,11 @@ fn execute_raw_dpc_inner(
     durable_env_color: Color4,
     durable_prim_color: PrimColor,
     durable_fog_color: Color4,
+    // `durable_scissor`: the rect latched by an EARLIER packet, or `None`
+    // if none has ever been issued. Passed for the same reason as the color
+    // registers above -- `SetScissor` is durable RDP state, so a packet
+    // that issues none must still be clipped by whatever the last one set.
+    durable_scissor: Option<crate::targets::RdpScissorRect>,
     durable_color_image: Option<ColorImage>,
     durable_tiles: [(
         Option<fn64_render::NeutralTileDescriptor>,
@@ -2745,6 +2776,7 @@ fn execute_raw_dpc_inner(
         durable_env_color,
         durable_prim_color,
         durable_fog_color,
+        durable_scissor,
         durable_color_image,
         durable_tiles,
     );
@@ -2760,6 +2792,7 @@ fn execute_raw_dpc_inner(
             durable_env_color,
             durable_prim_color,
             durable_fog_color,
+            durable_scissor,
             durable_color_image,
             durable_tiles,
         ),
@@ -4218,6 +4251,31 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // position, not the walk's running final value.
     let blend_registers =
         crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color);
+    // The scissor current at THIS texrect's own stream position, from the
+    // same `RetrievedTriangleDraw` snapshot as the registers above.
+    //
+    // **The fallback when the plan issued no `SetScissor` is the whole
+    // colour target, not an empty rect and not a refusal.** The RDP's clip
+    // registers hold a value from reset onward; a display list that never
+    // writes them draws unscissored, and refusing it here would refuse
+    // every stream that relies on the boot-time rect. The target extent is
+    // this consumer's own honest widest bound -- which is exactly why
+    // `RetrievedTriangleDraw::scissor` leaves the fallback to the consumer
+    // instead of defaulting in the collector, which does not know it.
+    //
+    // Quarter-pixels, because that is the domain `RdpScissorRect` latches
+    // in (angrylion `rasterizer.c:2779-2784`); `extent` is in pixels, so it
+    // is scaled by four.
+    let scissor = draw_state.scissor.unwrap_or_else(|| {
+        let extent = candidate.key().extent();
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+            0,
+            0,
+            0,
+            u16::try_from(extent.width().saturating_mul(4)).unwrap_or(u16::MAX),
+            u16::try_from(extent.height().saturating_mul(4)).unwrap_or(u16::MAX),
+        )
+    });
     let completed = crate::targets::execute_texture_rectangle(
         candidate,
         other_mode,
@@ -4227,6 +4285,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
         lut_mode,
         shading,
         blend_registers,
+        scissor,
         resident_bytes,
         already_initialized,
     )?;
