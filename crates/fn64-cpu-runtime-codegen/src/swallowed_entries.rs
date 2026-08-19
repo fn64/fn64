@@ -141,18 +141,109 @@ impl SwallowedEntry {
     }
 }
 
+/// Why a `jal`-proven root that sits in a GAP between declared functions
+/// could not be adopted as a new entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapRefusal {
+    /// The gap's words do not begin a plausible function body: the entry
+    /// itself must be a real instruction, and the gap must end in `jr $ra`
+    /// plus its delay slot (allowing only `nop` tail padding).
+    GapDoesNotReturn,
+    /// The proven root is not word-aligned within the region.
+    Misaligned,
+    /// The gap extends past the words this region actually holds.
+    OutOfRange,
+    /// The root is not at the very start of the gap. Adopting it would leave
+    /// unclaimed words before it, which is a different (unmapped-region)
+    /// defect and is reported rather than guessed at.
+    NotAtGapStart,
+}
+
+impl GapRefusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::GapDoesNotReturn => {
+                "the uncovered range does not end in `jr $ra` + delay slot (nop tail padding only)"
+            }
+            Self::Misaligned => "proven root is not word-aligned in the region",
+            Self::OutOfRange => "the uncovered range exceeds the region's words",
+            Self::NotAtGapStart => {
+                "proven root is not at the start of the uncovered range, so words before it \
+                 would stay unclaimed"
+            }
+        }
+    }
+}
+
+/// One function entry that `jal` evidence proves exists, and that the symbol
+/// dump left entirely UNCOVERED — it falls in a gap between two declared
+/// functions rather than inside one.
+///
+/// # Why this is a distinct case from [`SwallowedEntry`]
+///
+/// A swallowed entry is *hidden inside* a preceding function's declared
+/// `size`; repairing it means SPLITTING that function, which is dangerous and
+/// needs the head-returns precondition. An uncovered entry is claimed by
+/// nobody: the dump simply omits the function. Adopting it takes bytes away
+/// from no one, so it cannot corrupt a live body — the risk profile is
+/// entirely different, and so is the repair.
+///
+/// This is exactly the shape of WM2000's `0x801226A0` and `0x80122F2C`,
+/// which the `glabel`-only harvester dropped from `bank4_text` even though
+/// the disassembly gives both a `glabel`, a stack prologue, and a `jr $ra`
+/// epilogue. Because those vrams are ALSO interior addresses of other
+/// overlay banks' functions, they were misfiled as bank-overlap cases; they
+/// are not. Only one bank declares an entry there, so the ordinary flat
+/// `LOOKUP_TABLE` carries them once the dump is repaired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UncoveredEntry {
+    /// The region (config section) the evidence lives in.
+    pub region: String,
+    /// The proven entry point: a `jal` immediate target.
+    pub vram: u32,
+    /// The uncovered range this root starts: `[gap_start, gap_end)`.
+    pub gap_start: u32,
+    pub gap_end: u32,
+    /// Every `jal` site in the region whose immediate targets `vram`, in
+    /// ascending address order. Never empty — this IS the evidence.
+    pub jal_sites: Vec<u32>,
+    /// `None` when the entry can be safely adopted; `Some(reason)` otherwise.
+    pub refusal: Option<GapRefusal>,
+}
+
+impl UncoveredEntry {
+    pub fn is_repairable(&self) -> bool {
+        self.refusal.is_none()
+    }
+
+    /// The size the adopted entry would declare: the whole uncovered range.
+    pub fn adopted_size(&self) -> u32 {
+        self.gap_end.wrapping_sub(self.gap_start)
+    }
+}
+
 /// The whole cross-check outcome for one run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CrossCheck {
     /// Every swallowed entry found, in ascending `(region, vram)` order.
     pub swallowed: Vec<SwallowedEntry>,
+    /// Every uncovered entry found, in ascending `(region, vram)` order.
+    pub uncovered: Vec<UncoveredEntry>,
     /// Number of distinct `jal`-proven roots examined across all regions.
     pub proven_roots: usize,
 }
 
 impl CrossCheck {
     pub fn is_clean(&self) -> bool {
-        self.swallowed.is_empty()
+        self.swallowed.is_empty() && self.uncovered.is_empty()
+    }
+
+    pub fn uncovered_repairable(&self) -> impl Iterator<Item = &UncoveredEntry> {
+        self.uncovered.iter().filter(|e| e.is_repairable())
+    }
+
+    pub fn uncovered_refused(&self) -> impl Iterator<Item = &UncoveredEntry> {
+        self.uncovered.iter().filter(|e| !e.is_repairable())
     }
 
     pub fn repairable(&self) -> impl Iterator<Item = &SwallowedEntry> {
@@ -202,6 +293,41 @@ impl CrossCheck {
                 None => s.push_str("    repair: SPLIT (head returns before this point)\n"),
                 Some(reason) => {
                     s.push_str(&format!("    repair: REFUSED -- {}\n", reason.reason()));
+                }
+            }
+        }
+        if !self.uncovered.is_empty() {
+            s.push_str(
+                "\nUNCOVERED-FUNCTION-ENTRY: the symbol dump omits function entries that static\n\
+                 `jal` immediates prove exist. Each falls in a GAP between two declared\n\
+                 functions -- claimed by nobody -- so it never reaches LOOKUP_TABLE and every\n\
+                 call to it traps at runtime. Adopting one takes bytes from no declared\n\
+                 function, so it cannot corrupt a live body.\n\n",
+            );
+            for entry in &self.uncovered {
+                s.push_str(&format!(
+                    "  {:#010X} in section {} uncovered, gap {:#010X}..{:#010X} (size {:#X})\n",
+                    entry.vram,
+                    entry.region,
+                    entry.gap_start,
+                    entry.gap_end,
+                    entry.adopted_size(),
+                ));
+                let sites: Vec<String> = entry
+                    .jal_sites
+                    .iter()
+                    .map(|pc| format!("{pc:#010X}"))
+                    .collect();
+                s.push_str(&format!(
+                    "    proven by {} jal site(s): {}\n",
+                    entry.jal_sites.len(),
+                    sites.join(", ")
+                ));
+                match entry.refusal {
+                    None => s.push_str("    repair: ADOPT (gap is a self-contained body)\n"),
+                    Some(reason) => {
+                        s.push_str(&format!("    repair: REFUSED -- {}\n", reason.reason()));
+                    }
                 }
             }
         }
@@ -319,6 +445,74 @@ pub fn classify_split(
     Some(SplitRefusal::HeadDoesNotReturn)
 }
 
+/// Decide whether a `jal`-proven root starting an uncovered range may be
+/// adopted as a new declared entry covering `[gap_start, gap_end)`.
+///
+/// # The precondition, and why it is the right one
+///
+/// Adopting removes bytes from no declared function, so the split rule's
+/// "the head must have returned" question does not arise. What must instead
+/// be true is that the uncovered range is a SELF-CONTAINED BODY:
+///
+/// * the root sits exactly at `gap_start` — otherwise words before it would
+///   remain unclaimed, which is a different defect (an unmapped region), not
+///   this one; and
+/// * the range ENDS in `jr $ra` plus its delay slot, with only `nop` tail
+///   padding after it — i.e. control leaves the range by returning, so the
+///   adopted entry does not run off its own end into the next function.
+///
+/// A range that fails either test is REPORTED, never adopted.
+pub fn classify_gap_adoption(
+    region: &CodeRegion<'_>,
+    gap_start: u32,
+    gap_end: u32,
+    root: u32,
+) -> Option<GapRefusal> {
+    let word_at = |vram: u32| -> Option<u32> {
+        let delta = vram.checked_sub(region.vram)?;
+        if delta % 4 != 0 {
+            return None;
+        }
+        region.words.get(delta as usize / 4).copied()
+    };
+    if root.checked_sub(region.vram).is_none_or(|d| d % 4 != 0) {
+        return Some(GapRefusal::Misaligned);
+    }
+    if root != gap_start {
+        return Some(GapRefusal::NotAtGapStart);
+    }
+    if gap_end <= gap_start {
+        return Some(GapRefusal::OutOfRange);
+    }
+    // The whole range must be inspectable.
+    if word_at(gap_start).is_none() || word_at(gap_end.wrapping_sub(4)).is_none() {
+        return Some(GapRefusal::OutOfRange);
+    }
+    // Walk back from the end over `nop` tail padding; the last real word must
+    // be a `jr $ra` delay slot, with `jr $ra` immediately before it.
+    let mut tail = gap_end.wrapping_sub(4);
+    while tail > gap_start && word_at(tail) == Some(NOP) {
+        tail = tail.wrapping_sub(4);
+    }
+    // `tail` is now the delay slot of the terminating return (it may itself
+    // be a `nop`, in which case the loop above stopped only because the word
+    // before it is `jr $ra`; check that explicitly rather than assuming).
+    let mut candidate = tail;
+    loop {
+        if candidate <= gap_start {
+            return Some(GapRefusal::GapDoesNotReturn);
+        }
+        if word_at(candidate.wrapping_sub(4)) == Some(JR_RA) {
+            return None;
+        }
+        // Only `nop` may separate the return's delay slot from the end.
+        if word_at(candidate) != Some(NOP) {
+            return Some(GapRefusal::GapDoesNotReturn);
+        }
+        candidate = candidate.wrapping_sub(4);
+    }
+}
+
 /// Cross-check one region's dump functions against its `jal` evidence.
 ///
 /// A proven root is reported when it is NOT itself a declared function entry
@@ -328,8 +522,12 @@ pub fn cross_check_region(region: &CodeRegion<'_>, functions: &[DumpFunction]) -
     let mut sorted: Vec<&DumpFunction> = functions.iter().collect();
     sorted.sort_by_key(|f| f.vram);
 
+    let region_end = region
+        .vram
+        .wrapping_add((region.words.len() as u32).wrapping_mul(4));
     let roots = jal_proven_roots(region);
     let mut swallowed = Vec::new();
+    let mut uncovered = Vec::new();
     for (target, jal_sites) in &roots {
         if declared.contains(target) {
             continue;
@@ -338,9 +536,31 @@ pub fn cross_check_region(region: &CodeRegion<'_>, functions: &[DumpFunction]) -
             .iter()
             .find(|f| f.vram < *target && *target < f.vram.wrapping_add(f.size))
         else {
-            // A `jal` target outside every declared function is a different
-            // defect (an entirely unmapped region), not this one. Left to the
-            // existing coverage reporting.
+            // A `jal` target claimed by NO declared function: the dump omits
+            // the function entirely. Bound the uncovered range by the nearest
+            // declared neighbours (falling back to the region's own bounds)
+            // and decide whether it is a self-contained body worth adopting.
+            let gap_start = sorted
+                .iter()
+                .map(|f| f.vram.wrapping_add(f.size))
+                .filter(|end| *end <= *target)
+                .max()
+                .unwrap_or(region.vram);
+            let gap_end = sorted
+                .iter()
+                .map(|f| f.vram)
+                .filter(|start| *start > *target)
+                .min()
+                .unwrap_or(region_end);
+            let refusal = classify_gap_adoption(region, gap_start, gap_end, *target);
+            uncovered.push(UncoveredEntry {
+                region: region.name.clone(),
+                vram: *target,
+                gap_start,
+                gap_end,
+                jal_sites: jal_sites.clone(),
+                refusal,
+            });
             continue;
         };
         let refusal = classify_split(region, containing, *target).or_else(|| {
@@ -362,8 +582,10 @@ pub fn cross_check_region(region: &CodeRegion<'_>, functions: &[DumpFunction]) -
         });
     }
     swallowed.sort_by_key(|e| e.vram);
+    uncovered.sort_by_key(|e| e.vram);
     CrossCheck {
         swallowed,
+        uncovered,
         proven_roots: roots.len(),
     }
 }
@@ -407,6 +629,37 @@ pub fn apply_repairs(functions: &mut Vec<DumpFunction>, check: &CrossCheck) -> u
         applied += 1;
     }
     applied
+}
+
+/// Insert every adoptable uncovered entry from `check` into `functions`.
+///
+/// Unlike [`apply_repairs`], this changes no existing entry's `vram` or
+/// `size`: it only claims a range nothing declared. Returns the number
+/// adopted.
+///
+/// The generated name follows the dump's own `func_<VRAM>` convention so the
+/// emitted body, the `LOOKUP_TABLE` row, and any report line all agree.
+pub fn apply_gap_adoptions(functions: &mut Vec<DumpFunction>, check: &CrossCheck) -> usize {
+    let mut adopted = 0usize;
+    for entry in check.uncovered_repairable() {
+        // Never adopt an address some function already declares, and never
+        // adopt into a range that overlaps a declared function: both would
+        // mean the list changed under us since the check ran.
+        let overlaps = functions
+            .iter()
+            .any(|f| f.vram < entry.gap_end && entry.gap_start < f.vram.wrapping_add(f.size));
+        if overlaps {
+            continue;
+        }
+        functions.push(DumpFunction {
+            name: format!("func_{:08X}_uncovered", entry.vram),
+            vram: entry.vram,
+            size: entry.adopted_size(),
+        });
+        adopted += 1;
+    }
+    functions.sort_by_key(|f| f.vram);
+    adopted
 }
 
 #[cfg(test)]

@@ -37,7 +37,8 @@ use std::path::PathBuf;
 
 use fn64_cpu_runtime::{decode, Instruction};
 use fn64_cpu_runtime_codegen::swallowed_entries::{
-    apply_repairs, cross_check_region, CodeRegion, CrossCheck, DumpFunction,
+    apply_gap_adoptions, apply_repairs, cross_check_region, CodeRegion, CrossCheck,
+    DumpFunction,
 };
 use fn64_cpu_runtime_codegen::{
     emit_function_resolved, emit_lookup_dispatcher,
@@ -1085,7 +1086,7 @@ fn check_and_repair_symbol_dump(cfg: &mut RecompConfig, rom: &[u8]) -> String {
         return String::new();
     }
     let mut out = check.render_diagnostic();
-    let applied = repair_symbol_dump(cfg, &check);
+    let (applied, adopted) = repair_symbol_dump(cfg, &check);
     out.push_str(&format!(
         "swallowed-entry cross-check: {} proven root(s) examined, {} missing entry/entries, \
          {} repaired by splitting, {} reported only\n",
@@ -1094,6 +1095,15 @@ fn check_and_repair_symbol_dump(cfg: &mut RecompConfig, rom: &[u8]) -> String {
         applied,
         check.refused().count(),
     ));
+    if !check.uncovered.is_empty() {
+        out.push_str(&format!(
+            "uncovered-entry cross-check: {} entry/entries claimed by no declared function, \
+             {} adopted, {} reported only\n",
+            check.uncovered.len(),
+            adopted,
+            check.uncovered_refused().count(),
+        ));
+    }
     out
 }
 
@@ -1127,6 +1137,7 @@ fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
         let mut section_check = cross_check_region(&region, &functions);
         combined.proven_roots += section_check.proven_roots;
         combined.swallowed.append(&mut section_check.swallowed);
+        combined.uncovered.append(&mut section_check.uncovered);
     }
     combined
 }
@@ -1138,8 +1149,9 @@ fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
 /// downstream stage — `read_func_words`, `SymbolTable`, `LOOKUP_TABLE`, and
 /// body emission — derives from this list, so the proven entry becomes
 /// dispatchable without any other change. Refused entries are left alone.
-fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> usize {
+fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> (usize, usize) {
     let mut applied = 0usize;
+    let mut adopted = 0usize;
     for section in &mut cfg.sections {
         let mut functions: Vec<DumpFunction> = section
             .functions
@@ -1157,13 +1169,21 @@ fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> usize {
                 .filter(|e| e.region == section.name)
                 .cloned()
                 .collect(),
+            uncovered: check
+                .uncovered
+                .iter()
+                .filter(|e| e.region == section.name)
+                .cloned()
+                .collect(),
             proven_roots: check.proven_roots,
         };
-        let count = apply_repairs(&mut functions, &scoped);
-        if count == 0 {
+        let splits = apply_repairs(&mut functions, &scoped);
+        let adoptions = apply_gap_adoptions(&mut functions, &scoped);
+        if splits + adoptions == 0 {
             continue;
         }
-        applied += count;
+        applied += splits;
+        adopted += adoptions;
         section.functions = functions
             .into_iter()
             .map(|f| Function {
@@ -1173,7 +1193,7 @@ fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> usize {
             })
             .collect();
     }
-    applied
+    (applied, adopted)
 }
 
 /// Read one whole section's big-endian words, or `None` when the section's
