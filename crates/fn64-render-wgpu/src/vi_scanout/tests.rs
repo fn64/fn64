@@ -363,6 +363,311 @@ fn unit_scale_rgba16_scanout_is_the_identity_over_the_source_rectangle() {
     }
 }
 
+/// **VI STATUS bit 2 runs the gamma dither instead of refusing it** -- D17
+/// of `docs/RT64-LANE-DIVERGENCES.md`.
+///
+/// The refusal this replaces said gamma dither "needs a retrace-seeded noise
+/// generator this module does not own." It was already public in
+/// `fn64_render::vi_public_filters`, which `vi_scanout.rs` imports
+/// `restore_rgba16_component_bounded_v1` from one line away.
+///
+/// The expectation is hand-derived, not captured. For each output pixel and
+/// each RGB channel the quantizer is
+/// `q = (channel + bit) >> 1; (q << 1) | (q >> 6)`, with `bit` the
+/// SplitMix64-derived `reference_noise_bit_v1(seed, pixel_index,
+/// channel_index)`. Both are re-implemented in this test body from the
+/// published expressions, independently of the module under test, so a
+/// mutation to either half is caught here rather than compared against
+/// itself.
+///
+/// The source channels are deliberately chosen so that the eight-bit
+/// expansions are ODD: `expand_five_bit` is `(v << 3) | (v >> 2)`, whose low
+/// bit is set exactly when the five-bit value's bit 2 is set. An odd channel
+/// is the only kind the quantizer can move, so an even-only fixture would
+/// pass against a no-op filter. `the_gamma_dither_moves_at_least_one_channel`
+/// below asserts the fixture actually moves something rather than trusting
+/// that reasoning.
+///
+/// Alpha is asserted untouched at 255: gamma dither is an RGB filter in both
+/// this module and the reference.
+#[test]
+fn gamma_dither_runs_and_quantizes_each_rgb_channel_to_seven_bits() {
+    const ORIGIN: u32 = 0x400;
+    const SEED: u64 = 0x0123_4567_89ab_cdef;
+    let mut rdram = fresh_rdram();
+    // Every five-bit value here has bit 2 set, so every eight-bit expansion
+    // is odd and therefore movable by the quantizer.
+    let source: [(u8, u8, u8, u8); 8] = [
+        (5, 7, 13, 1),
+        (21, 29, 31, 1),
+        (4 | 1, 4 | 2, 4 | 3, 1),
+        (12, 20, 28, 1),
+        (7, 5, 6, 1),
+        (13, 15, 23, 1),
+        (31, 21, 5, 1),
+        (6, 14, 30, 1),
+    ];
+    for (index, &(r, g, b, a)) in source.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            ORIGIN + index as u32 * 2,
+            pack_rgba5551(r, g, b, a),
+        );
+    }
+
+    // `rgba16_replicate_status()` plus VI STATUS bit 2 (GAMMA_DITHER_EN).
+    let status_word = rgba16_replicate_status() | (1 << 2);
+    let registers = live_registers(
+        status_word,
+        ORIGIN,
+        4,
+        100,
+        104,
+        20,
+        24,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    assert!(
+        registers.filters().gamma_dither,
+        "the fixture's STATUS word must actually select gamma dither"
+    );
+    let mut vi = presentation(registers);
+    vi.noise_seed = SEED;
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(vi, &memory).unwrap();
+
+    assert_eq!((field.width, field.height), (4, 2));
+    for y in 0..2u32 {
+        for x in 0..4u32 {
+            let pixel_index = (y * 4 + x) as u64;
+            let (r5, g5, b5, _) = source[pixel_index as usize];
+            let expected: Vec<u8> = [r5, g5, b5]
+                .iter()
+                .enumerate()
+                .map(|(channel_index, &five)| {
+                    hand_gamma_dither(
+                        expand_five_bit(five),
+                        SEED,
+                        pixel_index,
+                        channel_index as u8,
+                    )
+                })
+                .collect();
+            let actual = field.pixel(x, y).unwrap();
+            assert_eq!(
+                &actual[..3],
+                expected.as_slice(),
+                "output ({x}, {y}) RGB must be the seven-bit stochastic rounding of the \
+                 expanded source"
+            );
+            assert_eq!(actual[3], 255, "gamma dither must not touch alpha");
+        }
+    }
+}
+
+/// **Positive control for the fixture above**: the filter is not the
+/// identity on it.
+///
+/// Without this, `gamma_dither_runs_and_quantizes_each_rgb_channel_to_seven_bits`
+/// could pass against a gamma dither that did nothing, since the quantizer
+/// is the identity on every even channel. This asserts the same source,
+/// scanned out with bit 2 clear, differs from the bit-2-set field -- and
+/// names how many channels moved, so a fixture that degrades to one lucky
+/// cell is visible.
+#[test]
+fn the_gamma_dither_moves_at_least_one_channel() {
+    const ORIGIN: u32 = 0x400;
+    const SEED: u64 = 0x0123_4567_89ab_cdef;
+    let mut rdram = fresh_rdram();
+    let source: [(u8, u8, u8, u8); 8] = [
+        (5, 7, 13, 1),
+        (21, 29, 31, 1),
+        (5, 6, 7, 1),
+        (12, 20, 28, 1),
+        (7, 5, 6, 1),
+        (13, 15, 23, 1),
+        (31, 21, 5, 1),
+        (6, 14, 30, 1),
+    ];
+    for (index, &(r, g, b, a)) in source.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            ORIGIN + index as u32 * 2,
+            pack_rgba5551(r, g, b, a),
+        );
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+
+    let scan = |status_word: u32| {
+        let registers = live_registers(
+            status_word,
+            ORIGIN,
+            4,
+            100,
+            104,
+            20,
+            24,
+            u32::from(ViScaleAxis::ONE),
+            u32::from(ViScaleAxis::ONE),
+        );
+        let mut vi = presentation(registers);
+        vi.noise_seed = SEED;
+        scan_out_guest_rdram(vi, &memory).unwrap()
+    };
+
+    let plain = scan(rgba16_replicate_status());
+    let dithered = scan(rgba16_replicate_status() | (1 << 2));
+    let moved = plain
+        .rgba8
+        .iter()
+        .zip(dithered.rgba8.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        moved >= 4,
+        "the gamma-dither fixture must exercise the quantizer on several channels, not one \
+         lucky cell; only {moved} of {} bytes moved",
+        plain.rgba8.len()
+    );
+}
+
+/// **The seed reaches the filter.** Two different `noise_seed` values over
+/// the same source must produce different fields, or the noise bit is being
+/// derived from something the caller does not control.
+#[test]
+fn the_gamma_dither_noise_stream_is_keyed_by_the_retrace_seed() {
+    const ORIGIN: u32 = 0x400;
+    let mut rdram = fresh_rdram();
+    for index in 0..8u32 {
+        write_rgba16(&mut rdram, ORIGIN + index * 2, pack_rgba5551(5, 13, 21, 1));
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+
+    let scan = |seed: u64| {
+        let registers = live_registers(
+            rgba16_replicate_status() | (1 << 2),
+            ORIGIN,
+            4,
+            100,
+            104,
+            20,
+            24,
+            u32::from(ViScaleAxis::ONE),
+            u32::from(ViScaleAxis::ONE),
+        );
+        let mut vi = presentation(registers);
+        vi.noise_seed = seed;
+        scan_out_guest_rdram(vi, &memory).unwrap().rgba8
+    };
+
+    assert_ne!(
+        scan(0),
+        scan(0x0123_4567_89ab_cdef),
+        "two retrace seeds over one source must give different dithered fields"
+    );
+}
+
+/// **Gamma dither leaves alpha alone, proven on an alpha the quantizer
+/// COULD move.**
+///
+/// The RGBA16 fixture above asserts alpha stays 255, which is worthless as
+/// evidence: 255 is a fixed point of the quantizer
+/// (`(255 + bit) >> 1 = 127`, `(127 << 1) | (127 >> 6) = 255`), so an
+/// implementation that dithered all four channels would pass it. That
+/// mutant survived until this test existed.
+///
+/// RGBA32 carries a rescaled coverage alpha that is not pinned to 255. The
+/// source alpha byte `0x05` decodes to five bits 5 and expands to
+/// `(5 << 3) | (5 >> 2) = 41`, which is odd and therefore movable: the
+/// quantizer would take it to 40 or 42. Asserting it stays exactly 41 is
+/// what makes "alpha is untouched" a real claim.
+#[test]
+fn gamma_dither_leaves_a_movable_alpha_untouched() {
+    const ORIGIN: u32 = 0x2000;
+    const SEED: u64 = 0x0123_4567_89ab_cdef;
+    // Every RGB byte is odd so the RGB half of this fixture is movable too;
+    // alpha 0x05 expands to 41, likewise odd.
+    const PIXELS: [[u8; 4]; 2] = [[0x11, 0x23, 0x35, 0x05], [0xa9, 0xbb, 0xcd, 0x05]];
+    let mut rdram = fresh_rdram();
+    {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        for (index, bytes) in PIXELS.into_iter().enumerate() {
+            for (byte_index, byte) in bytes.into_iter().enumerate() {
+                view.write_u8(
+                    fn64_runtime::RdramAddr::from_offset(
+                        ORIGIN + index as u32 * 4 + byte_index as u32,
+                    ),
+                    byte,
+                );
+            }
+        }
+    }
+
+    let registers = live_registers(
+        rgba32_replicate_status() | (1 << 2),
+        ORIGIN,
+        2,
+        0,
+        2,
+        0,
+        2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let mut vi = presentation(registers);
+    vi.noise_seed = SEED;
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let field = scan_out_guest_rdram(vi, &memory).unwrap();
+
+    // Independent derivation of the expanded alpha, not a call into the
+    // module: five bits 5, expanded (5 << 3) | (5 >> 2).
+    const EXPANDED_ALPHA: u8 = (5 << 3) | (5 >> 2);
+    assert_eq!(EXPANDED_ALPHA, 41);
+    let moved_alpha = hand_gamma_dither(EXPANDED_ALPHA, SEED, 0, 3);
+    assert_ne!(
+        moved_alpha, EXPANDED_ALPHA,
+        "this fixture is only evidence if the quantizer WOULD move this alpha; it takes 41 to \
+         {moved_alpha}"
+    );
+
+    for (index, source) in PIXELS.iter().enumerate() {
+        let actual = field.pixel(index as u32, 0).unwrap();
+        assert_eq!(
+            actual[3], EXPANDED_ALPHA,
+            "pixel {index}: gamma dither must not touch alpha, even one it could move"
+        );
+        for (channel_index, &byte) in source[..3].iter().enumerate() {
+            assert_eq!(
+                actual[channel_index],
+                hand_gamma_dither(byte, SEED, index as u64, channel_index as u8),
+                "pixel {index} channel {channel_index}: RGBA32 RGB is dithered from the raw \
+                 eight-bit source byte"
+            );
+        }
+    }
+}
+
+/// `gamma_dither_quantize_bounded_v1` composed with `reference_noise_bit_v1`,
+/// re-derived here from their published expressions rather than called.
+///
+/// The point of re-deriving is that a mutation inside either shared function
+/// must fail this file's assertions. Calling them would make the test a
+/// tautology over whatever they currently do.
+fn hand_gamma_dither(channel: u8, seed: u64, pixel_index: u64, channel_index: u8) -> u8 {
+    // `reference_noise_bit_v1` (`fn64-render/src/vi_public_filters.rs:63-76`).
+    let key = seed
+        ^ pixel_index.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (channel_index as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let mut mixed = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let bit = (mixed ^ (mixed >> 31)) as u8 & 1;
+    // `gamma_dither_quantize_bounded_v1` (`:56-59`).
+    let quantized = channel.saturating_add(bit) >> 1;
+    (quantized << 1) | (quantized >> 6)
+}
+
 /// The source stride, not the output width, selects the next row. A 4-wide
 /// output over an 8-wide source must skip four pixels per row.
 #[test]
@@ -577,7 +882,7 @@ fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
     let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
     let base = rgba16_replicate_status();
 
-    let cases: [(u32, bool, bool, ViScanoutRefusal); 7] = [
+    let cases: [(u32, bool, bool, ViScanoutRefusal); 6] = [
         // AA mode 0: silhouette AA (and resampling; AA is checked first).
         (
             base & !(3 << 8),
@@ -604,7 +909,6 @@ fn every_unimplemented_vi_filter_is_refused_by_its_own_name() {
         ),
         (base | (1 << 4), false, false, ViScanoutRefusal::Divot),
         (base | (1 << 3), false, false, ViScanoutRefusal::Gamma),
-        (base | (1 << 2), false, false, ViScanoutRefusal::GammaDither),
         (base, true, false, ViScanoutRefusal::Fade),
     ];
 
@@ -677,7 +981,6 @@ fn refusal_reasons_are_distinct_and_never_generic() {
         ViScanoutRefusal::DitherRestorationNonRgba16,
         ViScanoutRefusal::Divot,
         ViScanoutRefusal::Gamma,
-        ViScanoutRefusal::GammaDither,
         ViScanoutRefusal::Fade,
         ViScanoutRefusal::RepeatLine,
         ViScanoutRefusal::ReservedPixelType,
