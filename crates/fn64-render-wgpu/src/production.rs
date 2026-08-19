@@ -10095,6 +10095,51 @@ mod tests {
         );
     }
 
+    /// **The `<` boundary in `prefix_before`, pinned directly.**
+    ///
+    /// A load and a texrect can never share a command index --
+    /// `PlanCollector::command` increments `next_command_index` once per
+    /// wire command and dispatches into exactly one arm -- so `<` and `<=`
+    /// are indistinguishable on every stream the decoder can produce, and
+    /// mutating `<` to `<=` survived the whole suite. That makes the
+    /// boundary an EQUIVALENT mutant today rather than a tested one, which
+    /// is precisely why it is pinned here: the equivalence rests on a
+    /// property of the decoder, not of `prefix_before`, and a future
+    /// decoder that reused an index would silently let a texrect observe a
+    /// load at its own position.
+    ///
+    /// Called at the function with a hand-built equal pair the decoder
+    /// cannot emit, because that is the only way to reach the boundary at
+    /// all.
+    #[test]
+    fn a_load_at_a_texrect_s_own_index_is_not_observed_by_it() {
+        let prefixes = vec![
+            (10u32, crate::tmem::TmemPrefixSnapshot::empty_for_test()),
+            (20u32, crate::tmem::TmemPrefixSnapshot::empty_for_test()),
+        ];
+        // Strictly after: selects the load at 10.
+        assert!(
+            prefix_before(&prefixes, 15).is_some(),
+            "a texrect after a load must select it"
+        );
+        // Equal: must NOT select the load at 10, because a load sharing a
+        // texrect's stream position has not run before it.
+        assert!(
+            prefix_before(&prefixes[..1], 10).is_none(),
+            "a load at the texrect's OWN index must not be observed by it -- `<=` here would let \
+             a texrect sample a load that did not precede it"
+        );
+        // Before every load: no prefix at all, so the texrect reads durable
+        // committed TMEM.
+        assert!(
+            prefix_before(&prefixes, 5).is_none(),
+            "a texrect before every load in its packet selects no prefix"
+        );
+        // Empty prefix list: the load-free arm never reaches here, but the
+        // function must not panic if it did.
+        assert!(prefix_before(&[], 99).is_none());
+    }
+
     /// **The mutation control for the test above: re-seal per packet and it
     /// fails.**
     ///
