@@ -9,6 +9,7 @@ pub mod body_reuse;
 pub mod emit;
 pub mod module;
 pub mod static_micro_op;
+pub mod swallowed_entries;
 
 pub use body_reuse::{inventory_dense_body_reuse, DenseBodyReuseInventory};
 pub use emit::{
@@ -31,6 +32,10 @@ pub use static_micro_op::{
     StaticMicroOpSpanInputV2, STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V1,
     STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V2, STATIC_MICRO_OP_PACKER_SOURCE_SCHEMA_V3,
     STATIC_MICRO_OP_PACK_SCHEMA_V1,
+};
+pub use swallowed_entries::{
+    apply_repairs, cross_check_region, CodeRegion, CrossCheck, DumpFunction, SplitRefusal,
+    SwallowedEntry,
 };
 
 /// Whether one raw instruction owns an architectural delay slot.
