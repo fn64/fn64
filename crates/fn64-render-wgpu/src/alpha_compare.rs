@@ -1250,6 +1250,28 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
         /// required-host-GPU convention rather than silently skipping.
         #[test]
         fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
+            dispatch_and_check("fragment-fn", shim_source(), "alpha_compare_fragment_fn_shim");
+        }
+
+        /// Same required-host-GPU three-way check for the *characterization*
+        /// compute shader `alpha_compare.wgsl`, which has its own
+        /// `@compute` entry point and until now had no behavioural coverage
+        /// at all -- only string-contains and naga-parse assertions. That
+        /// gap let a mutant that re-added a `mode == 2u -> return false`
+        /// rejection survive. Wire encoding 2 must PASS here for the same
+        /// reason it does in the fragment-callable twin (angrylion
+        /// `src/core/n64video/rdp.c:659-660`; `docs/RT64-GUARD-AUDIT.md` A3).
+        #[test]
+        fn required_host_characterization_shader_matches_cpu_oracle_across_frozen_fixtures() {
+            dispatch_and_check(
+                "characterization",
+                ALPHA_COMPARE_WGSL.to_string(),
+                ALPHA_COMPARE_ENTRY_POINT,
+            );
+        }
+
+        fn dispatch_and_check(label: &str, source: String, entry: &str) {
+            let _ = label;
             let fixtures = frozen_fixtures();
             let cases: Vec<RawCase> = fixtures
                 .iter()
@@ -1298,13 +1320,13 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fn64-alpha-compare-fragment-fn-shim"),
-                source: wgpu::ShaderSource::Wgsl(shim_source().into()),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("fn64-alpha-compare-fragment-fn-shim"),
                 layout: None,
                 module: &shader,
-                entry_point: Some("alpha_compare_fragment_fn_shim"),
+                entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -1370,6 +1392,11 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
+                // The fragment-fn shim is `@workgroup_size(1)`; the
+                // characterization entry point is `@workgroup_size(64)`.
+                // One workgroup per case is correct for the former and
+                // safely over-dispatches for the latter, which bounds-checks
+                // `index >= arrayLength(&cases)` itself.
                 pass.dispatch_workgroups(cases.len() as u32, 1, 1);
             }
             encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_bytes);
