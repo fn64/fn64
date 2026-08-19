@@ -106,7 +106,7 @@ controller count `D_800FEF2C` at `0x800E23A0`.
 The caller stores the return in `$s1`; `-1` is the "not ready" answer that
 leaves the state unchanged.
 
-## What is NOT yet established
+## What is NOT yet established (SUPERSEDED -- all three are measured below)
 
 - **HYPOTHESIS**, not yet measured: which of the two exits of the loop is
   taken -- every entry skipped because its `0x16 & 0xF` port field is 0, or
@@ -122,6 +122,15 @@ leaves the state unchanged.
 - No claim is made here that a match was reached. It was not.
 
 ## CONFIRMED: fn64's controller path is NOT the defect
+
+> **Note added after measurement.** The conclusion in this section stands, but
+> the argument below it was not sufficient at the time it was written: it
+> leaned on a second-controller test that never pressed pad 1 (see "Why the
+> earlier second-controller test could not have settled this"), and it left
+> the deciding question -- which of the two loop exits is taken -- explicitly
+> unmeasured. Both are now measured, and the conclusion is re-established on
+> a counterfactual that moves the game. Read this section together with
+> "MEASURED: the loop VISITS its entries" and "THE PLATEAU IS BROKEN".
 
 The array `func_801456C8` reads, `D_80095186`, is filled by the game's own
 per-frame pad poll `func_80004628` (`0x80004628`), which:
@@ -209,7 +218,7 @@ Note that state 15's arm (`0x80126010`) compares this very field against
 `func_801456C8` -- the four-player ready check -- every frame, which returns
 `-1` when nobody is ready and hands control to exactly this epilogue.
 
-## What this makes the plateau
+## What this makes the plateau (SUPERSEDED by the measurements below)
 
 **HYPOTHESIS** (consistent with everything measured, not yet proven): state 18
 is the "waiting for players to be ready" screen, its descriptor's `+0x12`
@@ -234,7 +243,7 @@ result: it moves the remaining question from "what is fn64 failing to model"
 to "what does this screen actually want", and the next probe is a watch on
 `$s2->0x64 + 0x12` itself.
 
-## No match was reached
+## No match was reached (as of the ONE-PAD lane; see the two-pad result below)
 
 The furthest state reached remains the two-wrestler versus screen. The game
 walks eight menu states on scripted A presses and stops at state 18.
