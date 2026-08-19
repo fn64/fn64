@@ -301,6 +301,25 @@ if the decoder's row derivation and the executor's raster derive their covered
 X range from ONE function. That is the single most load-bearing constraint in
 this lane, so the span math lives in one module used by both.
 
+## STATUS AT A GLANCE (read this before quoting progress)
+
+| rung | state | evidence |
+| --- | --- | --- |
+| flat, opaque, untextured (0x08) | **DONE** | guest bytes verified end to end, no GPU |
+| shade plane interpolation (0x0c) | **DONE** | hand-derived gradients pinned |
+| texture s/t/w + perspective divide (0x0a/0x0e) | **NOT DONE** | planes decode; nothing calls them |
+| depth (0x09 and friends) | **NOT DONE** | not started |
+
+**A raw triangle is NOT yet visible in a WM2000 frame.** The ROM issues only
+opcode 0x0e (shaded AND textured); the decoder refuses `textured()`, so zero
+of WM2000's raw triangles reach the executor. The two finished rungs are
+proven correct on synthetic fixtures through the real decoder and the real
+guest-commit path -- they are not proven on a real WM2000 triangle, because
+the ROM emits none this backend admits.
+
+`texture_planes` decodes the S/T/W coefficient block and has **no callers
+outside its own tests**. Decoding it is not the texture rung.
+
 ## RESULT: a flat raw triangle's bytes now reach guest RDRAM
 
 The prior lane's chosen design (ii) is implemented, at the narrowest rung of
