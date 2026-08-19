@@ -387,7 +387,7 @@ impl WgpuBackend {
     fn draw_admitted_triangles(
         &mut self,
         triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
-        pending_tmem: Option<TmemGpuProjection>,
+        pending_tmem: Option<Vec<TmemGpuProjection>>,
     ) -> Result<(), WgpuRawDpcExecutionError> {
         let pipeline = self
             .triangle_pipeline
@@ -396,13 +396,16 @@ impl WgpuBackend {
         let extent = self
             .triangle_target_extent
             .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
-        // **The TMEM byte image this draw samples: this packet's OWN
-        // pending post-image, not the published slot.**
+        // **The TMEM byte images this draw samples: one per triangle, from
+        // this packet's OWN sealed transaction, not the published slot.**
         //
-        // Still projected once per `draw_admitted_triangles` call, not once
-        // per triangle -- the post-image is sealed once per packet from
-        // every load in it, so every triangle in one call shares it, exactly
-        // as they shared the committed snapshot before.
+        // Projected once per triangle, at each triangle's own stream
+        // position, because within one packet TMEM is not one image: a
+        // packet's own loads change it as they run.
+        // `project_pending_tmem_per_triangle` builds the list upstream,
+        // where the sealed transaction is still alive, selecting each entry
+        // with the same `prefix_before` the CPU texel reader uses. This
+        // loop only indexes it.
         //
         // What changed is WHICH image, and it had to. Projecting
         // `self.coordinator.physical()` -- the published, already-committed
@@ -433,14 +436,39 @@ impl WgpuBackend {
         // project the SAME image for the same packet, which is what keeps
         // the GPU raster and the CPU texel reader from disagreeing about a
         // load-free texrect. Neither arm is a guess.
-        let tmem = match pending_tmem {
-            Some(projection) => projection,
-            None => project_committed_tmem(self.coordinator.physical()),
+        //
+        // One image per triangle either way, so the loop below indexes a
+        // single list and never re-decides which source an entry came from.
+        // The `None` arm repeats the committed projection because that IS
+        // one image for every triangle in a load-free packet -- there is no
+        // load in it to change TMEM mid-packet -- so materialising the
+        // repeat removes the second code path that could disagree with the
+        // first, at a clone the pipeline was going to make per fixture
+        // regardless.
+        let per_triangle: Vec<TmemGpuProjection> = match pending_tmem {
+            Some(projections) => projections,
+            None => vec![project_committed_tmem(self.coordinator.physical()); triangles.len()],
         };
+        // A list shorter than the draw would leave a triangle with no
+        // image, and the only images available to substitute are the two
+        // this whole change exists to withhold: another triangle's, or the
+        // whole-packet post-image. Refused by name rather than padded.
+        // `project_pending_tmem_per_triangle` walks
+        // `plan.triangle_commands` while `execute_raw_dpc` draws
+        // `plan.triangles`, two vectors pushed at one site, so a mismatch
+        // is a structural break rather than a length a caller could
+        // legitimately vary.
+        if per_triangle.len() != triangles.len() {
+            return Err(WgpuRawDpcExecutionError::TmemProjectionCountMismatch {
+                projections: per_triangle.len(),
+                triangles: triangles.len(),
+            });
+        }
 
         let mut fixtures = Vec::with_capacity(triangles.len());
         for (triangle_index, draw) in triangles.into_iter().enumerate() {
             let draw = draw.map_err(WgpuRawDpcExecutionError::MissingTriangleDrawState)?;
+            let tmem = per_triangle[triangle_index];
             // Per-triangle, not loop-invariant: a `TextureRectangle`-sourced
             // draw's `screen_scale`/`screen_offset` come from its own
             // `viewport` override (RT64's `convertViewportRect`,
@@ -734,6 +762,19 @@ struct PlanCollector {
             Option<fn64_render::NeutralTileSize>,
         ); 8],
     >,
+    /// The wire command index each admitted triangle was produced at,
+    /// parallel to `triangles` and pushed at the same site
+    /// `triangle_neutral_tiles` is.
+    ///
+    /// A texture rectangle contributes two entries carrying the *same*
+    /// index: both halves come from one wire command and both must sample
+    /// TMEM as of that one stream position. Splitting them would let a
+    /// rectangle's two triangles disagree about which load they saw.
+    ///
+    /// Needed because the GPU raster path selects a TMEM projection per
+    /// triangle for exactly the reason the CPU texel reader selects a
+    /// prefix per texrect: within one packet, TMEM is not one image.
+    triangle_commands: Vec<u32>,
     /// `G_SETCIMG` current at the walk's current stream position --
     /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
     /// time (`Self::seeded`), then updated on every `SetColorImage`
@@ -808,6 +849,7 @@ impl PlanCollector {
             fills: Vec::new(),
             full_sync_sites: Vec::new(),
             triangle_neutral_tiles: Vec::new(),
+            triangle_commands: Vec::new(),
             texrect_commands: Vec::new(),
         }
     }
@@ -968,6 +1010,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // names its own tile in its wire word and this file cannot
                 // know which until it reads that word at execute time.
                 self.triangle_neutral_tiles.push(self.current_tiles);
+                self.triangle_commands.push(command_index);
                 // One texture rectangle is admitted as TWO
                 // `TriangleSource::TextureRectangle` triangles sharing one
                 // originating wire command, and the adapter pushes them
@@ -1092,7 +1135,7 @@ struct ExecutionCollector<'coord> {
     /// durable state is the only image in existence, and it is the same one
     /// `TexrectTmemSource::Committed` hands the CPU texel reader for that
     /// packet.
-    draw_tmem: Option<TmemGpuProjection>,
+    draw_tmem: Option<Vec<TmemGpuProjection>>,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -1345,12 +1388,30 @@ pub enum WgpuRawDpcExecutionError {
     },
     /// The same forgery check as [`Self::PendingTmemImageClaimedCommitted`],
     /// at the *other* place a pending post-image is consumed: the GPU-side
-    /// projection `draw_admitted_triangles` samples. Separate variant, not a
-    /// shared one, because there is no triangle index at the projection site
-    /// -- the projection is per-packet, sealed once from every load in it,
-    /// and shared by every triangle in the draw. Collapsing the two would
-    /// report a triangle index this site cannot honestly supply.
+    /// projections `draw_admitted_triangles` samples. Separate variant, not
+    /// a shared one, because the two sites answer for different things: the
+    /// CPU variant names the texrect whose *pixels* would carry a forged
+    /// receipt, while this one names a projection built before any fixture
+    /// exists. `project_pending_tmem_per_triangle` does now walk the
+    /// triangles in order, so an index could be supplied -- but it would be
+    /// an index into `plan.triangle_commands`, not the `triangle_index` the
+    /// CPU variant reports, and offering two different numbers under one
+    /// field name is worse than offering none. The forgery is a property of
+    /// the *source* here, identical for every entry, so the first entry to
+    /// reach it is not more culpable than the rest.
     PendingTmemProjectionClaimedCommitted,
+    /// The per-triangle TMEM projection list handed to
+    /// `draw_admitted_triangles` is not the same length as the triangle
+    /// list it must cover. Both come from walks over the same plan
+    /// (`plan.triangle_commands` and `plan.triangles`, pushed at one site),
+    /// so a disagreement is a structural break -- and the only images
+    /// available to fill a gap are another triangle's or the whole-packet
+    /// post-image, which is exactly what per-position selection exists to
+    /// withhold. Refused rather than padded.
+    TmemProjectionCountMismatch {
+        projections: usize,
+        triangles: usize,
+    },
     /// The mirror of [`Self::PendingTmemImageClaimedCommitted`]: durable
     /// `PhysicalTmemState`, selected for a packet that staged no TMEM load,
     /// reported a `Proposed` snapshot identity. Durable state has no
@@ -1501,6 +1562,15 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "texture rectangle #{triangle_index} (plan order) sampled durable committed TMEM \
                  that reported a Proposed snapshot identity"
+            ),
+            Self::TmemProjectionCountMismatch {
+                projections,
+                triangles,
+            } => write!(
+                formatter,
+                "this packet's triangle draw was handed {projections} per-triangle TMEM \
+                 projections for {triangles} triangles; every triangle must sample the image at \
+                 its own stream position and none may borrow another's"
             ),
             Self::PendingTmemProjectionClaimedCommitted => formatter.write_str(
                 "the pending TMEM post-image projected for this packet's triangle draw reported \
@@ -2363,7 +2433,7 @@ fn execute_raw_dpc_inner(
         BackendPreparedRawDpc,
         Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
         Option<PendingFillPublication>,
-        Option<TmemGpuProjection>,
+        Option<Vec<TmemGpuProjection>>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -2797,8 +2867,14 @@ fn stage_and_report(
 
     let tmem_writes: Vec<CompletedWrite> = pending.proposed_effects().to_vec();
 
-    // **The GPU half's TMEM image, projected from the SAME pending
-    // post-image the CPU texel reader samples.**
+    // **The GPU half's TMEM images, one per triangle, selected by the SAME
+    // `prefix_before` rule the CPU texel reader uses.**
+    //
+    // Per triangle, not per packet, for the reason the CPU side is per
+    // texrect: within one packet TMEM is not one image. A single shared
+    // projection holds only the last load's texels, so WM2000's seven
+    // interleaved LoadTile/texrect pairs would raster the seventh sprite
+    // seven times.
     //
     // Projected here, not in `draw_admitted_triangles`, because here is the
     // only place the sealed transaction exists: it is move-only and
@@ -2809,7 +2885,12 @@ fn stage_and_report(
     // defect: a texrect whose combine references `TEXEL0` sampled invalid
     // bytes and the fragment shader reported
     // `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
-    collector.draw_tmem = Some(project_pending_tmem_for_draw(&pending)?);
+    collector.draw_tmem = Some(project_pending_tmem_per_triangle(
+        &collector.plan.triangle_commands,
+        &prefixes,
+        &pending,
+        collector.physical,
+    )?);
 
     // **The color-target half: every admitted fill and texrect in this
     // packet, accumulated into one buffer in the packet's own command
@@ -3521,20 +3602,52 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     Ok((completed, accesses))
 }
 
-/// **Projects this packet's pending TMEM post-image for the GPU draw,
-/// through the same one projection the committed path uses.**
+/// **One TMEM projection per admitted triangle, each taken at that
+/// triangle's own stream position, through the same one projection the
+/// committed path uses.**
 ///
-/// The whole body is `project_tmem` at `S = PendingTmemImage`. There is no
-/// second address walk, no second validity gate, and no second bitmap
-/// packing: `project_committed_tmem` is the same function at
-/// `S = PhysicalTmemState`. A pending/published *disagreement* about how
+/// ## Why per triangle and not per packet
+///
+/// The GPU half had the CPU half's old defect one layer up: a single
+/// projection was sealed per `draw_admitted_triangles` call and shared by
+/// every triangle in it. Within one packet TMEM is not one image --
+/// WM2000's measured sixth packet interleaves seven `LoadTile`s with seven
+/// texrects, all loading from TMEM word zero, so a shared projection holds
+/// only the seventh load's texels and the raster draws the seventh sprite
+/// seven times.
+///
+/// The position rule is `prefix_before`, **called here rather than
+/// reimplemented**, so the CPU texel reader and the GPU raster cannot
+/// disagree about which load a given command observed. Both arms match the
+/// CPU side exactly: a prefix when a load precedes the triangle, durable
+/// committed state when none does.
+///
+/// A texture rectangle's two triangles carry the same
+/// `plan.triangle_commands` entry, so both halves of one rectangle project
+/// the same image and cannot split across a load.
+///
+/// ## Cost
+///
+/// Bounded by the triangle count, and `submit_triangles` already creates a
+/// TMEM bytes buffer and validity buffer **per fixture**
+/// (`triangle_pipeline.rs`'s per-fixture `create_buffer`/`write_buffer`
+/// pair), so this changed *what* each fixture uploads, not how much. No
+/// pipeline, bind-group, or shader change was required.
+///
+/// ## What it does not relax
+///
+/// Every entry is `project_tmem`, at `S = PendingTmemPrefixImage` for the
+/// prefix arm and `S = PhysicalTmemState` for the committed one. There is
+/// no second address walk, no second validity gate, and no second bitmap
+/// packing, and the CPU texel reader reaches the same two sources through
+/// the same `TmemByteSource`. A pending/published *disagreement* about how
 /// bytes reach the shader is therefore unrepresentable rather than merely
 /// tested for -- the only thing that differs between the two calls is which
 /// image is handed in.
 ///
 /// **What the published-slot projection was protecting, and how this
-/// preserves it.** The `project_committed_tmem(self.coordinator.physical())`
-/// call this replaces was not arbitrary: reading the coordinator's active
+/// preserves it.** The `project_committed_tmem(coordinator.physical())`
+/// call the pending projection replaced was not arbitrary: reading the active
 /// slot guaranteed the GPU could only ever sample bytes some publication had
 /// actually durably installed, so no GPU-observed pixel could be attributed
 /// to a proposal that publication later rejected. That guarantee is real and
@@ -3564,10 +3677,27 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
 /// It is not a receipt and nothing downstream may read a publication out of
 /// it; the identity assertion happens here, at the crossing, and does not
 /// travel with the bytes.
-fn project_pending_tmem_for_draw(
+fn project_pending_tmem_per_triangle(
+    triangle_commands: &[u32],
+    prefixes: &[(u32, crate::tmem::TmemPrefixSnapshot)],
     pending: &crate::tmem::PendingTmemTransaction,
-) -> Result<TmemGpuProjection, WgpuRawDpcExecutionError> {
-    project_proposed_image(&pending.pending_image())
+    committed: &PhysicalTmemState,
+) -> Result<Vec<TmemGpuProjection>, WgpuRawDpcExecutionError> {
+    triangle_commands
+        .iter()
+        .map(
+            |&command_index| match prefix_before(prefixes, command_index) {
+                Some(prefix) => project_proposed_image(&pending.prefix_image(prefix)),
+                // No load precedes this triangle in its own packet, so durable
+                // committed state is what TMEM holds at its position -- the
+                // same answer, from the same fact, that `stage_color_commands`
+                // gives a texrect in the same position. Not a fallback for a
+                // missing image: the absence of a preceding load IS the stream
+                // fact that makes committed correct.
+                None => Ok(project_committed_tmem(committed)),
+            },
+        )
+        .collect()
 }
 
 /// **The committed/pending identity crossing, both directions, at one
@@ -3901,9 +4031,7 @@ mod tests {
         const ROW_BYTES: usize = 8;
         const FIRST_ACCESS: u32 = 1;
 
-        let rows: Vec<Vec<u8>> = (0..ROWS)
-            .map(|row| vec![row as u8; ROW_BYTES])
-            .collect();
+        let rows: Vec<Vec<u8>> = (0..ROWS).map(|row| vec![row as u8; ROW_BYTES]).collect();
         let source_bytes: Vec<&[u8]> = rows.iter().map(|row| row.as_slice()).collect();
 
         for row in 0..ROWS {
@@ -3954,7 +4082,9 @@ mod tests {
             0,
             0,
             false,
-            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+            crate::TmemTransferPhysicalWord::Linear(
+                fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
+            ),
         );
         assert!(
             word_source_bytes(&source_bytes, 1, overrun).is_none(),
@@ -3973,7 +4103,9 @@ mod tests {
             0,
             0,
             false,
-            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+            crate::TmemTransferPhysicalWord::Linear(
+                fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
+            ),
         );
         assert!(word_source_bytes(&source_bytes, 1, before_run).is_none());
         let past_run = TmemTransferWord::new(
@@ -3986,11 +4118,12 @@ mod tests {
             0,
             0,
             false,
-            crate::TmemTransferPhysicalWord::Linear(fn64_render_ir::TmemRange::try_new(0, 8).unwrap()),
+            crate::TmemTransferPhysicalWord::Linear(
+                fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
+            ),
         );
         assert!(word_source_bytes(&source_bytes, 1, past_run).is_none());
     }
-
 
     fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
         [word(SET_OTHER_MODE, cycle_type << 20), low]
@@ -10025,7 +10158,8 @@ mod tests {
         // carries load 6's texels and all seven of these are equal.
         for (index, sprite) in sprites.iter().enumerate().skip(1) {
             assert_ne!(
-                *sprite, sprites[index - 1],
+                *sprite,
+                sprites[index - 1],
                 "sprite {index} must carry load {index}'s texels and sprite {} must carry load \
                  {}'s; they are equal, which is what a single post-image sealed from all seven \
                  loads produces",
@@ -10158,9 +10292,7 @@ mod tests {
     fn re_sealing_per_packet_would_make_every_sprite_identical() {
         // The seven prefixes a real run captures differ from one another --
         // otherwise "they would all be the same" says nothing.
-        let selected: Vec<u32> = (0..SPRITE_STRIP_PAIRS)
-            .map(|index| index as u32)
-            .collect();
+        let selected: Vec<u32> = (0..SPRITE_STRIP_PAIRS).map(|index| index as u32).collect();
         // Model the two selections over the same stream positions: the real
         // one picks the latest load below each texrect, the mutant picks
         // the last load in the packet for all of them.
@@ -12151,11 +12283,8 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
         let forward_words = fill_load_and_copy_texrect_words();
-        let (_, forward) = plan_and_execute_composed(
-            &mut backend,
-            &mut session,
-            forward_words.clone(),
-        );
+        let (_, forward) =
+            plan_and_execute_composed(&mut backend, &mut session, forward_words.clone());
         assert!(
             forward.is_ok(),
             "the forward order (load, then texrect) must execute: {forward:?}"
