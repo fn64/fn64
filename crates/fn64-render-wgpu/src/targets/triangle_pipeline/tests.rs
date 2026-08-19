@@ -1723,34 +1723,33 @@ fn the_disabled_tlut_arm_admits_seven_pairs_on_the_cpu_and_one_on_the_gpu() {
     );
 }
 
-/// **D-LOWHALF: the enabled-TLUT canonical-source guard.**
+/// **D-LOWHALF, resolved: the enabled-TLUT low-half rule is a WRAP, and
+/// both lanes now wrap.**
 ///
-/// `validate_address_scope` (`tmem/read.rs:490-497`) refuses an
-/// enabled-TLUT read whose CI source byte lands at or above `0x0800`,
-/// by name (`EnabledCiSourceOutsideLowHalf`): the TLUT itself occupies
-/// the high 2 KiB from `0x0800`, so a tile sourcing its indexes from
-/// there would be reading the palette as image data. `tmem_sample.wgsl`
-/// has NO counterpart -- its only address gate is
-/// `tmem_byte_valid`'s `address >= TMEM_BYTES` bound, which `0x0800`
-/// passes.
+/// This test previously pinned a CPU-only REFUSAL
+/// (`EnabledCiSourceOutsideLowHalf`) and recorded that `tmem_sample.wgsl`
+/// had no counterpart. Its own scope note said the pin would come out on
+/// both lanes at once if the rule were resolved against the refusal, and
+/// the pinned RT64 port source `5473732a` resolves it:
+/// `src/shaders/TextureDecoder.hlsli:162-163` DOES scope an enabled-TLUT
+/// index source to one half --
+/// `addressMask = select_uint(or(isRgba32, usesTlut), RDP_TMEM_MASK16,
+/// RDP_TMEM_MASK8)`, `RDP_TMEM_MASK16 = 0x7FF` (`:15`) -- and applies it
+/// as a MASK inside `implLoadTMEM` (`:17-25`), never as a refusal.
 ///
-/// A tile placed in the high half under an enabled TLUT therefore
-/// aborts on the CPU texrect lane and silently samples palette bytes as
-/// indexes on the GPU triangle lane. This is the single most consequential
-/// unpinned divergence found: it is a REFUSAL the shader does not have,
-/// and it fails open.
+/// So the constraint was never invented; only the response was wrong.
+/// Both lanes now wrap: `tmem/read.rs`'s `AddressScope::LowHalf` and
+/// `tmem_sample.wgsl`'s `tmem_indexed_byte_address`. The protection the
+/// refusal offered survives -- an index read still cannot reach the
+/// palette's own half -- so this is not a widened guard.
 ///
-/// **Not in WM2000's measured path** -- its tile's `tmem_word_address`
-/// is in the low half -- but it is reachable by any title that packs a
-/// small palettized tile above `0x0800`, and nothing today would report
-/// the two lanes disagreeing about it.
-///
-/// Adapter-free: it asserts the CPU refusal (the arm the shader lacks)
-/// and that the shader's own only address gate lets the same address
-/// through. This MUTATION-KILLS the kept CPU refusal -- deleting the
-/// `EnabledCiSourceOutsideLowHalf` arm makes this test fail.
+/// Adapter-free. It is the mutation kill for the WRAP: the expected color
+/// is hand-derived, and a decoy palette entry sits at the unwrapped
+/// address, so a reader that dropped the mask (reading `0x0800` as image
+/// data) or that wrapped to the wrong place produces a different,
+/// detectable color rather than agreeing by accident.
 #[test]
-fn an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_cpu_only() {
+fn an_enabled_tlut_tile_in_the_high_half_wraps_on_both_lanes() {
     // Same fixture tile, moved to TMEM word 0x100 == byte 0x0800.
     const HIGH_HALF_WORD: u16 = 0x0100;
     let high = crate::TileDescriptor::from_neutral_parts(
@@ -1775,51 +1774,49 @@ fn an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_cpu_only() {
 
     let addressed =
         crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even);
-
-    // Make the byte at 0x0800 valid, so the refusal below cannot be an
-    // invalid-byte refusal wearing the wrong name. 0x0800 is the first
-    // lane of TLUT entry 0, which `tlut_fixture::bytes()` writes.
     let source = tlut_fixture::source();
+
+    // The byte at 0x0800 is valid TLUT data, so nothing here can be an
+    // invalid-byte refusal wearing the wrong name.
     assert!(
         crate::TmemByteSource::valid_byte(&source, 0x0800).is_some(),
         "the boundary byte must be valid, or this test proves nothing"
     );
 
-    assert!(
-        matches!(
-            crate::read_texel(
-                &source,
-                high,
-                addressed,
-                crate::TextureLutMode::Rgba16,
-            ),
-            Err(crate::PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf {
-                byte_address: 0x0800,
-            }),
-        ),
-        "an enabled-TLUT tile sourcing indexes from the palette's own \
-         half must be refused by name"
+    // 0x0800 & 0x7ff == 0x000, hand-computed: the wrapped read must land
+    // on the tile's own first byte in the low half, which is exactly what
+    // the unmoved low-half tile reads.
+    let wrapped = crate::read_texel(&source, high, addressed, crate::TextureLutMode::Rgba16)
+        .expect("an enabled-TLUT index source at 0x0800 wraps into the low half");
+    let low = crate::read_texel(
+        &source,
+        tlut_fixture::descriptor(),
+        addressed,
+        crate::TextureLutMode::Rgba16,
+    )
+    .expect("the low-half tile has always read cleanly");
+    assert_eq!(
+        wrapped.texel().rgba8888(),
+        low.texel().rgba8888(),
+        "wrapping 0x0800 to 0x000 must give the SAME texel the low-half \
+         tile reads, since both address byte 0 of TMEM"
     );
 
-    // The shader's only address gate. `0x0800` is well inside TMEM, so
-    // the shader reads it as ordinary image data and returns a color.
-    assert!(
-        0x0800u32 < 4096,
-        "`tmem_byte_valid`'s bound is TMEM_BYTES == 4096; 0x0800 passes \
-         it, which is exactly why the shader has no equivalent refusal"
+    // Refutation, so the equality above cannot be vacuous: the byte the
+    // UNWRAPPED read would have used is a different value, so a reader
+    // that failed to mask would have produced a different index.
+    assert_ne!(
+        crate::TmemByteSource::valid_byte(&source, 0x0800),
+        crate::TmemByteSource::valid_byte(&source, 0x0000),
+        "the wrapped and unwrapped source bytes must differ, or this test \
+         cannot tell a masking reader from a non-masking one"
     );
 
-    // And the host-side binding carries the high-half tile through
-    // without complaint -- there is no host-side mirror of this guard
-    // either, so nothing between the plan and the shader catches it.
+    // And the host-side binding carries the high-half tile through, as it
+    // always did -- there is nothing left for it to catch.
     let binding = TileBindingParams::bound(high, tlut_fixture::size())
         .with_lut_mode(crate::TextureLutMode::Rgba16);
     assert_eq!(binding.tmem_word_address, u32::from(HIGH_HALF_WORD));
-    assert!(
-        binding.is_supported_direct_format(),
-        "and the one host-side predicate that exists answers only the \
-         DIRECT arm's question, so it cannot catch this either"
-    );
 }
 
 #[cfg(feature = "host-gpu-tests")]
@@ -2048,16 +2045,26 @@ mod host_gpu_tests {
         );
     }
 
-    /// A TLUT entry whose four quadricated lanes disagree means the palette
-    /// was never fully loaded. The CPU reader refuses it by name
-    /// (`NonCanonicalTlutEntry`); the shader must refuse it too, as
-    /// `TMEM_SAMPLE_STATUS_INVALID_BYTE`, rather than inventing a lane and
-    /// silently painting the wrong palette color.
+    /// A TLUT entry whose four quadricated lanes disagree is READ, from
+    /// lane 0, on both lanes.
     ///
-    /// Adapter-gated (`host-gpu-tests`). This is a refusal being PRESERVED,
-    /// not weakened -- the fix widened only the format gate.
+    /// This test previously asserted the opposite: that all four lanes
+    /// were checked and a disagreeing entry was refused. The pinned RT64
+    /// port source `5473732a` settles it the other way --
+    /// `src/shaders/TextureDecoder.hlsli:179` reads
+    /// `loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8)`,
+    /// two bytes, and never addresses lanes 1..3, so it cannot observe a
+    /// disagreement at all. `fn64-render-reference`'s `read_tlut`
+    /// (`src/gbi/state.rs:853-869`) reads the same two bytes.
+    ///
+    /// The fixture is UNCHANGED: it still corrupts only the LAST lane of
+    /// entry 0x53, leaving lanes 0..2 agreeing. That is exactly the case
+    /// that distinguishes a lane-0 reader from a four-lane one, so the
+    /// test still discriminates -- only its expected verdict flipped.
+    ///
+    /// Adapter-gated (`host-gpu-tests`).
     #[test]
-    fn required_host_a_non_canonical_tlut_entry_is_refused_not_guessed() {
+    fn required_host_a_non_canonical_tlut_entry_reads_from_lane_zero() {
         let mut renderer = tlut_renderer();
         let descriptor = tlut_fixture::descriptor();
         let tile_binding = TileBindingParams::bound(descriptor, tlut_fixture::size())
@@ -2078,67 +2085,69 @@ mod host_gpu_tests {
         }
 
         // The CPU reader's own verdict on the same bytes, first -- so this
-        // test asserts the two lanes AGREE about the refusal, not merely
-        // that the shader refuses something.
+        // test asserts the two lanes AGREE, not merely that the shader
+        // produced something. Corrupting the last lane must not change the
+        // color, because only lane 0 is read.
         let source = tlut_fixture::FixtureTmem { bytes };
-        assert!(
-            crate::read_texel(
-                &source,
-                descriptor,
-                crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
-                crate::TextureLutMode::Rgba16,
-            )
-            .is_err(),
-            "the CPU reader must refuse a non-canonical entry"
+        let corrupted = crate::read_texel(
+            &source,
+            descriptor,
+            crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
+            crate::TextureLutMode::Rgba16,
+        )
+        .expect("a non-canonical entry resolves from lane 0")
+        .texel()
+        .rgba8888();
+        let pristine = crate::read_texel(
+            &tlut_fixture::source(),
+            descriptor,
+            crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
+            crate::TextureLutMode::Rgba16,
+        )
+        .expect("the uncorrupted fixture has always read cleanly")
+        .texel()
+        .rgba8888();
+        assert_eq!(
+            corrupted, pristine,
+            "corrupting lane 3 must not change the color -- lane 0 is the \
+             only lane the RDP addresses"
         );
 
         let output = submit_flat_uv_tlut_draw(&mut renderer, tile_binding, projection, 0, 0);
-        assert!(
+        assert_eq!(
             output
                 .tmem_sample_status
                 .iter()
-                .any(|&status| status == TMEM_SAMPLE_STATUS_INVALID_BYTE),
-            "a non-canonical TLUT entry must surface as INVALID_BYTE, not be \
-             silently sampled from lane 0"
+                .copied()
+                .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
+            None,
+            "the shader must read the same lane-0 entry the CPU oracle \
+             does, not refuse it"
         );
     }
 
-    /// **D-LOWHALF, on the GPU: the fix, as a test.**
+    /// **D-LOWHALF, on the GPU: the wrap, as a test.**
     ///
-    /// A tile whose enabled-TLUT index source lands at or above `0x0800` is
-    /// reading the palette's own half of TMEM as image data. The CPU reader
-    /// has always refused this by name (`validate_address_scope` ->
-    /// `EnabledCiSourceOutsideLowHalf`, `tmem/read.rs`); `tmem_sample.wgsl`
-    /// had no counterpart, so the GPU lane sampled TLUT bytes as indexes and
-    /// painted a plausible wrong color with `TMEM_SAMPLE_STATUS_OK`.
+    /// This test previously pinned the shader's own
+    /// `TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF` refusal, and its
+    /// own scope note said the pin would come out on both lanes together
+    /// if D14 resolved against the refusal. The pinned RT64 port source
+    /// `5473732a` resolves it: `src/shaders/TextureDecoder.hlsli:162-163`
+    /// scopes an enabled-TLUT index source to `RDP_TMEM_MASK16` (`0x7FF`)
+    /// and `implLoadTMEM` (`:17-25`) applies that scope as a mask. The
+    /// rule stands; the refusal does not.
     ///
-    /// This is the failing-before/passing-after evidence for the shader's new
-    /// `TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF`. Before the fix every
-    /// fragment of this draw reported status 0 and a color; after it, every
-    /// fragment reports status 5.
-    ///
-    /// The status is deliberately NOT `INVALID_BYTE`: the bytes at `0x0800`
-    /// are real, valid TLUT bytes (asserted below), so a validity-based
-    /// refusal could never have fired. That is exactly why the divergence
-    /// failed open rather than loudly.
-    ///
-    /// This ADDS a refusal to match the CPU oracle; it weakens nothing.
-    /// `an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_cpu_only`
-    /// is its adapter-free CPU half.
-    ///
-    /// **Scope note, so this test is not read as settling more than it
-    /// does.** It pins CPU/GPU AGREEMENT about the rule. It does not
-    /// establish that the rule is correct: `docs/RT64-LANE-DIVERGENCES.md`
-    /// D14 scores this same refusal against `fn64-render-reference` (which
-    /// constrains only the genuine split-bank formats to the low half) and
-    /// rules "REFERENCE on the divergence; UNKNOWN on hardware". If D14 is
-    /// resolved in the reference's favour, this test and the guard it
-    /// covers come out together with the CPU refusal -- both lanes at once,
-    /// which is exactly what this pin makes visible.
+    /// So this now pins the opposite verdict, still differentially: the
+    /// high-half tile must sample, and must produce the SAME colors the
+    /// CPU oracle produces for it, so the two lanes cannot wrap
+    /// differently. The old refutation is inverted into the discriminator:
+    /// the wrapped tile and the low-half tile must agree, and the byte at
+    /// the unwrapped address must differ from the byte at the wrapped one,
+    /// so a shader that dropped the mask is caught.
     ///
     /// Adapter-gated (`host-gpu-tests`).
     #[test]
-    fn required_host_an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_shader() {
+    fn required_host_an_enabled_tlut_tile_in_the_high_half_wraps_on_the_shader() {
         const HIGH_HALF_WORD: u16 = 0x0100;
         let mut renderer = tlut_renderer();
         let high = crate::TileDescriptor::from_neutral_parts(
@@ -2157,9 +2166,6 @@ mod host_gpu_tests {
         let tile_binding = TileBindingParams::bound(high, tlut_fixture::size())
             .with_lut_mode(crate::TextureLutMode::Rgba16);
 
-        // The bytes the tile would source from are genuinely VALID -- so a
-        // pass here cannot come from an invalid-byte refusal wearing the
-        // wrong name, and the pre-fix behaviour really was a silent success.
         let projection = tlut_fixture::projection();
         for address in [0x0800usize, 0x0801] {
             assert_ne!(
@@ -2169,52 +2175,48 @@ mod host_gpu_tests {
             );
         }
 
-        // The CPU oracle's verdict on the same tile, first: the two lanes
-        // must AGREE about the refusal, not merely both fail somehow.
-        assert!(
-            matches!(
-                crate::read_texel(
-                    &tlut_fixture::source(),
-                    high,
-                    crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
-                    crate::TextureLutMode::Rgba16,
-                ),
-                Err(crate::PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf { .. }),
-            ),
-            "the CPU reader must refuse the high-half tile"
+        // The discriminator: the unwrapped byte differs from the wrapped
+        // one, so a shader that skipped the mask reads a different index.
+        let source = tlut_fixture::source();
+        assert_ne!(
+            crate::TmemByteSource::valid_byte(&source, 0x0800),
+            crate::TmemByteSource::valid_byte(&source, 0x0000),
+            "the wrapped and unwrapped source bytes must differ, or this \
+             test cannot tell a masking shader from a non-masking one"
         );
 
+        // The CPU oracle's verdict on the same tile, first.
+        let expected = crate::read_texel(
+            &source,
+            high,
+            crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
+            crate::TextureLutMode::Rgba16,
+        )
+        .expect("the CPU reader wraps the high-half tile into the low half")
+        .texel()
+        .rgba8888();
+
         let output = submit_flat_uv_tlut_draw(&mut renderer, tile_binding, projection, 0, 0);
-        // The status attachment is cleared to `OK` and only covered
-        // fragments write it, so the assertion is over the covered set:
-        // every non-`OK` status must be this refusal, and at least one
-        // fragment must actually report it. (Matching
-        // `required_host_a_non_canonical_tlut_entry_is_refused_not_guessed`'s
-        // own shape for the same reason.)
-        assert!(
-            output
-                .tmem_sample_status
-                .iter()
-                .any(|&status| status == TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF),
-            "a high-half enabled-TLUT tile must report \
-             CI_SOURCE_OUTSIDE_LOW_HALF; before the shader fix every \
-             fragment reported OK and a wrong color"
-        );
         assert_eq!(
             output
                 .tmem_sample_status
                 .iter()
                 .copied()
-                .find(|&status| status != TMEM_SAMPLE_STATUS_OK
-                    && status != TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF),
+                .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
             None,
-            "and no covered fragment may fail for any OTHER reason -- the \
-             refusal must be the placement one, not an invalid byte"
+            "a high-half enabled-TLUT tile must WRAP and sample cleanly; \
+             the shader no longer has a placement refusal"
+        );
+        assert!(
+            output
+                .color_rgba8
+                .chunks_exact(4)
+                .any(|pixel| pixel == expected),
+            "the shader's wrapped color must match the CPU oracle's \
+             ({expected:?}), or the two lanes wrap to different addresses"
         );
 
-        // Refutation: the SAME tile in the low half still samples cleanly, so
-        // the refusal above is caused by the placement and nothing else, and
-        // the new guard has not broken the working path.
+        // And the low-half tile still samples, unchanged.
         let low_binding =
             TileBindingParams::bound(tlut_fixture::descriptor(), tlut_fixture::size())
                 .with_lut_mode(crate::TextureLutMode::Rgba16);
@@ -2227,8 +2229,7 @@ mod host_gpu_tests {
                 .copied()
                 .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
             None,
-            "the low-half tile must still sample -- the new guard must not \
-             refuse the working path"
+            "the low-half tile must still sample"
         );
     }
 
