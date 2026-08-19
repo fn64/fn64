@@ -136,7 +136,7 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 | **B1** | **Nothing.** Input to reach the menu is already implemented at every layer — `PifModel`, the raw-SI PIF protocol, `set_controller_state`, and the shell's per-step feed. | **Zero.** Already done. | §3 |
 | **B2** | **No harness could press a button.** The headless lane could not test any post-attract state, which is why the attract loop read as terminal for so long. | **Small — now landed.** `WM2000_INPUT_SCRIPT`, 98 lines, this card. | §3.2 |
 | **B2b** | **Unknown button grammar past the mid-menu plateau.** Not an emulator defect (no trap, no refusal, no panic in any run) -- just nobody has read the menu state machine. | **Small.** Read the guest's pad handler, or try the remaining button space. | §5 |
-| **B3** | **Menu/gameplay raster fidelity.** Menu text is legible but **horizontally duplicated** (the same string tiled ~2.5× across the width) and heavily interlace-striped. Something in the raster or the VI field composition is wrong, and it is wrong in *attract too* — it is not a menu-specific defect. | **Unknown. Not diagnosed here.** | §5 |
+| **B3** | ~~**Menu/gameplay raster fidelity.**~~ **RETRACTED — capture artifact, not a renderer defect.** Both the "duplication" and the "interlace striping" came from harnesses reading a 480x237 framebuffer at a hardcoded 320x240 stride. At true geometry the frames are clean. | **Zero renderer work.** Fix the harness capture default. | [`frames/README.md`](frames/README.md) |
 | **B4** | **Triangle composition (V3).** Still the expensive renderer item, and still required for anything to look right. | Large, unchanged. | `RT64-WM2000-REMAINING.md` §3 |
 | **B5** | **`FN64_RENDER=wgpu` refuses general gfx tasks** (`production.rs:1579`), so the all-fn64 target stack cannot run this path at all yet. | Large, unchanged. | Brief; not re-measured here |
 
@@ -158,6 +158,22 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 > card recorded has the same signature as a stride misread, so it is worth
 > re-measuring at the VI's real width before it is treated as a renderer
 > defect.
+>
+> **Update, 2026-08-19 (later) — B3 is now fully retracted.** That
+> re-measurement was done. The duplicated menu text is the *same* capture bug,
+> not a renderer defect. One run (Start at swap 1100, the §3.2 script) dumped
+> every swap twice: once at the harness's hardcoded 320x240, once at the
+> geometry the VI reported live (`480x237`, printed on all 5,272 swaps). At
+> swap 1250 the 320-wide read shows the WWF logo twice and the Rumble Pak
+> strings tiled; the identical bytes at 480 wide show one logo and one copy of
+> each string. Vertical coherence is 0.631 at stride 320 against 0.877 at
+> stride 480 — the same signature the striping carried. Both images are
+> committed in [`frames/README.md`](frames/README.md).
+>
+> Nothing in B3 remains attributable to the raster or to VI field composition.
+> The open work is the capture path: `examples/wm2000-census/src/main.rs` and
+> `packages/wm2000-boot/src/main.rs` (separate `~/Code/recomps/wm2000`
+> checkout) both still hardcode 320x240 by default.
 >
 > B4 (triangle composition) is unchanged and is now tracked as S1 in
 > [`RT64-WM2000-REMAINING.md`](RT64-WM2000-REMAINING.md), with the two
@@ -206,9 +222,9 @@ Stated plainly, because a precise blocker is the point of this card.
   consequence. A card that wants a match should read the menu state machine
   (or the guest's pad-handling function) rather than brute-force button
   combinations -- that is the specific, small, named next step.
-- **Why menu text is horizontally duplicated.** Recorded in §4 as B3 and left
-  undiagnosed. It could be a scissor, a stride, a VI x-scale, or the raster;
-  none was ruled in or out.
+- ~~**Why menu text is horizontally duplicated.**~~ **Answered: it is not.**
+  It was a stride misread in the capture path, proven by dumping the same
+  bytes at 320 and at the VI's live 480 in one run. See the B3 update in §4.
 - **Whether the white segment's length is correct.** No reference comparison
   was run.
 - **Anything about the `FN64_RENDER=wgpu` lane.** All measurement here used the
