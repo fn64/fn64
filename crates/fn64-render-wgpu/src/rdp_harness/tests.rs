@@ -977,10 +977,13 @@ fn two_triangles_straddling_a_load_sample_the_texture_each_one_saw() {
 
 /// **A raw triangle's tile comes from its OWN wire field, not a frozen 0.**
 ///
-/// `RawTriangle::tile()` is wire word 0 bits 18:16 -- a real field. This crate
-/// nonetheless freezes the triangle's `bound_tile_index` to 0 for the GPU
-/// uniform path, with a comment claiming "it carries no tile field of its own
-/// to read", which is wrong. The CPU executor reads the field.
+/// `RawTriangle::tile()` is wire word 0 bits 18:16 -- a real field, read by
+/// the CPU executor this harness drives. `PlanCollector`'s
+/// `bound_tile_index` once froze it to 0 for the GPU uniform path, with a
+/// comment claiming "it carries no tile field of its own to read"; that
+/// claim was wrong and the GPU arm now reads the same field (see
+/// `production.rs`'s own
+/// `plan_collector_binds_the_tile_a_raw_triangle_s_own_wire_word_names`).
 ///
 /// The fixture puts DIFFERENT texels in tile 0 and tile 5 and points the
 /// triangle at tile 5, so an implementation reading tile 0 samples the wrong
