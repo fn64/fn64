@@ -285,6 +285,30 @@ clip in the row planner shared by the texrect and fill executors. **This is the
 highest-value single fix in the audit**: a rectangle that overhangs the
 framebuffer is completely routine content.
 
+**RESOLVED for the texrect path.** Every citation above was re-read and holds.
+`RdpScissorRect` now latches the rect in the wire's own quarter-pixel units
+(`targets/texrect.rs`), `SetScissor` stages into `RdpState`/`RdpStateDelta`
+rather than being tracked-only (`raw_dpc/mod.rs`), it is snapshotted per
+triangle on `RetrievedTriangleDraw`, and `execute_texture_rectangle` clips
+through `clip_texrect_extent` instead of refusing. Precedence is
+`rect ∩ scissor ∩ target`; the scissor is the authority and the target extent
+is a separate bound, and both are exercised by fixtures where they disagree.
+
+Three cases still refuse, now as `ScissoredAway` rather than `OutsideTarget`:
+an extent empty after clipping, a reversed/degenerate scissor, and a rectangle
+entirely past the target. The texture-coordinate ramp stays anchored at the
+unclipped origin, matching `rdp_tex_rect`'s one-time load of `ewdata[24..39]`
+(`rasterizer.c:2657-2677`) against an edgewalker clip that writes only
+`majorx`/`minorx` (`:2349-2363`).
+
+**Still open:** the FILL executor performs no scissor clip
+(`targets/fill.rs`), and the `MixedFillAndTrianglePacket` composition path is
+owned by another lane. The scissor is now available as staged state wherever
+that lane needs it. The `mode` field (angrylion's `scfield`/`sckeepodd`,
+`:2786-2787`) is decoded and carried but not honoured: this executor renders
+progressive full-frame targets, and applying `sckeepodd` would drop every other
+row. Neither gap was measured on the ROM.
+
 ---
 
 ### B2. `FillCoordinateError::FractionalEdge` — CONFIRMED
