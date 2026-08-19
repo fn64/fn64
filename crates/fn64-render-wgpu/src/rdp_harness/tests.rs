@@ -699,3 +699,328 @@ fn a_textured_triangles_committed_writes_digest_the_sampled_texels() {
         );
     }
 }
+
+/// A constant W for the perspective fixtures. `2^20`, chosen so that one
+/// texel of S is `32 * W / 1024 = W / 32 = 32768` -- a round number in plane
+/// units that leaves every derived S comfortably inside `i32`.
+const PERSPECTIVE_W: i32 = 1 << 20;
+
+/// The S plane value that samples S10.5 coordinate `s10_5` at [`PERSPECTIVE_W`].
+///
+/// Inverts the CITED perspective rule -- `s10_5 = (S / |W|) * 1024` -- rather
+/// than reading anything back from the implementation.
+const fn perspective_s_for(s10_5: i32) -> i32 {
+    s10_5 * PERSPECTIVE_W / 1024
+}
+
+/// The perspective twin of [`non_perspective_texture_planes`]: the same four
+/// columns sampling the same four texels, through the `* 1024.0` path.
+///
+/// W is held CONSTANT across the triangle, so the divide is exact and the
+/// expected texels are hand-computable. A varying W is a different claim (the
+/// divide is per pixel) and belongs in its own fixture.
+///
+/// One texel of S is `32 * W / 1024 = W / 32`, so `dx = W / 32` advances one
+/// texel per pixel of X, and the base cancels the 1/8-pixel first-subsample
+/// offset and adds the half-texel anti-coincidence offset.
+fn perspective_texture_planes() -> ([i32; 4], [i32; 4], [i32; 4], [i32; 4]) {
+    let per_texel = PERSPECTIVE_W / 32;
+    let s_base = perspective_s_for(16) - per_texel / 8;
+    let t_base = perspective_s_for(16);
+    (
+        [s_base, t_base, PERSPECTIVE_W, 0],
+        [per_texel, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    )
+}
+
+/// **The perspective path -- the one WM2000's own triangles take.**
+///
+/// FAILS BEFORE this lane (no texture rung at all). It also fails if the
+/// `* 1024.0` factor is dropped: without it every S10.5 coordinate here
+/// collapses to well under one texel and all four columns sample texel 0,
+/// which is precisely the "uniform field" the reference recorded on the real
+/// title screen.
+#[test]
+fn a_perspective_textured_triangle_divides_by_w_and_scales_by_1024() {
+    let (value, dx, de, dy) = perspective_texture_planes();
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .texture_perspective()
+        .combine_texel_passthrough()
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 6.0)
+                .rows(0..3)
+                .texture_planes(value, dx, de, dy),
+        )
+        .run();
+
+    for y in 0..3 {
+        for (index, expected) in TEXELS.iter().enumerate() {
+            frame.assert_pixel(2 + index as u32, y, *expected);
+        }
+    }
+}
+
+/// **The two paths are genuinely different, measured rather than assumed.**
+///
+/// The identical S/T/W planes, drawn once with `G_TP_PERSP` set and once
+/// clear, must sample DIFFERENT texels. If they agreed, one of the two scale
+/// factors would be unreachable and a mutant swapping them could survive
+/// every other test in this file.
+///
+/// The planes are the perspective fixture's, whose W is `2^20`: through the
+/// perspective path column 2 reads texel 0 (by construction), while through
+/// `G_TP_NONE` the same S of 16384 divides by `2^21` to S10.5 0.0078 -- also
+/// texel 0. So the DISTINGUISHING column is the last one, where perspective
+/// reads texel 3 and non-perspective still reads texel 0.
+#[test]
+fn the_perspective_and_non_perspective_paths_sample_different_texels() {
+    let (value, dx, de, dy) = perspective_texture_planes();
+    let triangle = Tri::flat()
+        .left_major()
+        .edges(2.0, 6.0)
+        .rows(0..3)
+        .texture_planes(value, dx, de, dy);
+    let frame_for = |perspective: bool| {
+        let staged = Rdp::new(16, 8)
+            .cycle(CycleType::One)
+            .combine_texel_passthrough()
+            .texture(0, 4, 1, TEXELS.to_vec())
+            .triangle(triangle);
+        if perspective {
+            staged.texture_perspective()
+        } else {
+            staged
+        }
+        .run()
+    };
+
+    let perspective = frame_for(true);
+    let none = frame_for(false);
+
+    assert_eq!(
+        perspective.pixel(5, 0),
+        TEXELS[3],
+        "the perspective path scales by 1024, putting column 5 on texel 3"
+    );
+    assert_eq!(
+        none.pixel(5, 0),
+        TEXELS[0],
+        "G_TP_NONE divides the same plane by 2^21, leaving column 5 inside texel 0"
+    );
+    assert_ne!(
+        perspective.pixel(5, 0),
+        none.pixel(5, 0),
+        "the two texture paths must not agree, or one scale factor is untested"
+    );
+}
+
+/// **The `w <= 0` divide uses W's MAGNITUDE, not its signed value.**
+///
+/// The killing case for the difference between `w.unsigned_abs().max(1)` and
+/// a bare `w.max(1)`: a NEGATIVE W of the same magnitude as a positive one
+/// must sample the SAME texels, because the sign is discarded before the
+/// divide. A `max(1)` would floor the negative denominator at 1, multiplying
+/// every coordinate by 2^20 and sending all four columns off the tile.
+///
+/// This is a mutation-driven test, and it is stated as an equality against
+/// the positive-W fixture's own already-pinned texels rather than against a
+/// literal, so it cannot drift away from the claim it exists to make.
+///
+/// Found because the non-fault test below SURVIVED that mutant: asserting a
+/// packet completes says nothing about which texel it read. That is this
+/// area's recorded failure mode -- a fixture reading the arm at a point where
+/// correct and incorrect answers coincide -- and it recurred here.
+#[test]
+fn a_negative_w_samples_the_same_texels_its_positive_magnitude_does() {
+    let (mut value, dx, de, dy) = perspective_texture_planes();
+    value[2] = -PERSPECTIVE_W;
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .texture_perspective()
+        .combine_texel_passthrough()
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .edges(2.0, 6.0)
+                .rows(0..3)
+                .texture_planes(value, dx, de, dy),
+        )
+        .run();
+
+    for (index, expected) in TEXELS.iter().enumerate() {
+        assert_eq!(
+            frame.pixel(2 + index as u32, 0),
+            *expected,
+            "column {} under W = -2^20 must read the same texel it reads under W = +2^20; \
+             the divide takes |W|",
+            2 + index
+        );
+    }
+}
+
+/// **`w <= 0` must not fault** -- the rule earned from real WM2000 content
+/// (gfx task ~#27), not a hypothetical.
+///
+/// A perspective triangle crossing the near plane legitimately presents a
+/// non-positive W. Real hardware's tcdiv derives 1/w from the operand's top
+/// bits with no sign trap: the pixel samples garbage texels and the chip
+/// keeps rasterizing. So this triangle must COMPLETE -- writing whatever the
+/// magnitude divide produces -- rather than panicking, refusing, or aborting
+/// the packet.
+///
+/// Asserted as "the packet completed and wrote its declared rows", not as a
+/// specific texel: the sampled texel IS defined garbage, and pinning it would
+/// pin an accident rather than the rule.
+#[test]
+fn a_non_positive_w_samples_garbage_without_faulting() {
+    for w in [0i32, -1, -PERSPECTIVE_W, i32::MIN] {
+        let (mut value, dx, de, dy) = perspective_texture_planes();
+        value[2] = w;
+        let frame = Rdp::new(16, 8)
+            .cycle(CycleType::One)
+            .texture_perspective()
+            .combine_texel_passthrough()
+            .texture(0, 4, 1, TEXELS.to_vec())
+            .triangle(
+                Tri::flat()
+                    .left_major()
+                    .edges(2.0, 6.0)
+                    .rows(0..3)
+                    .texture_planes(value, dx, de, dy),
+            )
+            .try_run()
+            .unwrap_or_else(|refusal| {
+                panic!("W = {w} must rasterize as defined garbage, not refuse: {refusal:?}")
+            });
+
+        assert_eq!(
+            frame.write_ranges(),
+            vec![(0x2004, 8), (0x2024, 8), (0x2044, 8)],
+            "W = {w} must still declare and fill its three covered scanlines"
+        );
+    }
+}
+
+/// A second four-texel palette, disjoint from [`TEXELS`] in every entry, so a
+/// pixel that read the wrong LOAD is as visible as one that read the wrong
+/// texel within a load.
+const SECOND_TEXELS: [u16; 4] = [0x8421, 0x1085 ^ 0xFFFE, 0x7BDF, 0x0421];
+
+/// **The TMEM prefix rule, at the seam the brief names as the hard part.**
+///
+/// Two triangles in ONE packet with a `LoadBlock` BETWEEN them. The first
+/// must sample the first load's texels; the second must sample the second's.
+///
+/// This is the distinction a per-packet TMEM image cannot make. WM2000's own
+/// triangle packets carry NINE loads each, and the identical defect has
+/// already shipped once in this crate on the GPU side -- a single projection
+/// sealed per `draw_admitted_triangles` call meant WM2000's measured sixth
+/// packet drew the seventh sprite seven times. A test that staged both loads
+/// BEFORE both triangles would pass with either implementation, because both
+/// draws would legitimately observe the last load.
+///
+/// It also pins the direction: swapping the two assertions fails, so this
+/// cannot pass by the two draws merely DIFFERING.
+#[test]
+fn two_triangles_straddling_a_load_sample_the_texture_each_one_saw() {
+    let (value, dx, de, dy) = non_perspective_texture_planes();
+    let textured = |rows: std::ops::Range<i16>| {
+        Tri::flat()
+            .left_major()
+            .edges(2.0, 6.0)
+            .rows(rows)
+            .texture_planes(value, dx, de, dy)
+    };
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_texel_passthrough()
+        // Load #1, then the triangle on rows 0..2, then load #2 into the SAME
+        // tile, then the triangle on rows 4..6. Same tile deliberately: a
+        // fixture using two different tiles would pass even if the prefix
+        // were ignored, because the tile descriptors alone would separate
+        // them.
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .triangle(textured(0..2))
+        .texture(0, 4, 1, SECOND_TEXELS.to_vec())
+        .triangle(textured(4..6))
+        .run();
+
+    for (index, expected) in TEXELS.iter().enumerate() {
+        assert_eq!(
+            frame.pixel(2 + index as u32, 0),
+            *expected,
+            "the FIRST triangle precedes the second load and must sample the first"
+        );
+    }
+    for (index, expected) in SECOND_TEXELS.iter().enumerate() {
+        assert_eq!(
+            frame.pixel(2 + index as u32, 4),
+            *expected,
+            "the SECOND triangle follows the second load and must sample it"
+        );
+    }
+    // The two palettes are disjoint, so "each saw its own" is a real claim
+    // rather than one satisfiable by both draws reading the same thing.
+    assert_ne!(
+        frame.pixel(2, 0),
+        frame.pixel(2, 4),
+        "the two loads must be distinguishable at the pixel this test reads"
+    );
+}
+
+/// **A raw triangle's tile comes from its OWN wire field, not a frozen 0.**
+///
+/// `RawTriangle::tile()` is wire word 0 bits 18:16 -- a real field. This crate
+/// nonetheless freezes the triangle's `bound_tile_index` to 0 for the GPU
+/// uniform path, with a comment claiming "it carries no tile field of its own
+/// to read", which is wrong. The CPU executor reads the field.
+///
+/// The fixture puts DIFFERENT texels in tile 0 and tile 5 and points the
+/// triangle at tile 5, so an implementation reading tile 0 samples the wrong
+/// sprite -- the defect class this crate has already shipped once. Every other
+/// texture test here uses tile 0, where the correct and incorrect answers
+/// coincide, so this mutant survived until this test existed.
+///
+/// The two tiles are loaded at DISJOINT TMEM addresses, so the second load
+/// cannot overwrite the first and "wrong tile" is distinguishable from
+/// "clobbered TMEM".
+#[test]
+fn a_textured_triangle_samples_the_tile_its_own_wire_word_names() {
+    let (value, dx, de, dy) = non_perspective_texture_planes();
+    let frame = Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_texel_passthrough()
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .texture_at(5, 4, 1, SECOND_TEXELS.to_vec(), 0x100)
+        .triangle(
+            Tri::flat()
+                .left_major()
+                .tile(5)
+                .edges(2.0, 6.0)
+                .rows(0..3)
+                .texture_planes(value, dx, de, dy),
+        )
+        .run();
+
+    for (index, expected) in SECOND_TEXELS.iter().enumerate() {
+        assert_eq!(
+            frame.pixel(2 + index as u32, 0),
+            *expected,
+            "the triangle names tile 5, so column {} must read tile 5's texel, \
+             not tile 0's {:#06x}",
+            2 + index,
+            TEXELS[index]
+        );
+    }
+    assert_ne!(
+        SECOND_TEXELS[0], TEXELS[0],
+        "the two tiles must differ at the column this test reads"
+    );
+}
