@@ -334,6 +334,8 @@ mod production;
 mod random;
 mod raster_vs;
 mod raw_dpc;
+#[cfg(test)]
+mod rdp_harness;
 mod rgb_dither;
 mod rt64_blender_analysis;
 mod rt64_blender_emulation;
@@ -405,8 +407,6 @@ mod texture_lod;
 mod tmem;
 mod vi;
 mod vi_scanout;
-#[cfg(test)]
-mod rdp_harness;
 #[cfg(test)]
 mod wire_words;
 

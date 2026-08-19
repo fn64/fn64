@@ -68,12 +68,8 @@ pub const fn neutral_vertex_to_raster_vertex(vertex: NeutralTriangleVertex) -> R
 /// that is a hard error here, not a silent default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingTriangleDrawState {
-    NoOtherMode {
-        triangle_index: usize,
-    },
-    NoCombine {
-        triangle_index: usize,
-    },
+    NoOtherMode { triangle_index: usize },
+    NoCombine { triangle_index: usize },
 }
 
 impl core::fmt::Display for MissingTriangleDrawState {
@@ -574,7 +570,9 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::State(&written));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let draws = collector.finish().expect("written blend color is admissible");
+        let draws = collector
+            .finish()
+            .expect("written blend color is admissible");
         assert_eq!(draws[0].blend_color, Color4::from_wire(0x1122_3344));
         assert_ne!(
             draws[0].blend_color,

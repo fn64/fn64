@@ -1107,12 +1107,7 @@ impl CombinerProgramSlice {
     /// texrect and for every unshaded triangle, where a `Shade` selector
     /// would combine against `base_inputs`' zeroed field -- the silent
     /// substitution this whole admission exists to prevent.
-    fn admits_color(
-        self,
-        input: ColorInput,
-        shade_available: bool,
-        texel_available: bool,
-    ) -> bool {
+    fn admits_color(self, input: ColorInput, shade_available: bool, texel_available: bool) -> bool {
         if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
             return self.resolves_the_combined_selector();
         }
@@ -1132,12 +1127,7 @@ impl CombinerProgramSlice {
             .any(|admitted| core::mem::discriminant(admitted) == core::mem::discriminant(&input))
     }
 
-    fn admits_alpha(
-        self,
-        input: AlphaInput,
-        shade_available: bool,
-        texel_available: bool,
-    ) -> bool {
+    fn admits_alpha(self, input: AlphaInput, shade_available: bool, texel_available: bool) -> bool {
         if matches!(input, AlphaInput::Combined) {
             return self.resolves_the_combined_selector();
         }
@@ -1284,8 +1274,7 @@ impl TexrectShading {
                     return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
                 }
                 reads_env |= matches!(input, AlphaInput::Environment);
-                reads_prim |=
-                    matches!(input, AlphaInput::Primitive | AlphaInput::PrimLodFrac);
+                reads_prim |= matches!(input, AlphaInput::Primitive | AlphaInput::PrimLodFrac);
             }
         }
         // No refusal for a never-written `SetEnvColor`/`SetPrimColor`: both
@@ -2264,8 +2253,7 @@ fn blend_texrect_fragment(
     // `IM_RD`-clear ones, where the RDP runs it. This is the reference's
     // disjunction with `wraps` pinned `false` -- provably its exact value on
     // every mode `require_blendable_mode` lets through.
-    let blend_enabled =
-        state.other_mode.force_blend() || state.other_mode.antialias_enabled();
+    let blend_enabled = state.other_mode.force_blend() || state.other_mode.antialias_enabled();
     let BlendedFragment { rgba } = blend_fragment(combined, memory, 0, state, blend_enabled)
         .map_err(|source| TexrectExecutionError::Blend {
             column,
@@ -3070,7 +3058,12 @@ mod one_cycle_tests {
         // Color A index 4 is SHADE in the shared common table.
         let shade_in_color = pack_second_cycle([4, 8, 16, 7], [7, 7, 7, 7]);
         assert_eq!(
-            TexrectShading::new(shade_in_color, Color4::from_wire(0), PrimColor::from_wire(0, 0)).validate_one_cycle(),
+            TexrectShading::new(
+                shade_in_color,
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0)
+            )
+            .validate_one_cycle(),
             Err(TexrectExecutionError::UnsupportedColorInput {
                 slot: ColorInputSlot::A,
                 input: ColorInput::Shade,
@@ -3081,7 +3074,12 @@ mod one_cycle_tests {
         // And the alpha side, which has its own table.
         let shade_in_alpha = pack_second_cycle([8, 8, 16, 7], [4, 7, 7, 7]);
         assert_eq!(
-            TexrectShading::new(shade_in_alpha, Color4::from_wire(0), PrimColor::from_wire(0, 0)).validate_one_cycle(),
+            TexrectShading::new(
+                shade_in_alpha,
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0)
+            )
+            .validate_one_cycle(),
             Err(TexrectExecutionError::UnsupportedAlphaInput {
                 slot: AlphaInputSlot::A,
                 input: AlphaInput::Shade,
@@ -3090,10 +3088,14 @@ mod one_cycle_tests {
         );
         // The message names the selector, so a future title's log says what
         // is missing rather than only that something is.
-        let message = TexrectShading::new(shade_in_color, Color4::from_wire(0), PrimColor::from_wire(0, 0))
-            .validate_one_cycle()
-            .unwrap_err()
-            .to_string();
+        let message = TexrectShading::new(
+            shade_in_color,
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+        )
+        .validate_one_cycle()
+        .unwrap_err()
+        .to_string();
         assert!(
             message.contains("Shade"),
             "the refusal must name the selector: {message}"
@@ -3180,12 +3182,10 @@ mod one_cycle_tests {
             let input = params.decode_color(ColorInputSlot::A, true);
             // Both admission rules, exactly as `admits_color` composes
             // them -- see this test's own doc.
-            let admitted = matches!(
-                input,
-                ColorInput::Combined | ColorInput::CombinedAlpha
-            ) || ADMITTED_COLOR_INPUTS
-                .iter()
-                .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
+            let admitted = matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha)
+                || ADMITTED_COLOR_INPUTS
+                    .iter()
+                    .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
                 params,
                 Color4::from_wire(ENV_WIRE),
@@ -3213,8 +3213,8 @@ mod one_cycle_tests {
             let input = params.decode_alpha(AlphaInputSlot::A, true);
             let admitted = matches!(input, AlphaInput::Combined)
                 || ADMITTED_ALPHA_INPUTS
-                .iter()
-                .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
+                    .iter()
+                    .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
                 params,
                 Color4::from_wire(ENV_WIRE),
@@ -4473,8 +4473,8 @@ mod blend_stage_tests {
             crate::blend::ResolvedBlendCycle::from_wire(fba.blender_cycle_1()).b,
             BlendBInput::FramebufferAlpha
         );
-        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
-            .mode_state(fba);
+        let state =
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0)).mode_state(fba);
         assert_eq!(
             require_blendable_mode(state),
             Err(TexrectExecutionError::UnsupportedBlendFramebufferAlpha)
@@ -4579,8 +4579,8 @@ mod blend_stage_tests {
         const BLEND_REGISTER: [u8; 4] = [16, 200, 240, 255];
         let blend_color = Color4::from_wire(u32::from_be_bytes(BLEND_REGISTER));
         assert_eq!(blend_color.rgba8(), BLEND_REGISTER);
-        let mixing_state = TexrectBlendRegisters::new(blend_color, Color4::from_wire(0))
-            .mode_state(mixing);
+        let mixing_state =
+            TexrectBlendRegisters::new(blend_color, Color4::from_wire(0)).mode_state(mixing);
         assert_eq!(require_blendable_mode(mixing_state), Ok(()));
 
         let blended = blend_texrect_fragment(FRAGMENT, sample, mixing_state, 0, 0)
@@ -4640,8 +4640,9 @@ mod blend_stage_tests {
         // unpacks the wire word big-endian, so 0x1122_3344 is [0x11, 0x22,
         // 0x33, 0x44] -- derived from the wire layout, not from the code
         // under test.
-        let written = TexrectBlendRegisters::new(Color4::from_wire(0x1122_3344), Color4::from_wire(0))
-            .mode_state(mode);
+        let written =
+            TexrectBlendRegisters::new(Color4::from_wire(0x1122_3344), Color4::from_wire(0))
+                .mode_state(mode);
         assert_eq!(written.blend_color_register, [0x11, 0x22, 0x33, 0x44]);
 
         // A = Fog is cycle 1's alpha_a (bits 26:27) encoding 1.
@@ -4738,7 +4739,8 @@ mod fragment_stage_tests {
         assert_eq!(m.coverage_destination(), CoverageDestination::Wrap);
         assert_eq!((WM2000_LOW >> 8) & 0x3, 1, "cvg_dst is low bits 8:9");
 
-        TexrectFragmentStages::try_new(m, Color4::from_wire(0)).expect("every WM2000 stage mode is admitted");
+        TexrectFragmentStages::try_new(m, Color4::from_wire(0))
+            .expect("every WM2000 stage mode is admitted");
     }
 
     /// **The `blend_cycle_count` hazard, settled: the two counts are not
@@ -4890,7 +4892,9 @@ mod fragment_stage_tests {
 
         // And the executor's own accessor agrees, for the mode WM2000
         // latches.
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
+        let stages =
+            TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
+                .unwrap();
         let result = stages.coverage_for(Coverage::FULL).unwrap();
         assert!(result.wraps);
         assert!(result.blend_enabled);
@@ -4913,7 +4917,9 @@ mod fragment_stage_tests {
             })
         );
 
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
+        let stages =
+            TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
+                .unwrap();
         assert_eq!(
             stages.coverage_for(Coverage::new(4)),
             Err(TexrectExecutionError::DestinationCoverageUnavailable {
@@ -4939,7 +4945,9 @@ mod fragment_stage_tests {
     #[test]
     fn the_alpha_compare_gate_is_hand_derived_at_its_boundary() {
         // G_AC_NONE: WM2000's own mode.
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
+        let stages =
+            TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
+                .unwrap();
         for alpha in [0u8, 1, 128, 255] {
             assert!(
                 alpha_compare_texrect_fragment(stages, alpha).unwrap(),
@@ -4988,14 +4996,14 @@ mod fragment_stage_tests {
     fn an_alpha_compare_rejection_leaves_the_destination_untouched() {
         const THRESHOLD: u8 = 0xc0;
         let threshold_mode = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x1);
-        let stages = TexrectFragmentStages::try_new(
-            threshold_mode,
+        let stages =
+            TexrectFragmentStages::try_new(threshold_mode, Color4::from_wire(u32::from(THRESHOLD)))
+                .unwrap();
+        let blend_state = TexrectBlendRegisters::new(
             Color4::from_wire(u32::from(THRESHOLD)),
+            Color4::from_wire(0),
         )
-        .unwrap();
-        let blend_state =
-            TexrectBlendRegisters::new(Color4::from_wire(u32::from(THRESHOLD)), Color4::from_wire(0))
-                .mode_state(threshold_mode);
+        .mode_state(threshold_mode);
 
         let mut stored = 0x0001u16.to_be_bytes();
         // Alpha below the threshold: rejected, nothing written.
@@ -5243,11 +5251,7 @@ mod fragment_stage_tests {
                 // private copy. If the duplicate ever returns, this fails.
                 assert_eq!(
                     ours,
-                    crate::rgb_dither::ordered_tile_value(
-                        RgbDither::Bayer,
-                        x,
-                        y
-                    ),
+                    crate::rgb_dither::ordered_tile_value(RgbDither::Bayer, x, y),
                     "the alpha-dither path must read rgb_dither's tile at ({x}, {y})"
                 );
                 if ours != REFERENCE_BAYER[y as usize][x as usize] {
@@ -5365,7 +5369,9 @@ mod fragment_stage_tests {
         );
 
         // And WM2000's own Noise mode at the endpoint does not.
-        let wm = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
+        let wm =
+            TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
+                .unwrap();
         assert_eq!(
             apply_alpha_dither(
                 223,
