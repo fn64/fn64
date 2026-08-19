@@ -51,3 +51,39 @@ doc describes and NOT with the post-rung 1,118-distinct-frames measurement.
 The routing finding above is about which guest code path a press reaches and
 does not depend on the renderer; the *frames* from these runs are not evidence
 about the current tree.
+
+## Re-run on THIS tree: the frames are not black, and the ring renders
+
+The caveat above is now closed by rebuilding the harness against this branch
+(the emitted crate re-emitted from `recompile_rom`, `packages/wm2000-boot`
+patched to dump at true VI geometry via `fn64_abi::vi_width()` /
+`vi_output_height()` instead of a hardcoded 320x240). Same lead-in
+(`r_none.script`), 600,000 steps.
+
+| | prebuilt (fn64 `adb5c74a`) | rebuilt (this branch) |
+|---|---|---|
+| dump geometry | 320x240 (sheared, 2/3 of the frame) | **480x237** (true) |
+| max swap, rc | 3147, rc=0 | **3757, rc=0** |
+| `0x80120854` | 0 occurrences | 0 occurrences |
+| distinct frame hashes | **5** across 3147 swaps | **~3750** across 3757 swaps |
+| frames after swap ~1200 | all black | rendered content throughout |
+
+The five frames in `frames/` are from the rebuilt run and were looked at:
+
+- **`fn64-fb-700.png`** -- a **wrestling ring**: three dark-red ring ropes
+  strung between turnbuckle posts, a pale-green canvas mat below them, and a
+  large untextured yellow form (a wrestler) at the left.
+- **`fn64-fb-900.png`** -- a **wrestler figure seen from behind**, legs in
+  trunks and boots, torso, arms with wristbands, standing between green arena
+  structures on a blue entrance ramp.
+- **`fn64-fb-1005.png`** -- the same entrance shot with an arena/crowd
+  backdrop, heavily texture-corrupted (striped garbage across the crowd rows).
+- **`fn64-fb-1900.png`** and **`fn64-fb-3757.png`** -- the screen the run
+  settles on and holds: flat coloured rectangles (a menu whose text and
+  portraits are untextured quads) plus a slowly rotating yellow polyhedron.
+
+**What this is, stated honestly: attract mode.** The ring and the wrestler are
+the ROM's own demo/entrance sequence playing on its own around swaps 700-1100,
+not a match this lane drove into. From ~1900 the run holds a single static
+menu-shaped screen. Textures are largely absent or corrupt throughout, so
+nothing here reads as a playable match: no health/energy bars, no HUD.
