@@ -804,3 +804,219 @@ instead, it will silently bind tile 0 for every raw triangle again, the same
 failure `PlanCollector`'s fix just closed.
 
 Not a card today. Recorded so it is not rediscovered as if it were new.
+
+---
+
+# Depth (bit 0): scoping card
+
+Scoped on worktree `/private/tmp/fn64-depth-scope` (branch
+`card/rt64-depth-scope`) from `b484defa`. **Scoping only -- no behaviour
+change proposed or landed by this card.** The conclusion is that the "three
+nouns" the texture rung deferred ("a depth image, a depth journal
+declaration, and the RDP's own Z encoding") understate the work by one
+whole hazard, and overstate it by one whole component.
+
+## 1. Is depth needed for WM2000 gameplay? Measured: not for anything reached so far. Unknown for a match.
+
+Three INDEPENDENT censuses in this repo agree, and none is a re-count of
+another:
+
+| census | population | depth-bit set |
+| --- | --- | --- |
+| decode-seam (`RT64-TRIANGLE-WRITEBACK.md`, "MEASURED ON THE ROM") | 826,056 | **0** |
+| execution-seam (same doc, "Measured at the EXECUTION seam") | 1,314,648 | **0** |
+| planner-arm counters (`RT64-WM2000-INPUT-GRAMMAR.md:383`) | 1,600,000 | **0** |
+
+Exactly one flag combination occurs across all three: `s=true t=true
+d=false`, opcode 0x0e. `RT64-WM2000-INPUT-GRAMMAR.md:391` states the
+consequence directly: "The depth hypothesis is refuted outright... Depth is
+not what is blocking this screen, and implementing depth would not unblock
+it."
+
+**What this does and does not establish.** It establishes that depth is not
+a blocker for any screen the emulator currently reaches, and that building
+it would unblock nothing today. It does NOT establish that a match needs no
+depth, because **no match has ever been reached** -- the ROM plateaus before
+gameplay (`RT64-WM2000-INPUT-GRAMMAR.md`, the swap-1901 abort and the
+button-probe matrix). The measured population is attract loop and menus.
+
+So the honest answer to "does a match need depth" is **unknown, and not
+determinable from this repository today**. It is not merely unmeasured; it
+is unmeasurable until the input/abort work reaches a match. Any claim in
+either direction would be prediction, not measurement.
+
+One piece of genuine counter-evidence against assuming depth is required:
+the attract loop already draws **real textured 3D geometry with the depth
+bit clear on every single triangle** (the 12 -> 1017 distinct-colour frame
+result above). So this engine demonstrably issues 3D content without Z, and
+"3D therefore Z" is not a safe inference for it. That is evidence, not
+proof: attract-loop 3D may be depth-sorted content that gameplay's
+mutually-occluding wrestlers would not be.
+
+## 2. The Z encoding is ALREADY SOLVED IN THIS REPO, twice, in two different domains
+
+The brief expected this to be scoped from RT64's C++. It should not be:
+this workspace already contains a complete, tested, manual-cited integer
+implementation, and the RT64 one is the wrong domain for a CPU rasterizer.
+
+### `fn64-render-reference/src/depth.rs` -- the INTEGER encoding (the one a CPU rasterizer needs)
+
+Cited in-file to "Nintendo 64 Programming Manual, Chapter 16, Z Image
+Format" (`depth.rs:3`). Exact layout, quoted:
+
+- `decode_z` (`depth.rs:39`): 3-bit exponent `(encoded_z >> 11) & 7`,
+  11-bit mantissa `encoded_z & 0x07ff`, into an unsigned 18-bit 15.3 value
+  via two frozen tables (`depth.rs:9-12`):
+  `Z_SHIFT = [6,5,4,3,2,1,0,0]`,
+  `Z_ADD = [0x00000,0x20000,0x30000,0x38000,0x3c000,0x3e000,0x3f000,0x3f800]`.
+- `encode_z` (`depth.rs:47`): saturates at `0x3ffff`, selects the exponent
+  by an explicit eight-way range match, then
+  `((z - Z_ADD[e]) >> Z_SHIFT[e])`.
+- `pack` (`depth.rs:125`) is the load-bearing one:
+  `visible = (encoded_z << 2) | (encoded_delta >> 2)`, `hidden = encoded_delta & 3`.
+- `encode_delta_z` (`depth.rs:68`) is `floor(log2)` saturated to 15, cited
+  to "Programming Manual Chapter 15, Equation 10".
+
+### The hazard the "three nouns" missed: TWO OF THE SIXTEEN BITS DO NOT LIVE IN RDRAM
+
+`pack` splits DeltaZ across a `visible: u16` and a `hidden: u8`.
+`EncodedDepth` (`depth.rs:17-20`) exists precisely to carry both. The
+hidden pair is RDRAM's two extra bits per halfword, which **ordinary CPU
+halfword accesses cannot observe** (`depth.rs:5-7`).
+
+The reference stores them in a host-side sidecar keyed by physical
+halfword -- `RdramHiddenBits` (`backend/hidden_bits.rs:24-26`), a dense
+`Vec<u32>` over `DEFAULT_RDRAM_SIZE / 2`, entirely outside guest memory.
+
+This is a STRUCTURAL mismatch with the journal, not a detail. The whole
+raw-triangle path's correctness argument is "declared ResourceAccess ranges
+are satisfied by real CompletedWrite bytes, digested and committed into
+guest RDRAM". Guest RDRAM has 16 bits per halfword and no sidecar; grepping
+`fn64-abi` and `fn64-render-ir` for hidden-bit storage finds **nothing**.
+So a depth rung must decide, explicitly and on evidence, one of:
+
+  (a) model only the 16 visible bits and accept that the low two DeltaZ
+      bits read back as whatever the visible word's bits 1:0 hold -- which
+      changes `relations()`' tolerance, i.e. changes which pixels pass;
+  (b) add a hidden-bit sidecar to the wgpu crate mirroring the reference's,
+      and decide what a journal declaration means for state that never
+      reaches guest RDRAM;
+  (c) restrict the first rung to cases where the DeltaZ hidden bits provably
+      do not affect the outcome, and refuse the rest by name.
+
+None of these is obvious, and (a) is the one a fresh implementation would
+pick by accident. **This is the single reason this card stops at scoping.**
+
+### `fn64-render-wgpu/src/depth_encode.rs` -- RT64's FLOAT encoding (do NOT reuse for the CPU path)
+
+Already ported, `float_to_depth16` (`depth_encode.rs:257`), with
+`DEPTH_EXPONENT_SHIFT = 13` / `DEPTH_MANTISSA_SHIFT = 2` and masks
+`0xE000`/`0x1FFC` (`depth_encode.rs:211-214`), cited to `Depth.hlsli:24-41`.
+
+It is the SAME 16-bit layout, reached from a different domain: it takes
+`f32` in `[0,1]`, and its own module doc restricts its equivalence claim to
+that domain. It is also **inert** -- a private module whose only referrer
+in the whole workspace is another RT64 port (`rt64_framebuffer_shaders.rs:300`),
+matching this project's known "ported modules are inert" pattern. A CPU
+rasterizer working in the RDP's own s15.16 integer planes should use
+`fn64-render-reference`'s integer path's ARITHMETIC, not this one, or it
+will round-trip through float for no reason and inherit a domain
+restriction it cannot satisfy.
+
+**The two must not be casually unified.** They agree on layout and differ
+on domain, exactly the shape of the "two pins are both correct by design"
+trap this project has recorded before.
+
+## 3. What already exists on the fn64 side, and what genuinely does not
+
+Existing, tested, and directly reusable:
+
+- **Wire decode of the Z coefficient block.** `TriangleFlags::depth`
+  (`raw_dpc/triangle.rs:45`), `DepthWords = [RawWord; 2]`
+  (`triangle.rs:97`), retained by `RawTriangle::depth()` (`triangle.rs:322`),
+  pinned by `depth_triangle_carries_exactly_two_depth_words`
+  (`triangle.rs:548`). **The decoder already sizes 0x09 correctly.**
+- **The compare/mode logic, already public in the wgpu crate.**
+  `relations`, `mode_passes`, `depth_mode_decision`
+  (`depth_mode.rs:106`, `:140`), exported from `lib.rs:434-436`, including
+  the coverage-wrap override and an explicit
+  `UnsupportedInterpenetratingCoverageAdjustment` variant rather than a
+  silent Reject.
+- **The othermode bits**, in the reference: `depth_compare_enabled` is
+  `low & 0x0010`, `depth_update_enabled` is `low & 0x0020`
+  (`gbi/types.rs:445-451`), `depth_mode()` is `(low >> 10) & 3`
+  (`gbi/types.rs:490`), Z-source select is `primitive_depth_source`
+  (`gbi/types.rs:437`).
+- **Prim-depth precedent.** The reference's fill/texrect arms show the
+  exact shape: `crate::depth::pack(u32::from(primitive.z & 0x7fff) << 3,
+  primitive.delta_z)` (`raster/draw.rs:277`, `:545`) -- note the `<< 3`,
+  which is the s15.3 promotion, and the `& 0x7fff`.
+
+Genuinely missing, and the real work:
+
+1. **A depth image in the wgpu crate.** There is no `SetZImage`/`0xfe`
+   decoder arm at all -- grep finds only RT64-port doc comments
+   (`rt64_gbi_f3d.rs:687`'s `decode_depth_image` is an inert HLE-side
+   passthrough). This is the true twin of `SetColorImage`, and unlike
+   colour it has NO width/format word: G_SETZIMG carries an address only,
+   so extent must be inherited, which is its own decision.
+2. **A second journal target.** Every declaration today is a
+   `ColorFramebuffer` access into one accumulated buffer, digested by ONE
+   `fill_completed_writes` call at packet end. Depth is a SECOND, disjoint
+   guest region written by the SAME command. The exact-journal machinery
+   counts accesses and matches them positionally, so a depth-writing
+   triangle declares roughly 2N rows instead of N -- and the
+   read-modify-write nature of a Z test means the depth buffer must be
+   LOADED as well as stored, which no existing target does.
+3. **Per-pixel Z in the rasterizer.** Cheapest part. The Z plane is the
+   same `attribute_plane`/`attribute_sample` shape `triangle_span` already
+   uses for shade and texture; only two words instead of eight.
+
+## 4. Size: LARGER than the texture rung, and differently shaped
+
+The texture rung, measured (`git show --stat`, six commits
+`3790af9d`, `99a432b4`, `ebadd6ca`, `6e1d3cee`, `b718a59e`, `4d24c8f2`):
+**~1,623 insertions**, 14 mutants, and it needed one ROM run to find a
+defect no unit test could.
+
+Depth is **larger**, and the reason is not line count:
+
+- The texture rung added a per-pixel INPUT to an existing write. Every
+  seam downstream -- span geometry, journal declaration, row guard,
+  schedule, composition, digest, guest commit -- was reused **unchanged**,
+  which the doc above states explicitly.
+- Depth adds a per-pixel OUTPUT to a **second guest region**, plus a
+  per-pixel READ of that region's prior contents. It is the first thing in
+  this path that is read-modify-write, the first that declares against two
+  images, and the first whose correct value does not fit in guest RDRAM at
+  all (the hidden bits).
+
+Estimate: **large** -- 2-3x the texture rung, dominated by the journal's
+second target and the hidden-bit decision, not by the arithmetic. The Z
+encoding itself, which the "three nouns" framed as a third of the work, is
+effectively **already done** (`depth.rs`, tested, manual-cited); it is the
+cheapest of the three, not a peer of the other two.
+
+## 5. Stopped at scoping deliberately
+
+No code changed. Crossing into implementation was declined for one specific,
+non-negotiable reason rather than general caution:
+
+**The first increment the brief proposed cannot be built honestly without
+first deciding the hidden-bit question, and that decision is not mine to
+make on inference.** The proposed increment -- prim-depth Z, always-pass
+compare, "correct encoded Z bytes into a depth image" -- has to write
+`pack()`'s output. `pack()` produces 18 bits. Two of them have nowhere to
+go in guest RDRAM. A test asserting "correct encoded Z bytes" would
+therefore be asserting the 16 visible bits and **silently discarding the
+other two**, which is exactly the "substitute a placeholder value" the
+evidence rules forbid, dressed as a passing test. Choosing option (a) above
+by default is the failure mode, and it would be invisible until a depth
+compare's tolerance came out wrong much later.
+
+The secondary reason: with three independent censuses showing 0/1.6M depth
+triangles and no match reachable, a depth rung is **speculative for this
+ROM today** by this repo's own measurement. The project's own recorded
+lesson -- "measure what the ROM emits before scoping which rung to build" --
+argues for spending the next unit of effort on reaching a match (which would
+also ANSWER question 1 by measurement) before building for it.
