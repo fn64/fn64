@@ -1,0 +1,41 @@
+WM2000, all-Rust lane (FN64_RECOMP=rs, FN64_RENDER=wgpu), two controllers,
+committed match lead-in, VI swap 2873. Instrumented at the
+MixedFillAndTrianglePacket raise site in production.rs::stage_and_report.
+
+MEASURED PACKET SHAPE:
+
+  fills=60  raw_tris=1  texrects=0  loads=2  tri_slots=1
+
+All 60 FillRectangles carry cycle=Fill -- they are REAL fill-cycle fills that
+declare and execute per-row RenderTarget writes. This is NOT the one-cycle
+"admitted but declares no write" case introduced by 1e9b1591; that case never
+reaches plan.fills at all, because production_adapter's FillRectangle arm
+`continue`s past a command whose bind_fill_rectangle reports FillNotDeclared.
+
+The 60 fills are one framebuffer clear striped into 60 horizontal bands of the
+same 480-wide RGBA16 image at physical 0x3C7C00 (3963904), fill_color
+0x00010001, commands 15..74, y advancing 16 quarter-pixels (4 pixels) per band:
+
+  fill#0  cmd=15 cycle=Fill rect=(0,0)-(1916,12)     img_w=480 fmt=Rgba size=Bits16
+  fill#1  cmd=16 cycle=Fill rect=(0,16)-(1916,28)    img_w=480 fmt=Rgba size=Bits16
+  ...
+  fill#59 cmd=74 cycle=Fill rect=(0,944)-(1916,956)  img_w=480 fmt=Rgba size=Bits16
+
+The single raw triangle is at command 93 -- strictly after every fill -- and it
+DECLARED A WRITE:
+
+  tri#0        source=RawTriangle
+  rawtri_cmd#0 cmd=93 span=TriangleAccessSpan { first_access_index: 65, access_count: 5 }
+
+`raw_triangle_commands` holds only triangles whose span is Some, so its presence
+there is itself the proof the decoder declared five per-scanline RenderTarget
+accesses for it. It is therefore a colour-target command executed by
+targets/raw_triangle.rs's CPU rasterizer, composing into the same accumulation
+buffer as the fills, in the same command-index-sorted schedule, with the same
+digests computed once at the end against the final composed buffer.
+
+CONCLUSION: the refusal's stated reason -- "the CPU-side fill and the GPU
+triangle raster target are disjoint with no defined composition or ordering
+between them" -- does not describe this packet, and does not describe this file
+any more. Both commands are CPU-side and journal-ordered. See stage_and_report's
+own replacement comment for the code citations.
