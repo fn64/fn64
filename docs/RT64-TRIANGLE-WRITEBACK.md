@@ -927,6 +927,193 @@ restriction it cannot satisfy.
 on domain, exactly the shape of the "two pins are both correct by design"
 trap this project has recorded before.
 
+## 2b. Corrections and additions from a second, independent evidence sweep
+
+Three things the first pass of this card got incomplete. All verified by
+reading.
+
+### The census evidence is far wider than the triangle censuses alone
+
+`G_SETZIMG` (`0xfe` on the GBI lane, cmd6 `0x3e` on the raw-DPC lane) is
+measured absent across **five** windows of increasing size, not one:
+
+| window | population | `G_SETZIMG` |
+| --- | --- | --- |
+| `RT64-WM2000-CENSUS.md:207` | 142,606 commands | **0** |
+| `RT64-WM2000-0X1CC-DIAGNOSIS.md:79` | 2,636,852 commands | **0** |
+| `RT64-WM2000-SECTION-LOCAL.md:71` | 5,406,193 commands | **0** |
+| `RT64-WM2000-REMAINING.md:83` | 109,041 decode entries (~500x) | **0** |
+| `RT64-WM2000-GAMEPLAY-GAP.md:185` | 6,526,330 commands, **input-driven through 18 menu screens** | **0** |
+
+The last one matters most: it is not the attract loop. Someone drove the
+game through eighteen menu screens and the command set did not change --
+"same 21 opcodes, same rank order... still zero Z-variants, zero two-cycle,
+zero `G_SETZIMG`". `G_SETPRIMDEPTH` (`0xee`) is **also zero**
+(`RT64-WM2000-CENSUS.md:216`), despite already being decoded and staged
+here (`raw_dpc/mod.rs:1261`).
+
+The instrument would have caught one: the census is `[AtomicU64; 256]`, one
+counter per command byte, not an allowlist (`gbi/census.rs:26-30`), and
+unrecognized bytes report as `UNNAMED_<byte>`.
+
+Note also that `0x3e` today makes the decoder refuse the **whole packet**
+(`raw_dpc/mod.rs:2553` pins it as an `UnsupportedCommand` fixture), so a
+`G_SETZIMG` could not have passed silently.
+
+### The a-priori "wrestling game must be Z-buffered" argument was already made HERE, and already retracted BY MEASUREMENT
+
+`RT64-WM2000-GAP.md:312` ranked depth as item 4 on exactly that reasoning:
+"A wrestling game is z-buffered 3D -- two wrestlers, a ring, a crowd, all
+interpenetrating." `RT64-WM2000-CENSUS.md:405` then demoted it to item 8,
+"Deferred. Zero occurrences and zero Z-variant triangles in this window.
+**Revisit only when the window reaches gameplay**."
+
+So the intuition this card was asked to test has already been raised,
+acted on, and overturned on evidence once in this project. Raising it a
+second time without new measurement would repeat that cycle.
+
+### The genuine gap: nobody has ever decoded the othermode Z bits
+
+This is the one place the evidence is **absent rather than negative**, and
+it is worth stating loudly because it is the only way the "0% depth" story
+could be misleading.
+
+`G_RDPSETOTHERMODE` is the single most frequent opcode WM2000 issues --
+23,639 occurrences, 16.6% (`RT64-WM2000-CENSUS.md:177`) -- and **its
+payload bits are never decoded** by any census. Stated explicitly in at
+least four docs, e.g. `RT64-LANE-DIVERGENCES.md:816`: "the census counts
+opcodes and does not decode `G_RDPSETOTHERMODE` payload bits... Absence in
+the census window is not absence."
+
+So: no measurement anywhere says whether WM2000 sets `Z_CMP`/`Z_UPD`.
+`RT64-WM2000-INPUT-GRAMMAR.md:383`'s `no_other_mode = 0` proves every
+triangle HAD a latched othermode; nobody read its Z bits out.
+
+**This is cheap to close and should be done before any depth
+implementation.** `RT64-WM2000-CYCLE-MODES.md` already decoded othermode
+payloads for cycle type on this ROM, so the instrument exists and merely
+needs pointing at bits `0x0010`/`0x0020`. If WM2000 turns out to set
+Z_CMP/Z_UPD while issuing only non-Z triangles, that is a genuinely
+different picture from the one the triangle censuses paint, and it is
+knowable today without reaching a match.
+
+## 2c. RT64's pinned C++ (`5473732a`), read directly -- and why it is the WRONG reference here
+
+Checked out at `/private/tmp/rt64-pin-5473732a`. Every claim below was
+verified by reading the file, not inferred.
+
+### The headline: RT64 never software-rasterizes depth
+
+Depth testing and writing are **GPU fixed-function depth-stencil state**
+(`src/render/rt64_raster_shader.cpp:315-319`):
+`depthEnabled = zCmp || zUpd`, `depthFunction = zCmp ? LESS : ALWAYS`,
+`depthWriteEnabled = zUpd`, and `depthTargetFormat = D32_FLOAT`. There is
+no span walker, no per-pixel Z compare loop, and no CPU depth encoder
+anywhere in the tree -- CPU-side has decode only
+(`ColorConverter::D16::toF`, `src/hle/rt64_color_converter.cpp:61-70`),
+used for exactly one thing: turning a FILLRECT fill colour into a clear
+depth (`src/render/rt64_framebuffer_renderer.cpp:1528`).
+
+**So for the inner loop this card would have to write, RT64 has nothing to
+cite.** `fn64-render-reference` is the better reference on every axis: it
+is integer, it is a CPU rasterizer, it is in-tree, and it is tested.
+
+RT64 remains the right citation for two things: the 16-bit word layout, and
+the othermode->depth-state mapping.
+
+### The 16-bit word layout (`src/shaders/Depth.hlsli:7-42`), verified
+
+```
+DEPTH_EXPONENT_MASK   0xE000   DEPTH_EXPONENT_SHIFT  13
+DEPTH_MANTISSA_MASK   0x1FFC   DEPTH_MANTISSA_SHIFT   2
+```
+bits 15:13 exponent, bits 12:2 mantissa (**11 bits**), bits 1:0 dz.
+
+`FloatToDepth16` computes the exponent by counting leading ones
+(`depthFixed << 14`, `firstbithigh(~depthShifted)`, `clamp(31-firstZero,0,7)`)
+and `Depth16ToFloat` computes the bias as
+`0x40000 - (0x40000 >> exponent)`. **RT64 has no lookup tables.**
+
+**The two implementations AGREE, and that is worth stating.** RT64's
+computed bias `0x40000 - (0x40000 >> e)` expands to exactly
+`fn64-render-reference`'s frozen `Z_ADD` table
+(`0, 0x20000, 0x30000, 0x38000, 0x3c000, 0x3e000, 0x3f000, 0x3f800`), and
+its `6 - min(6, e)` shift expands to exactly that crate's
+`Z_SHIFT = [6,5,4,3,2,1,0,0]` -- including the asymmetric cap where
+exponent 7 shifts the same as 6. Two independently-sourced implementations
+(HLSL from RT64, integer from the Programming Manual) producing the same
+eight-entry table is strong corroboration for the encoding.
+
+### RT64's dz is a dead path -- do not cite it as behaviour
+
+`FloatToDepth16` keeps only `(dzBit >> 2) & 0x3`, the top two bits of the
+power-of-two index. And **both call sites pass zero**:
+`FbWriteDepthCS.hlsl:27` is `float dz = 0.0f; // TODO`, and
+`RtCopyDepthToColorPS.hlsl:42` passes `0.0f`. RT64 has never written a
+nonzero dz to a depth image.
+
+This is the same 18-bit split the reference handles as visible+hidden, seen
+from the other side: RT64 keeps 2 dz bits because 2 is all that fits in the
+visible halfword. The other two are the RDRAM hidden bits. **RT64's answer
+to the hidden-bit question is "discard them", which is option (a) above --
+and it is a GPU renderer that never needed the tolerance to be right.**
+
+### The mode bits (`src/shared/rt64_f3d_defines.h:84-101`), verified
+
+`Z_CMP 0x10` (bit 4), `Z_UPD 0x20` (bit 5), `ZMODE_MASK 0xc00` (bits 11:10)
+with `OPA 0 / INTER 0x400 / XLU 0x800 / DEC 0xc00`. Z-source select is
+`G_MDSFT_ZSRCSEL 2` (bit 2), `G_ZS_PIXEL`/`G_ZS_PRIM`
+(`rt64_f3d_defines.h:12-14`).
+
+**These match `fn64-render-reference` exactly** -- `depth_compare_enabled`
+is `low & 0x0010`, `depth_update_enabled` is `low & 0x0020`, `depth_mode`
+is `(low >> 10) & 3` (`gbi/types.rs:445-451`, `:490`). Second independent
+confirmation of the bit positions.
+
+**`G_CLR_ZCMP` does not exist in RT64's source.** Grep finds only `Z_CMP`.
+The brief named it; it is not an RT64 symbol.
+
+RT64 also **collapses OPA/INTER/XLU into one `LESS` test** and only
+distinguishes `ZMODE_DEC`, which it implements as a manual depth-read and
+tolerance compare in the pixel shader
+(`rt64_framebuffer_renderer.cpp:553-562`, `RasterPS.hlsl:88-110`), not as a
+depth bias. `fn64-render-reference` is STRICTER here -- its `mode_passes`
+gives Translucent and Decal genuinely different predicates
+(`depth.rs:110-118`). Another reason to prefer the in-tree reference.
+
+### G_SETZIMG carries an address and nothing else -- confirmed
+
+`src/hle/rt64_rdp.h:85-89`: the depth image struct is `{ uint32_t address;
+bool changed; }`, against the colour image struct directly above it
+(`:76-83`) which carries `fmt`, `siz` and `width`. Depth width is inherited
+from the **colour** image (`rt64_rdp.cpp:215-217` derives `depthBpr` from
+`imageWidth`, which came from `fbPair.colorImage.width` at `:196`), and
+16-bit size is asserted rather than decoded
+(`rt64_native_target.cpp:274`).
+
+This confirms the extent-inheritance decision named in section 3 below is
+real and unavoidable, not an artifact of fn64's design.
+
+### The Z coefficient block: order and layout confirmed
+
+`src/hle/rt64_rdp.h:31-35` sizes the blocks (base 4 / shade 8 / texture 8 /
+**depth 2** 64-bit words) and `src/gbi/rt64_gbi_rdp.cpp:410-574` confirms
+the stream order base -> shade -> texture -> depth. The depth block is
+`w0.w0 = Z`, `w0.w1 = dZdx`, `w1.w0 = dZde`, `w1.w1 = dZdy`
+(`rt64_gbi_rdp.cpp:559-566`).
+
+This exactly matches what `RawTriangle` already decodes
+(`DepthWords = [RawWord; 2]`, `triangle.rs:97`), so **the fn64 decoder's
+Z-block sizing is confirmed correct against RT64 as well as against its own
+test.**
+
+Two cautions on this RT64 path specifically: it discards `dZdy` (comment:
+"only used on edge pixels for anti aliasing purposes"), it converts the
+edge-walked Z into three per-vertex Z values for the GPU rather than
+interpolating per pixel, and it is **incomplete** -- `rt64_gbi_rdp.cpp:306`
+and `:583` both carry `// TODO do more than 1 triangle` followed by
+`break;`. It is not a reference to copy.
+
 ## 3. What already exists on the fn64 side, and what genuinely does not
 
 Existing, tested, and directly reusable:
@@ -968,9 +1155,20 @@ Genuinely missing, and the real work:
    triangle declares roughly 2N rows instead of N -- and the
    read-modify-write nature of a Z test means the depth buffer must be
    LOADED as well as stored, which no existing target does.
-3. **Per-pixel Z in the rasterizer.** Cheapest part. The Z plane is the
-   same `attribute_plane`/`attribute_sample` shape `triangle_span` already
-   uses for shade and texture; only two words instead of eight.
+3. **Per-pixel Z in the rasterizer.** Cheapest part, and **cheaper than
+   first scoped**: `fn64-render-reference` already does exactly this for
+   raw triangles, per pixel, with the manual cited. `raster/draw.rs:988-1001`
+   evaluates the Z plane, converts 16.16 -> the 15.3 working domain by
+   `* 8 / Q16_ONE`, clamps to `0x3ffff`, and derives DeltaZ as
+   `(|dzdx| + |dzdy|) * 8 / Q16_ONE` -- cited in-file to "Programming
+   Manual, Chapter 16, Equation 4: DeltaZpix = |dZ/dx| + |dZ/dy|". The Z
+   block is gated on the opcode bit at `gbi/stream.rs:332` and decoded by
+   `gbi/entries.rs:611`. In fn64-render-wgpu this is the same
+   `attribute_plane`/`attribute_sample` shape `triangle_span` already uses,
+   with two coefficient words instead of eight.
+
+   Note this makes the reference's `dzdy` handling STRICTER than RT64's,
+   which discards `dzdy` entirely. Follow the reference.
 
 ## 4. Size: LARGER than the texture rung, and differently shaped
 
@@ -992,10 +1190,19 @@ Depth is **larger**, and the reason is not line count:
   all (the hidden bits).
 
 Estimate: **large** -- 2-3x the texture rung, dominated by the journal's
-second target and the hidden-bit decision, not by the arithmetic. The Z
-encoding itself, which the "three nouns" framed as a third of the work, is
-effectively **already done** (`depth.rs`, tested, manual-cited); it is the
-cheapest of the three, not a peer of the other two.
+second target and the hidden-bit decision, not by the arithmetic.
+
+**Two of the "three nouns" are effectively already solved**, which is the
+single biggest correction this card makes to the deferred framing:
+
+| the deferred noun | actual state |
+| --- | --- |
+| "the RDP's own Z encoding" | **done** -- `depth.rs`, tested, manual-cited, and independently corroborated by RT64's HLSL |
+| "a depth image" | genuinely missing, but small -- address-only, extent inherited (confirmed against RT64) |
+| "a depth journal declaration" | **the whole job**, and it is read-modify-write against a second image, which nothing in this path has ever done |
+
+So the work is not three equal thirds. It is one small piece, one large
+piece, and one already finished.
 
 ## 5. Stopped at scoping deliberately
 
@@ -1014,9 +1221,44 @@ evidence rules forbid, dressed as a passing test. Choosing option (a) above
 by default is the failure mode, and it would be invisible until a depth
 compare's tolerance came out wrong much later.
 
-The secondary reason: with three independent censuses showing 0/1.6M depth
-triangles and no match reachable, a depth rung is **speculative for this
-ROM today** by this repo's own measurement. The project's own recorded
-lesson -- "measure what the ROM emits before scoping which rung to build" --
-argues for spending the next unit of effort on reaching a match (which would
-also ANSWER question 1 by measurement) before building for it.
+RT64 sharpens this rather than resolving it. RT64's answer to the hidden
+bits is to **discard them** -- `FloatToDepth16` keeps only 2 of the 4 dz
+bits, and both its call sites pass `dz = 0.0f` with a literal `// TODO`
+(`FbWriteDepthCS.hlsl:27`). That is a defensible choice for a GPU renderer
+that does its real depth test in `D32_FLOAT` and only serializes to the N64
+format at the RDRAM boundary. It is **not** defensible for a CPU rasterizer
+whose depth test IS the encoded value: here the dz tolerance directly
+decides which pixels pass. So the one available precedent for option (a)
+comes from a renderer that never depended on the answer, and cannot be
+cited as evidence that (a) is correct for this path.
+
+The secondary reason: with **five** independent censuses showing zero
+`G_SETZIMG` and zero Z-variant triangles -- including one driven through
+eighteen menu screens -- and no match reachable, a depth rung is
+**speculative for this ROM today** by this repo's own measurement. The
+project's own recorded lesson, from this very doc ("Measuring what the ROM
+emits before scoping which rung to build would have reordered the whole
+session"), argues for spending the next unit of effort on reaching a match
+rather than building for one.
+
+## 6. What to do instead, in order
+
+1. **Decode the othermode Z bits on the real ROM.** Cheap, answers a
+   question nobody has asked, and needs no match. `Z_CMP` is `low & 0x0010`
+   and `Z_UPD` is `low & 0x0020` -- confirmed by two independent sources
+   (`gbi/types.rs:445-451` and RT64's `rt64_f3d_defines.h:85-86`). The
+   instrument already exists: `RT64-WM2000-CYCLE-MODES.md` decoded othermode
+   payloads on this ROM for cycle type. If WM2000 latches Z_CMP/Z_UPD while
+   issuing only non-Z triangles, the current picture is incomplete in a way
+   that matters. If it never sets them, the "no depth" conclusion gets its
+   fourth independent leg and depth can be closed out with confidence.
+
+2. **Reach a match.** This is the only thing that converts "unknown" into a
+   measurement, and `RT64-WM2000-GAMEPLAY-GAP.md:219-223` already names the
+   approach (read the guest's menu state machine rather than guessing
+   buttons). It is also the gate on re-checking every other "five flat
+   deltas" claim, not just depth.
+
+3. **Only then, if the evidence calls for it, build depth** -- and decide
+   the hidden-bit question explicitly and in writing before the first line
+   of the rasterizer, because it is not recoverable later by testing.
