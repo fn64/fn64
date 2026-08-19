@@ -49,8 +49,8 @@ use fn64_render_ir::ResourceAccess;
 
 use super::texrect::{
     admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
-    TexrectBlendRegisters, TexrectCombinerEvaluation, TexrectExecutionError,
-    TexrectFragmentStages, TexrectShading, TexrectTileBinding,
+    TexrectBlendRegisters, TexrectCombinerEvaluation, TexrectExecutionError, TexrectFragmentStages,
+    TexrectShading, TexrectTileBinding,
 };
 use super::{
     CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
@@ -157,10 +157,12 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     // one equality rather than tolerated in either direction.
     let textured = triangle.flags().textured();
     if textured != texture.is_some() {
-        return Err(TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
-            opcode_textured: textured,
-            binding_present: texture.is_some(),
-        });
+        return Err(
+            TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
+                opcode_textured: textured,
+                binding_present: texture.is_some(),
+            },
+        );
     }
     let base_inputs = shading
         .validate_combiner_program_for(cycles, triangle.flags().shaded(), textured)?
@@ -199,10 +201,12 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     // named refusal rather than a silent clip.
     let rows = triangle_span::covered_rows(triangle, extent.width(), extent.height());
     if rows.len() != declared.len() {
-        return Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
-            declared: declared.len(),
-            rasterized: rows.len(),
-        });
+        return Err(
+            TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
+                declared: declared.len(),
+                rasterized: rows.len(),
+            },
+        );
     }
     // Range for range, in order. Each row's bytes start at the target's own
     // base plus `(y * width + x0) * bpp` and run `(x1 - x0) * bpp` -- which
@@ -220,19 +224,23 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
         // bytes". `verify_accesses_inside` already proved the resource
         // upstream, which is exactly why this arm must not quietly agree.
         let fn64_render_ir::ResourceRegion::Rdram { range, .. } = access.region() else {
-            return Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
-                position,
-                declared: (0, 0),
-                rasterized: (start, len),
-            });
+            return Err(
+                TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                    position,
+                    declared: (0, 0),
+                    rasterized: (start, len),
+                },
+            );
         };
         let declared_range = (range.start().get(), range.len());
         if declared_range != (start, len) {
-            return Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
-                position,
-                declared: declared_range,
-                rasterized: (start, len),
-            });
+            return Err(
+                TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                    position,
+                    declared: declared_range,
+                    rasterized: (start, len),
+                },
+            );
         }
     }
     if rows.is_empty() {

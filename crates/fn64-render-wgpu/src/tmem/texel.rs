@@ -368,9 +368,7 @@ pub fn resolve_indexed_texel(
         // index; the 16-bit texel indexes through its high (unincremented,
         // big-endian first) byte. With the TLUT disabled there is no CI16
         // alias to admit, so that case stays refused.
-        PixelSize::Bits16 if lut_mode != TextureLutMode::Disabled => {
-            (raw_index.value() >> 8) as u8
-        }
+        PixelSize::Bits16 if lut_mode != TextureLutMode::Disabled => (raw_index.value() >> 8) as u8,
         size => return Err(IndexedTexelResolveError::UnsupportedIndexSize { size }),
     };
     match lut_mode {

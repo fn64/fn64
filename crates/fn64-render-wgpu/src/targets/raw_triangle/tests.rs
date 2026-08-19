@@ -320,13 +320,14 @@ fn a_sloped_triangle_writes_a_different_pixel_count_on_each_row() {
 fn a_declared_pixel_with_no_subpixel_coverage_is_not_painted() {
     let key = key_at(16, 8);
     let resident = sentinel_resident(key);
-    let sloped_left = triangle(
-        true, 16, 8, 0, 786432, 0, 147456, 32768, 524288, 0,
-    );
+    let sloped_left = triangle(true, 16, 8, 0, 786432, 0, 147456, 32768, 524288, 0);
     // The precondition, asserted rather than assumed: this pixel really is
     // inside the declared run and really has zero coverage.
     let rows = crate::raw_dpc::triangle_span::covered_rows(&sloped_left, 16, 8);
-    let row = rows.iter().find(|row| row.y == 1).expect("row 1 is covered");
+    let row = rows
+        .iter()
+        .find(|row| row.y == 1)
+        .expect("row 1 is covered");
     assert_eq!((row.x0, row.x1), (2, 8), "row 1's declared run");
     assert_eq!(
         crate::raw_dpc::triangle_span::pixel_coverage(&sloped_left, 2, 1),
@@ -394,20 +395,24 @@ fn a_row_count_disagreeing_with_the_journal_is_refused_by_name() {
     let resident = sentinel_resident(key);
     assert!(matches!(
         run(key, &box_triangle(), &resident, 4),
-        Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
-            declared: 4,
-            rasterized: 3
-        })
+        Err(
+            TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
+                declared: 4,
+                rasterized: 3
+            }
+        )
     ));
     // And the opposite direction, which is the one that actually reaches
     // guest memory: the journal declared fewer rows than the raster covers,
     // so the raster would write bytes nobody declared.
     assert!(matches!(
         run(key, &box_triangle(), &resident, 2),
-        Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
-            declared: 2,
-            rasterized: 3
-        })
+        Err(
+            TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
+                declared: 2,
+                rasterized: 3
+            }
+        )
     ));
 }
 
@@ -444,11 +449,13 @@ fn a_declared_row_at_the_wrong_range_is_refused_even_when_the_count_matches() {
     assert!(
         matches!(
             result,
-            Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
-                position: 1,
-                declared: (0x410, 8),
-                rasterized: (0x414, 8),
-            })
+            Err(
+                TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                    position: 1,
+                    declared: (0x410, 8),
+                    rasterized: (0x414, 8),
+                }
+            )
         ),
         "a shifted declared row must be refused by name, got {result:?}"
     );
@@ -464,10 +471,12 @@ fn a_short_target_makes_the_row_counts_disagree_rather_than_clipping() {
     let resident = sentinel_resident(key);
     assert!(matches!(
         run(key, &box_triangle(), &resident, 3),
-        Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
-            declared: 3,
-            rasterized: 2
-        })
+        Err(
+            TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
+                declared: 3,
+                rasterized: 2
+            }
+        )
     ));
 }
 
@@ -801,7 +810,6 @@ fn an_unshaded_triangle_reading_shade_is_still_refused() {
     );
 }
 
-
 /// **An untextured triangle whose program reads `Texel0` is refused.**
 ///
 /// The gap this closes: `combine_one_texel` is handed `[0; 4]` as the texel
@@ -854,16 +862,7 @@ fn textured_box_triangle() -> RawTriangle {
     let w0 = (1u32 << 23) | ((3u32 << 2) & 0xffff);
     let w1 = ((3u32 << 2) << 16) | 0;
     let mut bytes = Vec::with_capacity(64);
-    for word in [
-        w0,
-        w1,
-        (6u32 << 16),
-        0,
-        (2u32 << 16),
-        0,
-        (6u32 << 16),
-        0,
-    ] {
+    for word in [w0, w1, (6u32 << 16), 0, (2u32 << 16), 0, (6u32 << 16), 0] {
         bytes.extend_from_slice(&word.to_be_bytes());
     }
     // Eight coefficient words = sixteen u32 halves, all zero. The VALUES do
@@ -908,10 +907,12 @@ fn a_textured_triangle_without_a_tmem_binding_is_refused_by_name() {
     assert!(
         matches!(
             result,
-            Err(TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
-                opcode_textured: true,
-                binding_present: false,
-            })
+            Err(
+                TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
+                    opcode_textured: true,
+                    binding_present: false,
+                }
+            )
         ),
         "a textured triangle with no TMEM binding must refuse by name, got {result:?}"
     );

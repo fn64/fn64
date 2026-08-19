@@ -30,12 +30,12 @@ pub use fill::{
     decode_fill_cycle_pixel, execute_fill_rectangle, resolve_fill_pixel_rectangle,
     FillCoordinateError, FillCycleBypassHazards, FillExecutionError, FillPixelRectangle,
 };
-pub use raw_triangle::{execute_raw_triangle, RawTriangleTexture};
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
+pub use raw_triangle::{execute_raw_triangle, RawTriangleTexture};
 pub use texrect::{
     execute_texture_rectangle, TexrectAxis, TexrectBlendRegisters, TexrectConstantRegister,
     TexrectDraw, TexrectExecutionError, TexrectShading, TexrectTileBinding,
