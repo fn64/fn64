@@ -44,6 +44,7 @@ use fn64_render::{
 };
 
 use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor};
+use crate::targets::RdpScissorRect;
 use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
 
@@ -136,6 +137,20 @@ pub struct RetrievedTriangleDraw {
     /// `M` selects [`crate::blend::BlendColorInput::Fog`] or its `A`
     /// selects [`crate::blend::BlendAlphaInput::Fog`].
     pub fog_color: Color4,
+    /// `G_SETSCISSOR` current at this triangle's own stream position, as
+    /// the quarter-pixel rect the wire carries -- the same
+    /// command-time-snapshot pattern as `blend_color`/`env_color`/
+    /// `prim_color`/`fog_color`, and for the same reason: one packet can
+    /// carry several rectangles under different scissors, so the walk's
+    /// running final value would clip the earlier ones with the later
+    /// one's rect.
+    ///
+    /// `None` means this plan issued no `SetScissor` before this triangle.
+    /// It is deliberately NOT defaulted to the full framebuffer here: the
+    /// consumer, not this collector, owns the fallback, because only the
+    /// consumer knows the target extent that fallback has to be. See
+    /// `production.rs`'s texrect submission for where it is supplied.
+    pub scissor: Option<RdpScissorRect>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -177,6 +192,11 @@ pub struct TriangleDrawStateCollector {
     /// `G_SETFOGCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color`/`current_prim_color` exactly.
     current_fog_color: Color4,
+    /// `G_SETSCISSOR` current at the walk's current stream position --
+    /// mirrors `current_fog_color`'s pattern, except that it stays `None`
+    /// until this plan issues one (see [`RetrievedTriangleDraw::scissor`]
+    /// for why the fallback is the consumer's and not this collector's).
+    current_scissor: Option<RdpScissorRect>,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -236,6 +256,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         env_color: self.current_env_color,
                         prim_color: self.current_prim_color,
                         fog_color: self.current_fog_color,
+                        scissor: self.current_scissor,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -263,6 +284,21 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
+                }
+                // Latched verbatim in wire quarter-pixels, matching
+                // `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`),
+                // which stores the four twelve-bit fields into
+                // `wstate->clip` with no rescale and no reordering. A
+                // reversed or empty rect latches too; it becomes visible
+                // at clip time, not at latch time.
+                RdpStateCommand::SetScissor { scissor, .. } => {
+                    self.current_scissor = Some(RdpScissorRect::from_wire_quarter_pixels(
+                        scissor.mode,
+                        scissor.upper_left_x,
+                        scissor.upper_left_y,
+                        scissor.lower_right_x,
+                        scissor.lower_right_y,
+                    ));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,

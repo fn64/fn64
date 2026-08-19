@@ -355,6 +355,228 @@ fn step_axis(start: i16, end: i16, index: u32, span: u32) -> i16 {
     i16::try_from(i64::from(start) + stepped).unwrap_or(if delta < 0 { i16::MIN } else { i16::MAX })
 }
 
+/// The RDP's latched scissor rectangle (`G_SETSCISSOR`, opcode `0x2d`), in
+/// the **quarter-pixel (10.2 fixed-point) wire units the command carries**.
+///
+/// ## Why quarter-pixels and not pixels
+///
+/// `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`) latches the four
+/// twelve-bit fields verbatim into `wstate->clip`:
+///
+/// ```c
+/// wstate->clip.xh = (args[0] >> 12) & 0xfff;
+/// wstate->clip.yh = (args[0] >>  0) & 0xfff;
+/// wstate->clip.xl = (args[1] >> 12) & 0xfff;
+/// wstate->clip.yl = (args[1] >>  0) & 0xfff;
+/// ```
+///
+/// and `rdp_tex_rect` (`:2637-2640`) reads the rectangle's own corners from
+/// the identical bit positions at the identical scale. The two are therefore
+/// directly comparable in quarter-pixels, which is exactly how the edgewalker
+/// compares them: Y with no rescale at all (`yhlimit = (yh >= wstate->clip.yh)`
+/// at `:2303-2305`, `yllimit = (yl & 0xfff) < wstate->clip.yl` at `:2286-2290`),
+/// and X after shifting BOTH sides into the edgewalker's own 1/8-pixel domain
+/// (`clipxlshift = wstate->clip.xl << 1`, `:2308-2309`).
+///
+/// Storing pixels here instead would have to round at latch time, before the
+/// comparison hardware performs, and a sub-pixel scissor edge would then clip
+/// the wrong column.
+///
+/// `mode` is the two-bit field angrylion splits into `scfield`/`sckeepodd`
+/// (`:2786-2787`) -- interlaced field selection. It is carried so the value
+/// survives the round trip, and is **not** consulted by the texrect clip:
+/// this executor renders progressive full-frame targets, where every scanline
+/// is drawn, and honouring `sckeepodd` would drop every other row of content
+/// the progressive path is expected to write. Marked here rather than
+/// silently ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RdpScissorRect {
+    upper_left_x: u16,
+    upper_left_y: u16,
+    lower_right_x: u16,
+    lower_right_y: u16,
+    mode: u8,
+}
+
+impl RdpScissorRect {
+    /// Latches one decoded `G_SETSCISSOR`, in the quarter-pixel units the
+    /// wire carries. No rounding, no reordering: the RDP latches whatever
+    /// four values arrive, including a reversed or empty rect, and the
+    /// *clip* -- not the latch -- is where an empty result becomes visible.
+    pub const fn from_wire_quarter_pixels(
+        mode: u8,
+        upper_left_x: u16,
+        upper_left_y: u16,
+        lower_right_x: u16,
+        lower_right_y: u16,
+    ) -> Self {
+        Self {
+            upper_left_x,
+            upper_left_y,
+            lower_right_x,
+            lower_right_y,
+            mode,
+        }
+    }
+
+    pub const fn mode(self) -> u8 {
+        self.mode
+    }
+
+    pub const fn upper_left_x(self) -> u16 {
+        self.upper_left_x
+    }
+
+    pub const fn upper_left_y(self) -> u16 {
+        self.upper_left_y
+    }
+
+    pub const fn lower_right_x(self) -> u16 {
+        self.lower_right_x
+    }
+
+    pub const fn lower_right_y(self) -> u16 {
+        self.lower_right_y
+    }
+
+    /// The half-open pixel column range `[first, limit)` this scissor
+    /// admits, and likewise for rows.
+    ///
+    /// **The rounding is angrylion's, derived from its comparison and not
+    /// invented here.** The edgewalker's X clamp (`:2349-2363`) drives a
+    /// span endpoint to `clipxhshift = clip.xh << 1` on the low side and to
+    /// `clipxlshift = clip.xl << 1` on the high side, both in 1/8-pixel
+    /// units, and the span is then consumed at whole-pixel granularity by
+    /// `span[j].lx/rx`. A low edge at quarter-pixel `q` therefore first
+    /// admits pixel `ceil(q / 4)` -- any coverage strictly left of the
+    /// scissor edge is driven out -- and a high edge at `q` last admits the
+    /// pixel below it, giving an exclusive limit of `ceil(q / 4)` as well.
+    /// Both are the same ceiling because `clip.xl` is itself an exclusive
+    /// bound: `curover` fires on `>= clipxlshift`, not `>`.
+    ///
+    /// fn64's own reference renderer computes the identical thing at
+    /// `fn64-render-reference/src/raster/draw.rs:193-203`, differing only in
+    /// that it takes the rect pre-divided into `f32` pixels and so writes
+    /// the ceiling as `(scissor.ulx - 0.5).ceil()`.
+    const fn quarter_to_pixel_ceil(quarter: u16) -> u32 {
+        (quarter as u32).div_ceil(4)
+    }
+
+    /// First admitted pixel column, inclusive.
+    pub const fn first_column(self) -> u32 {
+        Self::quarter_to_pixel_ceil(self.upper_left_x)
+    }
+
+    /// One past the last admitted pixel column.
+    pub const fn column_limit(self) -> u32 {
+        Self::quarter_to_pixel_ceil(self.lower_right_x)
+    }
+
+    /// First admitted pixel row, inclusive.
+    pub const fn first_row(self) -> u32 {
+        Self::quarter_to_pixel_ceil(self.upper_left_y)
+    }
+
+    /// One past the last admitted pixel row.
+    pub const fn row_limit(self) -> u32 {
+        Self::quarter_to_pixel_ceil(self.lower_right_y)
+    }
+}
+
+/// The result of clipping one texrect's rasterized extent against the
+/// scissor and the colour target, expressed as offsets **into the
+/// rectangle's own span** so the texture-coordinate ramp stays anchored at
+/// the unclipped origin.
+///
+/// ## Why the ramp must not move
+///
+/// `rdp_tex_rect` loads the S/T origin into `ewdata[24]` and the per-pixel
+/// steps into `ewdata[26..39]` once, from the *unclipped* command
+/// (`rasterizer.c:2657-2677`), and the edgewalker then clips the span
+/// without touching them (`:2349-2363` writes only `majorx`/`minorx`).
+/// A clipped rectangle therefore samples the SAME texel at a given screen
+/// pixel that the unclipped one would have -- the texture does not slide.
+/// Recomputing `s_start` from the clipped left edge would slide it, which is
+/// why this carries offsets rather than a narrowed [`TexrectDraw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClippedTexrectExtent {
+    first_column: u32,
+    column_limit: u32,
+    first_row: u32,
+    row_limit: u32,
+}
+
+impl ClippedTexrectExtent {
+    /// Column offsets, relative to the rectangle's own left edge.
+    pub const fn columns(self) -> core::ops::Range<u32> {
+        self.first_column..self.column_limit
+    }
+
+    /// Row offsets, relative to the rectangle's own top edge.
+    pub const fn rows(self) -> core::ops::Range<u32> {
+        self.first_row..self.row_limit
+    }
+}
+
+/// Clips `draw`'s rasterized extent against `scissor` and then against the
+/// colour target's extent, returning the surviving sub-span as offsets into
+/// the rectangle.
+///
+/// ## Precedence: the scissor is the authority, the target is a second bound
+///
+/// Both are applied, and neither substitutes for the other. angrylion clamps
+/// the span to `clip` unconditionally (`rasterizer.c:2349-2363` for X,
+/// `:2284-2305` for Y) -- a scissor TIGHTER than the framebuffer really does
+/// suppress pixels the framebuffer could hold. Separately, no span may name
+/// memory outside the target, which is this executor's own invariant and not
+/// a hardware one: the RDP would happily scribble past the end of a
+/// colour image, but fn64's target is a sized buffer and a write past it is
+/// a defect, not content. Intersecting both is therefore strictly narrower
+/// than either.
+///
+/// ## What this REFUSES rather than clips
+///
+/// An empty result. Once the intersection is taken, an extent with no
+/// surviving column or row is not a rectangle that draws nothing quietly --
+/// it is either a genuinely off-screen primitive or a reversed/degenerate
+/// scissor, and both are worth naming. `ScissoredAway` carries the rect and
+/// the scissor so the reader can tell which.
+///
+/// The old [`TexrectExecutionError::OutsideTarget`] refusal it replaces was
+/// wrong for the opposite reason: it refused whenever ANY part of the
+/// rectangle overhung, which for a rectangle straddling the framebuffer edge
+/// is completely routine content the RDP draws every frame.
+fn clip_texrect_extent(
+    draw: TexrectDraw,
+    scissor: RdpScissorRect,
+    extent_width: u32,
+    extent_height: u32,
+    key: ColorTargetKey,
+    rectangle: TargetRectangle,
+) -> Result<ClippedTexrectExtent, TexrectExecutionError> {
+    // Screen-space intersection of three half-open spans: the rectangle's
+    // own, the scissor's, and the target's. `saturating_sub` below then
+    // rebases the survivor onto the rectangle's origin; it cannot underflow
+    // because `first` is already `>= draw.left()`.
+    let first_x = draw.left().max(scissor.first_column());
+    let limit_x = draw.right().min(scissor.column_limit()).min(extent_width);
+    let first_y = draw.top().max(scissor.first_row());
+    let limit_y = draw.bottom().min(scissor.row_limit()).min(extent_height);
+    if first_x >= limit_x || first_y >= limit_y {
+        return Err(TexrectExecutionError::ScissoredAway {
+            key,
+            rectangle,
+            scissor,
+        });
+    }
+    Ok(ClippedTexrectExtent {
+        first_column: first_x - draw.left(),
+        column_limit: limit_x - draw.left(),
+        first_row: first_y - draw.top(),
+        row_limit: limit_y - draw.top(),
+    })
+}
+
 /// Which texture axis a texrect diagnostic names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TexrectAxis {
@@ -489,11 +711,37 @@ pub enum TexrectExecutionError {
         value: f32,
     },
     /// The rectangle's rasterized extent is not inside the color target.
-    /// Never clamped: a clamped rectangle would write pixels the RDP never
-    /// covers, or drop pixels the journal already declared.
+    ///
+    /// **Reached only from the raw-triangle executor now.** For a texrect
+    /// this variant used to fire whenever any part of the rectangle
+    /// overhung the target, on the reasoning that "a clamped rectangle
+    /// would write pixels the RDP never covers." That reasoning was
+    /// backwards: clamping is precisely what the RDP's scissor does.
+    /// angrylion drives every span endpoint to the clip rect rather than
+    /// rejecting the primitive (`rasterizer.c:2349-2363` for X,
+    /// `:2284-2305` for Y, with `clip` latched by `rdp_set_scissor` at
+    /// `:2779-2784`), and fn64's own reference renderer clamps the same way
+    /// at `fn64-render-reference/src/raster/draw.rs:197-203`. The texrect
+    /// path now clips through [`clip_texrect_extent`] and refuses only the
+    /// genuinely empty result, as [`Self::ScissoredAway`].
     OutsideTarget {
         key: ColorTargetKey,
         rectangle: TargetRectangle,
+    },
+    /// Nothing of the rectangle survived the intersection of its own
+    /// extent, the latched scissor, and the colour target.
+    ///
+    /// This is the *clipped-to-nothing* case, not the *overhangs* case: a
+    /// rectangle that merely straddles an edge is drawn, narrowed to the
+    /// surviving span. An empty result means the primitive is entirely
+    /// outside the admitted region, or the scissor is reversed/degenerate,
+    /// and both are worth naming rather than silently writing zero pixels
+    /// and reporting success. Carries both rects so the reader can tell
+    /// which of the two it is.
+    ScissoredAway {
+        key: ColorTargetKey,
+        rectangle: TargetRectangle,
+        scissor: RdpScissorRect,
     },
     /// No `SetTile`/`SetTileSize` was staged for the sampled tile at this
     /// texrect's own stream position, so there is no descriptor to sample
@@ -712,6 +960,15 @@ impl core::fmt::Display for TexrectExecutionError {
             Self::OutsideTarget { key, rectangle } => write!(
                 formatter,
                 "texture rectangle {rectangle:?} is not inside color target {key:?}"
+            ),
+            Self::ScissoredAway {
+                key,
+                rectangle,
+                scissor,
+            } => write!(
+                formatter,
+                "texture rectangle {rectangle:?} has no pixel surviving the scissor {scissor:?} \
+                 and color target {key:?}"
             ),
             Self::UnboundTile => formatter.write_str(
                 "execute_texture_rectangle requires a SetTile and SetTileSize staged for the \
@@ -1445,6 +1702,7 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     lut_mode: TextureLutMode,
     shading: TexrectShading,
     blend_registers: TexrectBlendRegisters,
+    scissor: RdpScissorRect,
     resident_bytes: &[u8],
     already_initialized: Option<TargetRectangle>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
@@ -1480,14 +1738,39 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     let format = key.format();
     let extent = key.extent();
     let rectangle = TargetRectangle::try_new(draw.left(), draw.top(), draw.width(), draw.height())?;
-    if draw.right() > extent.width() || draw.bottom() > extent.height() {
-        return Err(TexrectExecutionError::OutsideTarget { key, rectangle });
-    }
+    // **Clipped, not refused.** The RDP's scissor drives every span
+    // endpoint to the clip rect rather than rejecting the primitive --
+    // angrylion `rasterizer.c:2349-2363` (X) and `:2284-2305` (Y), against
+    // the rect `rdp_set_scissor` latches at `:2779-2784`. A rectangle that
+    // overhangs the framebuffer is routine content, and the previous
+    // `OutsideTarget` refusal here dropped all of it. See
+    // [`clip_texrect_extent`] for the precedence between the scissor and
+    // the target extent, and for what still refuses.
+    let clipped = clip_texrect_extent(
+        draw,
+        scissor,
+        extent.width(),
+        extent.height(),
+        key,
+        rectangle,
+    )?;
+    // The rectangle actually written, after clipping -- narrower than
+    // `rectangle` whenever the scissor or the target bit into it. This is
+    // what the journal is told about, because it is what the pixel loop
+    // below touches; claiming the unclipped rectangle would declare rows
+    // this call never writes.
+    let drawn = TargetRectangle::try_new(
+        draw.left() + clipped.first_column,
+        draw.top() + clipped.first_row,
+        clipped.column_limit - clipped.first_column,
+        clipped.row_limit - clipped.first_row,
+    )?;
     // Planned, not just bounds-checked: `plan_rows` is the target's own
     // row-planning authority and rejects the same out-of-bounds cases with
     // its own named error. Calling it keeps this executor and the fill
-    // executor on one row planner.
-    let _plan = candidate.plan_rows(rectangle)?;
+    // executor on one row planner. Handed the CLIPPED rectangle, which is
+    // the one whose rows are written.
+    let _plan = candidate.plan_rows(drawn)?;
 
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
     let full_len = (extent.pixels() as usize)
@@ -1536,9 +1819,18 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
         TmemFirstRowParity::Even
     };
 
-    for row in 0..draw.height() {
+    // The loop walks the CLIPPED offsets, but `t_at`/`s_at` are still
+    // indexed by the offset from the rectangle's own unclipped origin --
+    // that is the whole reason `clip_texrect_extent` returns offsets rather
+    // than a narrowed `TexrectDraw`. `rdp_tex_rect` loads the S/T origin and
+    // steps once from the unclipped command (`rasterizer.c:2657-2677`) and
+    // the edgewalker's clip touches only `majorx`/`minorx` (`:2349-2363`),
+    // so a clipped rectangle samples the same texel at a given screen pixel
+    // that an unclipped one would. Rebasing the ramp onto the clipped left
+    // edge would slide the texture sideways by the clipped amount.
+    for row in clipped.rows() {
         let t = draw.t_at(row);
-        for column in 0..draw.width() {
+        for column in clipped.columns() {
             let s = draw.s_at(column);
             // The one texel fetch. `sample_point` is `tmem/sample.rs`'s
             // existing sampler, monomorphized over the pending post-image
@@ -1620,7 +1912,12 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     // would overstate it for a texrect with no fill under it. The union is
     // the honest answer, and the caller supplies the other half rather than
     // this executor assuming one.
-    let claimed = union_rectangle(rectangle, already_initialized);
+    //
+    // `drawn`, not `rectangle`: the claim must be what this call actually
+    // wrote. A clipped texrect covers less than its command asked for, and
+    // claiming the unclipped rect would assert proof over pixels the
+    // scissor kept it away from.
+    let claimed = union_rectangle(drawn, already_initialized);
     Ok(CompletedColorTargetWrite::new_for_fill(
         key,
         candidate.generation(),
