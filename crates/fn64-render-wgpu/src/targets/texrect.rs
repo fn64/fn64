@@ -639,6 +639,19 @@ pub enum TexrectExecutionError {
         declared: (u32, u32),
         rasterized: (u32, u32),
     },
+    /// A pixel with non-zero subpixel coverage reported no covered subsample
+    /// to evaluate its attribute planes at.
+    ///
+    /// Unreachable while `pixel_coverage` and `attribute_sample` scan the
+    /// same subsamples in the same order, which they do. Named rather than
+    /// `expect`ed so a future divergence between the two refuses the
+    /// triangle instead of aborting the process -- and refuses rather than
+    /// falling back to the pixel centre, which would evaluate the shade
+    /// plane at a point the triangle does not cover.
+    TriangleAttributeSampleMissing {
+        column: u32,
+        row: u32,
+    },
     Target(TargetError),
 }
 
@@ -741,6 +754,11 @@ impl core::fmt::Display for TexrectExecutionError {
                 formatter,
                 "the raw triangle's scanline #{position} is declared at \
                  {declared:?} but rasterizes {rasterized:?} (start, len)"
+            ),
+            Self::TriangleAttributeSampleMissing { column, row } => write!(
+                formatter,
+                "raw-triangle pixel ({column}, {row}) has subpixel coverage but no covered \
+                 subsample to evaluate its attribute planes at"
             ),
             Self::ReservedAlphaCompare => formatter
                 .write_str("the texrect selected the reserved G_AC alpha-compare encoding 2"),
@@ -1058,18 +1076,30 @@ impl CombinerProgramSlice {
         !matches!(self, Self::FirstOfTwoCycles)
     }
 
-    fn admits_color(self, input: ColorInput) -> bool {
+    /// `shade_available` is `true` only for a SHADED raw triangle, whose
+    /// executor interpolates a real per-pixel shade colour from the
+    /// triangle's own shade coefficient planes. It is `false` for every
+    /// texrect and for every unshaded triangle, where a `Shade` selector
+    /// would combine against `base_inputs`' zeroed field -- the silent
+    /// substitution this whole admission exists to prevent.
+    fn admits_color(self, input: ColorInput, shade_available: bool) -> bool {
         if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
             return self.resolves_the_combined_selector();
+        }
+        if shade_available && matches!(input, ColorInput::Shade | ColorInput::ShadeAlpha) {
+            return true;
         }
         ADMITTED_COLOR_INPUTS
             .iter()
             .any(|admitted| core::mem::discriminant(admitted) == core::mem::discriminant(&input))
     }
 
-    fn admits_alpha(self, input: AlphaInput) -> bool {
+    fn admits_alpha(self, input: AlphaInput, shade_available: bool) -> bool {
         if matches!(input, AlphaInput::Combined) {
             return self.resolves_the_combined_selector();
+        }
+        if shade_available && matches!(input, AlphaInput::Shade) {
+            return true;
         }
         ADMITTED_ALPHA_INPUTS
             .iter()
@@ -1129,6 +1159,23 @@ impl TexrectShading {
         self,
         cycles: CombinerProgramCycles,
     ) -> Result<Self, TexrectExecutionError> {
+        // Texrects have no interpolated vertex colour, so `Shade` stays
+        // refused for them -- this preserves the texrect path exactly.
+        self.validate_combiner_program_with_shade(cycles, false)
+    }
+
+    /// [`Self::validate_combiner_program`], but told whether the caller can
+    /// supply a real per-pixel `Shade`.
+    ///
+    /// Only the SHADED raw-triangle executor passes `true`, and only because
+    /// it interpolates the value from the triangle's own shade coefficient
+    /// planes. Every other caller passes `false` and gets the identical
+    /// admission it had before this parameter existed.
+    pub fn validate_combiner_program_with_shade(
+        self,
+        cycles: CombinerProgramCycles,
+        shade_available: bool,
+    ) -> Result<Self, TexrectExecutionError> {
         let Self {
             combine,
             env_color,
@@ -1145,7 +1192,7 @@ impl TexrectShading {
                 ColorInputSlot::D,
             ] {
                 let input = combine.decode_color(slot, second_cycle);
-                if !slice.admits_color(input) {
+                if !slice.admits_color(input, shade_available) {
                     return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
                 }
                 // **Every selector that reads the register, not only the
@@ -1171,7 +1218,7 @@ impl TexrectShading {
                 AlphaInputSlot::D,
             ] {
                 let input = combine.decode_alpha(slot, second_cycle);
-                if !slice.admits_alpha(input) {
+                if !slice.admits_alpha(input, shade_available) {
                     return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
                 }
                 reads_env |= matches!(input, AlphaInput::Environment);
@@ -2136,9 +2183,18 @@ fn blend_texrect_fragment(
     row: u32,
 ) -> Result<[u8; 4], TexrectExecutionError> {
     let memory = state.other_mode.image_read_enabled().then_some(destination);
-    // `shade_alpha` is zero because this executor has no vertex-interpolated
-    // color; a cycle whose `A` selects `Shade` is refused before any pixel
-    // is produced (see `require_blendable_mode`), so the zero is never read.
+    // `shade_alpha` is zero, and it is never read: a blender cycle whose `A`
+    // selects `Shade` is refused by name before any pixel is produced (see
+    // `require_blendable_mode`/`UnsupportedBlendShadeAlpha`).
+    //
+    // The refusal, not the absence of a value, is what makes the zero safe.
+    // This mattered when the shaded raw-triangle executor landed: that
+    // executor DOES interpolate a per-pixel shade colour, so the old reason
+    // given here ("this executor has no vertex-interpolated color") stopped
+    // being true for one of its two callers while the conclusion stayed
+    // correct. Threading the triangle's real shade alpha through is the
+    // right widening when a blender program that reads it is admitted; until
+    // then the refusal above is the one that holds.
     // Exact on the admitted set, not a stand-in: see this function's own
     // doc. A hardcoded `true` would be wrong for the `AA_EN`-clear modes
     // `require_blendable_mode` admits, where the RDP bypasses the last

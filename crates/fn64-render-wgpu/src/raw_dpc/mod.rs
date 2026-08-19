@@ -1693,9 +1693,13 @@ fn plan_texture_rectangle(
     )
 }
 
-/// The narrowest raw triangle this backend can produce guest bytes for, and
-/// therefore the only one it declares a write for: **flat, opaque,
-/// untextured, unshaded, no depth**.
+/// The raw triangles this backend can produce guest bytes for, and
+/// therefore the only ones it declares a write for: **opaque, untextured,
+/// no depth plane** -- shaded or not.
+///
+/// Shaded was admitted after the executor gained per-pixel shade plane
+/// interpolation, in that order. Widening this predicate first would
+/// declare rows the executor cannot fill.
 ///
 /// This is an *admission*, not an approximation. A triangle outside the
 /// subset declares nothing and behaves exactly as it did before this
@@ -1711,7 +1715,7 @@ fn plan_texture_rectangle(
 /// never the other way round.
 fn raw_triangle_is_flat_opaque(triangle: &triangle::RawTriangle) -> bool {
     let flags = triangle.flags();
-    !flags.shaded() && !flags.textured() && !flags.depth()
+    !flags.textured() && !flags.depth()
 }
 
 /// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
@@ -5561,17 +5565,20 @@ mod tests {
     }
 
     #[test]
-    fn a_shaded_or_textured_or_depth_triangle_declares_no_write() {
-        // Everything outside the flat-opaque subset must declare nothing --
-        // declaring a row the CPU executor cannot fill would digest stale
-        // resident bytes into guest RDRAM.
-        for opcode in [0x09u8, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f] {
+    fn a_textured_or_depth_triangle_declares_no_write() {
+        // Textured and depth-bearing triangles are still outside the
+        // executor's subset -- there is no s/t/w perspective divide and no
+        // depth test -- so they must declare nothing. Declaring a row the
+        // executor cannot fill would digest stale resident bytes into guest
+        // RDRAM.
+        //
+        // Opcodes: bit 0 = depth, bit 1 = textured, bit 2 = shaded. So the
+        // refused set is every opcode with bit 0 or bit 1 set, and the
+        // ADMITTED set is exactly {0x08, 0x0c}.
+        for opcode in [0x09u8, 0x0a, 0x0b, 0x0d, 0x0e, 0x0f] {
             let mut words = flat_triangle_state_words(0);
             let mut triangle = flat_triangle_words(0);
             triangle[0] = word(0, opcode, 1 << 23 | 12);
-            // Word count straight off the opcode bits, per the RDP command
-            // summary: 4 base words, +8 shade (bit 2), +8 texture (bit 1),
-            // +2 depth (bit 0). Each 64-bit word is two u32 halves.
             let extra_words = 8 * u32::from(opcode & 0x4 != 0)
                 + 8 * u32::from(opcode & 0x2 != 0)
                 + 2 * u32::from(opcode & 0x1 != 0);
@@ -5584,6 +5591,31 @@ mod tests {
                 "opcode {opcode:#04x} declared a write it cannot fill"
             );
         }
+    }
+
+    #[test]
+    fn a_shaded_triangle_declares_the_same_per_row_run_a_flat_one_does() {
+        // Opcode 0x0c is flat's shaded sibling: identical edge coefficients
+        // plus eight shade words. The footprint is a function of the EDGE
+        // coefficients alone, so the declared run must be byte-identical to
+        // `a_flat_raw_triangle_declares_one_exact_access_per_covered_row`'s.
+        //
+        // This is what the executor's shade interpolation bought: 100% of
+        // the 826,056 raw triangles WM2000 issues are shaded (and textured),
+        // so a decoder that refuses shaded declares nothing for the entire
+        // ROM.
+        let mut words = flat_triangle_state_words(0);
+        let mut triangle = flat_triangle_words(0);
+        triangle[0] = word(0, 0x0c, 1 << 23 | 12);
+        // Eight shade coefficient words = sixteen u32 halves.
+        triangle.extend(core::iter::repeat_n(0u32, 16));
+        words.extend(triangle);
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses(),
+            decoded.submitted().packet().journal().accesses()
+        );
     }
 
     #[test]
