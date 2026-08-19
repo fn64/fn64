@@ -519,8 +519,8 @@ impl WgpuBackend {
             let tile_binding = draw.tile_binding.with_lut_mode(lut_mode);
             let blend_mode = BlendModeState {
                 other_mode: draw.other_mode,
-                blend_color_register: draw.blend_color.map_or([0u8; 4], |color| color.rgba8()),
-                fog_color: draw.fog_color.map_or([0u8; 4], |color| color.rgba8()),
+                blend_color_register: draw.blend_color.rgba8(),
+                fog_color: draw.fog_color.rgba8(),
             };
             let cycle_count = blend_mode.cycle_count();
             let cycle0 = blend_mode.cycle(0);
@@ -736,23 +736,23 @@ struct PlanCollector {
     /// in plan order. Mirrors `current_other_mode`/`current_combine`
     /// exactly, a third instance of the same seed-then-track pattern (card
     /// §4d).
-    current_blend_color: Option<Color4>,
+    current_blend_color: Color4,
     /// `G_SETENVCOLOR` current at the walk's current stream position --
     /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
     /// time (`Self::seeded`), then updated on every `SetEnvColor` command
     /// in plan order. Mirrors `current_blend_color`, but unconditionally
     /// tracked -- no `AlphaCompare` gate.
-    current_env_color: Option<Color4>,
+    current_env_color: Color4,
     /// `G_SETPRIMCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color` exactly.
-    current_prim_color: Option<PrimColor>,
+    current_prim_color: PrimColor,
     /// `G_SETFOGCOLOR` current at the walk's current stream position --
     /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
     /// time (`Self::seeded`), then updated on every `SetFogColor` command
     /// in plan order. Mirrors `current_env_color`/`current_prim_color`
     /// exactly. Needed by the production blend-cycle wiring's `Fog`
     /// selector.
-    current_fog_color: Option<Color4>,
+    current_fog_color: Color4,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -873,10 +873,10 @@ impl PlanCollector {
     fn seeded(
         other_mode: Option<OtherMode>,
         combine: Option<CombineParams>,
-        blend_color: Option<Color4>,
-        env_color: Option<Color4>,
-        prim_color: Option<PrimColor>,
-        fog_color: Option<Color4>,
+        blend_color: Color4,
+        env_color: Color4,
+        prim_color: PrimColor,
+        fog_color: Color4,
         color_image: Option<ColorImage>,
         tiles: [(
             Option<fn64_render::NeutralTileDescriptor>,
@@ -923,19 +923,19 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         Some(CombineParams::from_wire(combine.low, combine.high));
                 }
                 RdpStateCommand::SetBlendColor { color, .. } => {
-                    self.current_blend_color = Some(Color4::from_wire(color.value));
+                    self.current_blend_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetEnvColor { color, .. } => {
-                    self.current_env_color = Some(Color4::from_wire(color.value));
+                    self.current_env_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetPrimColor { color, .. } => {
-                    self.current_prim_color = Some(PrimColor::from_wire(
+                    self.current_prim_color = PrimColor::from_wire(
                         u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
                         color.color,
-                    ));
+                    );
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
-                    self.current_fog_color = Some(Color4::from_wire(color.value));
+                    self.current_fog_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetColorImage { image, .. } => {
                     self.current_color_image = Some(ColorImage::from_wire(
@@ -1035,11 +1035,15 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                              this pipeline (no frame-count uniform exists to seed it honestly; \
                              see fn64-alpha-compare-production-card.md \u{a7}2)"
                         ),
-                        AlphaCompare::Threshold => {
-                            self.current_blend_color
-                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?;
-                        }
-                        AlphaCompare::None => {}
+                        // `Threshold` compares the fragment alpha against
+                        // `G_SETBLENDCOLOR.a`. That register always holds a
+                        // value -- zero until the guest writes one -- so
+                        // there is nothing to refuse here: a plan with no
+                        // `SetBlendColor` compares against 0, and
+                        // `alpha >= 0` passes, which is what the reference
+                        // lane and RT64 both do. See `RdpState`'s
+                        // constant-color field doc for the citations.
+                        AlphaCompare::Threshold | AlphaCompare::None => {}
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
@@ -1303,7 +1307,16 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // its exact seed values are irrelevant.
         self.plan = core::mem::replace(
             plan_visitor,
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]),
+            PlanCollector::seeded(
+                None,
+                None,
+                Color4::default(),
+                Color4::default(),
+                PrimColor::default(),
+                Color4::default(),
+                None,
+                [(None, None); 8],
+            ),
         );
     }
 
@@ -2523,10 +2536,10 @@ fn execute_raw_dpc_inner(
     bound: BoundSubmittedRawDpc,
     durable_other_mode: Option<OtherMode>,
     durable_combine: Option<CombineParams>,
-    durable_blend_color: Option<Color4>,
-    durable_env_color: Option<Color4>,
-    durable_prim_color: Option<PrimColor>,
-    durable_fog_color: Option<Color4>,
+    durable_blend_color: Color4,
+    durable_env_color: Color4,
+    durable_prim_color: PrimColor,
+    durable_fog_color: Color4,
     durable_color_image: Option<ColorImage>,
     durable_tiles: [(
         Option<fn64_render::NeutralTileDescriptor>,

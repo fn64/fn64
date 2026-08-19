@@ -505,6 +505,16 @@ impl FillColor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color4(u32);
 
+/// The RDP color registers power up holding zero, so the `Default` of a
+/// color word is the all-zero wire value rather than an "absent" marker --
+/// see [`RdpState`]'s constant-color field doc for the reference-lane and
+/// RT64 citations.
+impl Default for Color4 {
+    fn default() -> Self {
+        Self::from_wire(0)
+    }
+}
+
 impl Color4 {
     pub(crate) const fn from_wire(value: u32) -> Self {
         Self(value)
@@ -598,6 +608,14 @@ pub struct PrimColor {
     color: Color4,
 }
 
+/// Zero LOD word and zero color word: `SetPrimColor`'s power-on state, the
+/// same all-zero `primColor` RT64 installs at `rt64_state.cpp:126`.
+impl Default for PrimColor {
+    fn default() -> Self {
+        Self::from_wire(0, 0)
+    }
+}
+
 impl PrimColor {
     pub(crate) const fn from_wire(w0: u32, w1: u32) -> Self {
         Self {
@@ -677,10 +695,32 @@ pub struct RdpState {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
-    blend_color: Option<Color4>,
-    fog_color: Option<Color4>,
+    /// The four RDP constant-color registers are **not** `Option`: they are
+    /// registers with a defined power-on value, not state that can be
+    /// absent. `Default` gives each one all-zero wire bytes.
+    ///
+    /// Both other lanes model them exactly this way.
+    /// `fn64-render-reference/src/gbi/state.rs:227` declares
+    /// `blend_color: [u8; 4]` and `:387` initializes it to `[0; 4]`;
+    /// RT64's own C++ (`src/hle/rt64_state.cpp:126-131`) zero-initializes
+    /// `primColor`, `envColor`, `fogColor` and `blendColor` to
+    /// `{0.0f, 0.0f, 0.0f, 0.0f}`, then overwrites each only when its
+    /// `DrawAttribute` is marked changed (`loadDrawState`, `:174-197`).
+    ///
+    /// Modelling them as `Option` invented an "unset" state the RDP has no
+    /// way to be in, and turned it into a refusal: a `Threshold`
+    /// alpha-compare against a never-written blend color aborted the plan
+    /// instead of comparing against zero. Note this is *not* the same
+    /// question as whether a value was invented -- zero here is the
+    /// register's real content, cited above, not a stand-in for a value
+    /// nobody knows.
+    ///
+    /// `RdpStateDelta` keeps its `Option`s: there, `None` means "this
+    /// packet issued no such command", which is a real distinction.
+    env_color: Color4,
+    prim_color: PrimColor,
+    blend_color: Color4,
+    fog_color: Color4,
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
     tmem: TmemState,
@@ -699,19 +739,19 @@ impl RdpState {
         self.fill_color
     }
 
-    pub const fn env_color(&self) -> Option<Color4> {
+    pub const fn env_color(&self) -> Color4 {
         self.env_color
     }
 
-    pub const fn prim_color(&self) -> Option<PrimColor> {
+    pub const fn prim_color(&self) -> PrimColor {
         self.prim_color
     }
 
-    pub const fn blend_color(&self) -> Option<Color4> {
+    pub const fn blend_color(&self) -> Color4 {
         self.blend_color
     }
 
-    pub const fn fog_color(&self) -> Option<Color4> {
+    pub const fn fog_color(&self) -> Color4 {
         self.fog_color
     }
 
@@ -757,16 +797,16 @@ impl RdpState {
             self.fill_color = Some(value);
         }
         if let Some(value) = delta.env_color {
-            self.env_color = Some(value);
+            self.env_color = value;
         }
         if let Some(value) = delta.prim_color {
-            self.prim_color = Some(value);
+            self.prim_color = value;
         }
         if let Some(value) = delta.blend_color {
-            self.blend_color = Some(value);
+            self.blend_color = value;
         }
         if let Some(value) = delta.fog_color {
-            self.fog_color = Some(value);
+            self.fog_color = value;
         }
         if let Some(value) = delta.prim_depth {
             self.prim_depth = Some(value);
@@ -899,19 +939,19 @@ impl StagedRdpState {
         self.state.fill_color()
     }
 
-    pub const fn env_color(&self) -> Option<Color4> {
+    pub const fn env_color(&self) -> Color4 {
         self.state.env_color()
     }
 
-    pub const fn prim_color(&self) -> Option<PrimColor> {
+    pub const fn prim_color(&self) -> PrimColor {
         self.state.prim_color()
     }
 
-    pub const fn blend_color(&self) -> Option<Color4> {
+    pub const fn blend_color(&self) -> Color4 {
         self.state.blend_color()
     }
 
-    pub const fn fog_color(&self) -> Option<Color4> {
+    pub const fn fog_color(&self) -> Color4 {
         self.state.fog_color()
     }
 
@@ -966,6 +1006,57 @@ impl StagedRdpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four RDP constant-color registers power up with defined contents,
+    /// so a program that never issues `SetBlendColor`/`SetEnvColor`/
+    /// `SetPrimColor`/`SetFogColor` still reads a real value -- zero.
+    ///
+    /// Both other lanes model exactly this. `fn64-render-reference`'s
+    /// `gbi/state.rs:227` declares `blend_color: [u8; 4]` (not an `Option`)
+    /// and `:387` initializes it to `[0; 4]`; RT64's own C++
+    /// (`src/hle/rt64_state.cpp:126-131`) zero-initializes `primColor`,
+    /// `envColor`, `fogColor` and `blendColor` to `{0,0,0,0}` and only
+    /// overwrites them on a change. Modelling the durable register as
+    /// "absent" invents a state the hardware does not have.
+    ///
+    /// Derived by hand, not from the constructor: an RDP color register is
+    /// four bytes of zero at power-on, so the packed wire word is
+    /// `0x0000_0000` and the alpha byte the `Threshold` comparator reads is
+    /// `0`.
+    #[test]
+    fn the_four_constant_color_registers_power_up_zeroed_rather_than_absent() {
+        let state = RdpState::default();
+        assert_eq!(state.blend_color(), Color4::from_wire(0));
+        assert_eq!(state.env_color(), Color4::from_wire(0));
+        assert_eq!(state.fog_color(), Color4::from_wire(0));
+        assert_eq!(state.prim_color(), PrimColor::from_wire(0, 0));
+        assert_eq!(
+            state.blend_color().rgba8()[3],
+            0,
+            "the power-on alpha byte is what a Threshold alpha-compare reads"
+        );
+    }
+
+    /// A written register must still win. Without this the previous test
+    /// could pass against a constant that ignores every `SetBlendColor`.
+    #[test]
+    fn a_written_constant_color_register_overrides_its_power_on_zero() {
+        let mut state = RdpState::default();
+        let mut delta = RdpStateDelta::default();
+        delta.set_blend_color(Color4::from_wire(0x1122_3344));
+        delta.set_env_color(Color4::from_wire(0x5566_7788));
+        delta.set_fog_color(Color4::from_wire(0x99aa_bbcc));
+        state.apply(&delta);
+        assert_eq!(state.blend_color(), Color4::from_wire(0x1122_3344));
+        assert_eq!(state.env_color(), Color4::from_wire(0x5566_7788));
+        assert_eq!(state.fog_color(), Color4::from_wire(0x99aa_bbcc));
+        assert_ne!(
+            state.blend_color(),
+            Color4::from_wire(0),
+            "a written register must differ from the power-on value, or this test cannot \
+             distinguish real tracking from a hardcoded zero"
+        );
+    }
 
     #[test]
     fn texture_lut_mode_decodes_all_four_wire_encodings_without_normalization() {
