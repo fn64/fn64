@@ -1100,4 +1100,221 @@ mod tests {
             "the frozen Even parity fails exactly one pixel per rectangle row"
         );
     }
+
+    // ---------------------------------------------------------------
+    // WM2000 walls 3/4/5: what the RDP does when a TLUT read is not the
+    // textbook shape.
+    //
+    // AUTHORITY, checked against the pinned RT64 port source
+    // `5473732a822a4423b5696e7cb18fecc425a59875`:
+    //
+    // * WALL 3 (`EnabledCiSourceOutsideLowHalf`). RT64
+    //   `src/shaders/TextureDecoder.hlsli:162-163` DOES restrict a
+    //   TLUT-enabled index source to the low half --
+    //   `addressMask = select_uint(or(isRgba32, usesTlut),
+    //   RDP_TMEM_MASK16, RDP_TMEM_MASK8)` with `RDP_TMEM_MASK16 = 0x7FF`
+    //   (`:15`). So the constraint is REAL and is NOT invented here. But
+    //   RT64 applies it as a MASK inside `implLoadTMEM` (`:17-25`:
+    //   `TMEM.Load(((finalAddress & maskAddress) | orAddress) & ...)`),
+    //   never as a refusal. Masking preserves the whole point of the
+    //   rule -- a TLUT-enabled index read can never reach the palette's
+    //   own half -- while matching hardware's wrap. This mirrors what
+    //   `rgba32_low_address` in this very file already does for the
+    //   other genuinely half-scoped format.
+    //
+    // * WALLS 4 and 5 (`NonCanonicalTlutEntry` / `IncompleteTlutEntry`).
+    //   RT64 reads exactly ONE lane: `TextureDecoder.hlsli:179` is
+    //   `loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8)`
+    //   over `#define loadTLUT(a) TMEM.Load(uint2((a) & RDP_TMEM_MASK8,
+    //   0))` (`:28`). Lanes 1..3 are never addressed, so RT64 can
+    //   neither observe nor refuse a non-quadricated word. The in-tree
+    //   reference lane agrees: `fn64-render-reference`
+    //   `src/gbi/state.rs:853-869` (`read_tlut`) reads two bytes at
+    //   `TMEM_HALF_BYTES + index * 8` and `+ 1` and stops.
+    //
+    //   The quadrication CONVENTION is still real on the write side --
+    //   RT64 `src/hle/rt64_rdp.cpp:368-397` (`loadWord<_, TLUT=true>`)
+    //   masks the RDRAM offset to `& 0x1` and stores all eight TMEM
+    //   bytes -- and this crate's `tmem/execute/load_tlut.rs` does the
+    //   same. What was wrong was promoting a WRITE convention into a
+    //   READ precondition, which this crate's own loader can then
+    //   violate: `load_tlut.rs`'s wrapping-base support (base 511
+    //   wrapping across the bank) writes exactly the unequal lanes the
+    //   reader refused.
+    //
+    //   The validity requirement is NOT dropped, only narrowed to the
+    //   two bytes actually read. Inventing an unloaded palette byte
+    //   stays refused, by the same `InvalidTexelByte` rule every other
+    //   read in this file obeys -- see
+    //   `an_unloaded_lane_zero_is_still_refused_by_name` below.
+
+    /// WALL 3, before/after pin. A CI8 tile under an enabled TLUT whose
+    /// index source walks to exactly `0x800` must WRAP into the low half
+    /// (RT64 `TextureDecoder.hlsli:162-163`), not refuse.
+    ///
+    /// The expected value is hand-derived, never read back from the
+    /// constant under test: `0x800 & 0x7ff == 0x000`, so the read must
+    /// land on byte `0x000`. That byte is written here as index `0x42`,
+    /// and entry `0x42` is written as `0xf801`, which the RGBA16 5/5/5/1
+    /// layout sends to `r=0b11111 g=0 b=0 a=1` -> `[0xff, 0, 0, 0xff]`.
+    /// A distinct index `0x11` is placed at `0x800` itself, so a reader
+    /// that failed to wrap and read the palette half as image data would
+    /// produce a *different, detectably wrong* color rather than
+    /// silently agreeing.
+    #[test]
+    fn an_enabled_tlut_ci_source_at_the_low_half_boundary_wraps_like_rt64() {
+        let subject = tile(ImageFormat::ColorIndex, PixelSize::Bits8, 256, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+
+        // tmem word 256 * 8 == 0x800 exactly: the first byte past the
+        // low half, which is the address the WM2000 run aborted on.
+        assert_eq!(u64::from(subject.tmem().get()) * 8, 0x800);
+
+        let mut source = SparseSource::new();
+        // Where the wrap must land.
+        source.write(0x000, 0x42);
+        source.write_quadricated_entry(0x42, 0xf801);
+        // A decoy at the unwrapped address, with its own distinct entry.
+        source.write(0x800, 0x11);
+        source.write_quadricated_entry(0x11, 0x07c1);
+
+        let decoded = read_texel(&source, subject, addressed, TextureLutMode::Rgba16)
+            .expect("a TLUT-enabled CI source at 0x800 wraps into the low half");
+        assert_eq!(
+            decoded.texel().rgba8888(),
+            [0xff, 0x00, 0x00, 0xff],
+            "the wrapped read must resolve index 0x42 at byte 0x000, not \
+             the decoy index 0x11 sitting at 0x800"
+        );
+    }
+
+    /// WALL 3's kept half. Masking must not turn into "no rule at all":
+    /// an RGBA32 tile based in the high half is a genuinely different
+    /// refusal (`Rgba32BaseOutsideLowHalf`) that RT64 also does not
+    /// share, and it stays exactly as it was. This is the mutation
+    /// guard on the arm that is KEPT.
+    #[test]
+    fn the_rgba32_high_half_base_refusal_is_untouched_by_the_ci_wrap() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        assert_eq!(
+            read_committed_texel(
+                &state,
+                tile(ImageFormat::Rgba, PixelSize::Bits32, 256, 0),
+                AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even),
+                TextureLutMode::Disabled,
+            ),
+            Err(PhysicalTexelReadError::Rgba32BaseOutsideLowHalf {
+                byte_address: 0x800,
+            })
+        );
+    }
+
+    /// WALL 4, before/after pin. A TLUT word whose lanes disagree must
+    /// resolve from LANE 0, exactly as RT64
+    /// `TextureDecoder.hlsli:179` and the reference's
+    /// `read_tlut` do.
+    ///
+    /// The lane pattern is WM2000's own measured one in shape --
+    /// three agreeing lanes and one foreign -- but the values are
+    /// chosen here so the expected color is hand-derivable and so that
+    /// reading ANY lane other than 0 gives a different answer.
+    /// Lane 0 is `0xf801` -> opaque red. Lane 3 is `0x07c1`, which is
+    /// `r=0 g=0b11111 b=0 a=1` -> opaque green, so a reader that took
+    /// the last lane would be caught.
+    #[test]
+    fn an_unequal_tlut_word_resolves_from_lane_zero_like_rt64() {
+        let subject = tile(ImageFormat::ColorIndex, PixelSize::Bits8, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+
+        let mut source = SparseSource::new();
+        source.write(0x000, 0x00);
+        // Entry 0 lives at 0x800. Hand-write lanes 0..2 as 0xf801 and
+        // lane 3 as 0x07c1, the three-quarters-consistent shape the
+        // WM2000 run reported (`[0100, 0100, 0100, 8f94]`).
+        for lane in 0..3_u16 {
+            source.write(0x800 + lane * 2, 0xf8);
+            source.write(0x800 + lane * 2 + 1, 0x01);
+        }
+        source.write(0x806, 0x07);
+        source.write(0x807, 0xc1);
+
+        let decoded = read_texel(&source, subject, addressed, TextureLutMode::Rgba16)
+            .expect("an unequal TLUT word resolves from lane 0");
+        assert_eq!(
+            decoded.texel().rgba8888(),
+            [0xff, 0x00, 0x00, 0xff],
+            "lane 0 (0xf801, opaque red) is the entry; lane 3's 0x07c1 \
+             (opaque green) must never be read"
+        );
+    }
+
+    /// WALL 5, before/after pin. A TLUT word with only its low four
+    /// bytes valid (`mask 0x0f`, the exact mask the WM2000 run
+    /// reported) has a VALID lane 0, so the read succeeds. RT64 and
+    /// the reference never address lanes 1..3, so their validity
+    /// cannot gate the read.
+    ///
+    /// Expected color hand-derived from `0xf801` as above.
+    #[test]
+    fn a_tlut_word_valid_only_in_its_low_four_bytes_still_reads() {
+        let subject = tile(ImageFormat::ColorIndex, PixelSize::Bits8, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+
+        let mut source = SparseSource::new();
+        source.write(0x000, 0x00);
+        // mask 0x0f: bytes 0..3 valid, 4..7 never written.
+        source.write(0x800, 0xf8);
+        source.write(0x801, 0x01);
+        source.write(0x802, 0xf8);
+        source.write(0x803, 0x01);
+
+        let decoded = read_texel(&source, subject, addressed, TextureLutMode::Rgba16)
+            .expect("lanes 1..3's validity is not addressed by the RDP");
+        assert_eq!(decoded.texel().rgba8888(), [0xff, 0x00, 0x00, 0xff]);
+    }
+
+    /// WALLS 4/5's kept half, and the mutation guard on the arm that
+    /// SURVIVES. Narrowing validity to lane 0 must not become "invent
+    /// missing palette bytes". A word whose lane 0 is itself unwritten
+    /// is still refused, and by the SAME `InvalidTexelByte` name every
+    /// other unloaded read in this file uses -- so the refusal cannot
+    /// have been quietly downgraded to a zero.
+    #[test]
+    fn an_unloaded_lane_zero_is_still_refused_by_name() {
+        let subject = tile(ImageFormat::ColorIndex, PixelSize::Bits8, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+
+        // Nothing at all in the palette.
+        let mut nothing = SparseSource::new();
+        nothing.write(0x000, 0x00);
+        assert_eq!(
+            read_texel(&nothing, subject, addressed, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x800 })
+        );
+
+        // Lanes 1..3 fully written, lane 0 missing: the inverse of the
+        // wall-5 fixture. If validity had merely been widened to
+        // "any lane will do", this would wrongly succeed.
+        let mut tail_only = SparseSource::new();
+        tail_only.write(0x000, 0x00);
+        for lane in 1..4_u16 {
+            tail_only.write(0x800 + lane * 2, 0xf8);
+            tail_only.write(0x800 + lane * 2 + 1, 0x01);
+        }
+        assert_eq!(
+            read_texel(&tail_only, subject, addressed, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x800 })
+        );
+
+        // Lane 0's HIGH byte written but its low byte missing: the
+        // half-lane case, which must refuse at 0x801 specifically.
+        let mut half_lane = SparseSource::new();
+        half_lane.write(0x000, 0x00);
+        half_lane.write(0x800, 0xf8);
+        assert_eq!(
+            read_texel(&half_lane, subject, addressed, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x801 })
+        );
+    }
+
 }
