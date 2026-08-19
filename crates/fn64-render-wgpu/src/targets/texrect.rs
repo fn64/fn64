@@ -851,29 +851,70 @@ pub struct TexrectShading {
     prim_color: Option<PrimColor>,
 }
 
-/// Every color selector this executor evaluates. Measured against WM2000's
-/// entire boot-through-attract window (`docs/RT64-WM2000-CYCLE-MODES.md`
-/// §2): its 2,520 texrects run exactly two programs, and between them they
-/// read only these five. Everything else is refused by name so a future
-/// title gets a loud error instead of wrong pixels -- `Shade` in
-/// particular, which this executor has no vertex-interpolated color to
-/// supply and would otherwise silently combine against zero.
-const ADMITTED_COLOR_INPUTS: [ColorInput; 5] = [
+/// Every color selector this executor evaluates.
+///
+/// The first five were measured against WM2000's entire
+/// boot-through-attract window (`docs/RT64-WM2000-CYCLE-MODES.md` §2): its
+/// 2,520 texrects run exactly two programs, and between them they read only
+/// those. Everything else is refused by name so a future title gets a loud
+/// error instead of wrong pixels -- `Shade` in particular, which this
+/// executor has no vertex-interpolated color to supply and would otherwise
+/// silently combine against zero.
+///
+/// **The last four are admitted on a different ground, and the distinction
+/// is the whole point of this comment.** They are not measured in WM2000's
+/// window; they are admitted because each resolves to a component of a
+/// value this executor *already sources from a real wire register*, so
+/// evaluating them invents nothing:
+///
+/// - `Texel0Alpha` is `texel0[3]`, the alpha of the very texel the sampling
+///   loop decodes for `Texel0` (`combiner.rs`'s `resolve_color_input`).
+/// - `PrimitiveAlpha` is `prim_color[3]` and `EnvAlpha` is `env_color[3]`.
+///   Both registers are already required to be set -- a program reading
+///   them with no wire command staged is
+///   [`TexrectExecutionError::UnsetConstantRegister`], not a black default.
+/// - `PrimLodFrac` is `PrimColor::lod().lod_frac_normalized()`, wired into
+///   `CombinerInputs` by `combiner_inputs_from_fragment_registers` from the
+///   same `SetPrimColor` word that supplies `Primitive`.
+///
+/// `docs/RT64-LANE-DIVERGENCES.md` D4 lists twelve selectors this executor
+/// refused while `crate::combiner` implements all of them, and scores the
+/// gap reference-correct. Four is the subset that is a *wiring* gap. The
+/// rest stay refused, and for a reason the audit's framing does not
+/// separate out: `crate::combiner` implementing a selector means it can
+/// read the corresponding `CombinerInputs` field, not that this executor
+/// can fill it. `LodFraction`, `Noise`, `K4`, `K5`, `KeyCenter` and
+/// `KeyScale` all read fields [`TexrectShading::base_inputs`] leaves at
+/// zero -- there is no `SetConvert`/`SetKey` plumbing, no LOD stage, and no
+/// noise authority (the same one [`TexrectNoiseStage`] refuses by name).
+/// Admitting them would combine against an invented zero, which is exactly
+/// the failure the `Shade` refusal exists to prevent. `Texel1` and
+/// `Texel1Alpha` stay refused because a rectangle binds one tile, which is
+/// the reference's own reason (`backend/validate.rs:479-483`).
+const ADMITTED_COLOR_INPUTS: [ColorInput; 9] = [
     ColorInput::Texel0,
     ColorInput::Primitive,
     ColorInput::Environment,
     ColorInput::One,
     ColorInput::Zero,
+    ColorInput::Texel0Alpha,
+    ColorInput::PrimitiveAlpha,
+    ColorInput::EnvAlpha,
+    ColorInput::PrimLodFrac,
 ];
 
 /// [`ADMITTED_COLOR_INPUTS`]' alpha counterpart, same measurement and same
-/// rationale.
-const ADMITTED_ALPHA_INPUTS: [AlphaInput; 5] = [
+/// rationale -- including the register-backed widening, which for the alpha
+/// selectors adds only `PrimLodFrac`. The alpha enum has no `*Alpha`
+/// variants: an alpha selector already resolves to a scalar, so
+/// `AlphaInput::Primitive` *is* `prim_color[3]`.
+const ADMITTED_ALPHA_INPUTS: [AlphaInput; 6] = [
     AlphaInput::Texel0,
     AlphaInput::Primitive,
     AlphaInput::Environment,
     AlphaInput::One,
     AlphaInput::Zero,
+    AlphaInput::PrimLodFrac,
 ];
 
 /// Which combiner bitfield slices a program's cycle mode actually
@@ -1027,8 +1068,21 @@ impl TexrectShading {
                 if !slice.admits_color(input) {
                     return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
                 }
-                reads_env |= matches!(input, ColorInput::Environment);
-                reads_prim |= matches!(input, ColorInput::Primitive);
+                // **Every selector that reads the register, not only the
+                // one named after it.** `EnvAlpha` is `env_color[3]`, and
+                // `PrimitiveAlpha`/`PrimLodFrac` are `prim_color[3]` and
+                // `PrimColor::lod()` -- all three come from the same wire
+                // word as the plain variant. Matching only the plain
+                // variant would let a program reading `EnvAlpha` with no
+                // `SetEnvColor` staged fall through to `base_inputs`'
+                // `unwrap_or(Color4::from_wire(0))` and silently combine
+                // against a black default, which is the exact substitution
+                // `UnsetConstantRegister` exists to prevent.
+                reads_env |= matches!(input, ColorInput::Environment | ColorInput::EnvAlpha);
+                reads_prim |= matches!(
+                    input,
+                    ColorInput::Primitive | ColorInput::PrimitiveAlpha | ColorInput::PrimLodFrac
+                );
             }
             for slot in [
                 AlphaInputSlot::A,
@@ -1041,7 +1095,8 @@ impl TexrectShading {
                     return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
                 }
                 reads_env |= matches!(input, AlphaInput::Environment);
-                reads_prim |= matches!(input, AlphaInput::Primitive);
+                reads_prim |=
+                    matches!(input, AlphaInput::Primitive | AlphaInput::PrimLodFrac);
             }
         }
         if reads_env && env_color.is_none() {
@@ -2921,6 +2976,172 @@ mod one_cycle_tests {
                 );
             }
         }
+    }
+
+    /// **D4, the register-backed widening.** Four color selectors and one
+    /// alpha selector this executor refused resolve to components of values
+    /// it already sources from real wire registers, so evaluating them
+    /// invents nothing.
+    ///
+    /// `docs/RT64-LANE-DIVERGENCES.md` D4 scores twelve refused selectors
+    /// reference-correct on the ground that `crate::combiner` implements
+    /// every one of them. That is true and it is not sufficient: the
+    /// combiner implementing a selector means it can *read* a
+    /// `CombinerInputs` field, not that this executor can *fill* it. This
+    /// test separates the two, admitting exactly the register-backed subset
+    /// and pinning the rest as still-refused.
+    ///
+    /// Expectations are hand-derived from `combiner.rs`'s
+    /// `resolve_color_input`/`resolve_alpha_input` and from
+    /// `combiner_inputs_from_fragment_registers`, and the wire indices are
+    /// found by asking the decoder rather than transcribed -- so a decode
+    /// table change moves the probe instead of silently testing the wrong
+    /// selector. Deliberately does NOT consult `ADMITTED_COLOR_INPUTS`, the
+    /// way the exhaustive sweep above does: a test that derives its
+    /// expectation from the constant under test cannot fail when that
+    /// constant changes, which is why the sweep stayed green across this
+    /// widening.
+    #[test]
+    fn register_backed_selectors_are_admitted_and_invented_ones_are_not() {
+        // Find a (slot, wire index) pair decoding to `target`. Slot C is
+        // the five-bit slot reaching most extended selectors, but not all:
+        // `Noise` is slot-A only, and slot A is four bits. Ask the decoder
+        // which slot can express the selector rather than assuming one.
+        let color_probe_for = |target: ColorInput| -> (ColorInputSlot, CombineParams) {
+            for index in 0u32..32 {
+                let params = pack_second_cycle([1, 1, index, 1], [7, 7, 7, 7]);
+                if core::mem::discriminant(&params.decode_color(ColorInputSlot::C, true))
+                    == core::mem::discriminant(&target)
+                {
+                    return (ColorInputSlot::C, params);
+                }
+            }
+            // Slots A, B and D are four-bit and reach different subsets:
+            // `Noise` is slot-A only and `K4` is slot-B only. Try each.
+            for index in 0u32..16 {
+                for (slot, params) in [
+                    (
+                        ColorInputSlot::A,
+                        pack_second_cycle([index, 1, 16, 1], [7, 7, 7, 7]),
+                    ),
+                    (
+                        ColorInputSlot::B,
+                        pack_second_cycle([1, index, 16, 1], [7, 7, 7, 7]),
+                    ),
+                    (
+                        ColorInputSlot::D,
+                        pack_second_cycle([1, 1, 16, index], [7, 7, 7, 7]),
+                    ),
+                ] {
+                    if core::mem::discriminant(&params.decode_color(slot, true))
+                        == core::mem::discriminant(&target)
+                    {
+                        return (slot, params);
+                    }
+                }
+            }
+            panic!("no color wire index decodes to {target:?}")
+        };
+        let alpha_index_for = |target: AlphaInput| -> u32 {
+            (0u32..8)
+                .find(|index| {
+                    let params = pack_second_cycle([1, 1, 16, 7], [7, 7, *index, 7]);
+                    core::mem::discriminant(&params.decode_alpha(AlphaInputSlot::C, true))
+                        == core::mem::discriminant(&target)
+                })
+                .unwrap_or_else(|| panic!("no slot-C alpha wire index decodes to {target:?}"))
+        };
+
+        let shading = |params| {
+            TexrectShading::new(
+                params,
+                Some(Color4::from_wire(ENV_WIRE)),
+                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            )
+            .validate_one_cycle()
+        };
+
+        // ADMITTED: each reads a component of a register this executor
+        // already sources. Before this widening every one of these was
+        // `UnsupportedColorInput`.
+        for target in [
+            ColorInput::Texel0Alpha,
+            ColorInput::PrimitiveAlpha,
+            ColorInput::EnvAlpha,
+            ColorInput::PrimLodFrac,
+        ] {
+            let (slot, params) = color_probe_for(target);
+            assert!(
+                shading(params).is_ok(),
+                "{target:?} (via {slot:?}) reads a register this executor \
+                 already supplies and must be admitted"
+            );
+        }
+        let index = alpha_index_for(AlphaInput::PrimLodFrac);
+        let params = pack_second_cycle([1, 1, 16, 7], [7, 7, index, 7]);
+        assert!(
+            shading(params).is_ok(),
+            "AlphaInput::PrimLodFrac (slot-C index {index}) comes from the \
+             same SetPrimColor word as Primitive and must be admitted"
+        );
+
+        // STILL REFUSED: each reads a `base_inputs` field left at zero.
+        // Admitting these would combine against an invented value, which is
+        // the failure the Shade refusal exists to prevent.
+        for target in [
+            ColorInput::LodFraction,
+            ColorInput::Noise,
+            ColorInput::K4,
+            ColorInput::K5,
+            ColorInput::KeyCenter,
+            ColorInput::KeyScale,
+            ColorInput::Texel1,
+            ColorInput::Texel1Alpha,
+            ColorInput::Shade,
+            ColorInput::ShadeAlpha,
+        ] {
+            let (slot, params) = color_probe_for(target);
+            assert_eq!(
+                shading(params),
+                Err(TexrectExecutionError::UnsupportedColorInput {
+                    slot,
+                    input: target,
+                }),
+                "{target:?} (via {slot:?}) reads a zeroed field and must \
+                 stay refused by name"
+            );
+        }
+
+        // **The newly admitted register readers are covered by the unset
+        // gate too.** Widening the admitted set without widening
+        // `reads_env`/`reads_prim` would let a program reading `EnvAlpha`
+        // with no SetEnvColor staged fall through to `base_inputs`'
+        // `unwrap_or(Color4::from_wire(0))` and combine against black --
+        // exactly the substitution `UnsetConstantRegister` exists to stop.
+        for (target, register) in [
+            (ColorInput::EnvAlpha, TexrectConstantRegister::Environment),
+            (
+                ColorInput::PrimitiveAlpha,
+                TexrectConstantRegister::Primitive,
+            ),
+            (ColorInput::PrimLodFrac, TexrectConstantRegister::Primitive),
+        ] {
+            let (_, params) = color_probe_for(target);
+            assert_eq!(
+                TexrectShading::new(params, None, None).validate_one_cycle(),
+                Err(TexrectExecutionError::UnsetConstantRegister { register }),
+                "{target:?} reads {register:?}, so an unset register must be \
+                 refused rather than defaulted to black"
+            );
+        }
+        let index = alpha_index_for(AlphaInput::PrimLodFrac);
+        let params = pack_second_cycle([1, 1, 16, 7], [7, 7, index, 7]);
+        assert_eq!(
+            TexrectShading::new(params, None, None).validate_one_cycle(),
+            Err(TexrectExecutionError::UnsetConstantRegister {
+                register: TexrectConstantRegister::Primitive,
+            })
+        );
     }
 
     /// **A program reading an unset constant register is refused**, and
