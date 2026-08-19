@@ -155,3 +155,78 @@ ports 1-3.
 
 **So the plateau is not an input-delivery defect.** A is reaching the guest,
 in the right place, in the right format, every time it is pressed.
+
+## CONFIRMED: A is delivered during the plateau and the guest refuses it
+
+The same watch, inside the plateau (state 18, entered at swap 2102):
+
+| swap | `D_8011C37E` | `D_80095186` | `D_8003DD04` |
+|---|---|---|---|
+| 2102 | `0x8000` | `0x8000` | 17 -> **18** |
+| **2202** | **`0x8000`** | **`0x8000`** | **still 18** |
+
+At swap 2202 port 0's pressed word carries A exactly as it did at 1202, 1302,
+1402, ... 2002, every one of which advanced the screen. The screen does not
+move. **The press is delivered and refused.**
+
+## CONFIRMED: why it is refused -- the menu graph is data-driven
+
+`func_801261D4` (`0x801261D4`) is the state machine's epilogue, and it is
+where every one of the eight advancing transitions actually happened:
+
+```
+801261D4  bgez $s1, .L80126608    # handler returned >= 0 -> no transition
+801261DC  lhu  $v1, D_8011C37E    # else read the pressed word
+801261E4  andi $v0, $v1, 0x9000   # A (0x8000) | START (0x1000)
+801261E8  beqz -> .L80126384      # neither pressed -> done
+801261F0  lw   $v0, 0x64($s2)
+801261F4  lh   $a1, 0x12($v0)     # the menu descriptor's NEXT-SCREEN field
+801261F8  bltz $a1, .L80126384    # <-- NEGATIVE => the press is DISCARDED
+...
+.L80126218:                       # the A path
+80126258  sh   $v1, D_8016EC24    # push: menu depth += 1
+80126270  sh   $v0, D_8016EB78[]  # push: remember the screen we came from
+80126280  lw   $v0, 0x64($s2)
+80126284  lh   $s1, 0x12($v0)     # the next screen id comes from THE SAME field
+```
+
+So WM2000's menu graph is not coded per screen -- it is **read out of a
+descriptor at `$s2->0x64`, field `+0x12`**, and the same field both gates the
+press (`bltz` at `0x801261F8`) and supplies the destination
+(`0x80126284`). `func_80126288` then decodes it: `< 0x23` is a literal screen
+id, otherwise the `0x7F00` bits pick an action.
+
+Note that state 15's arm (`0x80126010`) compares this very field against
+`0x41C` before advancing, and state 18's own arm reaches
+`func_801456C8` -- the four-player ready check -- every frame, which returns
+`-1` when nobody is ready and hands control to exactly this epilogue.
+
+## What this makes the plateau
+
+**HYPOTHESIS** (consistent with everything measured, not yet proven): state 18
+is the "waiting for players to be ready" screen, its descriptor's `+0x12`
+field is negative or names an action rather than a screen, and the transition
+out of it is meant to be driven by `func_801456C8` finding a *ready* player
+rather than by the epilogue's generic A handling. On a real console with the
+same single controller, the same code would have to reach the same decision --
+so the interesting question is which input `func_801456C8` accepts as "ready"
+that a bare A press is not.
+
+**What is ruled out, with measurements:** it is not input delivery (A reaches
+`D_80095186` in the plateau), not the `D_80161FF8` countdown (the census shows
+the guest clears it every frame), not a second controller (431 byte-identical
+frames, prior card), not the analog stick (identical gfx rate and frames), and
+not a recompiler trap (0 traps, 0 panics across every run here).
+
+**No fn64 defect has been demonstrated.** Every fn64 mechanism this path
+depends on -- the PIF controller-read block, `osContGetReadData`'s `errno`
+discipline and swizzle, the per-port stride-12 array the game builds from it,
+the state machine's own dispatch -- was measured working. That is a real
+result: it moves the remaining question from "what is fn64 failing to model"
+to "what does this screen actually want", and the next probe is a watch on
+`$s2->0x64 + 0x12` itself.
+
+## No match was reached
+
+The furthest state reached remains the two-wrestler versus screen. The game
+walks eight menu states on scripted A presses and stops at state 18.
