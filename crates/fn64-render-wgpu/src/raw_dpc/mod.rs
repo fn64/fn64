@@ -213,19 +213,24 @@ pub enum RawDpcCommandKind {
         variant: u8,
     },
     SetOtherMode(OtherMode),
-    /// `G_SETSCISSOR` (`0x2d`), **tracked state only**.
+    /// `G_SETSCISSOR` (`0x2d`), **staged RDP state**.
     ///
     /// Carries the rect exactly as
     /// [`crate::rt64_gbi_rdp_decode::decode_set_scissor`] -- the pinned
-    /// RT64 port, reused verbatim rather than re-derived -- reads it. This
-    /// variant deliberately does **not** stage into
-    /// [`RdpState`]/[`RdpStateDelta`] the way every other `Set*` kind here
-    /// does: no draw, clip, or bounds computation in this crate reads a
-    /// scissor rect today (`production.rs`'s viewport is an identity
-    /// mapping; `texture_rectangle.rs` performs no scissor intersection),
-    /// and keeping the value out of the staged state is the structural
-    /// guarantee that admitting the opcode cannot move a pixel. Applying
-    /// the rect is separate, later work.
+    /// RT64 port, reused verbatim rather than re-derived -- reads it, and
+    /// stages into [`RdpState`]/[`RdpStateDelta`] like every other `Set*`
+    /// kind here, as a [`crate::targets::RdpScissorRect`] in the same
+    /// quarter-pixel units the wire carries.
+    ///
+    /// It was previously tracked-only, and this doc previously claimed
+    /// "no draw, clip, or bounds computation in this crate reads a scissor
+    /// rect today". That was accurate when written, and is precisely why a
+    /// texrect overhanging the framebuffer was refused outright instead of
+    /// clipped. `execute_texture_rectangle` now clips against this rect the
+    /// way the RDP does (angrylion `rasterizer.c:2349-2363` for X,
+    /// `:2284-2305` for Y), so the value has to survive into durable state:
+    /// a display list commonly sets the scissor once per frame and then
+    /// submits several packets under it.
     SetScissor(crate::rt64_gbi_rdp_decode::SetScissorDecoded),
     SetColorImage(ColorImage),
     SetFillColor(FillColor),
@@ -1252,11 +1257,38 @@ fn decode_stream(
                 // none is applied, matching how `SET_COMBINE` below passes
                 // `w0` unmasked.
                 //
-                // No `delta.set_*`/`state.apply` call: this kind is tracked,
-                // never staged. See `RawDpcCommandKind::SetScissor`.
-                RawDpcCommandKind::SetScissor(crate::rt64_gbi_rdp_decode::decode_set_scissor(
-                    w0, w1,
-                ))
+                // **Staged now, not merely tracked.** It used to be
+                // tracked-only, on the reasoning that nothing in this crate
+                // read a scissor rect -- true when written, and no longer
+                // true: `execute_texture_rectangle` clips against it (see
+                // `targets::clip_texrect_extent` and angrylion
+                // `rasterizer.c:2349-2363`), so keeping it out of `RdpState`
+                // would silently unscissor every packet that inherits the
+                // rect from an earlier one.
+                //
+                // Latched in the decoder's own quarter-pixel wire units,
+                // matching `rdp_set_scissor` (angrylion
+                // `rasterizer.c:2779-2784`), which stores the four
+                // twelve-bit fields with no rescale.
+                let decoded = crate::rt64_gbi_rdp_decode::decode_set_scissor(w0, w1);
+                // `p0`/`p1` mask to twelve bits and never sign-extend, so
+                // every coordinate is in `0..=4095` and fits a `u16`. The
+                // `expect`s are loud traps on that invariant rather than
+                // silent `as` truncations, matching `neutral_scissor`'s own
+                // treatment of the identical decode.
+                let quarter = |value: i32, field: &str| {
+                    u16::try_from(value)
+                        .unwrap_or_else(|_| panic!("SetScissor {field} is a 12-bit field: {value}"))
+                };
+                delta.set_scissor(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    decoded.mode,
+                    quarter(decoded.ulx, "ulx"),
+                    quarter(decoded.uly, "uly"),
+                    quarter(decoded.lrx, "lrx"),
+                    quarter(decoded.lry, "lry"),
+                ));
+                state.apply(delta);
+                RawDpcCommandKind::SetScissor(decoded)
             }
             SET_PRIM_DEPTH => {
                 let value = PrimDepth::from_wire(w1);

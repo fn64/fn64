@@ -742,6 +742,21 @@ pub struct RdpState {
     fog_color: Color4,
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
+    /// `G_SETSCISSOR`'s latched clip rect, in the quarter-pixel wire units
+    /// angrylion's `rdp_set_scissor` latches (`rasterizer.c:2779-2784`).
+    ///
+    /// **Durable across packets, like every other `Set*` register here.**
+    /// A display list that sets the scissor once at the top of a frame and
+    /// then submits several packets expects the later packets to be
+    /// scissored too; keeping this per-packet would silently unscissor
+    /// everything after the first.
+    ///
+    /// `Option` rather than a defaulted rect for the reason the doc on
+    /// [`crate::targets::RdpScissorRect`]'s consumer gives: the honest
+    /// default is the colour target's extent, and this struct is not where
+    /// the extent is known. `None` means no `SetScissor` has been seen and
+    /// the consumer supplies its own widest bound.
+    scissor: Option<crate::targets::RdpScissorRect>,
     tmem: TmemState,
     /// The HOST-configured colour-target height, in scanlines.
     ///
@@ -807,6 +822,10 @@ impl RdpState {
         self.fog_color
     }
 
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.scissor
+    }
+
     pub const fn prim_depth(&self) -> Option<PrimDepth> {
         self.prim_depth
     }
@@ -825,6 +844,10 @@ impl RdpState {
 
     pub(crate) fn fork_for_decode(&self) -> Self {
         Self {
+            // Forked, not dropped: a scissor latched by an earlier packet
+            // still governs this one, so a fork that reset it would
+            // unscissor everything after the packet that set it.
+            scissor: self.scissor,
             other_mode: self.other_mode,
             color_image: self.color_image,
             fill_color: self.fill_color,
@@ -870,6 +893,9 @@ impl RdpState {
         if let Some(value) = delta.combine {
             self.combine = Some(value);
         }
+        if let Some(value) = delta.scissor {
+            self.scissor = Some(value);
+        }
         if let Some(value) = &delta.tmem {
             self.tmem = value.clone();
         }
@@ -887,6 +913,10 @@ pub struct RdpStateDelta {
     fog_color: Option<Color4>,
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
+    /// `None` here means "this packet issued no `SetScissor`", which is a
+    /// real distinction from `RdpState`'s own `None` ("none has ever been
+    /// issued") -- the same split every other field in this struct makes.
+    scissor: Option<crate::targets::RdpScissorRect>,
     tmem: Option<TmemState>,
 }
 
@@ -925,6 +955,14 @@ impl RdpStateDelta {
 
     pub const fn combine(&self) -> Option<CombineParams> {
         self.combine
+    }
+
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.scissor
+    }
+
+    pub(crate) fn set_scissor(&mut self, value: crate::targets::RdpScissorRect) {
+        self.scissor = Some(value);
     }
 
     pub const fn tmem(&self) -> Option<&TmemState> {
