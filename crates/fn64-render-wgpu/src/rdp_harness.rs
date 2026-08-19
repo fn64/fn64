@@ -327,9 +327,15 @@ impl StagedTexture {
         // `width`-texel tile's high S is `(width - 1) << 2`. Off by one here
         // clamps the last column onto its neighbour -- visible only at the
         // tile's own right edge, which is why a fixture must sample there.
+        // LOW S/T live in w0 (bits 23:12 and 11:0), HIGH S/T in w1 at the
+        // same two positions -- all four in 10.2 fixed point. The high T is
+        // measured from the low one, so a tile with `low_t = n` spans rows
+        // `n ..= n + height - 1`.
         words.extend([
-            word(SET_TILE_SIZE, 0),
-            self.tile << 24 | ((self.width - 1) << 2) << 12 | ((self.height - 1) << 2),
+            word(SET_TILE_SIZE, self.low_t << 2),
+            self.tile << 24
+                | ((self.width - 1) << 2) << 12
+                | ((self.low_t + self.height - 1) << 2),
         ]);
         words.extend([word(LOAD_SYNC, 0), 0]);
         // `LoadBlock`'s texel count field is INCLUSIVE of the last texel, so
@@ -388,6 +394,11 @@ pub(crate) struct StagedTexture {
     /// would clobber each other, making "sampled the wrong tile"
     /// indistinguishable from "the second load overwrote the first".
     tmem_word_address: u32,
+    /// The tile's LOW T coordinate, in whole texels. Its PARITY decides which
+    /// TMEM rows carry the XOR4 bank exchange, so an odd origin is the only
+    /// shape that can distinguish a real parity derivation from a frozen
+    /// `Even` -- and WM2000's own measured sprite-strip tile has `low_t` 47.
+    low_t: u32,
     /// How many of the packet's triangles this load is emitted AFTER. Zero
     /// puts it before every draw; `n` puts it between triangle `n-1` and
     /// triangle `n`.
@@ -515,8 +526,20 @@ impl Rdp {
             height,
             texels,
             tmem_word_address,
+            low_t: 0,
             after_triangles,
         });
+        self
+    }
+
+    /// Gives the LAST staged texture an odd low-T origin, shifting its rows
+    /// down by `low_t` texels and -- the point -- flipping the parity of the
+    /// XOR4 bank exchange the reader must apply.
+    pub(crate) fn with_low_t(mut self, low_t: u32) -> Self {
+        self.textures
+            .last_mut()
+            .expect("with_low_t follows a staged texture")
+            .low_t = low_t;
         self
     }
 

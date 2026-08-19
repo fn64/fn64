@@ -846,3 +846,73 @@ fn an_untextured_triangle_reading_texel0_is_refused() {
         "an untextured triangle reading Texel0 must refuse, got {result:?}"
     );
 }
+
+/// A TEXTURED (opcode 0x0a) twin of [`box_triangle`]: identical edges, plus
+/// eight zeroed texture coefficient words. Decoded through the REAL decoder,
+/// so the flag bits come from the opcode rather than being asserted.
+fn textured_box_triangle() -> RawTriangle {
+    let w0 = (1u32 << 23) | ((3u32 << 2) & 0xffff);
+    let w1 = ((3u32 << 2) << 16) | 0;
+    let mut bytes = Vec::with_capacity(64);
+    for word in [
+        w0,
+        w1,
+        (6u32 << 16),
+        0,
+        (2u32 << 16),
+        0,
+        (6u32 << 16),
+        0,
+    ] {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    // Eight coefficient words = sixteen u32 halves, all zero. The VALUES do
+    // not matter here: this fixture exists to carry the texture FLAG.
+    bytes.extend(core::iter::repeat_n(0u8, 64));
+    RawTriangle::decode(0x0a, &bytes).expect("a textured triangle is 96 bytes")
+}
+
+/// **The opcode/binding equality guard, exercised at the only level that can
+/// reach it.**
+///
+/// `execute_scheduled_raw_triangle` builds the binding FROM `flags().
+/// textured()`, so the production caller cannot present a mismatch and no
+/// end-to-end fixture can reach this arm -- a mutant disabling the guard
+/// survived the entire suite until this test existed.
+///
+/// The guard is still worth keeping rather than deleting: it is what stops a
+/// future caller from combining a textured triangle against a fabricated zero
+/// texel, which would be a silently wrong picture rather than a refusal --
+/// the defect class this crate has already shipped once.
+#[test]
+fn a_textured_triangle_without_a_tmem_binding_is_refused_by_name() {
+    let triangle = textured_box_triangle();
+    assert!(
+        triangle.flags().textured(),
+        "the fixture must actually carry the texture flag for this test to mean anything"
+    );
+    let key = key_at(8, 4);
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let declared = declared_accesses(key, &triangle, Some(3));
+    let result = execute_raw_triangle(
+        &candidate,
+        one_cycle_other_mode(),
+        &triangle,
+        flat_shading(),
+        TexrectBlendRegisters::default(),
+        &vec![0u8; (8 * 4 * 2) as usize],
+        &declared,
+        NO_TEXTURE,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
+                opcode_textured: true,
+                binding_present: false,
+            })
+        ),
+        "a textured triangle with no TMEM binding must refuse by name, got {result:?}"
+    );
+}
