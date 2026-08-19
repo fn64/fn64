@@ -50,14 +50,40 @@ use fn64_render_ir::ResourceAccess;
 use super::texrect::{
     admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
     TexrectBlendRegisters, TexrectCombinerEvaluation, TexrectExecutionError,
-    TexrectFragmentStages, TexrectShading,
+    TexrectFragmentStages, TexrectShading, TexrectTileBinding,
 };
 use super::{
     CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
     TargetError, TargetRectangle,
 };
 use crate::raw_dpc::{triangle_span, RawTriangle};
-use crate::{CycleType, OtherMode};
+use crate::tmem::{
+    sample_point, PointSampleCoordinates, PointSampleRequest, TextureCoordinateS10_5,
+    TmemFirstRowParity,
+};
+use crate::{CycleType, OtherMode, TextureLutMode, TmemByteSource};
+
+/// The TMEM binding one TEXTURED raw triangle samples through: the tile pair
+/// current at its own stream position, the TMEM image that position observes,
+/// and the TLUT mode its `SetOtherMode` selected.
+///
+/// **The image is selected by the caller, never by this module.** It is the
+/// SAME `TexrectTmemSource::Pending` / `prefix_before` selection
+/// `execute_scheduled_texrect` makes -- see `production.rs`'s schedule loop
+/// -- passed in already resolved. Reimplementing that rule here would give a
+/// packet's triangles and its texrects two answers to "which load did this
+/// draw see", and within one packet TMEM is not one image: WM2000's measured
+/// sixth packet interleaves seven `LoadTile`s with seven draws all loading
+/// from TMEM word zero, so a shared image holds only the seventh load's
+/// texels and every draw samples the seventh sprite.
+pub struct RawTriangleTexture<'a, S: TmemByteSource + ?Sized> {
+    /// The `SetTile`/`SetTileSize` pair for the tile index the TRIANGLE's own
+    /// wire word 0 names -- not a frozen tile 0.
+    pub tile: TexrectTileBinding,
+    /// TMEM as this triangle's stream position observes it.
+    pub tmem: &'a S,
+    pub lut_mode: TextureLutMode,
+}
 
 /// The subpixel coverage a fully-covered pixel has: two X sample columns
 /// times four Y sample rows.
@@ -91,7 +117,8 @@ const FULL_COVERAGE: u32 = 8;
 /// triangle covers a sub-region, so every pixel outside it must come from
 /// real prior content, which in the composed schedule is the previous
 /// command's own output.
-pub fn execute_raw_triangle(
+#[allow(clippy::too_many_arguments)]
+pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     other_mode: OtherMode,
     triangle: &RawTriangle,
@@ -99,6 +126,7 @@ pub fn execute_raw_triangle(
     blend_registers: TexrectBlendRegisters,
     resident_bytes: &[u8],
     declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     // Cycle, combiner-program, blender and fragment-stage admission all run
     // BEFORE any pixel is produced, so a mode this executor cannot evaluate
@@ -121,8 +149,21 @@ pub fn execute_raw_triangle(
     // there is nothing to read and `base_inputs`' zeroed field would be a
     // silent substitution. The flag is the wire opcode's own shade bit, not
     // a policy.
+    // **`texel_available` is the wire opcode's own texture bit AND a
+    // resolved binding**, never one without the other. A textured triangle
+    // whose caller passed no `RawTriangleTexture` would combine against a
+    // fabricated zero texel; a caller that passed one for an UNtextured
+    // triangle has no S/T/W planes to evaluate. Both are refused by this
+    // one equality rather than tolerated in either direction.
+    let textured = triangle.flags().textured();
+    if textured != texture.is_some() {
+        return Err(TexrectExecutionError::TriangleTextureBindingDisagreesWithOpcode {
+            opcode_textured: textured,
+            binding_present: texture.is_some(),
+        });
+    }
     let base_inputs = shading
-        .validate_combiner_program_with_shade(cycles, triangle.flags().shaded())?
+        .validate_combiner_program_for(cycles, triangle.flags().shaded(), textured)?
         .base_inputs();
     let blend_state = blend_registers.mode_state(other_mode);
     require_blendable_mode(blend_state)?;
@@ -235,6 +276,14 @@ pub fn execute_raw_triangle(
     // about the wire opcode rather than a missing value.
     let shade = triangle.shade().map(triangle_span::shade_planes);
 
+    // The three S/T/W planes, decoded from this triangle's OWN texture
+    // coefficient block by the same `coefficient_components` the shade
+    // block goes through -- not a second transcription of the split
+    // fixed-point layout. `None` exactly when the wire opcode has no
+    // texture bit, which the equality above already proved matches
+    // `texture`.
+    let texture_planes = triangle.texture().map(triangle_span::texture_planes);
+
     let mut bytes = resident_bytes.to_vec();
     raster_triangle(
         &mut bytes,
@@ -245,6 +294,9 @@ pub fn execute_raw_triangle(
         shading,
         base_inputs,
         shade,
+        texture_planes,
+        texture,
+        other_mode.texture_perspective(),
         blend_state,
         stages,
         evaluation,
@@ -285,7 +337,7 @@ pub fn execute_raw_triangle(
 /// its own coefficient planes; an unshaded one's stays zero and is refused
 /// by `validate_combiner_program_with_shade` before any pixel is produced.
 #[allow(clippy::too_many_arguments)]
-fn raster_triangle(
+fn raster_triangle<S: TmemByteSource + ?Sized>(
     bytes: &mut [u8],
     format: ColorTargetFormat,
     width: u32,
@@ -294,11 +346,27 @@ fn raster_triangle(
     shading: TexrectShading,
     base_inputs: crate::CombinerInputs,
     shade: Option<[triangle_span::AttributePlane; 4]>,
+    texture_planes: Option<[triangle_span::AttributePlane; 3]>,
+    texture: Option<RawTriangleTexture<'_, S>>,
+    perspective: bool,
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
 ) -> Result<(), TexrectExecutionError> {
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    // **First-row parity comes from the tile's own T origin, not a
+    // constant** -- `execute_texture_rectangle`'s own rule, applied here for
+    // the identical reason: the reader owes the WRITER the same parity, or
+    // the two disagree about which TMEM rows carry the XOR4 bank exchange.
+    // A frozen `Even` is correct only for an even T origin, and WM2000's
+    // measured sprite-strip tile has `low_t.integer() == 47`, an odd one.
+    let first_row_parity = texture.as_ref().map(|texture| {
+        if texture.tile.size().low_t().integer() & 1 == 1 {
+            TmemFirstRowParity::Odd
+        } else {
+            TmemFirstRowParity::Even
+        }
+    });
     for row in rows {
         for x in row.x0..row.x1 {
             // The coverage this pixel actually has, from the SAME span
@@ -320,7 +388,13 @@ fn raster_triangle(
             // covered subsample, and both functions scan the same samples in
             // the same order. Handled rather than `expect`ed so a future
             // divergence between them refuses instead of aborting.
-            let inputs = match (shade, triangle_span::attribute_sample(triangle, x as i32, row.y as i32)) {
+            // The attribute sample point, computed ONCE per pixel and shared
+            // by the shade and texture planes. The RDP evaluates every one of
+            // a fragment's attributes at the SAME covered subsample, so
+            // sampling the two at different points would put a pixel's colour
+            // and its texel a quarter pixel apart.
+            let sample = triangle_span::attribute_sample(triangle, x as i32, row.y as i32);
+            let inputs = match (shade, sample) {
                 (Some(planes), Some((delta_y_eighth, delta_x))) => {
                     let shade_color = std::array::from_fn(|component| {
                         // Q16.16 -> [0.0, 1.0]: the plane's integer part is
@@ -352,7 +426,61 @@ fn raster_triangle(
                     })
                 }
             };
-            let combined = combine_one_texel(shading.combine(), inputs, [0; 4], evaluation);
+            // **The texel, sampled through the texrect path's own one
+            // sampler.** `sample_point` is `tmem/sample.rs`'s existing
+            // reader, monomorphized over whichever TMEM image the CALLER
+            // selected -- the same shift/mask/mirror/clamp addressing, the
+            // same validity-gated physical read, the same format and TLUT
+            // decode. There is no second sampler and no second tile binding.
+            //
+            // `[0; 4]` for an untextured triangle is not a substitution: the
+            // admission above refused every `Texel0`-reading selector for
+            // one, so nothing reads it.
+            let texel = match (&texture, texture_planes, sample) {
+                (Some(binding), Some(planes), Some((delta_y_eighth, delta_x))) => {
+                    // The three planes at the pixel's own covered subsample,
+                    // in Q16.16 -- the identical `attribute_plane` call the
+                    // shade components go through.
+                    let stw: [i64; 3] = core::array::from_fn(|component| {
+                        triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
+                    });
+                    let (s, t) = triangle_span::texture_coordinates_s10_5(stw, perspective);
+                    let request = PointSampleRequest::new(
+                        PointSampleCoordinates::new(
+                            TextureCoordinateS10_5::from_raw(s),
+                            TextureCoordinateS10_5::from_raw(t),
+                        ),
+                        first_row_parity.expect("a bound texture resolved its parity above"),
+                    );
+                    sample_point(
+                        binding.tmem,
+                        binding.tile.descriptor(),
+                        binding.tile.size(),
+                        request,
+                        binding.lut_mode,
+                    )
+                    .map_err(|source| TexrectExecutionError::Sample {
+                        column: x,
+                        row: row.y,
+                        source,
+                    })?
+                    .texel()
+                    .rgba8888()
+                }
+                // A textured triangle whose pixel has no covered subsample
+                // cannot reach here: the `coverage == 0` guard above already
+                // proved one exists, and `attribute_sample` scans the same
+                // samples in the same order. Refused rather than `expect`ed,
+                // for the same reason the shade arm is.
+                (Some(_), _, None) | (Some(_), None, _) => {
+                    return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
+                        column: x,
+                        row: row.y,
+                    })
+                }
+                (None, _, _) => [0; 4],
+            };
+            let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
             let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
                 format,
