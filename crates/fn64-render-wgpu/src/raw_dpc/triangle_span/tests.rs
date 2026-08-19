@@ -7,10 +7,8 @@ const BASE: u8 = 0x08;
 /// Builds one triangle's four base-edge wire words, big-endian, exactly as
 /// the RDP command stream carries them.
 ///
-/// Layout taken from the wire, not from the decoder: word 0 high half holds
-/// `lft` at bit 23, `level` at 21..19, `tile` at 18..16; word 0 low half is
-/// YL; word 1 high half is YM, low half is YH; then XL/dXLdy, XH/dXHdy,
-/// XM/dXMdy as full 32-bit Q16.16 pairs.
+/// Delegates to the crate's shared `wire_words` builder, which owns the
+/// layout; this signature is kept so the tests below read unchanged.
 #[allow(clippy::too_many_arguments)]
 fn wire(
     lft: bool,
@@ -24,37 +22,27 @@ fn wire(
     xm: i32,
     dxmdy: i32,
 ) -> Vec<u8> {
-    let w0 = (u32::from(lft) << 23) | (yl as u16 as u32);
-    let w1 = ((ym as u16 as u32) << 16) | (yh as u16 as u32);
-    let mut bytes = Vec::with_capacity(32);
-    for word in [
-        w0,
-        w1,
-        xl as u32,
-        dxldy as u32,
-        xh as u32,
-        dxhdy as u32,
-        xm as u32,
-        dxmdy as u32,
-    ] {
-        bytes.extend_from_slice(&word.to_be_bytes());
+    crate::wire_words::EdgeWords {
+        lft,
+        yl,
+        ym,
+        yh,
+        xl,
+        dxldy,
+        xh,
+        dxhdy,
+        xm,
+        dxmdy,
+        ..crate::wire_words::EdgeWords::zeroed()
     }
-    bytes
+    .bytes(BASE)
 }
 
 fn decode(bytes: &[u8]) -> RawTriangle {
     RawTriangle::decode(BASE, bytes).expect("hand-built base triangle is 32 bytes")
 }
 
-/// Q16.16 for a whole number of pixels.
-const fn px(pixels: i32) -> i32 {
-    pixels << 16
-}
-
-/// S11.2 for a whole number of scanlines.
-const fn line(scanlines: i16) -> i16 {
-    scanlines << 2
-}
+use crate::wire_words::{line, px};
 
 // ---------------------------------------------------------------------------
 // The polarity of wire bit 23
@@ -477,35 +465,24 @@ fn coefficient_block(
     de: [i32; 4],
     dy: [i32; 4],
 ) -> super::super::triangle::CoefficientWords {
-    let mut halves = [0u32; 16];
-    let mut put = |integer_byte: usize, fraction_byte: usize, components: [i32; 4]| {
-        for (index, component) in components.iter().enumerate() {
-            let half_index = integer_byte / 4 + index / 2;
-            let fraction_index = fraction_byte / 4 + index / 2;
-            // Component 0 and 2 sit in their u32's HIGH half; 1 and 3 in the low.
-            let shift = if index % 2 == 0 { 16 } else { 0 };
-            halves[half_index] |= (((*component >> 16) as u32) & 0xffff) << shift;
-            halves[fraction_index] |= ((*component as u32) & 0xffff) << shift;
-        }
-    };
-    put(0, 16, value);
-    put(8, 24, dx);
-    put(32, 48, de);
-    put(40, 56, dy);
+    let halves = crate::wire_words::coefficient_halves(value, dx, de, dy);
 
     // Round-tripped through the REAL decoder rather than by constructing
     // `RawWord` directly (whose fields are private, and rightly so): a
     // shaded triangle carries exactly this block after its four base-edge
     // words, so `RawTriangle::decode` hands back the same `CoefficientWords`
     // the stream would produce.
-    let mut bytes = Vec::with_capacity(96);
-    for word in [(1u32 << 23) | 12, 12u32 << 16, 0, 0, 0, 0, 0, 0] {
-        bytes.extend_from_slice(&word.to_be_bytes());
+    let mut bytes = crate::wire_words::EdgeWords {
+        lft: true,
+        yl: 12,
+        ym: 12,
+        ..crate::wire_words::EdgeWords::zeroed()
     }
+    .bytes(crate::wire_words::RAW_TRIANGLE_SHADE);
     for half in halves {
         bytes.extend_from_slice(&half.to_be_bytes());
     }
-    *RawTriangle::decode(0x0c, &bytes)
+    *RawTriangle::decode(crate::wire_words::RAW_TRIANGLE_SHADE, &bytes)
         .expect("a shaded triangle is 32 + 64 bytes")
         .shade()
         .expect("opcode 0x0c carries a shade block")
