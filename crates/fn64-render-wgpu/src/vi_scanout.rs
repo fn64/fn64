@@ -52,8 +52,12 @@
 //! establish the U2.10 scale/offset split.
 
 use fn64_render::{
-    vi_public_filters::restore_rgba16_component_bounded_v1, RenderError, ViFilterControl,
-    ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis, ViScanoutRegisters,
+    vi_public_filters::{
+        gamma_dither_quantize_bounded_v1, reference_noise_bit_v1,
+        restore_rgba16_component_bounded_v1,
+    },
+    RenderError, ViFilterControl, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
+    ViScanoutRegisters,
 };
 
 /// A VI feature this scanout genuinely does not implement, named
@@ -85,9 +89,6 @@ pub(crate) enum ViScanoutRefusal {
     /// publicly specified; emitting a linear image while STATUS asks for
     /// gamma would be a wrong image, not a partial one.
     Gamma,
-    /// VI STATUS bit 2: gamma dither, which needs a retrace-seeded noise
-    /// generator this module does not own.
-    GammaDither,
     /// `osViFade`'s two-row interpolation.
     Fade,
     /// `osViRepeatLine`.
@@ -116,10 +117,6 @@ impl ViScanoutRefusal {
             Self::Gamma => {
                 "VI STATUS bit 3 selects the gamma curve; the silicon gamma ROM is not \
                  publicly specified and emitting a linear field instead would be a wrong image"
-            }
-            Self::GammaDither => {
-                "VI STATUS bit 2 selects gamma dither; this scanout owns no retrace-seeded \
-                 noise generator"
             }
             Self::Fade => {
                 "osViFade programmed a two-row interpolation factor; this scanout implements \
@@ -309,9 +306,14 @@ fn source_rows(registers: ViScanoutRegisters, output_height: u32, filters: ViFil
 /// `divot`, `fade`, `repeat_line` all clear. Exactly two of the eight named
 /// refusals were reachable, and both are now implemented: dither
 /// restoration ([`restore_dither`]) and resampling ([`resample_bilinear`]).
-/// Silhouette AA, divot, gamma, gamma dither, fade and repeat-line stay
-/// refusing by name because WM2000 never selects them and this module still
-/// cannot produce them.
+/// Silhouette AA, divot, gamma, fade and repeat-line stay refusing by name
+/// because WM2000 never selects them and this module still cannot produce
+/// them. **Gamma dither is no longer among them**: its refusal claimed a
+/// missing "retrace-seeded noise generator" that was already public in
+/// `fn64_render::vi_public_filters`, which this module imports from, so it
+/// is implemented rather than refused (see [`apply_gamma_dither`]). WM2000
+/// still does not select it; the refusal was removed because it was false,
+/// not because the census reached it.
 fn admitted_filters(vi: ViPresentation) -> Result<(), ViScanoutRefusal> {
     let filters = vi.scanout.filters();
     if filters.pixel_type == ViPixelType::Reserved {
@@ -337,9 +339,6 @@ fn admitted_filters(vi: ViPresentation) -> Result<(), ViScanoutRefusal> {
     }
     if filters.gamma {
         return Err(ViScanoutRefusal::Gamma);
-    }
-    if filters.gamma_dither {
-        return Err(ViScanoutRefusal::GammaDither);
     }
     Ok(())
 }
@@ -597,11 +596,14 @@ pub(crate) fn scan_out_guest_rdram(
         // `DitherRestorationNonRgba16`.
         plane.restore_dither();
     }
-    let rgba8 = if filters.antialias_mode.resampling_enabled() {
+    let mut rgba8 = if filters.antialias_mode.resampling_enabled() {
         resample_bilinear(&plane, x, y, output_width, output_height)
     } else {
         replicate(&plane, x, y, output_width, output_height)
     };
+    if filters.gamma_dither {
+        apply_gamma_dither(&mut rgba8, vi.noise_seed);
+    }
 
     let field = PresentedField {
         width: output_width,
@@ -611,6 +613,58 @@ pub(crate) fn scan_out_guest_rdram(
     };
     report_field(&field, filters);
     Ok(field)
+}
+
+/// VI STATUS bit 2's gamma dither: stochastically round each RGB channel of
+/// the presented field to seven bits, then expand it back to this module's
+/// eight-bit storage.
+///
+/// **Both halves come from `fn64_render::vi_public_filters`, the shared
+/// crate this module already imports one filter from.**
+/// [`gamma_dither_quantize_bounded_v1`] is the quantizer and
+/// [`reference_noise_bit_v1`] is the bit stream, and
+/// `fn64-render-reference`'s `apply_gamma_dither`
+/// (`crates/fn64-render-reference/src/vi.rs:590-600`) is the same two calls
+/// over the same seed, pixel index and channel index. Neither lane
+/// implements a generator of its own; there is exactly one, and it is
+/// public.
+///
+/// This module previously refused bit 2 outright, on the stated ground that
+/// gamma dither "needs a retrace-seeded noise generator this module does not
+/// own." The generator was already public in the crate this file's `use`
+/// statement names, alongside `restore_rgba16_component_bounded_v1` -- which
+/// this module does call. The refusal was a stale nonclaim, not a
+/// capability gap, so it is removed rather than narrowed.
+///
+/// **What this is NOT.** `VI_PUBLIC_FILTER_POLICY_ID`'s own header says it:
+/// public documentation specifies fresh random low-bit noise before the
+/// final seven-bit quantization but publishes no silicon generator, seed, or
+/// advancement. `reference_noise_bit_v1` is fn64's declared deterministic
+/// policy (`fn64.vi-public-filters.bounded-v1`), and this function inherits
+/// that status exactly -- an executable cross-backend contract, not a claim
+/// about the RDP's random stream. The quantizer half *is* the documented
+/// mechanism; only the bit source is policy.
+///
+/// Alpha is untouched, matching both the reference and the public
+/// description: gamma dither is an RGB output-stage filter.
+///
+/// Ordering: last, after resampling. The reference composes it the same way
+/// (`vi.rs:126-133`, gamma then gamma dither, both after `apply_resampling`),
+/// and it is the only sensible order for a filter whose whole purpose is to
+/// shape the final quantization to the DAC. `ViScanoutRefusal::Gamma`
+/// still refuses bit 3, so the reference's gamma-then-dither pair is not
+/// reachable here in its two-filter form; the relative order is recorded so
+/// that a later gamma implementation inserts itself before this call rather
+/// than after.
+fn apply_gamma_dither(rgba8: &mut [u8], seed: u64) {
+    for (pixel_index, pixel) in rgba8.chunks_exact_mut(4).enumerate() {
+        for (channel_index, channel) in pixel[..3].iter_mut().enumerate() {
+            *channel = gamma_dither_quantize_bounded_v1(
+                *channel,
+                reference_noise_bit_v1(seed, pixel_index as u64, channel_index as u8),
+            );
+        }
+    }
 }
 
 /// Emit one line per presented field under `FN64_VI_FIELD_DIGEST`.
