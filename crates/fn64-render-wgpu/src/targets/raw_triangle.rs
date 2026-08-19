@@ -1,6 +1,6 @@
-//! The CPU rasterizer for one flat, opaque, untextured raw RDP triangle,
-//! producing the same [`CompletedColorTargetWrite`] the fill and texrect
-//! executors produce.
+//! The CPU rasterizer for one opaque, untextured raw RDP triangle -- shaded
+//! or flat -- producing the same [`CompletedColorTargetWrite`] the fill and
+//! texrect executors produce.
 //!
 //! # Why a CPU rasterizer and not the GPU one
 //!
@@ -16,12 +16,15 @@
 //!
 //! # What this executor is, and is not
 //!
-//! It is the NARROWEST triangle that can be made correct end to end: flat
-//! (opcode 0x08 -- no shade, no texture, no depth plane on the wire),
-//! non-Fill cycle, drawn through the latched combiner and blender.
+//! It executes opcodes 0x08 (flat) and 0x0c (shaded) -- no texture plane,
+//! no depth plane on the wire -- in non-Fill cycle, drawn through the
+//! latched combiner and blender. Shade planes ARE interpolated per pixel.
 //!
-//! It is **not** a general triangle rasterizer. There is no shade plane
-//! interpolation, no s/t/w perspective divide, no LOD, and no depth test.
+//! It is **not** a general triangle rasterizer. There is no s/t/w
+//! perspective divide, no LOD, and no depth test -- which is why it draws
+//! nothing in WM2000, whose 826,056 attract-loop triangles are all 0x0e
+//! (shaded AND textured). The texture rung is the one that remains; see
+//! `docs/RT64-TRIANGLE-WRITEBACK.md`.
 //! `crate::raw_dpc::raw_triangle_is_executable` is the decoder-side twin of
 //! that admission, and the two must widen together in that order: the
 //! executor first, the declaration second. Declaring a row this executor
@@ -34,11 +37,13 @@
 //! The journal declares whole `[x0, x1)` runs per scanline, because a
 //! `ResourceAccess` is a byte range and cannot express "these pixels within
 //! the range". A pixel at either end of that run may have zero subpixel
-//! coverage. That is safe only because this executor writes **every pixel in
-//! the declared run**, using the resident's own prior byte where coverage is
-//! zero -- so the declared range's content is always real, current content,
-//! never stale bytes from a generation the accumulator moved past. See
-//! [`raster_triangle`]'s loop.
+//! coverage. That is safe because this executor LEAVES such a pixel holding
+//! the resident's own current byte -- it is skipped, not painted -- so the
+//! declared range's content is always real, current content rather than
+//! stale bytes from a generation the accumulator moved past, and the
+//! triangle's colour never lands outside the triangle. See
+//! [`raster_triangle`]'s loop and
+//! `a_declared_pixel_with_no_subpixel_coverage_is_not_painted`.
 
 use fn64_render_ir::ResourceAccess;
 
