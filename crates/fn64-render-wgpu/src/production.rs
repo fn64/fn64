@@ -7509,6 +7509,169 @@ mod tests {
         );
     }
 
+    /// A neutral tile descriptor whose `tmem_word_address` is the caller's,
+    /// so two tiles seeded into `PlanCollector` are distinguishable in the
+    /// GPU uniform by a field the uniform actually carries.
+    fn fixture_neutral_tile(
+        tmem_word_address: u16,
+    ) -> (
+        fn64_render::NeutralTileDescriptor,
+        fn64_render::NeutralTileSize,
+    ) {
+        (
+            fn64_render::NeutralTileDescriptor {
+                format: fn64_render::NeutralImageFormat::Rgba,
+                size: fn64_render::NeutralPixelSize::Bits16,
+                line_words: 2,
+                tmem_word_address,
+                palette: 0,
+                s_mode: fn64_render::NeutralTileAddressMode {
+                    mirror: false,
+                    clamp: false,
+                },
+                mask_s: 0,
+                shift_s: 0,
+                t_mode: fn64_render::NeutralTileAddressMode {
+                    mirror: false,
+                    clamp: false,
+                },
+                mask_t: 0,
+                shift_t: 0,
+            },
+            fn64_render::NeutralTileSize {
+                low_s: 0,
+                low_t: 0,
+                high_s: 7 << 2,
+                high_t: 7 << 2,
+            },
+        )
+    }
+
+    /// One raw triangle command carrying real wire words whose word 0 names
+    /// `tile` in bits 18:16 -- the field `RawTriangle::decode` reads as
+    /// `((w0 >> 16) & 0x7)` and the CPU executor already honours.
+    fn fixture_raw_triangle_naming_tile(tile: u32) -> RdpTriangleCommand {
+        // Opcode 0x08 (flat, untextured) in bits 29:24 of word 0, the tile
+        // index in bits 18:16, everything else zero. Four 64-bit words = 8
+        // u32 words for a `triangleBaseWords` command.
+        let word0 = (0x08u32 << 24) | (tile << 16);
+        RdpTriangleCommand {
+            location: fixture_location(0),
+            raw_words: Box::new([word0, 0, 0, 0, 0, 0, 0, 0]),
+            vertices: core::array::from_fn(|index| fixture_vertex(index as f32)),
+            source: TriangleSource::RawTriangle,
+            viewport: None,
+            texrect_accesses: None,
+        }
+    }
+
+    /// **A raw triangle's GPU tile binding comes from its OWN wire field.**
+    ///
+    /// `PlanCollector` froze `bound_tile_index` to 0 for every
+    /// `TriangleSource::RawTriangle`, with a comment claiming the triangle
+    /// "carries no tile field of its own to read". That claim is false:
+    /// wire word 0 bits 18:16 are the tile index, `RawTriangle::decode`
+    /// reads them, and `execute_scheduled_raw_triangle` (the CPU path)
+    /// already binds from them. The GPU uniform path silently sampled tile
+    /// 0's texture for any triangle naming another tile.
+    ///
+    /// The wire word here is `0x0805_0000`. Derived by hand: opcode `0x08`
+    /// occupies bits 29:24, so `0x08 << 24 = 0x0800_0000`; the tile field
+    /// is bits 18:16, so tile 5 contributes `5 << 16 = 0x0005_0000`. The
+    /// expected index is therefore `(0x0805_0000 >> 16) & 0x7 == 5`.
+    ///
+    /// Tile 5 and tile 0 are seeded with DIFFERENT `tmem_word_address`
+    /// values, so "read the named tile" and "read tile 0" are two
+    /// distinguishable answers -- every other raw-triangle fixture in this
+    /// file uses tile 0, where the two coincide, which is why a frozen 0
+    /// survived all of them.
+    #[test]
+    fn plan_collector_binds_the_tile_a_raw_triangle_s_own_wire_word_names() {
+        const TILE_ZERO_TMEM: u16 = 0x010;
+        const TILE_FIVE_TMEM: u16 = 0x100;
+
+        let mut tiles = [(None, None); 8];
+        let (descriptor_zero, size_zero) = fixture_neutral_tile(TILE_ZERO_TMEM);
+        tiles[0] = (Some(descriptor_zero), Some(size_zero));
+        let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
+        tiles[5] = (Some(descriptor_five), Some(size_five));
+
+        let mut collector = PlanCollector::seeded(
+            Some(OtherMode::from_wire(0, 0)),
+            Some(CombineParams::from_wire(0, 0)),
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            tiles,
+        );
+
+        let triangle = fixture_raw_triangle_naming_tile(5);
+        assert_eq!(
+            triangle.raw_words[0], 0x0805_0000,
+            "the fixture's wire word must be the hand-derived one this test reasons about"
+        );
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draw = collector.triangles[0].as_ref().unwrap();
+        assert_eq!(
+            draw.tile_binding.tmem_word_address,
+            u32::from(TILE_FIVE_TMEM),
+            "the triangle names tile 5 in wire word 0 bits 18:16, so the GPU uniform must bind \
+             tile 5's TMEM address, not tile 0's {TILE_ZERO_TMEM:#x}"
+        );
+        assert_ne!(
+            TILE_FIVE_TMEM, TILE_ZERO_TMEM,
+            "the two seeded tiles must differ in the field this test reads, or a frozen 0 would \
+             pass"
+        );
+        assert_eq!(
+            draw.tile_binding.bound, 1,
+            "tile 5 was seeded with both halves present, so the binding must be bound"
+        );
+    }
+
+    /// The companion arm: a raw triangle whose wire word names tile 0 must
+    /// still bind tile 0. Keeps the fix from degenerating into "always read
+    /// some other tile" -- the arm kept unchanged needs its own test, not
+    /// just the arm that changed.
+    #[test]
+    fn plan_collector_binds_tile_zero_when_a_raw_triangle_s_wire_word_names_it() {
+        const TILE_ZERO_TMEM: u16 = 0x010;
+        const TILE_FIVE_TMEM: u16 = 0x100;
+
+        let mut tiles = [(None, None); 8];
+        let (descriptor_zero, size_zero) = fixture_neutral_tile(TILE_ZERO_TMEM);
+        tiles[0] = (Some(descriptor_zero), Some(size_zero));
+        let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
+        tiles[5] = (Some(descriptor_five), Some(size_five));
+
+        let mut collector = PlanCollector::seeded(
+            Some(OtherMode::from_wire(0, 0)),
+            Some(CombineParams::from_wire(0, 0)),
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            tiles,
+        );
+
+        // `0x0800_0000`: opcode 0x08 in bits 29:24, tile field bits 18:16
+        // all zero -- `(0x0800_0000 >> 16) & 0x7 == 0` by hand.
+        let triangle = fixture_raw_triangle_naming_tile(0);
+        assert_eq!(triangle.raw_words[0], 0x0800_0000);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draw = collector.triangles[0].as_ref().unwrap();
+        assert_eq!(
+            draw.tile_binding.tmem_word_address,
+            u32::from(TILE_ZERO_TMEM),
+            "the triangle names tile 0, so it must bind tile 0 -- not tile 5's {TILE_FIVE_TMEM:#x}"
+        );
+    }
+
     /// Framebuffer-blend admission split (Slice B): a triangle whose
     /// resolved blend cycle selects `BlendBInput::FramebufferAlpha` on an
     /// active cycle must still be rejected before GPU submission with a
