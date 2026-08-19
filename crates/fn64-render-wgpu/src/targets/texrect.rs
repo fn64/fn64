@@ -1031,6 +1031,35 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     }
     let mut bytes = resident_bytes.to_vec();
 
+    // **First-row parity comes from the tile's own T origin, not a
+    // constant.** [`crate::TmemFirstRowParity`] is explicit caller input by
+    // design -- the reader never infers it -- so this executor owes the
+    // reader the same parity the *writer* used, or the two disagree about
+    // which TMEM rows carry the XOR4 bank exchange.
+    //
+    // The writer's rule is `tmem/types.rs`'s `project_tmem_transfer_word`,
+    // `TmemLoadKind::Tile` arm: `odd_row_exchange = (bounds.low_t().integer()
+    // + row) & 1`, applied to the physical lanes by
+    // `tmem/execute/load_tile.rs`'s `map_physical_lanes`. The reader's rule
+    // is `tmem/read.rs`'s `odd_row_exchange`: `first_is_odd ^ (row & 1)`.
+    // The two agree exactly when `first_is_odd == low_t.integer() & 1`, and
+    // this line is that equality.
+    //
+    // A frozen `Even` was previously passed here. That is correct only for
+    // a tile whose T origin is even -- and it is invisible for `LoadBlock`,
+    // whose `transfer_shape` `Block` arm always reports `row_count = 1` so
+    // its own `odd_row_exchange` never fires on the write side. Measured on
+    // the real ROM, WM2000's sprite-strip tile has `low_t.integer() == 47`,
+    // an ODD origin, so the frozen constant inverted the exchange for every
+    // row and each rectangle row's last pixel read a byte the load never
+    // wrote (`tmem::read::tests`'s two `wm2000_texrect_*` tests pin exactly
+    // that, including the production abort's own byte `0x04c`).
+    let first_row_parity = if tile.size().low_t().integer() & 1 == 1 {
+        TmemFirstRowParity::Odd
+    } else {
+        TmemFirstRowParity::Even
+    };
+
     for row in 0..draw.height() {
         let t = draw.t_at(row);
         for column in 0..draw.width() {
@@ -1045,58 +1074,13 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
                     TextureCoordinateS10_5::from_raw(s),
                     TextureCoordinateS10_5::from_raw(t),
                 ),
-                TmemFirstRowParity::Even,
+                first_row_parity,
             );
             let decoded = sample_point(tmem, tile.descriptor(), tile.size(), request, lut_mode)
-                .map_err(|source| {
-                    if std::env::var_os("FN64_COV63_DIAG").is_some() {
-                        let d = tile.descriptor();
-                        eprintln!(
-                            "[cov63] FAIL px=({column},{row}) s={s} t={t} \
-                             fmt={:?} siz={:?} line_words={} tmem_word={} palette={} \
-                             mask_s={} shift_s={} mask_t={} shift_t={} \
-                             s_mode={:?} t_mode={:?} \
-                             tile_size=(sl={} tl={} sh={} th={}) lut={:?} \
-                             draw=(l={} t={} w={} h={}) s_start={} s_end={} t_start={} t_end={} \
-                             err={source}",
-                            d.format(), d.size(), d.line_words(), d.tmem().get(), d.palette(),
-                            d.mask_s(), d.shift_s(), d.mask_t(), d.shift_t(),
-                            d.s_mode(), d.t_mode(),
-                            tile.size().low_s().raw(), tile.size().low_t().raw(),
-                            tile.size().high_s().raw(), tile.size().high_t().raw(),
-                            lut_mode,
-                            draw.left(), draw.top(), draw.width(), draw.height(),
-                            draw.s_at(0), draw.s_at(draw.width() - 1),
-                            draw.t_at(0), draw.t_at(draw.height() - 1),
-                        );
-                        // Valid-byte runs over the low half of TMEM: the
-                        // loaded SET, not the loaded RANGE.
-                        let mut runs: Vec<(u32, u32)> = Vec::new();
-                        let mut start: Option<u32> = None;
-                        for a in 0u32..4096 {
-                            let ok = tmem.valid_byte(a as u16).is_some();
-                            match (ok, start) {
-                                (true, None) => start = Some(a),
-                                (false, Some(b)) => {
-                                    runs.push((b, a));
-                                    start = None;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if let Some(b) = start {
-                            runs.push((b, 4096));
-                        }
-                        eprintln!("[cov63] valid runs (low+high TMEM), {} runs:", runs.len());
-                        for (b, e) in runs.iter().take(80) {
-                            eprintln!("[cov63]   0x{b:04x}..0x{e:04x} ({} bytes)", e - b);
-                        }
-                    }
-                    TexrectExecutionError::Sample {
-                        column,
-                        row,
-                        source,
-                    }
+                .map_err(|source| TexrectExecutionError::Sample {
+                    column,
+                    row,
+                    source,
                 })?;
             let rgba = match base_inputs {
                 // Copy cycle: the sampled texel's own RGBA8888, unchanged.
