@@ -1727,6 +1727,93 @@ fn raw_triangle_is_executable(triangle: &triangle::RawTriangle) -> bool {
     !triangle.flags().depth()
 }
 
+
+/// **Diagnostic-only.** Counts, per named reason, every raw triangle
+/// `plan_raw_triangle` declines to declare a write for -- the eight
+/// `return Ok(())` arms that are silent by design. Nothing in the render
+/// path reads these; they exist so a real ROM run can say WHICH silent
+/// arm a frozen frame is falling into, instead of inferring it.
+///
+/// Dumped to stderr at process exit when `FN64_TRI_DROP_STATS` is set.
+pub mod raw_triangle_drop_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The named arms of `plan_raw_triangle`, in source order.
+    pub const REASONS: [&str; 9] = [
+        "depth_bit_set",
+        "no_other_mode",
+        "fill_cycle",
+        "no_color_image",
+        "color_image_format",
+        "no_target_height",
+        "no_covered_rows",
+        "row_outside_rdram",
+        "ADMITTED",
+    ];
+
+    static COUNTS: [AtomicU64; 9] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn bump(index: usize) {
+        COUNTS[index].fetch_add(1, Ordering::Relaxed);
+        // Periodic self-report: the harness is a separate crate that does
+        // not call into this module, so the dump has to come from here.
+        // Every 100k decisions is ~1 line per few VI swaps on the real ROM.
+        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick % 100_000 == 0 && std::env::var_os("FN64_TRI_DROP_STATS").is_some() {
+            report(&format!("tick={tick}"));
+        }
+    }
+
+    /// Current counts, in `REASONS` order.
+    pub fn snapshot() -> [u64; 9] {
+        let mut out = [0u64; 9];
+        for (slot, counter) in out.iter_mut().zip(COUNTS.iter()) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Admitted-triangle destination addresses: the `SetColorImage` address
+    /// each admitted raw triangle declares its rows against, with a count.
+    /// This is the measurement that distinguishes "triangles are drawn but
+    /// into a buffer nobody scans out" from "triangles are drawn into the
+    /// scanned-out buffer and something later discards them".
+    static ADDRESSES: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn note_address(address: u32) {
+        let mut guard = ADDRESSES.lock().expect("address histogram poisoned");
+        guard
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .entry(address)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    /// Prints the snapshot to stderr. Called by the harness, or by a test.
+    pub fn report(tag: &str) {
+        let counts = snapshot();
+        let total: u64 = counts.iter().sum();
+        eprintln!("[fn64-tri-drop] {tag} total={total}");
+        for (name, count) in REASONS.iter().zip(counts.iter()) {
+            if *count > 0 {
+                eprintln!("[fn64-tri-drop]   {name} = {count}");
+            }
+        }
+        if let Some(map) = ADDRESSES.lock().expect("address histogram poisoned").as_ref() {
+            for (address, count) in map.iter() {
+                eprintln!("[fn64-tri-drop]   admitted_target {address:#010x} = {count}");
+            }
+        }
+    }
+}
+
 /// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
 /// raw triangle covers -- **one access per covered scanline** -- and records
 /// the run as a [`FillAccessSpan`].
@@ -1760,6 +1847,7 @@ fn plan_raw_triangle(
     fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
     if !raw_triangle_is_executable(triangle) {
+        raw_triangle_drop_stats::bump(0);
         return Ok(());
     }
     // A triangle before any `SetOtherMode` has no defined blend or cycle
@@ -1767,6 +1855,7 @@ fn plan_raw_triangle(
     // (`TriangleBeforeAnyOtherMode`); declaring a write for one here would
     // declare a write for a command that never executes.
     let Some(other_mode) = state.other_mode() else {
+        raw_triangle_drop_stats::bump(1);
         return Ok(());
     };
     // Fill cycle consults no combiner and no blender at all -- the RDP fills
@@ -1774,9 +1863,11 @@ fn plan_raw_triangle(
     // for triangles. Refused by declaring nothing rather than drawn as an
     // approximation.
     if matches!(other_mode.cycle_type(), CycleType::Fill) {
+        raw_triangle_drop_stats::bump(2);
         return Ok(());
     }
     let Some(image) = state.color_image() else {
+        raw_triangle_drop_stats::bump(3);
         return Ok(());
     };
     // The same narrow colour-image subset `plan_fill` and
@@ -1784,6 +1875,7 @@ fn plan_raw_triangle(
     if image.format() != ImageFormat::Rgba
         || !matches!(image.size(), PixelSize::Bits16 | PixelSize::Bits32)
     {
+        raw_triangle_drop_stats::bump(4);
         return Ok(());
     }
     let bytes_per_pixel = image
@@ -1812,10 +1904,12 @@ fn plan_raw_triangle(
     // `None` (no `create` yet) declares nothing rather than guessing, the
     // same shape every other missing precondition above takes.
     let Some(height) = state.color_target_height() else {
+        raw_triangle_drop_stats::bump(5);
         return Ok(());
     };
     let rows = triangle_span::covered_rows(triangle, image.width(), height);
     if rows.is_empty() {
+        raw_triangle_drop_stats::bump(6);
         return Ok(());
     }
     if planned
@@ -1845,6 +1939,7 @@ fn plan_raw_triangle(
                 layout.range(start, end).ok()
             })
         else {
+            raw_triangle_drop_stats::bump(7);
             return Ok(());
         };
         ranges.push(range);
@@ -1880,6 +1975,8 @@ fn plan_raw_triangle(
         first_access_index,
         count,
     });
+    raw_triangle_drop_stats::note_address(image.address().get());
+    raw_triangle_drop_stats::bump(8);
     Ok(())
 }
 
