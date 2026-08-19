@@ -335,3 +335,60 @@ Summary of the three access widths:
 | word (`store_backed_word`) | `off` | little-endian |
 | halfword (`store_h`) | `off ^ 2` | little-endian |
 | byte (`store_b`) | `off ^ 3` | n/a |
+
+## MEASURED: the loop VISITS its entries -- the second entry is on port 1
+
+Run `run3`, solo on an otherwise idle host, `rc=0`, 511 samples over swaps
+2090-2600 under the proven lead-in (START 1100, A every 100 to 2400, then A
+every 60). Probe: `WM2000_READY_PROBE`, reading words little-endian at the
+plain offset and halfwords little-endian at `off ^ 2`.
+
+`D_801702A4 = 0x8025F360` (KSEG0, so the entry addresses are real).
+
+| swaps | screen | `0x16 & 0xF` per entry | `D_8011BF50[0..4]` | entry `+0x00` |
+|---|---|---|---|---|
+| 2090-2101 | 17 | **`[1, 2, 3, 4]`** | `[0, 0, 0, 0]` | `[0,0,0,0]` |
+| 2102-2201 | **18** | **`[1, 2, 0, 0]`** | `[1, 1, 0, 0]` | `[0,0,1,1]` |
+| 2202-2600 | **18** | **`[1, 2, 0, 0]`** | **`[0, 1, 0, 0]`** | `[2,0,1,1]` |
+
+**This settles the card's open question. The first exit is NOT taken.** Two
+entries have a nonzero port field for the whole plateau, so the loop body runs
+for both. The fields are **1-based port indices**: `func_801456C8` computes
+`(field-1) * 12` into `D_80095186`, so field 1 is port 0's pressed word,
+field 2 is **port 1's**.
+
+### The A press is accepted -- for entry 0, and only entry 0
+
+At swap 2202 (A pressed, `pressed=[8000,0,0,0]`) the loop's own writes appear
+in the very next sample:
+
+- `D_8011BF50[0]`: `1 -> 0`, which is `sw $zero, 0x0($a1)` at `0x80145754`;
+- entry 0's `+0x00`: `0 -> 2`, which is `ori $v0, $v0, 0x2` at `0x80145768`.
+
+So entry 0 joined (B/`0x4000` path) and then confirmed (A/`0x8000` path)
+exactly as the disassembly says. `$a2` reaches 1 and the `beqz $a2` at
+`0x801457B8` is not taken.
+
+**`D_8011BF50[1]` never changes from 1, for all 233 plateau samples.** Entry 1
+reads `D_80095186 + 12` -- port 1's pressed word -- and that word is zero in
+every one of the 511 samples, because:
+
+```
+pad_errno = [0, 8, 8, 8]   (invariant across all 511 samples)
+pressed   = [8000, 0, 0, 0] on press swaps, [0,0,0,0] otherwise
+```
+
+### What fn64 reports for the empty ports, and whether that is right
+
+`8` is `CONT_NO_RESPONSE_ERROR`. On real hardware an empty port returns no PIF
+response, the SI channel's `CHNL_ERR_NORESP` (`0x80`) is set, and libultra's
+`osContGetReadData` computes `errno = (status & 0xC0) >> 4 = 0x08`. The game's
+own `func_8002F788` performs exactly that arithmetic at `0x8002F7CC`. **fn64
+models an empty port correctly**, and `D_800FEF2C = 4` (measured) is
+`__osMaxControllers`, not a count of connected pads -- the game's
+`func_800049E8(0xF)` likewise hardcodes its port mask to all four.
+
+So the plateau is: **the game is set up as a two-player match (entries on
+ports 0 and 1), the console it is running on has one controller, and player 2
+can never press anything.** That is the correct behaviour of the modeled
+hardware, not a defect in it.
