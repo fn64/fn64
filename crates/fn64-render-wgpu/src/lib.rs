@@ -412,8 +412,8 @@ mod wire_words;
 
 pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value, AlphaCompareNoise,
-    CopyCycleSourceFormat,
-    ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_FRAGMENT_FN_WGSL, ALPHA_COMPARE_WGSL,
+    CopyCycleSourceFormat, ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_FRAGMENT_FN_WGSL,
+    ALPHA_COMPARE_WGSL,
 };
 pub use blend::{
     blend_a, blend_b, blend_color, blend_fragment, dual_source_blend_output,

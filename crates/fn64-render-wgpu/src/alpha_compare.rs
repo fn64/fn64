@@ -436,8 +436,18 @@ mod tests {
         // Threshold/Dither, or a gate that rejected it, would fail here.
         let mode = OtherMode::from_wire(0, 2).alpha_compare();
         assert!(alpha_compare_value(mode, 0, 255, noise(255)));
-        assert!(!alpha_compare_value(AlphaCompareMode::Threshold, 0, 255, noise(255)));
-        assert!(!alpha_compare_value(AlphaCompareMode::Dither, 0, 255, noise(255)));
+        assert!(!alpha_compare_value(
+            AlphaCompareMode::Threshold,
+            0,
+            255,
+            noise(255)
+        ));
+        assert!(!alpha_compare_value(
+            AlphaCompareMode::Dither,
+            0,
+            255,
+            noise(255)
+        ));
 
         // Copy path, same distinguishing pair. RGBA16 source would collapse
         // Threshold/Dither onto `alpha != 0`, which also rejects alpha 0, so
@@ -1250,7 +1260,11 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
         /// required-host-GPU convention rather than silently skipping.
         #[test]
         fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
-            dispatch_and_check("fragment-fn", shim_source(), "alpha_compare_fragment_fn_shim");
+            dispatch_and_check(
+                "fragment-fn",
+                shim_source(),
+                "alpha_compare_fragment_fn_shim",
+            );
         }
 
         /// Same required-host-GPU three-way check for the *characterization*
