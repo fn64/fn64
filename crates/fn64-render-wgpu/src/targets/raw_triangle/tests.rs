@@ -592,10 +592,7 @@ fn the_claimed_rectangle_is_the_bounding_box_of_the_covered_rows() {
 /// D = 4, which is `Shade` in `colorInputD`'s shared common table; alpha
 /// A/B/C at `Zero` (7) and D = 4, `Shade` in `alphaInputABD`.
 fn shade_passthrough_program() -> CombineParams {
-    let (ca, cb, cc, cd) = (8u32, 8u32, 16u32, 4u32);
-    let (aa, ab, ac, ad) = (7u32, 7u32, 7u32, 4u32);
-    let low = (ca << 5) | cc;
-    let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+    let (low, high) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_SHADE);
     CombineParams::from_wire(low, high)
 }
 
@@ -622,34 +619,30 @@ fn shade_passthrough_program() -> CombineParams {
 ///   colour (0, 16)  d/dx (8, 24)  d/de (32, 48)  d/dy (40, 56)
 fn shaded_triangle(red: (i32, i32, i32)) -> RawTriangle {
     let (base, dcdx, dcde) = red;
-    let mut halves = [0u32; 16];
-    let put = |halves: &mut [u32; 16], integer_byte: usize, fraction_byte: usize, value: i32| {
-        // R occupies the HIGH half of the first u32 of each pair.
-        halves[integer_byte / 4] |= ((value >> 16) as u32 & 0xffff) << 16;
-        halves[fraction_byte / 4] |= (value as u32 & 0xffff) << 16;
-    };
-    put(&mut halves, 0, 16, base);
-    put(&mut halves, 8, 24, dcdx);
-    put(&mut halves, 32, 48, dcde);
+    // Only the R component is driven; G/B/A stay zero.
+    let halves = crate::wire_words::coefficient_halves(
+        [base, 0, 0, 0],
+        [dcdx, 0, 0, 0],
+        [dcde, 0, 0, 0],
+        [0, 0, 0, 0],
+    );
 
-    let mut bytes = Vec::with_capacity(64);
-    // The eight base-edge words: same box triangle, opcode 0x0c.
-    for word in [
-        (1u32 << 23) | 12,
-        12u32 << 16,
-        6 << 16,
-        0,
-        2 << 16,
-        0,
-        6 << 16,
-        0,
-    ] {
-        bytes.extend_from_slice(&word.to_be_bytes());
+    let mut bytes = crate::wire_words::EdgeWords {
+        lft: true,
+        yl: crate::wire_words::line(3),
+        ym: crate::wire_words::line(3),
+        yh: 0,
+        xl: crate::wire_words::px(6),
+        xh: crate::wire_words::px(2),
+        xm: crate::wire_words::px(6),
+        ..crate::wire_words::EdgeWords::zeroed()
     }
+    .bytes(crate::wire_words::RAW_TRIANGLE_SHADE);
     for half in halves {
         bytes.extend_from_slice(&half.to_be_bytes());
     }
-    RawTriangle::decode(0x0c, &bytes).expect("a shaded triangle is 32 + 64 bytes")
+    RawTriangle::decode(crate::wire_words::RAW_TRIANGLE_SHADE, &bytes)
+        .expect("a shaded triangle is 32 + 64 bytes")
 }
 
 fn shaded_shading() -> TexrectShading {
