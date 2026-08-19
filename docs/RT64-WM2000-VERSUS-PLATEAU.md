@@ -293,3 +293,45 @@ entries filled is that table's own count. It is NOT derived from how many
 controllers fn64 reports. So "every entry skipped" and "entries visited but no
 A" have to be told apart by measurement -- neither is predictable from the
 controller model.
+
+## CONFIRMED: the word-read gotcha the earlier note did not cover
+
+This card's existing gotcha paragraph covers HALFWORDS (`Rdram::store_h`
+writes at `backing_offset(vaddr) ^ 2`). It does not cover WORDS, and a probe
+that generalises the `^2` rule to 32-bit reads gets a plausible-looking wrong
+answer rather than an obvious one.
+
+`Rdram::store_backed_word` (`crates/fn64-cpu-runtime/src/runtime/host.rs:815-817`):
+
+```rust
+let p = Self::backing_offset(vaddr);
+self.mem[p..p + 4].copy_from_slice(&value.to_ne_bytes());
+```
+
+**no `^` swizzle at all, and `to_ne_bytes` -- native, i.e. LITTLE-endian.**
+So a word is read at the plain offset and decoded `from_le_bytes`.
+
+Measured cost of getting this wrong, from this lane's first probe build,
+which read words big-endian at the plain offset:
+
+| variable | wrong (BE) | right (LE) |
+|---|---|---|
+| `D_801702A4` | `0x60f32580` | **`0x8025F360`** |
+| `D_800FEF2C` | `0x04000000` | **`4`** |
+| `D_8011BF50[0]` | `0x01000000` | **`1`** |
+
+`0x60f32580` is not obviously wrong -- it is not zero, it is stable across
+every swap, and it looks like it could be a pointer. Every entry read derived
+from it (`ptr + 0x512 + i*0x88`) landed on unrelated memory and reported
+`ports=[0,0,0,0]`, which is exactly the "every entry skipped" answer this card
+set out to test for. **A probe bug produced the more interesting of the two
+hypotheses.** The rule: for any pointer read out of fn64's RDRAM, check it is
+KSEG0 (`0x80......`) before believing anything computed from it.
+
+Summary of the three access widths:
+
+| width | offset | byte order |
+|---|---|---|
+| word (`store_backed_word`) | `off` | little-endian |
+| halfword (`store_h`) | `off ^ 2` | little-endian |
+| byte (`store_b`) | `off ^ 3` | n/a |
