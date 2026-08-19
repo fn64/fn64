@@ -1116,12 +1116,13 @@ fn check_and_repair_symbol_dump(cfg: &mut RecompConfig, rom: &[u8]) -> String {
 /// rather than by importing the analysis back the other way.
 fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
     let mut combined = CrossCheck::default();
-    for section in &cfg.sections {
+    for (index, section) in cfg.sections.iter().enumerate() {
         let Some(words) = read_section_words(rom, section) else {
             continue;
         };
         let region = CodeRegion {
             name: section.name.clone(),
+            index,
             vram: section.vram,
             words: &words,
         };
@@ -1152,7 +1153,7 @@ fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
 fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> (usize, usize) {
     let mut applied = 0usize;
     let mut adopted = 0usize;
-    for section in &mut cfg.sections {
+    for (index, section) in cfg.sections.iter_mut().enumerate() {
         let mut functions: Vec<DumpFunction> = section
             .functions
             .iter()
@@ -1166,13 +1167,13 @@ fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> (usize, usi
             swallowed: check
                 .swallowed
                 .iter()
-                .filter(|e| e.region == section.name)
+                .filter(|e| e.region_index == index)
                 .cloned()
                 .collect(),
             uncovered: check
                 .uncovered
                 .iter()
-                .filter(|e| e.region == section.name)
+                .filter(|e| e.region_index == index)
                 .cloned()
                 .collect(),
             proven_roots: check.proven_roots,

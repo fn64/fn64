@@ -76,6 +76,9 @@ pub struct DumpFunction {
 #[derive(Clone, Debug)]
 pub struct CodeRegion<'a> {
     pub name: String,
+    /// Position of this section in the config's section list. Section NAMES
+    /// are not unique, so this is what a repair must be scoped by.
+    pub index: usize,
     pub vram: u32,
     pub words: &'a [u32],
 }
@@ -114,7 +117,15 @@ impl SplitRefusal {
 pub struct SwallowedEntry {
     /// The region (config section) the evidence and the containing function
     /// both live in.
+    ///
+    /// NOT unique: a config may declare many sections with the same name
+    /// (Super Mario 64 has 154 called `_main`). Scope repairs by
+    /// [`Self::region_index`], never by this.
     pub region: String,
+    /// The section's position in the config's section list. This IS unique,
+    /// and is the only safe key for applying a repair back to the right
+    /// section.
+    pub region_index: usize,
     /// The proven entry point: a `jal` immediate target.
     pub vram: u32,
     /// The dump function whose declared range swallowed it.
@@ -197,8 +208,11 @@ impl GapRefusal {
 /// `LOOKUP_TABLE` carries them once the dump is repaired.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UncoveredEntry {
-    /// The region (config section) the evidence lives in.
+    /// The region (config section) the evidence lives in. NOT unique — see
+    /// [`SwallowedEntry::region`]. Scope by [`Self::region_index`].
     pub region: String,
+    /// The section's position in the config's section list; unique.
+    pub region_index: usize,
     /// The proven entry point: a `jal` immediate target.
     pub vram: u32,
     /// The uncovered range this root starts: `[gap_start, gap_end)`.
@@ -567,6 +581,7 @@ pub fn cross_check_region(region: &CodeRegion<'_>, functions: &[DumpFunction]) -
             let refusal = classify_gap_adoption(region, gap_start, gap_end, *target);
             uncovered.push(UncoveredEntry {
                 region: region.name.clone(),
+                region_index: region.index,
                 vram: *target,
                 gap_start,
                 gap_end,
@@ -585,6 +600,7 @@ pub fn cross_check_region(region: &CodeRegion<'_>, functions: &[DumpFunction]) -
         });
         swallowed.push(SwallowedEntry {
             region: region.name.clone(),
+            region_index: region.index,
             vram: *target,
             containing_name: containing.name.clone(),
             containing_vram: containing.vram,
@@ -743,6 +759,7 @@ mod tests {
         let (words, functions) = uncovered_fixture();
         let region = CodeRegion {
             name: "bank4_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -803,6 +820,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "bank4_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -849,6 +867,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "bank4_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -874,6 +893,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -925,6 +945,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -986,6 +1007,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1046,6 +1068,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1102,6 +1125,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1125,6 +1149,7 @@ mod tests {
         let (words, functions) = uncovered_fixture();
         let region = CodeRegion {
             name: "bank4_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1149,6 +1174,44 @@ mod tests {
         assert_eq!(claimed, before);
     }
 
+    /// MUTATION GUARD for the section-scoping key. Config section NAMES are
+    /// not unique -- Super Mario 64's dump declares 154 sections all called
+    /// `_main`. Scoping a repair by name therefore applies every same-named
+    /// section's findings to every one of them: on SM64 that turned 154
+    /// uncovered entries into 805 adoptions, at ROM offsets belonging to
+    /// other sections.
+    ///
+    /// The entries must carry the section INDEX, which is unique, and that is
+    /// what a caller scopes by.
+    #[test]
+    fn entries_carry_a_unique_section_index_not_just_a_name() {
+        let (words, functions) = uncovered_fixture();
+        // Two DIFFERENT sections that share a name, as SM64's dump does.
+        let first = CodeRegion {
+            name: "_main".into(),
+            index: 7,
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let second = CodeRegion {
+            name: "_main".into(),
+            index: 11,
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let a = cross_check_region(&first, &functions);
+        let b = cross_check_region(&second, &functions);
+        assert_eq!(a.uncovered.len(), 1);
+        assert_eq!(b.uncovered.len(), 1);
+        assert_eq!(a.uncovered[0].region, b.uncovered[0].region, "same name");
+        assert_eq!(a.uncovered[0].region_index, 7);
+        assert_eq!(b.uncovered[0].region_index, 11);
+        assert_ne!(
+            a.uncovered[0].region_index, b.uncovered[0].region_index,
+            "the index must distinguish sections the name cannot"
+        );
+    }
+
     /// The diagnostic must NAME an uncovered entry and its evidence, so the
     /// build reports what the runtime would otherwise only discover as a
     /// trap 2,483 VI swaps into a run.
@@ -1157,6 +1220,7 @@ mod tests {
         let (words, functions) = uncovered_fixture();
         let region = CodeRegion {
             name: "bank4_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1198,6 +1262,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, j(0x8000_0014), NOP, NOP, NOP];
         let region = CodeRegion {
             name: "t".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1212,6 +1277,7 @@ mod tests {
         let words = [jal(0x8000_1000), NOP];
         let region = CodeRegion {
             name: "t".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1223,6 +1289,7 @@ mod tests {
         let words = [jal(0x8000_0014), NOP, NOP, NOP, jal(0x8000_0014), NOP];
         let region = CodeRegion {
             name: "t".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1244,6 +1311,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1272,6 +1340,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, 0x27BD_FFE0, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1305,6 +1374,7 @@ mod tests {
         let words = [jal(0x8000_0014), NOP, JR_RA, NOP, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1337,6 +1407,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1358,6 +1429,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1392,6 +1464,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1430,6 +1503,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1459,6 +1533,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1520,6 +1595,7 @@ mod tests {
         ];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1555,6 +1631,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "bank3_text".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1577,6 +1654,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, 0x27BD_FFE0, NOP, NOP, JR_RA, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1596,6 +1674,7 @@ mod tests {
         let words = [j(0x8000_000C), NOP, jal(0x8000_0010), NOP, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1611,6 +1690,7 @@ mod tests {
         let words = [JR_RA, NOP, NOP, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
@@ -1632,6 +1712,7 @@ mod tests {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP];
         let region = CodeRegion {
             name: "sec".into(),
+            index: 0,
             vram: 0x8000_0000,
             words: &words,
         };
