@@ -934,7 +934,21 @@ unreachable today or blocked behind another row.
   (`state.rs:841-852`, four banks), but its *reader* imposes no cross-lane
   agreement and no eight-byte validity requirement. wgpu promotes the write
   convention into a read precondition.
-- **Which lane is right: REFERENCE on `NonCanonicalTlutEntry`.** The decisive
+- **RESOLVED against the wgpu refusal, on RT64 evidence.** The pinned
+  port source `5473732a` settles both halves of this row.
+  `src/shaders/TextureDecoder.hlsli:179` is RT64's entire palette read --
+  `loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8)` over
+  `#define loadTLUT(a) TMEM.Load(uint2((a) & RDP_TMEM_MASK8, 0))` (`:28`)
+  -- so lanes 1..3 are never addressed and neither their contents nor
+  their validity can gate a read. RT64's *writer*
+  (`src/hle/rt64_rdp.cpp:368-397`, `loadWord<_, TLUT = true>`) does
+  quadricate, confirming the convention is write-side only. Both halves
+  of the wgpu refusal are removed: `read.rs`'s `read_canonical_tlut_entry`
+  is now `read_tlut_entry`, reading lane 0's two bytes, with lane 0's own
+  validity still required as `InvalidTexelByte`. `tmem_sample.wgsl` moved
+  with it, so the lanes stay converged. Measured on WM2000 as scout walls
+  4 and 5.
+- **Which lane was right: REFERENCE on `NonCanonicalTlutEntry`.** The decisive
   point is an internal inconsistency: wgpu's own
   `crates/fn64-render-wgpu/src/tmem/execute/load_tlut.rs:811-822` deliberately
   supports arbitrary wrapping TLUT bases (base 511 across the bank), which
@@ -963,7 +977,22 @@ unreachable today or blocked behind another row.
   reference's only low-half rules are for RGBA32 (`state.rs:766-767`,
   `:826-827`) and YUV (`:790-791`) — both genuine split-bank formats. A CI tile
   is not a split-bank format.
-- **Which lane is right: REFERENCE on the divergence; UNKNOWN on hardware.**
+- **RESOLVED, and NOT in the reference's favour.** The pinned RT64 port
+  source `5473732a` shows the low-half constraint is REAL, contrary to
+  this row's "invented" reading: `src/shaders/TextureDecoder.hlsli:162-163`
+  is `const uint addressMask = select_uint(or(isRgba32, usesTlut),
+  RDP_TMEM_MASK16, RDP_TMEM_MASK8)` with `RDP_TMEM_MASK16 = 0x7FF`
+  (`:15`), under the comment *"When using RGBA32 or TLUT, each sample only
+  addresses half of TMEM."* So RT64 scopes an enabled-TLUT index source to
+  one half exactly as it scopes RGBA32 -- the reference lane, which
+  constrains only RGBA32 and YUV, is the one missing a rule. What was
+  wrong on the wgpu side was the RESPONSE: RT64 applies the scope as a
+  MASK inside `implLoadTMEM` (`:17-25`), never as a refusal. wgpu now
+  wraps (`read.rs`'s `AddressScope::LowHalf`, `tmem_sample.wgsl`'s
+  `tmem_indexed_byte_address`), which keeps what the refusal protected --
+  an index read still cannot reach the palette's own half -- without
+  aborting a frame the RDP would draw. Measured on WM2000 as scout wall 3.
+- **Which lane was scored right at audit time: REFERENCE on the divergence; UNKNOWN on hardware.**
   wgpu's header calls this "the canonical low-half source … frozen by
   M4.3.3b" — a self-citation, not a hardware citation. Neither lane cites a
   measurement of what silicon does with a high-half CI tile, so this row is
