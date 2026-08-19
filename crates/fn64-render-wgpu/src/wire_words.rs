@@ -173,8 +173,21 @@ pub(crate) fn coefficient_halves(
 
 /// `SetOtherMode`'s two words: cycle type at bits 21..20 of the payload.
 pub(crate) const fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
-    [word(SET_OTHER_MODE, cycle_type << 20), low]
+    set_other_mode_bits(cycle_type, 0, low)
 }
+
+/// [`set_other_mode`] with extra HIGH-word bits ORed in beside the cycle type.
+///
+/// `high_bits` is the raw other-mode high word, which is where the texture
+/// perspective bit (19) lives -- a bit a triangle fixture must be able to set,
+/// since the perspective and non-perspective texture paths are two different
+/// scale factors and only one of them is what WM2000 uses.
+pub(crate) const fn set_other_mode_bits(cycle_type: u32, high_bits: u32, low: u32) -> [u32; 2] {
+    [word(SET_OTHER_MODE, cycle_type << 20 | high_bits), low]
+}
+
+/// Other-mode HIGH bit 19: `G_TP_PERSP`. Clear means `G_TP_NONE`.
+pub(crate) const OTHER_MODE_TEXTURE_PERSPECTIVE: u32 = 1 << 19;
 
 /// `SetCombine`'s two words, from the two packed bitfield slices.
 pub(crate) const fn set_combine(low: u32, high: u32) -> [u32; 2] {

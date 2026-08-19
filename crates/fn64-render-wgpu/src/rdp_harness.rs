@@ -28,8 +28,9 @@
 
 use crate::production::{WgpuBackend, WgpuCreateError};
 use crate::wire_words::{
-    line, set_combine, set_other_mode, set_prim_color, word, EdgeWords, D_SLOT_PRIMITIVE,
-    D_SLOT_SHADE, D_SLOT_TEXEL0, RAW_TRIANGLE_BASE_EDGE,
+    line, set_combine, set_other_mode, set_other_mode_bits, set_prim_color, word, EdgeWords,
+    D_SLOT_PRIMITIVE, D_SLOT_SHADE, D_SLOT_TEXEL0, OTHER_MODE_TEXTURE_PERSPECTIVE,
+    RAW_TRIANGLE_BASE_EDGE,
 };
 use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
 use fn64_render_ir::{
@@ -319,7 +320,7 @@ impl StagedTexture {
             TEXTURE_ADDRESS,
         ]);
         words.extend([
-            word(SET_TILE, 2 << 19 | line_words << 9),
+            word(SET_TILE, 2 << 19 | line_words << 9 | self.tmem_word_address),
             self.tile << 24,
         ]);
         // `SetTileSize`'s high S/T are 10.2 fixed point and INCLUSIVE, so a
@@ -337,6 +338,9 @@ impl StagedTexture {
             word(LOAD_BLOCK, 0),
             self.tile << 24 | (texel_count - 1) << 12,
         ]);
+        // `LoadBlock` writes to the tile descriptor's own TMEM address, so a
+        // second tile staged at a nonzero address lands beside the first
+        // rather than on top of it.
         words
     }
 
@@ -356,6 +360,7 @@ pub(crate) struct Rdp {
     width: u32,
     height: u32,
     cycle_type: CycleType,
+    other_mode_high: u32,
     other_mode_low: u32,
     combine: Option<(u32, u32)>,
     prim_color: Option<u32>,
@@ -379,6 +384,14 @@ pub(crate) struct StagedTexture {
     height: u32,
     /// The RGBA16 texels, row-major, big-endian, exactly `width * height`.
     texels: Vec<u16>,
+    /// The tile's TMEM word address. Two tiles staged at the same address
+    /// would clobber each other, making "sampled the wrong tile"
+    /// indistinguishable from "the second load overwrote the first".
+    tmem_word_address: u32,
+    /// How many of the packet's triangles this load is emitted AFTER. Zero
+    /// puts it before every draw; `n` puts it between triangle `n-1` and
+    /// triangle `n`.
+    after_triangles: usize,
 }
 
 #[allow(
@@ -393,6 +406,7 @@ impl Rdp {
             width,
             height,
             cycle_type: CycleType::One,
+            other_mode_high: 0,
             other_mode_low: 0,
             combine: None,
             prim_color: None,
@@ -408,6 +422,14 @@ impl Rdp {
 
     pub(crate) fn other_mode_low(mut self, low: u32) -> Self {
         self.other_mode_low = low;
+        self
+    }
+
+    /// Sets `G_TP_PERSP` (other-mode high bit 19), selecting the perspective
+    /// texture path -- the one WM2000's own triangles use, and the one whose
+    /// scale factor differs from `G_TP_NONE`'s.
+    pub(crate) fn texture_perspective(mut self) -> Self {
+        self.other_mode_high |= OTHER_MODE_TEXTURE_PERSPECTIVE;
         self
     }
 
@@ -449,23 +471,51 @@ impl Rdp {
         self
     }
 
-    /// Stages one RGBA16 texture into `tile`, loaded BEFORE every triangle in
-    /// the same packet, so `prefix_before` selects it for all of them.
+    /// Stages one RGBA16 texture into `tile`, emitted at the CURRENT builder
+    /// position -- i.e. after every triangle added so far and before every
+    /// triangle added next.
     ///
-    /// Several calls stage several loads in call order, each preceded by its
-    /// own `LoadSync` so the epoch strictly advances -- which is what makes a
-    /// "which load did this draw see" test possible at all.
+    /// So `.texture(..).triangle(a)` loads before `a`, while
+    /// `.triangle(a).texture(..).triangle(b)` puts the load BETWEEN them and
+    /// `prefix_before` gives `a` and `b` different TMEM. That interleaving is
+    /// the only shape that distinguishes a correct per-draw prefix selection
+    /// from a per-packet one.
+    ///
+    /// Each load carries its own `LoadSync`, so the epoch strictly advances
+    /// and a later load is genuinely a successor rather than a re-stage.
     pub(crate) fn texture(mut self, tile: u32, width: u32, height: u32, texels: Vec<u16>) -> Self {
         assert_eq!(
             texels.len() as u32,
             width * height,
             "a staged texture's texel count must be exactly width * height"
         );
+        self.texture_at(tile, width, height, texels, 0)
+    }
+
+    /// [`Rdp::texture`] with an explicit TMEM word address, so two tiles can
+    /// occupy DISJOINT TMEM and a fixture can tell "read the wrong tile" apart
+    /// from "the second load clobbered the first".
+    pub(crate) fn texture_at(
+        mut self,
+        tile: u32,
+        width: u32,
+        height: u32,
+        texels: Vec<u16>,
+        tmem_word_address: u32,
+    ) -> Self {
+        assert_eq!(
+            texels.len() as u32,
+            width * height,
+            "a staged texture's texel count must be exactly width * height"
+        );
+        let after_triangles = self.triangles.len();
         self.textures.push(StagedTexture {
             tile,
             width,
             height,
             texels,
+            tmem_word_address,
+            after_triangles,
         });
         self
     }
@@ -500,23 +550,42 @@ impl Rdp {
     /// The staged-state + triangle packet's wire words.
     fn draw_words(&self) -> Vec<u32> {
         let mut words = Vec::new();
-        words.extend(set_other_mode(self.cycle_type as u32, self.other_mode_low));
+        words.extend(set_other_mode_bits(
+            self.cycle_type as u32,
+            self.other_mode_high,
+            self.other_mode_low,
+        ));
         if let Some((low, high)) = self.combine {
             words.extend(set_combine(low, high));
         }
         if let Some(color) = self.prim_color {
             words.extend(set_prim_color(0, 0, color));
         }
-        // **Every load precedes every triangle**, so `prefix_before` gives
-        // each triangle the last staged texture. A test that needs a load
-        // BETWEEN two draws states that itself; this default is the shape
-        // WM2000's own packets have (nine loads, then the geometry).
-        for texture in &self.textures {
-            words.extend(texture.words());
-        }
+        // **Loads and triangles are INTERLEAVED by stream position**, not
+        // batched. Each texture names how many triangles precede it, so a
+        // fixture can put a load BETWEEN two draws -- which is the only shape
+        // that can tell "this draw saw load N" apart from "every draw saw the
+        // last load". WM2000's own triangle packets carry NINE loads each, so
+        // that distinction is live on the real ROM, not hypothetical.
         words.extend(self.set_color_image());
-        for triangle in &self.triangles {
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            for texture in self
+                .textures
+                .iter()
+                .filter(|texture| texture.after_triangles == index)
+            {
+                words.extend(texture.words());
+            }
             words.extend(triangle.words());
+        }
+        // Any texture staged after the last triangle still emits its load, so
+        // a fixture cannot silently lose one to an off-by-one.
+        for texture in self
+            .textures
+            .iter()
+            .filter(|texture| texture.after_triangles >= self.triangles.len())
+        {
+            words.extend(texture.words());
         }
         words
     }
