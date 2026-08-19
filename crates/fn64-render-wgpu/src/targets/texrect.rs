@@ -2925,16 +2925,90 @@ mod one_cycle_tests {
         );
     }
 
+    /// **The admitted-selector tables are pinned by value, not merely
+    /// consulted.**
+    ///
+    /// [`every_unmeasured_selector_is_refused`] derives its expectation
+    /// FROM [`ADMITTED_COLOR_INPUTS`]/[`ADMITTED_ALPHA_INPUTS`], so it
+    /// cannot notice a selector being added to those tables -- the
+    /// expectation moves with the mutation. Measured: a mutant inserting
+    /// `ColorInput::Shade` into `ADMITTED_COLOR_INPUTS` SURVIVED that sweep
+    /// once the sweep was taught the second (slice-scoped) admission rule.
+    ///
+    /// This test is the fixed point. The contents are the measured WM2000
+    /// window's selector set plus the register-backed widening, transcribed
+    /// here by hand so that widening the executor's admitted set requires
+    /// editing an explicit list in a test that says why.
+    #[test]
+    fn the_admitted_selector_tables_are_exactly_these() {
+        assert_eq!(
+            ADMITTED_COLOR_INPUTS,
+            [
+                ColorInput::Texel0,
+                ColorInput::Primitive,
+                ColorInput::Environment,
+                ColorInput::One,
+                ColorInput::Zero,
+                ColorInput::Texel0Alpha,
+                ColorInput::PrimitiveAlpha,
+                ColorInput::EnvAlpha,
+                ColorInput::PrimLodFrac,
+            ],
+            "ADMITTED_COLOR_INPUTS changed; a selector added here is a claim this executor \
+             evaluates it, which needs its own measurement and citation"
+        );
+        assert_eq!(
+            ADMITTED_ALPHA_INPUTS,
+            [
+                AlphaInput::Texel0,
+                AlphaInput::Primitive,
+                AlphaInput::Environment,
+                AlphaInput::One,
+                AlphaInput::Zero,
+                AlphaInput::PrimLodFrac,
+            ],
+            "ADMITTED_ALPHA_INPUTS changed; same rule as the color table"
+        );
+        // `Combined`/`CombinedAlpha` are deliberately NOT in either table:
+        // their admissibility is slice-scoped, not selector-scoped, and
+        // lives in `resolves_the_combined_selector`.
+        assert!(
+            !ADMITTED_COLOR_INPUTS.contains(&ColorInput::Combined)
+                && !ADMITTED_COLOR_INPUTS.contains(&ColorInput::CombinedAlpha)
+                && !ADMITTED_ALPHA_INPUTS.contains(&AlphaInput::Combined),
+            "the COMBINED selectors must stay out of the flat tables, or the slice rule is \
+             bypassed for a two-cycle program's first cycle"
+        );
+    }
+
     /// The other unmeasured selectors are refused too, each by name -- not
     /// only `Shade`. Swept over every selector the wire can express in
     /// color slot A and alpha slot A, so a selector added to `ColorInput`
     /// later cannot be silently admitted.
+    ///
+    /// **Admission has two independent rules, and the sweep must model
+    /// both.** [`ADMITTED_COLOR_INPUTS`]/[`ADMITTED_ALPHA_INPUTS`] are the
+    /// register-and-texel table, and
+    /// [`CombinerProgramSlice::resolves_the_combined_selector`] is a
+    /// separate slice-scoped rule for `Combined`/`CombinedAlpha`, which are
+    /// deliberately absent from those tables because their admissibility
+    /// depends on the cycle mode rather than on the selector alone. This
+    /// sweep runs `validate_one_cycle`, so for it the second rule says
+    /// `Combined` IS admitted -- it reads RT64's zero-initialized
+    /// accumulator (`rt64_color_combiner.h:470-471`, `611-620`). Deriving
+    /// the expectation from the table alone would assert the opposite and
+    /// contradict the gate this crate actually ships.
     #[test]
     fn every_unmeasured_selector_is_refused() {
         for index in 0u32..16 {
             let params = pack_second_cycle([index, 8, 16, 7], [7, 7, 7, 7]);
             let input = params.decode_color(ColorInputSlot::A, true);
-            let admitted = ADMITTED_COLOR_INPUTS
+            // Both admission rules, exactly as `admits_color` composes
+            // them -- see this test's own doc.
+            let admitted = matches!(
+                input,
+                ColorInput::Combined | ColorInput::CombinedAlpha
+            ) || ADMITTED_COLOR_INPUTS
                 .iter()
                 .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
@@ -2962,7 +3036,8 @@ mod one_cycle_tests {
         for index in 0u32..8 {
             let params = pack_second_cycle([8, 8, 16, 7], [index, 7, 7, 7]);
             let input = params.decode_alpha(AlphaInputSlot::A, true);
-            let admitted = ADMITTED_ALPHA_INPUTS
+            let admitted = matches!(input, AlphaInput::Combined)
+                || ADMITTED_ALPHA_INPUTS
                 .iter()
                 .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
