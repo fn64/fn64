@@ -835,10 +835,20 @@ fn neutral_pixel_size(size: fn64_render::NeutralPixelSize) -> PixelSize {
 ///
 /// Constructed by [`Self::try_new`], which refuses -- by name, before any
 /// pixel is written -- every combiner selector this executor does not
-/// evaluate. `Primitive` and `Environment` are `Option` because the
-/// registers are genuinely unset until their own wire command runs, and a
-/// program that reads an unset register is a named refusal rather than a
-/// silently-black default.
+/// evaluate.
+///
+/// `Primitive` and `Environment` are **not** `Option`: they name RDP
+/// registers, which always hold a value (zero until the guest writes one).
+/// `fn64-render-reference` models the constant color registers as
+/// zero-initialized `[u8; 4]` (`gbi/state.rs:227`, `:387`) and RT64's own
+/// C++ zero-initializes `primColor`/`envColor` at
+/// `src/hle/rt64_state.cpp:126-129`. The refusal this replaced invented an
+/// "unset" state the hardware has no way to be in.
+///
+/// This is a different question from the selector refusals above, which
+/// stay: a register's power-on zero is its **real content**, whereas
+/// `Shade`/`Noise`/`K4`/`K5` have no register behind them at all and would
+/// combine against a value this executor made up.
 ///
 /// Not a `CombinerInputs` itself: that struct is per-pixel (its `tex_val0`
 /// changes on every texel), whereas this is the per-rectangle half. The
@@ -847,8 +857,8 @@ fn neutral_pixel_size(size: fn64_render::NeutralPixelSize) -> PixelSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TexrectShading {
     combine: CombineParams,
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
+    env_color: Color4,
+    prim_color: PrimColor,
 }
 
 /// Every color selector this executor evaluates.
@@ -1004,11 +1014,7 @@ impl TexrectShading {
     /// would check a program that never runs. This function and
     /// `run_one_cycle` must agree on which slice they read or the gate
     /// would admit one program and evaluate another.
-    pub fn new(
-        combine: CombineParams,
-        env_color: Option<Color4>,
-        prim_color: Option<PrimColor>,
-    ) -> Self {
+    pub fn new(combine: CombineParams, env_color: Color4, prim_color: PrimColor) -> Self {
         Self {
             combine,
             env_color,
@@ -1099,16 +1105,13 @@ impl TexrectShading {
                     matches!(input, AlphaInput::Primitive | AlphaInput::PrimLodFrac);
             }
         }
-        if reads_env && env_color.is_none() {
-            return Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Environment,
-            });
-        }
-        if reads_prim && prim_color.is_none() {
-            return Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Primitive,
-            });
-        }
+        // No refusal for a never-written `SetEnvColor`/`SetPrimColor`: both
+        // are RDP registers holding their power-on zero until the guest
+        // writes them (see this type's own doc). `reads_env`/`reads_prim`
+        // are still computed above because the *selector* admission checks
+        // below them depend on the same walk, and because a future consumer
+        // that genuinely cannot supply a register needs the same tracking.
+        let _ = (reads_env, reads_prim);
         Ok(Self {
             combine,
             env_color,
@@ -1130,11 +1133,11 @@ impl TexrectShading {
     /// incapable of disagreeing about the normalization
     /// ([`Color4::normalized`]'s `/ 255.0`) or about `prim_lod_frac`.
     ///
-    /// The unset case substitutes `Color4::from_wire(0)`, which is
-    /// unreachable for any register the program actually reads --
-    /// [`Self::try_new`] refused that combination already. It is a total
-    /// function's answer for a register nothing consults, not a default
-    /// that could reach a pixel.
+    /// There is no "unset case" to substitute for any more: both registers
+    /// carry their real contents, which are zero until the guest writes
+    /// them (see this type's own doc). A program reading `Environment`
+    /// before any `SetEnvColor` therefore combines against the register's
+    /// actual power-on value rather than aborting.
     fn base_inputs(self) -> CombinerInputs {
         combiner_inputs_from_fragment_registers(
             CombinerInputs {
@@ -1151,8 +1154,8 @@ impl TexrectShading {
                 k4: 0.0,
                 k5: 0.0,
             },
-            self.env_color.unwrap_or(Color4::from_wire(0)),
-            self.prim_color.unwrap_or(PrimColor::from_wire(0, 0)),
+            self.env_color,
+            self.prim_color,
         )
     }
 }
@@ -1253,7 +1256,7 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     // this executor cannot evaluate exactly refuses with an untouched
     // target rather than a half-drawn one. Copy cycle passes through with
     // `cycle_count() == 0`, which is the RDP's own blender bypass.
-    let blend_state = blend_registers.mode_state(other_mode)?;
+    let blend_state = blend_registers.mode_state(other_mode);
     require_blendable_mode(blend_state)?;
     // The other three post-combiner stages, admitted at the same point and
     // for the same reason: a mode this executor cannot evaluate exactly
@@ -1556,58 +1559,42 @@ fn combine_one_texel(
 ///
 /// Separate from [`TexrectShading`] because these feed a different stage:
 /// the combiner never reads `SetBlendColor`, and the blender never reads
-/// `SetPrimColor`. Both are `Option` for the same reason `TexrectShading`'s
-/// are -- a register is genuinely unset until its own wire command runs,
-/// and a blender cycle that selects an unset one is a named refusal rather
-/// than a silently-black default.
+/// `SetPrimColor`.
+///
+/// Neither is an `Option`. `SetBlendColor` and `SetFogColor` name RDP
+/// registers, and a register always holds a value -- zero until the guest
+/// writes one. `fn64-render-reference` models both as zero-initialized
+/// `[u8; 4]` (`gbi/state.rs:227-228`, `:387-388`) and RT64's own C++
+/// zero-initializes `fogColor`/`blendColor` at
+/// `src/hle/rt64_state.cpp:130-131`. Treating "never written" as a refusal
+/// invented a state the hardware has no way to be in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TexrectBlendRegisters {
-    blend_color: Option<Color4>,
-    fog_color: Option<Color4>,
+    blend_color: Color4,
+    fog_color: Color4,
 }
 
 impl TexrectBlendRegisters {
-    pub const fn new(blend_color: Option<Color4>, fog_color: Option<Color4>) -> Self {
+    pub const fn new(blend_color: Color4, fog_color: Color4) -> Self {
         Self {
             blend_color,
             fog_color,
         }
     }
 
-    /// Assembles the [`BlendModeState`] [`blend_fragment`] consumes,
-    /// refusing by name when an active cycle selects a register no wire
-    /// command has set.
+    /// Assembles the [`BlendModeState`] [`blend_fragment`] consumes.
     ///
-    /// The substituted `[0; 4]` for an unset register is unreachable for
-    /// any register a cycle actually selects -- this function refused that
-    /// combination already -- exactly as [`TexrectShading::base_inputs`]'s
-    /// own `Color4::from_wire(0)` substitution is.
-    fn mode_state(self, other_mode: OtherMode) -> Result<BlendModeState, TexrectExecutionError> {
-        let state = BlendModeState {
+    /// No refusal for a never-written register: both registers always hold
+    /// a value (see this type's own doc), so a cycle selecting `Blend` or
+    /// `Fog` before any `SetBlendColor`/`SetFogColor` reads the power-on
+    /// zero, which is what both other lanes do. The bytes here are the
+    /// register's real contents, not a substitution.
+    fn mode_state(self, other_mode: OtherMode) -> BlendModeState {
+        BlendModeState {
             other_mode,
-            blend_color_register: self.blend_color.map_or([0u8; 4], Color4::rgba8),
-            fog_color: self.fog_color.map_or([0u8; 4], Color4::rgba8),
-        };
-        let cycle_count = state.cycle_count();
-        for cycle_index in 0..cycle_count {
-            let cycle = state.cycle(cycle_index);
-            let reads_blend = matches!(cycle.p, crate::blend::BlendColorInput::Blend)
-                || matches!(cycle.m, crate::blend::BlendColorInput::Blend);
-            let reads_fog = matches!(cycle.p, crate::blend::BlendColorInput::Fog)
-                || matches!(cycle.m, crate::blend::BlendColorInput::Fog)
-                || matches!(cycle.a, crate::blend::BlendAlphaInput::Fog);
-            if reads_blend && self.blend_color.is_none() {
-                return Err(TexrectExecutionError::UnsetConstantRegister {
-                    register: TexrectConstantRegister::Blend,
-                });
-            }
-            if reads_fog && self.fog_color.is_none() {
-                return Err(TexrectExecutionError::UnsetConstantRegister {
-                    register: TexrectConstantRegister::Fog,
-                });
-            }
+            blend_color_register: self.blend_color.rgba8(),
+            fog_color: self.fog_color.rgba8(),
         }
-        Ok(state)
     }
 }
 
@@ -1679,10 +1666,13 @@ impl core::fmt::Display for TexrectNoiseStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TexrectFragmentStages {
     alpha_compare: AlphaCompare,
-    /// `G_SETBLENDCOLOR.a`, the `G_AC_THRESHOLD` comparand. `None` when no
-    /// `SetBlendColor` has run; only read when `alpha_compare` is
-    /// `Threshold`, and refused by name in that case.
-    threshold_alpha: Option<u8>,
+    /// `G_SETBLENDCOLOR.a`, the `G_AC_THRESHOLD` comparand. Always a real
+    /// byte: the register holds zero until the guest writes it, so a
+    /// `Threshold` compare with no `SetBlendColor` tests `alpha >= 0`,
+    /// which passes -- the reference lane's own behaviour
+    /// (`raster/blend.rs:113` against the zero-initialized
+    /// `other_mode.blend_color_alpha`).
+    threshold_alpha: u8,
     alpha_dither: AlphaDither,
     rgb_dither: RgbDither,
     coverage_times_alpha: bool,
@@ -1718,7 +1708,7 @@ impl TexrectFragmentStages {
     /// ([`TexrectExecutionError::DestinationCoverageUnavailable`]).
     pub fn try_new(
         other_mode: OtherMode,
-        blend_color: Option<Color4>,
+        blend_color: Color4,
     ) -> Result<Self, TexrectExecutionError> {
         let alpha_compare = other_mode.alpha_compare();
         match alpha_compare {
@@ -1730,11 +1720,11 @@ impl TexrectFragmentStages {
                 })
             }
         }
-        if matches!(alpha_compare, AlphaCompare::Threshold) && blend_color.is_none() {
-            return Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Blend,
-            });
-        }
+        // No refusal for a never-written `SetBlendColor` under
+        // `Threshold`: the register holds its power-on zero, so the
+        // comparand is 0 and every fragment passes. That is what the
+        // reference lane computes and what RT64's zero-initialized
+        // `blendColor` produces.
 
         let alpha_dither = other_mode.alpha_dither();
         let rgb_dither = other_mode.rgb_dither();
@@ -1826,7 +1816,7 @@ impl TexrectFragmentStages {
         };
         Ok(Self {
             alpha_compare,
-            threshold_alpha: blend_color.map(|color| color.rgba8()[3]),
+            threshold_alpha: blend_color.rgba8()[3],
             alpha_dither,
             rgb_dither,
             coverage_times_alpha: other_mode.coverage_times_alpha(),
@@ -2187,23 +2177,18 @@ fn blend_and_write_pixel(
 /// before any pixel was produced.
 ///
 /// # Errors
-/// [`TexrectExecutionError::UnsetConstantRegister`] if `Threshold` is
-/// selected with no `SetBlendColor` staged. Also refused in `try_new`; kept
-/// here so the invariant holds at the point it is relied on rather than
-/// only where it was checked.
+/// [`TexrectExecutionError::NoiseThresholdUnavailable`] for the dither and
+/// reserved encodings, which [`TexrectFragmentStages::try_new`] already
+/// refused; kept here so the invariant holds at the point it is relied on
+/// rather than only where it was checked. `Threshold` needs no error of its
+/// own -- `G_SETBLENDCOLOR.a` is always a real byte.
 fn alpha_compare_texrect_fragment(
     stages: TexrectFragmentStages,
     alpha: u8,
 ) -> Result<bool, TexrectExecutionError> {
     let threshold_alpha = match stages.alpha_compare {
         AlphaCompare::None => 0,
-        AlphaCompare::Threshold => {
-            stages
-                .threshold_alpha
-                .ok_or(TexrectExecutionError::UnsetConstantRegister {
-                    register: TexrectConstantRegister::Blend,
-                })?
-        }
+        AlphaCompare::Threshold => stages.threshold_alpha,
         AlphaCompare::Reserved | AlphaCompare::Dither => {
             return Err(TexrectExecutionError::NoiseThresholdUnavailable {
                 stage: TexrectNoiseStage::AlphaCompareDither,
