@@ -445,19 +445,20 @@ pub fn read_texel<S: TmemByteSource + ?Sized>(
     lut_mode: TextureLutMode,
 ) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
     let kind = preflight(tile, lut_mode)?;
-    validate_address_scope(tile, addressed, lut_mode, kind)?;
+    validate_address_scope(tile, kind)?;
+    let scope = AddressScope::of(tile, kind);
     let snapshot = state.snapshot();
     let texel = match kind {
         ReadKind::Direct => {
-            let raw = read_raw_texel(state, tile, addressed)?;
+            let raw = read_raw_texel(state, tile, addressed, scope)?;
             decode_direct_texel(tile.format(), raw)?
         }
         ReadKind::Indexed { palette } => {
-            let raw_index = read_raw_texel(state, tile, addressed)?;
+            let raw_index = read_raw_texel(state, tile, addressed, scope)?;
             match resolve_indexed_texel(tile.format(), raw_index, palette, lut_mode)? {
                 ResolvedIndexedTexel::Direct(texel) => texel,
                 ResolvedIndexedTexel::Tlut(lookup) => {
-                    let entry = read_canonical_tlut_entry(state, lookup.byte_address())?;
+                    let entry = read_tlut_entry(state, lookup.byte_address())?;
                     decode_tlut_entry(lookup, entry)?
                 }
             }
@@ -480,31 +481,85 @@ fn preflight(
     Ok(ReadKind::Indexed { palette })
 }
 
+/// The one address-scope preflight, now carrying only the refusal that
+/// survives hardware comparison.
+///
+/// The enabled-TLUT low-half rule has NOT been dropped -- it moved from a
+/// refusal to a mask, in [`AddressScope`] below, which is what RT64 does.
+/// See that type's doc for the citation.
 fn validate_address_scope(
     tile: TileDescriptor,
-    addressed: AddressedTmemTexel,
-    lut_mode: TextureLutMode,
     kind: ReadKind,
 ) -> Result<(), PhysicalTexelReadError> {
     let base = tile.tmem().get() * 8;
     if matches!(kind, ReadKind::Direct) && tile.size() == PixelSize::Bits32 && base >= 0x0800 {
         return Err(PhysicalTexelReadError::Rgba32BaseOutsideLowHalf { byte_address: base });
     }
-    if matches!(kind, ReadKind::Indexed { .. }) && lut_mode != TextureLutMode::Disabled {
-        let address = first_physical_byte(tile, addressed);
-        if address >= TMEM_HIGH_HALF_BASE {
-            return Err(PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf {
-                byte_address: address,
-            });
+    Ok(())
+}
+
+/// How far a read may address before it wraps.
+///
+/// The RDP masks a texel's TMEM address rather than trapping it, and the
+/// mask depends on whether the read scopes to one 2 KiB half. RT64's
+/// `src/shaders/TextureDecoder.hlsli:162-163` states the whole rule in one
+/// line:
+///
+/// ```text
+/// // Determine the TMEM address mask. When using RGBA32 or TLUT, each
+/// // sample only addresses half of TMEM.
+/// const uint addressMask =
+///     select_uint(or(isRgba32, usesTlut), RDP_TMEM_MASK16, RDP_TMEM_MASK8);
+/// ```
+///
+/// with `RDP_TMEM_MASK16 = 0x7FF` and `RDP_TMEM_MASK8 = 0xFFF` (`:14-15`),
+/// applied inside `implLoadTMEM` (`:17-25`) as
+/// `TMEM.Load(((finalAddress & maskAddress) | orAddress) & RDP_TMEM_MASK8)`.
+///
+/// So an enabled-TLUT index source IS confined to the low half -- that
+/// constraint is real, not invented here -- but hardware confines it by
+/// wrapping. Wrapping keeps the property the old refusal existed to
+/// protect (a TLUT-enabled index read can never reach the palette's own
+/// half and paint palette bytes as image data) without refusing a frame
+/// the RDP would have drawn. RGBA32 in this same file has always been
+/// handled this way, by [`rgba32_low_address`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressScope {
+    /// The full 4 KiB, mask `0x0fff`.
+    FullTmem,
+    /// One 2 KiB half, mask `0x07ff`.
+    LowHalf,
+}
+
+impl AddressScope {
+    const fn mask(self) -> u64 {
+        match self {
+            Self::FullTmem => TMEM_ADDRESS_MASK,
+            Self::LowHalf => TMEM_LOW_HALF_MASK,
         }
     }
-    Ok(())
+
+    /// RT64's `or(isRgba32, usesTlut)`, in this reader's own terms. The
+    /// `ReadKind::Indexed` arm is reached only under an enabled TLUT
+    /// (`preflight` classifies a TLUT-disabled CI tile through
+    /// `resolve_indexed_texel`, which refuses it long before here), and
+    /// `PixelSize::Bits32` is the RGBA32 half of the same disjunction.
+    const fn of(tile: TileDescriptor, kind: ReadKind) -> Self {
+        if matches!(kind, ReadKind::Indexed { .. }) {
+            return Self::LowHalf;
+        }
+        match tile.size() {
+            PixelSize::Bits32 => Self::LowHalf,
+            _ => Self::FullTmem,
+        }
+    }
 }
 
 fn read_raw_texel<S: TmemByteSource + ?Sized>(
     state: &S,
     tile: TileDescriptor,
     addressed: AddressedTmemTexel,
+    scope: AddressScope,
 ) -> Result<RawTexel, PhysicalTexelReadError> {
     match tile.size() {
         PixelSize::Bits4 => {
@@ -512,7 +567,7 @@ fn read_raw_texel<S: TmemByteSource + ?Sized>(
                 PixelSize::Bits8,
                 u32::from(read_valid_byte(
                     state,
-                    first_physical_byte(tile, addressed),
+                    first_physical_byte(tile, addressed, scope),
                 )?),
             )?;
             let parity = if addressed.column() & 1 == 0 {
@@ -526,12 +581,12 @@ fn read_raw_texel<S: TmemByteSource + ?Sized>(
             PixelSize::Bits8,
             u32::from(read_valid_byte(
                 state,
-                first_physical_byte(tile, addressed),
+                first_physical_byte(tile, addressed, scope),
             )?),
         )
         .map_err(Into::into),
         PixelSize::Bits16 => {
-            let bytes = read_linear_bytes::<2, S>(state, tile, addressed)?;
+            let bytes = read_linear_bytes::<2, S>(state, tile, addressed, scope)?;
             RawTexel::try_new(PixelSize::Bits16, u32::from(u16::from_be_bytes(bytes)))
                 .map_err(Into::into)
         }
@@ -552,12 +607,13 @@ fn read_linear_bytes<const N: usize, S: TmemByteSource + ?Sized>(
     state: &S,
     tile: TileDescriptor,
     addressed: AddressedTmemTexel,
+    scope: AddressScope,
 ) -> Result<[u8; N], PhysicalTexelReadError> {
     let linear = linear_byte_address(tile, addressed);
     let exchange = odd_row_exchange(addressed);
     let mut bytes = [0; N];
     for (offset, byte) in bytes.iter_mut().enumerate() {
-        let address = ((linear + offset as u64) & TMEM_ADDRESS_MASK) as u16;
+        let address = ((linear + offset as u64) & scope.mask()) as u16;
         let address = if exchange { address ^ 4 } else { address };
         *byte = read_valid_byte(state, address)?;
     }
@@ -573,45 +629,64 @@ fn read_valid_byte<S: TmemByteSource + ?Sized>(
         .ok_or(PhysicalTexelReadError::InvalidTexelByte { address })
 }
 
-fn read_canonical_tlut_entry<S: TmemByteSource + ?Sized>(
+/// Reads one TLUT entry: the FIRST quadricated lane, and only that lane.
+///
+/// The RDP quadricates on `LoadTLUT` -- one 16-bit palette entry into all
+/// four 16-bit lanes of the 64-bit word -- and this crate's loader does
+/// too (`tmem/execute/load_tlut.rs`'s `map_physical_lanes`), matching
+/// RT64's `src/hle/rt64_rdp.cpp:368-397` (`loadWord<_, TLUT = true>`,
+/// which masks the RDRAM offset to `& 0x1` and stores all eight bytes).
+///
+/// That is a WRITE-side convention. It used to be enforced here as a
+/// READ-side precondition -- all eight bytes valid
+/// (`IncompleteTlutEntry`) and all four lanes equal
+/// (`NonCanonicalTlutEntry`) -- and neither half survives comparison
+/// with the hardware model this crate ports. RT64's palette read is one
+/// line, `src/shaders/TextureDecoder.hlsli:179`:
+///
+/// ```text
+/// const uint paletteValue =
+///     loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8);
+/// ```
+///
+/// over `#define loadTLUT(a) TMEM.Load(uint2((a) & RDP_TMEM_MASK8, 0))`
+/// (`:28`). Lanes 1..3 are never addressed, so RT64 can neither observe
+/// nor refuse a word whose lanes disagree or whose tail is unwritten.
+/// The in-tree reference lane reads the same two bytes and stops
+/// (`fn64-render-reference` `src/gbi/state.rs:853-869`, `read_tlut`).
+///
+/// The refusal was also self-inconsistent: this crate's own
+/// `load_tlut.rs` deliberately supports wrapping TLUT bases (base 511
+/// across the bank), which writes exactly the unequal lanes this
+/// function then refused to read.
+///
+/// What is KEPT is the rule that governs every other read in this file:
+/// a byte the reader actually addresses must have been written. Lane 0's
+/// two bytes are still required, and a missing one still raises
+/// [`PhysicalTexelReadError::InvalidTexelByte`] naming the exact address,
+/// rather than being invented as zero.
+fn read_tlut_entry<S: TmemByteSource + ?Sized>(
     state: &S,
     byte_address: u16,
 ) -> Result<RawTexel, PhysicalTexelReadError> {
-    let mut bytes = [0; 8];
-    let mut valid_mask = 0_u8;
-    for (lane, byte) in bytes.iter_mut().enumerate() {
-        let address = byte_address + lane as u16;
-        if let Some(value) = state.valid_byte(address) {
-            *byte = value;
-            valid_mask |= 1 << lane;
-        }
-    }
-    if valid_mask != u8::MAX {
-        return Err(PhysicalTexelReadError::IncompleteTlutEntry {
-            byte_address,
-            valid_mask,
-        });
-    }
-    let lanes = [
-        u16::from_be_bytes([bytes[0], bytes[1]]),
-        u16::from_be_bytes([bytes[2], bytes[3]]),
-        u16::from_be_bytes([bytes[4], bytes[5]]),
-        u16::from_be_bytes([bytes[6], bytes[7]]),
-    ];
-    if lanes[1..].iter().any(|lane| *lane != lanes[0]) {
-        return Err(PhysicalTexelReadError::NonCanonicalTlutEntry {
-            byte_address,
-            lanes,
-        });
-    }
-    RawTexel::try_new(PixelSize::Bits16, u32::from(lanes[0])).map_err(Into::into)
+    let high = read_valid_byte(state, byte_address)?;
+    let low = read_valid_byte(state, byte_address + 1)?;
+    RawTexel::try_new(
+        PixelSize::Bits16,
+        u32::from(u16::from_be_bytes([high, low])),
+    )
+    .map_err(Into::into)
 }
 
-fn first_physical_byte(tile: TileDescriptor, addressed: AddressedTmemTexel) -> u16 {
+fn first_physical_byte(
+    tile: TileDescriptor,
+    addressed: AddressedTmemTexel,
+    scope: AddressScope,
+) -> u16 {
     if tile.size() == PixelSize::Bits32 {
         return rgba32_low_address(tile, addressed);
     }
-    let address = (linear_byte_address(tile, addressed) & TMEM_ADDRESS_MASK) as u16;
+    let address = (linear_byte_address(tile, addressed) & scope.mask()) as u16;
     if odd_row_exchange(addressed) {
         address ^ 4
     } else {
