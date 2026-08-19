@@ -196,6 +196,19 @@ D20 is scored reference-correct on the narrow ground that the *inconsistency*
 is a defect regardless of which table wins; which table wins is D19 and is
 UNKNOWN.
 
+**Since measurement, one verdict has been overturned by later work rather
+than by re-argument.** D7 was scored a wgpu defect because the alpha-dither
+stage read a table that agreed with the reference while the disputed one
+lived in the RGB module. `51b4e184` deleted that duplicate -- correctly, since
+libultra makes the two paths read one table by definition -- so the alpha
+stage is now downstream of the disputed tile and the refusal is right.
+**Reclassify D7 from wgpu-side defect to blocked on D19**, which makes the
+standing counts 14 defects / 0 wgpu-correct / 6 UNKNOWN / 1 blocked-on-UNKNOWN.
+
+The general shape is worth carrying forward: a row whose evidence is *"two
+sites in one crate disagree"* can be discharged by making them agree, which
+changes the verdict without anyone touching the refusal it was scoring.
+
 Three structural causes account for eleven of the fifteen. This matters for
 sequencing: they are not eleven independent fixes.
 
@@ -205,11 +218,32 @@ sequencing: they are not eleven independent fixes.
    `RdramHiddenBits`) that `fn64-render-wgpu` does not maintain. Every wgpu
    refusal naming "coverage this backend does not track" is downstream of that
    one absence: **D1, D5, D8, D9.**
+
+   **Amended after working the rows.** Two corrections, both in the
+   direction of the cause being *narrower but deeper* than stated. (a) It is
+   not one datum but two: the sidecar holds the low two bits, and the
+   reference's rasterizer supplies the third through the visible LSB, which
+   on the wgpu lane holds `alpha >> 7` instead -- so wgpu recovers none of
+   the three bits, not one of three, and a sidecar alone would widen a field
+   nothing writes. D1's and D8's outcome blocks carry the sizing. (b) **D5
+   does not belong on this list except in one of its four cases.** Its
+   `wraps` term is a conjunction gated on `IM_RD`, so three of the four
+   `FORCE_BL`-clear cases settle with no coverage count at all; only the
+   fourth is downstream of the sidecar. Landed as `7ebe0647`.
 2. **Wiring gaps described as capability gaps.** `fn64-render-wgpu`'s own
    `combiner.rs`, `blend.rs`, `coverage.rs`, and `alpha_compare.rs` already
    implement behaviors that `targets/texrect.rs` refuses as unimplementable.
    Four refusal doc comments are factually contradicted by sibling modules in
    the same crate: **D2, D4, D5, D7.**
+
+   **Amended.** The pattern is real and was right about D2, D4 and D5, but
+   "a sibling module implements it" is necessary and not sufficient, and two
+   of the four rows needed splitting on exactly that. `crate::combiner`
+   implementing a selector means it can *read* a `CombinerInputs` field, not
+   that the executor can *fill* it -- so D4 is five wiring gaps and seven
+   genuine ones (`e50789de`). And D7's sibling module stopped contradicting
+   the refusal when `51b4e184` deduplicated its table. When applying cause 2,
+   check what feeds the sibling's inputs, not only that the sibling exists.
 3. **Cite-then-decline.** A doc comment names n64brew, RT64's
    `TextureDecoder.hlsli`, the SGI RDP Command Summary, or the reference lane,
    states what the source establishes, and then declares it out of scope:
@@ -257,6 +291,38 @@ unreachable today or blocked behind another row.
   or 1); this scanout implements only AA mode 3`
   ([`RT64-WM2000-REMAINING.md:25`](RT64-WM2000-REMAINING.md)). This is the
   highest-priority row in the table.
+
+- **SIZED, NOT LANDED (`4d7a45ac`). The refusal is kept, and the sidecar is
+  necessary but not sufficient.** The verdict above stands -- the reference
+  is right and wgpu is the only one of three lanes refusing -- but this
+  row's attribution to *one* missing datum is incomplete, and the missing
+  half changes the estimate.
+  1. **The sidecar is genuinely required.** `SourcePlane::coverage` can
+     express only 8 or 1, never 2..=7, and silhouette AA consumes the
+     magnitude as the blend weight `coverage/8` (`vi.rs:281-291`). A pixel
+     the RDP wrote at coverage 4 would blend 1/8 foreground against 7/8
+     estimated background. So cause 2 does **not** apply here: this is not
+     a wiring gap.
+  2. **A sidecar alone would not be enough, because this lane never
+     produces coverage to put in one.** The reference's sidecar is
+     populated by its own rasterizer -- `write_rgba5551_framebuffer` splits
+     `Coverage::stored()`, bit 2 into the visible halfword and bits 0..=1
+     into the sidecar (`backend/framebuffer_io.rs:143-190`), so on that
+     lane the visible LSB really is the coverage MSB. On the wgpu lane that
+     bit is **alpha**: `targets::pack_device_pixels`
+     (`targets/oracle.rs:128-131`) and the private `write_pixel`s in
+     `targets/fill.rs` and `targets/texrect.rs` all emit `alpha >> 7`, and
+     `crate::coverage::Coverage::stored()` has zero production callers.
+     wgpu's committed RDRAM carries no coverage information in any bit.
+
+  The real shape is two pieces, in order: a coverage stage that computes
+  and *retains* a per-pixel count through the draw path (the executors
+  derive one and discard it today -- `targets/texrect.rs`'s `coverage_for`
+  says so itself), then the 195-line sidecar for the two bits RGBA16 has no
+  room for. Building only the sidecar would produce a filter weighted by a
+  count that is still always 8 or 1. Pinned by
+  `this_lanes_rgba16_low_bit_is_alpha_not_a_coverage_msb`; the kept arm's
+  mutant is killed by three tests.
 #### D2 — Two-cycle texture rectangles · **REACHES WM2000: yes, by census**
 
 - **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:369`
@@ -380,6 +446,43 @@ unreachable today or blocked behind another row.
   `Combined` unread, so the *measured* programs stay inside the admitted set.
   Any program outside it aborts, and the window has never reached gameplay.
 
+- **PARTLY RESOLVED (`e50789de`): five of the twelve landed, seven kept.**
+  The premise is right and the conclusion needed splitting. `crate::combiner`
+  implementing a selector means it can *read* a `CombinerInputs` field, not
+  that the executor can *fill* it.
+
+  **Admitted** -- each resolves to a component of a value the executor
+  already sources from a real wire register, so evaluating it invents
+  nothing: `ColorInput::Texel0Alpha` (`texel0[3]`, the sampled texel's own
+  alpha), `ColorInput::PrimitiveAlpha` (`prim_color[3]`),
+  `ColorInput::EnvAlpha` (`env_color[3]`), and `PrimLodFrac` on both the
+  color and alpha sides (`PrimColor::lod().lod_frac_normalized()`, wired by
+  `combiner_inputs_from_fragment_registers`). The reference admits all of
+  these for rectangles.
+
+  **Kept, and this row should say so:** `LodFraction`, `Noise`, `K4`, `K5`,
+  `KeyCenter` and `KeyScale` read `TexrectShading::base_inputs` fields left
+  at **zero** -- there is no `SetConvert`/`SetKey` plumbing, no LOD stage,
+  and no noise authority. Admitting them would combine against an invented
+  zero, the failure the `Shade` refusal exists to prevent.
+  `Texel1`/`Texel1Alpha` stay refused because a rectangle binds one tile,
+  which is the reference's own reason (`validate.rs:479-483`).
+
+  The widening exposed a second, load-bearing half: `validate_combiner_
+  program`'s `reads_env`/`reads_prim` matched only the plain
+  `Environment`/`Primitive` variants, so admitting `EnvAlpha` /
+  `PrimitiveAlpha` / `PrimLodFrac` without widening that detection would
+  have let a program reading them with no `SetEnvColor`/`SetPrimColor`
+  staged fall through to `base_inputs`' `unwrap_or(Color4::from_wire(0))`
+  and combine against black. Both matches are widened.
+
+  Note for future rows: the pre-existing exhaustive sweep derived its
+  expectation from `ADMITTED_COLOR_INPUTS` itself, so it could not fail
+  when that constant changed. The new test
+  `register_backed_selectors_are_admitted_and_invented_ones_are_not` is
+  hand-derived instead. Four mutants killed, including the over-widen that
+  admits `K4`.
+
 #### D5 — Blender `blend_enabled` derivation · **REACHES WM2000: same texrect path as D4**
 
 - **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:498`
@@ -397,6 +500,31 @@ unreachable today or blocked behind another row.
   declines to follow it.**
 - **WM2000 reach.** Same texrect path as D4; the specific mode bits are
   unmeasured because the census does not decode `G_RDPSETOTHERMODE` payloads.
+
+- **RESOLVED (`7ebe0647`), and the refusal narrows rather than disappears.**
+  The row is right that the reference is the authority, but the refusal was
+  over-broad by exactly one conjunct rather than wholly wrong.
+  `wraps = image_read_enabled && sum > 8` is a **conjunction whose first
+  term is `image_read`**, so a clear `IM_RD` pins `wraps` to `false`
+  without the sum being formed at all, and `blend_enabled` collapses to
+  `antialias_enabled()`. No sidecar, no coverage stage, no D1 dependency:
+  `require_blendable_mode` now requires all three of `!FORCE_BL`, `AA_EN`
+  and `IM_RD` before refusing. The genuinely underivable case
+  (`FORCE_BL` clear, `AA_EN` set, `IM_RD` set) still refuses by name, and
+  that arm's mutant is killed by two tests.
+
+  This row's placement under structural cause 1 (the missing sidecar) is
+  therefore only two-thirds right: the sidecar bounds the *last* case, not
+  the whole refusal.
+
+  The widening exposed a second half the row does not mention:
+  `blend_texrect_fragment` hardcoded `blend_enabled = force_blend()`,
+  justified by an admitted set that no longer held. On the newly admitted
+  mode that expression is `false` where the RDP's is `true`, which would
+  have bypassed the blender silently. It is now the reference's disjunction
+  with `wraps` pinned `false` -- provably exact on every admitted mode.
+  Four mutants killed. WM2000's own mode (`0x005041c8`) sets all three
+  bits, so its behavior is unchanged.
 
 #### D6 — RGBA4 / RGBA8 aliasing to I4 / I8 · **REACHES WM2000: unmeasured; cite-then-decline**
 
@@ -443,6 +571,34 @@ unreachable today or blocked behind another row.
   which is the genuine unresolved table question.
 - **WM2000 reach.** Same texrect path as D4.
 
+- **VERDICT SUPERSEDED (`9063f83c`): the refusal is right after all, and
+  this row's premise expired between the audit and now.** The argument
+  above is sound *as of `4371d57a`* -- `alpha_compare.rs:175-176` really did
+  hold a `BAYER` byte-identical to the reference's, so the stage being
+  refused really did agree with the reference cell-for-cell.
+
+  **`51b4e184` deleted that duplicate.** libultra defines `G_AD_PATTERN`'s
+  threshold as *the currently selected RGB dither matrix*
+  (`gbi.h:674-678`), so one hardware quantity having two tables in one
+  crate was itself the defect -- whichever table is right, at most one of
+  the two sites could have been. `alpha_compare.rs` now reads
+  `crate::rgb_dither::ordered_tile_value`, pinned at every cell by
+  `rgb_dither.rs`'s `the_alpha_dither_path_reads_this_modules_tables`.
+
+  So the alpha stage is now downstream of the disputed tile **by
+  construction**, and `apply_alpha_dither`'s rounding
+  (`(alpha & 7) > threshold`) reads the threshold directly, making the
+  eight disputed cells observable in its output. The refusal is blocked on
+  **D19** -- which Bayer arrangement the RDP uses -- which this audit
+  itself scores UNKNOWN. Reclassify this row from *wgpu-side defect* to
+  *blocked on D19*. Pinned by
+  `the_alpha_dither_refusal_is_downstream_of_the_one_disputed_tile`, which
+  kills a mutant reintroducing the duplicate.
+
+  General lesson for this table: a row whose evidence is "two sites in one
+  crate disagree" can be discharged by making them agree, which changes the
+  verdict without anyone editing the refusal.
+
 
 ---
 
@@ -466,6 +622,16 @@ unreachable today or blocked behind another row.
 - **WM2000 reach.** UNKNOWN. The census counts opcodes and does not decode
   `G_RDPSETOTHERMODE` payload bits, so no evidence shows WM2000 selecting a
   coverage-consuming blend mode. Absence in the census window is not absence.
+
+- **REVIEWED, KEPT, and blocked behind D1's *two* prerequisites** (see D1's
+  outcome block). The row's own concession -- "refusing rather than guessing
+  from one third of the bits is the *correct local* call" -- is right, and
+  it is stronger than stated: wgpu recovers not one third of the bits but
+  **none**, because the visible LSB on this lane holds `alpha >> 7` rather
+  than a coverage MSB. `coverage_for`'s existing doc already derives the
+  one case that *is* determined (a texrect's `pixel == 8` forces
+  `sum >= 9 > 8`, so `wraps` is `true` regardless of the missing bits) and
+  refuses only where the missing part is observable. No change.
 #### D9 — VI divot filter · **REACHES WM2000: unmeasured**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:82`
