@@ -175,20 +175,24 @@ the very evidence a plateau claim rests on.** What separated them was a solo
 run of the same script reaching swap 2397 without incident. `WM2000_TRACE_PATH`
 gives each run its own sink.
 
-**A second cause produces the identical swap-1901 abort, and per-run trace
-paths do not fix it: host memory.** A later four-run wave with separate sinks
-aborted at swap 1901 in all four runs again. The tell was the trace sizes --
-three were *byte-identically* 61,940,485 bytes, while the wave that succeeded
-had reached ~142 MB per run. Each concurrent run holds its whole trace in
-memory alongside its RDRAM, and four of them plus the previous wave's leftover
-files exhausted the box. Running two at a time, and deleting each trace when
-its run ends, is what made the same scripts complete.
+**Swap 1901 recurs with per-run trace paths, and the cause is still open.** A
+later wave with separate sinks aborted at swap 1901 in all four runs. Host
+memory looked like the answer -- three traces were *byte-identically*
+61,940,485 bytes where the successful wave reached ~142 MB per run -- but
+halving the concurrency to two runs did not help: all four of those aborted at
+swap 1901 too. **So the memory explanation is not established, and is recorded
+here as tried and insufficient rather than as a finding.**
 
-The lesson generalises past this harness: **swap 1901 is not a fact about the
-guest.** Two unrelated host-side limits both terminate the run there, both in
-every concurrent run at once, and both wearing the shape of a reproducible
-plateau. Any claim that the ROM stops somewhere needs a solo run, or a
-resource-headroom check, before it is believed.
+What is solid is the negative: **swap 1901 is not a fact about the guest.** The
+same lead-in reached swap 2397 solo and swaps 4156-4431 in the four wave-1 runs
+that completed, so nothing in the ROM stops there. What separates the waves that
+complete from the waves that abort is not yet identified. Until it is, treat any
+run ending at 1901 as an infrastructure result, and confirm a plateau claim with
+a run that got past it.
+
+The abort itself is always the same shape -- a coroutine unwound through the
+`extern "C"` `_osRecvMesg_recomp` during `Executor` drop, which cannot unwind --
+so it is a teardown failure, and the frames written before it are still valid.
 
 Note that `WM2000_NO_TRACE=1` is not the fix, because the harness computes
 `dumps_disabled = trace_disabled || ...` -- turning off the trace also turns off
