@@ -5791,9 +5791,9 @@ mod tests {
                 },
                 tmem,
                 tile_binding,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::default(),
                 ResolvedFragmentBlendParams::NO_OP,
                 false,
             )
@@ -6013,9 +6013,9 @@ mod tests {
                 },
                 tmem,
                 tile_binding,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::default(),
                 ResolvedFragmentBlendParams::NO_OP,
                 false,
             )
@@ -6115,10 +6115,10 @@ mod tests {
             other_mode: OtherMode::from_wire(0, 0),
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
-            blend_color: None,
-            env_color: None,
-            prim_color: None,
-            fog_color: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::default(),
+            fog_color: Color4::from_wire(0),
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -6290,10 +6290,10 @@ mod tests {
             other_mode: OtherMode::from_wire(0, 0),
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
-            blend_color: None,
-            env_color: None,
-            prim_color: None,
-            fog_color: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::default(),
+            fog_color: Color4::from_wire(0),
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -7150,10 +7150,10 @@ mod tests {
             other_mode: framebuffer_alpha_blend_other_mode,
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
-            blend_color: None,
-            env_color: None,
-            prim_color: None,
-            fog_color: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::default(),
+            fog_color: Color4::from_wire(0),
         };
         let error = backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)
@@ -7225,10 +7225,10 @@ mod tests {
             other_mode: framebuffer_color_only_other_mode,
             combine_params: CombineParams::from_wire(0, 0),
             tile_binding: TileBindingParams::unbound(),
-            blend_color: None,
-            env_color: None,
-            prim_color: None,
-            fog_color: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::default(),
+            fog_color: Color4::from_wire(0),
         };
         backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)
@@ -7334,8 +7334,16 @@ mod tests {
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut collector = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -9759,8 +9767,16 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut plan_visitor = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -10078,8 +10094,16 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut plan_visitor = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -10248,8 +10272,7 @@ mod tests {
         // own journal -- a second, independent derivation of the identical
         // fact, hand-derived from the extent rather than read back from the
         // writes above.
-        let ranges =
-            declared_render_target_ranges(load_texrect_and_trailing_raw_triangle_words());
+        let ranges = declared_render_target_ranges(load_texrect_and_trailing_raw_triangle_words());
         assert_eq!(
             ranges.len(),
             TEXRECT_HEIGHT as usize,
@@ -10995,8 +11018,16 @@ mod tests {
             plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
-        let mut plan_visitor =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut plan_visitor = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -11643,8 +11674,16 @@ mod tests {
             .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
             .unwrap();
 
-        let mut plan_visitor =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut plan_visitor = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -11681,8 +11720,16 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let mut plan_visitor = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -13693,8 +13740,16 @@ mod tests {
     /// with a zeroed default would fail the second assertion.
     #[test]
     fn a_plan_collector_starts_from_the_durable_tile_registers() {
-        let unseeded =
-            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
+        let unseeded = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            [(None, None); 8],
+        );
         assert!(
             unseeded
                 .current_tiles
@@ -13800,7 +13855,16 @@ mod tests {
         assert_eq!(neutral_size.low_t, 0x0cba, "low_t is w0 bits 11:0");
         assert_eq!(neutral_size.high_s, 0x0abc, "high_s is w1 bits 23:12");
         assert_eq!(neutral_size.high_t, 0x0789, "high_t is w1 bits 11:0");
-        let seeded = PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, tiles);
+        let seeded = PlanCollector::seeded(
+            None,
+            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            tiles,
+        );
         assert_eq!(
             seeded.current_tiles[5], tiles[5],
             "a collector seeded from durable state must start with tile 5 already bound, \
