@@ -849,3 +849,38 @@ That a second controller changes guest execution is already visible: at step
 
 The one frame in this whole lane that shows a ring is attract-mode demo play at
 swap 560, which no input produced.
+
+### The loop has exact structure: a 40-swap cycle, deterministic
+
+Rendering the frame hashes as ids over swaps 3200-3300 shows the plateau is not
+merely "38 distinct frames" but a **clean 40-swap cycle** that repeats without
+drift:
+
+```
+0 1 2 2 2 3 4 5 ... 36 37 | 0 1 2 2 2 3 4 5 ... 36 37 | 0 1 2 2 2 ...
+```
+
+38 unique frames, one of them (id 2) held for three swaps, total period 40.
+The cycle is byte-identical on every repetition across 2,500 swaps.
+
+A screen that plays a fixed-length animation on a perfect loop while composing
+3.00 display lists per field is **healthy and idling**, waiting on a condition.
+It is not a stalled screen, not a crashed one, and not a rendering failure.
+That is what makes "the confirm is being consumed but does not satisfy the
+transition" the right description, and it is why more A presses cannot help.
+
+### Final numbers for the one-port lane
+
+Stopped deliberately at its budget, not aborted:
+
+| metric | value |
+|---|---|
+| max VI swap | **5021** |
+| traps / panics | **0 / 0** |
+| gfx rate, swaps 4000-5000 | **3.00 lists/field** |
+| audio rate | 1.83 tasks/swap |
+| distinct frames, swaps 4700-4995 | **38** |
+
+5021 is **2.3x** the 2149 that was the best previously recorded on the fixed
+tree. The run never degraded: the loop at swap 4995 is the same 38 frames as
+the loop at 2500.
