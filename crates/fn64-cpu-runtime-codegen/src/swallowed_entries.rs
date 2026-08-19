@@ -488,29 +488,39 @@ pub fn classify_gap_adoption(
     if word_at(gap_start).is_none() || word_at(gap_end.wrapping_sub(4)).is_none() {
         return Some(GapRefusal::OutOfRange);
     }
-    // Walk back from the end over `nop` tail padding; the last real word must
-    // be a `jr $ra` delay slot, with `jr $ra` immediately before it.
-    let mut tail = gap_end.wrapping_sub(4);
-    while tail > gap_start && word_at(tail) == Some(NOP) {
-        tail = tail.wrapping_sub(4);
-    }
-    // `tail` is now the delay slot of the terminating return (it may itself
-    // be a `nop`, in which case the loop above stopped only because the word
-    // before it is `jr $ra`; check that explicitly rather than assuming).
-    let mut candidate = tail;
-    loop {
-        if candidate <= gap_start {
+    // The range must END by returning. Scan back from the last word for a
+    // `jr $ra`, requiring everything after its delay slot to be `nop`
+    // alignment padding.
+    //
+    // The delay slot is very often itself a `nop`, so a naive "walk back over
+    // nops first" would consume it and then look one word too early. Instead
+    // try each candidate `jr $ra` position from the end backwards, and
+    // require every word after its delay slot to be `nop` — the same shape
+    // `classify_split` uses for the head side.
+    let mut ret = gap_end.wrapping_sub(8);
+    while ret >= gap_start {
+        if word_at(ret) == Some(JR_RA) {
+            let padding_is_clean = (ret.wrapping_add(8)..gap_end)
+                .step_by(4)
+                .all(|vram| word_at(vram) == Some(NOP));
+            return if padding_is_clean {
+                None
+            } else {
+                // A `jr $ra` followed by real instructions before the end
+                // means control resumed inside the range and then ran off it.
+                Some(GapRefusal::GapDoesNotReturn)
+            };
+        }
+        // Only `nop` may sit between a return's delay slot and the end.
+        if word_at(ret.wrapping_add(8)).is_some_and(|w| w != NOP) && ret.wrapping_add(8) < gap_end {
             return Some(GapRefusal::GapDoesNotReturn);
         }
-        if word_at(candidate.wrapping_sub(4)) == Some(JR_RA) {
-            return None;
+        match ret.checked_sub(4) {
+            Some(previous) => ret = previous,
+            None => break,
         }
-        // Only `nop` may separate the return's delay slot from the end.
-        if word_at(candidate) != Some(NOP) {
-            return Some(GapRefusal::GapDoesNotReturn);
-        }
-        candidate = candidate.wrapping_sub(4);
     }
+    Some(GapRefusal::GapDoesNotReturn)
 }
 
 /// Cross-check one region's dump functions against its `jal` evidence.
@@ -674,6 +684,273 @@ mod tests {
 
     fn j(target: u32) -> u32 {
         (OPCODE_J << 26) | ((target >> 2) & 0x03FF_FFFF)
+    }
+
+    /// `jr $ra` in the delay-slot-bearing shape used by the gap fixtures.
+    ///
+    /// Layout shared by the uncovered-entry tests below, derived by hand from
+    /// WM2000's `bank4_text` around `0x801226A0`:
+    ///
+    /// ```text
+    ///   0x80000000  jal 0x80000010     <- the caller, INSIDE this region
+    ///   0x80000004  nop                   (delay slot)
+    ///   0x80000008  jr $ra             <- `head` ends here
+    ///   0x8000000C  nop                   (delay slot)
+    ///   ---- head's declared range ends at 0x80000010 ----
+    ///   0x80000010  addiu $sp, $sp, -0x18   <- UNCOVERED entry, prologue
+    ///   0x80000014  jr $ra
+    ///   0x80000018  nop                     (delay slot)
+    ///   ---- gap ends at 0x8000001C ----
+    ///   0x8000001C  nop                <- `tail`, a declared function
+    /// ```
+    fn uncovered_fixture() -> ([u32; 8], Vec<DumpFunction>) {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            0x27BD_FFE8, // addiu $sp, $sp, -0x18
+            JR_RA,
+            NOP,
+            NOP,
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_001C,
+                size: 0x4,
+            },
+        ];
+        (words, functions)
+    }
+
+    /// FAILS BEFORE this change (`cross_check_region` skipped every `jal`
+    /// target claimed by no declared function, so `uncovered` was empty and
+    /// the address stayed undispatchable); PASSES AFTER.
+    ///
+    /// This is the reduced form of WM2000's `0x801226A0`: a real function
+    /// entry sitting in a GAP between two declared entries, not swallowed
+    /// inside either of them.
+    #[test]
+    fn a_jal_proven_root_in_a_gap_is_reported_as_uncovered_and_adopted() {
+        let (words, functions) = uncovered_fixture();
+        let region = CodeRegion {
+            name: "bank4_text".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        // It is NOT a swallowed entry: no declared function contains it.
+        assert!(check.swallowed.is_empty(), "{:?}", check.swallowed);
+        assert_eq!(check.uncovered.len(), 1, "{:?}", check.uncovered);
+        let entry = &check.uncovered[0];
+        assert_eq!(entry.vram, 0x8000_0010);
+        // Gap bounds derived by hand: head ends at 0x10, tail starts at 0x1C.
+        assert_eq!(entry.gap_start, 0x8000_0010);
+        assert_eq!(entry.gap_end, 0x8000_001C);
+        assert_eq!(entry.adopted_size(), 0xC);
+        assert_eq!(entry.jal_sites, vec![0x8000_0000]);
+        assert_eq!(entry.refusal, None);
+
+        // And the repair actually lands a dispatchable entry.
+        let mut repaired = functions.clone();
+        assert_eq!(apply_gap_adoptions(&mut repaired, &check), 1);
+        let adopted = repaired
+            .iter()
+            .find(|f| f.vram == 0x8000_0010)
+            .expect("the adopted entry must be in the function list");
+        assert_eq!(adopted.size, 0xC);
+        assert_eq!(adopted.name, "func_80000010_uncovered");
+        // Neither neighbour may be disturbed: adoption claims only the gap.
+        assert_eq!(repaired.iter().find(|f| f.name == "head").unwrap().size, 0x10);
+        assert_eq!(repaired.iter().find(|f| f.name == "tail").unwrap().size, 0x4);
+    }
+
+    /// MUTATION GUARD for the `jr $ra` terminator precondition. Identical to
+    /// the adoptable fixture except the gap never returns, so control would
+    /// run off the adopted entry's end into the next function. Must be
+    /// REPORTED and REFUSED. Deleting the terminator check fails this.
+    #[test]
+    fn an_uncovered_gap_that_never_returns_is_refused() {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            0x27BD_FFE8, // addiu $sp, $sp, -0x18
+            0x27BD_FFE8, // ... and no return anywhere in the gap
+            0x27BD_FFE8,
+            NOP,
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_001C,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "bank4_text".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1, "still reported");
+        assert_eq!(
+            check.uncovered[0].refusal,
+            Some(GapRefusal::GapDoesNotReturn)
+        );
+        let mut repaired = functions.clone();
+        assert_eq!(apply_gap_adoptions(&mut repaired, &check), 0);
+        assert_eq!(repaired, functions);
+    }
+
+    /// MUTATION GUARD for the "root must be at the gap start" precondition.
+    /// This is the shape of WM2000's REAL refusal, `0x800400CC`: a word in a
+    /// large uncovered span that merely decodes as a `jal` target. Adopting
+    /// it would leave every word before it unclaimed. Dropping the
+    /// `NotAtGapStart` arm fails this.
+    #[test]
+    fn an_uncovered_root_that_is_not_at_the_gap_start_is_refused() {
+        // The proven root is 0x80000014, but the gap starts at 0x80000010.
+        let words = [
+            jal(0x8000_0014),
+            NOP,
+            JR_RA,
+            NOP,
+            NOP, // 0x80000010: unclaimed, and BEFORE the root
+            0x27BD_FFE8,
+            JR_RA,
+            NOP,
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_0020,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "bank4_text".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1);
+        assert_eq!(check.uncovered[0].vram, 0x8000_0014);
+        assert_eq!(check.uncovered[0].gap_start, 0x8000_0010);
+        assert_eq!(
+            check.uncovered[0].refusal,
+            Some(GapRefusal::NotAtGapStart)
+        );
+        let mut repaired = functions.clone();
+        assert_eq!(apply_gap_adoptions(&mut repaired, &check), 0);
+        assert_eq!(repaired, functions);
+    }
+
+    /// MUTATION GUARD separating the two repair classes. A root INSIDE a
+    /// declared function must stay a `SwallowedEntry` and must NOT be
+    /// adopted as uncovered; if the gap branch ever swallowed this case it
+    /// would split nothing and silently claim overlapping bytes.
+    #[test]
+    fn a_root_inside_a_declared_function_is_swallowed_not_uncovered() {
+        let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, JR_RA, NOP];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let functions = vec![DumpFunction {
+            name: "head".into(),
+            vram: 0x8000_0000,
+            size: 0x1C,
+        }];
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.swallowed.len(), 1);
+        assert!(
+            check.uncovered.is_empty(),
+            "a swallowed entry must not also be reported as uncovered: {:?}",
+            check.uncovered
+        );
+        // And the adoption pass must not touch it.
+        let mut repaired = functions.clone();
+        assert_eq!(apply_gap_adoptions(&mut repaired, &check), 0);
+    }
+
+    /// MUTATION GUARD: `nop` tail padding between the gap's return and the
+    /// next declared function is permitted (the real WM2000 gaps are
+    /// 4-to-12-byte aligned), but the return must still be there.
+    #[test]
+    fn nop_tail_padding_after_the_gaps_return_is_allowed() {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            0x27BD_FFE8,
+            JR_RA,
+            NOP, // delay slot
+            NOP, // alignment padding
+            NOP, // alignment padding
+            NOP, // tail function
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_0024,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1);
+        assert_eq!(check.uncovered[0].refusal, None, "nop tail padding is fine");
+        assert_eq!(check.uncovered[0].adopted_size(), 0x14);
+    }
+
+    /// The diagnostic must NAME an uncovered entry and its evidence, so the
+    /// build reports what the runtime would otherwise only discover as a
+    /// trap 2,483 VI swaps into a run.
+    #[test]
+    fn the_diagnostic_names_uncovered_entries_and_their_evidence() {
+        let (words, functions) = uncovered_fixture();
+        let region = CodeRegion {
+            name: "bank4_text".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        let text = check.render_diagnostic();
+        assert!(text.contains("UNCOVERED-FUNCTION-ENTRY"), "{text}");
+        assert!(text.contains("0x80000010"), "{text}");
+        assert!(text.contains("bank4_text"), "{text}");
+        assert!(text.contains("0x80000000"), "the jal site:\n{text}");
+        assert!(text.contains("repair: ADOPT"), "{text}");
+        assert!(!check.is_clean(), "an uncovered entry is not a clean check");
     }
 
     #[test]
@@ -921,10 +1198,18 @@ mod tests {
         assert_eq!(check.proven_roots, 1);
     }
 
+    /// SUPERSEDED ASSERTION, kept as a guard. This test used to assert that
+    /// a `jal` target claimed by no declared function was "a different
+    /// (coverage) problem, deliberately not reported here" and left the
+    /// check CLEAN. That assumption is exactly what let WM2000's
+    /// `0x801226A0` reach a live run as a `lookup:` trap, so it no longer
+    /// holds: such a target is now always REPORTED as uncovered.
+    ///
+    /// What is still true, and is what this test now pins, is that it is not
+    /// a SWALLOWED entry and — for this fixture, whose gap never returns —
+    /// not adoptable either.
     #[test]
-    fn a_jal_target_inside_no_declared_function_is_not_this_defect() {
-        // The target falls in a gap between declared functions: a different
-        // (coverage) problem, deliberately not reported here.
+    fn a_jal_target_inside_no_declared_function_is_reported_but_not_swallowed() {
         let words = [jal(0x8000_0010), NOP, JR_RA, NOP, NOP, NOP];
         let region = CodeRegion {
             name: "sec".into(),
@@ -937,7 +1222,19 @@ mod tests {
             size: 0x10,
         }];
         let check = cross_check_region(&region, &functions);
-        assert!(check.is_clean(), "{:?}", check.swallowed);
+        assert!(
+            check.swallowed.is_empty(),
+            "not the swallowed class: {:?}",
+            check.swallowed
+        );
+        assert_eq!(check.uncovered.len(), 1, "but it MUST be reported");
+        // The gap is `[nop, nop]` with no `jr $ra`, so it is not a
+        // self-contained body and must not be adopted.
+        assert_eq!(
+            check.uncovered[0].refusal,
+            Some(GapRefusal::GapDoesNotReturn)
+        );
+        assert!(!check.is_clean(), "silence is what shipped the trap");
     }
 
     #[test]
