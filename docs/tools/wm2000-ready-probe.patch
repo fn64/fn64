@@ -1,0 +1,156 @@
+--- /Users/jer/Code/recomps/wm2000/packages/wm2000-boot/src/main.rs	2026-08-19 15:08:28
++++ /tmp/probe-main.rs	2026-08-19 16:07:12
+@@ -852,9 +852,41 @@
+                 e.from, e.to, e.buttons, e.stick_x, e.stick_y
+             );
+         }
++    }
++    // WM2000_PORTS=<n>: how many controller ports have a standard controller
++    // PLUGGED IN. This is console configuration, not input: fn64's default is
++    // one controller in port 0 (PifModel's documented model), and ports 1-3
++    // then answer the PIF read with no response, which the game's own
++    // libultra turns into OSContPad.errno = CHNL_ERR_NORESP>>4 = 8 -- exactly
++    // what real hardware reports for an empty port. Raising this attaches a
++    // real modeled controller so those ports answer errno = 0, which is what
++    // a console with two pads plugged in does. It fabricates no button state:
++    // an attached-but-undriven pad is idle.
++    let populated_ports: usize = std::env::var("WM2000_PORTS")
++        .ok()
++        .map(|raw| raw.parse::<usize>().expect("WM2000_PORTS must be an integer"))
++        .unwrap_or(1);
++    assert!(
++        (1..=4).contains(&populated_ports),
++        "WM2000_PORTS must be 1..=4, got {populated_ports}"
++    );
++    for port in 1..populated_ports {
++        fn64_abi::set_controller_port_state(
++            port,
++            fn64_runtime::PortState::StandardControllerNoPak,
++        );
++        println!("[wm2000-input] port {port}: standard controller attached (WM2000_PORTS)");
+     }
+     let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);
+ 
++    // WM2000_READY_PROBE=<lo>-<hi>: per-swap read-only dump of the
++    // four-player ready-check inputs (scratch probe, not upstream).
++    let ready_probe_window: Option<(u64, u64)> = std::env::var("WM2000_READY_PROBE")
++        .ok()
++        .map(|raw| {
++            let (a, b) = raw.split_once('-').expect("WM2000_READY_PROBE=<lo>-<hi>");
++            (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap())
++        });
+     let mut steps = 0u64;
+     let mut drain = fn64_boot_harness::GuestDrain::default();
+     loop {
+@@ -1045,7 +1077,13 @@
+                 }
+                 let desired = (buttons, stick.0, stick.1);
+                 if desired != last_applied_input {
+-                    fn64_abi::set_controller_state(0, desired.0, desired.1, desired.2);
++                    // Mirror the scripted pad onto every PLUGGED port. A
++                    // two-player screen wants two players pressing; with
++                    // WM2000_PORTS=1 (the default) this is exactly the
++                    // previous port-0-only behaviour.
++                    for port in 0..populated_ports {
++                        fn64_abi::set_controller_state(port, desired.0, desired.1, desired.2);
++                    }
+                     println!(
+                         "[wm2000-input] swap #{swap_count}: pad0 -> buttons={:#06x} \
+                          stick=({}, {})",
+@@ -1065,6 +1103,96 @@
+             if !dumps_disabled && (active_renderer == "reference" || active_renderer == "wgpu") {
+                 if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
+                     capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
++                }
++            }
++
++            // ---- WM2000_READY_PROBE (scratch, read-only) ----
++            // fn64 backs RDRAM word-swapped: Rdram::store_h writes at
++            // backing_offset(vaddr) ^ 2. So read halfwords at (off ^ 2) and
++            // decode little-endian; read bytes at (off ^ 3) likewise.
++            if let Some((lo, hi)) = ready_probe_window {
++                if swap_count >= lo && swap_count <= hi {
++                    let rd = |off: u32| -> u16 {
++                        let o = ((off & 0x00ff_ffff) ^ 2) as usize;
++                        u16::from_le_bytes([rdram[o], rdram[o + 1]])
++                    };
++                    let rb = |off: u32| -> u8 {
++                        rdram[((off & 0x00ff_ffff) ^ 3) as usize]
++                    };
++                    // Rdram::store_backed_word (host.rs:815-817) writes
++                    // `value.to_ne_bytes()` -- NATIVE, i.e. little-endian --
++                    // at the PLAIN backing offset (no ^ swizzle). A word must
++                    // therefore be decoded little-endian; reading it
++                    // big-endian yields halves that look like a plausible but
++                    // wrong pointer (measured: 0x60f32580 for a D_801702A4
++                    // that really holds 0x8025F360).
++                    let rw = |off: u32| -> u32 {
++                        let o = (off & 0x00ff_ffff) as usize;
++                        u32::from_le_bytes([rdram[o], rdram[o+1], rdram[o+2], rdram[o+3]])
++                    };
++                    // D_801702A4 is a POINTER; entries live at *ptr + 0x512, stride 0x88.
++                    let base_ptr = rw(0x001702A4);
++                    let mut ports = [0u16; 4];
++                    let mut e00 = [0u16; 4];
++                    if base_ptr >= 0x8000_0000 {
++                        let entries = (base_ptr - 0x8000_0000) + 0x512;
++                        for i in 0..4u32 {
++                            let e = entries + i * 0x88;
++                            ports[i as usize] = rd(e + 0x16) & 0xF;
++                            e00[i as usize] = rd(e);
++                        }
++                    }
++                    // D_80095180 array, stride 12 per port: +4 held, +6 pressed, +8 released
++                    let mut held = [0u16; 4];
++                    let mut pressed = [0u16; 4];
++                    for i in 0..4u32 {
++                        held[i as usize] = rd(0x00095180 + i * 12 + 4);
++                        pressed[i as usize] = rd(0x00095180 + i * 12 + 6);
++                    }
++                    // OSContPad[] at D_80057210, stride 6: +0 button, +4 errno byte (D_80057214)
++                    let mut pad_btn = [0u16; 4];
++                    let mut pad_errno = [0u8; 4];
++                    for i in 0..4u32 {
++                        pad_btn[i as usize] = rd(0x00057210 + i * 6);
++                        pad_errno[i as usize] = rb(0x00057214 + i * 6);
++                    }
++                    // D_8011BF50 slot array (4 words), the "joined" flags read by func_801456C8
++                    let mut slots = [0u32; 4];
++                    for i in 0..4u32 {
++                        slots[i as usize] = rw(0x0011BF50 + i * 4);
++                    }
++                    println!(
++                        "[wm2000-ready] swap={} screen={} bitpat_F8={:#04x} bitpat_F9={:#04x} \
++                         D_800573FA={:#04x} D_8011C37E={:#06x} entbase={:#010x} \
++                         ports={:?} ent0x00={:x?} slots={:x?} held={:04x?} pressed={:04x?} \
++                         pad_btn={:04x?} pad_errno={:?} D_80161FF8={:#010x} D_800FEF2C={:#x}",
++                        swap_count,
++                        rd(0x0003DD04),
++                        rb(0x000573F8), rb(0x000573F9), rb(0x000573FA),
++                        rd(0x0011C37E),
++                        base_ptr,
++                        ports, e00, slots, held, pressed, pad_btn, pad_errno,
++                        rw(0x00161FF8),
++                        rw(0x000FEF2C),
++                    );
++                    // Second view: the SAME entries reached through D_8017016C
++                    // + 0x4A + i*0x88, the pointer func_801445BC fills them
++                    // through, plus the match-type mask and player count.
++                    let p16c = rw(0x0017016C);
++                    let mut fill_ports = [0u16; 4];
++                    if p16c >= 0x8000_0000 {
++                        let b = (p16c - 0x8000_0000) + 0x4A;
++                        for i in 0..4u32 {
++                            fill_ports[i as usize] = rd(b + i * 0x88 + 0x16);
++                        }
++                    }
++                    println!(
++                        "[wm2000-fill] swap={} D_8017016C={:#010x} D_80170162={} \
++                         D_8009EAA0={:#06x} fill_0x16={:04x?} delta={:#x}",
++                        swap_count, p16c, rd(0x00170162), rd(0x0009EAA0), fill_ports,
++                        p16c.wrapping_sub(base_ptr),
++                    );
++                    let _ = std::io::stdout().flush();
+                 }
+             }
+             last_swap_count = swap_count;
