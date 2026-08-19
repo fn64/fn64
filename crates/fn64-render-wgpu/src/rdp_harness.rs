@@ -29,7 +29,7 @@
 use crate::production::{WgpuBackend, WgpuCreateError};
 use crate::wire_words::{
     line, set_combine, set_other_mode, set_prim_color, word, EdgeWords, D_SLOT_PRIMITIVE,
-    D_SLOT_SHADE, RAW_TRIANGLE_BASE_EDGE,
+    D_SLOT_SHADE, D_SLOT_TEXEL0, RAW_TRIANGLE_BASE_EDGE,
 };
 use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
 use fn64_render_ir::{
@@ -426,6 +426,16 @@ impl Rdp {
     /// `(Zero - Zero) * Zero + Shade`.
     pub(crate) fn combine_shade_passthrough(self) -> Self {
         let wire = crate::wire_words::passthrough_combine(D_SLOT_SHADE);
+        self.combine(wire)
+    }
+
+    /// `(Zero - Zero) * Zero + Texel0` -- the sampled texel, unmodified.
+    ///
+    /// The program that makes a texture test measure the SAMPLER rather than
+    /// the combiner: any other D slot would let a correct pixel appear while
+    /// the texel fetch was wrong.
+    pub(crate) fn combine_texel_passthrough(self) -> Self {
+        let wire = crate::wire_words::passthrough_combine(D_SLOT_TEXEL0);
         self.combine(wire)
     }
 
