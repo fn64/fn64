@@ -1,7 +1,9 @@
 # The swap240 "striping" is a capture artifact, not a renderer defect
 
-Measured from `docs/frames/wm2000-allguards-swap240.png` (the 320x240 PNG the
-WM2000 harness writes from guest RDRAM) and from the live ROM.
+Measured from the 320x240 PNG the WM2000 harness wrote from guest RDRAM at
+swap 240, and from the live ROM. That misread capture is no longer committed --
+see [the frames README](README.md) for why it was retracted. The correct
+capture is `wm2000-swap240-true-geometry-480x237.png`.
 
 ## 1. The pattern is period 3 at 1/3 density, not period 2 at 1/2
 
