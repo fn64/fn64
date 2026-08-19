@@ -515,93 +515,14 @@ task ~#27) hit it.
 
 Cite these; do not re-derive them.
 
-## The feedback loop is the real bottleneck, and what would fix it
+## Follow-up card (NOT this card's work): nine duplicated wire-word encoders
 
-Measured on this session, not asserted. The renderer work was not the slow
-part; the round trip between "I changed something" and "I know what WM2000's
-stream does to it" was. Five ROM runs at ~15 minutes each, and each one
-rebuilds the whole workspace from `FN64=<worktree>` into a fresh `SCRATCH`,
-so they do not even share a target directory.
+Noted while writing fixtures, recorded here so it is not lost, and
+deliberately NOT implemented -- it is a different card from this one, and the
+goal is pixels on screen rather than better tooling.
 
-Worse, the ordering was wrong. The census that answered the session's most
-important question -- "WM2000 issues 826,056 raw triangles and 100% of them
-are shaded AND textured" -- cost one instrumented run and would have taken
-ten minutes at the START. Instead the entire flat rung was built and the ROM
-run twice before anything measured what the ROM actually emits. The flat rung
-was still the right first increment (it validated decoder -> adapter ->
-collector -> schedule -> executor -> digest -> guest commit end to end), but
-the session would have been scoped around the texture rung from hour one.
-
-### What a replay harness should be
-
-**1. Capture the stream once; replay it forever.** A committed corpus of real
-raw-DPC packets -- wire words, staged RDP state, captured guest reads. This
-is the piece that changes the economics: the ROM run stops being a per-change
-feedback loop and becomes a weekly corpus refresh.
-
-**2. Make it QUERYABLE, not merely replayable.** The questions that actually
-needed answering here: which opcodes and in what proportion; which combiner
-programs the triangles latch; which cycle types, colour-image formats and
-tile bindings appear; and -- the highest-value one -- for each packet, does
-it decode, declare, and execute, and if not, **which named refusal fired**.
-A per-refusal histogram over the corpus turns "widen the renderer" from
-guesswork into a worklist sorted by real frequency. Today the only way to
-learn a refusal fires is to hit it at runtime.
-
-**3. Report coverage as a share of real frames, not a test count.** "4797
-tests pass" says nothing about whether WM2000 renders. "0 of 826,056
-triangles are executable" says everything, and it took a throwaway worktree
-to learn.
-
-**4. Golden-hash each replayed packet's framebuffer bytes.** Then a renderer
-change either preserves every packet's output or names exactly which packets
-moved -- the feedback mutation testing had to substitute for here.
-
-### What makes it effective rather than merely existing
-
-- **It must run in the default suite with no GPU.** The whole reason the CPU
-  seam won this design is that guest-visible correctness must not be
-  adapter-conditional; a harness needing Metal reintroduces the problem.
-- **The corpus must be committed and small** -- a few hundred packets
-  deduplicated by shape, not 800k triangles. Honest enough to trust, fast
-  enough to run per-change.
-- **Refusals must be keyed on the error ENUM variant, not `to_string()`.**
-- **It must take a ROM name**, so a widening can be scored across the AKI
-  titles rather than only WM2000.
-
-**The trap to avoid:** faithful capture is the whole bet. Getting it wrong
-gives fast, confident, wrong answers -- strictly worse than the slow loop.
-Validate it by proving a replayed corpus reproduces the live run's swap count
-AND its refusal set exactly, before trusting a single query.
-
-### Two other feedback gaps this session exposed
-
-- **The focused suite (`-p fn64-render-wgpu`) is systematically misleading
-  here.** Half A landed "green" only because no fixture happened to be a
-  flat triangle in one-cycle mode. The prior lane recorded the mirror image:
-  a present-path mutant that survived the focused suite and died in the
-  workspace. Neither run alone is a gate.
-- **Nothing detects a doc comment its own commit falsified.** Five commits
-  in this lane exist only to fix comments the lane made false, including one
-  that described the exact OPPOSITE of the code (claiming the raster writes
-  every pixel in a declared run, when it skips zero-coverage pixels -- which
-  is mutant M5, the one that survived). These were found by re-reading, which
-  does not scale.
-
-### Better: a ROM-INDEPENDENT harness (revises the corpus proposal above)
-
-The corpus proposal has a flaw worth stating plainly: it makes the loop
-faster but keeps it coupled to a capture pipeline whose faithfulness must be
-continually re-proven. A synthetic harness has no capture step to be wrong
-about.
-
-The layer under test takes **wire words plus staged RDP state and produces
-guest bytes**. Neither end needs a ROM. What a ROM tells you is *which* wire
-words are realistic -- and that is a question you answer ONCE, with a census,
-not a dependency of the inner loop.
-
-**The measured waste, counted in this tree:** NINE hand-rolled wire-word
-encoders for the same RDP command set, three of them predating this lane.
+This tree contains **nine hand-rolled RDP wire-word encoders for the same
+command set**, three of which predate this lane:
 
 ```
 production.rs               triangle_base_edge_words, flat_triangle_in_target_words
@@ -611,56 +532,14 @@ raw_dpc/triangle_span/tests wire, coefficient_block
 targets/raw_triangle/tests  triangle, shaded_triangle
 ```
 
-Each re-derives the same bit layouts; each is a place to get a shift wrong.
-This duplication is entirely ROM-independent and removing it needs no new
-capability.
+Each re-derives the same bit layouts and each is a place to get a shift
+wrong. Collapsing them into one builder is a pure refactor needing no new
+capability, and it is verifiable because every existing test must still pass
+unchanged. Any such builder must emit WIRE WORDS through the real decoder --
+never construct `RawTriangle` or `ResourceAccess` directly -- or it stops
+testing the thing that breaks.
 
-**Shape:**
-
-```rust
-let frame = Rdp::new(16, 8)                  // colour-image extent
-    .other_mode(OneCycle)
-    .combine(shade_passthrough())
-    .prim_color(0x80FF_4080)
-    .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..3))
-    .run();                                   // plan -> execute -> commit -> publish
-frame.assert_pixel(3, 1, 0x87D1);
-frame.assert_outside_untouched();
-```
-
-**Why this beats the corpus for the INNER loop:**
-
-1. **You can write the failing test before the feature exists.** A ROM corpus
-   only tests what the ROM emits. Here a textured-triangle test can be
-   written today and watched to fail with `UnsupportedColorInput` -- the TDD
-   the brief asks for, and which was not possible this session.
-2. **It makes the two mutation survivors preventable rather than luck.** M5
-   and M10 both survived because a fixture sampled the arm at a point where
-   the correct and incorrect answers coincide. With explicit subpixel
-   positioning, "put the edge at 0.75 px" is a one-liner -- this session it
-   took a throwaway Python search, twice.
-3. **Refusal coverage becomes enumerable.** Iterate every
-   `TexrectExecutionError` variant and assert the harness can produce it. A
-   variant nothing can reach is either dead or untested, and today you cannot
-   tell which.
-
-**Where the ROM still earns its keep, and ONLY there:** answering "is the
-subset I admit the subset the hardware actually emits?" That is the census --
-one run, occasionally, producing a committed table of opcode/cycle/format
-frequencies. Not a loop; a fact sheet. It is what revealed flat triangles are
-0% of WM2000, and it would have reordered this entire session.
-
-**Least-waste build order:**
-1. The wire-word builder alone, replacing the nine encoders. Pure refactor,
-   no new capability, and verifiable because every existing test must still
-   pass unchanged.
-2. The one-call pipeline runner returning guest bytes.
-3. A `Tri::` geometry builder in pixel/subpixel coordinates, so edge cases
-   are STATED rather than searched for.
-4. The refusal-enumeration test.
-
-**The trap:** the builder must emit WIRE WORDS and go through the real
-decoder -- never construct `RawTriangle` or `ResourceAccess` directly. The
-moment it shortcuts past the decoder it stops testing the thing that breaks.
-That is exactly why `coefficient_block` here round-trips through
-`RawTriangle::decode` rather than building `RawWord` values.
+One measurement worth keeping from the same observation: the census that
+established WM2000's real triangle mix cost a single instrumented ROM run and
+was done LAST in this session rather than first. Measuring what the ROM emits
+before scoping which rung to build would have reordered the whole session.
