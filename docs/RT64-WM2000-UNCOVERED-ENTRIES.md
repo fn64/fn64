@@ -212,3 +212,36 @@ wrong section rarely satisfies.
 
 This is worth keeping as a general caution: **anything in this codebase that
 keys on a config section name is wrong.** Only the index is unique.
+
+## MEASURED on the real ROM: the blocker is cleared
+
+One solo run on an otherwise idle host, its own scratch root, its own trace
+path, `WM2000_PORTS=2` with the proven lead-in (START at 1100, A every 100
+swaps to 2400, then every 60):
+
+```
+WM2000_PORTS=2 FN64_RENDER=wgpu FN64_ABSENT_N64DD=1 FN64_NO_AUDIO=1
+WM2000_INPUT_SCRIPT="1100..1110:1000;1200..1210:8000;...;3540..3550:8000"
+WM2000_STOP_AT_SWAP=3600 WM2000_MAX_STEPS=6000000
+```
+
+The harness reports the stack it is on, and it is the intended one:
+
+```
+[fn64-stack] recompiler : fn64-cpu-runtime (FN64_RECOMP=rs, typed-Rust whole-ROM crate)
+[fn64-stack] renderer   : wgpu
+```
+
+| | before (recorded in RT64-WM2000-VERSUS-PLATEAU.md) | after |
+|---|---|---|
+| outcome | `lookup: no recompiled function or host shim at vram 0x801226A0` | **no trap** |
+| swap | died at ~2483 | **past 2519 and running** |
+| traps | 1 | **0** |
+| panics | 1 (+ SIGABRT teardown) | **0** |
+
+`grep -c "lookup: no recompiled|panicked at"` over the whole log is **0**, and
+neither `0x801226A0` nor `0x80122F2C` appears in it at all.
+
+The emitted crate the run was built from is byte-identical to what the final
+tree produces (`diff -rq` over `src/` is empty), so the binary measured is the
+binary this card ships.
