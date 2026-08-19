@@ -7566,6 +7566,135 @@ mod tests {
         );
     }
 
+    fn fixture_set_scissor(
+        mode: u8,
+        ulx: u16,
+        uly: u16,
+        lrx: u16,
+        lry: u16,
+    ) -> RdpStateCommand {
+        let scissor = fn64_render::NeutralScissor {
+            mode,
+            upper_left_x: ulx,
+            upper_left_y: uly,
+            lower_right_x: lrx,
+            lower_right_y: lry,
+        };
+        RdpStateCommand::SetScissor {
+            location: fixture_location(0),
+            raw_words: Box::new([0]),
+            scissor,
+            before: None,
+            after: fn64_render::RdpStateIdentity::of_scissor(scissor),
+        }
+    }
+
+    /// **`SetScissor` is a per-triangle snapshot, not the walk's running
+    /// final value.**
+    ///
+    /// One packet can carry several rectangles under different scissors --
+    /// the RDP re-latches `wstate->clip` on every `rdp_set_scissor`
+    /// (angrylion `rasterizer.c:2779-2784`) and the edgewalker clips each
+    /// primitive against whatever was latched when it arrived
+    /// (`:2349-2363`). Collecting a single running value would clip the
+    /// earlier rectangles with the later one's rect.
+    ///
+    /// Mirrors `plan_collector_snapshots_fog_color_per_triangle` exactly,
+    /// and uses two rects sharing NO coordinate so a snapshot that mixed
+    /// fields from both cannot pass.
+    #[test]
+    fn plan_collector_snapshots_scissor_per_triangle() {
+        let seed_other_mode = OtherMode::from_wire(0, 0);
+        let seed_combine = CombineParams::from_wire(0, 0);
+        let mut collector = PlanCollector::seeded(
+            Some(seed_other_mode),
+            Some(seed_combine),
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            None,
+            None,
+            [(None, None); 8],
+        );
+
+        let scissor_a = fixture_set_scissor(0, 4, 8, 12, 16);
+        collector.command(RawDpcSemanticCommandRef::State(&scissor_a));
+        let triangle_a = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_a));
+
+        let scissor_b = fixture_set_scissor(1, 20, 24, 28, 32);
+        collector.command(RawDpcSemanticCommandRef::State(&scissor_b));
+        let triangle_b = fixture_triangle(10.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
+
+        assert_eq!(collector.triangles.len(), 2);
+        let first = collector.triangles[0]
+            .as_ref()
+            .unwrap()
+            .scissor
+            .expect("triangle A saw scissor A");
+        let second = collector.triangles[1]
+            .as_ref()
+            .unwrap()
+            .scissor
+            .expect("triangle B saw scissor B");
+        assert_eq!(
+            (
+                first.mode(),
+                first.upper_left_x(),
+                first.upper_left_y(),
+                first.lower_right_x(),
+                first.lower_right_y()
+            ),
+            (0, 4, 8, 12, 16)
+        );
+        assert_eq!(
+            (
+                second.mode(),
+                second.upper_left_x(),
+                second.upper_left_y(),
+                second.lower_right_x(),
+                second.lower_right_y()
+            ),
+            (1, 20, 24, 28, 32)
+        );
+        assert_ne!(
+            first, second,
+            "triangle A must NOT be retroactively re-scissored by a SetScissor after it in plan \
+             order"
+        );
+    }
+
+    /// A collector seeded with an EARLIER packet's rect hands that rect to
+    /// a triangle in a packet that issues no `SetScissor` of its own.
+    ///
+    /// `SetScissor` is durable RDP state: a display list commonly sets the
+    /// scissor once per frame and then submits several packets under it, so
+    /// a per-packet reset would silently unscissor every packet after the
+    /// first.
+    #[test]
+    fn plan_collector_carries_a_seeded_scissor_into_a_packet_that_sets_none() {
+        let seeded = crate::targets::RdpScissorRect::from_wire_quarter_pixels(2, 40, 44, 48, 52);
+        let mut collector = PlanCollector::seeded(
+            Some(OtherMode::from_wire(0, 0)),
+            Some(CombineParams::from_wire(0, 0)),
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
+            Some(seeded),
+            None,
+            [(None, None); 8],
+        );
+        let triangle = fixture_triangle(0.0);
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+        assert_eq!(
+            collector.triangles[0].as_ref().unwrap().scissor,
+            Some(seeded)
+        );
+    }
+
     /// A neutral tile descriptor whose `tmem_word_address` is the caller's,
     /// so two tiles seeded into `PlanCollector` are distinguishable in the
     /// GPU uniform by a field the uniform actually carries.
