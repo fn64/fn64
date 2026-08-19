@@ -3956,7 +3956,7 @@ fn execute_scheduled_raw_triangle(
         ),
         crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color),
         resident_bytes,
-        accesses.len(),
+        &accesses,
     )?;
     Ok((completed, accesses))
 }

@@ -61,10 +61,16 @@ const FULL_COVERAGE: u32 = 8;
 /// Rasterizes one flat raw triangle into `resident_bytes`, returning the
 /// full-extent result.
 ///
-/// `declared_rows` is how many `ResourceAccess` rows the DECODER declared
-/// for this triangle. This executor recomputes the row list from
-/// `triangle_span::covered_rows` -- the same function the decoder called --
-/// and refuses by name if the two counts differ.
+/// `declared` is the DECODER's own `ResourceAccess` run for this triangle.
+/// This executor recomputes the row list from `triangle_span::covered_rows`
+/// -- the same function the decoder called -- and refuses by name unless
+/// every declared range is exactly the byte range of the row at the same
+/// position.
+///
+/// Comparing the RANGES, not merely the count, is deliberate. Equal counts
+/// would leave the equality an inference ("the two walks differ only in
+/// their height bound, and the widths are always the same value, so equal
+/// lengths implies equal rows"). Comparing the ranges makes it a check.
 ///
 /// That check is not belt-and-braces; it is the whole safety argument. The
 /// decoder bounds its row walk by installed RDRAM and a fixed cap, because
@@ -87,7 +93,7 @@ pub fn execute_raw_triangle(
     shading: TexrectShading,
     blend_registers: TexrectBlendRegisters,
     resident_bytes: &[u8],
-    declared_rows: usize,
+    declared: &[fn64_render_ir::ResourceAccess],
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     // Cycle, combiner-program, blender and fragment-stage admission all run
     // BEFORE any pixel is produced, so a mode this executor cannot evaluate
@@ -140,11 +146,32 @@ pub fn execute_raw_triangle(
     // extent is checked against the rows below, and a row outside it is a
     // named refusal rather than a silent clip.
     let rows = triangle_span::covered_rows(triangle, extent.width(), extent.height());
-    if rows.len() != declared_rows {
+    if rows.len() != declared.len() {
         return Err(TexrectExecutionError::TriangleRowCountDisagreesWithJournal {
-            declared: declared_rows,
+            declared: declared.len(),
             rasterized: rows.len(),
         });
+    }
+    // Range for range, in order. Each row's bytes start at the target's own
+    // base plus `(y * width + x0) * bpp` and run `(x1 - x0) * bpp` -- which
+    // is the identical arithmetic `plan_raw_triangle` used, over the
+    // identical row, so a mismatch means the two walks genuinely disagreed.
+    let base = key.address().get();
+    let bpp = format.bytes_per_pixel();
+    for (position, (row, access)) in rows.iter().zip(declared.iter()).enumerate() {
+        let start = base + (row.y * extent.width() + row.x0) * bpp;
+        let len = (row.x1 - row.x0) * bpp;
+        let declared_range = match access.region() {
+            fn64_render_ir::ResourceRegion::Rdram { range, .. } => (range.start().get(), range.len()),
+            _ => (0, 0),
+        };
+        if declared_range != (start, len) {
+            return Err(TexrectExecutionError::TriangleRowRangeDisagreesWithJournal {
+                position,
+                declared: declared_range,
+                rasterized: (start, len),
+            });
+        }
     }
     if rows.is_empty() {
         // A triangle whose declared rows are all empty at this extent has

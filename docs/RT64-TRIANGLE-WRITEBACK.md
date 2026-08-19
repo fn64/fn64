@@ -383,3 +383,44 @@ effect count is 0; exact journal requires 3". `stage_and_report`'s routing
 condition counted fills and writing texrects but not writing raw triangles.
 The exact-journal check refusing the packet rather than committing a partial
 one is the design working as intended.
+
+## MEASURED ON THE ROM: WM2000 emits ZERO flat triangles
+
+Instrumented `plan_raw_triangle` on a scratch worktree (`probe/tri-census`,
+never merged) to print every raw triangle's opcode flags, then ran the
+all-Rust lane on the real ROM at `WM2000_MAX_STEPS=200000`.
+
+```
+826056  shaded=true textured=true depth=false
+     0  anything else
+```
+
+**Every one of 826,056 raw triangles WM2000 issues in the attract loop is
+opcode 0x0e -- shaded AND textured, no depth plane. Not one is flat.**
+
+So the flat-triangle rung landed here is correct, proven end to end into
+guest RDRAM, and draws **nothing in WM2000**. It removes the structural
+blocker (a RawTriangle now declares journal writes and composes into the
+guest-visible buffer through the same seam a texrect uses) and it validates
+the whole path -- decoder -> adapter -> collector -> schedule -> executor ->
+digest -> guest commit -- but WM2000's own geometry needs two more rungs
+before a pixel changes on screen:
+
+1. **Shade plane interpolation.** The eight shade coefficient words are
+   already decoded and retained (`RawTriangle::shade()`); what is missing is
+   the per-pixel `raw_attribute_plane` evaluation and feeding the result into
+   `CombinerInputs::shade`. The reference's version is ~15 lines
+   (`raster/draw.rs`'s `plane` closure and its `shade` arm).
+2. **Texture s/t/w plane interpolation with perspective divide**, then the
+   TMEM fetch. The fetch itself already exists and is already generic over
+   the byte source (`sample_point`, used by `execute_texture_rectangle`); the
+   missing piece is deriving s/t from the plane and dividing by w.
+
+Both are genuinely per-pixel arithmetic over coefficients this crate already
+decodes, and both go through the SAME `combine_one_texel` call this lane
+already wires. The span geometry, the journal declaration, the row-by-row
+guard, the composition and the guest commit do not change at all -- only
+what fills `CombinerInputs` for a covered pixel.
+
+`raw_triangle_is_flat_opaque` and `execute_raw_triangle` are the two places
+that widen, in that order (executor first).
