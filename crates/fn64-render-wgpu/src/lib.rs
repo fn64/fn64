@@ -533,7 +533,6 @@ pub use state::{
     AlphaCompare, AlphaDither, BlenderCycle, Color4, ColorImage, CoverageDestination, CycleType,
     DepthMode, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor, PrimDepth, PrimLod,
     RdpState, RdpStateDelta, RgbDither, StagedRdpState, TextureFilter, TextureLutMode,
-    TextureLutModeError,
 };
 pub use targets::{
     decode_fill_cycle_pixel, execute_fill_rectangle, execute_texture_rectangle,
