@@ -1,0 +1,122 @@
+# The versus-screen plateau is guest state 18, waiting on a player-ready check
+
+Everything below marked CONFIRMED was read off a live run of the real ROM on
+the all-Rust lane (fn64's own recompiler + `fn64-render-wgpu`, no `--features
+rt64`), on the tree where the swap-1901 `lookup` trap is fixed
+(`recompile_rom` emits 2,480 functions). Everything marked HYPOTHESIS is not.
+
+## How the running code was identified
+
+Two read-only harness probes, both applied to a scratch copy of
+`~/Code/recomps/wm2000` (see `docs/tools/wm2000-versus-probe-harness.patch`):
+
+- `WM2000_WATCH` samples guest half-words once per VI swap.
+- `WM2000_CENSUS=<lo>-<hi>` counts every emitted function ENTERED inside a
+  swap window, through the existing
+  `fn64_abi::recompiled::copy_function_execution_destinations()`.
+
+**Gotcha that cost an hour, worth keeping:** fn64 backs RDRAM word-swapped.
+`Rdram::store_h` (`crates/fn64-cpu-runtime/src/runtime/host.rs:1014-1020`)
+writes at `backing_offset(vaddr) ^ 2` with `to_ne_bytes`. A probe reading
+`rdram[vram & 0xffffff]` big-endian therefore samples the guest variable at
+`vram ^ 2`, byte-reversed. Read at `off ^ 2`, decode little-endian.
+
+## CONFIRMED: the screen is guest state 18, and how it got there
+
+WM2000's global screen id is `D_8003DD04` (`0x8003DD04`). `func_801255E4`
+bounds-checks it against `0x22` and dispatches `jtbl_8016DAE8` at
+`0x80125AB4`. Watching it under the proven lead-in (START at 1100, A every 100
+swaps to 2400, then A every 60):
+
+| swap | `D_8003DD04` | menu depth `D_8016EC24` | arm |
+|---|---|---|---|
+| 1318 | 0 -> 1 | 0 | |
+| 1402 | 1 -> 5 | 0 -> 1 | |
+| 1502 | 5 -> 3 | 1 -> 2 | |
+| 1602 | 3 -> 4 | 2 -> 3 | |
+| 1702 | 4 -> 10 | 3 -> 4 | |
+| 1802 | 10 -> **19** | 4 -> 5 | `0x80125B8C` -- P1 select |
+| 1902 | 19 -> **20** | 5 -> 6 | `0x80125B8C` -- P2 select |
+| 2002 | 20 -> **17** | 6 -> 7 | `0x80126008` -> `func_80144A4C` |
+| 2102 | 17 -> **18** | 7 -> 8 | `0x80126048` -- **the plateau** |
+| 2520 | still 18 | 8 | through A at 2200/2300/2400/2460/2520 |
+
+Every A press advances the state exactly two swaps later, which is why the
+menus walked eight screens. At **state 18 that stops.** Two wrestler models on
+screen at 2300 is states 19 and 20 having each committed a character.
+
+## CONFIRMED: what state 18 polls
+
+The arm at `0x80126048`:
+
+```
+80126048  lhu $v0, 0xA($s3)      # sub-state
+8012604C  bnez -> .L80126074     # every frame after the first
+80126058  sw 0x53 -> D_8011BC84  # first frame only: request scene 0x53
+80126070  sh 1    -> 0xA($s3)
+.L80126074:
+80126074  jal func_8012BA94
+8012607C  beqz $v0 -> .L8012608C # advance only when it returns 0
+80126084  j func_801261D4        # else idle this frame
+.L8012608C:
+8012608C  lh $v0, 0x4($s3)
+80126090  bnez -> .L801260A8
+80126098  jal func_801456C8      # <-- reached EVERY frame
+```
+
+`func_8012BA94` (`0x8012BA94`, three instructions) returns the word at
+`D_80161FF8`. The census settles which branch is live.
+
+**Census over swaps 2600-2603 (14,652 entries, 201 distinct):**
+
+| function | entries | meaning |
+|---|---|---|
+| `func_801255E4` | 4 | the state machine, once per frame |
+| `func_8012BA94` | 4 | the poll, once per frame |
+| **`func_801456C8`** | **4** | reached every frame, so the poll returns 0 |
+| `func_80144A4C` | **0** | state 17's arm -- absent, so the state really is 18 |
+
+So the countdown at `D_80161FF8` is NOT the blocker: it completes, and the
+guest gets past it every single frame. The screen sits inside
+**`func_801456C8`**.
+
+## CONFIRMED: what `func_801456C8` is
+
+`func_801456C8` (`0x801456C8`) is a **player-ready check**. It loops over four
+player entries (`$a0 = D_801702A4 + 0x512`, stride `0x88`, `slti $a3, 4` at
+`0x801457AC`):
+
+```
+80145708  lhu $v0, 0x16($a0)     # per-entry port field
+8014570C  andi $v0, $v0, 0xF
+80145710  beqz -> .L801457A4     # 0 => entry SKIPPED entirely
+80145718..80145730                # index D_80095186[(field-1) * 12]
+80145738  andi $v0, $v1, 0x8000  # A
+8014577C  andi $v0, $v1, 0x4000  # B
+80145748  andi $v0, $v0, 0x1000  # START, via D_8011C37E
+801457B8  beqz $a2 -> .L801457F0 # nobody ready
+801457F8  addiu $v0, $zero, -1   # return -1
+```
+
+`D_80095186` is the **per-controller-port button array, stride 12** -- the
+same array `func_800E236C` (`0x800E236C`) merges into the global
+`D_8011C37E`/`D_8011C380` words at `0x800E23EC..0x800E2418`, gated on the
+controller count `D_800FEF2C` at `0x800E23A0`.
+
+The caller stores the return in `$s1`; `-1` is the "not ready" answer that
+leaves the state unchanged.
+
+## What is NOT yet established
+
+- **HYPOTHESIS**, not yet measured: which of the two exits of the loop is
+  taken -- every entry skipped because its `0x16 & 0xF` port field is 0, or
+  entries visited but `D_80095186[(field-1)*12]` never showing A. These are
+  different defects and the probe distinguishing them is
+  `WM2000_WATCH`/`WM2000_WATCHP` on `D_800FEF2C`, `D_80095186` and the four
+  entry port fields.
+- Whether fn64 populates `D_80095186` per port at stride 12 at all. fn64's
+  `PifModel` answers the controller-read block, and `osContGetReadData`
+  (`func_8002F788`) unpacks at stride 6 into `OSContPad[]`; `D_80095186` is a
+  *game* array the game fills from those pads, so the question is whether the
+  game's own fill loop runs for more than port 0.
+- No claim is made here that a match was reached. It was not.
