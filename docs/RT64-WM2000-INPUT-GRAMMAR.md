@@ -117,10 +117,34 @@ Two further notes that constrain the search:
 
 The disassembly does not by itself say which screen the plateau is. What it
 does is bound the search: on any select screen the confirm is **A**, motion is
-the **D-pad** (never the analog stick -- no grid navigator reads
-`D_8011C382/83`), back is **B**, and paging is **L**/**R** or a C-button. That
-is the matrix `docs/tools/wm2000-input-probe.py` drives, and the measured
-results of driving it are recorded alongside it.
+the **D-pad**, back is **B**, and paging is **L**/**R** or a C-button. That is
+the matrix `docs/tools/wm2000-input-probe.py` drives, and the measured results
+of driving it are recorded alongside it.
+
+**The analog stick is not ruled out.** A first pass concluded no menu code read
+the stick globals. That was wrong, and counting the references is what corrects
+it: `D_8011C382`/`D_8011C383` are read **8 times in the frontend overlay
+(`4C160.s`)** and **6 times in the select-screen overlay (`809D0.s`)**, the
+latter including `0x8012CE0C`/`0x8012CE2C` inside `func_8012C9E4` -- one of the
+two functions that also tests Z as a held modifier. The grid *walkers*
+(`func_8015B2F0` and its siblings) really do read only the D-pad, which is what
+the first pass generalised from; the screens around them do not. The stick
+stays in the untried space, and the harness already carries it
+(`WM2000_INPUT_SCRIPT` takes optional `:<sx>:<sy>`).
+
+## Ports 1-3 are permanently absent, and no script can change that
+
+`func_800E236C` OR-s menu input across *active* ports, and the ROM tracks how
+many controllers are present. fn64 models port 0 as `StandardControllerNoPak`
+and ports 1-3 as `Absent` (`crates/fn64-runtime/src/si.rs:120`), which is the
+honest default and what the gameplay-gap card measured the guest receiving.
+
+`fn64_abi::set_controller_port_state` (`crates/fn64-abi/src/si/mod.rs:773`)
+can change that -- but **the WM2000 harness never calls it**, and exposes no
+env knob that would. So a screen that gates on a second player being plugged in
+cannot be satisfied by any button script whatsoever, no matter how long the
+matrix runs. That is a distinct, cheap, and entirely untried axis: give the
+harness a `WM2000_PORTS` knob and re-run the same matrix with two ports live.
 
 ## Two harness collisions that must be cleared before any probe matrix
 
