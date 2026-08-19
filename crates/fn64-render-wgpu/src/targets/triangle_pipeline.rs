@@ -167,14 +167,23 @@ pub const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1;
 pub const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2;
 pub const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3;
 pub const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4;
-/// The enabled-TLUT canonical-source refusal, mirroring the CPU reader's
-/// own `PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf`
-/// (`tmem/read.rs`'s `validate_address_scope`): under `tlut_en` the palette
-/// occupies the high 2 KiB of TMEM from `0x0800`, so a tile whose index
-/// source lands there would be reading the palette as image data. Distinct
-/// from `INVALID_BYTE` on purpose -- the bytes at `0x0800` are typically
-/// perfectly valid TLUT bytes, which is precisely why this must be its own
-/// named refusal and not a validity failure.
+/// RETIRED, and reserved so no future status reuses the code.
+///
+/// This was the enabled-TLUT low-half REFUSAL, mirroring the CPU reader's
+/// `PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf`. The low-half
+/// rule itself is real and is still enforced -- RT64's
+/// `src/shaders/TextureDecoder.hlsli:162-163` (pinned port source
+/// `5473732a`) confines an enabled-TLUT index source to `RDP_TMEM_MASK16`
+/// (`0x7FF`) exactly as it confines RGBA32. But RT64 confines it by
+/// MASKING inside `implLoadTMEM` (`:17-25`), never by refusing, so both
+/// lanes now wrap: `tmem/read.rs`'s `AddressScope::LowHalf` and
+/// `tmem_sample.wgsl`'s `tmem_indexed_byte_address`. Wrapping preserves
+/// what the refusal protected -- an index read can still never reach the
+/// palette's own half -- without refusing a frame the RDP would draw.
+///
+/// No shader path emits this value any more. It is kept, unused, so the
+/// numbering of codes 0..4 is undisturbed and a stale readback carrying a
+/// 5 is still nameable.
 pub const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5;
 
 /// One `RasterVS`-shaped vertex: RDP screen-pixel position, UV (unused by
