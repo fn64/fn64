@@ -372,6 +372,15 @@ impl WgpuBackend {
     /// concept exists to derive anything narrower from), so a later
     /// triangle draw knows what render-target size to use without `cfg`
     /// being threaded through every call.
+    /// Whether `create_inner` recorded the host-configured framebuffer extent.
+    ///
+    /// Exposed for the adapterless harness, which asserts the extent survived
+    /// a `NoAdapter` create rather than reaching into the field itself.
+    #[cfg(test)]
+    pub(crate) fn has_configured_target_extent(&self) -> bool {
+        self.configured_target_extent.is_some()
+    }
+
     pub(crate) fn create_inner(&mut self, cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
         // Recorded before the device request, unlike `triangle_target_extent`
         // below: an admitted `FillRectangle` is executed entirely CPU-side
