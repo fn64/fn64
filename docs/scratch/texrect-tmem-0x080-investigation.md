@@ -80,3 +80,89 @@ export outside the harness is therefore DROPPED before the binary starts. A
 first instrumented run produced no output for exactly this reason. Gate
 temporary instrumentation on a marker FILE, not an env var, or edit the
 harness.
+
+## MEASURED: the failing texrect's own state (run 4, `/private/tmp/tr4.log`)
+
+Instrumentation dumped at the abort site (marker-file gated):
+
+```
+FN64DUMP fail pixel=(1,15) s=10272 t=7392 parity=Odd
+  fmt=Rgba px=Bits16 line_words=17 tmem_word=0 palette=0
+  mask_s=0 shift_s=0 mask_t=0 shift_t=0
+  low_s=1276 low_t=860 high_s=1536 high_t=956
+  draw=(l=320,t=216,w=64,h=23)
+  err=Read(InvalidTexelByte { address: 128 })
+```
+
+### Hand-replay from the wire layout (not from the code under test)
+
+`shift_s == shift_t == 0`, so `relative = (coord - low * 8) >> 5`:
+
+- `s`: `(10272 - 1276 * 8) >> 5 = (10272 - 10208) >> 5 = 64 >> 5 = 2`
+- `t`: `(7392 - 860 * 8) >> 5 = (7392 - 6880) >> 5 = 512 >> 5 = 16`
+
+`mask == 0` on both axes forces the clamp arm; `dim_s = 1536/4 - 1276/4 + 1 = 66`,
+`dim_t = 956/4 - 860/4 + 1 = 25`. Both 2 and 16 are in range, so
+`column = 2`, `row = 16`.
+
+16bpp linear address: `tmem*8 + row*line_words*8 + column*2`
+= `0 + 16 * 17 * 8 + 2 * 2` = `2176 + 4` = **0x884**.
+
+`low_t.integer() = 860 >> 2 = 215`, odd, so `first_is_odd = true`;
+`row = 16` is even, so `odd_row_exchange = true ^ false = true` → XOR 4.
+
+Now the two candidate scopes:
+
+| scope | mask | masked | after XOR4 |
+|---|---|---|---|
+| `FullTmem` | `0x0fff` | `0x884` | **`0x880`** |
+| `LowHalf` | `0x07ff` | `0x084` | **`0x080`** |
+
+The production abort names **`0x080`**. So the read took the **LowHalf**
+scope. That is the measurement, derived by hand and matching to the byte.
+
+### The TMEM validity bitmap says the low-half masking is what breaks it
+
+Dumped alongside, all 4096 bytes:
+
+- `0x884` (what `FullTmem` would have read) is **VALID** — the load wrote it.
+- `0x080` (the `LowHalf` alias) is **INVALID**.
+- Low half: 1988 / 2048 valid. High half: 2004 / 2048 valid. TMEM is broadly
+  loaded across BOTH halves; this is not a sparsely-loaded tile.
+- The 26 invalid runs are all exactly 4 bytes long and regularly spaced
+  (0x080, 0x10c, 0x190, 0x21c, ...), i.e. the XOR4 partners of each loaded
+  row's tail — the ordinary undefined padding a wider load leaves.
+
+So the byte genuinely was never loaded, AND the byte the read should have
+addressed genuinely WAS loaded. The guard is right; the address is wrong.
+
+### Why the scope came out LowHalf
+
+`AddressScope::of` returns `LowHalf` for `ReadKind::Indexed{..}` (RT64's
+`or(isRgba32, usesTlut)`). This tile is `fmt=Rgba px=Bits16`, NOT RGBA32 and
+NOT ColorIndex — so it can only have reached the indexed arm via `preflight`,
+whose first arm is:
+
+```rust
+if lut_mode == TextureLutMode::Disabled && tile.format() != ImageFormat::ColorIndex {
+    ... return Ok(ReadKind::Direct);
+}
+... return Ok(ReadKind::Indexed { palette });
+```
+
+i.e. an ENABLED TLUT sends *any* format down the indexed path, including a
+plain RGBA16 tile, and `resolve_indexed_texel`'s `Bits16` arm then treats the
+texel's high byte as a palette index.
+
+## Hypothesis status
+
+The briefed wrong-tile-binding hypothesis is **REFUTED for this abort**. The
+tile's own geometry is self-consistent and its addressed byte 0x884 is loaded.
+The defect is the address SCOPE, which follows from `lut_mode`, not from which
+tile is bound.
+
+Next question, and the one that decides the fix: is `lut_mode` genuinely
+enabled at this texrect's stream position (in which case the RDP really would
+index an RGBA16 tile through the palette, and the bug is upstream in what sets
+`G_SETOTHERMODE` / which snapshot the texrect reads), or is the texrect reading
+a `TextureLutMode` from the wrong stream position?
