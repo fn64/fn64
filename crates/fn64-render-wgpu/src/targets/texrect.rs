@@ -1082,24 +1082,45 @@ impl CombinerProgramSlice {
     /// texrect and for every unshaded triangle, where a `Shade` selector
     /// would combine against `base_inputs`' zeroed field -- the silent
     /// substitution this whole admission exists to prevent.
-    fn admits_color(self, input: ColorInput, shade_available: bool) -> bool {
+    fn admits_color(
+        self,
+        input: ColorInput,
+        shade_available: bool,
+        texel_available: bool,
+    ) -> bool {
         if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
             return self.resolves_the_combined_selector();
         }
         if shade_available && matches!(input, ColorInput::Shade | ColorInput::ShadeAlpha) {
             return true;
         }
+        // An UNTEXTURED raw triangle has no texel, so a program selecting
+        // Texel0 would combine against a fabricated zero -- the exact
+        // substitution every other refusal here exists to prevent. Texrects
+        // always sample a texel and pass `true`, so their admission is
+        // unchanged.
+        if !texel_available && matches!(input, ColorInput::Texel0 | ColorInput::Texel0Alpha) {
+            return false;
+        }
         ADMITTED_COLOR_INPUTS
             .iter()
             .any(|admitted| core::mem::discriminant(admitted) == core::mem::discriminant(&input))
     }
 
-    fn admits_alpha(self, input: AlphaInput, shade_available: bool) -> bool {
+    fn admits_alpha(
+        self,
+        input: AlphaInput,
+        shade_available: bool,
+        texel_available: bool,
+    ) -> bool {
         if matches!(input, AlphaInput::Combined) {
             return self.resolves_the_combined_selector();
         }
         if shade_available && matches!(input, AlphaInput::Shade) {
             return true;
+        }
+        if !texel_available && matches!(input, AlphaInput::Texel0) {
+            return false;
         }
         ADMITTED_ALPHA_INPUTS
             .iter()
@@ -1160,21 +1181,37 @@ impl TexrectShading {
         cycles: CombinerProgramCycles,
     ) -> Result<Self, TexrectExecutionError> {
         // Texrects have no interpolated vertex colour, so `Shade` stays
-        // refused for them -- this preserves the texrect path exactly.
-        self.validate_combiner_program_with_shade(cycles, false)
+        // refused for them; they always sample a texel, so `Texel0` stays
+        // admitted. Both preserve the texrect path exactly.
+        self.validate_combiner_program_for(cycles, false, true)
     }
 
-    /// [`Self::validate_combiner_program`], but told whether the caller can
-    /// supply a real per-pixel `Shade`.
-    ///
-    /// Only the SHADED raw-triangle executor passes `true`, and only because
-    /// it interpolates the value from the triangle's own shade coefficient
-    /// planes. Every other caller passes `false` and gets the identical
-    /// admission it had before this parameter existed.
+    /// [`Self::validate_combiner_program`] for a raw triangle, told whether
+    /// this triangle carries a shade plane and whether it carries a texture.
     pub fn validate_combiner_program_with_shade(
         self,
         cycles: CombinerProgramCycles,
         shade_available: bool,
+    ) -> Result<Self, TexrectExecutionError> {
+        self.validate_combiner_program_for(cycles, shade_available, false)
+    }
+
+    /// [`Self::validate_combiner_program`], but told which per-fragment
+    /// inputs the caller can actually supply.
+    ///
+    /// `shade_available` is `true` only for a SHADED raw triangle, which
+    /// interpolates the value from its own shade coefficient planes.
+    /// `texel_available` is `true` for every texrect (which always samples
+    /// one) and `false` for the untextured raw triangles this backend
+    /// currently admits -- so a program reading `Texel0` on one is refused
+    /// rather than combined against a fabricated zero.
+    ///
+    /// Both flags are facts about the primitive, not policy.
+    pub fn validate_combiner_program_for(
+        self,
+        cycles: CombinerProgramCycles,
+        shade_available: bool,
+        texel_available: bool,
     ) -> Result<Self, TexrectExecutionError> {
         let Self {
             combine,
@@ -1192,7 +1229,7 @@ impl TexrectShading {
                 ColorInputSlot::D,
             ] {
                 let input = combine.decode_color(slot, second_cycle);
-                if !slice.admits_color(input, shade_available) {
+                if !slice.admits_color(input, shade_available, texel_available) {
                     return Err(TexrectExecutionError::UnsupportedColorInput { slot, input });
                 }
                 // **Every selector that reads the register, not only the
@@ -1218,7 +1255,7 @@ impl TexrectShading {
                 AlphaInputSlot::D,
             ] {
                 let input = combine.decode_alpha(slot, second_cycle);
-                if !slice.admits_alpha(input, shade_available) {
+                if !slice.admits_alpha(input, shade_available, texel_available) {
                     return Err(TexrectExecutionError::UnsupportedAlphaInput { slot, input });
                 }
                 reads_env |= matches!(input, AlphaInput::Environment);
