@@ -14,6 +14,18 @@ An interlace / field-parity bug predicts period **2** at density **1/2**. The
 measurement is period **3** at density **1/3**. Interlace does not fit, and
 neither does anything else that drops alternate rows.
 
+**And WM2000 is not interlaced at all.** Its measured VI STATUS word is
+`0x00013202` (pinned in `vi_scanout/tests.rs`'s `wm2000_measured_status`,
+reconciled there against the literal a live run printed). Bit 6 -- RT64's
+`serrate`, `rt64_vi.h:35`, the interlace bit -- is **0**. So the field-parity
+hypothesis is ruled out twice over: by the shape of the pattern, and by the
+register that would have had to be set for it to be possible.
+
+Worth noting for the next reader: RT64's own interlace handling *halves the
+width* when `serrate` is set (`rt64_vi.cpp:99-106`) -- it never drops
+alternate rows. Even a genuinely interlaced N64 framebuffer would not produce
+"every other row is black" through this path.
+
 ## 2. In linear RDRAM order it is a clean 480-pixel period
 
 Run-length encoding the non-black mask from row 60:
