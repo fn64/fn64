@@ -1408,12 +1408,11 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 // three-way (WGSL, Rust oracle, hand-derived) agreement is
                 // checked in the same assertion pass, not just WGSL-vs-
                 // hand-derived.
-                let mode = match fixture.mode {
-                    0 => AlphaCompareMode::None,
-                    1 => AlphaCompareMode::Threshold,
-                    3 => AlphaCompareMode::Dither,
-                    other => panic!("fixture {}: unexpected wire mode {other}", fixture.name),
-                };
+                // Decoded via the real wire decoder, so wire 2 exercises
+                // the `alpha_compare_en`-clear path (angrylion
+                // `src/core/n64video/rdp.c:659-660`) rather than a
+                // test-local table.
+                let mode = crate::state::OtherMode::from_wire(0, fixture.mode).alpha_compare();
                 let alpha = fixture.alpha as u8;
                 let threshold_alpha = fixture.threshold_alpha as u8;
                 let noise_byte = noise(fixture.noise_byte as u8);
