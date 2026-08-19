@@ -466,13 +466,6 @@ pub enum TexrectExecutionError {
         slot: AlphaInputSlot,
         input: AlphaInput,
     },
-    /// The program reads a constant color register whose wire command has
-    /// not run at this texrect's own stream position. Never defaulted to
-    /// black: an unset register is a stream this executor has not seen,
-    /// not a register that happens to be zero.
-    UnsetConstantRegister {
-        register: TexrectConstantRegister,
-    },
     /// A texrect declares no journal write when its destination is not
     /// provable at decode time; reaching the executor with no declared row
     /// means the plan and the decoder disagree.
@@ -638,11 +631,6 @@ impl core::fmt::Display for TexrectExecutionError {
                 "execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO \
                  alpha inputs (plus COMBINED in a two-cycle program's second cycle); slot \
                  {slot:?} selects {input:?}"
-            ),
-            Self::UnsetConstantRegister { register } => write!(
-                formatter,
-                "the one-cycle combiner program reads the {register} register, but no {register} \
-                 command has run at this texrect's own stream position"
             ),
             Self::NoDeclaredRows => formatter.write_str(
                 "execute_texture_rectangle was given no declared destination rows; a texrect \
@@ -2343,8 +2331,8 @@ mod one_cycle_tests {
     fn measured_shading(combine: CombineParams) -> TexrectShading {
         TexrectShading::new(
             combine,
-            Some(Color4::from_wire(ENV_WIRE)),
-            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
         )
         .validate_one_cycle()
         .expect("both measured programs read only admitted selectors")
@@ -2602,8 +2590,8 @@ mod one_cycle_tests {
         let straight = combine_texel(measured_shading(env_lerp_program()), texel);
         let swapped = TexrectShading::new(
             env_lerp_program(),
-            Some(Color4::from_wire(PRIM_WIRE)),
-            Some(PrimColor::from_wire(PRIM_LOD_W0, ENV_WIRE)),
+            Color4::from_wire(PRIM_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, ENV_WIRE),
         )
         .validate_one_cycle()
         .expect("the swapped registers are still admitted selectors");
@@ -2681,7 +2669,7 @@ mod one_cycle_tests {
         // C = PRIMITIVE (3), D = ONE (6 in `colorInputD`).
         // Alpha: A = ONE (6), B = ZERO (7), C = PRIMITIVE (3), D = ONE (6).
         let over = pack_second_cycle([6, 8, 3, 6], [6, 7, 3, 6]);
-        let shading = TexrectShading::new(over, None, Some(one_register))
+        let shading = TexrectShading::new(over, Color4::from_wire(0), one_register)
             .validate_one_cycle()
             .expect("ONE/ZERO/PRIMITIVE are all admitted selectors");
         assert_eq!(
@@ -2710,7 +2698,7 @@ mod one_cycle_tests {
         // KEY_CENTER), so the subtrahend ONE comes from B index... none.
         // Reached instead through B = PRIMITIVE (3) at 1.0.
         let negative = pack_second_cycle([8, 3, 3, 7], [7, 3, 3, 7]);
-        let shading = TexrectShading::new(negative, None, Some(one_register))
+        let shading = TexrectShading::new(negative, Color4::from_wire(0), one_register)
             .validate_one_cycle()
             .expect("ZERO/PRIMITIVE are admitted selectors");
         assert_eq!(
@@ -2822,8 +2810,8 @@ mod one_cycle_tests {
         let program = pack_second_cycle([5, 1, 3, 1], [1, 7, 3, 7]);
         let shading = TexrectShading::new(
             program,
-            Some(Color4::from_wire(0x0000_0000)),
-            Some(PrimColor::from_wire(0, 0x8080_8080)),
+            Color4::from_wire(0x0000_0000),
+            PrimColor::from_wire(0, 0x8080_8080),
         )
         .validate_one_cycle()
         .expect("the env-lerp program reads only admitted selectors");
@@ -2869,7 +2857,7 @@ mod one_cycle_tests {
         // Color A index 4 is SHADE in the shared common table.
         let shade_in_color = pack_second_cycle([4, 8, 16, 7], [7, 7, 7, 7]);
         assert_eq!(
-            TexrectShading::new(shade_in_color, None, None).validate_one_cycle(),
+            TexrectShading::new(shade_in_color, Color4::from_wire(0), PrimColor::from_wire(0, 0)).validate_one_cycle(),
             Err(TexrectExecutionError::UnsupportedColorInput {
                 slot: ColorInputSlot::A,
                 input: ColorInput::Shade,
@@ -2880,7 +2868,7 @@ mod one_cycle_tests {
         // And the alpha side, which has its own table.
         let shade_in_alpha = pack_second_cycle([8, 8, 16, 7], [4, 7, 7, 7]);
         assert_eq!(
-            TexrectShading::new(shade_in_alpha, None, None).validate_one_cycle(),
+            TexrectShading::new(shade_in_alpha, Color4::from_wire(0), PrimColor::from_wire(0, 0)).validate_one_cycle(),
             Err(TexrectExecutionError::UnsupportedAlphaInput {
                 slot: AlphaInputSlot::A,
                 input: AlphaInput::Shade,
@@ -2889,7 +2877,7 @@ mod one_cycle_tests {
         );
         // The message names the selector, so a future title's log says what
         // is missing rather than only that something is.
-        let message = TexrectShading::new(shade_in_color, None, None)
+        let message = TexrectShading::new(shade_in_color, Color4::from_wire(0), PrimColor::from_wire(0, 0))
             .validate_one_cycle()
             .unwrap_err()
             .to_string();
@@ -2913,8 +2901,8 @@ mod one_cycle_tests {
                 .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
                 params,
-                Some(Color4::from_wire(ENV_WIRE)),
-                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+                Color4::from_wire(ENV_WIRE),
+                PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
             )
             .validate_one_cycle();
             if admitted {
@@ -2941,8 +2929,8 @@ mod one_cycle_tests {
                 .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
             let result = TexrectShading::new(
                 params,
-                Some(Color4::from_wire(ENV_WIRE)),
-                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+                Color4::from_wire(ENV_WIRE),
+                PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
             )
             .validate_one_cycle();
             if admitted {
@@ -3040,8 +3028,8 @@ mod one_cycle_tests {
         let shading = |params| {
             TexrectShading::new(
                 params,
-                Some(Color4::from_wire(ENV_WIRE)),
-                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+                Color4::from_wire(ENV_WIRE),
+                PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
             )
             .validate_one_cycle()
         };
@@ -3097,82 +3085,92 @@ mod one_cycle_tests {
             );
         }
 
-        // **The newly admitted register readers are covered by the unset
-        // gate too.** Widening the admitted set without widening
-        // `reads_env`/`reads_prim` would let a program reading `EnvAlpha`
-        // with no SetEnvColor staged fall through to `base_inputs`'
-        // `unwrap_or(Color4::from_wire(0))` and combine against black --
-        // exactly the substitution `UnsetConstantRegister` exists to stop.
-        for (target, register) in [
-            (ColorInput::EnvAlpha, TexrectConstantRegister::Environment),
-            (
-                ColorInput::PrimitiveAlpha,
-                TexrectConstantRegister::Primitive,
-            ),
-            (ColorInput::PrimLodFrac, TexrectConstantRegister::Primitive),
+        // **The register-backed selectors are admitted even against a
+        // never-written register.** `SetEnvColor`/`SetPrimColor` name RDP
+        // registers, which hold their power-on zero until the guest writes
+        // them, so reading one before any wire command is a legal read of a
+        // real value -- not a substitution. This is the opposite assertion
+        // to the loop above, and the difference is the point: `Shade` has
+        // no register behind it at all, while `EnvAlpha` does.
+        for target in [
+            ColorInput::EnvAlpha,
+            ColorInput::PrimitiveAlpha,
+            ColorInput::PrimLodFrac,
         ] {
             let (_, params) = color_probe_for(target);
-            assert_eq!(
-                TexrectShading::new(params, None, None).validate_one_cycle(),
-                Err(TexrectExecutionError::UnsetConstantRegister { register }),
-                "{target:?} reads {register:?}, so an unset register must be \
-                 refused rather than defaulted to black"
+            assert!(
+                TexrectShading::new(params, Color4::from_wire(0), PrimColor::from_wire(0, 0))
+                    .validate_one_cycle()
+                    .is_ok(),
+                "{target:?} reads a register that always holds a value, so a never-written \
+                 register must not refuse the rectangle"
             );
         }
         let index = alpha_index_for(AlphaInput::PrimLodFrac);
         let params = pack_second_cycle([1, 1, 16, 7], [7, 7, index, 7]);
-        assert_eq!(
-            TexrectShading::new(params, None, None).validate_one_cycle(),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Primitive,
-            })
+        assert!(
+            TexrectShading::new(params, Color4::from_wire(0), PrimColor::from_wire(0, 0))
+                .validate_one_cycle()
+                .is_ok()
         );
     }
 
-    /// **A program reading an unset constant register is refused**, and
-    /// only when it actually reads it.
+    /// **A never-written constant register reads as its power-on zero
+    /// rather than refusing the rectangle**, and the value it supplies is
+    /// really the register's -- a written register still wins.
+    ///
+    /// This replaces a test that asserted the opposite. The refusal it
+    /// pinned invented an "unset" state the RDP has no way to be in:
+    /// `fn64-render-reference` models the constant color registers as
+    /// zero-initialized `[u8; 4]` (`gbi/state.rs:227`, `:387`) and RT64's
+    /// C++ zero-initializes `primColor`/`envColor` at
+    /// `src/hle/rt64_state.cpp:126-129`.
     #[test]
-    fn an_unset_constant_register_is_refused_only_when_the_program_reads_it() {
-        assert_eq!(
-            TexrectShading::new(
-                env_lerp_program(),
-                None,
-                Some(PrimColor::from_wire(0, PRIM_WIRE))
-            )
-            .validate_one_cycle(),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Environment,
-            }),
-            "program 1 reads ENVIRONMENT, so an unset env register must be refused"
+    fn a_never_written_constant_register_reads_as_zero_instead_of_refusing() {
+        let unwritten = TexrectShading::new(
+            env_lerp_program(),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+        )
+        .validate_one_cycle()
+        .expect("a program reading ENVIRONMENT/PRIMITIVE before any wire command is legal");
+        // Derived by hand: an RDP color register powers up holding four
+        // zero bytes, and `Color4::normalized` is `byte / 255.0`, so every
+        // channel is exactly 0.0.
+        let inputs = unwritten.base_inputs();
+        assert_eq!(inputs.env_color, [0.0; 4]);
+        assert_eq!(inputs.prim_color, [0.0; 4]);
+        assert_eq!(inputs.prim_lod_frac, 0.0);
+
+        // A written register must actually reach the combiner inputs, or
+        // the assertions above could pass against a hardcoded zero that
+        // ignores every SetEnvColor/SetPrimColor.
+        let written = TexrectShading::new(
+            env_lerp_program(),
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        )
+        .validate_one_cycle()
+        .expect("a program reading written registers is legal");
+        let written_inputs = written.base_inputs();
+        assert_ne!(
+            written_inputs.env_color, inputs.env_color,
+            "a written SetEnvColor must differ from the power-on zero, or this test cannot \
+             distinguish a real register read from a hardcoded zero"
         );
-        assert_eq!(
-            TexrectShading::new(env_lerp_program(), Some(Color4::from_wire(ENV_WIRE)), None)
-                .validate_one_cycle(),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Primitive,
-            }),
-            "program 1 reads PRIMITIVE, so an unset prim register must be refused"
+        assert_ne!(
+            written_inputs.prim_color, inputs.prim_color,
+            "a written SetPrimColor must differ from the power-on zero"
         );
-        // Program 2 reads PRIMITIVE but never ENVIRONMENT, so an unset env
-        // register must NOT refuse it -- the gate is per-register-actually-
-        // read, not a blanket requirement.
-        assert!(
-            TexrectShading::new(
-                flat_primitive_program(),
-                None,
-                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE))
-            )
-            .validate_one_cycle()
-            .is_ok(),
-            "program 2 never reads ENVIRONMENT, so its absence must not refuse the rectangle"
-        );
-        // A ZERO-only program reads neither.
+
+        // A ZERO-only program reads neither register and is legal either
+        // way -- unchanged by this fix.
         let neither = pack_second_cycle([8, 8, 16, 7], [7, 7, 7, 7]);
         assert!(
-            TexrectShading::new(neither, None, None)
+            TexrectShading::new(neither, Color4::from_wire(0), PrimColor::from_wire(0, 0))
                 .validate_one_cycle()
                 .is_ok(),
-            "a program reading neither constant register must not require either"
+            "a program reading neither constant register stays admitted"
         );
     }
 
@@ -3325,8 +3323,8 @@ mod one_cycle_tests {
         let program = carry_program();
         let base = TexrectShading::new(
             program,
-            Some(Color4::from_wire(ENV_WIRE)),
-            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
         )
         .base_inputs();
         // The texel is deliberately non-zero and unlike the primitive
@@ -3372,8 +3370,8 @@ mod one_cycle_tests {
     fn combined_is_admitted_only_in_the_second_slice_of_two_cycles() {
         let shading = TexrectShading::new(
             carry_program(),
-            Some(Color4::from_wire(ENV_WIRE)),
-            Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
         );
         shading
             .validate_combiner_program(CombinerProgramCycles::BothSlices)
@@ -3415,8 +3413,8 @@ mod one_cycle_tests {
         for (program, slice) in [(in_first, "cycle 0"), (in_second, "cycle 1")] {
             let shading = TexrectShading::new(
                 program,
-                Some(Color4::from_wire(ENV_WIRE)),
-                Some(PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE)),
+                Color4::from_wire(ENV_WIRE),
+                PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
             );
             assert_eq!(
                 shading.validate_combiner_program(CombinerProgramCycles::BothSlices),
@@ -3557,13 +3555,12 @@ mod blend_stage_tests {
     }
 
     fn wm2000_blend_state() -> BlendModeState {
-        TexrectBlendRegisters::new(None, None)
+        TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
             .mode_state(wm2000_other_mode())
-            .expect("WM2000's cycle selects neither the blend nor the fog register")
     }
 
     fn wm2000_stages() -> TexrectFragmentStages {
-        TexrectFragmentStages::try_new(wm2000_other_mode(), None)
+        TexrectFragmentStages::try_new(wm2000_other_mode(), Color4::from_wire(0))
             .expect("WM2000's frame-0 mode is admitted by every stage")
     }
 
@@ -3958,9 +3955,8 @@ mod blend_stage_tests {
     fn copy_cycle_passes_the_fragment_through_unblended() {
         let copy_mode = OtherMode::from_wire(2 << 20, WM2000_OTHER_MODE_LOW);
         assert_eq!(copy_mode.cycle_type(), CycleType::Copy);
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(copy_mode)
-            .expect("Copy cycle reads no blender register");
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(copy_mode);
         assert_eq!(state.cycle_count(), 0);
         const TEXEL: [u8; 4] = [200, 100, 50, 128];
         let blended = blend_texrect_fragment(
@@ -3993,9 +3989,8 @@ mod blend_stage_tests {
         assert!(!no_force.force_blend());
         assert!(no_force.antialias_enabled(), "WM2000's mode sets AA_EN");
         assert!(no_force.image_read_enabled(), "WM2000's mode sets IM_RD");
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(no_force)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(no_force);
         assert_eq!(
             require_blendable_mode(state),
             Err(TexrectExecutionError::BlendEnabledNotDerivable)
@@ -4013,9 +4008,8 @@ mod blend_stage_tests {
         );
         assert!(!no_force_no_aa.force_blend());
         assert!(!no_force_no_aa.antialias_enabled());
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(no_force_no_aa)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(no_force_no_aa);
         assert_eq!(require_blendable_mode(state), Ok(()));
         // And that admitted mode bypasses the blender: `is_last &&
         // !blend_enabled` selects P, which is `Combined`, leaving the
@@ -4048,9 +4042,8 @@ mod blend_stage_tests {
             crate::blend::ResolvedBlendCycle::from_wire(shade.blender_cycle_1()).a,
             BlendAlphaInput::Shade
         );
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(shade)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(shade);
         assert_eq!(
             require_blendable_mode(state),
             Err(TexrectExecutionError::UnsupportedBlendShadeAlpha)
@@ -4063,9 +4056,8 @@ mod blend_stage_tests {
             crate::blend::ResolvedBlendCycle::from_wire(fba.blender_cycle_1()).b,
             BlendBInput::FramebufferAlpha
         );
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(fba)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(fba);
         assert_eq!(
             require_blendable_mode(state),
             Err(TexrectExecutionError::UnsupportedBlendFramebufferAlpha)
@@ -4103,9 +4095,8 @@ mod blend_stage_tests {
         assert!(!no_force_no_read.force_blend());
         assert!(no_force_no_read.antialias_enabled());
         assert!(!no_force_no_read.image_read_enabled());
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(no_force_no_read)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(no_force_no_read);
 
         // Before this narrowing this returned `BlendEnabledNotDerivable`.
         assert_eq!(
@@ -4124,9 +4115,8 @@ mod blend_stage_tests {
             (WM2000_OTHER_MODE_LOW & !0x4000) | 0x0040,
         );
         assert!(read_enabled.image_read_enabled());
-        let refused = TexrectBlendRegisters::new(None, None)
-            .mode_state(read_enabled)
-            .unwrap();
+        let refused = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(read_enabled);
         assert_eq!(
             require_blendable_mode(refused),
             Err(TexrectExecutionError::BlendEnabledNotDerivable),
@@ -4172,9 +4162,8 @@ mod blend_stage_tests {
         const BLEND_REGISTER: [u8; 4] = [16, 200, 240, 255];
         let blend_color = Color4::from_wire(u32::from_be_bytes(BLEND_REGISTER));
         assert_eq!(blend_color.rgba8(), BLEND_REGISTER);
-        let mixing_state = TexrectBlendRegisters::new(Some(blend_color), None)
-            .mode_state(mixing)
-            .expect("the blend register the program reads is set");
+        let mixing_state = TexrectBlendRegisters::new(blend_color, Color4::from_wire(0))
+            .mode_state(mixing);
         assert_eq!(require_blendable_mode(mixing_state), Ok(()));
 
         let blended = blend_texrect_fragment(FRAGMENT, sample, mixing_state, 0, 0)
@@ -4212,46 +4201,49 @@ mod blend_stage_tests {
         );
     }
 
-    /// A blender cycle that reads an unset `SetBlendColor`/`SetFogColor`
-    /// is a named refusal, never a silently-black default -- matching the
-    /// combiner's own `UnsetConstantRegister` treatment of `SetPrimColor`
-    /// and `SetEnvColor`.
+    /// A blender cycle reading a never-written `SetBlendColor`/
+    /// `SetFogColor` gets the register's power-on zero, not a refusal.
+    ///
+    /// This replaces a test that asserted the refusal. The registers always
+    /// hold a value: `fn64-render-reference` zero-initializes both
+    /// (`gbi/state.rs:227-228`, `:387-388`) and RT64's C++ does the same at
+    /// `src/hle/rt64_state.cpp:130-131`.
     #[test]
-    fn an_unset_blender_register_is_refused_only_when_a_cycle_reads_it() {
+    fn a_never_written_blender_register_reads_as_zero_instead_of_refusing() {
         // P = Blend is cycle 1's color_a (bits 30:31) encoding 2.
         let blend_low = (WM2000_OTHER_MODE_LOW & !(0x3u32 << 30)) | (0x2u32 << 30);
         let mode = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, blend_low);
-        assert_eq!(
-            TexrectBlendRegisters::new(None, None).mode_state(mode),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Blend
-            })
-        );
-        assert!(
-            TexrectBlendRegisters::new(Some(Color4::from_wire(0x1122_3344)), None)
-                .mode_state(mode)
-                .is_ok()
-        );
+        // Derived by hand: an unwritten register holds four zero bytes.
+        let unwritten =
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0)).mode_state(mode);
+        assert_eq!(unwritten.blend_color_register, [0, 0, 0, 0]);
+
+        // A written register must reach `BlendModeState` unchanged, or the
+        // assertion above could hold against a hardcoded zero. `rgba8`
+        // unpacks the wire word big-endian, so 0x1122_3344 is [0x11, 0x22,
+        // 0x33, 0x44] -- derived from the wire layout, not from the code
+        // under test.
+        let written = TexrectBlendRegisters::new(Color4::from_wire(0x1122_3344), Color4::from_wire(0))
+            .mode_state(mode);
+        assert_eq!(written.blend_color_register, [0x11, 0x22, 0x33, 0x44]);
 
         // A = Fog is cycle 1's alpha_a (bits 26:27) encoding 1.
         let fog_low = (WM2000_OTHER_MODE_LOW & !(0x3 << 26)) | (0x1 << 26);
         let mode = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, fog_low);
-        assert_eq!(
-            TexrectBlendRegisters::new(None, None).mode_state(mode),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Fog
-            })
-        );
-        assert!(
-            TexrectBlendRegisters::new(None, Some(Color4::from_wire(0x5566_7788)))
-                .mode_state(mode)
-                .is_ok()
-        );
+        let unwritten_fog =
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0)).mode_state(mode);
+        assert_eq!(unwritten_fog.fog_color, [0, 0, 0, 0]);
+        let written_fog =
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0x5566_7788))
+                .mode_state(mode);
+        assert_eq!(written_fog.fog_color, [0x55, 0x66, 0x77, 0x88]);
 
-        // WM2000's own cycle reads neither, so both stay legitimately unset.
-        assert!(TexrectBlendRegisters::new(None, None)
-            .mode_state(wm2000_other_mode())
-            .is_ok());
+        // WM2000's own cycle reads neither register; both still carry their
+        // real (zero) contents.
+        let wm2000 = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(wm2000_other_mode());
+        assert_eq!(wm2000.blend_color_register, [0, 0, 0, 0]);
+        assert_eq!(wm2000.fog_color, [0, 0, 0, 0]);
     }
 
     /// `IM_RD` disabled with a `Framebuffer` selector is propagated as a
@@ -4260,9 +4252,8 @@ mod blend_stage_tests {
     fn a_framebuffer_selector_without_image_read_is_refused_by_name() {
         let no_read = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, WM2000_OTHER_MODE_LOW & !0x0040);
         assert!(!no_read.image_read_enabled());
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(no_read)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(no_read);
         let error = blend_texrect_fragment(
             [255, 255, 255, 223],
             BlendFramebufferSample {
@@ -4330,7 +4321,7 @@ mod fragment_stage_tests {
         assert_eq!(m.coverage_destination(), CoverageDestination::Wrap);
         assert_eq!((WM2000_LOW >> 8) & 0x3, 1, "cvg_dst is low bits 8:9");
 
-        TexrectFragmentStages::try_new(m, None).expect("every WM2000 stage mode is admitted");
+        TexrectFragmentStages::try_new(m, Color4::from_wire(0)).expect("every WM2000 stage mode is admitted");
     }
 
     /// **The `blend_cycle_count` hazard, settled: the two counts are not
@@ -4361,9 +4352,8 @@ mod fragment_stage_tests {
         // FORCE_BL clear: the two disagree, by exactly one.
         let no_force = mode(WM2000_HIGH, WM2000_LOW & !0x4000);
         assert!(!no_force.force_blend());
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(no_force)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(no_force);
         assert_eq!(combine_cycle_count(no_force), 1);
         assert_eq!(blend_cycle_count(no_force), 0, "no cycle actually blends");
         assert_eq!(state.cycle_count(), 1, "one loop iteration still runs");
@@ -4372,9 +4362,8 @@ mod fragment_stage_tests {
         // why the disagreement is unreachable for this packet.
         let forced = mode(WM2000_HIGH, WM2000_LOW);
         assert!(forced.force_blend());
-        let state = TexrectBlendRegisters::new(None, None)
-            .mode_state(forced)
-            .unwrap();
+        let state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(forced);
         assert_eq!(blend_cycle_count(forced), 1);
         assert_eq!(u32::from(state.cycle_count()), blend_cycle_count(forced));
 
@@ -4387,9 +4376,8 @@ mod fragment_stage_tests {
                 rgba: [16, 200, 240, 255],
                 coverage_count: 8,
             },
-            TexrectBlendRegisters::new(None, None)
-                .mode_state(mode(WM2000_HIGH, WM2000_LOW & !0x4000 & !0x0008))
-                .unwrap(),
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+                .mode_state(mode(WM2000_HIGH, WM2000_LOW & !0x4000 & !0x0008)),
             0,
             0,
         )
@@ -4485,7 +4473,7 @@ mod fragment_stage_tests {
 
         // And the executor's own accessor agrees, for the mode WM2000
         // latches.
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
         let result = stages.coverage_for(Coverage::FULL).unwrap();
         assert!(result.wraps);
         assert!(result.blend_enabled);
@@ -4500,7 +4488,7 @@ mod fragment_stage_tests {
         // cvg_dst = Save is low bits 8:9 == 3.
         let save = mode(WM2000_HIGH, (WM2000_LOW & !(0x3 << 8)) | (0x3 << 8));
         assert_eq!(save.coverage_destination(), CoverageDestination::Save);
-        let stages = TexrectFragmentStages::try_new(save, None).unwrap();
+        let stages = TexrectFragmentStages::try_new(save, Color4::from_wire(0)).unwrap();
         assert_eq!(
             stages.coverage_for(Coverage::FULL),
             Err(TexrectExecutionError::DestinationCoverageUnavailable {
@@ -4508,7 +4496,7 @@ mod fragment_stage_tests {
             })
         );
 
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
         assert_eq!(
             stages.coverage_for(Coverage::new(4)),
             Err(TexrectExecutionError::DestinationCoverageUnavailable {
@@ -4521,7 +4509,7 @@ mod fragment_stage_tests {
         // observability, not about the mode's name.
         let no_read = mode(WM2000_HIGH, (WM2000_LOW & !0x40 & !(0x3 << 8)) | (0x3 << 8));
         assert!(!no_read.image_read_enabled());
-        let stages = TexrectFragmentStages::try_new(no_read, None).unwrap();
+        let stages = TexrectFragmentStages::try_new(no_read, Color4::from_wire(0)).unwrap();
         assert!(stages.coverage_for(Coverage::new(4)).is_ok());
     }
 
@@ -4534,7 +4522,7 @@ mod fragment_stage_tests {
     #[test]
     fn the_alpha_compare_gate_is_hand_derived_at_its_boundary() {
         // G_AC_NONE: WM2000's own mode.
-        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        let stages = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
         for alpha in [0u8, 1, 128, 255] {
             assert!(
                 alpha_compare_texrect_fragment(stages, alpha).unwrap(),
@@ -4552,19 +4540,29 @@ mod fragment_stage_tests {
             THRESHOLD,
             "the wire's low byte is alpha"
         );
-        let stages = TexrectFragmentStages::try_new(threshold_mode, Some(blend_color)).unwrap();
+        let stages = TexrectFragmentStages::try_new(threshold_mode, blend_color).unwrap();
         assert!(!alpha_compare_texrect_fragment(stages, THRESHOLD - 1).unwrap());
         assert!(alpha_compare_texrect_fragment(stages, THRESHOLD).unwrap());
         assert!(alpha_compare_texrect_fragment(stages, THRESHOLD + 1).unwrap());
 
-        // Threshold with no SetBlendColor staged is a named refusal, not a
-        // comparison against zero (which would pass everything).
-        assert_eq!(
-            TexrectFragmentStages::try_new(threshold_mode, None),
-            Err(TexrectExecutionError::UnsetConstantRegister {
-                register: TexrectConstantRegister::Blend
-            })
-        );
+        // Threshold with no SetBlendColor staged compares against the
+        // register's power-on zero. `alpha >= 0` holds for every alpha, so
+        // every fragment passes -- derived by hand from the comparison
+        // `alpha >= threshold_alpha`, and it is exactly what the reference
+        // lane computes (`raster/blend.rs:113` against the zero-initialized
+        // `other_mode.blend_color_alpha`).
+        let unwritten =
+            TexrectFragmentStages::try_new(threshold_mode, Color4::from_wire(0)).unwrap();
+        for alpha in [0u8, 1, 0x7f, THRESHOLD - 1, THRESHOLD, 0xff] {
+            assert!(
+                alpha_compare_texrect_fragment(unwritten, alpha).unwrap(),
+                "alpha {alpha:#04x} must pass a Threshold compare against the power-on zero"
+            );
+        }
+        // ...and the written register must still reject below its own
+        // threshold, or the sweep above could pass against a comparator
+        // that ignores the register entirely.
+        assert!(!alpha_compare_texrect_fragment(stages, THRESHOLD - 1).unwrap());
     }
 
     /// A rejected fragment writes **nothing** -- the destination keeps its
@@ -4575,13 +4573,12 @@ mod fragment_stage_tests {
         let threshold_mode = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x1);
         let stages = TexrectFragmentStages::try_new(
             threshold_mode,
-            Some(Color4::from_wire(u32::from(THRESHOLD))),
+            Color4::from_wire(u32::from(THRESHOLD)),
         )
         .unwrap();
         let blend_state =
-            TexrectBlendRegisters::new(Some(Color4::from_wire(u32::from(THRESHOLD))), None)
-                .mode_state(threshold_mode)
-                .unwrap();
+            TexrectBlendRegisters::new(Color4::from_wire(u32::from(THRESHOLD)), Color4::from_wire(0))
+                .mode_state(threshold_mode);
 
         let mut stored = 0x0001u16.to_be_bytes();
         // Alpha below the threshold: rejected, nothing written.
@@ -4678,10 +4675,9 @@ mod fragment_stage_tests {
         // ALPHA_CVG_SEL is low bit 13.
         let cvg_sel = mode(WM2000_HIGH, WM2000_LOW | 0x2000);
         assert!(cvg_sel.alpha_coverage_select());
-        let stages = TexrectFragmentStages::try_new(cvg_sel, None).unwrap();
-        let blend_state = TexrectBlendRegisters::new(None, None)
-            .mode_state(cvg_sel)
-            .unwrap();
+        let stages = TexrectFragmentStages::try_new(cvg_sel, Color4::from_wire(0)).unwrap();
+        let blend_state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(cvg_sel);
 
         let mut stored = 0x0001u16.to_be_bytes();
         blend_and_write_pixel(
@@ -4722,10 +4718,9 @@ mod fragment_stage_tests {
         let cvg_x_alpha = mode(WM2000_HIGH, WM2000_LOW | 0x1000);
         assert!(cvg_x_alpha.coverage_times_alpha());
         assert_eq!(Coverage::FULL.times_alpha(0).count(), 0);
-        let stages = TexrectFragmentStages::try_new(cvg_x_alpha, None).unwrap();
-        let blend_state = TexrectBlendRegisters::new(None, None)
-            .mode_state(cvg_x_alpha)
-            .unwrap();
+        let stages = TexrectFragmentStages::try_new(cvg_x_alpha, Color4::from_wire(0)).unwrap();
+        let blend_state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(cvg_x_alpha);
         let mut stored = 0x0001u16.to_be_bytes();
         blend_and_write_pixel(
             ColorTargetFormat::Rgba16,
@@ -4748,7 +4743,7 @@ mod fragment_stage_tests {
         let reserved = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
         assert_eq!(reserved.alpha_compare(), AlphaCompare::Reserved);
         assert_eq!(
-            TexrectFragmentStages::try_new(reserved, None),
+            TexrectFragmentStages::try_new(reserved, Color4::from_wire(0)),
             Err(TexrectExecutionError::ReservedAlphaCompare)
         );
 
@@ -4756,7 +4751,7 @@ mod fragment_stage_tests {
         let ac_dither = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x3);
         assert_eq!(ac_dither.alpha_compare(), AlphaCompare::Dither);
         assert_eq!(
-            TexrectFragmentStages::try_new(ac_dither, None),
+            TexrectFragmentStages::try_new(ac_dither, Color4::from_wire(0)),
             Err(TexrectExecutionError::NoiseThresholdUnavailable {
                 stage: TexrectNoiseStage::AlphaCompareDither
             })
@@ -4769,7 +4764,7 @@ mod fragment_stage_tests {
         assert_eq!(bayer.alpha_dither(), AlphaDither::Pattern);
         assert_eq!(bayer.rgb_dither(), RgbDither::Disabled);
         assert_eq!(
-            TexrectFragmentStages::try_new(bayer, None),
+            TexrectFragmentStages::try_new(bayer, Color4::from_wire(0)),
             Err(TexrectExecutionError::OrderedDitherAuthorityUnsettled {
                 stage: TexrectNoiseStage::AlphaDither,
                 pattern: RgbDither::Bayer
@@ -4784,7 +4779,7 @@ mod fragment_stage_tests {
         );
         assert_eq!(magic.alpha_dither(), AlphaDither::Pattern);
         assert_eq!(magic.rgb_dither(), RgbDither::MagicSquare);
-        assert!(TexrectFragmentStages::try_new(magic, None).is_ok());
+        assert!(TexrectFragmentStages::try_new(magic, Color4::from_wire(0)).is_ok());
     }
 
     /// **D7's premise, re-measured — and the refusal kept.**
@@ -4902,7 +4897,7 @@ mod fragment_stage_tests {
             (WM2000_HIGH & !(0x3 << 4) & !(0x3 << 6)) | (0x0 << 4) | (0x0 << 6),
             WM2000_LOW,
         );
-        let stages = TexrectFragmentStages::try_new(magic, None).unwrap();
+        let stages = TexrectFragmentStages::try_new(magic, Color4::from_wire(0)).unwrap();
         assert_eq!(stages.alpha_dither, AlphaDither::Pattern);
 
         // alpha 223: floor 27, low bits 7 > threshold 0 -> rounds to 28.
@@ -4924,9 +4919,8 @@ mod fragment_stage_tests {
         // observable here because `MagicSquare` at cell (0,0) has
         // threshold 0, which bumps alpha 223 to 231 and moves the blended
         // channel by a whole five-bit step.
-        let blend_state = TexrectBlendRegisters::new(None, None)
-            .mode_state(magic)
-            .unwrap();
+        let blend_state = TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0))
+            .mode_state(magic);
         let mut stored = 0x0001u16.to_be_bytes();
         blend_and_write_pixel(
             ColorTargetFormat::Rgba16,
@@ -4954,7 +4948,7 @@ mod fragment_stage_tests {
         );
 
         // And WM2000's own Noise mode at the endpoint does not.
-        let wm = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), None).unwrap();
+        let wm = TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0)).unwrap();
         assert_eq!(
             apply_alpha_dither(
                 223,

@@ -6199,10 +6199,10 @@ mod tests {
             // indistinguishable from an uncovered/cleared pixel).
             combine_params: CombineParams::from_wire(0, (4 << 6) | 4),
             tile_binding: TileBindingParams::unbound(),
-            blend_color: None,
-            env_color: None,
-            prim_color: None,
-            fog_color: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
         }
     }
 
@@ -7084,10 +7084,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7105,8 +7105,8 @@ mod tests {
         assert_eq!(collector.triangles.len(), 2);
         let first = collector.triangles[0].as_ref().unwrap();
         let second = collector.triangles[1].as_ref().unwrap();
-        assert_eq!(first.fog_color, Some(Color4::from_wire(0x7777_7777)));
-        assert_eq!(second.fog_color, Some(Color4::from_wire(0x8888_8888)));
+        assert_eq!(first.fog_color, Color4::from_wire(0x7777_7777));
+        assert_eq!(second.fog_color, Color4::from_wire(0x8888_8888));
         assert_ne!(
             first.fog_color, second.fog_color,
             "triangle A must NOT be retroactively affected by a SetFogColor after it in plan \
@@ -7249,10 +7249,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7274,15 +7274,15 @@ mod tests {
         assert_eq!(collector.triangles.len(), 2);
         let first = collector.triangles[0].as_ref().unwrap();
         let second = collector.triangles[1].as_ref().unwrap();
-        assert_eq!(first.env_color, Some(Color4::from_wire(0x1111_1111)));
+        assert_eq!(first.env_color, Color4::from_wire(0x1111_1111));
         assert_eq!(
             first.prim_color,
-            Some(PrimColor::from_wire(10 | (5 << 8), 0x2222_2222))
+            PrimColor::from_wire(10 | (5 << 8), 0x2222_2222)
         );
-        assert_eq!(second.env_color, Some(Color4::from_wire(0x3333_3333)));
+        assert_eq!(second.env_color, Color4::from_wire(0x3333_3333));
         assert_eq!(
             second.prim_color,
-            Some(PrimColor::from_wire(20 | (10 << 8), 0x4444_4444))
+            PrimColor::from_wire(20 | (10 << 8), 0x4444_4444)
         );
         assert_ne!(
             first.env_color, second.env_color,
@@ -7310,10 +7310,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
-            None,
-            Some(seed_env_color),
-            Some(seed_prim_color),
-            None,
+            Color4::from_wire(0),
+            seed_env_color,
+            seed_prim_color,
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7323,8 +7323,8 @@ mod tests {
         let retrieved = collector.triangles[0]
             .as_ref()
             .expect("a triangle with durably-seeded state must resolve, not reject");
-        assert_eq!(retrieved.env_color, Some(seed_env_color));
-        assert_eq!(retrieved.prim_color, Some(seed_prim_color));
+        assert_eq!(retrieved.env_color, seed_env_color);
+        assert_eq!(retrieved.prim_color, seed_prim_color);
     }
 
     /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
@@ -7335,7 +7335,7 @@ mod tests {
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
         let mut collector =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
@@ -7363,10 +7363,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7395,10 +7395,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(seed_combine),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7440,10 +7440,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(seed_other_mode),
             Some(CombineParams::from_wire(0, 0)),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -7471,10 +7471,10 @@ mod tests {
         let mut collector = PlanCollector::seeded(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
-            None,
-            None,
-            None,
-            None,
+            Color4::from_wire(0),
+            Color4::from_wire(0),
+            PrimColor::from_wire(0, 0),
+            Color4::from_wire(0),
             None,
             [(None, None); 8],
         );
@@ -9760,7 +9760,7 @@ mod tests {
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
         let mut plan_visitor =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -9768,10 +9768,10 @@ mod tests {
             plan: PlanCollector::seeded(
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0),
+                Color4::from_wire(0),
                 None,
                 [(None, None); 8],
             ),
@@ -10079,7 +10079,7 @@ mod tests {
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
         let mut plan_visitor =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -10087,10 +10087,10 @@ mod tests {
             plan: PlanCollector::seeded(
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0),
+                Color4::from_wire(0),
                 None,
                 [(None, None); 8],
             ),
@@ -10996,7 +10996,7 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
         let mut plan_visitor =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -11008,10 +11008,10 @@ mod tests {
             plan: PlanCollector::seeded(
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0),
+                Color4::from_wire(0),
                 None,
                 [(None, None); 8],
             ),
@@ -11644,7 +11644,7 @@ mod tests {
             .unwrap();
 
         let mut plan_visitor =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -11652,10 +11652,10 @@ mod tests {
             plan: PlanCollector::seeded(
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0),
+                Color4::from_wire(0),
                 None,
                 [(None, None); 8],
             ),
@@ -11682,7 +11682,7 @@ mod tests {
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
         let mut plan_visitor =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -11690,10 +11690,10 @@ mod tests {
             plan: PlanCollector::seeded(
                 None,
                 None,
-                None,
-                None,
-                None,
-                None,
+                Color4::from_wire(0),
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0),
+                Color4::from_wire(0),
                 None,
                 [(None, None); 8],
             ),
@@ -13694,7 +13694,7 @@ mod tests {
     #[test]
     fn a_plan_collector_starts_from_the_durable_tile_registers() {
         let unseeded =
-            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+            PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, [(None, None); 8]);
         assert!(
             unseeded
                 .current_tiles
@@ -13800,7 +13800,7 @@ mod tests {
         assert_eq!(neutral_size.low_t, 0x0cba, "low_t is w0 bits 11:0");
         assert_eq!(neutral_size.high_s, 0x0abc, "high_s is w1 bits 23:12");
         assert_eq!(neutral_size.high_t, 0x0789, "high_t is w1 bits 11:0");
-        let seeded = PlanCollector::seeded(None, None, None, None, None, None, None, tiles);
+        let seeded = PlanCollector::seeded(None, None, Color4::from_wire(0), Color4::from_wire(0), PrimColor::from_wire(0, 0), Color4::from_wire(0), None, tiles);
         assert_eq!(
             seeded.current_tiles[5], tiles[5],
             "a collector seeded from durable state must start with tile 5 already bound, \
