@@ -414,3 +414,40 @@ this card warns about -- the screen not changing was read as the second
 controller not mattering, when the experiment never exercised the thing the
 second controller is for. The measurement that distinguishes them is
 `D_8011BF50[1]`, and it needs pad 1 to be DRIVEN, not merely attached.
+
+## Is fn64's empty-port model right? Yes, on both sides of the seam
+
+The card asks what real hardware reports for an empty controller port and
+whether fn64 matches. Both halves are checkable in-tree.
+
+**Hardware.** An empty port produces no Joybus response. The SI/PIF marks that
+channel's status byte with `CHNL_ERR_NORESP = 0x80`, and libultra's
+`osContGetReadData` turns the channel status into
+`errno = (status & 0xC0) >> 4`, so a no-response port yields `errno = 0x08`
+(`CONT_NO_RESPONSE_ERROR`). A status query for such a port answers a zeroed
+type with `CONT_ABSENT = 0x80` set.
+
+**The game agrees, in its own code.** `func_8002F788` -- WM2000's own linked
+libultra, which is what actually runs on the rs lane -- does exactly that
+arithmetic:
+
+```
+8002F7CC  lbu  $v0, 0x2($sp)     # PIF status byte for this channel
+8002F7D0  andi $v0, $v0, 0xC0
+8002F7D4  srl  $v0, $v0, 4       # -> 0x08 for a no-response port
+8002F7D8  bnez $v0, .L8002F7F8   # nonzero errno: leave button/stick alone
+```
+
+**fn64 agrees.** `PifModel::query_response` returns `[0, 0, CONT_ABSENT]` for
+`PortState::Absent` (`crates/fn64-runtime/src/si.rs:216`), `CONT_ABSENT` is
+`0x80` (`si.rs:47`), and the default port table is port 0 populated with
+ports 1-3 `Absent` (`si.rs:121-123`, pinned by the `ports_1_to_3_report_absent`
+test at `si.rs:250`). `CONT_NO_RESPONSE_ERROR = 0x08` is named at
+`crates/fn64-abi/src/si/mod.rs:1075`.
+
+**And the measurement agrees with both:** `pad_errno = [0, 8, 8, 8]`,
+invariant across all 511 samples of run3.
+
+So the three descriptions -- hardware, the game's own libultra, and fn64's
+model -- coincide exactly. **fn64 is not reporting the wrong thing for ports
+1-3. It is correctly reporting a console with one controller plugged in.**
