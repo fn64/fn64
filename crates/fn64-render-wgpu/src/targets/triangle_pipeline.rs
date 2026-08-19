@@ -167,6 +167,15 @@ pub const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1;
 pub const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2;
 pub const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3;
 pub const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4;
+/// The enabled-TLUT canonical-source refusal, mirroring the CPU reader's
+/// own `PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf`
+/// (`tmem/read.rs`'s `validate_address_scope`): under `tlut_en` the palette
+/// occupies the high 2 KiB of TMEM from `0x0800`, so a tile whose index
+/// source lands there would be reading the palette as image data. Distinct
+/// from `INVALID_BYTE` on purpose -- the bytes at `0x0800` are typically
+/// perfectly valid TLUT bytes, which is precisely why this must be its own
+/// named refusal and not a validity failure.
+pub const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5;
 
 /// One `RasterVS`-shaped vertex: RDP screen-pixel position, UV (unused by
 /// this slice's textureless fragment shader, but present in the layout to
