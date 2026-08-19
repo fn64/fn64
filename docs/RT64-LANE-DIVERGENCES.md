@@ -22,9 +22,9 @@ V1/V4/V5/V7 rows are the predecessor to this table),
 
 ## 0. Since this audit was taken
 
-**A twenty-second divergence, found at an abort rather than by grepping, and
-already fixed.** Not renumbered into the table below, which stays as measured
-at `4371d57a`.
+**Two further divergences, both found at an abort rather than by grepping, and
+both already fixed.** Not renumbered into the table below, which stays as
+measured at `4371d57a`.
 
 ### D22 — GPU triangle sampler refused a non-RGBA16 tile under an enabled TLUT · **REACHED WM2000: FIRST TEXTURED TRIANGLE**
 
@@ -52,13 +52,60 @@ at `4371d57a`.
   texels palettize (4-bit through the tile's `palette` field); 32-bit stays
   refused on both arms, matching `4c412a96`, which deliberately did not widen
   there. Pinned by five tests, four adapter-gated; ten of ten shader mutants
-  killed. The run now advances to a different refusal
-  (`NoCompletedLoads`), one layer up in raw-DPC plan admission.
+  killed. The run then advanced to a different refusal
+  (`NoCompletedLoads`), one layer up in raw-DPC plan admission -- D23 below.
 
 **Method note for the next lane.** The abort named only a status code, which
 sent an earlier reader to the CPU-side tile to guess the shape.
 `WgpuRawDpcExecutionError::TmemSampleFailed` now carries the triangle index
 and the tile's format/size/TLUT codes, so the shape is measured at the abort.
+
+### D23 — raw-DPC execution refused a sync-only packet · **REACHED WM2000: FOURTH ABORT**
+
+- **wgpu** `crates/fn64-render-wgpu/src/production.rs`,
+  `stage_and_report`'s no-completed-transaction arm, surfacing as
+  `WgpuRawDpcExecutionError::NoCompletedLoads` and aborting the all-Rust
+  stack at `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+- **The refused packet, measured — not inferred.** Instrumented at the
+  refusal site and run on the real ROM through the all-Rust lane
+  (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`): **one wire command**,
+  `wire_opcode = 0xE9` (`G_RDPFULLSYNC`), raw words
+  `[0xE9000000, 0x07000000]`; **0 loads, 0 triangles, 0 texrects, 0 fills**;
+  one `ResourceAccess`, `Read`/`CommandDecode` over the 8 `RspDmem` bytes of
+  the sync command itself; site `dp_slot_reserved: true`,
+  `interrupt_after: Clear`.
+- **Disagreement — internal to wgpu, before any lane comparison.** The
+  `Display` string said "zero TMEM loads"; the doc comment said "zero loads
+  AND zero admitted triangles"; the code checked triangles only. All three
+  descriptions of one guard, and the packet satisfied every one of them
+  while still being a legitimate command.
+- **Which lane was right: NEITHER — the guard was WRONG on its own terms.**
+  `PlanCollector`'s own `FullSyncSite` arm already states the semantics:
+  the site is *"collected, not executed ... retained so the executed plan
+  still accounts for every command the plan carried"*, and dropping it
+  *"would be wrong in the other direction"*. `RdpFullSyncSite`'s doc adds
+  that a sync *"reads and writes no resource"*. The refusal contradicted
+  two doc comments in its own crate. "Zero raster work" and "nothing to do"
+  are not the same claim.
+- **Status: FIXED.** A sync-only plan now completes via
+  `StagedOutcome::NoPhysicalSuccessor` (renamed from `TriangleOnly`, which
+  named the wrong one of its now-two producers) through
+  `complete_execution_preserving_physical`. **This is not a weakening**: that
+  destination builds its own explicitly empty write list and rechecks it
+  against the packet's real journal via `BackendEffectReport::try_new`, so a
+  write-bearing packet routed there is still rejected with
+  `EffectCountMismatch` — the zero-write property is *proved* at the
+  destination, not assumed at the branch. The refusal itself is kept and
+  narrowed to "no load, no triangle, AND no sync", pinned by its own test
+  after the over-widening mutant was found to survive the suite. Three of
+  three mutants killed. The run now advances to
+  `MixedTexrectAndRawTrianglePacket`.
+
+**Method note for the next lane.** Three descriptions of one guard disagreed,
+and the code was the least accurate of the three. When an error message and
+its doc comment differ, measure the packet before believing either — the
+instrumentation that answered this took one run and ruled out four candidate
+shapes at once.
 
 ---
 
