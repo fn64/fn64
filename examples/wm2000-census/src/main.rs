@@ -545,24 +545,32 @@ fn main() {
     fn64_render_reference::gbi::census::texrect::report();
 }
 
-/// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
-/// the common NTSC low-res mode -- NOT verified against this ROM's actual
-/// `osViSetMode` mode-table contents, since this milestone doesn't decode
-/// `OSViMode`'s fields; see `fn64_runtime::vi`'s doc comment on why that's
-/// not modeled yet). If ANY byte differs from the first (non-uniform),
-/// convert RGBA5551 -> RGBA8888 and dump a PNG. A uniform/blank buffer is
-/// reported as blank, never faked as containing real content.
+/// Dump the fb region at the VI's LIVE geometry -- never an assumed one.
+/// Reading a 480-wide buffer at a hardcoded 320 stride shears every row and
+/// manufactures a convincing "horizontal duplication" artifact out of
+/// perfectly coherent memory; that exact mistake shipped from this file
+/// three times before it was made structurally impossible here. If ANY byte
+/// differs from the first (non-uniform), convert RGBA5551 -> RGBA8888 and
+/// dump a PNG. A uniform/blank buffer is reported as blank, never faked as
+/// containing real content.
 fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mut Vec<String>) {
-    const FB_WIDTH: usize = 320;
-    const FB_HEIGHT: usize = 240;
-    const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2; // RGBA5551, 2 bytes/px
-
     let start = fb_offset as usize;
-    let end = start + FB_BYTES;
+
+    let Some((width, height)) = fn64_abi::vi_width().zip(fn64_abi::vi_output_height()) else {
+        eprintln!(
+            "[wm2000-census] swap #{swap_index}: VI geometry not programmed yet -- refusing to \
+             guess a stride"
+        );
+        maybe_dump_fixed_320x240(rdram, fb_offset, swap_index);
+        return;
+    };
+    let (width, height) = (width as usize, height as usize);
+    let fb_bytes = width * height * 2; // RGBA5551, 2 bytes/px
+    let end = start + fb_bytes;
     if end > rdram.len() {
         eprintln!(
-            "[wm2000-census] swap #{swap_index}: framebuffer offset {fb_offset:#x} + assumed size \
-             {FB_BYTES:#x} exceeds rdram bounds ({} bytes) -- skipping capture, not guessing a \
+            "[wm2000-census] swap #{swap_index}: framebuffer offset {fb_offset:#x} + live size \
+             {width}x{height} exceeds rdram bounds ({} bytes) -- skipping capture, not guessing a \
              smaller region",
             rdram.len()
         );
@@ -582,14 +590,14 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     }
 
     println!(
-        "[wm2000-census] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
-         dumping PNG."
+        "[wm2000-census] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM at \
+         live geometry {width}x{height} -- dumping PNG."
     );
     let path = format!(
         "{}/fn64-fb-{swap_index}.png",
         std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string())
     );
-    match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
+    match dump_rgba5551_as_png(rdram, start, width, height, &path) {
         Ok(()) => {
             println!("[wm2000-census] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
@@ -597,42 +605,35 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         Err(e) => eprintln!("[wm2000-census] failed to write {path}: {e}"),
     }
 
-    // Additive, env-gated companion capture at the VI's LIVE geometry, never
-    // an assumed one. The 320x240 dump above is retained unchanged so both
-    // readings of the SAME bytes at the SAME swap can be compared directly;
-    // that is the whole point of this probe, since reading a 480-stride
-    // buffer at a 320 stride shears every row and can manufacture a
-    // convincing "horizontal duplication" artifact out of coherent memory.
-    if std::env::var("WM2000_TRUE_GEOMETRY_DUMP").is_err() {
+    maybe_dump_fixed_320x240(rdram, fb_offset, swap_index);
+}
+
+/// Opt-in ONLY (`WM2000_FIXED_320X240_DUMP`): the old fixed-size guess this
+/// file used to take as its default. Kept for direct comparison against a
+/// live-geometry capture of the same bytes -- never write this path
+/// unlabelled, and never let it be the only capture taken.
+fn maybe_dump_fixed_320x240(rdram: &[u8], fb_offset: u32, swap_index: u64) {
+    if std::env::var("WM2000_FIXED_320X240_DUMP").is_err() {
         return;
     }
-    let (Some(vi_w), Some(vi_h)) = (fn64_abi::vi_width(), fn64_abi::vi_output_height()) else {
-        eprintln!(
-            "[wm2000-census] swap #{swap_index}: VI geometry not programmed yet -- refusing to \
-             guess a true-geometry stride"
-        );
-        return;
-    };
-    let (true_w, true_h) = (vi_w as usize, vi_h as usize);
-    let true_bytes = true_w * true_h * 2;
-    if start + true_bytes > rdram.len() {
-        eprintln!(
-            "[wm2000-census] swap #{swap_index}: true geometry {true_w}x{true_h} exceeds rdram \
-             bounds -- skipping"
-        );
+    const FB_WIDTH: usize = 320;
+    const FB_HEIGHT: usize = 240;
+    const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2;
+    let start = fb_offset as usize;
+    let end = start + FB_BYTES;
+    if end > rdram.len() {
         return;
     }
-    let true_path = format!(
-        "{}/fn64-fb-true-{true_w}x{true_h}-{swap_index}.png",
+    let path = format!(
+        "{}/fn64-fb-fixed320x240-{swap_index}.png",
         std::env::var("WM2000_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string())
     );
-    println!(
-        "[wm2000-census] swap #{swap_index}: live VI geometry is {true_w}x{true_h} (fb \
-         {fb_offset:#010x})"
-    );
-    match dump_rgba5551_as_png(rdram, start, true_w, true_h, &true_path) {
-        Ok(()) => println!("[wm2000-census] *** TRUE-GEOMETRY FRAMEBUFFER DUMPED: {true_path} ***"),
-        Err(e) => eprintln!("[wm2000-census] failed to write {true_path}: {e}"),
+    match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
+        Ok(()) => println!(
+            "[wm2000-census] *** FIXED-320x240 COMPARISON DUMP (opt-in, likely sheared): {path} \
+             ***"
+        ),
+        Err(e) => eprintln!("[wm2000-census] failed to write {path}: {e}"),
     }
 }
 
