@@ -144,6 +144,37 @@ fn shade_passthrough_combine_params() -> CombineParams {
     CombineParams::from_wire(low, high)
 }
 
+/// `shade_passthrough_combine_params`'s sibling, selecting TEXEL0 (D=1)
+/// instead of SHADE (D=4) through the same zero-times-anything identity, so
+/// the combiner output IS the sampled texel. `alpha_c` is TEXEL0 as well
+/// but multiplied by `(A - B) == 0`, so it never reaches the output --
+/// present only to keep the wire encoding identical in shape to the
+/// SHADE variant.
+///
+/// This is also what makes `CombineParams::references_texels_in_first_cycle`
+/// true, which is what opens the fragment shader's `texture_referenced`
+/// gate and makes it call the sampler at all -- a SHADE-passthrough
+/// triangle short-circuits before sampling and could never observe a
+/// status-4 refusal.
+fn texel0_passthrough_combine_params() -> CombineParams {
+    let color_a: u32 = 0; // COMBINED
+    let color_b: u32 = 0; // COMBINED -- (A - B) == 0
+    let color_c: u32 = 0;
+    let color_d: u32 = 1; // TEXEL0
+    let alpha_a: u32 = 0;
+    let alpha_b: u32 = 0;
+    let alpha_c: u32 = 1; // TEXEL0, x0
+    let alpha_d: u32 = 1; // TEXEL0
+    let low = (color_a << 5) | color_c;
+    let high = (color_b << 24)
+        | (color_d << 6)
+        | (alpha_a << 21)
+        | (alpha_b << 3)
+        | (alpha_c << 18)
+        | alpha_d;
+    CombineParams::from_wire(low, high)
+}
+
 fn cpu_combiner_reference(shade_color: [f32; 4]) -> [f32; 4] {
     let params = shade_passthrough_combine_params();
     let inputs = CombinerInputs {
@@ -1051,6 +1082,300 @@ fn admitted_triangle_fixture_assembly_never_panics_and_needs_no_device() {
     assert_eq!(fixture.vertices[2].color, [0.0, 0.0, 1.0, 1.0]);
 }
 
+/// **WM2000's measured tile shape, as a fixture: `IntensityAlpha`/`Bits4`
+/// under an enabled `G_TT_RGBA16` TLUT.**
+///
+/// This is the combination that aborted the all-Rust stack at
+/// `rsp_commit.rs:1202` with `tmem_sample.wgsl` status 4
+/// (`TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`). Under `tlut_en` the RDP
+/// ignores the tile format and sources the texel from a palette; for a
+/// 4-bit texel size the palette's TMEM address comes from the tile's own
+/// `palette` field (n64brew `Reality_Display_Processor/Pipeline`, CC BY-SA
+/// 4.0, quoted in `shaders/tmem_sample.wgsl`'s header).
+///
+/// Everything here is shared by the GPU test and the CPU oracle it is
+/// differentiated against, so the two cannot drift apart in what they mean
+/// by "this tile".
+mod tlut_fixture {
+    use crate::tmem::{TmemGpuProjection, TMEM_VALIDITY_WORDS};
+    use crate::{
+        ImageFormat, PixelSize, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
+        TmemWordAddress,
+    };
+
+    /// Byte 0 of the tile's own image data: the packed pair of 4-bit texels
+    /// for columns 0 and 1 of row 0. Even column is bits 7:4, odd column
+    /// bits 3:0 (`unpack_ci4_texel`) -- `0x30` therefore means column 0
+    /// indexes nibble 3 and column 1 indexes nibble 0. Deliberately
+    /// DIFFERENT nibbles so a decoder taking the wrong half is caught.
+    pub const PACKED_ROW0: u8 = 0x30;
+    /// Row 1's packed pair, at the tile's row-1 address AFTER the odd-row
+    /// XOR4 exchange (`odd_row_exchange`): row 1's linear address is
+    /// `line_words * 8 == 8`, exchanged to `8 ^ 4 == 12`.
+    pub const PACKED_ROW1: u8 = 0x21;
+    pub const ROW1_EXCHANGED_ADDRESS: usize = 12;
+
+    /// The tile's four-bit palette selector. NONZERO on purpose: the index
+    /// is `(palette << 4) | nibble`, so a decoder that drops the palette
+    /// field reads entry `nibble` instead of `0x50 | nibble` and lands on a
+    /// different (deliberately different-colored) TLUT entry.
+    pub const PALETTE: u8 = 5;
+
+    pub const TMEM_WORD_ADDRESS: u16 = 0;
+    pub const LINE_WORDS: u16 = 1;
+
+    /// The four palette entries this fixture's texels reach, as
+    /// `(index, rgba16_value)`. `0x50 | nibble` for nibble in 0..=3.
+    ///
+    /// Every value is chosen so the RGBA16 and IA16 decodes of the SAME
+    /// entry differ -- that is what lets the `G_TT_IA16` test discriminate
+    /// the two entry formats instead of passing vacuously.
+    /// `0xffff` is deliberately absent: it decodes to opaque white under
+    /// both formats and would make that discrimination impossible (a
+    /// measured trap -- the first draft of this fixture used it and the
+    /// IA16 test's own guard assertion caught it).
+    pub const ENTRIES: [(u8, u16); 4] = [
+        (0x50, 0xf801), // RGBA16 (255,0,0,255) vs IA16 (248,248,248,1)
+        (0x51, 0x07c1), // RGBA16 (0,255,0,255) vs IA16 (7,7,7,193)
+        (0x52, 0x003f), // RGBA16 (0,0,255,255) vs IA16 (0,0,0,63)
+        (0x53, 0x8421), // RGBA16 (132,132,132,255) vs IA16 (132,132,132,33)
+    ];
+
+    /// The TLUT entries the four decoy indexes would hit if the palette
+    /// field were dropped (`nibble` instead of `0x50 | nibble`). Written to
+    /// a DIFFERENT color from their palette-5 counterparts so
+    /// "palette field ignored" is a visible failure, not a silent pass.
+    pub const DECOY_ENTRIES: [(u8, u16); 4] = [
+        (0x00, 0x0001),
+        (0x01, 0x0801),
+        (0x02, 0x1001),
+        (0x03, 0x1801),
+    ];
+
+    /// `IntensityAlpha`/`Bits4` -- NOT `ColorIndex`. That is the whole
+    /// point: the format must be ignored while the TLUT is enabled.
+    pub fn descriptor() -> TileDescriptor {
+        TileDescriptor::from_wire(
+            ImageFormat::IntensityAlpha,
+            PixelSize::Bits4,
+            LINE_WORDS,
+            TmemWordAddress::try_new(TMEM_WORD_ADDRESS).unwrap(),
+            PALETTE,
+            TileAddressMode::default(),
+            0,
+            0,
+            TileAddressMode::default(),
+            0,
+            0,
+        )
+    }
+
+    /// A 2x2-texel tile, matching `production.rs`'s own RGBA16 fixture's
+    /// S10.2 convention (`high.integer() - low.integer() + 1 == 2`).
+    pub fn size() -> TileSize {
+        TileSize::from_wire(
+            TileCoordinate::try_new(0).unwrap(),
+            TileCoordinate::try_new(0).unwrap(),
+            TileCoordinate::try_new(4).unwrap(),
+            TileCoordinate::try_new(4).unwrap(),
+        )
+    }
+
+    /// The 16-bit sibling of `descriptor`, over the SAME TMEM bytes: an
+    /// `Rgba`/`Bits16` tile under an enabled TLUT. Under `tlut_en` a 16-bit
+    /// texel indexes the palette through its HIGH (big-endian first) byte
+    /// and the low byte is ignored -- the case `4c412a96` admitted on the
+    /// CPU side. Included so a shader that hardcoded the index (or read the
+    /// low byte) cannot survive the 4-bit tests alone.
+    ///
+    /// `line_words` is 1 as for the 4-bit tile; with two bytes per texel the
+    /// tile's own row 0 spans bytes 0..4.
+    pub fn descriptor_sixteen_bit() -> TileDescriptor {
+        TileDescriptor::from_wire(
+            ImageFormat::Rgba,
+            PixelSize::Bits16,
+            LINE_WORDS,
+            TmemWordAddress::try_new(TMEM_WORD_ADDRESS).unwrap(),
+            PALETTE,
+            TileAddressMode::default(),
+            0,
+            0,
+            TileAddressMode::default(),
+            0,
+            0,
+        )
+    }
+
+    /// A sparse `TmemByteSource` over the same bytes the GPU projection
+    /// carries -- the CPU oracle's half of the differential. Only the
+    /// addresses this fixture writes are valid, exactly like untouched
+    /// physical TMEM.
+    pub struct FixtureTmem {
+        pub bytes: std::collections::BTreeMap<u16, u8>,
+    }
+
+    impl crate::TmemByteSource for FixtureTmem {
+        fn snapshot(&self) -> crate::TmemSnapshotIdentity {
+            // A fresh durable state's own identity: this fixture's bytes
+            // are read through `valid_byte`, and no caller here compares
+            // snapshots, so borrowing one real committed identity is
+            // honest -- matching `tmem/read.rs`'s own `SparseSource`.
+            crate::TmemByteSource::snapshot(&crate::PhysicalTmemState::try_new().unwrap())
+        }
+
+        fn valid_byte(&self, address: u16) -> Option<u8> {
+            self.bytes.get(&address).copied()
+        }
+    }
+
+    /// Writes one quadricated TLUT entry: four identical big-endian 16-bit
+    /// lanes across the eight bytes at `0x800 + index * 8`. Both the CPU
+    /// reader (`read_canonical_tlut_entry`) and the WGSL sampler require
+    /// all eight valid and all four lanes equal.
+    fn write_entry(bytes: &mut std::collections::BTreeMap<u16, u8>, index: u8, value: u16) {
+        let base = 0x0800u16 + u16::from(index) * 8;
+        for lane in 0..4u16 {
+            bytes.insert(base + lane * 2, (value >> 8) as u8);
+            bytes.insert(base + lane * 2 + 1, (value & 0xff) as u8);
+        }
+    }
+
+    /// The one byte map both halves of the differential read.
+    pub fn bytes() -> std::collections::BTreeMap<u16, u8> {
+        let mut bytes = std::collections::BTreeMap::new();
+        bytes.insert(0u16, PACKED_ROW0);
+        bytes.insert(ROW1_EXCHANGED_ADDRESS as u16, PACKED_ROW1);
+        for (index, value) in ENTRIES {
+            write_entry(&mut bytes, index, value);
+        }
+        for (index, value) in DECOY_ENTRIES {
+            write_entry(&mut bytes, index, value);
+        }
+        // The 16-bit path's entries. `descriptor_sixteen_bit`'s texel at
+        // (0,0) spans bytes 0..2, whose HIGH byte is `PACKED_ROW0` and whose
+        // LOW byte is byte 1. Byte 1 is left INVALID by this map on purpose
+        // for the 4-bit fixture, so give the 16-bit case its own explicit
+        // low byte, chosen to differ from the high byte -- a decoder reading
+        // the low byte then lands on `LOW_BYTE_DECOY_INDEX` instead.
+        bytes.insert(1u16, SIXTEEN_BIT_LOW_BYTE);
+        write_entry(&mut bytes, SIXTEEN_BIT_INDEX, SIXTEEN_BIT_ENTRY);
+        write_entry(&mut bytes, SIXTEEN_BIT_LOW_BYTE, SIXTEEN_BIT_LOW_DECOY);
+        // The 2x2 tile's three OTHER corners at 16 bits, so the
+        // three-nearest filter's four reads all hit valid bytes. Column 1
+        // of row 0 is bytes 2..4; row 1 (odd) is exchanged, so its two
+        // texels live at `8 ^ 4 = 12`..16. Each is given
+        // `SIXTEEN_BIT_INDEX` as its own high byte, which makes all four
+        // corners resolve to one entry and the filter the identity -- the
+        // assertion under test is the index derivation, not the blend.
+        for address in [2u16, 12, 14] {
+            bytes.insert(address, SIXTEEN_BIT_INDEX);
+            bytes.insert(address + 1, SIXTEEN_BIT_LOW_BYTE);
+        }
+        bytes
+    }
+
+    /// Index the 16-bit texel at (0,0) must resolve to: its HIGH byte,
+    /// which is `PACKED_ROW0`. The tile's `palette` field is NOT applied at
+    /// 16-bit -- only 4-bit texels take the palette prefix
+    /// (`resolve_indexed_texel`).
+    pub const SIXTEEN_BIT_INDEX: u8 = PACKED_ROW0;
+    pub const SIXTEEN_BIT_ENTRY: u16 = 0x1f83;
+    /// The low byte, and the entry a low-byte-reading decoder would hit.
+    /// Different from `SIXTEEN_BIT_INDEX` and given a different color, so
+    /// "reads the wrong byte" is a visible failure.
+    pub const SIXTEEN_BIT_LOW_BYTE: u8 = 0xa7;
+    pub const SIXTEEN_BIT_LOW_DECOY: u16 = 0x0842;
+
+    pub fn source() -> FixtureTmem {
+        FixtureTmem { bytes: bytes() }
+    }
+
+    /// The GPU half: the same map, projected into the shader's byte image
+    /// plus validity bitmap. Built from `bytes()` rather than from a second
+    /// hand-written table, so the two halves cannot describe different TMEM.
+    pub fn projection() -> TmemGpuProjection {
+        let mut projection = TmemGpuProjection {
+            bytes: [0u8; fn64_render_ir::TMEM_BYTES as usize],
+            validity_words: [0u32; TMEM_VALIDITY_WORDS],
+        };
+        for (address, byte) in bytes() {
+            let address = address as usize;
+            projection.bytes[address] = byte;
+            projection.validity_words[address / 32] |= 1 << (address % 32);
+        }
+        projection
+    }
+}
+
+/// **Positive control for the fixture itself.** Adapter-free: proves the
+/// fixture really is `IntensityAlpha`/`Bits4` under an enabled TLUT --
+/// never a `ColorIndex` tile that would pass the GPU test vacuously through
+/// the pre-existing CI path -- and that the CPU reader (fixed at
+/// `4c412a96`) resolves it through the palette field to the entries this
+/// fixture wrote.
+#[test]
+fn tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_the_cpu_reader_palettizes() {
+    let descriptor = tlut_fixture::descriptor();
+    assert_eq!(
+        descriptor.format(),
+        crate::ImageFormat::IntensityAlpha,
+        "a ColorIndex tile would pass the GPU test through the pre-existing \
+         CI path without exercising the format-ignored rule at all"
+    );
+    assert_eq!(descriptor.size(), crate::PixelSize::Bits4);
+    assert_eq!(descriptor.palette(), tlut_fixture::PALETTE);
+    assert_ne!(
+        descriptor.palette(),
+        0,
+        "a zero palette cannot discriminate (palette << 4) | nibble from nibble"
+    );
+
+    // Column 0 of row 0 takes the HIGH nibble (3), column 1 the LOW (0);
+    // the packed byte's two nibbles differ, so a parity mistake is visible.
+    assert_ne!(
+        tlut_fixture::PACKED_ROW0 >> 4,
+        tlut_fixture::PACKED_ROW0 & 0x0f
+    );
+
+    let source = tlut_fixture::source();
+    for (column, nibble) in [
+        (0u16, tlut_fixture::PACKED_ROW0 >> 4),
+        (1, tlut_fixture::PACKED_ROW0 & 0x0f),
+    ] {
+        let addressed =
+            crate::AddressedTmemTexel::new(column, 0, crate::TmemFirstRowParity::Even);
+        let decoded = crate::read_texel(
+            &source,
+            descriptor,
+            addressed,
+            crate::TextureLutMode::Rgba16,
+        )
+        .expect("the CPU reader palettizes an IA4 tile under an enabled TLUT");
+        let expected_index = (tlut_fixture::PALETTE << 4) | nibble;
+        let (_, expected_value) = tlut_fixture::ENTRIES
+            .into_iter()
+            .find(|(index, _)| *index == expected_index)
+            .expect("this fixture wrote every entry its texels reach");
+        let expected = crate::decode_direct_texel(
+            crate::ImageFormat::Rgba,
+            crate::RawTexel::try_new(crate::PixelSize::Bits16, u32::from(expected_value)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.texel().rgba8888(),
+            expected.rgba8888(),
+            "column {column} must palettize through index {expected_index:#04x}"
+        );
+        // The decoy entry at the same nibble is a DIFFERENT color, so this
+        // assertion would also fail if the palette field were dropped.
+        let (_, decoy_value) = tlut_fixture::DECOY_ENTRIES
+            .into_iter()
+            .find(|(index, _)| *index == nibble)
+            .expect("this fixture wrote every decoy entry");
+        assert_ne!(expected_value, decoy_value);
+    }
+}
+
 #[cfg(feature = "host-gpu-tests")]
 mod host_gpu_tests {
     use super::*;
@@ -1080,6 +1405,412 @@ mod host_gpu_tests {
     fn pixel_index(x: u32, y: u32) -> usize {
         (y * EXTENT.width + x) as usize
     }
+
+    /// Submits one flat-UV triangle over `tlut_fixture`'s TMEM at the given
+    /// tile binding, returning the readback. Shared by the three
+    /// enabled-TLUT GPU tests below so they cannot disagree about the
+    /// geometry, the combine program, or the fixture's bytes.
+    fn submit_flat_uv_tlut_draw(
+        renderer: &mut TrianglePipelineRenderer,
+        tile_binding: TileBindingParams,
+        projection: TmemGpuProjection,
+        column: u32,
+        row: u32,
+    ) -> TriangleDrawOutput {
+        // Raw S10.5 exactly on the texel's integer coordinate: both
+        // fractions are zero, so the three-nearest filter over four equal
+        // corners is the identity and the readback is this texel's own
+        // color with no blending to unpick.
+        let raw_s = (column * 32) as f32;
+        let raw_t = (row * 32) as f32;
+        let vertex = |x: f32, y: f32| fn64_render::NeutralTriangleVertex {
+            x,
+            y,
+            z: 0.5,
+            w: 1.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            texcoord: [raw_s, raw_t],
+        };
+        renderer
+            .submit_admitted_triangle(
+                [vertex(0.0, 0.0), vertex(8.0, 0.0), vertex(0.0, 8.0)],
+                OtherMode::from_wire(0, 0),
+                texel0_passthrough_combine_params(),
+                identity_raster_params(),
+                EXTENT,
+                projection,
+                tile_binding,
+                None,
+                None,
+                None,
+                ResolvedFragmentBlendParams::NO_OP,
+                false,
+            )
+            .expect("palettized triangle draw must submit cleanly")
+            .complete()
+            .expect("palettized triangle draw must complete cleanly")
+    }
+
+    fn tlut_renderer() -> Box<TrianglePipelineRenderer> {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        }
+    }
+
+    /// The `G_TT_IA16` half of the enabled-TLUT arm: the SAME palette entry
+    /// bytes must decode as IA16 (high byte intensity, low byte alpha), not
+    /// as RGBA16. The two decodes disagree on every entry this fixture
+    /// writes, so a shader that ignored `lut_mode` and always ran
+    /// `decode_rgba16` fails here even though the RGBA16 test above passes.
+    ///
+    /// Adapter-gated (`host-gpu-tests`).
+    #[test]
+    fn required_host_ia16_tlut_mode_decodes_the_entry_as_ia16_not_rgba16() {
+        let mut renderer = tlut_renderer();
+        let descriptor = tlut_fixture::descriptor();
+        let tile_binding = TileBindingParams::bound(descriptor, tlut_fixture::size())
+            .with_lut_mode(crate::TextureLutMode::Ia16);
+
+        for (column, row) in [(0u32, 0u32), (1, 0)] {
+            let output = submit_flat_uv_tlut_draw(
+                &mut renderer,
+                tile_binding,
+                tlut_fixture::projection(),
+                column,
+                row,
+            );
+            assert_eq!(
+                output
+                    .tmem_sample_status
+                    .iter()
+                    .copied()
+                    .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
+                None,
+                "texel ({column},{row}) under G_TT_IA16 must sample"
+            );
+
+            let expected = crate::read_texel(
+                &tlut_fixture::source(),
+                descriptor,
+                crate::AddressedTmemTexel::new(
+                    column as u16,
+                    row as u16,
+                    crate::TmemFirstRowParity::Even,
+                ),
+                crate::TextureLutMode::Ia16,
+            )
+            .expect("the CPU reader palettizes this tile under Ia16")
+            .texel()
+            .rgba8888();
+
+            // The discriminating fact: this fixture's entries decode
+            // DIFFERENTLY under the two modes, so matching the IA16 oracle
+            // is not something an RGBA16-only decoder could do by accident.
+            let as_rgba16 = crate::read_texel(
+                &tlut_fixture::source(),
+                descriptor,
+                crate::AddressedTmemTexel::new(
+                    column as u16,
+                    row as u16,
+                    crate::TmemFirstRowParity::Even,
+                ),
+                crate::TextureLutMode::Rgba16,
+            )
+            .expect("the CPU reader palettizes this tile under Rgba16")
+            .texel()
+            .rgba8888();
+            assert_ne!(
+                expected, as_rgba16,
+                "texel ({column},{row}): this fixture cannot discriminate the \
+                 two TLUT entry formats"
+            );
+
+            assert_close_rgba8(rgba8_at(&output, 1, 1), expected, 2);
+        }
+    }
+
+    /// A 16-bit texel under an enabled TLUT indexes the palette through its
+    /// HIGH (big-endian first) byte, the low byte ignored -- the case
+    /// `4c412a96` admitted on the CPU side, mirrored here on the GPU. The
+    /// fixture's low byte differs from its high byte and points at a
+    /// differently-colored decoy entry, so a decoder reading the wrong byte
+    /// (or hardcoding the index) fails.
+    ///
+    /// Adapter-gated (`host-gpu-tests`).
+    #[test]
+    fn required_host_sixteen_bit_tlut_texel_indexes_through_its_high_byte() {
+        let mut renderer = tlut_renderer();
+        let descriptor = tlut_fixture::descriptor_sixteen_bit();
+        assert_ne!(
+            tlut_fixture::SIXTEEN_BIT_INDEX,
+            tlut_fixture::SIXTEEN_BIT_LOW_BYTE,
+            "the two bytes must differ or this test cannot tell them apart"
+        );
+        let tile_binding = TileBindingParams::bound(descriptor, tlut_fixture::size())
+            .with_lut_mode(crate::TextureLutMode::Rgba16);
+
+        let output = submit_flat_uv_tlut_draw(
+            &mut renderer,
+            tile_binding,
+            tlut_fixture::projection(),
+            0,
+            0,
+        );
+        assert_eq!(
+            output
+                .tmem_sample_status
+                .iter()
+                .copied()
+                .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
+            None,
+            "a 16-bit texel under an enabled TLUT must sample"
+        );
+
+        let expected = crate::read_texel(
+            &tlut_fixture::source(),
+            descriptor,
+            crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
+            crate::TextureLutMode::Rgba16,
+        )
+        .expect("the CPU reader palettizes a 16-bit texel under an enabled TLUT")
+        .texel()
+        .rgba8888();
+        assert_close_rgba8(rgba8_at(&output, 1, 1), expected, 2);
+
+        // The two wrong answers this fixture is built to catch, each a
+        // different color from the right one.
+        let decode = |value: u16| {
+            crate::decode_direct_texel(
+                crate::ImageFormat::Rgba,
+                crate::RawTexel::try_new(crate::PixelSize::Bits16, u32::from(value)).unwrap(),
+            )
+            .unwrap()
+            .rgba8888()
+        };
+        assert_eq!(expected, decode(tlut_fixture::SIXTEEN_BIT_ENTRY));
+        assert_ne!(
+            expected,
+            decode(tlut_fixture::SIXTEEN_BIT_LOW_DECOY),
+            "the low-byte decoy must be a different color"
+        );
+    }
+
+    /// A TLUT entry whose four quadricated lanes disagree means the palette
+    /// was never fully loaded. The CPU reader refuses it by name
+    /// (`NonCanonicalTlutEntry`); the shader must refuse it too, as
+    /// `TMEM_SAMPLE_STATUS_INVALID_BYTE`, rather than inventing a lane and
+    /// silently painting the wrong palette color.
+    ///
+    /// Adapter-gated (`host-gpu-tests`). This is a refusal being PRESERVED,
+    /// not weakened -- the fix widened only the format gate.
+    #[test]
+    fn required_host_a_non_canonical_tlut_entry_is_refused_not_guessed() {
+        let mut renderer = tlut_renderer();
+        let descriptor = tlut_fixture::descriptor();
+        let tile_binding = TileBindingParams::bound(descriptor, tlut_fixture::size())
+            .with_lut_mode(crate::TextureLutMode::Rgba16);
+
+        // Column 0 of row 0 reads nibble 3, i.e. index 0x53. Corrupt only
+        // that entry's LAST lane, leaving lanes 0-2 agreeing: a shader
+        // reading lane 0 alone would happily return the right color, so
+        // this specifically tests that all four lanes are checked.
+        let mut bytes = tlut_fixture::bytes();
+        let last_lane = 0x0800u16 + 0x53 * 8 + 6;
+        bytes.insert(last_lane, 0x00);
+        bytes.insert(last_lane + 1, 0x00);
+
+        let mut projection = tlut_fixture::projection();
+        for (address, byte) in &bytes {
+            projection.bytes[*address as usize] = *byte;
+        }
+
+        // The CPU reader's own verdict on the same bytes, first -- so this
+        // test asserts the two lanes AGREE about the refusal, not merely
+        // that the shader refuses something.
+        let source = tlut_fixture::FixtureTmem { bytes };
+        assert!(
+            crate::read_texel(
+                &source,
+                descriptor,
+                crate::AddressedTmemTexel::new(0, 0, crate::TmemFirstRowParity::Even),
+                crate::TextureLutMode::Rgba16,
+            )
+            .is_err(),
+            "the CPU reader must refuse a non-canonical entry"
+        );
+
+        let output = submit_flat_uv_tlut_draw(&mut renderer, tile_binding, projection, 0, 0);
+        assert!(
+            output
+                .tmem_sample_status
+                .iter()
+                .any(|&status| status == TMEM_SAMPLE_STATUS_INVALID_BYTE),
+            "a non-canonical TLUT entry must surface as INVALID_BYTE, not be \
+             silently sampled from lane 0"
+        );
+    }
+
+    /// **The blocker, as a test: WM2000's IA4-under-`G_TT_RGBA16` tile must
+    /// sample on the GPU triangle path.**
+    ///
+    /// Before the `lut_mode` wiring landed, `tmem_sample.wgsl` consulted
+    /// `tile.format` unconditionally and returned
+    /// `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT` (4) for every fragment of
+    /// this draw -- the abort that stopped the all-Rust stack at
+    /// `rsp_commit.rs:1202`. Under `tlut_en` the hardware ignores the tile
+    /// format entirely, so the refusal was a lane gap, not a hardware rule.
+    ///
+    /// Differential, not a frozen expectation: the four corner texels'
+    /// colors are read back from the GPU and compared against
+    /// `crate::read_texel` -- the SAME CPU reader `execute_scheduled_texrect`
+    /// uses -- over the SAME byte map, so the two lanes cannot drift apart
+    /// silently. `tlut_fixture_is_genuinely_a_non_ci_four_bit_tile_...`
+    /// above is this test's positive control: it proves, without an
+    /// adapter, that the fixture is a non-CI 4-bit tile with a nonzero
+    /// palette, so a pass here cannot be vacuous.
+    ///
+    /// Adapter-gated (`host-gpu-tests`): panics with a typed reason rather
+    /// than skipping when the host has no native adapter, matching this
+    /// module's own required-host convention.
+    #[test]
+    fn required_host_enabled_tlut_over_an_ia4_tile_samples_and_matches_the_cpu_reader() {
+        let requested =
+            block_on(UninitializedTrianglePipeline::new(HeadlessBackend::AnyNative).request())
+                .unwrap();
+        let mut renderer = match requested {
+            TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+            TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+                "required host GPU evidence unavailable: typed no-adapter for {:?}",
+                no_adapter.requested()
+            ),
+        };
+
+        let descriptor = tlut_fixture::descriptor();
+        let size = tlut_fixture::size();
+        let tile_binding = TileBindingParams::bound(descriptor, size)
+            .with_lut_mode(crate::TextureLutMode::Rgba16);
+        assert_ne!(
+            tile_binding.format,
+            0,
+            "the fixture must NOT be RGBA -- an RGBA16 tile would pass \
+             through the pre-existing direct arm without exercising the fix"
+        );
+        assert_eq!(tile_binding.palette, u32::from(tlut_fixture::PALETTE));
+
+        // Each of the four target quadrants samples one of the tile's four
+        // texels. A single flat UV per draw keeps the whole triangle on one
+        // texel, so the readback is that texel's color with no filter
+        // blending to unpick -- the three-nearest filter over four equal
+        // corners is the identity.
+        for (column, row, packed_nibble) in [
+            (0u32, 0u32, tlut_fixture::PACKED_ROW0 >> 4),
+            (1, 0, tlut_fixture::PACKED_ROW0 & 0x0f),
+            (0, 1, tlut_fixture::PACKED_ROW1 >> 4),
+            (1, 1, tlut_fixture::PACKED_ROW1 & 0x0f),
+        ] {
+            // Raw S10.5: exactly on the texel's integer coordinate, so both
+            // the S and T fractions are zero and all four filter corners
+            // collapse onto this one texel.
+            let raw_s = (column * 32) as f32;
+            let raw_t = (row * 32) as f32;
+            let vertices = [
+                fn64_render::NeutralTriangleVertex {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.5,
+                    w: 1.0,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                    texcoord: [raw_s, raw_t],
+                },
+                fn64_render::NeutralTriangleVertex {
+                    x: 8.0,
+                    y: 0.0,
+                    z: 0.5,
+                    w: 1.0,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                    texcoord: [raw_s, raw_t],
+                },
+                fn64_render::NeutralTriangleVertex {
+                    x: 0.0,
+                    y: 8.0,
+                    z: 0.5,
+                    w: 1.0,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                    texcoord: [raw_s, raw_t],
+                },
+            ];
+
+            let output = renderer
+                .submit_admitted_triangle(
+                    vertices,
+                    OtherMode::from_wire(0, 0),
+                    texel0_passthrough_combine_params(),
+                    identity_raster_params(),
+                    EXTENT,
+                    tlut_fixture::projection(),
+                    tile_binding,
+                    None,
+                    None,
+                    None,
+                    ResolvedFragmentBlendParams::NO_OP,
+                    false,
+                )
+                .expect("palettized triangle draw must submit cleanly")
+                .complete()
+                .expect("palettized triangle draw must complete cleanly");
+
+            // THE assertion that failed before the fix: every fragment
+            // reported status 4 (`TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`).
+            let bad = output
+                .tmem_sample_status
+                .iter()
+                .copied()
+                .find(|&status| status != TMEM_SAMPLE_STATUS_OK);
+            assert_eq!(
+                bad, None,
+                "texel ({column},{row}): the shader must sample an IA4 tile \
+                 under an enabled TLUT, not refuse it by format"
+            );
+
+            // Differential against the CPU reader over the same bytes.
+            let addressed = crate::AddressedTmemTexel::new(
+                column as u16,
+                row as u16,
+                crate::TmemFirstRowParity::Even,
+            );
+            let expected = crate::read_texel(
+                &tlut_fixture::source(),
+                descriptor,
+                addressed,
+                crate::TextureLutMode::Rgba16,
+            )
+            .expect("the CPU reader palettizes this tile")
+            .texel()
+            .rgba8888();
+
+            // A covered pixel well inside the right triangle.
+            let observed = rgba8_at(&output, 1, 1);
+            assert_close_rgba8(observed, expected, 2);
+
+            // Liveness: the expected color must not be the clear color, or
+            // an all-black readback would pass without the draw happening.
+            assert_ne!(
+                expected,
+                [0, 0, 0, 0],
+                "texel ({column},{row}) nibble {packed_nibble:#x} must be a \
+                 visible color, not the cleared attachment"
+            );
+        }
+    }
+
+
 
     fn rgba8_at(output: &TriangleDrawOutput, x: u32, y: u32) -> [u8; 4] {
         let index = pixel_index(x, y) * 4;
