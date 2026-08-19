@@ -373,3 +373,88 @@ fn ceil_ratio_rounds_up_on_both_sides_of_zero() {
     assert_eq!(ceil_ratio(-8, 8), -1);
     assert_eq!(ceil_ratio(-1, 8), 0);
 }
+
+
+// ---------------------------------------------------------------------------
+// The coverage samples are a CHECKERBOARD, not a 2x4 grid
+// ---------------------------------------------------------------------------
+
+/// **The X sample columns alternate by Y row, and the difference decides
+/// whether a pixel is painted at all.**
+///
+/// This test exists because the mutant that freezes the columns at (1, 5) on
+/// every row SURVIVED the whole suite. The gradient tests above sample at Y
+/// row 1, where both readings agree, so nothing reached the difference.
+///
+/// Hand-derived. Left edge parked at x = 0.75 px (49152 in Q16.16), right
+/// edge far away. Pixel 0's eight subsamples, by
+/// `crate::COVERAGE_SAMPLES`:
+///   Y row 1 -> X columns 1/8 = 0.125, 5/8 = 0.625  -- both < 0.75, OUT
+///   Y row 3 -> X columns 3/8 = 0.375, 7/8 = 0.875  -- 0.875 >= 0.75, IN
+///   Y row 5 -> X columns 1/8, 5/8                  -- both OUT
+///   Y row 7 -> X columns 3/8, 7/8                  -- 0.875 IN
+/// So the checkerboard covers exactly 2 of 8.
+///
+/// Frozen at (1, 5) on every row, all eight samples are 0.125 or 0.625 and
+/// the pixel covers ZERO -- so the pixel would not be painted at all, not
+/// merely painted with a different weight.
+#[test]
+fn the_x_sample_columns_alternate_by_row_and_change_whether_a_pixel_is_covered() {
+    // yh = 0, yl = 4 scanlines, left edge x = 0.75, right edge x = 6.
+    let triangle = decode(&wire(
+        true,
+        line(4),
+        line(4),
+        0,
+        px(6),
+        0,
+        49152,
+        0,
+        px(6),
+        0,
+    ));
+    assert_eq!(
+        pixel_coverage(&triangle, 0, 0),
+        2,
+        "pixel 0 is covered only on the Y rows whose X columns are (3, 7)"
+    );
+    // Pixel 1 is entirely right of the edge and fully covered either way,
+    // so this test cannot pass by the coverage function returning 0.
+    assert_eq!(pixel_coverage(&triangle, 1, 0), 8);
+
+    // And the columns themselves, read off `crate::COVERAGE_SAMPLES`.
+    assert_eq!(sample_x_eighths(1), [1, 5]);
+    assert_eq!(sample_x_eighths(3), [3, 7]);
+    assert_eq!(sample_x_eighths(5), [1, 5]);
+    assert_eq!(sample_x_eighths(7), [3, 7]);
+}
+
+/// The attribute sample point follows the same checkerboard.
+///
+/// For the triangle above, pixel 0's FIRST covered subsample in the RDP's
+/// scan order is Y row 3, X column 7/8 -- not Y row 1. So the attribute
+/// plane is evaluated at `edge_delta_y_eighth = 3` and
+/// `edge_delta_x = 0.875 - 0.75 = 0.125 px`, not at row 1 at all.
+///
+/// With the columns frozen at (1, 5) there is no covered subsample and the
+/// function returns `None`, which the executor turns into a named refusal.
+#[test]
+fn the_attribute_sample_point_follows_the_checkerboard_too() {
+    let triangle = decode(&wire(
+        true,
+        line(4),
+        line(4),
+        0,
+        px(6),
+        0,
+        49152,
+        0,
+        px(6),
+        0,
+    ));
+    let (delta_y_eighth, delta_x) =
+        attribute_sample(&triangle, 0, 0).expect("pixel 0 has two covered subsamples");
+    assert_eq!(delta_y_eighth, 3, "the first covered Y row is 3/8, not 1/8");
+    // 7/8 px = 57344; major edge = 49152. 57344 - 49152 = 8192 = 0.125 px.
+    assert_eq!(delta_x, 8192);
+}
