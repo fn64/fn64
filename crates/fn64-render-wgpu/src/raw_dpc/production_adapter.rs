@@ -988,7 +988,7 @@ pub fn push_decoded_raw_dpc(
                 let decoded = decode_triangle_vertices(&triangle, other_mode.texture_perspective());
                 let vertices =
                     core::array::from_fn(|index| neutral_triangle_vertex(decoded.vertex(index)));
-                // **A flat raw triangle now declares a per-scanline write
+                // **An executable raw triangle now declares a per-scanline write
                 // run, and this is where the decoder's own access slice is
                 // pushed into the writer.**
                 //
@@ -1002,7 +1002,7 @@ pub fn push_decoded_raw_dpc(
                 // access-for-access check exists to catch.
                 //
                 // An empty slice means this triangle declared no destination
-                // write -- outside `plan_raw_triangle`'s flat-opaque subset,
+                // write -- outside `plan_raw_triangle`'s executable subset,
                 // no staged `SetColorImage`, Fill cycle, or a covered row
                 // outside installed RDRAM. That is `None`, not a zero-count
                 // span: "declared nothing" and "declared zero accesses" must
