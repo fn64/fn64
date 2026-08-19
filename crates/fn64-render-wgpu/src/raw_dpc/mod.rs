@@ -5247,6 +5247,42 @@ mod tests {
         assert_eq!(SET_SCISSOR, 0xedu8 & 0x3f);
     }
 
+    /// **`SetScissor` now STAGES, where it used to be tracked-only.**
+    ///
+    /// The tracked-only shape is exactly what made a texrect overhanging
+    /// the framebuffer a refusal rather than a clip: with no latched rect,
+    /// `execute_texture_rectangle` had nothing to clip against. angrylion
+    /// latches the four fields into `wstate->clip` in `rdp_set_scissor`
+    /// (`rasterizer.c:2779-2784`) and the edgewalker clips every span
+    /// against them (`:2349-2363` for X, `:2284-2305` for Y).
+    ///
+    /// Asserts the staged rect field by field, in the quarter-pixel wire
+    /// units the command carries, using four DISTINCT values so a staging
+    /// path that transposed two of them cannot pass.
+    #[test]
+    fn set_scissor_stages_its_rect_into_durable_rdp_state() {
+        let decoded = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let staged = decoded
+            .staged_state()
+            .scissor()
+            .expect("SetScissor stages a rect");
+        assert_eq!(staged.mode(), 2);
+        assert_eq!(staged.upper_left_x(), 0x123);
+        assert_eq!(staged.upper_left_y(), 0x456);
+        assert_eq!(staged.lower_right_x(), 0x789);
+        assert_eq!(staged.lower_right_y(), 0xABC);
+    }
+
+    /// A stream with no `SetScissor` stages none -- the consumer's own
+    /// fallback (the colour target's extent) applies, rather than a
+    /// fabricated rect latched here.
+    #[test]
+    fn a_stream_with_no_set_scissor_stages_no_rect() {
+        let words = vec![word(0, SET_BLEND_COLOR, 0), 0xAABBCCDD];
+        let decoded = decode(words).unwrap();
+        assert_eq!(decoded.staged_state().scissor(), None);
+    }
+
     #[test]
     fn set_scissor_decodes_each_field_from_its_own_wire_position() {
         // ulx = 0x123 (291), uly = 0x456 (1110) from w0's low 24 bits;

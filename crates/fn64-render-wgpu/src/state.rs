@@ -1049,6 +1049,10 @@ impl StagedRdpState {
         self.state.fog_color()
     }
 
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.state.scissor()
+    }
+
     pub const fn prim_depth(&self) -> Option<PrimDepth> {
         self.state.prim_depth()
     }

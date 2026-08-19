@@ -6649,6 +6649,11 @@ mod tests {
             env_color: Color4::from_wire(0),
             prim_color: PrimColor::from_wire(0, 0),
             fog_color: Color4::from_wire(0),
+            // A raw-triangle fixture: this path does not read the scissor
+            // (only `execute_texture_rectangle` clips against it today),
+            // so an unset rect is the honest value rather than a fabricated
+            // full-frame one.
+            scissor: None,
         }
     }
 
@@ -7535,6 +7540,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
 
@@ -7664,6 +7670,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             tiles,
         );
 
@@ -7714,6 +7721,7 @@ mod tests {
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
+            None,
             None,
             tiles,
         );
@@ -7874,6 +7882,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
 
@@ -7935,6 +7944,7 @@ mod tests {
             seed_prim_color,
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let triangle = fixture_triangle(1.0);
@@ -7961,6 +7971,7 @@ mod tests {
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
+            None,
             None,
             [(None, None); 8],
         );
@@ -7996,6 +8007,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let triangle = fixture_triangle(1.0);
@@ -8027,6 +8039,7 @@ mod tests {
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
+            None,
             None,
             [(None, None); 8],
         );
@@ -8073,6 +8086,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
 
@@ -8103,6 +8117,7 @@ mod tests {
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
+            None,
             None,
             [(None, None); 8],
         );
@@ -9143,6 +9158,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.scissor(),
             backend.rdp_state.color_image(),
             durable_neutral_tiles(&backend.rdp_state),
             &mut backend.color_targets,
@@ -10451,6 +10467,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let mut color_targets = None;
@@ -10464,6 +10481,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
+            None,
                 None,
                 [(None, None); 8],
             ),
@@ -10778,6 +10796,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let mut color_targets = None;
@@ -10791,6 +10810,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
+            None,
                 None,
                 [(None, None); 8],
             ),
@@ -11826,6 +11846,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.scissor(),
             backend.rdp_state.color_image(),
             durable_neutral_tiles(&backend.rdp_state),
             &mut backend.color_targets,
@@ -11950,6 +11971,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let mut color_targets = None;
@@ -11967,6 +11989,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
+            None,
                 None,
                 [(None, None); 8],
             ),
@@ -12150,6 +12173,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.scissor(),
             backend.rdp_state.color_image(),
             durable_neutral_tiles(&backend.rdp_state),
             &mut backend.color_targets,
@@ -12606,6 +12630,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let mut color_targets = None;
@@ -12619,6 +12644,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
+            None,
                 None,
                 [(None, None); 8],
             ),
@@ -12652,6 +12678,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         let mut color_targets = None;
@@ -12665,6 +12692,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
+            None,
                 None,
                 [(None, None); 8],
             ),
@@ -14672,6 +14700,7 @@ mod tests {
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
             None,
+            None,
             [(None, None); 8],
         );
         assert!(
@@ -14786,6 +14815,7 @@ mod tests {
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
             Color4::from_wire(0),
+            None,
             None,
             tiles,
         );
@@ -14909,6 +14939,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.scissor(),
             backend.rdp_state.color_image(),
             seed,
         );
@@ -14927,7 +14958,8 @@ mod tests {
                 backend.rdp_state.env_color(),
                 backend.rdp_state.prim_color(),
                 backend.rdp_state.fog_color(),
-                backend.rdp_state.color_image(),
+                backend.rdp_state.scissor(),
+            backend.rdp_state.color_image(),
                 seed,
             ),
             reads: Vec::new(),
@@ -15152,6 +15184,7 @@ mod tests {
             backend.rdp_state.env_color(),
             backend.rdp_state.prim_color(),
             backend.rdp_state.fog_color(),
+            backend.rdp_state.scissor(),
             backend.rdp_state.color_image(),
             backend
                 .tiles_before_last_plan
