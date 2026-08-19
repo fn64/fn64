@@ -1015,11 +1015,7 @@ pub(super) fn decode_stream_impl(
                 // latched, off unless `FN64_GBI_OTHERMODE_CENSUS` is set.
                 // Reads `state.other_mode` rather than `w0`/`w1` so the
                 // count is of what the renderer will act on.
-                super::census::othermode::note(
-                    state.other_mode.high,
-                    state.other_mode.low,
-                    raw_rdp,
-                );
+                super::census::othermode::note(state.other_mode, raw_rdp);
             }
             G_SETOTHERMODE_H => {
                 // F3DEX2 gSPSetOtherMode (`gbi.h:3353-3369`) stores
