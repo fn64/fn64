@@ -127,6 +127,17 @@ unreachable today or blocked behind another row.
   Tier A on the *texrect path* rather than on a proven two-cycle draw. Read the
   zero correctly: it means "not seen in boot/logo/attract," never "does not
   occur." Gameplay has never been reached on either lane.
+- **RESOLVED (`6c0dc19a`).** Two-cycle now evaluates through
+  `combiner::run_two_cycle`. Validation follows the reference rather than the
+  old constant set: `TexrectShading::validate_combiner_program` checks every
+  bitfield slice the cycle mode actually evaluates and admits `COMBINED` only
+  in two-cycle's second slice (`validate.rs:476-478`'s rule); `TEXEL1` stays
+  refused in both slices, because a rectangle binds one tile
+  (`validate.rs:479-483`, the reference's own reason). The audit's warning was
+  acted on: `two_cycle_carries_the_accumulator_one_cycle_cannot` runs a program
+  whose cycle 0 is `(0-0)*0 + Primitive` and whose cycle 1 is
+  `(0-0)*0 + Combined`, so two-cycle must give the primitive colour and the
+  same program as one-cycle must give transparent black. Four mutants killed.
 
 #### D3 — Fill-cycle texture rectangles · **REACHES WM2000: unmeasured; broke a sibling ROM**
 
@@ -152,6 +163,37 @@ unreachable today or blocked behind another row.
 - **WM2000 reach.** UNKNOWN for WM2000 itself; **proven** for its engine
   sibling. Listed in Tier A because the failure mode is already witnessed on
   the same engine.
+- **NOT LANDED, and it is NOT one match arm** (checked at `6c0dc19a`, pinned
+  by `the_texrect_and_fill_rectangle_rules_disagree_by_a_pixel_on_every_axis`
+  and `the_fill_rule_refuses_a_fractional_edge_the_texrect_rule_rounds`). The
+  verdict above stands — the reference is right and this is a lane gap — but
+  the estimate of the fix does not. Widening `admitted_cycle_evaluation` to
+  admit `Fill` would draw the wrong rectangle, silently. Three things block it,
+  each in a different module:
+  1. **The two rectangle rules disagree by one pixel on every axis.** A texrect
+     reaches the executor as an already-resolved `RectViewportPixels`, built by
+     `raw_dpc/texture_rectangle.rs`'s port of RT64's `FixedRect`:
+     `(coord + 3) >> 2` at both ends, **half-open**. A fill rectangle's rule is
+     `targets/fill.rs`'s `resolve_fill_pixel_rectangle`: `coord >> 2` at both
+     ends, **inclusive** (`width = x1 - x0 + 1`). On wire `(0, 0, 1276, 956)`
+     the first gives 319x239 and the second 320x240. On `ulx = 2` the first
+     rounds down and the second refuses `FractionalEdge`.
+  2. **`FillColor` is not on this path.**
+     `raw_dpc::triangle_draw_data::RetrievedTriangleDraw` snapshots
+     `blend_color`, `env_color`, `prim_color` and `fog_color` per triangle. It
+     does not snapshot the fill colour, because no triangle-sourced command has
+     ever read it — and a Fill-cycle texrect reads nothing else.
+  3. **The fill-cycle blender hazard must run.** It is a property of the cycle,
+     not the command (`backend/validate.rs:152-161`), and
+     `targets/fill.rs`'s `require_safe_fill_cycle_bypass` is this crate's
+     equivalent.
+
+  The real shape: carry the raw wire rectangle alongside the viewport,
+  snapshot `FillColor` on the triangle path, and route the command to
+  `execute_fill_rectangle` rather than through the texrect executor at all —
+  which is exactly what the reference does. Three modules, not one arm. The
+  refusal's own doc comment now carries this, so the next lane meets it before
+  an abort rather than after.
 
 #### D4 — Combiner inputs the executor refuses but its own combiner implements · **REACHES WM2000: yes, texrects are its entire title path**
 
@@ -464,6 +506,15 @@ gated behind an unresolved authority question or another row's refusal.
   ports the same mechanism (`vi-gamma-dither:v1`), and wgpu's refusal reason
   cites an unavailability that is factually not the case.
 - **WM2000 reach.** UNKNOWN, same reason as D9.
+- **RESOLVED (`1d0983e3`).** `ViScanoutRefusal::GammaDither` is removed —
+  variant, reason arm, and admission-gate branch — and `vi_scanout.rs` now
+  calls `gamma_dither_quantize_bounded_v1` with `reference_noise_bit_v1`, the
+  same two shared functions the reference's `apply_gamma_dither` calls, over
+  the same seed/pixel/channel keying. Applied last, after resampling, RGB only.
+  The caveat in this row is preserved in the code: the quantizer half is the
+  documented mechanism, the bit source is fn64's declared policy
+  (`VI_PUBLIC_FILTER_POLICY_ID`), and `apply_gamma_dither`'s doc says so.
+  `ViScanoutRefusal::Gamma` (D18) is untouched.
 
 #### D18 — VI gamma curve · **UNKNOWN**
 
@@ -539,6 +590,18 @@ gated behind an unresolved authority question or another row's refusal.
   refusal in the texrect path, so unreachable today. It becomes live the moment
   D19 is
   resolved — which is exactly when a silent wrong answer would ship.
+- **RESOLVED (`b56454bc`).** `alpha_compare.rs`'s local `MAGIC_SQUARE`/`BAYER`
+  constants are deleted; `ordered_dither_threshold` now calls
+  `rgb_dither::ordered_tile_value`. **Table kept: `rgb_dither.rs`'s**, and the
+  reason is `gbi.h:674-678` itself rather than a judgement about the
+  arrangements — `rgb_dither.rs` *is* this crate's RGB dither module, so "the
+  currently selected RGB dither matrix" is the thing it owns and alpha dither
+  is downstream of it; keeping the other copy would have inverted the
+  dependency libultra states. `the_alpha_dither_path_reads_this_modules_tables`
+  pins the agreement over both selectors and all sixteen cells; restoring the
+  duplicate makes it fail at Bayer `x=0 y=1` (6 vs 4). **D19 is untouched and
+  still UNKNOWN** — this resolves the self-inconsistency only, and both module
+  docs say so.
 
 ---
 
