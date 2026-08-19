@@ -90,3 +90,17 @@ decl = '''    // WM2000_READY_PROBE=<lo>-<hi>: per-swap read-only dump of the
 src = src.replace(decl_anchor, decl + decl_anchor, 1)
 open(p, "w").write(src)
 print("patched")
+
+# RUN DISCIPLINE (RT64-WM2000-INPUT-GRAMMAR.md:154-162, :360, :753)
+#
+# The two documented ways concurrent WM2000 runs counterfeit a plateau are a
+# SHARED scratch sibling tree (`cp: ... File exists`) and a SHARED
+# WM2000_TRACE_PATH (four runs writing one JSONL all aborted at an identical
+# swap 1901). This probe avoids both by construction:
+#
+#   - its own scratch root  /private/tmp/wm2000-rc-probe/scratch  (own emit1,
+#     own sib, own built binary), shared with no other lane;
+#   - WM2000_NO_TRACE=1, so it opens no trace file at all;
+#   - ONE run at a time, verified with `pgrep -f release/wm2000-boot` plus
+#     `lsof -a -p <pid> -d cwd` to tell this lane's PIDs from another lane's
+#     before touching anything. NEVER `pkill -f wm2000-boot`.
