@@ -6351,6 +6351,37 @@ mod scissor_clip_tests {
         );
     }
 
+    /// **The refusal fires on EITHER axis alone, not only on both.**
+    ///
+    /// The two degenerate cases above are empty on X *and* Y, so a check
+    /// that consulted only one axis would pass them both -- exactly the
+    /// coincident-fixture trap. These two cases are empty on one axis while
+    /// the other still has a healthy span, so each one fails if its axis is
+    /// dropped from the emptiness test.
+    #[test]
+    fn an_extent_empty_on_only_the_x_axis_is_still_refused() {
+        // X: rect 0..8 vs scissor first column 10 -> empty.
+        // Y: rect 0..64 vs scissor rows 5..50 -> 45 rows survive.
+        let rect = draw(0, 0, 8, 64, 8, 64);
+        let error = clip(rect, tight_scissor()).expect_err("an empty X span admits nothing");
+        assert!(
+            matches!(error, TexrectExecutionError::ScissoredAway { .. }),
+            "expected ScissoredAway, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_extent_empty_on_only_the_y_axis_is_still_refused() {
+        // Y: rect 0..4 vs scissor first row 5 -> empty.
+        // X: rect 0..64 vs scissor columns 10..60 -> 50 columns survive.
+        let rect = draw(0, 0, 64, 4, 64, 4);
+        let error = clip(rect, tight_scissor()).expect_err("an empty Y span admits nothing");
+        assert!(
+            matches!(error, TexrectExecutionError::ScissoredAway { .. }),
+            "expected ScissoredAway, got {error:?}"
+        );
+    }
+
     /// A reversed scissor -- `lrx < ulx` -- is likewise refused rather than
     /// producing a backwards span. The RDP latches whatever four values
     /// arrive (`rdp_set_scissor` performs no ordering check at
