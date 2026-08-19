@@ -110,8 +110,8 @@ VI-sampled framebuffer."
 Texrects reach guest memory; raw triangles do not. WM2000's title and HUD are
 texrects (2,520 measured), so the ROM renders a real frame while no 3D geometry
 appears at all. A capture from a clean run with every guard live confirms this:
-see `docs/frames/wm2000-allguards-swap240.png`, which shows flat 2D bands and
-blocks and no geometry.
+see `docs/frames/wm2000-swap240-true-geometry-480x237.png`, which shows flat 2D
+rectangles and no geometry.
 
 S1 sets the ceiling on playable gameplay. Closing it requires a design change
 rather than a guard fix, so it does not parallelize with the guard cards.
