@@ -741,3 +741,111 @@ Three findings this produced that are larger than the one bug:
   differently, so `jr $ra` is ambiguous. Declining to split them is correct;
   they should route to the residency machinery the bank-ambiguous vrams
   already use rather than stay silent.
+
+## Update, 2026-08-19 -- past the trap: the plateau is a versus screen looping 38 frames
+
+Run on `lane/wm2000-match-drive` from `port/rt64-conveyor` 8cf9df5a (the tree
+where the swap-1901 `lookup` trap is fixed), rebuilt end to end in an isolated
+scratch root: `recompile_rom` emits 2,480 functions (up from 2,471), with the
+repair report naming 17 swallowed entries, 9 SPLIT and 8 REFUSED.
+
+Every run got its own `WM2000_TRACE_PATH` and `WM2000_FB_DUMP_DIR`. Two ran
+concurrently, never four.
+
+### The trap is really gone, and the guest runs far past it
+
+| run | input | max swap | traps | panics |
+|---|---|---|---|---|
+| `sustA` | lead-in + A every 60 swaps, 2500-12000 | **4080+** | **0** | **0** |
+| `aStick` | same + analog stick right between A taps | 3464 | 0 | 0 |
+
+Both cleared swap 1901 without incident. 4080 is past the 2149 that was the
+best previously recorded on the fixed tree, and past the 3314 of the scratch
+`dump.toml` split lane.
+
+### The attract demo renders a wrestling ring
+
+Before any scripted button fires (first press is at swap 1100), the game plays
+its own attract demo, and **it draws a recognisable wrestling ring**: red ropes
+across the frame at swap 560, the same ropes at a diagonal at 580 as the camera
+swings, a third camera position at 700. Character bodies move between the
+ropes as large flat-shaded polygons. Over swaps 500-620: **121 frames, 121
+distinct** -- every frame unique.
+
+Frames are committed under `docs/frames/wm2000-attract-ring/`. Read the
+`reframed-*` ones: the harness dumps at a hardcoded 320x240 while WM2000 scans
+out 480x237, so the raw dumps shear every row (`docs/tools/wm2000-reframe.py`
+re-lays them at stride 480, recovering the top 160 true rows).
+
+This is **not** a match reached through the menus. It is the game's own demo.
+What it establishes is that geometry, the ring, and the camera already reach
+the rasterizer correctly on the all-Rust stack. What it also shows is the
+remaining surface gap: bodies render untextured and flat-shaded rather than as
+textured wrestlers.
+
+### The menus advance three screens, then stop at a versus screen
+
+Frames committed under `docs/frames/wm2000-menu-progression/`:
+
+| swap | what the frame shows |
+|---|---|
+| 1700 | menu panels (green/purple/cream rectangles), no portrait |
+| 1950 | **one** wrestler model in the purple panel |
+| 2300 | **two** wrestler models side by side -- a versus/matchup screen |
+
+So A does advance the menus, and further than the earlier card could see: it
+reaches a two-character matchup screen. Then it stops.
+
+### The plateau is an idle loop, not a stall -- measured
+
+From swap ~2500 to 4080 the screen never changes again, under A pressed every
+60 swaps:
+
+| swaps | frames | distinct |
+|---|---|---|
+| 2500-2668 | 169 | 38 |
+| 3200-3416 | 217 | 38 |
+| 3600-3800 | 200 | 38 |
+| 3900-4100 | 200 | 38 |
+| 3200-4160 | 960 | **38** |
+
+**Exactly 38 distinct frames in every window**, each recurring about 25 times
+over 960 swaps. Meanwhile the gfx rate holds a steady **3.00 lists/field**
+(swaps 2600-3400). So the guest is composing at full rate and cycling a fixed
+38-frame animation -- a screen idling on its own loop, waiting for something,
+not a frozen or crashed one.
+
+This sharpens the earlier record in two ways. The gfx-rate collapse to 1.00
+that the wave-1 runs saw does **not** reproduce here: the profile goes 3.0
+(attract) -> 1.14 (menu transition, swaps 1472-1855) -> 2.18 -> **3.00** and
+stays there. And the plateau screen is now identified: a two-wrestler versus
+screen, not an unread select screen.
+
+### The analog stick does nothing, quantified
+
+`aStick` ran the identical lead-in plus stick-right held between every A tap.
+Against `sustA` over swaps 2600-3400: **both exactly 3.00 gfx/swap and 1.83
+audio/swap**, and the same 38-frame loop. The stick is inert here, now with a
+number rather than an impression. This agrees with the earlier finding and
+closes untried item #3.
+
+### Untried item #2 is now testable: the WM2000_PORTS knob exists
+
+`fn64_abi::set_controller_port_state` was always there; the harness never
+called it. A `WM2000_PORTS=<n>` knob was added to the wm2000-boot harness
+(in the scratch copy -- `~/Code/recomps/wm2000` is another session's dirty
+tree and was not touched) that plugs in ports 0..n. The driver is committed as
+`docs/tools/wm2000-run-ports.sh`.
+
+That a second controller changes guest execution is already visible: at step
+50,000 the two-port run's `sim_time` is 895,926,191 against the one-port run's
+895,940,131. The ROM is taking a different path.
+
+### Where this leaves the goal
+
+**No match was reached.** The furthest state reached by input is a
+**two-wrestler versus screen at swap 2300**, held from ~2500 to 4080 as a
+38-frame idle loop at 3.00 lists/field, with zero traps.
+
+The one frame in this whole lane that shows a ring is attract-mode demo play at
+swap 560, which no input produced.
