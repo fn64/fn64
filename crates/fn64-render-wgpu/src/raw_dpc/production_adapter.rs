@@ -1355,9 +1355,7 @@ mod tests {
     const LOAD_TILE: u8 = 0x34;
     const LOAD_TLUT: u8 = 0x30;
 
-    fn word(opcode: u8, payload: u32) -> u32 {
-        u32::from(opcode) << 24 | payload
-    }
+    use crate::wire_words::word;
 
     fn set_texture_image(format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
         [
@@ -3293,23 +3291,17 @@ mod tests {
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
-    /// eight raw wire words -- the simplest admitted triangle opcode, same
-    /// shape `raw_dpc::mod::tests`' own `triangle_base_word0` builds.
+    /// eight raw wire words, from the crate's shared `wire_words` builder.
     fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
-        let w0 = word(
-            RAW_TRIANGLE_BASE_EDGE,
-            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
-        );
-        [
-            w0,
-            0,
-            0x0010_0000,
-            0,
-            0x0020_0000,
-            0x0000_8000,
-            0x0005_0000,
-            0,
-        ]
+        let mut words = crate::wire_words::EdgeWords {
+            tile,
+            level,
+            yl: yl as i16,
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(0, RAW_TRIANGLE_BASE_EDGE);
+        words[2..].copy_from_slice(&[0x0010_0000, 0, 0x0020_0000, 0x0000_8000, 0x0005_0000, 0]);
+        words
     }
 
     fn push_and_expect_error(words: Vec<u32>, source_range: (u32, u32)) -> PushDecodedRawDpcError {
