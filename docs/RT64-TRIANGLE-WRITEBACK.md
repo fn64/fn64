@@ -424,3 +424,67 @@ what fills `CombinerInputs` for a covered pixel.
 
 `raw_triangle_is_flat_opaque` and `execute_raw_triangle` are the two places
 that widen, in that order (executor first).
+
+## Rung two landed: shade plane interpolation
+
+`triangle_span::shade_planes` + `attribute_plane` + `attribute_sample`, wired
+into the raster loop's `CombinerInputs::shade_color`, and
+`raw_triangle_is_flat_opaque` widened to admit opcode 0x0c. The executor was
+widened FIRST and the decoder predicate second, per the rule.
+
+Hand-derived and pinned: `dcdx = 32<<16` gives red 4/36/68/100 across x=2..6
+(four distinct values, which no constant-colour implementation produces);
+`dcde = 8<<16` gives 1/9/17 down rows 0..2.
+
+### A defect found while wiring it
+
+The RDP's eight coverage subsamples are a **checkerboard**, not a 2x4 grid:
+the X columns are (1,5) on Y rows 1 and 5 and (3,7) on rows 3 and 7. This
+module's first draft used (1,5) on every row. Now derived from
+`crate::COVERAGE_SAMPLES` so the two cannot drift, and pinned by a test whose
+distinguishing case is a left edge at x=0.75px, where the checkerboard covers
+2 of 8 subsamples and the frozen grid covers ZERO -- the pixel is painted or
+not, not merely weighted differently.
+
+### Mutation, round two
+
+| mutant | result |
+| --- | --- |
+| M7 drop the along-edge (de) plane term | KILLED |
+| M8 drop the across-span (dx) plane term | KILLED |
+| M9 measure X from x=0 rather than the major edge | KILLED |
+| M10 freeze the X sample columns at (1,5) | **SURVIVED** -> fixed |
+
+M10 survived for exactly M5's reason: both gradient tests sample at Y row 1,
+where the two readings agree, so nothing reached the difference. **Two of ten
+mutants survived, both because a test read the arm at a point where the
+correct and incorrect answers coincide.** That is the failure mode to look
+for first in this area.
+
+## What actually remains before WM2000's geometry appears
+
+The admitted subset is now opcode 0x08 and 0x0c. WM2000 issues **only**
+0x0e -- shaded AND textured. So one rung remains for the ROM:
+
+**Texture s/t/w plane interpolation with perspective divide.** Concretely:
+- `triangle_span::shade_planes`' twin for the texture block, which has the
+  identical (integer, fraction) 16-bytes-apart wire layout -- the decode is
+  a near-copy and `RawTriangle::texture()` already retains the words.
+- Per pixel: evaluate the s, t and w planes at the same `attribute_sample`
+  point the shade planes already use, then `s/w`, `t/w` when
+  `other_mode.texture_perspective()` is set.
+- Feed the resulting S10.5 coordinates to `sample_point`, which already
+  exists, is already generic over `TmemByteSource`, and is already the
+  texrect executor's one sampler. Its result goes into
+  `combine_one_texel`'s `texel` argument, which this lane already passes
+  (currently `[0; 4]`).
+- Then widen `raw_triangle_is_flat_opaque` to admit bit 1, and thread the
+  tile binding the way `execute_scheduled_texrect` already does.
+
+Everything else is done and does not change: span geometry, the per-row
+journal declaration, the declared-vs-rasterized range guard, the schedule,
+the composition into the accumulated buffer, the single end-of-packet digest,
+and the guest commit. Only `CombinerInputs::tex_val0` is still zero.
+
+Depth (bit 0) remains out and is a separate, larger piece: it needs a depth
+image, a depth journal declaration, and the RDP's own Z encoding.
