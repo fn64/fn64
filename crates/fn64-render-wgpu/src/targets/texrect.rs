@@ -6275,7 +6275,11 @@ mod scissor_clip_tests {
     fn a_rectangle_under_a_tighter_scissor_is_clipped_to_the_scissor_not_the_target() {
         let rect = draw(0, 0, 64, 64, 64, 64);
         let clipped = clip(rect, tight_scissor()).expect("a clipped rectangle still draws");
-        assert_eq!(clipped.columns(), 10..60, "hand-derived from ulx=40, lrx=240");
+        assert_eq!(
+            clipped.columns(),
+            10..60,
+            "hand-derived from ulx=40, lrx=240"
+        );
         assert_eq!(clipped.rows(), 5..50, "hand-derived from uly=20, lry=200");
         // Distinguishes the scissor from the target: had the clip used the
         // 64x64 extent, the answer would have been the full 0..64 span.
