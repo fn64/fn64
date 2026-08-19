@@ -391,6 +391,15 @@ impl WgpuBackend {
             width: cfg.width,
             height: cfg.height,
         });
+        // **The same height, given to the DECODER.** `plan_raw_triangle`
+        // declares one write per covered scanline and `SetColorImage` carries
+        // no height, so without this the decoder's only bound is installed
+        // RDRAM -- and a triangle taller than the target declares ranges past
+        // its end, which `verify_accesses_inside` then refuses for the whole
+        // packet. Set from the SAME `cfg` field as `configured_target_extent`
+        // above, on the same line of control flow, so the decoder's bound and
+        // the executor's extent cannot drift apart.
+        self.rdp_state.set_color_target_height(cfg.height);
         let outcome = pollster::block_on(
             UninitializedTrianglePipeline::new(HeadlessBackend::default()).request(),
         )

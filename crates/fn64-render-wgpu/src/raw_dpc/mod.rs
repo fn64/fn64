@@ -1797,8 +1797,24 @@ fn plan_raw_triangle(
     // installed RDRAM", derived below by `layout.range` refusing the first
     // row that is not. `MAX_RAW_TRIANGLE_ROWS` caps the walk itself so a
     // wildly out-of-range YL cannot make this loop unbounded.
-    const MAX_RAW_TRIANGLE_ROWS: u32 = 4096;
-    let rows = triangle_span::covered_rows(triangle, image.width(), MAX_RAW_TRIANGLE_ROWS);
+    // **The row walk is bounded by the HOST-CONFIGURED target height**, the
+    // same value `configured_target_extent` gives the executor. Without it
+    // the only bound is installed RDRAM -- 4MB, hundreds of times the real
+    // target -- and a triangle whose YL reaches past the last row declares
+    // byte ranges outside the target, which `verify_accesses_inside` refuses
+    // for the WHOLE PACKET rather than for the one triangle.
+    //
+    // Measured on the real ROM: WM2000 aborted after 280 VI swaps naming
+    // "FillRectangle access #59". The defect predates the texture rung; it
+    // was unreachable only because the decoder refused every triangle the
+    // ROM emits.
+    //
+    // `None` (no `create` yet) declares nothing rather than guessing, the
+    // same shape every other missing precondition above takes.
+    let Some(height) = state.color_target_height() else {
+        return Ok(());
+    };
+    let rows = triangle_span::covered_rows(triangle, image.width(), height);
     if rows.is_empty() {
         return Ok(());
     }
@@ -5493,6 +5509,24 @@ mod tests {
     ///
     /// One cycle, not Fill: `plan_raw_triangle` refuses Fill cycle, where
     /// the RDP consults no combiner at all.
+    /// `RdpState` with a host-configured colour-target height, which every
+    /// raw-triangle declaration test needs.
+    ///
+    /// `plan_raw_triangle` bounds its per-scanline row walk by this height --
+    /// the same value `create_inner` gives `configured_target_extent` -- and
+    /// declares NOTHING when it is absent, rather than guessing one. So a
+    /// fixture using bare `RdpState::default()` measures the missing-height
+    /// refusal instead of the row walk.
+    ///
+    /// Eight rows: taller than the three-row fixture triangle, so the height
+    /// bound is not what limits it and these tests keep measuring the edge
+    /// coefficients.
+    fn triangle_state() -> RdpState {
+        let mut state = RdpState::default();
+        state.set_color_target_height(8);
+        state
+    }
+
     fn flat_triangle_state_words(prefix: u8) -> Vec<u32> {
         vec![
             word(prefix, SET_OTHER_MODE, 0),
@@ -5539,7 +5573,7 @@ mod tests {
         // The three hand-derived per-row ranges, in row order. A collapsed
         // single span would be (4, 44) and this would fail.
         let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
-        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
         assert_eq!(
             decoded.resource_plan().accesses(),
             decoded.submitted().packet().journal().accesses(),
@@ -5557,7 +5591,7 @@ mod tests {
         let mut words = flat_triangle_state_words(0);
         words.extend(flat_triangle_words(0));
         let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
-        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
         // The triangle is command index 2 (two state commands precede it).
         let accesses = decoded
             .resource_plan()
@@ -5603,7 +5637,7 @@ mod tests {
             &[(4, 12), (20, 28), (36, 44)]
         };
         let submitted = submit(packet(7, words, expected));
-        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
         decoded.resource_plan().accesses().len()
     }
 
@@ -5675,7 +5709,7 @@ mod tests {
         triangle.extend(core::iter::repeat_n(0u32, 16));
         words.extend(triangle);
         let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
-        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
         assert_eq!(
             decoded.resource_plan().accesses(),
             decoded.submitted().packet().journal().accesses()

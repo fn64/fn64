@@ -307,18 +307,14 @@ this lane, so the span math lives in one module used by both.
 | --- | --- | --- |
 | flat, opaque, untextured (0x08) | **DONE** | guest bytes verified end to end, no GPU |
 | shade plane interpolation (0x0c) | **DONE** | hand-derived gradients pinned |
-| texture s/t/w + perspective divide (0x0a/0x0e) | **NOT DONE** | planes decode; nothing calls them |
-| depth (0x09 and friends) | **NOT DONE** | not started |
+| texture s/t/w + perspective divide (0x0a/0x0e) | **DONE** | both scale factors pinned; 14 mutants, 13 killed + 1 proven equivalent |
+| depth (0x09 and friends) | **NOT DONE** | not started, and deliberately out of the texture rung's scope |
 
-**A raw triangle is NOT yet visible in a WM2000 frame.** The ROM issues only
-opcode 0x0e (shaded AND textured); the decoder refuses `textured()`, so zero
-of WM2000's raw triangles reach the executor. The two finished rungs are
-proven correct on synthetic fixtures through the real decoder and the real
-guest-commit path -- they are not proven on a real WM2000 triangle, because
-the ROM emits none this backend admits.
-
-`texture_planes` decodes the S/T/W coefficient block and has **no callers
-outside its own tests**. Decoding it is not the texture rung.
+**The texture rung landed.** `raw_triangle_is_executable` now refuses only
+the DEPTH bit, so WM2000's opcode 0x0e -- the only opcode it issues -- is
+admitted, and `CombinerInputs::tex_val0` is a real sampled texel rather than
+zero. See "The texture rung, landed" below for what it does and does not
+prove.
 
 ## RESULT: a flat raw triangle's bytes now reach guest RDRAM
 
