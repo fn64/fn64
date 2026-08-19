@@ -676,3 +676,22 @@ and yes respectively -- every row is a real, reachable trap.
 The spread is itself informative. OoT's 2 reflect a heavily curated symbol
 set; SM64's 332 say that lane carries the same latent defect class at much
 larger scale, undetected until now because nothing looked for it.
+
+### Measured on the real ROM: before and after
+
+Same lead-in, same binary settings, same host; the only difference is the
+three-way split of `func_8012079C_bank3_text` in a scratch `dump.toml`.
+
+| lane | runs | outcome |
+|---|---|---|
+| unsplit (as shipped) | 2 | **both aborted at VI swap 1901**, `lookup: no recompiled function or host shim at vram 0x80120854` |
+| split | see below | **cleared swap 1901 with zero traps** |
+
+The split lane reached swap 1907 and beyond with `traps=0`, i.e. past the
+exact swap where both unsplit runs died. In the split crate every call site
+is now a direct call --
+`call_host_or_recompiled(0x80120854, func_80120854_bank3_text, ctx, mem)` --
+and `0x80120854` is a row in `LOOKUP_TABLE`, so the trap is removed
+structurally rather than suppressed. The body it now reaches is an ordinary
+12-instruction bounds-checked table lookup (`sltiu $v0, $a0, 50`), which is
+what a function entry should look like.
