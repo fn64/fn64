@@ -815,14 +815,12 @@ struct PlanCollector {
     /// Same seed-then-track pattern, and the same defect class, as
     /// `current_color_image`.
     ///
-    /// The two `current_tile0_*` fields above are deliberately kept: they
-    /// mirror `TriangleDrawStateCollector` field-for-field and feed
-    /// `RetrievedTriangleDraw::tile_binding`, whose GPU uniform shape this
-    /// file must not change. This array is the additional fact a texture
-    /// rectangle needs and tile 0 alone cannot supply -- a texrect names
-    /// its tile in its own wire word, and WM2000's do not name tile 0.
-    /// Tracking only tile 0 would have made every non-zero-tile texrect an
-    /// `UnboundTile` refusal.
+    /// The whole table, not tile 0 alone, because EVERY admitted draw
+    /// names its own tile in its own wire word: a texture rectangle in
+    /// word 1 bits 26:24, a raw triangle in word 0 bits 18:16. Tracking
+    /// only tile 0 made every non-zero-tile texrect an `UnboundTile`
+    /// refusal (WM2000's do not name tile 0), and made every non-zero-tile
+    /// raw triangle silently bind tile 0's descriptor in the GPU uniform.
     current_tiles: [(
         Option<fn64_render::NeutralTileDescriptor>,
         Option<fn64_render::NeutralTileSize>,
@@ -1098,22 +1096,34 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // composed fixtures name tile 7; two of them had to be moved
                 // to tile 0 to exercise the GPU path at all before this.
                 //
-                // A `RawTriangle` keeps tile 0: it carries no tile field of
-                // its own to read, so tile 0 is the RDP's own default for it
-                // rather than a guess -- and every existing raw-triangle
-                // fixture's binding is byte-identical to before.
+                // A `RawTriangle` names its tile in wire word 0 bits
+                // 18:16 -- the same field `RawTriangle::decode` reads as
+                // `tile` and `execute_scheduled_raw_triangle` (the CPU
+                // reader) already binds from. This arm previously froze the
+                // index to 0, with a comment claiming the triangle "carries
+                // no tile field of its own to read". That claim was false,
+                // and the consequence was silent: a triangle naming any
+                // other tile had the GPU uniform sample tile 0's descriptor
+                // instead of its own. Reading the field here from the
+                // command's own retained `raw_words` is the same one-field
+                // read the texrect arm above already performs, so the two
+                // paths resolve the SAME tile for the same triangle.
                 //
                 // `current_tiles` is the whole 8-entry table as of this
                 // command's stream position (the same table
                 // `triangle_neutral_tiles` snapshots for the CPU reader), so
                 // the two paths now resolve the SAME tile for the same
-                // texrect instead of disagreeing whenever tile != 0.
+                // draw -- texrect or raw triangle alike -- instead of
+                // disagreeing whenever tile != 0.
                 let bound_tile_index = match source {
                     TriangleSource::TextureRectangle => raw_words
                         .get(1)
                         .map(|word| ((word >> 24) & 0x7) as usize)
                         .unwrap_or(0),
-                    TriangleSource::RawTriangle => 0,
+                    TriangleSource::RawTriangle => raw_words
+                        .first()
+                        .map(|word| ((word >> 16) & 0x7) as usize)
+                        .unwrap_or(0),
                 };
                 let tile_binding = match self
                     .current_tiles
@@ -4024,11 +4034,12 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     // triangle's OWN wire tile field.**
     //
     // `RawTriangle::tile()` is wire word 0 bits 18:16 -- a real field the
-    // triangle carries, which `PlanCollector`'s `bound_tile_index` currently
-    // freezes to 0 for the GPU uniform path. Reading it here rather than
-    // trusting that frozen index is the same correction
-    // `execute_scheduled_texrect` already makes for a texrect, which reads
-    // its own tile from its own wire word instead of the uniform.
+    // triangle carries. `PlanCollector`'s `bound_tile_index` reads the same
+    // field from the same word for the GPU uniform path, so the two paths
+    // agree by construction; reading it here from the decoded command is the
+    // same shape `execute_scheduled_texrect` already uses for a texrect,
+    // which reads its own tile from its own wire word rather than the
+    // uniform.
     //
     // The tile TABLE is `triangle_neutral_tiles`, the snapshot taken at this
     // triangle's own stream position -- so a packet that re-tiles between
