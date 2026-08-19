@@ -166,3 +166,75 @@ enabled at this texrect's stream position (in which case the RDP really would
 index an RGBA16 tile through the palette, and the bug is upstream in what sets
 `G_SETOTHERMODE` / which snapshot the texrect reads), or is the texrect reading
 a `TextureLutMode` from the wrong stream position?
+
+## The reader is FAITHFUL — checked against RT64, not assumed
+
+`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/TextureDecoder.hlsli:162-163`:
+
+```hlsl
+// Determine the TMEM address mask. When using RGBA32 or TLUT, each
+// sample only addresses half of TMEM.
+const uint addressMask =
+    select_uint(or(isRgba32, usesTlut), RDP_TMEM_MASK16, RDP_TMEM_MASK8);
+```
+
+and `:174` `if (usesTlut) { ... }` branches on the TLUT flag BEFORE any format
+dispatch, with the non-4b palette index taken as `pixelValue0` — i.e. RT64
+does index a plain RGBA16 tile through the palette when TLUT is on, and does
+confine that read to half of TMEM.
+
+fn64's CPU reader (`AddressScope::of` + `preflight`) and its GPU shader
+(`tmem_sample.wgsl:532`, `tmem_sample_texel` branching on `lut_mode` before
+format) both implement exactly this. So NEITHER sampler is the defect, and
+neither the `InvalidTexelByte` guard nor the low-half mask should be touched.
+
+The question therefore reduces to: is `TextureLutMode::Rgba16` the right value
+AT THIS TEXRECT'S OWN STREAM POSITION?
+
+## MEASURED: the other-mode word at the abort (run 5, `/private/tmp/tr5.log`)
+
+```
+FN64DUMP othermode high=0x0008acef low=0x005041c8 lut=Rgba16 cycle=OneCycle
+```
+
+Hand-decoded from the `G_SETOTHERMODE_H` wire layout:
+
+| field | bits | value |
+|---|---|---|
+| `G_MDSFT_TEXTFILT` | 13:12 | 2 (Bilinear) |
+| **`G_MDSFT_TEXTLUT`** | **15:14** | **2 = `G_TT_RGBA16`** |
+| `G_MDSFT_TEXTPERSP` | 19 | 1 |
+| `G_MDSFT_CYCLETYPE` | 21:20 | 0 (OneCycle) |
+
+So `TEXTLUT` really is set in the register the executor read. The decode is
+right. The remaining possibility is that the executor read the register from
+the WRONG STREAM POSITION.
+
+## The prime suspect: `other_mode` was left out of f2c52822's repair
+
+`execute_raw_dpc` (`production.rs:2125-2143`) seeds the executor's walk with:
+
+```rust
+self.rdp_state.other_mode(),        // <-- POST-fold
+...
+self.tiles_before_last_plan          // <-- PRE-fold (f2c52822's repair)
+    .unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state)),
+```
+
+`plan_raw_dpc` folds the whole packet's `RdpStateDelta` into `rdp_state`
+BEFORE `execute_raw_dpc` runs. f2c52822 repaired that time-travel for the tile
+registers only, and its own doc says so explicitly:
+
+> Only the *tile* registers need this. Every other seeded register
+> (`other_mode`, `combine`, the constant colors, `color_image`) is also folded
+> early, and the same reasoning applies to them -- but they are not what this
+> repair measured, and widening the snapshot to registers no measurement
+> implicates would be a change with no evidence behind it.
+
+This abort is a candidate for exactly the measurement that was missing. If the
+packet carries a `SetOtherMode` that turns TLUT ON, and this texrect stands
+BEFORE it, the texrect would be seeded with the packet's final TLUT-enabled
+mode instead of its carried-in TLUT-disabled one — the identical class of
+defect, one register over.
+
+Measurement in flight to confirm or refute.
