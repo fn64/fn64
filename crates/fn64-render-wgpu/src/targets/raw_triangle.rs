@@ -22,7 +22,7 @@
 //!
 //! It is **not** a general triangle rasterizer. There is no shade plane
 //! interpolation, no s/t/w perspective divide, no LOD, and no depth test.
-//! `crate::raw_dpc::raw_triangle_is_flat_opaque` is the decoder-side twin of
+//! `crate::raw_dpc::raw_triangle_is_executable` is the decoder-side twin of
 //! that admission, and the two must widen together in that order: the
 //! executor first, the declaration second. Declaring a row this executor
 //! cannot fill is worse than declaring none, because `fill_completed_writes`
