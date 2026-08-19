@@ -792,3 +792,48 @@ fn an_unshaded_triangle_reading_shade_is_still_refused() {
         "an unshaded triangle reading Shade must refuse, got {result:?}"
     );
 }
+
+
+/// **An untextured triangle whose program reads `Texel0` is refused.**
+///
+/// The gap this closes: `combine_one_texel` is handed `[0; 4]` as the texel
+/// because an untextured triangle has none, and `ADMITTED_COLOR_INPUTS`
+/// admits `Texel0` for the texrect path that shares the table -- so a
+/// program selecting it would have combined against a fabricated zero. That
+/// is the silent substitution every other refusal in this executor exists to
+/// prevent, and it was reachable.
+///
+/// Program: `(Zero - Zero) * Zero + Texel0`. `Texel0 = 1` in `colorInputD`'s
+/// shared common table and in `alphaInputABD`.
+#[test]
+fn an_untextured_triangle_reading_texel0_is_refused() {
+    let key = key_at(8, 4);
+    let resident = sentinel_resident(key);
+    let declared = declared_accesses(key, &box_triangle(), None);
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let (ca, cb, cc, cd) = (8u32, 8u32, 16u32, 1u32);
+    let (aa, ab, ac, ad) = (7u32, 7u32, 7u32, 1u32);
+    let low = (ca << 5) | cc;
+    let high = (cb << 24) | (cd << 6) | (aa << 21) | (ab << 3) | (ac << 18) | ad;
+    let result = execute_raw_triangle(
+        &candidate,
+        one_cycle_other_mode(),
+        &box_triangle(),
+        TexrectShading::new(
+            CombineParams::from_wire(low, high),
+            Color4::from_wire(ENV_WIRE),
+            PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+        ),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TexrectExecutionError::UnsupportedColorInput { .. })
+        ),
+        "an untextured triangle reading Texel0 must refuse, got {result:?}"
+    );
+}
