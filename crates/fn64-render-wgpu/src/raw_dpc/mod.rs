@@ -5276,6 +5276,45 @@ mod tests {
     /// A stream with no `SetScissor` stages none -- the consumer's own
     /// fallback (the colour target's extent) applies, rather than a
     /// fabricated rect latched here.
+    /// **A scissor latched by an earlier packet survives into a later
+    /// one.** `decode_raw_dpc` decodes against
+    /// `durable_state.fork_for_decode()`, so a fork that dropped the rect
+    /// would unscissor every packet after the one that set it -- and a
+    /// display list commonly sets the scissor once per frame and then
+    /// submits several packets under it.
+    ///
+    /// The second packet deliberately issues a DIFFERENT state command
+    /// (`SetEnvColor`) so its own decode really does run and really does
+    /// stage something, ruling out a vacuous pass.
+    #[test]
+    fn a_scissor_from_an_earlier_packet_survives_the_fork_into_a_later_one() {
+        let first = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let latched = first
+            .staged_state()
+            .scissor()
+            .expect("the first packet stages a rect");
+
+        // Feed the first packet's result forward as the second's durable
+        // state, which is what the backend does between packets.
+        let mut durable = RdpState::default();
+        let mut delta = RdpStateDelta::default();
+        delta.set_scissor(latched);
+        durable.apply(&delta);
+
+        let submitted = submit(packet(7, vec![word(0, SET_ENV_COLOR, 0), 0x1122_3344], &[]));
+        let second = decode_raw_dpc(submitted, &durable).unwrap();
+        assert_eq!(
+            second.staged_state().scissor(),
+            Some(latched),
+            "the second packet issued no SetScissor and must inherit the first packet's rect"
+        );
+        // The second packet's own command staged too, so the decode ran.
+        assert_eq!(
+            second.staged_state().env_color().rgba8(),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
     #[test]
     fn a_stream_with_no_set_scissor_stages_no_rect() {
         let words = vec![word(0, SET_BLEND_COLOR, 0), 0xAABBCCDD];
