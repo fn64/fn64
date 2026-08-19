@@ -463,5 +463,97 @@ fn coefficient_components(
     ]
 }
 
+/// The S10.5 texture coordinates one covered pixel samples at, from the
+/// triangle's own S/T/W planes evaluated at the SAME attribute sample point
+/// the shade planes use.
+///
+/// `stw` is the three planes' Q16.16 values at that point, already evaluated
+/// by [`attribute_plane`]; `perspective` is `OtherMode::texture_perspective`.
+///
+/// # The two scale factors are EMPIRICAL and are cited, not re-derived
+///
+/// Both come from `fn64-render-reference`'s `draw_raw_rdp_triangle_impl`
+/// (`raster/draw.rs:898`), which derived them against WM2000's own title
+/// screen and recorded what getting them wrong looks like.
+///
+/// 1. **Perspective.** Hardware `tcdiv` is not a bare `S/W` ratio. The
+///    pipeline feeds tcdiv the HIGH bits of the s15.16 attribute planes and
+///    multiplies by a 2^15-normalized reciprocal of W, so the output is
+///    `(S/W) * 2^15` in S10.5 units = `(S/W) * 2^10` texels (angrylion's
+///    `tcdiv` perspective path; RT64 divides `s.w` by `w` and scales
+///    identically). The reference records that without the `* 1024.0` "the
+///    whole title-screen quad collapsed onto texel (0,0) -- every pixel
+///    sampled the image's corner and the presented frame was a uniform
+///    field."
+/// 2. **Non-perspective (`G_TP_NONE`).** The divide is skipped entirely and
+///    the plane's own s15.16 value converts to S10.5 by dividing by `2^21`
+///    (`2^16 * 2^5`) -- angrylion's `tcdiv_nopersp`.
+///
+/// # `w <= 0` must not fault
+///
+/// Also earned from real content rather than reasoned. A perspective
+/// triangle crossing the near plane legitimately presents non-positive W at
+/// edge pixels of the interpolated plane. Real RDP hardware's tcdiv derives
+/// 1/w from the operand's top bits with NO sign trap: the pixel samples
+/// garbage texels and the chip keeps rasterizing. So the divide is by
+/// `w.unsigned_abs().max(1)` -- the magnitude, floored at one ULP so it
+/// stays finite. The reference records that a loud assert here was correct
+/// until real WM2000 content (gfx task ~#27, a pixel-level near-plane
+/// crossing) hit it, and that the hardware-faithful behaviour is "keep
+/// rasterizing", not "abort the machine".
+///
+/// # The result is SATURATED into S10.5's own `i16`, never wrapped
+///
+/// `TextureCoordinateS10_5` is an `i16` -- ten integer bits and five
+/// fractional ones -- which is the format the texrect path's
+/// `TexrectDraw::s_at` also produces, so both primitives reach
+/// [`crate::sample_point`] through one coordinate type.
+///
+/// A perspective divide by a near-zero W legitimately produces a coordinate
+/// far outside that range, and `w <= 0` above guarantees the divide never
+/// faults, so this conversion MUST have a defined answer for one. Saturating
+/// clamps it to the extreme the tile's own address mode then folds; wrapping
+/// (`as i16`) would send a coordinate that ran off the right edge back to
+/// the LEFT one, which is a visible tear rather than a stretched edge.
+pub(crate) fn texture_coordinates_s10_5(stw: [i64; 3], perspective: bool) -> (i16, i16) {
+    let (s, t) = if perspective {
+        // The magnitude, never the signed value: see this function's own doc
+        // on why a non-positive W is defined garbage rather than a fault.
+        let denominator = stw[2].unsigned_abs().max(1) as f32;
+        (
+            stw[0] as f32 / denominator * PERSPECTIVE_TEXEL_SCALE,
+            stw[1] as f32 / denominator * PERSPECTIVE_TEXEL_SCALE,
+        )
+    } else {
+        (
+            stw[0] as f32 / PLANE_TO_TEXEL,
+            stw[1] as f32 / PLANE_TO_TEXEL,
+        )
+    };
+    // `as i16` on a float is NOT available; and `f32 as i32` saturates while
+    // a subsequent `as i16` would WRAP. So the clamp is explicit, in float,
+    // before any narrowing -- and NaN (which `0/0` cannot produce here, since
+    // the denominator is floored at 1, but which a future caller could) maps
+    // to zero through `clamp`'s own total order rather than to an arbitrary
+    // bit pattern.
+    (saturate_s10_5(s), saturate_s10_5(t))
+}
+
+/// One float S10.5 coordinate clamped into `i16` before narrowing.
+fn saturate_s10_5(value: f32) -> i16 {
+    if value.is_nan() {
+        return 0;
+    }
+    value.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+/// tcdiv's perspective output scale: `(S/W) * 2^15` in S10.5 units is
+/// `(S/W) * 2^10` texels. See [`texture_coordinates_s10_5`].
+const PERSPECTIVE_TEXEL_SCALE: f32 = 1024.0;
+
+/// s15.16 plane value -> S10.5 texel coordinate, for the `G_TP_NONE` path:
+/// `2^16 * 2^5`. See [`texture_coordinates_s10_5`].
+const PLANE_TO_TEXEL: f32 = (1u32 << 21) as f32;
+
 #[cfg(test)]
 mod tests;

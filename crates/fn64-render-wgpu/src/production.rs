@@ -3717,7 +3717,49 @@ fn stage_color_commands(
                 let resident = accumulated
                     .as_deref()
                     .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
-                execute_scheduled_raw_triangle(collector, &candidate, index, resident)?
+                // **A raw triangle samples TMEM at its OWN stream position,
+                // by the SAME rule a texrect does.**
+                //
+                // Not a parallel implementation: this is the identical
+                // `prefix_before` call over the identical `prefixes` slice,
+                // dispatched on the identical `TexrectTmemSource` the arm
+                // above matches on. WM2000's own triangle packets carry NINE
+                // TMEM loads each, so "which load did this draw see" is a
+                // live question for a triangle exactly as it is for a
+                // texrect -- and answering it with a per-packet image would
+                // draw every triangle with the ninth load's texels.
+                let command_index = collector.plan.raw_triangle_commands[index].2;
+                match tmem {
+                    TexrectTmemSource::Pending { pending, prefixes } => {
+                        match prefix_before(prefixes, command_index) {
+                            Some(prefix) => execute_scheduled_raw_triangle(
+                                collector,
+                                &candidate,
+                                index,
+                                resident,
+                                &pending.prefix_image(prefix),
+                                true,
+                            )?,
+                            // No load precedes this triangle in its own
+                            // packet, so TMEM holds exactly what an earlier
+                            // packet published -- durable committed state,
+                            // read through the same one sampler. The absence
+                            // of a preceding load IS the stream fact that
+                            // makes committed correct; it is not a fallback.
+                            None => execute_scheduled_raw_triangle(
+                                collector,
+                                &candidate,
+                                index,
+                                resident,
+                                collector.physical,
+                                false,
+                            )?,
+                        }
+                    }
+                    TexrectTmemSource::Committed(state) => execute_scheduled_raw_triangle(
+                        collector, &candidate, index, resident, state, false,
+                    )?,
+                }
             }
         };
         // This command's own output becomes the next command's resident
@@ -3905,11 +3947,13 @@ fn execute_scheduled_fill(
 /// pushed those accesses. The one number this function computes itself is
 /// the declared row COUNT, which it hands the executor so the executor can
 /// prove its own raster covers exactly those rows.
-fn execute_scheduled_raw_triangle(
+fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
     index: usize,
     resident_bytes: &[u8],
+    tmem: &S,
+    expect_proposed: bool,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let (span, triangle_index, _, raw_words) = &collector.plan.raw_triangle_commands[index];
     let draw_state = collector.plan.triangles[*triangle_index]
@@ -3926,10 +3970,23 @@ fn execute_scheduled_raw_triangle(
     for word in raw_words.iter() {
         bytes.extend_from_slice(&word.to_be_bytes());
     }
-    let triangle = crate::raw_dpc::RawTriangle::decode(0x08, &bytes)
-        .map_err(|_| WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
+    // **The opcode comes from the command's own first wire byte**, not a
+    // frozen 0x08. `RawTriangle::decode` sizes every optional coefficient
+    // block from the opcode's flag bits, so decoding a shaded-and-textured
+    // 0x0e as 0x08 would reject it on length -- which is exactly what the
+    // frozen constant did before the texture rung, harmlessly, because no
+    // textured triangle was ever admitted this far.
+    let opcode = raw_words
+        .first()
+        .map(|word| ((word >> 24) & 0x3f) as u8)
+        .ok_or(WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
             triangle_index: *triangle_index,
         })?;
+    let triangle = crate::raw_dpc::RawTriangle::decode(opcode, &bytes).map_err(|_| {
+        WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
+            triangle_index: *triangle_index,
+        }
+    })?;
 
     // Locate the declared run by the decoder's own recorded span.
     let start = span.first_access_index as usize;
@@ -3954,6 +4011,58 @@ fn execute_scheduled_raw_triangle(
     let key = candidate.key();
     verify_accesses_inside(&accesses, key)?;
 
+    // **The tile binding, for a TEXTURED triangle only, resolved from the
+    // triangle's OWN wire tile field.**
+    //
+    // `RawTriangle::tile()` is wire word 0 bits 18:16 -- a real field the
+    // triangle carries, which `PlanCollector`'s `bound_tile_index` currently
+    // freezes to 0 for the GPU uniform path. Reading it here rather than
+    // trusting that frozen index is the same correction
+    // `execute_scheduled_texrect` already makes for a texrect, which reads
+    // its own tile from its own wire word instead of the uniform.
+    //
+    // The tile TABLE is `triangle_neutral_tiles`, the snapshot taken at this
+    // triangle's own stream position -- so a packet that re-tiles between
+    // draws gives each draw its own binding. Absent means no `SetTile`/
+    // `SetTileSize` was staged for that index at this position: refused by
+    // name, never defaulted to a zeroed tile that would silently sample TMEM
+    // word zero.
+    let texture = if triangle.flags().textured() {
+        let tile_index = usize::from(triangle.tile().get());
+        let (Some(descriptor), Some(size)) = collector.plan.triangle_neutral_tiles[*triangle_index]
+            [tile_index]
+        else {
+            return Err(WgpuRawDpcExecutionError::TexrectUnboundTile {
+                triangle_index: *triangle_index,
+            });
+        };
+        let tile = crate::targets::TexrectTileBinding::try_from_neutral(descriptor, size)
+            .map_err(|_| WgpuRawDpcExecutionError::TexrectUnboundTile {
+                triangle_index: *triangle_index,
+            })?;
+        // The reserved TLUT encoding is a named refusal in `OtherMode`'s own
+        // decoder, propagated rather than coerced to Disabled -- which would
+        // silently sample a direct-format texel out of an indexed tile.
+        let lut_mode = draw_state
+            .other_mode
+            .texture_lut_mode()
+            .map_err(WgpuRawDpcExecutionError::TextureLutMode)?;
+        // The image this call was handed must answer the identity its CALLER
+        // selected: a pending post-image answers `Proposed`, durable state
+        // answers `Committed`. Checked here rather than trusted, exactly as
+        // `execute_scheduled_texrect` checks it and for the same reason --
+        // both variants inhabit one enum, so a wrong `snapshot()` impl
+        // compiles.
+        verify_tmem_identity(tmem, expect_proposed, *triangle_index)?;
+        Some(crate::targets::RawTriangleTexture {
+            tile,
+            tmem,
+            lut_mode,
+        })
+    } else {
+        None
+    };
+
     let completed = crate::targets::execute_raw_triangle(
         candidate,
         draw_state.other_mode,
@@ -3966,6 +4075,7 @@ fn execute_scheduled_raw_triangle(
         crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color),
         resident_bytes,
         &accesses,
+        texture,
     )?;
     Ok((completed, accesses))
 }
