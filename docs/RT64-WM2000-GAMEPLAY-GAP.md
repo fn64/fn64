@@ -148,10 +148,16 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 > run on `FN64_RENDER=wgpu` with every guard live reaches 2,149 VI swaps and
 > 5,967 gfx tasks, exit 0, no panics. Treat B5 as closed.
 >
-> B3 (raster/VI fidelity) is confirmed in a captured frame from that run,
-> `docs/frames/wm2000-allguards-swap240.png`: the lower field is striped at a
-> one-pixel period. This card already noted the defect appears in attract as
-> well as menus, so it is not menu-specific.
+> B3 (raster/VI fidelity) is **partly retracted**. A capture from that run
+> appeared to show one-pixel striping, and that reading was wrong: the harness
+> captures at a hardcoded 320x240 while WM2000 renders 480x237, which shears
+> every row. See [the frames README](frames/README.md). The correct capture,
+> `docs/frames/wm2000-swap240-true-geometry-480x237.png`, has no striping.
+>
+> This does not clear B3 entirely. The horizontally duplicated menu text this
+> card recorded has the same signature as a stride misread, so it is worth
+> re-measuring at the VI's real width before it is treated as a renderer
+> defect.
 >
 > B4 (triangle composition) is unchanged and is now tracked as S1 in
 > [`RT64-WM2000-REMAINING.md`](RT64-WM2000-REMAINING.md), with the two
