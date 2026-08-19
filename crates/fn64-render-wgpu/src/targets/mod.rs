@@ -22,6 +22,7 @@ use crate::{ColorImage, ImageFormat, PixelSize};
 mod fill;
 mod oracle;
 mod raster;
+mod raw_triangle;
 mod texrect;
 mod triangle_pipeline;
 
