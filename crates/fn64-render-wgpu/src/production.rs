@@ -7565,7 +7565,13 @@ mod tests {
         // Opcode 0x08 (flat, untextured) in bits 29:24 of word 0, the tile
         // index in bits 18:16, everything else zero. Four 64-bit words = 8
         // u32 words for a `triangleBaseWords` command.
-        let word0 = (0x08u32 << 24) | (tile << 16);
+        // Bit 19 is the LEVEL field's low bit, deliberately SET here: it
+        // is the bit immediately above the 3-bit tile field, so a decode
+        // that widens the mask past `0x7` reads it as part of the tile
+        // index and lands on a different table entry. Without a set bit
+        // there, `& 0x7` and `& 0xf` agree for every tile 0..=7 and a
+        // widened-mask mutant survives.
+        let word0 = (0x08u32 << 24) | (1 << 19) | (tile << 16);
         RdpTriangleCommand {
             location: fixture_location(0),
             raw_words: Box::new([word0, 0, 0, 0, 0, 0, 0, 0]),
@@ -7586,10 +7592,13 @@ mod tests {
     /// already binds from them. The GPU uniform path silently sampled tile
     /// 0's texture for any triangle naming another tile.
     ///
-    /// The wire word here is `0x0805_0000`. Derived by hand: opcode `0x08`
-    /// occupies bits 29:24, so `0x08 << 24 = 0x0800_0000`; the tile field
-    /// is bits 18:16, so tile 5 contributes `5 << 16 = 0x0005_0000`. The
-    /// expected index is therefore `(0x0805_0000 >> 16) & 0x7 == 5`.
+    /// The wire word here is `0x080d_0000`. Derived by hand: opcode `0x08`
+    /// occupies bits 29:24, so `0x08 << 24 = 0x0800_0000`; the LEVEL field
+    /// starts at bit 19, so its low bit set contributes `1 << 19 =
+    /// 0x0008_0000`; the tile field is bits 18:16, so tile 5 contributes
+    /// `5 << 16 = 0x0005_0000`. Summed: `0x080d_0000`, and the expected
+    /// index is `(0x080d_0000 >> 16) & 0x7 == (0xd & 0x7) == 5` -- while a
+    /// decode masking `0xf` would read `0xd == 13`, off the 8-entry table.
     ///
     /// Tile 5 and tile 0 are seeded with DIFFERENT `tmem_word_address`
     /// values, so "read the named tile" and "read tile 0" are two
@@ -7620,7 +7629,7 @@ mod tests {
 
         let triangle = fixture_raw_triangle_naming_tile(5);
         assert_eq!(
-            triangle.raw_words[0], 0x0805_0000,
+            triangle.raw_words[0], 0x080d_0000,
             "the fixture's wire word must be the hand-derived one this test reasons about"
         );
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -7669,10 +7678,12 @@ mod tests {
             tiles,
         );
 
-        // `0x0800_0000`: opcode 0x08 in bits 29:24, tile field bits 18:16
-        // all zero -- `(0x0800_0000 >> 16) & 0x7 == 0` by hand.
+        // `0x0808_0000`: opcode 0x08 in bits 29:24, LEVEL's low bit set at
+        // bit 19, tile field bits 18:16 all zero -- `(0x0808_0000 >> 16) &
+        // 0x7 == (0x8 & 0x7) == 0` by hand, while a `0xf` mask would read
+        // `0x8 == 8`, off the 8-entry table.
         let triangle = fixture_raw_triangle_naming_tile(0);
-        assert_eq!(triangle.raw_words[0], 0x0800_0000);
+        assert_eq!(triangle.raw_words[0], 0x0808_0000);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
         let draw = collector.triangles[0].as_ref().unwrap();
