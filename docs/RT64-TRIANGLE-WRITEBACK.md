@@ -542,9 +542,14 @@ produce guest bytes -- by instrumenting both seams on a scratch worktree
 (`/private/tmp/fn64-tri-exec`, never merged) and running the real ROM.
 
 ```
-TRIDECL (raw triangles reaching the admission check)  116,958+
-TRIEXEC (raw triangles reaching the CPU executor)           0
+TRIDECL (raw triangles reaching the admission check)  1,314,648
+TRIEXEC (raw triangles reaching the CPU executor)             0
 ```
+
+The probe run itself: exit 0, 1087 VI swaps, zero panics, `last render
+error: None`, terminated on its own 200,000-step cap. And exactly ONE flag
+combination appears across all 1,314,648 -- `s=true t=true d=false`, i.e.
+opcode 0x0e -- with `executable=false` for every one.
 
 Every one carries `textured=true`, which `raw_triangle_is_executable`
 refuses. So the answer to "is a raw triangle visible in a captured guest
