@@ -313,32 +313,10 @@ const fn fixed_16_16(integer: u32, fraction: u32) -> i32 {
 /// Within a pair, the first u32 holds R in its high half and G in its low
 /// half; the second holds B and A the same way.
 pub(crate) fn shade_planes(words: &super::triangle::CoefficientWords) -> [AttributePlane; 4] {
-    // The block as sixteen u32 halves, in wire order, so the byte offsets
-    // above index directly: half `n` is byte `4n`.
-    let half = |index: usize| -> u32 {
-        let word = words[index / 2];
-        if index % 2 == 0 {
-            word.w0()
-        } else {
-            word.w1()
-        }
-    };
-    let components = |integer_byte: usize, fraction_byte: usize| -> [i32; 4] {
-        let integer_rg = half(integer_byte / 4);
-        let integer_ba = half(integer_byte / 4 + 1);
-        let fraction_rg = half(fraction_byte / 4);
-        let fraction_ba = half(fraction_byte / 4 + 1);
-        [
-            fixed_16_16(integer_rg >> 16, fraction_rg >> 16),
-            fixed_16_16(integer_rg, fraction_rg),
-            fixed_16_16(integer_ba >> 16, fraction_ba >> 16),
-            fixed_16_16(integer_ba, fraction_ba),
-        ]
-    };
-    let colour = components(0, 16);
-    let dcdx = components(8, 24);
-    let dcde = components(32, 48);
-    let dcdy = components(40, 56);
+    let colour = coefficient_components(words, 0, 16);
+    let dcdx = coefficient_components(words, 8, 24);
+    let dcde = coefficient_components(words, 32, 48);
+    let dcdy = coefficient_components(words, 40, 56);
     core::array::from_fn(|component| AttributePlane {
         base: colour[component],
         dx: dcdx[component],
@@ -422,6 +400,67 @@ pub(crate) fn attribute_sample(
         }
     }
     None
+}
+
+/// Decodes the three S/T/W planes from a triangle's eight texture
+/// coefficient words.
+///
+/// **The same wire layout as [`shade_planes`]**, and deliberately the same
+/// code path: the RDP's shade and texture coefficient blocks are both 64
+/// bytes with each attribute at a (integer, fraction) byte pair 16 bytes
+/// apart --
+///   value (0, 16)   d/dx (8, 24)   d/de (32, 48)   d/dy (40, 56)
+/// -- and differ only in how many components they carry. Shade takes four
+/// (R,G,B,A) from two u32s per pair; texture takes three (S,T,W), with S in
+/// the first u32's high half, T in its low half, and W in the second u32's
+/// high half. The second u32's low half is unused by the texture block.
+///
+/// Written as one shared `coefficient_components` rather than a near-copy,
+/// because a second transcription of a split-fixed-point layout is exactly
+/// where a fraction gets paired with the wrong component's integer.
+pub(crate) fn texture_planes(words: &super::triangle::CoefficientWords) -> [AttributePlane; 3] {
+    let value = coefficient_components(words, 0, 16);
+    let dtdx = coefficient_components(words, 8, 24);
+    let dtde = coefficient_components(words, 32, 48);
+    let dtdy = coefficient_components(words, 40, 56);
+    core::array::from_fn(|component| AttributePlane {
+        base: value[component],
+        dx: dtdx[component],
+        de: dtde[component],
+        dy: dtdy[component],
+    })
+}
+
+/// The four Q16.16 components at one (integer byte, fraction byte) pair of a
+/// coefficient block: the first u32's high and low halves, then the second
+/// u32's high and low halves, each reassembled from its own integer and
+/// fraction 16-bit field.
+///
+/// Shade reads all four as R, G, B, A. Texture reads the first three as
+/// S, T, W and ignores the fourth.
+fn coefficient_components(
+    words: &super::triangle::CoefficientWords,
+    integer_byte: usize,
+    fraction_byte: usize,
+) -> [i32; 4] {
+    let half = |index: usize| -> u32 {
+        let word = words[index / 2];
+        if index % 2 == 0 {
+            word.w0()
+        } else {
+            word.w1()
+        }
+    };
+    let integer_first = half(integer_byte / 4);
+    let integer_second = half(integer_byte / 4 + 1);
+    let fraction_first = half(fraction_byte / 4);
+    let fraction_second = half(fraction_byte / 4 + 1);
+    [
+        fixed_16_16(integer_first >> 16, fraction_first >> 16),
+        fixed_16_16(integer_first, fraction_first),
+        fixed_16_16(integer_second >> 16, fraction_second >> 16),
+        fixed_16_16(integer_second, fraction_second),
+    ]
 }
 
 #[cfg(test)]
