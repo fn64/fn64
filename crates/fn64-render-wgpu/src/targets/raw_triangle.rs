@@ -112,7 +112,13 @@ pub fn execute_raw_triangle(
     let cycles = evaluation
         .validated_cycles()
         .expect("Copy cycle was refused above, and Fill by admitted_cycle_evaluation");
-    let base_inputs = shading.validate_combiner_program(cycles)?.base_inputs();
+    // A shaded triangle may read `Shade`; an unshaded one may not, because
+    // there is nothing to read and `base_inputs`' zeroed field would be a
+    // silent substitution. The flag is the wire opcode's own shade bit, not
+    // a policy.
+    let base_inputs = shading
+        .validate_combiner_program_with_shade(cycles, triangle.flags().shaded())?
+        .base_inputs();
     let blend_state = blend_registers.mode_state(other_mode);
     require_blendable_mode(blend_state)?;
     let stages = TexrectFragmentStages::try_new(other_mode, blend_registers.blend_color())?;
@@ -209,6 +215,11 @@ pub fn execute_raw_triangle(
         return Err(TexrectExecutionError::OutsideTarget { key, rectangle });
     }
 
+    // The four RGBA shade planes, decoded from this triangle's own shade
+    // coefficient block. `None` for an unshaded triangle, which is a fact
+    // about the wire opcode rather than a missing value.
+    let shade = triangle.shade().map(triangle_span::shade_planes);
+
     let mut bytes = resident_bytes.to_vec();
     raster_flat_triangle(
         &mut bytes,
@@ -218,6 +229,7 @@ pub fn execute_raw_triangle(
         &rows,
         shading,
         base_inputs,
+        shade,
         blend_state,
         stages,
         evaluation,
@@ -258,6 +270,7 @@ fn raster_flat_triangle(
     rows: &[triangle_span::CoveredRow],
     shading: TexrectShading,
     base_inputs: crate::CombinerInputs,
+    shade: Option<[triangle_span::AttributePlane; 4]>,
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
@@ -273,7 +286,50 @@ fn raster_flat_triangle(
                 continue;
             }
             debug_assert!(coverage <= FULL_COVERAGE);
-            let combined = combine_one_texel(shading.combine(), base_inputs, [0; 4], evaluation);
+            // **The shade colour is interpolated per pixel, at the pixel's
+            // own covered subsample -- not at its centre.** The RDP
+            // evaluates a fragment's attributes at a subsample it actually
+            // covers, so an edge pixel's colour comes from inside the
+            // triangle rather than from a point the triangle misses.
+            //
+            // `attribute_sample` returning `None` cannot happen here: the
+            // `coverage == 0` guard above already proved this pixel has a
+            // covered subsample, and both functions scan the same samples in
+            // the same order. Handled rather than `expect`ed so a future
+            // divergence between them refuses instead of aborting.
+            let inputs = match (shade, triangle_span::attribute_sample(triangle, x as i32, row.y as i32)) {
+                (Some(planes), Some((delta_y_eighth, delta_x))) => {
+                    let shade_color = std::array::from_fn(|component| {
+                        // Q16.16 -> [0.0, 1.0]: the plane's integer part is
+                        // the 0..=255 channel value, clamped the way the
+                        // RDP's own colour combiner input stage clamps it.
+                        let value = triangle_span::attribute_plane(
+                            planes[component],
+                            delta_y_eighth,
+                            delta_x,
+                        )
+                        .div_euclid(triangle_span::Q16_ONE)
+                        .clamp(0, 255);
+                        value as f32 / 255.0
+                    });
+                    crate::CombinerInputs {
+                        shade_color,
+                        ..base_inputs
+                    }
+                }
+                // An unshaded triangle keeps `base_inputs`' zeroed shade.
+                // That is not a substitution: `validate_combiner_program`
+                // refuses every Shade-reading selector for an unshaded
+                // triangle, so nothing reads it.
+                (None, _) => base_inputs,
+                (Some(_), None) => {
+                    return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
+                        column: x,
+                        row: row.y,
+                    })
+                }
+            };
+            let combined = combine_one_texel(shading.combine(), inputs, [0; 4], evaluation);
             let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
                 format,
