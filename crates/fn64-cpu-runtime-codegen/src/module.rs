@@ -514,6 +514,68 @@ mod tests {
         );
     }
 
+    /// Encode `J <target>` (opcode 2).
+    fn j(target: u32) -> u32 {
+        (2u32 << 26) | ((target & 0x0FFF_FFFF) >> 2)
+    }
+
+    /// A `J` backwards or forwards INSIDE its own function is an ordinary
+    /// local branch: the emitter lowers it to `pc = <target>; continue 'run`
+    /// and never calls `lookup()`, so it can never trap. Counting it would
+    /// bury the real findings -- on WM2000 it turned 12 genuine targets into
+    /// 3961 rows, almost all of them ordinary loop branches.
+    #[test]
+    fn local_jump_inside_own_function_is_not_reported() {
+        // A 6-word function whose 5th word jumps back to its own 2nd word.
+        let mut words = [0u32; 6];
+        words[4] = j(0x8012_0904);
+        let funcs = [ModuleFunc {
+            name: "loops_to_itself",
+            vram: 0x8012_0900,
+            words: &words,
+        }];
+        let symbols = SymbolTable::from_entries([("loops_to_itself", 0x8012_0900u32)]);
+
+        // The emitter really does keep this local (no lookup at all).
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            !module.contains("lookup(0x80120904)"),
+            "a local J must not be emitted as a lookup"
+        );
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// The counterpart: a `J` that LEAVES the function is a tail call, and if
+    /// its target is swallowed by another function's span it is exactly as
+    /// undispatchable as a `JAL` would be. The local-jump exclusion must be
+    /// scoped to the jumping function, not applied to every `J`.
+    #[test]
+    fn tail_call_j_to_swallowed_target_is_reported() {
+        let swallower_words = [0u32; 75];
+        // Jumps out of its own body, into the middle of `swallower`.
+        let caller_words = [j(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "tail_caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("swallower", 0x8012_079Cu32),
+            ("tail_caller", 0x8012_0A00u32),
+        ]);
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1, "a J tail call to a swallowed target is a trap");
+        assert_eq!(findings[0].target, 0x8012_0854);
+        assert_eq!(findings[0].callers, vec!["tail_caller".to_string()]);
+    }
+
     /// The audit must not fire on the ordinary cases. A call to a declared
     /// entry is direct; a call to an address outside every emitted span is a
     /// host shim or a genuinely absent function, not a swallowed entry; and a
@@ -537,6 +599,156 @@ mod tests {
         ];
         let symbols =
             SymbolTable::from_entries([("callee", 0x8012_0900u32), ("caller", 0x8012_0A00u32)]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// Both span bounds are exclusive, and both edges are real cases.
+    ///
+    /// The LOW edge is a function's own entry: it is in the dispatch table by
+    /// definition, so an `>= start` test would report every ordinary
+    /// self-recursive call as undispatchable. The HIGH edge is the first word
+    /// of the NEXT function: it belongs to that function's entry, so a
+    /// `<= end` test would blame the wrong function for a perfectly
+    /// dispatchable call.
+    #[test]
+    fn span_bounds_are_exclusive_at_both_edges() {
+        let a_words = [0u32; 4]; // 0x80120800..0x80120810
+        let b_words = [0u32; 4]; // 0x80120810..0x80120820
+        // `caller` recurses to `a`'s entry (low edge) and calls `b`'s entry,
+        // which is exactly one past `a`'s end (high edge). Both dispatchable.
+        let caller_words = [jal(0x8012_0800), jal(0x8012_0810)];
+        let funcs = [
+            ModuleFunc {
+                name: "a",
+                vram: 0x8012_0800,
+                words: &a_words,
+            },
+            ModuleFunc {
+                name: "b",
+                vram: 0x8012_0810,
+                words: &b_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0900,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("a", 0x8012_0800u32),
+            ("b", 0x8012_0810u32),
+            ("caller", 0x8012_0900u32),
+        ]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+
+        // Now drop `a`'s and `b`'s symbols so BOTH calls resolve indirect and
+        // actually reach the span test. `a`'s entry is its own span's low
+        // edge, and `b`'s entry is `a`'s exclusive high edge; a body is
+        // emitted at each, so both are dispatchable through their own
+        // entries and neither may be reported as swallowed by `a`.
+        let partial = SymbolTable::from_entries([("caller", 0x8012_0900u32)]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &partial), vec![]);
+    }
+
+    /// The local-jump exclusion applies to `J` ONLY. A `JAL` is always a
+    /// call -- the emitter emits `lookup()` for it even when the target lies
+    /// inside the calling function itself -- so a `JAL` into one's own body
+    /// at an undeclared address is a real trap, not a local branch.
+    #[test]
+    fn jal_into_own_body_is_still_reported() {
+        // A 75-word function that JALs to an undeclared address inside
+        // itself: dispatch has to go through `lookup()`, which cannot name it.
+        let mut words = [0u32; 75];
+        words[0] = jal(0x8012_0854);
+        let funcs = [ModuleFunc {
+            name: "self_caller",
+            vram: 0x8012_079C,
+            words: &words,
+        }];
+        let symbols = SymbolTable::from_entries([("self_caller", 0x8012_079Cu32)]);
+
+        // The emitter really does route a self-JAL through lookup().
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            module.contains("lookup(0x80120854)"),
+            "a JAL is a call even when its target is inside the caller"
+        );
+
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].target, 0x8012_0854);
+        assert_eq!(findings[0].containing_function, "self_caller");
+        assert_eq!(findings[0].callers, vec!["self_caller".to_string()]);
+    }
+
+    /// Findings are ordered by target vram, independent of the `HashMap`
+    /// iteration order they are collected in. The gap report is a build
+    /// artifact that gets diffed across runs, so an unstable order would show
+    /// spurious churn and hide real movement.
+    #[test]
+    fn findings_are_sorted_by_target_vram() {
+        let swallower_words = [0u32; 75];
+        // Call the high target first, so insertion order is NOT sorted order.
+        let caller_words = [jal(0x8012_0884), 0, jal(0x8012_0854)];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols =
+            SymbolTable::from_entries([("swallower", 0x8012_079Cu32), ("caller", 0x8012_0A00u32)]);
+        let targets: Vec<u32> = audit_undispatchable_call_targets(&funcs, &symbols)
+            .into_iter()
+            .map(|f| f.target)
+            .collect();
+        assert_eq!(targets, vec![0x8012_0854, 0x8012_0884]);
+    }
+
+    /// A call the symbol table resolves is emitted as a DIRECT Rust call and
+    /// never goes through `lookup()`, so it cannot trap however its address
+    /// relates to another function's declared span. Overlapping declared
+    /// spans do occur (overlay banks), and reporting a direct call inside one
+    /// would be a pure false positive.
+    #[test]
+    fn direct_call_inside_another_declared_span_is_not_reported() {
+        let outer_words = [0u32; 75];
+        // 0x801207C0 is INSIDE `outer`'s span and is also its own declared
+        // entry, so the call to it is direct.
+        let inner_words = [0u32; 4];
+        let caller_words = [jal(0x8012_07C0), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "outer",
+                vram: 0x8012_079C,
+                words: &outer_words,
+            },
+            ModuleFunc {
+                name: "inner",
+                vram: 0x8012_07C0,
+                words: &inner_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("outer", 0x8012_079Cu32),
+            ("inner", 0x8012_07C0u32),
+            ("caller", 0x8012_0A00u32),
+        ]);
+        // The emitter renders it direct, which is what makes it safe.
+        let module = emit_module(&funcs, &symbols);
+        assert!(module.contains("call_host_or_recompiled(0x801207C0, inner"));
+        assert!(!module.contains("lookup(0x801207C0)"));
         assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
     }
 
