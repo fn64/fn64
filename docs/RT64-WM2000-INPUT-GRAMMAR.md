@@ -543,3 +543,83 @@ takeover" session, busy at the time this was found. Handed back rather than
 edited, per this project's rule against touching another session's dirty
 tree. The precise four entries and their boundary evidence are recorded for
 whoever picks this up.
+
+## Update, 2026-08-19 -- the abort reproduced, its panic read, and the gap made visible at build time
+
+The prior update handed this back as "the fix lives in `~/Code/aki-recomp`".
+That is still where the symbol boundaries live, but it is not the whole
+story: **fn64 could not see the defect at all until the guest tripped over
+it**, and that is an fn64 gap, now closed.
+
+### The panic, verbatim
+
+Reproduced on the proven lead-in with `RUST_BACKTRACE=full`, twice, both at
+**VI swap 1901**. No custom panic hook was needed -- the abort's origin
+backtrace is printed before the unwind reaches the `extern "C"` boundary:
+
+```
+thread 'main' panicked at fn64-cpu-runtime/src/runtime/host.rs:549:5:
+lookup: no recompiled function or host shim at vram 0x80120854
+  10: fn64_cpu_runtime::runtime::host::trap_unsupported
+  11: oot_recompiled::lookup
+  12: oot_recompiled::part_000::func_8012070C_bank3_text
+  ...
+  26: corosensei::coroutine::Coroutine<..>::with_stack_unchecked::coroutine_func
+  28: fn64_runtime::thread::GameThread::resume
+  29: fn64_runtime::executor::Executor::run_one_step
+```
+
+Frames 26-29 are why the earlier reports showed only
+`panic_cannot_unwind` / `drop_in_place<Executor>`: the panic is raised inside
+a coroutine and cannot cross the `extern "C"` frame, so it converts to a hard
+abort. **The `_osRecvMesg_recomp` in those reports is the unwind path, and
+has nothing to do with message queues.**
+
+### It is an fn64 bookkeeping gap, not guest behaviour
+
+`0x80120854` is the target of plain static `JAL` immediates (target field
+295445). fn64 *does* emit the code there -- as an interior `match` arm of
+`func_8012079C_bank3_text`, whose dump-declared `size = 0x12C` (75
+instructions) spans `0x8012079C..0x801208C8` and swallows it. Because no
+symbol declares it, `SymbolTable::resolve` returns `Indirect`, the emitter
+writes `lookup(0x80120854)`, and neither dispatch table can hold it: both
+are keyed on function ENTRY vrams **by construction**. The call is dead the
+moment it is emitted; only the trap is deferred to whenever the guest first
+takes that path, which is why the swap number moves with the input schedule.
+
+### What changed in fn64
+
+`audit_undispatchable_call_targets` (`crates/fn64-cpu-runtime-codegen/src/module.rs`)
+is the whole-module check neither half could make alone -- the emitter is
+right that an unknown vram must become `lookup()`, and the dispatcher is
+right that only entries belong in its tables. `recompile_rom` runs it and
+renders the result as a new gap-report section.
+
+On WM2000 it reports **12 targets, with zero false positives**: none of the
+12 appears in `LOOKUP_TABLE`, `BANKED_LOOKUP_TABLE`, or the harness's
+host-shim address set. A `J` that stays inside its own function is excluded,
+because the emitter lowers that to a local `pc = ...` branch that never
+calls `lookup()`; counting those reported 3961 rows, almost all ordinary
+loop branches.
+
+The 12 include `0x8013F998`, previously recorded as a separate and
+less-verified suspicion, now confirmed by the same mechanism.
+
+### The split is confirmed as the correct repair, and it is measured
+
+Splitting `func_8012079C_bank3_text` into the three entries the live
+disassembly shows (`0xB8 + 0x30 + 0x44 = 0x12C`, exactly the original size)
+in a **scratch copy** of `dump.toml` takes the audit from **12 targets to
+10** -- removing exactly `0x80120854` and `0x80120884` and nothing else.
+
+11 of the 12 show the textbook entry shape: the preceding instruction is
+`jr $ra` plus its delay slot. The twelfth, `0x80127D54`, does **not**, and
+is worth its own note: two overlay banks disassemble those words
+differently, so it is a bank-overlap case. **A blind "split after every
+`jr $ra`" sweep would be wrong there**, which is why the audit reports the
+boundary evidence and leaves the decision to the symbol source rather than
+patching silently.
+
+`~/Code/aki-recomp` was not modified: it is out of scope for this lane and
+was dirty with another session's work. The split above was validated in
+`/tmp/abort-hunt/scratch-cfg`.
