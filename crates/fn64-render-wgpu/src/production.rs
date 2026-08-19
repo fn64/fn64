@@ -2858,10 +2858,14 @@ fn stage_and_report(
     // color attachment `draw_admitted_triangles` clears itself -- disjoint
     // from the CPU-side fill buffer this packet staged. Admitting the pair
     // would silently drop one of two render results with no ordering
-    // defined between them. Unlike the fill+TMEM case below, there is no
-    // journal order to read the composition off: a triangle raster
-    // declares no write access at all. Composing them is a follow-on
-    // slice; refusing by name is the honest answer until then.
+    // defined between them. A FLAT raw triangle now declares per-row
+    // journal writes and composes through the same accumulation seam as a
+    // texrect, so the "no journal order to read the composition off" reason
+    // no longer applies to it. The refusal is kept anyway, and narrowly: a
+    // fill packet with no texrect routes through `stage_fills_and_report`,
+    // and the fill+raw-triangle pair has never been measured in WM2000's
+    // stream, so admitting it would be widening on inference rather than
+    // evidence. Composing them is a follow-on slice.
     // A texture rectangle is admitted as two triangles, so "has triangles"
     // no longer implies "has a raster with no declared write". Partition
     // first: a texrect DOES declare its own journal `ColorFramebuffer`
