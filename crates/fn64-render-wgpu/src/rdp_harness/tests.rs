@@ -374,7 +374,7 @@ fn every_texrect_execution_error_variant_is_classified_as_reachable_or_not() {
     // The enum's own variant count, written down from its declaration in
     // `targets/texrect.rs`. Adding a variant without classifying it above
     // fails here rather than silently going untested.
-    const DECLARED_VARIANTS: usize = 24;
+    const DECLARED_VARIANTS: usize = 23;
 
     assert_eq!(
         REACHED_BY_THIS_HARNESS.len() + UNREACHABLE_FROM_THE_RAW_TRIANGLE_SEAM.len(),
