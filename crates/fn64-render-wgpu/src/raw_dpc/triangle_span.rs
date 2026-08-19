@@ -47,9 +47,44 @@ use super::triangle::RawTriangle;
 /// arrives in.
 pub(crate) const Q16_ONE: i64 = 1 << 16;
 
+/// The RDP's eight subpixel coverage samples, in eighth-pixel
+/// `(x_eighth, y_eighth)` units.
+///
+/// **A checkerboard, not a 2x4 grid.** The X columns ALTERNATE by row:
+/// (1,5) on Y rows 1 and 5, (3,7) on Y rows 3 and 7. This is
+/// `crate::COVERAGE_SAMPLES` verbatim, which is itself
+/// `fn64-render-reference::raster::coverage::COVERAGE_SAMPLES`
+/// index-for-index.
+///
+/// Taking the columns as a constant (1,5) on every row -- which the first
+/// draft of this module did -- shifts half of every edge pixel's coverage by
+/// a quarter pixel, and shifts the attribute sample point with it.
+pub(crate) const COVERAGE_SAMPLES: [(i32, i32); 8] = crate::COVERAGE_SAMPLES;
+
 /// The four subpixel Y sample offsets, in eighths of a pixel, that the RDP
 /// evaluates per scanline. Sample centers sit on odd eighths.
 pub(crate) const SAMPLE_Y_EIGHTHS: [i32; 4] = [1, 3, 5, 7];
+
+/// The two X sample columns the RDP checks on the scanline whose Y offset is
+/// `y_eighth` -- (1, 5) on rows 1 and 5, (3, 7) on rows 3 and 7.
+///
+/// Derived from [`COVERAGE_SAMPLES`] rather than written out, so the two
+/// cannot drift.
+fn sample_x_eighths(y_eighth: i32) -> [i32; 2] {
+    let mut columns = [0i32; 2];
+    let mut found = 0;
+    let mut index = 0;
+    while index < COVERAGE_SAMPLES.len() {
+        let (x, y) = COVERAGE_SAMPLES[index];
+        if y == y_eighth && found < 2 {
+            columns[found] = x;
+            found += 1;
+        }
+        index += 1;
+    }
+    debug_assert!(found == 2, "every Y sample row has exactly two X columns");
+    columns
+}
 
 /// `value * numerator / denominator`, evaluated in `i128` and floored, so a
 /// full-range Q16.16 slope multiplied by a subpixel delta cannot overflow
@@ -203,8 +238,8 @@ pub(crate) fn covered_rows(triangle: &RawTriangle, width: u32, height: u32) -> V
 }
 
 /// The subpixel coverage count (0..=8) of one pixel: how many of the RDP's
-/// eight subsamples -- two X columns at 1/8 and 5/8, four Y rows at 1/8,
-/// 3/8, 5/8, 7/8 -- fall inside the triangle.
+/// eight [`COVERAGE_SAMPLES`] fall inside the triangle. The X columns
+/// alternate by Y row -- it is a checkerboard, not a grid.
 ///
 /// Used by the rasterizer, not the decoder: a declared row is declared as a
 /// whole `[x0, x1)` range because that is what `plan_render_target_rows`
@@ -223,7 +258,7 @@ pub(crate) fn pixel_coverage(triangle: &RawTriangle, x: i32, y: i32) -> u32 {
             continue;
         }
         let (left_x, right_x) = row_span(triangle, sample_y_eighth);
-        for offset_x in [1, 5] {
+        for offset_x in sample_x_eighths(offset_y) {
             let sample_x = (i64::from(x) * 8 + i64::from(offset_x)) * Q16_ONE / 8;
             if sample_x >= left_x && sample_x < right_x {
                 count += 1;
@@ -231,6 +266,162 @@ pub(crate) fn pixel_coverage(triangle: &RawTriangle, x: i32, y: i32) -> u32 {
         }
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Attribute planes (shade, and later texture)
+// ---------------------------------------------------------------------------
+
+/// One attribute's four Q16.16 plane coefficients, in the RDP's own order:
+/// the value at the triangle's origin, its X derivative, its along-edge
+/// derivative, and its Y derivative.
+///
+/// `dcdy` is decoded and carried but not evaluated by [`attribute_plane`]:
+/// the RDP's own plane evaluation is `base + de*dy + dx*dxpos`, walking the
+/// major edge with `de` and then stepping across the span with `dx`. `dcdy`
+/// exists for the hardware's own span-walker and is not a third term.
+/// Carried rather than dropped so the decode is complete and a future
+/// consumer does not have to re-read the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AttributePlane {
+    pub(crate) base: i32,
+    pub(crate) dx: i32,
+    pub(crate) de: i32,
+    pub(crate) dy: i32,
+}
+
+/// Reassembles one Q16.16 coefficient from the split integer and fraction
+/// half-words the RDP's coefficient blocks store them in.
+///
+/// The blocks are NOT eight consecutive Q16.16 values: the RDP stores every
+/// coefficient's high 16 bits in the block's first half and its low 16 bits
+/// 16 bytes later, so a naive `w0 as i32` read would produce a value with
+/// the fraction of a completely different component.
+const fn fixed_16_16(integer: u32, fraction: u32) -> i32 {
+    ((integer as u16 as i16 as i32) << 16) | (fraction as u16 as i32)
+}
+
+/// Decodes the four RGBA shade planes from a triangle's eight shade
+/// coefficient words.
+///
+/// Wire layout, from the RDP command summary's shade block and matched
+/// against `fn64-render-reference`'s `decode_rdp_shade_coefficients`
+/// (`gbi/entries.rs:623`): the block is 64 bytes = 8 wire words = 16 u32
+/// halves, and each attribute occupies a (integer_offset, fraction_offset)
+/// byte pair 16 bytes apart:
+///   colour  (0, 16)   d/dx (8, 24)   d/de (32, 48)   d/dy (40, 56)
+/// Within a pair, the first u32 holds R in its high half and G in its low
+/// half; the second holds B and A the same way.
+pub(crate) fn shade_planes(words: &super::triangle::CoefficientWords) -> [AttributePlane; 4] {
+    // The block as sixteen u32 halves, in wire order, so the byte offsets
+    // above index directly: half `n` is byte `4n`.
+    let half = |index: usize| -> u32 {
+        let word = words[index / 2];
+        if index % 2 == 0 {
+            word.w0()
+        } else {
+            word.w1()
+        }
+    };
+    let components = |integer_byte: usize, fraction_byte: usize| -> [i32; 4] {
+        let integer_rg = half(integer_byte / 4);
+        let integer_ba = half(integer_byte / 4 + 1);
+        let fraction_rg = half(fraction_byte / 4);
+        let fraction_ba = half(fraction_byte / 4 + 1);
+        [
+            fixed_16_16(integer_rg >> 16, fraction_rg >> 16),
+            fixed_16_16(integer_rg, fraction_rg),
+            fixed_16_16(integer_ba >> 16, fraction_ba >> 16),
+            fixed_16_16(integer_ba, fraction_ba),
+        ]
+    };
+    let colour = components(0, 16);
+    let dcdx = components(8, 24);
+    let dcde = components(32, 48);
+    let dcdy = components(40, 56);
+    core::array::from_fn(|component| AttributePlane {
+        base: colour[component],
+        dx: dcdx[component],
+        de: dcde[component],
+        dy: dcdy[component],
+    })
+}
+
+/// Evaluates one attribute plane at a sample point, in Q16.16.
+///
+/// `edge_delta_y_eighth` is the sample's Y distance below the triangle's own
+/// high origin, in eighths of a scanline; `edge_delta_x_q16` is its X
+/// distance from the MAJOR edge at that Y, in Q16.16.
+///
+/// The RDP walks the major edge with `de` and then steps across the span
+/// with `dx`, so the X term is measured from the major edge rather than from
+/// x=0. Measuring it from x=0 would add `dx * major_x`, which for a triangle
+/// far from the left of the screen is an enormous colour offset.
+pub(crate) fn attribute_plane(
+    plane: AttributePlane,
+    edge_delta_y_eighth: i32,
+    edge_delta_x_q16: i64,
+) -> i64 {
+    let x_term = i64::try_from(
+        (i128::from(plane.dx) * i128::from(edge_delta_x_q16)).div_euclid(i128::from(Q16_ONE)),
+    )
+    .expect("a Q16.16 attribute slope times a Q16.16 X delta fits i64");
+    i64::from(plane.base)
+        .checked_add(fixed_mul_ratio(plane.de, i64::from(edge_delta_y_eighth), 8))
+        .and_then(|value| value.checked_add(x_term))
+        .expect("attribute plane evaluation fits i64")
+}
+
+/// The X position of the MAJOR edge at one subpixel Y sample line, in
+/// Q16.16 -- the origin every attribute plane's X term is measured from.
+///
+/// Always the H edge, regardless of which SIDE of the span it is on: `lft`
+/// decides where the major edge sits on screen, not which edge the RDP
+/// walks its attribute planes along.
+pub(crate) fn major_edge_x(triangle: &RawTriangle, sample_y_eighth: i32) -> i64 {
+    let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;
+    i64::from(triangle.xh())
+        + fixed_mul_ratio(
+            triangle.dxhdy(),
+            i64::from(sample_y_eighth - high_origin_eighth),
+            8,
+        )
+}
+
+/// The sample point one covered pixel's attributes are evaluated at, as
+/// `(edge_delta_y_eighth, edge_delta_x_q16)` -- ready for
+/// [`attribute_plane`].
+///
+/// The RDP evaluates a pixel's attributes at one of its covered subsamples,
+/// not at the pixel centre. This picks the first covered subsample in the
+/// RDP's own scan order -- Y rows 1,3,5,7 eighths, and on each the two X
+/// columns [`COVERAGE_SAMPLES`] gives that row -- and returns `None` when
+/// the pixel has no covered subsample at all.
+pub(crate) fn attribute_sample(
+    triangle: &RawTriangle,
+    x: i32,
+    y: i32,
+) -> Option<(i32, i64)> {
+    let yh_eighth = i32::from(triangle.yh()) * 2;
+    let yl_eighth = i32::from(triangle.yl()) * 2;
+    let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;
+    for offset_y in SAMPLE_Y_EIGHTHS {
+        let sample_y_eighth = y * 8 + offset_y;
+        if sample_y_eighth < yh_eighth || sample_y_eighth >= yl_eighth {
+            continue;
+        }
+        let (left_x, right_x) = row_span(triangle, sample_y_eighth);
+        for offset_x in sample_x_eighths(offset_y) {
+            let sample_x = (i64::from(x) * 8 + i64::from(offset_x)) * Q16_ONE / 8;
+            if sample_x >= left_x && sample_x < right_x {
+                return Some((
+                    sample_y_eighth - high_origin_eighth,
+                    sample_x - major_edge_x(triangle, sample_y_eighth),
+                ));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
