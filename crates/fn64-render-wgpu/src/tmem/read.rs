@@ -874,4 +874,201 @@ mod tests {
             Err(PhysicalTexelReadError::InvalidTexelByte { address: 4 })
         ));
     }
+
+    // --- WM2000's failing texrect: reader/writer odd-row parity ---------
+    //
+    // Measured on the real ROM through the all-Rust stack
+    // (`fn64-cpu-runtime` + `fn64-render-wgpu`), the texrect that aborted
+    // execution carries exactly these wire fields:
+    //
+    //     fmt=IntensityAlpha siz=Bits4 line_words=5 tmem_word=0 palette=0
+    //     mask_s=0 shift_s=0 mask_t=0 shift_t=0  (both axes clamp)
+    //     SetTileSize raw 10.2: sl=252 tl=188 sh=512 th=384
+    //     draw 64x48 at (144,48); S10.5 s_at(0)=2048 s_at(63)=4064
+    //                             t_at(0)=1536 t_at(47)=3040
+    //     lut=Rgba16
+    //
+    // `low_t.integer() == 188 >> 2 == 47`, which is **odd**. That single
+    // fact is what these tests are about: the WRITER
+    // (`tmem/types.rs`'s `project_tmem_transfer_word`, `Tile` arm) derives
+    // its XOR4 exchange as `(bounds.low_t().integer() + row) & 1`, so with
+    // an odd `low_t` it exchanges the EVEN tile rows. The READER's
+    // `odd_row_exchange` derives it as `first_is_odd ^ (row & 1)`, so a
+    // caller passing `TmemFirstRowParity::Even` exchanges the ODD rows --
+    // exactly inverted, and every texel whose row lands in the 6-byte
+    // per-row tail gap then reads an address the load never wrote.
+
+    /// WM2000's own wire fields, named once so the two tests below cannot
+    /// drift apart from each other or from the measured packet.
+    const WM2000_LINE_WORDS: u16 = 5;
+    const WM2000_LOW_S_RAW: u16 = 252;
+    const WM2000_LOW_T_RAW: u16 = 188;
+    const WM2000_HIGH_S_RAW: u16 = 512;
+    const WM2000_HIGH_T_RAW: u16 = 384;
+    /// `ceil(row_bytes / 8)` for this load: 5 destination words per row, of
+    /// which the last carries only 2 defined source bytes (34 bytes/row).
+    const WM2000_WORDS_PER_ROW: u16 = 5;
+    const WM2000_DEFINED_TAIL_BYTES: u16 = 2;
+    const WM2000_ROWS: u16 = 50;
+
+    /// Rebuilds the exact TMEM byte set WM2000's `cmd 39` `LoadTile`
+    /// validates, from the WRITER's own two rules rather than from a
+    /// capture:
+    ///
+    /// - `project_tmem_transfer_word`'s `Tile` arm places transfer word
+    ///   `w` at destination word `tmem + (w / words_per_row) * line_words
+    ///   + (w % words_per_row)`, so rows advance by `line_words` while only
+    ///   `words_per_row` words per row are written -- a gap when
+    ///   `words_per_row < line_words`, and a 6-byte tail gap here because
+    ///   the row's last word is only partly defined.
+    /// - `tmem/execute/load_tile.rs`'s `map_physical_lanes` writes lane
+    ///   `source_lane ^ (4 * odd_row_exchange)` for the `Linear64` layout.
+    ///
+    /// Returns a source whose valid set is precisely that, so a read of any
+    /// byte the load did not write fails exactly as production did.
+    fn wm2000_load_tile_source() -> SparseSource {
+        let mut source = SparseSource::new();
+        let low_t_integer = WM2000_LOW_T_RAW >> 2;
+        for word in 0..WM2000_WORDS_PER_ROW * WM2000_ROWS {
+            let row = word / WM2000_WORDS_PER_ROW;
+            let within = word % WM2000_WORDS_PER_ROW;
+            let destination_word = row * WM2000_LINE_WORDS + within;
+            // The writer's own parity, not the reader's.
+            let exchange = if (low_t_integer + row) & 1 == 1 { 4 } else { 0 };
+            let defined = if within + 1 < WM2000_WORDS_PER_ROW {
+                8
+            } else {
+                WM2000_DEFINED_TAIL_BYTES
+            };
+            for lane in 0..defined {
+                // A nonzero payload: the CI4 index must resolve to a TLUT
+                // entry this fixture actually writes.
+                source.write(destination_word * 8 + (lane ^ exchange), 0x00);
+            }
+        }
+        // The palette the enabled TLUT resolves through. Index 0 is the only
+        // index this fixture's all-zero payload produces.
+        source.write_quadricated_entry(0, 0x0001);
+        source
+    }
+
+    fn wm2000_tile() -> TileDescriptor {
+        TileDescriptor::from_wire(
+            ImageFormat::IntensityAlpha,
+            PixelSize::Bits4,
+            WM2000_LINE_WORDS,
+            TmemWordAddress::try_new(0).unwrap(),
+            0,
+            TileAddressMode::from_wire(0b10),
+            0,
+            0,
+            TileAddressMode::from_wire(0b10),
+            0,
+            0,
+        )
+    }
+
+    /// The reader's addressing for WM2000's texrect pixel `(column, row)`,
+    /// hand-derived from the wire fields above rather than routed through
+    /// the texrect executor (which this crate's unit tests cannot drive
+    /// without a GPU): the rectangle steps exactly one texel per pixel on
+    /// both axes, so `s = 2048 + 32 * column` and `t = 1536 + 32 * row` in
+    /// S10.5, and `mask == 0` forces the clamp arm of `address_axis_texel`.
+    fn wm2000_addressed(
+        column: u32,
+        row: u32,
+        parity: TmemFirstRowParity,
+    ) -> AddressedTmemTexel {
+        let dimension_s = i64::from((WM2000_HIGH_S_RAW >> 2) - (WM2000_LOW_S_RAW >> 2) + 1);
+        let dimension_t = i64::from((WM2000_HIGH_T_RAW >> 2) - (WM2000_LOW_T_RAW >> 2) + 1);
+        let s = 2048_i64 + 32 * i64::from(column) - i64::from(WM2000_LOW_S_RAW) * 8;
+        let t = 1536_i64 + 32 * i64::from(row) - i64::from(WM2000_LOW_T_RAW) * 8;
+        let texel_column = (s >> 5).clamp(0, dimension_s - 1) as u16;
+        let texel_row = (t >> 5).clamp(0, dimension_t - 1) as u16;
+        AddressedTmemTexel::new(texel_column, texel_row, parity)
+    }
+
+    /// **Positive control.** Before asserting anything about parity, prove
+    /// this fixture really reaches WM2000's failing pixel and really
+    /// reproduces its byte -- otherwise the test below could pass against a
+    /// rectangle that never leaves column 0.
+    ///
+    /// Pixel `(63, 0)` addresses texel column 64, row 1. Row 1's own
+    /// un-exchanged byte is `0 * 8 + 1 * 5 * 8 + 64 / 2 == 0x048`, which the
+    /// load DID write; `TmemFirstRowParity::Even` XORs it to `0x04c`, which
+    /// the load did NOT. `0x04c` is the exact address the production abort
+    /// named.
+    #[test]
+    fn wm2000_texrect_pixel_sixty_three_reproduces_the_production_invalid_byte() {
+        let addressed = wm2000_addressed(63, 0, TmemFirstRowParity::Even);
+        assert_eq!(
+            (addressed.column(), addressed.row()),
+            (64, 1),
+            "the fixture must reach texel column 64 of tile row 1, not column 0"
+        );
+        let source = wm2000_load_tile_source();
+        // The un-exchanged address is inside the load; only the XOR4 moves
+        // it out. That is the whole claim, so assert both halves.
+        assert!(
+            source.valid_byte(0x048).is_some(),
+            "row 1's own un-exchanged byte must be one the load wrote"
+        );
+        assert!(
+            source.valid_byte(0x04c).is_none(),
+            "the XOR4 partner must be a byte the load never wrote"
+        );
+        assert_eq!(
+            read_texel(&source, wm2000_tile(), addressed, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x04c }),
+            "this fixture must reproduce the production abort exactly"
+        );
+    }
+
+    /// **The defect.** Every one of the 3,072 pixels WM2000's texrect draws
+    /// samples a byte its own `LoadTile` wrote -- but only when the reader
+    /// is told the first row's real parity. `low_t.integer()` is 47, so the
+    /// tile's first row is ODD, and `TmemFirstRowParity::Odd` is the value
+    /// that matches the writer.
+    ///
+    /// Swept over the whole rectangle rather than one pixel so a fix that
+    /// merely moves the failure along the strip cannot pass.
+    #[test]
+    fn wm2000_texrect_reads_only_loaded_bytes_under_the_writers_own_row_parity() {
+        let source = wm2000_load_tile_source();
+        let tile = wm2000_tile();
+        assert_eq!(
+            (WM2000_LOW_T_RAW >> 2) & 1,
+            1,
+            "this test is only meaningful while WM2000's low_t really is odd"
+        );
+
+        let mut even_failures = 0_u32;
+        let mut odd_failures = 0_u32;
+        for row in 0..48 {
+            for column in 0..64 {
+                for (parity, failures) in [
+                    (TmemFirstRowParity::Even, &mut even_failures),
+                    (TmemFirstRowParity::Odd, &mut odd_failures),
+                ] {
+                    let addressed = wm2000_addressed(column, row, parity);
+                    if read_texel(&source, tile, addressed, TextureLutMode::Rgba16).is_err() {
+                        *failures += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            odd_failures, 0,
+            "under the writer's own first-row parity every sampled byte is one the load wrote"
+        );
+        assert!(
+            even_failures > 0,
+            "the frozen Even parity must still fail, or this test proves nothing"
+        );
+        assert_eq!(
+            even_failures, 48,
+            "the frozen Even parity fails exactly one pixel per rectangle row"
+        );
+    }
 }
