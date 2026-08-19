@@ -1172,12 +1172,45 @@ gated behind an unresolved authority question or another row's refusal.
 These were audited and are **not** divergences — both lanes decline, for the
 same stated reason. Listed so a later lane does not re-audit them.
 
-- **`UnsupportedBlendShadeAlpha` / `UnsupportedColorInput{Shade}`**
-  (`targets/texrect.rs:481`, `:376`). The reference agrees explicitly:
-  "Rectangle commands carry no shade attributes. Validation rejects programs
-  selecting SHADE, so zero is an inert and unreachable placeholder"
-  (`crates/fn64-render-reference/src/raster/draw.rs:510-513`). Both lanes
-  refuse.
+- **`UnsupportedBlendShadeAlpha`** (`targets/texrect.rs:481`) — still a
+  genuine refusal. The blender's shade alpha is `shade_color.a + adseed`, a
+  **dithered** quantity (angrylion `combiner.c:283-285`), and this crate has
+  no dither-seed authority, so it cannot reproduce it exactly.
+
+- **`UnsupportedColorInput{Shade}` on a texrect — OVERTURNED (measured).**
+  Both lanes did refuse, and both were wrong about *why*. A rectangle's shade
+  is not "absent"; it is **architecturally zero**. `rdp_tex_rect` synthesizes
+  a full edge-walker primitive and clears the entire 16-word shade block with
+  `memset(&ewdata[8], 0, 16 * sizeof(uint32_t))` (angrylion-rdp-plus
+  `src/core/n64video/rdp/rasterizer.c:2665`; flip variant `:2721`). Words
+  8..=23 are exactly the shade bases and their `DrDx`/`DrDe`/`DrDy`
+  derivatives (`rasterizer.c:2088-2105`), so the per-pixel reconstruction at
+  `:130-154` yields zero for every pixel, and that is what the combiner's
+  `SHADE`/`SHADE_ALPHA` selectors read (`combiner.c:14,33,52,59,80,95,110`).
+  RT64 agrees independently and unconditionally: `RDP::drawRect` inserts an
+  all-zero six-vertex `rectColorFloats` as the rectangle's vertex color
+  (`rt64/src/hle/rt64_rdp.cpp:1255-1265`, pinned `5473732a`).
+
+  So admitting the selector is not a substitution — the executor already held
+  the hardware's own number and declined to let the combiner read it. The
+  reference lane's `draw.rs:510-513` comment ("an inert and unreachable
+  placeholder") describes a value that is in fact correct and reachable, and
+  its `validate.rs:485-487` refusal should follow this lane.
+
+  **Measured, WM2000 swap 2555** (the real ROM, two controllers, in-ring
+  camera): `SetCombine low=0xfc15fe2b high=0xfffff3f9`, one-cycle, decoding
+  by hand to
+
+  ```
+  color = (TEXEL0 - ZERO) * SHADE_ALPHA + ZERO
+  alpha = (ZERO   - ZERO) * ZERO        + TEXEL0
+  ```
+
+  With the hardware's zero shade this is `color = 0, alpha = texel0` — a
+  black silhouette masked by the texture's own alpha, which is a meaningful
+  image rather than a degenerate one. **The refusal was a wiring gap.** An
+  UNSHADED raw *triangle* keeps its refusal: there the hardware interpolates
+  a real non-zero shade this executor cannot reconstruct.
 - **`DepthModeDecision::UnsupportedInterpenetratingCoverageAdjustment`**
   (`depth_mode.rs:126`). The reference leaves the same case an explicit
   `unimplemented!` panic (`raster/coverage.rs:36,46-48`), and wgpu's module

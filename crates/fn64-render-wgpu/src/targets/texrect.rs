@@ -1101,12 +1101,15 @@ impl CombinerProgramSlice {
         !matches!(self, Self::FirstOfTwoCycles)
     }
 
-    /// `shade_available` is `true` only for a SHADED raw triangle, whose
-    /// executor interpolates a real per-pixel shade colour from the
-    /// triangle's own shade coefficient planes. It is `false` for every
-    /// texrect and for every unshaded triangle, where a `Shade` selector
-    /// would combine against `base_inputs`' zeroed field -- the silent
-    /// substitution this whole admission exists to prevent.
+    /// `shade_available` is `true` when the caller can supply the shade the
+    /// RDP's edge walker would have produced. That is a SHADED raw triangle,
+    /// which interpolates it from the triangle's own shade coefficient
+    /// planes -- and **also every texture rectangle**, whose shade the
+    /// hardware defines as zero (derived in [`TexrectShading::base_inputs`]).
+    /// It is `false` for an UNSHADED raw triangle, where the coefficient
+    /// planes carry a real interpolated value this executor does not have,
+    /// and reading `base_inputs`' zeroed field would be the silent
+    /// substitution this admission exists to prevent.
     fn admits_color(self, input: ColorInput, shade_available: bool, texel_available: bool) -> bool {
         if matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha) {
             return self.resolves_the_combined_selector();
@@ -1195,10 +1198,14 @@ impl TexrectShading {
         self,
         cycles: CombinerProgramCycles,
     ) -> Result<Self, TexrectExecutionError> {
-        // Texrects have no interpolated vertex colour, so `Shade` stays
-        // refused for them; they always sample a texel, so `Texel0` stays
-        // admitted. Both preserve the texrect path exactly.
-        self.validate_combiner_program_for(cycles, false, true)
+        // A texture rectangle's shade is **architecturally zero**, not
+        // absent, so `Shade`/`ShadeAlpha` is admitted and evaluates against
+        // `base_inputs`' `shade_color: [0.0; 4]`. That is a hardware value
+        // with a citation, not a substituted placeholder -- see the
+        // `shade_color` field's own comment in [`Self::base_inputs`] for the
+        // derivation. Texrects always sample a texel, so `Texel0` stays
+        // admitted for the same reason it always was.
+        self.validate_combiner_program_for(cycles, true, true)
     }
 
     /// [`Self::validate_combiner_program`] for a raw triangle, told whether
@@ -1310,6 +1317,46 @@ impl TexrectShading {
     /// them (see this type's own doc). A program reading `Environment`
     /// before any `SetEnvColor` therefore combines against the register's
     /// actual power-on value rather than aborting.
+    ///
+    /// # `shade_color` is a hardware value, not a placeholder
+    ///
+    /// A texture rectangle's shade is **zero by construction**, and this is
+    /// a property of the command the RDP executes rather than a convention
+    /// this crate adopts. The rasterizer synthesizes a full edge-walker
+    /// primitive for a rectangle and explicitly clears the shade block
+    /// while doing so:
+    ///
+    /// - `rdp_tex_rect` builds `ewdata[0..44]` and then runs
+    ///   `memset(&ewdata[8], 0, 16 * sizeof(uint32_t))`
+    ///   (angrylion-rdp-plus, `src/core/n64video/rdp/rasterizer.c:2665`;
+    ///   `rdp_tex_rect_flip` does the same at `:2721`).
+    /// - Words 8..=23 are exactly the shade block: `edgewalker_for_prims`
+    ///   reads the shade bases from `ewdata[8]`/`[9]`/`[12]`/`[13]` and
+    ///   their `DrDx`/`DrDe`/`DrDy` derivatives from `[10]`, `[11]`,
+    ///   `[14]`..`[23]` (`rasterizer.c:2088-2105`). A texture rectangle
+    ///   command carries no shade words on the wire, so every one of them
+    ///   is zeroed rather than left holding the previous triangle's.
+    /// - With base and all derivatives zero, the per-pixel shade
+    ///   reconstruction at `rasterizer.c:130-154` evaluates to zero for
+    ///   every pixel of the rectangle, and that is what
+    ///   `wstate->shade_color` holds when the combiner's `SHADE` (index 4)
+    ///   and `SHADE_ALPHA` (color slot C index 11) selectors dereference it
+    ///   (`src/core/n64video/rdp/combiner.c:14,33,52,59,80,95,110`).
+    ///
+    /// So the zero here is not "a value we do not have"; it is the value
+    /// the hardware produces, and admitting `Shade`/`ShadeAlpha` for a
+    /// rectangle evaluates the guest's program against the same number real
+    /// silicon would. RT64 reaches the identical conclusion independently
+    /// and unconditionally: `RDP::drawRect` inserts a six-vertex
+    /// `rectColorFloats` of all zeros as the rectangle's vertex color
+    /// (`rt64/src/hle/rt64_rdp.cpp:1255-1265`, pinned `5473732a`), which
+    /// `RasterPS.hlsl` feeds straight to `ccInputs.shadeColor`.
+    ///
+    /// This is why the refusal that used to stand here was a wiring gap
+    /// rather than a guard: the executor already held the right number and
+    /// declined to let the combiner read it. Contrast an UNSHADED raw
+    /// triangle, where the hardware **does** interpolate a real non-zero
+    /// shade this executor cannot reconstruct -- that refusal stays.
     pub(super) fn base_inputs(self) -> CombinerInputs {
         combiner_inputs_from_fragment_registers(
             CombinerInputs {
@@ -3050,12 +3097,123 @@ mod one_cycle_tests {
         );
     }
 
-    /// **`Shade` is refused by name**, not combined against an invented
-    /// zero. Measured absent from all 2,520 WM2000 texrects, and this
-    /// executor has no vertex-interpolated color to supply.
+    /// **A texrect's `Shade`/`ShadeAlpha` is admitted and evaluates to the
+    /// hardware's zero**, rather than being refused by name.
+    ///
+    /// Derived by hand from the wire layout, not from the code under test:
+    /// a `G_TEXRECT` command carries no shade coefficient words, and the
+    /// rasterizer zeroes the whole 16-word shade block when it synthesizes
+    /// the edge-walker primitive (angrylion `rasterizer.c:2665`, block
+    /// decoded at `:2088-2105`), so `shade_color` is `[0, 0, 0, 0]` for
+    /// every pixel of every rectangle. See [`TexrectShading::base_inputs`].
     #[test]
-    fn a_shade_reading_program_is_refused_by_name() {
+    fn a_texrect_shade_reading_program_is_admitted_and_reads_zero() {
         // Color A index 4 is SHADE in the shared common table.
+        let shade_in_color = pack_second_cycle([4, 8, 16, 7], [7, 7, 7, 7]);
+        assert!(
+            TexrectShading::new(
+                shade_in_color,
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0)
+            )
+            .validate_one_cycle()
+            .is_ok(),
+            "a texrect program reading SHADE in a color slot must be admitted: its shade is the \
+             hardware's zero, not an absent value"
+        );
+        // Color C index 11 is SHADE_ALPHA -- the exact selector WM2000
+        // stages, and the one this executor used to abort on.
+        let shade_alpha_in_c = pack_second_cycle([1, 8, 11, 7], [7, 7, 7, 7]);
+        assert!(
+            TexrectShading::new(
+                shade_alpha_in_c,
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0)
+            )
+            .validate_one_cycle()
+            .is_ok(),
+            "slot C selecting SHADE_ALPHA must be admitted"
+        );
+        // And the alpha side, which has its own table.
+        let shade_in_alpha = pack_second_cycle([8, 8, 16, 7], [4, 7, 7, 7]);
+        assert!(
+            TexrectShading::new(
+                shade_in_alpha,
+                Color4::from_wire(0),
+                PrimColor::from_wire(0, 0)
+            )
+            .validate_one_cycle()
+            .is_ok(),
+            "a program reading SHADE in an alpha slot must be admitted too"
+        );
+    }
+
+    /// **The value a texrect's admitted `Shade` reads is zero, and the test
+    /// can tell zero from every other candidate.**
+    ///
+    /// This is the mutation-resistant half. The trap this guards is a
+    /// fixture where the correct answer and a wrong one coincide: if the
+    /// executor were changed to feed `Shade` the primitive colour, the
+    /// environment colour, or one, a program that merely *succeeds* would
+    /// not notice. So both constant registers are staged to distinctive
+    /// NON-ZERO values and the program is `(SHADE - ZERO) * ONE + ZERO`,
+    /// whose output is the shade itself. Expected `[0, 0, 0, 0]` is derived
+    /// from the wire layout (no shade words in a `G_TEXRECT`, block zeroed
+    /// at angrylion `rasterizer.c:2665`), never from this crate.
+    #[test]
+    fn a_texrects_shade_evaluates_to_the_hardwares_zero_not_a_neighbouring_register() {
+        // Distinctive non-zero registers: any executor that substituted one
+        // of these for the shade fails this test rather than passing it.
+        let env = Color4::from_wire(0x1122_3344);
+        let prim = PrimColor::from_wire(0, 0x5566_7788);
+        // Derived by hand from the four per-slot decode tables, which are
+        // NOT one shared table: slot A's index 6 is ONE, but slot C's is
+        // KEY_SCALE and slot C has no ONE entry at all. So the passthrough
+        // is built on the multiply-by-zero form instead of multiply-by-one.
+        //
+        // Color slots: A = SHADE(4), B = ZERO(8), C = ZERO(16), D = SHADE(4)
+        // => (shade - 0) * 0 + shade = shade.
+        // Alpha slots: A = SHADE(4), B = ZERO(7), C = ZERO(7), D = SHADE(4)
+        // (alpha A/B/D share `alpha_input_abd`, where 4 is SHADE).
+        let shade_passthrough = pack_second_cycle([4, 8, 16, 4], [4, 7, 7, 4]);
+        let shading = TexrectShading::new(shade_passthrough, env, prim)
+            .validate_one_cycle()
+            .expect("a texrect reading SHADE is admitted");
+        let inputs = shading.base_inputs();
+        assert_eq!(
+            inputs.shade_color,
+            [0.0; 4],
+            "a texture rectangle's shade is zero on hardware: the command carries no shade \
+             coefficient words and the rasterizer zeroes the block"
+        );
+        // The registers really are distinct from the shade, so the equality
+        // above is a measurement rather than a coincidence.
+        assert_ne!(
+            inputs.env_color, inputs.shade_color,
+            "the fixture must stage an environment colour that differs from the shade, or a \
+             mutant substituting ENV for SHADE survives"
+        );
+        assert_ne!(
+            inputs.prim_color, inputs.shade_color,
+            "the fixture must stage a primitive colour that differs from the shade, or a mutant \
+             substituting PRIM for SHADE survives"
+        );
+        // And zero is distinguishable from the other obvious wrong answer.
+        assert_ne!(
+            inputs.shade_color,
+            [1.0; 4],
+            "zero must be distinguishable from ONE, or a mutant feeding a full-scale shade \
+             survives"
+        );
+    }
+
+    /// **An UNSHADED raw triangle keeps its `Shade` refusal.** The texrect
+    /// admission above must not leak into the triangle path, where the
+    /// hardware interpolates a real non-zero shade this executor cannot
+    /// reconstruct. Kills the mutant that widens `shade_available` to `true`
+    /// everywhere instead of only for rectangles.
+    #[test]
+    fn an_unshaded_raw_triangle_still_refuses_shade() {
         let shade_in_color = pack_second_cycle([4, 8, 16, 7], [7, 7, 7, 7]);
         assert_eq!(
             TexrectShading::new(
@@ -3063,37 +3221,25 @@ mod one_cycle_tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0)
             )
-            .validate_one_cycle(),
+            .validate_combiner_program_with_shade(
+                CombinerProgramCycles::OnlySecondSlice,
+                false,
+            ),
             Err(TexrectExecutionError::UnsupportedColorInput {
                 slot: ColorInputSlot::A,
                 input: ColorInput::Shade,
             }),
-            "a program reading SHADE in a color slot must be refused, naming the slot and the \
-             selector"
+            "an unshaded triangle has a real interpolated shade this executor cannot supply, so \
+             it must still refuse"
         );
-        // And the alpha side, which has its own table.
-        let shade_in_alpha = pack_second_cycle([8, 8, 16, 7], [4, 7, 7, 7]);
-        assert_eq!(
-            TexrectShading::new(
-                shade_in_alpha,
-                Color4::from_wire(0),
-                PrimColor::from_wire(0, 0)
-            )
-            .validate_one_cycle(),
-            Err(TexrectExecutionError::UnsupportedAlphaInput {
-                slot: AlphaInputSlot::A,
-                input: AlphaInput::Shade,
-            }),
-            "a program reading SHADE in an alpha slot must be refused too"
-        );
-        // The message names the selector, so a future title's log says what
-        // is missing rather than only that something is.
+        // The message still names the selector, so a future title's log says
+        // what is missing rather than only that something is.
         let message = TexrectShading::new(
             shade_in_color,
             Color4::from_wire(0),
             PrimColor::from_wire(0, 0),
         )
-        .validate_one_cycle()
+        .validate_combiner_program_with_shade(CombinerProgramCycles::OnlySecondSlice, false)
         .unwrap_err()
         .to_string();
         assert!(
@@ -3175,14 +3321,23 @@ mod one_cycle_tests {
     /// accumulator (`rt64_color_combiner.h:470-471`, `611-620`). Deriving
     /// the expectation from the table alone would assert the opposite and
     /// contradict the gate this crate actually ships.
+    ///
+    /// There is a **third** rule, also deliberately outside the tables:
+    /// `Shade`/`ShadeAlpha` is primitive-scoped. `validate_one_cycle` is
+    /// the texrect entry point, and a rectangle's shade is the hardware's
+    /// zero (derived in [`TexrectShading::base_inputs`]), so this sweep
+    /// expects it admitted. The same selector on an UNSHADED raw triangle
+    /// is still refused -- see
+    /// [`an_unshaded_raw_triangle_still_refuses_shade`].
     #[test]
     fn every_unmeasured_selector_is_refused() {
         for index in 0u32..16 {
             let params = pack_second_cycle([index, 8, 16, 7], [7, 7, 7, 7]);
             let input = params.decode_color(ColorInputSlot::A, true);
-            // Both admission rules, exactly as `admits_color` composes
-            // them -- see this test's own doc.
+            // All three admission rules, exactly as `admits_color`
+            // composes them -- see this test's own doc.
             let admitted = matches!(input, ColorInput::Combined | ColorInput::CombinedAlpha)
+                || matches!(input, ColorInput::Shade | ColorInput::ShadeAlpha)
                 || ADMITTED_COLOR_INPUTS
                     .iter()
                     .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
@@ -3212,6 +3367,7 @@ mod one_cycle_tests {
             let params = pack_second_cycle([8, 8, 16, 7], [index, 7, 7, 7]);
             let input = params.decode_alpha(AlphaInputSlot::A, true);
             let admitted = matches!(input, AlphaInput::Combined)
+                || matches!(input, AlphaInput::Shade)
                 || ADMITTED_ALPHA_INPUTS
                     .iter()
                     .any(|a| core::mem::discriminant(a) == core::mem::discriminant(&input));
