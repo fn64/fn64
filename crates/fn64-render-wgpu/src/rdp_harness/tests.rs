@@ -539,3 +539,163 @@ fn each_committed_writes_stored_byte_count_matches_its_declared_range_length() {
         assert_eq!(write.byte_count(), 8, "row {index} is four RGBA16 pixels");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The texture rung: a raw triangle's texel reaches guest RDRAM
+// ---------------------------------------------------------------------------
+
+/// Four RGBA16 texels, each distinguishable from every other AND from the
+/// clear colour, so a pixel that sampled the WRONG texel is as visible as one
+/// that sampled none.
+///
+/// The alpha bit is 1 in all four: RGBA16's low bit is alpha, and a texel
+/// combining to alpha 0 would be indistinguishable from a differently-coloured
+/// one whose alpha happened to differ.
+const TEXELS: [u16; 4] = [0xF801, 0x07C1, 0x003F, 0xFFFF];
+
+/// **One texel of S, in the non-perspective plane's own units.**
+///
+/// Derived from the cited constant, not from the code: `G_TP_NONE` converts
+/// an s15.16 plane value to S10.5 by dividing by `2^21`, and one whole texel
+/// is 32 in S10.5. So one texel is `32 * 2^21 = 2^26` plane units.
+const PLANE_PER_TEXEL: i32 = 1 << 26;
+
+/// Half a texel in plane units, the offset every fixture's base carries.
+///
+/// **This is the anti-coincidence offset, and it is deliberate.** A sample
+/// landing exactly on a texel boundary needs a FULL texel of error before the
+/// sampled texel changes, so a boundary fixture cannot see a half-texel bug.
+/// Sampling at the texel's midpoint means an error of half a texel in either
+/// direction is visible.
+const PLANE_HALF_TEXEL: i32 = 16 << 21;
+
+/// The X distance, in Q16.16, from the major edge to the first covered
+/// subsample of the pixel the major edge itself starts in.
+///
+/// `attribute_sample` scans Y row 1 first, whose X columns are (1, 5) eighths.
+/// For a left edge at a whole pixel the first covered column is x + 1/8, so
+/// the delta is `Q16 / 8`. Every fixture's base cancels this, so column 2
+/// evaluates to exactly its intended plane value rather than one eighth of a
+/// dx past it.
+const FIRST_SUBSAMPLE_DELTA_X: i32 = 65536 / 8;
+
+/// A non-perspective textured triangle whose four covered columns sample the
+/// four staged texels in order.
+///
+/// Everything here is hand-derived from the wire layout and the two cited
+/// scale factors, never read back from the implementation:
+///
+///   * Geometry: left edge 2.0, right edge 6.0, rows 0..3 -- the SAME
+///     footprint the pinned flat fixture uses, so a geometry regression shows
+///     up as the already-pinned failure rather than as a texture one.
+///   * `attribute_sample` picks Y row 1 (sample_y_eighth = 8y + 1) and X
+///     column 1/8. For column x the X delta from the major (left) edge is
+///     `(x - 2) * 2^16 + 2^13`.
+///   * S plane: `dx = PLANE_PER_TEXEL`, so one pixel of X advance is one
+///     texel of S. `base` cancels the 1/8-pixel first-subsample offset and
+///     adds the half-texel anti-coincidence offset.
+///   * `de = 0` so every row samples the same S -- three identical rows are
+///     three independent readings of the same claim.
+///   * T plane: constant at the half-texel offset, so every pixel reads row 0
+///     of the 4x1 tile.
+///
+/// So column 2 -> texel 0, 3 -> 1, 4 -> 2, 5 -> 3.
+fn non_perspective_texture_planes() -> ([i32; 4], [i32; 4], [i32; 4], [i32; 4]) {
+    let s_base = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
+    let t_base = PLANE_HALF_TEXEL;
+    // W is unread on the non-perspective path. Set to a value that would be
+    // CATASTROPHIC if the perspective path ran by mistake -- 1, which would
+    // divide S by 1 and then multiply by 1024, sending every coordinate off
+    // the tile -- rather than to zero, which the `max(1)` rule would quietly
+    // normalize into something plausible.
+    let w_base = 1;
+    (
+        [s_base, t_base, w_base, 0],
+        [PLANE_PER_TEXEL, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    )
+}
+
+/// A 4x1 RGBA16 tile carrying [`TEXELS`], staged into tile 0.
+fn four_texel_frame(triangle: Tri) -> Frame {
+    Rdp::new(16, 8)
+        .cycle(CycleType::One)
+        .combine_texel_passthrough()
+        .texture(0, 4, 1, TEXELS.to_vec())
+        .triangle(triangle)
+        .run()
+}
+
+/// **The texture rung's headline claim: a textured raw triangle's sampled
+/// texels reach guest RDRAM.**
+///
+/// FAILS BEFORE this lane: `raw_triangle_is_executable` refused every
+/// textured triangle, so the packet declared no write at all and the harness
+/// refused with the exact-journal guard. AFTER: four distinct texels land at
+/// four distinct columns.
+///
+/// The assertion is per COLUMN and per texel, not "some pixel changed": a
+/// triangle that sampled texel 0 everywhere -- which is exactly what the
+/// missing `* 1024.0` produced on the real title screen -- would pass a
+/// "something was drawn" check and fail this one.
+#[test]
+fn a_non_perspective_textured_triangles_texels_reach_guest_rdram() {
+    let (value, dx, de, dy) = non_perspective_texture_planes();
+    let frame = four_texel_frame(
+        Tri::flat()
+            .left_major()
+            .edges(2.0, 6.0)
+            .rows(0..3)
+            .texture_planes(value, dx, de, dy),
+    );
+
+    for y in 0..3 {
+        for (index, expected) in TEXELS.iter().enumerate() {
+            frame.assert_pixel(2 + index as u32, y, *expected);
+        }
+    }
+    frame.assert_outside_untouched(2..6, 0..3);
+}
+
+/// The committed guest writes carry the digest of the hand-derived texels --
+/// so the claim is about bytes that reach RDRAM, not about a backend buffer.
+///
+/// `copy_committed_guest_writes` re-derives each digest from the payload
+/// before writing a byte, so a digest match here is the same statement it
+/// makes.
+#[test]
+fn a_textured_triangles_committed_writes_digest_the_sampled_texels() {
+    let (value, dx, de, dy) = non_perspective_texture_planes();
+    let frame = four_texel_frame(
+        Tri::flat()
+            .left_major()
+            .edges(2.0, 6.0)
+            .rows(0..3)
+            .texture_planes(value, dx, de, dy),
+    );
+
+    let expected_row: Vec<u8> = TEXELS.iter().flat_map(|texel| texel.to_be_bytes()).collect();
+    assert_eq!(expected_row.len(), 8, "four RGBA16 texels are eight bytes");
+    // **The write list is asserted before it is walked.** Measured: with the
+    // admission predicate reverted this test PASSED, because the triangle
+    // declared no write at all and the loop below had nothing to iterate. A
+    // digest assertion over an empty list is vacuous green, which is exactly
+    // the failure mode this file exists to make impossible.
+    assert_eq!(
+        frame.write_ranges(),
+        vec![(0x2004, 8), (0x2024, 8), (0x2044, 8)],
+        "one 8-byte write per covered scanline, at the same hand-derived \
+         addresses the pinned flat fixture declares -- the footprint is a \
+         function of the edges alone, so the texture block must not move it"
+    );
+    for (index, write) in frame.writes().iter().enumerate() {
+        let expected = CompletedWrite::try_from_bytes(write.access(), &expected_row)
+            .expect("eight bytes match the declared eight-byte access");
+        assert_eq!(
+            write.content(),
+            expected.content(),
+            "row {index}'s committed digest must be the digest of the four sampled texels"
+        );
+    }
+}
