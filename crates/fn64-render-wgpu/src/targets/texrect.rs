@@ -1809,20 +1809,26 @@ impl TexrectFragmentStages {
     }
 }
 
-/// Admits exactly the blender states this executor can evaluate exactly,/// Admits exactly the blender states this executor can evaluate exactly,
+/// Admits exactly the blender states this executor can evaluate exactly,
 /// refusing every other by name before any pixel is produced.
 ///
 /// Three refusals, each for a term this executor genuinely cannot supply
 /// rather than for one it has merely not written yet:
 ///
-/// - **`FORCE_BL` clear with `AA_EN` set.** The reference derives
-///   `blend_enabled` as `force_blend() || (antialias_enabled() && !wraps)`
-///   (`fn64-render-reference/src/raster/coverage.rs:69`). `wraps` is
+/// - **`FORCE_BL` clear with `AA_EN` set and `IM_RD` set.** The reference
+///   derives `blend_enabled` as
+///   `force_blend() || (antialias_enabled() && !wraps)`
+///   (`fn64-render-reference/src/raster/coverage.rs:68-69`). `wraps` is
 ///   `image_read && pixel_coverage + memory_coverage > 8`, and this
-///   executor maintains no coverage count on either side. Two of the three
-///   `FORCE_BL`-clear cases still settle exactly: `AA_EN` clear makes the
-///   conjunction `false` outright. Only `FORCE_BL` clear **and** `AA_EN`
-///   set leaves the value resting on `wraps`, and that one is refused
+///   executor maintains no coverage count on either side. Three of the four
+///   `FORCE_BL`-clear cases settle exactly without any coverage count:
+///   `AA_EN` clear makes the conjunction `false` outright, and — the second
+///   narrowing — a clear `IM_RD` makes `wraps` `false` **by the reference's
+///   own definition**, since `wraps` is a conjunction whose first term is
+///   `image_read`. With `wraps` pinned `false`, `blend_enabled` reduces to
+///   `antialias_enabled()`, which is `true`, and no coverage count is
+///   consulted. Only `FORCE_BL` clear **and** `AA_EN` set **and** `IM_RD`
+///   set leaves the value resting on the sum, and that one is refused
 ///   rather than blended under a guess.
 /// - **`A = Shade`.** No vertex-interpolated color exists here, matching
 ///   the combiner's own `Shade` refusal.
@@ -1839,14 +1845,20 @@ fn require_blendable_mode(state: BlendModeState) -> Result<(), TexrectExecutionE
         return Ok(());
     }
     // `blend_enabled = force_blend() || (antialias_enabled() && !wraps)`
-    // (`fn64-render-reference/src/raster/coverage.rs:69`). Only the middle
-    // case consults `wraps`: `force_blend()` short-circuits the disjunction
-    // to `true`, and a clear `AA_EN` short-circuits the conjunction to
-    // `false`. Refusing every `FORCE_BL`-clear mode instead of only this
-    // one was measured wrong -- three composed one-cycle fixtures latch
-    // other-mode low `0`, where `AA_EN` is clear and `blend_enabled` is
-    // exactly `false` with no coverage count needed.
-    if !state.other_mode.force_blend() && state.other_mode.antialias_enabled() {
+    // with `wraps = image_read_enabled() && sum > 8`
+    // (`fn64-render-reference/src/raster/coverage.rs:68-69`). Only one case
+    // consults the sum: `force_blend()` short-circuits the disjunction to
+    // `true`; a clear `AA_EN` short-circuits the conjunction to `false`;
+    // and a clear `IM_RD` short-circuits `wraps` itself to `false`, leaving
+    // `blend_enabled = antialias_enabled() = true` with no coverage count
+    // read. Refusing every `FORCE_BL`-clear mode instead of only the one
+    // that rests on the sum was measured wrong -- three composed one-cycle
+    // fixtures latch other-mode low `0`, where `AA_EN` is clear and
+    // `blend_enabled` is exactly `false` with no coverage count needed.
+    if !state.other_mode.force_blend()
+        && state.other_mode.antialias_enabled()
+        && state.other_mode.image_read_enabled()
+    {
         return Err(TexrectExecutionError::BlendEnabledNotDerivable);
     }
     for cycle_index in 0..cycle_count {
@@ -1915,17 +1927,42 @@ fn read_pixel(format: ColorTargetFormat, source: &[u8]) -> BlendFramebufferSampl
 /// reached here rather than reimplemented, so a disagreement between this
 /// executor and that port is unrepresentable rather than merely tested for.
 ///
-/// **`blend_enabled` is `force_blend()`, not a coverage derivation.** The
-/// reference computes it as `force_blend() || (antialias_enabled() &&
-/// !wraps)` (`raster/coverage.rs:69`), where `wraps` needs the destination
+/// **`blend_enabled` is the reference's own formula with `wraps` pinned
+/// `false`, which is exact on every admitted mode.** The reference computes
+/// it as
+///
+/// ```text
+/// wraps         = image_read_enabled && pixel_coverage + memory_coverage > 8
+/// blend_enabled = force_blend || (antialias_enabled && !wraps)
+/// ```
+///
+/// (`raster/coverage.rs:68-69`), where the sum needs the destination
 /// coverage *count* this executor does not maintain -- RGBA16 stores one
 /// coverage bit, not the three the count needs, and the executor declares no
-/// coverage stage. [`require_blendable_mode`] admits only the modes where
-/// the disjunction settles without `wraps`, and on every one of them
-/// `force_blend()` is the disjunction's exact value: `true` when
-/// `FORCE_BL` is set, and `false` when `AA_EN` is clear (which collapses
-/// the other disjunct). So no admitted fragment reaches the blender with a
+/// coverage stage. [`require_blendable_mode`] admits only the modes on which
+/// the disjunction settles **without evaluating that sum**, and on each of
+/// them `wraps` is provably `false`:
+///
+/// - `FORCE_BL` set: the disjunction is `true` regardless, so `wraps` is
+///   never read.
+/// - `AA_EN` clear: the conjunction is `false` regardless, so `wraps` is
+///   never read.
+/// - `FORCE_BL` clear, `AA_EN` set, `IM_RD` clear: `wraps` is a conjunction
+///   whose first term is `image_read`, so it is `false` outright and
+///   `blend_enabled` is `antialias_enabled()`, i.e. `true`.
+///
+/// Substituting `wraps = false` therefore reproduces the reference exactly
+/// on the admitted set rather than approximating it, and the one mode where
+/// that substitution would be a guess -- `FORCE_BL` clear, `AA_EN` set,
+/// `IM_RD` set -- is refused as
+/// [`TexrectExecutionError::BlendEnabledNotDerivable`] before any pixel is
+/// produced. So no admitted fragment reaches the blender with a
 /// `blend_enabled` this executor guessed.
+///
+/// Writing `force_blend()` alone here was correct only while the admitted
+/// set was the first two bullets; the third makes `false || (true && !false)`
+/// a case where the two expressions disagree, and the blender would have
+/// been bypassed on a mode the RDP runs it for.
 ///
 /// # Errors
 /// [`TexrectExecutionError::Blend`] when the blender selects a framebuffer
@@ -1942,10 +1979,14 @@ fn blend_texrect_fragment(
     // color; a cycle whose `A` selects `Shade` is refused before any pixel
     // is produced (see `require_blendable_mode`), so the zero is never read.
     // Exact on the admitted set, not a stand-in: see this function's own
-    // doc. A hardcoded `true` would additionally be wrong for the
-    // `AA_EN`-clear modes `require_blendable_mode` admits, where the RDP
-    // bypasses the last cycle.
-    let blend_enabled = state.other_mode.force_blend();
+    // doc. A hardcoded `true` would be wrong for the `AA_EN`-clear modes
+    // `require_blendable_mode` admits, where the RDP bypasses the last
+    // cycle; a hardcoded `force_blend()` would be wrong for the
+    // `IM_RD`-clear ones, where the RDP runs it. This is the reference's
+    // disjunction with `wraps` pinned `false` -- provably its exact value on
+    // every mode `require_blendable_mode` lets through.
+    let blend_enabled =
+        state.other_mode.force_blend() || state.other_mode.antialias_enabled();
     let BlendedFragment { rgba } = blend_fragment(combined, memory, 0, state, blend_enabled)
         .map_err(|source| TexrectExecutionError::Blend {
             column,
@@ -3703,12 +3744,16 @@ mod blend_stage_tests {
     fn every_unevaluatable_blender_mode_is_refused_by_name() {
         assert_eq!(require_blendable_mode(wm2000_blend_state()), Ok(()));
 
-        // FORCE_BL clear (bit 14) with AA_EN set (bit 3): the one case
-        // where `blend_enabled` rests on the coverage count.
+        // FORCE_BL clear (bit 14) with AA_EN set (bit 3) AND IM_RD set
+        // (bit 6): the one case where `blend_enabled` rests on the coverage
+        // count. All three conjuncts are required; see
+        // `a_clear_image_read_settles_blend_enabled_without_any_coverage_count`
+        // for the IM_RD-clear case this refusal must NOT claim.
         let no_force =
             OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, WM2000_OTHER_MODE_LOW & !0x4000);
         assert!(!no_force.force_blend());
         assert!(no_force.antialias_enabled(), "WM2000's mode sets AA_EN");
+        assert!(no_force.image_read_enabled(), "WM2000's mode sets IM_RD");
         let state = TexrectBlendRegisters::new(None, None)
             .mode_state(no_force)
             .unwrap();
@@ -3785,6 +3830,146 @@ mod blend_stage_tests {
         assert_eq!(
             require_blendable_mode(state),
             Err(TexrectExecutionError::UnsupportedBlendFramebufferAlpha)
+        );
+    }
+
+    /// **D5, the second narrowing.** `BlendEnabledNotDerivable` claimed that
+    /// `FORCE_BL` clear with `AA_EN` set always rests on a coverage count.
+    /// It does not. The reference's own definition
+    /// (`fn64-render-reference/src/raster/coverage.rs:68-69`) is
+    ///
+    /// ```text
+    /// wraps         = image_read_enabled && sum > 8
+    /// blend_enabled = force_blend || (antialias_enabled && !wraps)
+    /// ```
+    ///
+    /// and `wraps` is a **conjunction whose first term is `image_read`**. A
+    /// clear `IM_RD` therefore pins `wraps` to `false` without the sum being
+    /// evaluated at all, and `blend_enabled` collapses to
+    /// `antialias_enabled()`, which this branch already knows is `true`. No
+    /// coverage count on either side is read, so the stated reason for the
+    /// refusal — "needs the destination coverage count this executor does
+    /// not maintain" — is simply not true of this case.
+    ///
+    /// Hand-derived, not captured: the expectation below is read off the
+    /// two-line formula above, and the blended pixel off the resolved
+    /// selectors, never off a recorded run.
+    #[test]
+    fn a_clear_image_read_settles_blend_enabled_without_any_coverage_count() {
+        // FORCE_BL clear (bit 14), AA_EN set (bit 3), IM_RD clear (bit 6).
+        let no_force_no_read = OtherMode::from_wire(
+            WM2000_OTHER_MODE_HIGH,
+            (WM2000_OTHER_MODE_LOW & !0x4000) & !0x0040,
+        );
+        assert!(!no_force_no_read.force_blend());
+        assert!(no_force_no_read.antialias_enabled());
+        assert!(!no_force_no_read.image_read_enabled());
+        let state = TexrectBlendRegisters::new(None, None)
+            .mode_state(no_force_no_read)
+            .unwrap();
+
+        // Before this narrowing this returned `BlendEnabledNotDerivable`.
+        assert_eq!(
+            require_blendable_mode(state),
+            Ok(()),
+            "IM_RD clear pins `wraps` false, so `blend_enabled` is exactly \
+             `antialias_enabled()` with no coverage count consulted"
+        );
+
+        // **The KEPT arm, pinned in the same test.** Setting IM_RD back —
+        // and changing nothing else — must still refuse, because then and
+        // only then does `wraps` depend on `pixel + memory > 8`. Without
+        // this assertion, deleting the whole condition would pass.
+        let read_enabled = OtherMode::from_wire(
+            WM2000_OTHER_MODE_HIGH,
+            (WM2000_OTHER_MODE_LOW & !0x4000) | 0x0040,
+        );
+        assert!(read_enabled.image_read_enabled());
+        let refused = TexrectBlendRegisters::new(None, None)
+            .mode_state(read_enabled)
+            .unwrap();
+        assert_eq!(
+            require_blendable_mode(refused),
+            Err(TexrectExecutionError::BlendEnabledNotDerivable),
+            "with IM_RD set, `wraps` rests on a sum this executor cannot form"
+        );
+
+        // **`IM_RD` clear also removes the destination itself.** WM2000's
+        // own cycle 1 selects `M = Framebuffer`, and with no image read
+        // there is legally no destination sample, so `blend_fragment`
+        // refuses by name rather than substituting one. That is the RDP's
+        // rule, not a gap: the widening admits the *mode*, and this
+        // orthogonal refusal still fires on the *program*.
+        let cycle = crate::blend::ResolvedBlendCycle::from_wire(no_force_no_read.blender_cycle_1());
+        assert_eq!(cycle.m, BlendColorInput::Framebuffer);
+        const FRAGMENT: [u8; 4] = [200, 100, 50, 64];
+        const DESTINATION: [u8; 4] = [16, 200, 240, 255];
+        let sample = BlendFramebufferSample {
+            rgba: DESTINATION,
+            coverage_count: 8,
+        };
+        assert!(
+            matches!(
+                blend_texrect_fragment(FRAGMENT, sample, state, 0, 0),
+                Err(TexrectExecutionError::Blend { .. })
+            ),
+            "a framebuffer term with IM_RD clear is refused by the blender, \
+             not answered with an invented destination"
+        );
+
+        // **Positive control: the widened mode actually runs the mux.**
+        // Admitting it would be worthless if every admitted fragment then
+        // bypassed the blender. Swap `M` (cycle 1's color_b, bits 22:23) to
+        // `Blend` (encoding 2) so the second term is a register rather than
+        // the absent framebuffer, and supply that register.
+        let mixing_low = ((WM2000_OTHER_MODE_LOW & !0x4000) & !0x0040 & !(0x3 << 22)) | (0x2 << 22);
+        let mixing = OtherMode::from_wire(WM2000_OTHER_MODE_HIGH, mixing_low);
+        assert!(!mixing.force_blend());
+        assert!(mixing.antialias_enabled());
+        assert!(!mixing.image_read_enabled());
+        let resolved = crate::blend::ResolvedBlendCycle::from_wire(mixing.blender_cycle_1());
+        assert_eq!(resolved.p, BlendColorInput::Combined);
+        assert_eq!(resolved.m, BlendColorInput::Blend);
+        const BLEND_REGISTER: [u8; 4] = [16, 200, 240, 255];
+        let blend_color = Color4::from_wire(u32::from_be_bytes(BLEND_REGISTER));
+        assert_eq!(blend_color.rgba8(), BLEND_REGISTER);
+        let mixing_state = TexrectBlendRegisters::new(Some(blend_color), None)
+            .mode_state(mixing)
+            .expect("the blend register the program reads is set");
+        assert_eq!(require_blendable_mode(mixing_state), Ok(()));
+
+        let blended = blend_texrect_fragment(FRAGMENT, sample, mixing_state, 0, 0)
+            .expect("the widened mode evaluates");
+        assert_ne!(
+            blended[0..3],
+            FRAGMENT[0..3],
+            "an admitted-but-inert mode would prove nothing; with \
+             `blend_enabled` true the last cycle must NOT take the \
+             `is_last && !blend_enabled` P-passthrough"
+        );
+        // And it mixed the blend register in, not an invented constant:
+        // every channel lands between the two operands.
+        for channel in 0..3 {
+            let low = FRAGMENT[channel].min(BLEND_REGISTER[channel]);
+            let high = FRAGMENT[channel].max(BLEND_REGISTER[channel]);
+            assert!(
+                (low..=high).contains(&blended[channel]),
+                "channel {channel}: {} is outside [{low}, {high}]",
+                blended[channel]
+            );
+        }
+
+        // **The kept arm's other half, pinned.** Reverting `blend_enabled`
+        // to the old `force_blend()` alone would make this same program
+        // bypass the mux and return the fragment unchanged. Deriving the
+        // expected P-passthrough from the selector proves the two answers
+        // are actually distinguishable, so the assertion above is not
+        // vacuous.
+        assert_eq!(
+            crate::blend::ResolvedBlendCycle::from_wire(mixing.blender_cycle_1()).p,
+            BlendColorInput::Combined,
+            "the bypass this fix avoids would have returned P = Combined, \
+             i.e. the fragment unchanged"
         );
     }
 
