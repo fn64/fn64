@@ -1033,6 +1033,308 @@ pub mod packet {
     }
 }
 
+
+/// Per-`G_RDPSETOTHERMODE` depth-mode-bit census.
+///
+/// Every census before this one counted `G_RDPSETOTHERMODE` by name and never
+/// looked inside its payload, which left one question unanswerable from
+/// measurement: does the guest ever *arm* the RDP's depth pipeline? The
+/// opcode carries the full 56-bit other-mode word (high 24 bits in `w0`'s
+/// payload, low 32 in `w1`, `gbi.h:3697-3737`), and the depth controls all
+/// live in the low word.
+///
+/// **Bit positions are not re-derived here.** They are read through this
+/// crate's own [`OtherMode`](super::super::types::OtherMode) accessors --
+/// `depth_compare_enabled` (`low & 0x0010`), `depth_update_enabled`
+/// (`low & 0x0020`), `depth_mode` (`(low >> 10) & 3`) and
+/// `primitive_depth_source` (`low & (1 << 2)`), at `gbi/types.rs:445-451`
+/// and `:490` -- so a census row and a rasterizer decision cannot disagree
+/// about which bits mean depth. (These agree with RT64's
+/// `src/shared/rt64_f3d_defines.h:84-101` `Z_CMP 0x10` / `Z_UPD 0x20` /
+/// `ZMODE_MASK 0xc00`, but the in-tree accessor is the authority cited.)
+///
+/// Armed by `FN64_GBI_OTHERMODE_CENSUS`, independently of [`on`]. Aggregate
+/// counters only -- fixed memory, no per-command rows -- so it is safe to
+/// leave armed across a multi-million-command run. `FN64_GBI_OTHERMODE_CENSUS_OUT`
+/// names the sink; otherwise the report goes to stderr.
+pub mod othermode {
+    use super::{AtomicU64, Ordering};
+    use crate::gbi::types::{CycleType, DepthMode, OtherMode};
+
+    #[cfg(not(test))]
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(not(test))]
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    #[cfg(not(test))]
+    static INIT: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the probe is armed. Always off under `cfg(test)`, for the same
+    /// reason [`super::on`] is: a unit test must not observe an ambient
+    /// `FN64_*` knob, and one test's tallies leaking into another's report
+    /// would be worse than no report. The classifier below is a pure function
+    /// and stays testable regardless.
+    pub fn on() -> bool {
+        #[cfg(test)]
+        {
+            false
+        }
+        #[cfg(not(test))]
+        {
+            if crate::speculative_observations_suppressed() {
+                return false;
+            }
+            if !INIT.swap(true, Ordering::Relaxed) {
+                ENABLED.store(
+                    crate::debug_flag("FN64_GBI_OTHERMODE_CENSUS"),
+                    Ordering::Relaxed,
+                );
+            }
+            ENABLED.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Writes observed, split by lane. The GBI and raw-RDP lanes are kept
+    /// apart for the same reason the opcode histogram keeps them apart: the
+    /// same byte reaches the decoder from two different producers.
+    static SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static Z_CMP_SET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static Z_UPD_SET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// `G_MDSFT_ZSRCSEL` (low bit 2): primitive-Z rather than per-pixel Z.
+    static Z_PRIM_SRC: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// ZMODE distribution, indexed `[lane][(low >> 10) & 3]`.
+    static ZMODE: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+    /// Cycle-type distribution of the *same* writes, so a reader can tell a
+    /// depth-armed 1-cycle write from a Fill-mode one.
+    static CYCLE: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+    /// Writes whose low word carries neither Z_CMP nor Z_UPD.
+    static DEPTH_QUIET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    fn lane(raw_rdp: bool) -> usize {
+        usize::from(raw_rdp)
+    }
+
+    /// Record one full other-mode write.
+    ///
+    /// `high`/`low` must be the same pair the decoder is about to latch into
+    /// [`OtherMode`](crate::gbi::types::OtherMode), so the tally and the
+    /// renderer's state are two views of one value, not two reads.
+    pub fn note(high: u32, low: u32, raw_rdp: bool) {
+        if !on() {
+            return;
+        }
+        let l = lane(raw_rdp);
+        let mode = OtherMode::from_raw(high, low, 0);
+        SEEN[l].fetch_add(1, Ordering::Relaxed);
+        let cmp = mode.depth_compare_enabled();
+        let upd = mode.depth_update_enabled();
+        if cmp {
+            Z_CMP_SET[l].fetch_add(1, Ordering::Relaxed);
+        }
+        if upd {
+            Z_UPD_SET[l].fetch_add(1, Ordering::Relaxed);
+        }
+        if !cmp && !upd {
+            DEPTH_QUIET[l].fetch_add(1, Ordering::Relaxed);
+        }
+        if mode.primitive_depth_source() {
+            Z_PRIM_SRC[l].fetch_add(1, Ordering::Relaxed);
+        }
+        ZMODE[l][zmode_index(mode.depth_mode())].fetch_add(1, Ordering::Relaxed);
+        CYCLE[l][cycle_index(mode.cycle_type())].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Index the ZMODE slot by the decoder's own enum, so the report's column
+    /// order is pinned to `depth_mode`'s `(low >> 10) & 3` mapping rather
+    /// than to a literal repeated here.
+    fn zmode_index(mode: DepthMode) -> usize {
+        match mode {
+            DepthMode::Opaque => 0,
+            DepthMode::Interpenetrating => 1,
+            DepthMode::Translucent => 2,
+            DepthMode::Decal => 3,
+        }
+    }
+
+    pub fn zmode_label(mode: DepthMode) -> &'static str {
+        match mode {
+            DepthMode::Opaque => "OPA",
+            DepthMode::Interpenetrating => "INTER",
+            DepthMode::Translucent => "XLU",
+            DepthMode::Decal => "DEC",
+        }
+    }
+
+    fn cycle_index(cycle: CycleType) -> usize {
+        match cycle {
+            CycleType::OneCycle => 0,
+            CycleType::TwoCycle => 1,
+            CycleType::Copy => 2,
+            CycleType::Fill => 3,
+        }
+    }
+
+    pub fn seen(raw_rdp: bool) -> u64 {
+        SEEN[lane(raw_rdp)].load(Ordering::Relaxed)
+    }
+
+    pub fn z_cmp_set(raw_rdp: bool) -> u64 {
+        Z_CMP_SET[lane(raw_rdp)].load(Ordering::Relaxed)
+    }
+
+    pub fn z_upd_set(raw_rdp: bool) -> u64 {
+        Z_UPD_SET[lane(raw_rdp)].load(Ordering::Relaxed)
+    }
+
+    pub fn zmode_count(raw_rdp: bool, mode: DepthMode) -> u64 {
+        ZMODE[lane(raw_rdp)][zmode_index(mode)].load(Ordering::Relaxed)
+    }
+
+    /// Render the tallies as TSV. Both lanes are always emitted, including
+    /// when a lane saw nothing: a zero row is the measurement, and omitting
+    /// it would leave a reader unable to tell "never fired" from "not
+    /// instrumented".
+    pub fn render() -> String {
+        let mut text = String::new();
+        text.push_str("# fn64 G_RDPSETOTHERMODE depth-bit census\n");
+        text.push_str(
+            "# bits via crate::gbi::types::OtherMode -- depth_compare_enabled low&0x0010, \
+             depth_update_enabled low&0x0020, depth_mode (low>>10)&3, \
+             primitive_depth_source low&(1<<2) (gbi/types.rs:445-451,:490)\n",
+        );
+        text.push_str("lane\tfield\tvalue\tcount\tpct_of_lane\n");
+        for (l, lane_name) in [(false, "gbi"), (true, "raw_rdp")] {
+            let total = seen(l);
+            let pct = |n: u64| {
+                if total == 0 {
+                    0.0
+                } else {
+                    100.0 * n as f64 / total as f64
+                }
+            };
+            let mut row = |field: &str, value: &str, n: u64| {
+                text.push_str(&format!(
+                    "{lane_name}\t{field}\t{value}\t{n}\t{:.4}\n",
+                    pct(n)
+                ));
+            };
+            row("writes", "total", total);
+            let i = lane(l);
+            let cmp = Z_CMP_SET[i].load(Ordering::Relaxed);
+            let upd = Z_UPD_SET[i].load(Ordering::Relaxed);
+            row("z_cmp", "set", cmp);
+            row("z_cmp", "clear", total - cmp);
+            row("z_upd", "set", upd);
+            row("z_upd", "clear", total - upd);
+            row(
+                "z_neither",
+                "clear",
+                DEPTH_QUIET[i].load(Ordering::Relaxed),
+            );
+            row(
+                "z_src",
+                "primitive",
+                Z_PRIM_SRC[i].load(Ordering::Relaxed),
+            );
+            for mode in [
+                DepthMode::Opaque,
+                DepthMode::Interpenetrating,
+                DepthMode::Translucent,
+                DepthMode::Decal,
+            ] {
+                row("zmode", zmode_label(mode), zmode_count(l, mode));
+            }
+            for (cycle, name) in [
+                (CycleType::OneCycle, "1cycle"),
+                (CycleType::TwoCycle, "2cycle"),
+                (CycleType::Copy, "copy"),
+                (CycleType::Fill, "fill"),
+            ] {
+                row(
+                    "cycle",
+                    name,
+                    CYCLE[i][cycle_index(cycle)].load(Ordering::Relaxed),
+                );
+            }
+        }
+        text
+    }
+
+    /// Emit [`render`] to `FN64_GBI_OTHERMODE_CENSUS_OUT`, or to stderr when
+    /// that names no path. A no-op when the probe is off.
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        let text = render();
+        match std::env::var("FN64_GBI_OTHERMODE_CENSUS_OUT") {
+            Ok(path) if !path.is_empty() => {
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("[FN64_GBI_OTHERMODE_CENSUS] failed to write {path}: {e}");
+                    eprint!("{text}");
+                }
+            }
+            _ => eprint!("{text}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The depth bit positions this probe reports through, asserted as
+        /// literals against the decoder's own accessors. If either side
+        /// moves, this fails rather than letting a census row and a
+        /// rasterizer decision quietly disagree.
+        #[test]
+        fn depth_bits_match_the_decoders_own_accessors() {
+            assert!(OtherMode::from_raw(0, 0x0010, 0).depth_compare_enabled());
+            assert!(!OtherMode::from_raw(0, !0x0010u32, 0).depth_compare_enabled());
+            assert!(OtherMode::from_raw(0, 0x0020, 0).depth_update_enabled());
+            assert!(!OtherMode::from_raw(0, !0x0020u32, 0).depth_update_enabled());
+            assert!(OtherMode::from_raw(0, 0x0004, 0).primitive_depth_source());
+            assert!(!OtherMode::from_raw(0, !0x0004u32, 0).primitive_depth_source());
+        }
+
+        /// ZMODE occupies low bits 11:10, and the four values map onto the
+        /// labels this probe's columns are named for.
+        #[test]
+        fn zmode_labels_track_low_bits_11_10() {
+            for (value, label) in [(0u32, "OPA"), (1, "INTER"), (2, "XLU"), (3, "DEC")] {
+                let mode = OtherMode::from_raw(0, value << 10, 0);
+                assert_eq!(zmode_label(mode.depth_mode()), label, "zmode {value}");
+                assert_eq!(zmode_index(mode.depth_mode()), value as usize);
+            }
+            // The mask is exactly two bits: nothing outside 11:10 selects it.
+            assert_eq!(
+                zmode_index(OtherMode::from_raw(0, !0x0c00u32, 0).depth_mode()),
+                0
+            );
+        }
+
+        /// The probe is inert under `cfg(test)`, so `note` cannot leak
+        /// counts between tests however the ambient environment is set.
+        #[test]
+        fn probe_is_off_under_cfg_test() {
+            assert!(!on());
+            note(0, 0x0030, false);
+            note(0, 0x0030, true);
+            assert_eq!(seen(false), 0);
+            assert_eq!(seen(true), 0);
+            assert_eq!(z_cmp_set(false), 0);
+            assert_eq!(z_upd_set(false), 0);
+        }
+
+        /// Both lanes always appear in the report, zero or not.
+        #[test]
+        fn render_emits_both_lanes_even_when_empty() {
+            let text = render();
+            assert!(text.contains("gbi\twrites\ttotal\t0\t"));
+            assert!(text.contains("raw_rdp\twrites\ttotal\t0\t"));
+            assert!(text.contains("gbi\tzmode\tDEC\t0\t"));
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
