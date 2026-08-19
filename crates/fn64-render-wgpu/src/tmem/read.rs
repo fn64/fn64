@@ -308,9 +308,6 @@ pub enum PhysicalTexelReadError {
     TlutEntry(TlutEntryDecodeError),
     InvalidTexelByte { address: u16 },
     Rgba32BaseOutsideLowHalf { byte_address: u16 },
-    EnabledCiSourceOutsideLowHalf { byte_address: u16 },
-    IncompleteTlutEntry { byte_address: u16, valid_mask: u8 },
-    NonCanonicalTlutEntry { byte_address: u16, lanes: [u16; 4] },
 }
 
 impl fmt::Display for PhysicalTexelReadError {
@@ -329,24 +326,6 @@ impl fmt::Display for PhysicalTexelReadError {
                 formatter,
                 "RGBA32 tile base {byte_address:#05x} is outside low-half TMEM"
             ),
-            Self::EnabledCiSourceOutsideLowHalf { byte_address } => write!(
-                formatter,
-                "enabled-TLUT CI source byte {byte_address:#05x} is outside canonical low-half TMEM"
-            ),
-            Self::IncompleteTlutEntry {
-                byte_address,
-                valid_mask,
-            } => write!(
-                formatter,
-                "TLUT entry at {byte_address:#05x} requires all eight valid bytes, found mask {valid_mask:#04x}"
-            ),
-            Self::NonCanonicalTlutEntry {
-                byte_address,
-                lanes,
-            } => write!(
-                formatter,
-                "TLUT entry at {byte_address:#05x} is not four equal big-endian 16-bit lanes: {lanes:04x?}"
-            ),
         }
     }
 }
@@ -360,11 +339,7 @@ impl std::error::Error for PhysicalTexelReadError {
             Self::Ci4Unpack(error) => Some(error),
             Self::Raw(error) => Some(error),
             Self::TlutEntry(error) => Some(error),
-            Self::InvalidTexelByte { .. }
-            | Self::Rgba32BaseOutsideLowHalf { .. }
-            | Self::EnabledCiSourceOutsideLowHalf { .. }
-            | Self::IncompleteTlutEntry { .. }
-            | Self::NonCanonicalTlutEntry { .. } => None,
+            Self::InvalidTexelByte { .. } | Self::Rgba32BaseOutsideLowHalf { .. } => None,
         }
     }
 }
