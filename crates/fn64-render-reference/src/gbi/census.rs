@@ -1116,15 +1116,15 @@ pub mod othermode {
 
     /// Record one full other-mode write.
     ///
-    /// `high`/`low` must be the same pair the decoder is about to latch into
-    /// [`OtherMode`](crate::gbi::types::OtherMode), so the tally and the
-    /// renderer's state are two views of one value, not two reads.
-    pub fn note(high: u32, low: u32, raw_rdp: bool) {
+    /// Takes the [`OtherMode`] the decoder just latched, by value, rather
+    /// than the wire words: the tally and the renderer's state are then two
+    /// views of one value, not two reads of the same bytes that could drift
+    /// if the decode ever gained a normalization step.
+    pub fn note(mode: OtherMode, raw_rdp: bool) {
         if !on() {
             return;
         }
         let l = lane(raw_rdp);
-        let mode = OtherMode::from_raw(high, low, 0);
         SEEN[l].fetch_add(1, Ordering::Relaxed);
         let cmp = mode.depth_compare_enabled();
         let upd = mode.depth_update_enabled();
@@ -1282,18 +1282,27 @@ pub mod othermode {
     mod tests {
         use super::*;
 
+        /// An `OtherMode` carrying `low`, built the way the decoder builds
+        /// one: assign the field on a default. The struct's own `from_raw`
+        /// is `#[cfg(test)]`-gated and deliberately left that way.
+        fn with_low(low: u32) -> OtherMode {
+            let mut mode = OtherMode::default();
+            mode.low = low;
+            mode
+        }
+
         /// The depth bit positions this probe reports through, asserted as
         /// literals against the decoder's own accessors. If either side
         /// moves, this fails rather than letting a census row and a
         /// rasterizer decision quietly disagree.
         #[test]
         fn depth_bits_match_the_decoders_own_accessors() {
-            assert!(OtherMode::from_raw(0, 0x0010, 0).depth_compare_enabled());
-            assert!(!OtherMode::from_raw(0, !0x0010u32, 0).depth_compare_enabled());
-            assert!(OtherMode::from_raw(0, 0x0020, 0).depth_update_enabled());
-            assert!(!OtherMode::from_raw(0, !0x0020u32, 0).depth_update_enabled());
-            assert!(OtherMode::from_raw(0, 0x0004, 0).primitive_depth_source());
-            assert!(!OtherMode::from_raw(0, !0x0004u32, 0).primitive_depth_source());
+            assert!(with_low(0x0010).depth_compare_enabled());
+            assert!(!with_low(!0x0010u32).depth_compare_enabled());
+            assert!(with_low(0x0020).depth_update_enabled());
+            assert!(!with_low(!0x0020u32).depth_update_enabled());
+            assert!(with_low(0x0004).primitive_depth_source());
+            assert!(!with_low(!0x0004u32).primitive_depth_source());
         }
 
         /// ZMODE occupies low bits 11:10, and the four values map onto the
@@ -1301,15 +1310,12 @@ pub mod othermode {
         #[test]
         fn zmode_labels_track_low_bits_11_10() {
             for (value, label) in [(0u32, "OPA"), (1, "INTER"), (2, "XLU"), (3, "DEC")] {
-                let mode = OtherMode::from_raw(0, value << 10, 0);
+                let mode = with_low(value << 10);
                 assert_eq!(zmode_label(mode.depth_mode()), label, "zmode {value}");
                 assert_eq!(zmode_index(mode.depth_mode()), value as usize);
             }
             // The mask is exactly two bits: nothing outside 11:10 selects it.
-            assert_eq!(
-                zmode_index(OtherMode::from_raw(0, !0x0c00u32, 0).depth_mode()),
-                0
-            );
+            assert_eq!(zmode_index(with_low(!0x0c00u32).depth_mode()), 0);
         }
 
         /// The probe is inert under `cfg(test)`, so `note` cannot leak
@@ -1317,8 +1323,8 @@ pub mod othermode {
         #[test]
         fn probe_is_off_under_cfg_test() {
             assert!(!on());
-            note(0, 0x0030, false);
-            note(0, 0x0030, true);
+            note(with_low(0x0030), false);
+            note(with_low(0x0030), true);
             assert_eq!(seen(false), 0);
             assert_eq!(seen(true), 0);
             assert_eq!(z_cmp_set(false), 0);
