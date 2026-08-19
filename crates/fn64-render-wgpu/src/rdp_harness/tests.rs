@@ -1135,3 +1135,47 @@ fn an_overflowing_texture_coordinate_saturates_to_the_last_texel_not_the_first()
         );
     }
 }
+
+/// **A triangle taller than its colour target must not declare rows past the
+/// target's end.**
+///
+/// `plan_raw_triangle` bounds its row walk by INSTALLED RDRAM and a 4096-row
+/// cap, because `SetColorImage` carries no height and the target extent does
+/// not exist at decode time. On a 4MB RDRAM that bound is far looser than the
+/// real target, so a triangle whose YL reaches past the target's last row
+/// declares byte ranges beyond the target -- and `verify_accesses_inside`
+/// refuses the whole PACKET by name before the executor's own row-count guard
+/// can be consulted.
+///
+/// Measured on the real ROM: WM2000 aborted at 280 VI swaps with
+/// "FillRectangle access #59 names a range outside its own color target's
+/// full extent". The defect is NOT specific to textured triangles -- it was
+/// simply unreachable while the decoder refused every triangle WM2000
+/// emits.
+#[test]
+fn a_triangle_taller_than_its_target_does_not_declare_rows_past_the_targets_end() {
+    // A target 4 rows tall, and a triangle spanning 8 -- so rows 4..8 exist
+    // in the decoder's walk and not in the target.
+    let frame = Rdp::new(16, 4)
+        .cycle(CycleType::One)
+        .combine_prim_passthrough()
+        .prim_color(PRIM_WIRE)
+        .triangle(Tri::flat().left_major().edges(2.0, 6.0).rows(0..8))
+        .run();
+
+    for (start, _len) in frame.write_ranges() {
+        let offset = start - TARGET_ADDRESS;
+        assert!(
+            offset < 16 * 4 * 2,
+            "declared write at {start:#x} (offset {offset}) lies past the \
+             16x4 RGBA16 target's own 128 bytes"
+        );
+    }
+    // The rows that DO exist are still drawn, so this is not satisfied by
+    // declaring nothing at all.
+    for y in 0..4 {
+        for x in 2..6 {
+            frame.assert_pixel(x, y, PRIM_RGBA16);
+        }
+    }
+}
