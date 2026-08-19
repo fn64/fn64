@@ -175,6 +175,21 @@ the very evidence a plateau claim rests on.** What separated them was a solo
 run of the same script reaching swap 2397 without incident. `WM2000_TRACE_PATH`
 gives each run its own sink.
 
+**A second cause produces the identical swap-1901 abort, and per-run trace
+paths do not fix it: host memory.** A later four-run wave with separate sinks
+aborted at swap 1901 in all four runs again. The tell was the trace sizes --
+three were *byte-identically* 61,940,485 bytes, while the wave that succeeded
+had reached ~142 MB per run. Each concurrent run holds its whole trace in
+memory alongside its RDRAM, and four of them plus the previous wave's leftover
+files exhausted the box. Running two at a time, and deleting each trace when
+its run ends, is what made the same scripts complete.
+
+The lesson generalises past this harness: **swap 1901 is not a fact about the
+guest.** Two unrelated host-side limits both terminate the run there, both in
+every concurrent run at once, and both wearing the shape of a reproducible
+plateau. Any claim that the ROM stops somewhere needs a solo run, or a
+resource-headroom check, before it is believed.
+
 Note that `WM2000_NO_TRACE=1` is not the fix, because the harness computes
 `dumps_disabled = trace_disabled || ...` -- turning off the trace also turns off
 the framebuffer dumps the probes are judged by. Per-run trace paths are the
