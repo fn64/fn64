@@ -74,14 +74,6 @@ pub enum MissingTriangleDrawState {
     NoCombine {
         triangle_index: usize,
     },
-    /// A triangle whose `OtherMode::alpha_compare()` decodes `Threshold` was
-    /// visited before this plan's own first `SetBlendColor` (seeded or
-    /// in-plan) -- `Threshold` needs a real `G_SETBLENDCOLOR.a` to compare
-    /// against (`alpha_compare.rs:96-98`); a `None`-mode or `Dither`-rejected
-    /// triangle never reaches this check (module doc, card §4a).
-    NoBlendColor {
-        triangle_index: usize,
-    },
 }
 
 impl core::fmt::Display for MissingTriangleDrawState {
@@ -89,7 +81,6 @@ impl core::fmt::Display for MissingTriangleDrawState {
         let (missing, triangle_index) = match self {
             Self::NoOtherMode { triangle_index } => ("SetOtherMode", *triangle_index),
             Self::NoCombine { triangle_index } => ("SetCombine", *triangle_index),
-            Self::NoBlendColor { triangle_index } => ("SetBlendColor", *triangle_index),
         };
         write!(
             formatter,
@@ -481,12 +472,6 @@ mod tests {
              command; a triangle draw cannot retrieve real state that was never admitted at \
              its own stream position"
         );
-        assert_eq!(
-            MissingTriangleDrawState::NoBlendColor { triangle_index: 3 }.to_string(),
-            "triangle #3 (plan order) was visited before this plan's own first SetBlendColor \
-             command; a triangle draw cannot retrieve real state that was never admitted at \
-             its own stream position"
-        );
     }
 
     fn blend_color_command(index: u32, value: u32) -> RdpStateCommand {
@@ -523,7 +508,7 @@ mod tests {
         let draws = collector
             .finish()
             .expect("threshold triangle has blend_color");
-        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x1122_3344)));
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x1122_3344));
     }
 
     #[test]
@@ -540,11 +525,22 @@ mod tests {
         let draws = collector
             .finish()
             .expect("None-mode triangle needs no blend_color at all");
-        assert_eq!(draws[0].blend_color, None);
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0));
     }
 
+    /// **Wall 6.** A `Threshold` triangle with no `SetBlendColor` anywhere
+    /// in the plan is admitted, carrying the blend register's power-on
+    /// zero.
+    ///
+    /// This replaces a test that asserted the opposite. `Threshold`
+    /// compares the fragment alpha against `G_SETBLENDCOLOR.a`, and that
+    /// register always holds a value -- zero until the guest writes one.
+    /// `fn64-render-reference` models it as a zero-initialized `[u8; 4]`
+    /// (`gbi/state.rs:227`, `:387`) and RT64's C++ zero-initializes
+    /// `blendColor` at `src/hle/rt64_state.cpp:131`. The refusal invented an
+    /// "unset" state the RDP cannot be in, and it aborted WM2000's plan.
     #[test]
-    fn a_threshold_triangle_before_any_blend_color_is_a_loud_named_error() {
+    fn a_threshold_triangle_before_any_blend_color_reads_the_power_on_zero() {
         let mut collector = TriangleDrawStateCollector::default();
         let other_mode = threshold_other_mode_command(0);
         let combine = combine_command(1, 1, 2);
@@ -554,10 +550,37 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::State(&combine));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let error = collector.finish().unwrap_err();
-        assert_eq!(
-            error,
-            MissingTriangleDrawState::NoBlendColor { triangle_index: 0 }
+        let draws = collector
+            .finish()
+            .expect("a Threshold triangle with no SetBlendColor is admissible");
+        // Derived by hand: an RDP color register powers up holding four
+        // zero bytes, so the packed wire word is 0x0000_0000.
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0));
+    }
+
+    /// The companion to the test above: an in-plan `SetBlendColor` must
+    /// still reach the snapshot. Without this, the power-on assertion could
+    /// hold against a field hardcoded to zero that ignores every write.
+    #[test]
+    fn a_threshold_triangle_after_a_blend_color_carries_that_written_value() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = threshold_other_mode_command(0);
+        let combine = combine_command(1, 1, 2);
+        let written = blend_color_command(2, 0x1122_3344);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::State(&written));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector.finish().expect("written blend color is admissible");
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x1122_3344));
+        assert_ne!(
+            draws[0].blend_color,
+            Color4::from_wire(0),
+            "the written value must differ from the power-on zero, or neither test can \
+             distinguish real tracking from a hardcoded constant"
         );
     }
 
@@ -584,8 +607,8 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
 
         let draws = collector.finish().expect("both triangles have blend_color");
-        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x0000_00AA)));
-        assert_eq!(draws[1].blend_color, Some(Color4::from_wire(0x0000_00BB)));
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x0000_00AA));
+        assert_eq!(draws[1].blend_color, Color4::from_wire(0x0000_00BB));
         assert_ne!(
             draws[0].blend_color, draws[1].blend_color,
             "triangle A must NOT be retroactively affected by a SetBlendColor that comes after \
@@ -674,15 +697,15 @@ mod tests {
 
         let draws = collector.finish().expect("both triangles have state");
         assert_eq!(draws.len(), 2);
-        assert_eq!(draws[0].env_color, Some(Color4::from_wire(0x1111_1111)));
+        assert_eq!(draws[0].env_color, Color4::from_wire(0x1111_1111));
         assert_eq!(
             draws[0].prim_color,
-            Some(PrimColor::from_wire(10 | (5 << 8), 0x2222_2222))
+            PrimColor::from_wire(10 | (5 << 8), 0x2222_2222)
         );
-        assert_eq!(draws[1].env_color, Some(Color4::from_wire(0x3333_3333)));
+        assert_eq!(draws[1].env_color, Color4::from_wire(0x3333_3333));
         assert_eq!(
             draws[1].prim_color,
-            Some(PrimColor::from_wire(20 | (10 << 8), 0x4444_4444))
+            PrimColor::from_wire(20 | (10 << 8), 0x4444_4444)
         );
         assert_ne!(
             draws[0].env_color, draws[1].env_color,
@@ -713,7 +736,7 @@ mod tests {
         let draws = collector
             .finish()
             .expect("no env/prim color needed to resolve");
-        assert_eq!(draws[0].env_color, None);
-        assert_eq!(draws[0].prim_color, None);
+        assert_eq!(draws[0].env_color, Color4::from_wire(0));
+        assert_eq!(draws[0].prim_color, PrimColor::from_wire(0, 0));
     }
 }
