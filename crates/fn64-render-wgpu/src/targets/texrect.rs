@@ -80,8 +80,14 @@
 //!   stays refused in both slices: a rectangle binds one tile, so there is
 //!   no decoded tile+1 to sample -- the reference refuses it for that same
 //!   reason (`backend/validate.rs:479-483`). Fill cycle remains refused
-//!   by name ([`TexrectExecutionError::UnsupportedCycleType`]); it samples
-//!   no texture at all and draws from the fill-colour register instead.
+//!   by name ([`TexrectExecutionError::UnsupportedCycleType`]). n64brew
+//!   documents what it should do ("In FILL mode this behaves identically to
+//!   Fill Rectangle") and the reference lane implements it, so this refusal
+//!   is a known lane gap rather than an unknown -- but closing it is not a
+//!   widening of the cycle match, because this path's rectangle rule and
+//!   the fill path's differ by a pixel on every axis and no `FillColor`
+//!   reaches here. [`TexrectExecutionError::UnsupportedCycleType`]'s own
+//!   doc carries the measured numbers and the three-part shape of the fix.
 //! - **Three of the four post-combiner stages now run**, each through
 //!   this crate's already-landed port rather than a second copy:
 //!   the **blender** (`crate::blend::blend_fragment`), **alpha compare**
@@ -389,7 +395,61 @@ pub enum TexrectExecutionError {
     /// one-cycle") is a boot-through-attract window
     /// (`docs/RT64-WM2000-CYCLE-MODES.md` §1). It says two-cycle was not
     /// seen there; it never said two-cycle does not occur, and gameplay has
-    /// not been reached on either lane.
+    /// not been reached on either lane. Read the Fill zero in that same
+    /// window the same way.
+    ///
+    /// ## Why Fill is still refused, and what it would cost to admit
+    ///
+    /// **Not because the hardware behavior is unknown.** n64brew's RDP
+    /// command table states it in the Texture Rectangle section itself:
+    /// "In FILL mode this behaves identically to Fill Rectangle, the
+    /// texturing properties are ignored." `fn64-render-reference` acts on
+    /// exactly that, executing the command as
+    /// `draw_fill_rectangle(&rectangle.as_fill_cycle_rectangle(), target)`
+    /// (`backend/imp.rs:911-919`), and records that refusing it aborted a
+    /// real WCW/nWo Revenge frame -- a shipped AKI-engine sibling of
+    /// WM2000. This refusal is a lane gap, and it is the one row of
+    /// `docs/RT64-LANE-DIVERGENCES.md` this module could not close in the
+    /// pass that closed D2.
+    ///
+    /// It is **not** a widening of the match above. Admitting `Fill` there
+    /// would draw the wrong rectangle, silently, which is the exact failure
+    /// mode this whole error type exists to prevent. Three things are
+    /// missing, and each is somewhere else:
+    ///
+    /// 1. **The two lanes' rectangles disagree by a pixel on every axis.**
+    ///    A texrect reaches this executor as an already-resolved
+    ///    [`crate::RectViewportPixels`], which
+    ///    `raw_dpc/texture_rectangle.rs` builds by RT64's `FixedRect` rule:
+    ///    round `ulx`/`uly` down in fill mode, then `(coord + 3) >> 2` at
+    ///    *both* ends, giving a **half-open** rectangle. A fill rectangle's
+    ///    rule is `targets/fill.rs`'s `resolve_fill_pixel_rectangle`:
+    ///    `coord >> 2` at both ends, **inclusive** (`width = x1 - x0 + 1`).
+    ///    On wire `(0, 0, 1276, 956)` the first gives 319x239 and the
+    ///    second 320x240; on wire `ulx = 2` the first rounds and the second
+    ///    refuses `FractionalEdge`. Executing the viewport this function's
+    ///    caller already holds would draw a full-screen fill one pixel
+    ///    short on each axis.
+    /// 2. **`FillColor` is not on this path.**
+    ///    `raw_dpc::triangle_draw_data::RetrievedTriangleDraw` snapshots
+    ///    `blend_color`, `env_color`, `prim_color` and `fog_color` at each
+    ///    triangle's own stream position. It does not snapshot the fill
+    ///    color, because until now no triangle-sourced command read it.
+    ///    A Fill-cycle texrect reads nothing else.
+    /// 3. **The fill-cycle blender hazard is a property of the cycle, not
+    ///    the command.** The reference checks
+    ///    `other_mode.validate_fill_cycle_bypass()` on this command for
+    ///    that reason (`backend/validate.rs:152-161`: a retained depth
+    ///    consumer in fill cycle can hang the RDP), and
+    ///    `targets/fill.rs`'s `require_safe_fill_cycle_bypass` is this
+    ///    crate's equivalent. It would have to run here too.
+    ///
+    /// So the real shape of the fix is: carry the raw wire rectangle (or
+    /// the resolved fill rectangle) alongside the viewport, snapshot
+    /// `FillColor` on the triangle path, and route the command to
+    /// `execute_fill_rectangle` rather than through this executor at all --
+    /// which is what the reference does. That is three modules, and it is
+    /// deliberately not attempted behind a one-line match arm.
     UnsupportedCycleType {
         cycle_type: CycleType,
     },
@@ -3087,6 +3147,81 @@ mod one_cycle_tests {
                 "TEXEL1 in {slice} has no decoded tile+1 behind it and must be refused"
             );
         }
+    }
+
+    /// **The reason Fill cannot be admitted by widening the match above,
+    /// as an executable fact rather than a comment.**
+    ///
+    /// A texrect reaches [`execute_texture_rectangle`] as an
+    /// already-resolved [`RectViewportPixels`], built by
+    /// `raw_dpc/texture_rectangle.rs`'s port of RT64's `FixedRect`:
+    /// `(coord + 3) >> 2` at both ends, half-open. A fill rectangle's rule
+    /// is `targets/fill.rs`'s [`super::resolve_fill_pixel_rectangle`]:
+    /// `coord >> 2` at both ends, inclusive.
+    ///
+    /// This asserts the two disagree on wire coordinates that are legal for
+    /// both -- every edge a multiple of four, so the fill rule's
+    /// `FractionalEdge` refusal does not fire and the disagreement is
+    /// purely the inclusive/half-open split. If a future change made them
+    /// agree, admitting Fill above would become a one-line fix and this
+    /// test would say so by failing.
+    ///
+    /// Both rules are re-derived in this test body from their published
+    /// expressions on the texrect side, so this pins the disagreement
+    /// itself rather than one implementation against the other. The fill
+    /// side calls the real `resolve_fill_pixel_rectangle`, since that is
+    /// the function a fix would have to route to.
+    #[test]
+    fn the_texrect_and_fill_rectangle_rules_disagree_by_a_pixel_on_every_axis() {
+        // Wire 2.2 fixed-point coordinates, every edge a whole pixel.
+        for (ulx, uly, lrx, lry) in [
+            (0u16, 0u16, 16u16, 16u16),
+            (8, 8, 40, 24),
+            (0, 0, 1276, 956),
+        ] {
+            // The texrect side, re-derived: fill mode rounds the upper-left
+            // down (`ulx &= !3`, a no-op on these whole-pixel edges), then
+            // `FixedRect::left/top/right/bottom` with `ceil = true`.
+            let left = ((i32::from(ulx) & !3) + 3) >> 2;
+            let top = ((i32::from(uly) & !3) + 3) >> 2;
+            let right = (i32::from(lrx) + 3) >> 2;
+            let bottom = (i32::from(lry) + 3) >> 2;
+            let texrect_extent = (right - left, bottom - top);
+
+            // The fill side, through the executor a fix would route to.
+            let fill = super::super::resolve_fill_pixel_rectangle(ulx, uly, lrx, lry)
+                .expect("every edge here is a whole pixel");
+            let fill_extent = (fill.width() as i32, fill.height() as i32);
+
+            assert_eq!(
+                fill_extent,
+                (texrect_extent.0 + 1, texrect_extent.1 + 1),
+                "wire ({ulx}, {uly}, {lrx}, {lry}): the fill rule is inclusive and the texrect \
+                 rule is half-open, so the fill rectangle is exactly one pixel larger on each \
+                 axis"
+            );
+            assert_ne!(
+                fill_extent, texrect_extent,
+                "if these ever agree, admitting Fill at admitted_cycle_evaluation becomes a \
+                 one-line fix and this test must be re-justified"
+            );
+        }
+    }
+
+    /// **The fill rule refuses a fractional edge the texrect rule silently
+    /// rounds** -- the second half of why the two are not interchangeable.
+    #[test]
+    fn the_fill_rule_refuses_a_fractional_edge_the_texrect_rule_rounds() {
+        // `ulx = 2` is half a pixel.
+        let texrect_left = ((2i32 & !3) + 3) >> 2;
+        assert_eq!(
+            texrect_left, 0,
+            "the texrect rule rounds a half-pixel upper-left down to pixel 0"
+        );
+        assert!(
+            super::super::resolve_fill_pixel_rectangle(2, 2, 18, 18).is_err(),
+            "the fill rule refuses a fractional edge by name rather than rounding it"
+        );
     }
 
     /// **Fill remains refused by name** -- the admission widened by exactly
