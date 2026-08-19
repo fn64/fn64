@@ -37,8 +37,9 @@ pub use raster::{
 };
 pub use raw_triangle::{execute_raw_triangle, RawTriangleTexture};
 pub use texrect::{
-    execute_texture_rectangle, TexrectAxis, TexrectBlendRegisters, TexrectConstantRegister,
-    TexrectDraw, TexrectExecutionError, TexrectShading, TexrectTileBinding,
+    execute_texture_rectangle, ClippedTexrectExtent, RdpScissorRect, TexrectAxis,
+    TexrectBlendRegisters, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
+    TexrectShading, TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 pub use triangle_pipeline::{
