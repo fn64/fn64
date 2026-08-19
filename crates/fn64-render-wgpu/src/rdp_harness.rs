@@ -300,7 +300,6 @@ impl Tri {
     }
 }
 
-
 impl StagedTexture {
     /// The load sequence's wire words: `SetTextureImage`, `SetTile`,
     /// `SetTileSize`, `LoadSync`, `LoadBlock`.
@@ -333,9 +332,7 @@ impl StagedTexture {
         // `n ..= n + height - 1`.
         words.extend([
             word(SET_TILE_SIZE, self.low_t << 2),
-            self.tile << 24
-                | ((self.width - 1) << 2) << 12
-                | ((self.low_t + self.height - 1) << 2),
+            self.tile << 24 | ((self.width - 1) << 2) << 12 | ((self.low_t + self.height - 1) << 2),
         ]);
         words.extend([word(LOAD_SYNC, 0), 0]);
         // `LoadBlock`'s texel count field is INCLUSIVE of the last texel, so
@@ -637,13 +634,8 @@ impl Rdp {
             .iter()
             .map(StagedTexture::source_bytes)
             .collect();
-        let staged = publish_packet(
-            &mut backend,
-            &mut session,
-            self.draw_words(),
-            &source_bytes,
-        )
-        .map_err(HarnessRefusal::Draw)?;
+        let staged = publish_packet(&mut backend, &mut session, self.draw_words(), &source_bytes)
+            .map_err(HarnessRefusal::Draw)?;
 
         let bytes = backend
             .color_targets()

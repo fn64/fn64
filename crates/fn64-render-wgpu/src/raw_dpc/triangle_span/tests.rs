@@ -73,8 +73,14 @@ fn the_wm2000_title_triangle_spans_run_major_left_to_minor_right() {
     let triangle = decode(&wire(
         true, 106, 106, 17, 6832128, -16842729, 770048, 0, 701940, 272435,
     ));
-    assert!(triangle.right_major(), "the live-stream tri carries bit 23 set");
-    assert!(left_major(&triangle), "bit 23 set means the H edge is on the LEFT");
+    assert!(
+        triangle.right_major(),
+        "the live-stream tri carries bit 23 set"
+    );
+    assert!(
+        left_major(&triangle),
+        "bit 23 set means the H edge is on the LEFT"
+    );
 
     // Scanline 15, sample row y*8+7 = 127 eighths.
     //   yh = 17 (S11.2) -> yh & !3 = 16 -> high_origin_eighth = 32.
@@ -362,7 +368,6 @@ fn ceil_ratio_rounds_up_on_both_sides_of_zero() {
     assert_eq!(ceil_ratio(-1, 8), 0);
 }
 
-
 // ---------------------------------------------------------------------------
 // The coverage samples are a CHECKERBOARD, not a 2x4 grid
 // ---------------------------------------------------------------------------
@@ -446,7 +451,6 @@ fn the_attribute_sample_point_follows_the_checkerboard_too() {
     // 7/8 px = 57344; major edge = 49152. 57344 - 49152 = 8192 = 0.125 px.
     assert_eq!(delta_x, 8192);
 }
-
 
 // ---------------------------------------------------------------------------
 // Coefficient block decode: the split integer/fraction layout
@@ -540,5 +544,9 @@ fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
     ));
     assert_eq!(planes[0].base, negative);
     assert_eq!(planes[0].base >> 16, -2, "the integer part is -2");
-    assert_eq!(planes[0].base as u32 & 0xffff, 0x8000, "the fraction is 0.5");
+    assert_eq!(
+        planes[0].base as u32 & 0xffff,
+        0x8000,
+        "the fraction is 0.5"
+    );
 }

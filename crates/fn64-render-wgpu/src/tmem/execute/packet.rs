@@ -1750,14 +1750,9 @@ mod tests {
             "the two entries must differ, or the cell cannot show that the \
              upper-right corner read its OWN entry"
         );
-        let cell = gather_committed_texture_cell(
-            &partial,
-            tile,
-            size,
-            request,
-            TextureLutMode::Rgba16,
-        )
-        .expect("a partially valid TLUT word resolves from lane 0");
+        let cell =
+            gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16)
+                .expect("a partially valid TLUT word resolves from lane 0");
         assert_eq!(
             cell.texels().map(|texel| texel.texel().rgba8888()),
             [RED, RED, HOSTILE_PARTIAL, HOSTILE_PARTIAL],

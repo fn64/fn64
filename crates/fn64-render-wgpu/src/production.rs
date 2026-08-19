@@ -3627,16 +3627,11 @@ fn stage_color_commands(
         .chain(collector.plan.texrect_commands.iter().enumerate().map(
             |(index, (_, _, _, command_index))| (*command_index, ColorCommandKind::Texrect(index)),
         ))
-        .chain(
-            collector
-                .plan
-                .raw_triangle_commands
-                .iter()
-                .enumerate()
-                .map(|(index, (_, _, command_index, _))| {
-                    (*command_index, ColorCommandKind::RawTriangle(index))
-                }),
-        )
+        .chain(collector.plan.raw_triangle_commands.iter().enumerate().map(
+            |(index, (_, _, command_index, _))| {
+                (*command_index, ColorCommandKind::RawTriangle(index))
+            },
+        ))
         .collect();
     if schedule.is_empty() {
         return Ok(None);
@@ -4009,11 +4004,11 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
 
     // Locate the declared run by the decoder's own recorded span.
     let start = span.first_access_index as usize;
-    let end = start
-        .checked_add(span.access_count as usize)
-        .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
+    let end = start.checked_add(span.access_count as usize).ok_or(
+        WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
             triangle_index: *triangle_index,
-        })?;
+        },
+    )?;
     let accesses = collector
         .plan
         .accesses
@@ -4049,17 +4044,18 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     // word zero.
     let texture = if triangle.flags().textured() {
         let tile_index = usize::from(triangle.tile().get());
-        let (Some(descriptor), Some(size)) = collector.plan.triangle_neutral_tiles[*triangle_index]
-            [tile_index]
+        let (Some(descriptor), Some(size)) =
+            collector.plan.triangle_neutral_tiles[*triangle_index][tile_index]
         else {
             return Err(WgpuRawDpcExecutionError::TexrectUnboundTile {
                 triangle_index: *triangle_index,
             });
         };
-        let tile = crate::targets::TexrectTileBinding::try_from_neutral(descriptor, size)
-            .map_err(|_| WgpuRawDpcExecutionError::TexrectUnboundTile {
+        let tile = crate::targets::TexrectTileBinding::try_from_neutral(descriptor, size).map_err(
+            |_| WgpuRawDpcExecutionError::TexrectUnboundTile {
                 triangle_index: *triangle_index,
-            })?;
+            },
+        )?;
         // The reserved TLUT encoding is a named refusal in `OtherMode`'s own
         // decoder, propagated rather than coerced to Disabled -- which would
         // silently sample a direct-format texel out of an indexed tile.
@@ -8652,22 +8648,78 @@ mod tests {
         );
     }
 
-    /// **T-14:** admitting fills did not become "admit all fills". A
-    /// `FillRectangle` under Copy cycle (`cycle_type == 2`) is still
-    /// rejected at plan time.
+    /// **Supersedes T-14** (`plan_raw_dpc_rejects_a_copy_cycle_fill_rectangle`),
+    /// which asserted a Copy-cycle `FillRectangle` is rejected at plan
+    /// time. That pinned scaffolding, not hardware.
+    ///
+    /// The RDP defines `G_FILLRECT` in every cycle type; cycle type selects
+    /// how the rectangle's content is produced, not whether the command is
+    /// legal. `plan_fill`'s own doc carries the three authorities
+    /// (fn64's reference lane `raster/draw.rs:113-128`, RT64
+    /// `rt64_rdp.cpp:1033-1050`, and the WM2000 packet measured at VI swap
+    /// 2522 in `docs/WM2000-FILLRECT-EVIDENCE.txt`).
+    ///
+    /// What "admitted" means here is precise and narrow, and both halves
+    /// are asserted:
+    ///
+    /// 1. The plan SUCCEEDS -- one unexecutable command no longer refuses
+    ///    the whole packet.
+    /// 2. It declares NO `RenderTarget` write. That is what keeps this from
+    ///    being "admit all fills": `targets/fill.rs`'s
+    ///    `execute_fill_rectangle` implements the fill-cycle branch alone,
+    ///    so a declared write here would name bytes nothing fills and
+    ///    publish a digest of stale RDRAM.
+    ///
+    /// The Fill-cycle control arm below is what makes the fixture
+    /// non-degenerate: a planner that declared nothing for every cycle type
+    /// would satisfy assertion 2 alone.
+    ///
+    /// FAILS BEFORE this change (`plan_raw_dpc` returned `Err`), PASSES
+    /// AFTER.
     #[test]
-    fn plan_raw_dpc_rejects_a_copy_cycle_fill_rectangle() {
-        let (mut backend, session) = WgpuBackend::try_new().unwrap();
-        let mut words = Vec::new();
-        words.extend([word(SET_OTHER_MODE, 2 << 20), 0]);
-        words.extend(set_color_image_rgba16());
-        words.extend(set_fill_color(0x213c_4d59));
-        words.extend(fill_rectangle(4, 2, 14, 4));
+    fn plan_raw_dpc_admits_a_copy_cycle_fill_rectangle_without_declaring_a_write() {
+        let plans = |cycle_bits: u32| {
+            let (mut backend, session) = WgpuBackend::try_new().unwrap();
+            let mut words = Vec::new();
+            words.extend([word(SET_OTHER_MODE, cycle_bits << 20), 0]);
+            words.extend(set_color_image_rgba16());
+            words.extend(set_fill_color(0x213c_4d59));
+            words.extend(fill_rectangle(4, 2, 14, 4));
 
-        let request = session.plan_request(capture(words));
+            let request = session.plan_request(capture(words));
+            backend.plan_raw_dpc(request).is_ok()
+        };
+
+        // Control: Fill cycle, the case that always planned, still does --
+        // so a change that broke planning outright cannot pass this test by
+        // making every arm behave identically.
+        assert!(plans(3), "a Fill-cycle FillRectangle must still plan");
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1), ("Copy", 2)] {
+            assert!(
+                plans(cycle_bits),
+                "{name}: one command this backend has no executor for must no longer \
+                 refuse the whole packet"
+            );
+        }
+    }
+
+    /// The other half of the contract the card above states, asserted where
+    /// the access list is actually reachable: a non-Fill cycle
+    /// `FillRectangle` declares no `RenderTarget` write, so nothing slices
+    /// stale bytes for it. `PlannedRawDpcSubmission` exposes no journal
+    /// accessor, so the zero-write assertion lives on the decoder's own
+    /// plan in
+    /// `raw_dpc::tests::a_non_fill_cycle_fill_rectangle_declares_no_write_but_a_fill_cycle_one_does`.
+    /// Named here so a reader of this card finds it rather than assuming
+    /// the property is unpinned.
+    #[test]
+    fn the_zero_write_half_of_the_non_fill_cycle_contract_is_pinned_elsewhere() {
+        let source = include_str!("raw_dpc/mod.rs");
         assert!(
-            backend.plan_raw_dpc(request).is_err(),
-            "only fill-cycle FillRectangles are admitted"
+            source.contains(
+                "fn a_non_fill_cycle_fill_rectangle_declares_no_write_but_a_fill_cycle_one_does"
+            ),
+            "the zero-declared-write assertion this card defers to must exist"
         );
     }
 
@@ -10911,11 +10963,9 @@ mod tests {
         // not merely about what this backend recorded.
         let expected_row: Vec<u8> = TRIANGLE_PRIM_RGBA16.to_be_bytes().repeat(4);
         for (index, write) in staged.iter().enumerate() {
-            let expected = fn64_render_ir::CompletedWrite::try_from_bytes(
-                write.access(),
-                &expected_row,
-            )
-            .expect("eight bytes match the declared eight-byte access");
+            let expected =
+                fn64_render_ir::CompletedWrite::try_from_bytes(write.access(), &expected_row)
+                    .expect("eight bytes match the declared eight-byte access");
             assert_eq!(
                 write.content(),
                 expected.content(),
@@ -14980,10 +15030,7 @@ mod tests {
         // so the high word is built here from the same `word()` encoder it
         // uses, with TEXTLUT placed by its documented shift.
         fn other_mode_with_textlut(textlut: u32) -> [u32; 2] {
-            [
-                word(SET_OTHER_MODE, textlut << TEXTLUT_SHIFT),
-                0,
-            ]
+            [word(SET_OTHER_MODE, textlut << TEXTLUT_SHIFT), 0]
         }
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
