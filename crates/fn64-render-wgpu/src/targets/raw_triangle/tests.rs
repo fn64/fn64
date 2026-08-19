@@ -226,6 +226,57 @@ fn a_sloped_triangle_writes_a_different_pixel_count_on_each_row() {
     }
 }
 
+/// **A pixel with ZERO coverage inside a declared run must keep the
+/// resident's own byte.**
+///
+/// This exists because the mutant that removes the `coverage == 0` skip
+/// SURVIVED the first draft of this file: the partially-covered case below
+/// has coverage 4, not 0, so it never reached the arm. A declared run is
+/// the UNION over a scanline's four subpixel sample rows, so a sloped edge
+/// makes the run's first pixel uncovered on every sample row -- and painting
+/// it would put the triangle's colour outside the triangle.
+///
+/// Hand-derived, from the wire fields alone:
+///   xh = 147456 / 65536 = 2.25 px, dxhdy = 32768 / 65536 = +0.5 px/line.
+///   Row 1's sample rows are y-eighths 9, 11, 13, 15, so the left edge sits
+///   at 2.25 + 0.5 * 9/8 = 2.8125 on the topmost and further right below.
+///   min_left = 2.8125 -> x0 = ceil(2.8125 - 7/8) = ceil(1.9375) = 2.
+///   But pixel 2's two sample columns are 2.125 and 2.625, and BOTH are
+///   left of 2.8125 on every one of the four sample rows.
+/// So pixel 2 is declared and has coverage 0.
+#[test]
+fn a_declared_pixel_with_no_subpixel_coverage_is_not_painted() {
+    let key = key_at(16, 8);
+    let resident = sentinel_resident(key);
+    let sloped_left = triangle(
+        true, 16, 8, 0, 786432, 0, 147456, 32768, 524288, 0,
+    );
+    // The precondition, asserted rather than assumed: this pixel really is
+    // inside the declared run and really has zero coverage.
+    let rows = crate::raw_dpc::triangle_span::covered_rows(&sloped_left, 16, 8);
+    let row = rows.iter().find(|row| row.y == 1).expect("row 1 is covered");
+    assert_eq!((row.x0, row.x1), (2, 8), "row 1's declared run");
+    assert_eq!(
+        crate::raw_dpc::triangle_span::pixel_coverage(&sloped_left, 2, 1),
+        0,
+        "pixel (2,1) is declared but has no subpixel coverage"
+    );
+
+    let bytes = run(key, &sloped_left, &resident, rows.len()).expect("rasterizes");
+    let at = |x: usize, y: usize| {
+        let offset = (y * 16 + x) * 2;
+        [bytes[offset], bytes[offset + 1]]
+    };
+    assert_eq!(
+        at(2, 1),
+        [0x5A, 0x5A],
+        "a zero-coverage pixel inside a declared run must keep the resident's byte"
+    );
+    // Positive control: the next pixel along IS covered and IS painted, so
+    // this test cannot pass by the raster doing nothing at all.
+    assert_eq!(at(3, 1), PRIM_RGBA16);
+}
+
 #[test]
 fn a_zero_coverage_pixel_inside_a_declared_run_keeps_the_residents_byte() {
     // Left edge at x = 4.5: pixel 4's sample column at 4.125 is outside and
