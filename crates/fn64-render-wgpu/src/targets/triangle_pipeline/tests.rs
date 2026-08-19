@@ -2126,6 +2126,16 @@ mod host_gpu_tests {
     /// `an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_cpu_only`
     /// is its adapter-free CPU half.
     ///
+    /// **Scope note, so this test is not read as settling more than it
+    /// does.** It pins CPU/GPU AGREEMENT about the rule. It does not
+    /// establish that the rule is correct: `docs/RT64-LANE-DIVERGENCES.md`
+    /// D14 scores this same refusal against `fn64-render-reference` (which
+    /// constrains only the genuine split-bank formats to the low half) and
+    /// rules "REFERENCE on the divergence; UNKNOWN on hardware". If D14 is
+    /// resolved in the reference's favour, this test and the guard it
+    /// covers come out together with the CPU refusal -- both lanes at once,
+    /// which is exactly what this pin makes visible.
+    ///
     /// Adapter-gated (`host-gpu-tests`).
     #[test]
     fn required_host_an_enabled_tlut_tile_in_the_high_half_is_refused_by_the_shader() {
