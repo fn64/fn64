@@ -57,3 +57,26 @@ not the same one resurfacing.
 Measurement in flight: reproducing on the real ROM in my own worktree
 (`recompile_rom` had to be built there first — the harness reads
 `$FN64/target/release/recompile_rom`).
+
+## Reproduced in my own worktree (run 2, `/private/tmp/tr2.log`)
+
+Identical to the controller's measurement, so the abort is real and stable:
+
+```
+crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202
+execute_raw_dpc: render-wgpu/raw-dpc-execute backend error: texture rectangle
+texel fetch failed at pixel (1, 15): physical TMEM texel byte 0x080 is invalid
+vi_swaps=280
+```
+
+(Run 1 was void: the harness reads `$FN64/target/release/recompile_rom` and
+that binary did not exist in a fresh worktree. Built it, then re-ran.)
+
+## Harness gotcha worth recording
+
+`run-rs-lane.sh` ends in `exec env ROM=... FN64_ABSENT_N64DD=1 ... ./wm2000-boot`,
+an `env` invocation with an explicit variable list. Any diagnostic env var you
+export outside the harness is therefore DROPPED before the binary starts. A
+first instrumented run produced no output for exactly this reason. Gate
+temporary instrumentation on a marker FILE, not an env var, or edit the
+harness.
