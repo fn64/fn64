@@ -884,3 +884,72 @@ Stopped deliberately at its budget, not aborted:
 5021 is **2.3x** the 2149 that was the best previously recorded on the fixed
 tree. The run never degraded: the loop at swap 4995 is the same 38 frames as
 the loop at 2500.
+
+### Untried item #2 is now CLOSED: the second controller changes nothing on screen
+
+`WM2000_PORTS=2` plugs port 1 in through
+`fn64_abi::set_controller_port_state`, the same seam the accessory path uses.
+Run against the identical sustained-A schedule:
+
+| comparison | result |
+|---|---|
+| swaps 1700-2225 (menus) | **526 / 526 frames byte-identical** |
+| swaps 2226-2328 (versus screen appears) | **103 / 103 identical** |
+| swaps 2400-2516 (plateau) | **117 / 117 identical**, same 38 distinct |
+| swaps 2600-2913 (deep plateau) | **314 / 314 identical** |
+| max swap / traps | 2842+ / **0** |
+
+The second controller **is** reaching the guest -- `sim_time` diverges from the
+one-port run by step 50,000 (895,926,191 vs 895,940,131) and `gfx_tasks` by one
+at swap 2842 -- so the port state is live, not ignored. It simply does not
+change what is drawn. **The versus screen is not gated on a second controller
+being present.** Frame committed as
+`docs/frames/wm2000-menu-progression/reframed-swap-2500-two-controllers.png`.
+
+That closes the cheapest remaining hypothesis with frames rather than
+inference, and it removes the "unreachable by any button schedule" escape: the
+thing the screen waits on is reachable in principle, and is not port presence.
+
+## Where the goal stands, and what is left
+
+**No match was reached.** Stated exactly:
+
+- **Furthest state reached by input:** a **two-wrestler versus screen**, first
+  drawn at **swap 2300**, held unchanged to **swap 5021**.
+- **Schedule that produced it:** START at 1100, A every 100 swaps to 2400,
+  then A every 60 swaps.
+- **Its signature:** **3.00 gfx lists/field** sustained, a **40-swap loop** of
+  38 unique frames, **0 traps, 0 panics** in every run.
+- **The only ring on screen** in this whole lane is **attract-mode demo play at
+  swap 560**, which no input produced.
+
+### Tried and inert, with numbers
+
+| tried | result |
+|---|---|
+| A sustained to swap 12000 (item #5) | reaches the versus screen, then 38-frame loop to 5021. Closed. |
+| Analog stick right (item #3) | **3.00 gfx/swap, identical** to A-only. Inert. Closed. |
+| Second controller (item #2) | **431 consecutive frames byte-identical**. Inert. Closed. |
+
+### Ranked, still untried
+
+1. **Find what the versus screen polls.** It composes at full rate on a
+   deterministic 40-swap loop, so it is spinning on a condition in a known,
+   small piece of code. The trace sink records thread and message activity and
+   was captured for both runs; reading which flag or message the loop tests is
+   the direct question, and no button answers it. This is the highest-value
+   next step by a distance.
+2. **The paging grammar (item #4), unattempted here.** `func_8015733C` tests
+   L (`0x20`), R (`0x10`), the C-buttons, and the `0x1004` START|C-Down combo.
+   L was flagged in the earlier card as differing from control but was never
+   quantified, and this lane did not get to it.
+3. **The three remaining latent traps.** `0x801226A0`, `0x80122F2C`, and
+   `0x80127D54` are still undispatchable (bank-overlap cases the repair
+   correctly declines to split). Two are called from `func_800E1BC0`, a
+   frontend function. None fired in ~8,000 swaps of running, so they do not
+   block this screen, but they will abort whichever lane first routes through
+   them and should go to the residency machinery.
+4. **Text and texture rendering.** No glyph renders on any menu screen and
+   every model is untextured flat-shaded. This does not block the transition
+   -- the guest is composing correctly -- but it means a reached match would
+   still not be readable, so it is on the path to the headline goal.
