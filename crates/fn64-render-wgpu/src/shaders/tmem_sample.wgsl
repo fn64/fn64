@@ -37,6 +37,18 @@
 //    shader silently sample palette bytes as indexes where the CPU reader
 //    aborted by name.
 //
+//    **That mirroring makes the two lanes AGREE; it does not settle whether
+//    the rule itself is right.** `docs/RT64-LANE-DIVERGENCES.md` D14 scores
+//    this same refusal against `fn64-render-reference`, which imposes a
+//    low-half constraint only on the genuine split-bank formats (RGBA32,
+//    YUV) and addresses 4/8/16-bit CI across all 4 KiB. D14's verdict is
+//    "REFERENCE on the divergence; UNKNOWN on hardware" -- this crate's own
+//    justification is a self-citation to M4.3.3b, not a measurement. So if
+//    D14 is resolved in the reference's favour, the correct repair is to
+//    drop the rule from BOTH lanes together, not to re-open the gap between
+//    them. Until then the two lanes at least fail the same way instead of
+//    one aborting while the other paints palette bytes as a picture.
+//
 //    Two known differences from the CPU reader remain on this arm, both
 //    pinned by tests in `targets/triangle_pipeline/tests.rs` rather than
 //    resolved here:
