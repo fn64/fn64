@@ -424,7 +424,7 @@ impl WgpuBackend {
         //
         // `None` is not a silent fallback -- it is a different, narrower
         // packet shape with its own correct answer. A packet that staged no
-        // TMEM transaction at all (`StagedOutcome::TriangleOnly`: raw
+        // TMEM transaction at all (`StagedOutcome::NoPhysicalSuccessor`: raw
         // triangles, zero loads) has nothing pending to project, and the
         // published slot is then the honest image rather than a substitute
         // for one: there is no load in this packet for it to be missing.
@@ -1219,22 +1219,45 @@ struct ExecutionCollector<'coord> {
 
 /// What `stage_and_report` found for one sealed plan, structurally
 /// distinguishing "this plan has TMEM loads to stage" from "this plan has
-/// no TMEM loads, only triangles" (`WgpuBackend` production triangle-draw
-/// integration card §1c) -- the caller (`execute_raw_dpc_inner`) uses this
-/// to choose which `RawDpcCoordinator` completion method is even
-/// reachable, never by re-deriving "is this plan write-bearing" itself.
-/// Mechanical, not a judgment call: a plan reaches `TriangleOnly` only
-/// when `collector.plan.loads` is empty and `collector.plan.triangles` is
-/// not (checked once, here, at the one place both facts are already
-/// gathered) -- never inferred from the *presence* of triangles alone,
-/// since a plan could in principle carry both (mixed plans stay on the
-/// `TmemLoads` path unconditionally, per the `is_empty()` check).
+/// no TMEM loads and no physical successor to offer" (`WgpuBackend`
+/// production triangle-draw integration card §1c) -- the caller
+/// (`execute_raw_dpc_inner`) uses this to choose which
+/// `RawDpcCoordinator` completion method is even reachable, never by
+/// re-deriving "is this plan write-bearing" itself. Mechanical, not a
+/// judgment call: a plan reaches `NoPhysicalSuccessor` only when
+/// `collector.plan.loads` is empty and the plan still carries at least one
+/// command with no declared write -- checked once, here, at the one place
+/// those facts are already gathered -- never inferred from the *presence*
+/// of triangles alone, since a plan could in principle carry both (mixed
+/// plans stay on the `TmemLoads` path unconditionally, per the
+/// `is_empty()` check).
 enum StagedOutcome {
     TmemLoads(BackendEffectReport, PhysicalTmemState),
-    TriangleOnly,
+    /// This plan completed zero TMEM loads, declared zero guest-visible
+    /// writes, and therefore has no `PhysicalTmemState` successor to
+    /// install -- the `complete_execution_preserving_physical` route.
+    ///
+    /// **Two producers, one shape.** A triangle-only plan (§1c) reaches it
+    /// because a raw triangle rasters into a GPU attachment and declares no
+    /// journal write. A **sync-only** plan reaches it for the stricter
+    /// reason that `SYNC_FULL` declares no `ResourceAccess` at all
+    /// (`RdpFullSyncSite`'s own doc: "a sync reads and writes no
+    /// resource") -- its whole effect is on the RDP pipeline and the DP
+    /// interrupt line, both scheduled by the device fabric, never by this
+    /// backend. Both are genuinely completable packets with nothing for
+    /// this backend to raster, which is a different statement from having
+    /// nothing to do.
+    ///
+    /// The variant makes no zero-write *claim*: the destination proves it.
+    /// `complete_execution_preserving_physical` builds its own explicitly
+    /// empty write list and lets `BackendEffectReport::try_new` check it
+    /// against the packet's real journal, so a packet routed here that
+    /// secretly declared a write is still rejected with
+    /// `EffectCountMismatch`.
+    NoPhysicalSuccessor,
     /// This plan staged at least one guest-visible color-target write and
     /// completed zero TMEM loads. Structurally distinct from both siblings:
-    /// unlike `TriangleOnly` it carries a nonempty `BackendEffectReport` (so
+    /// unlike `NoPhysicalSuccessor` it carries a nonempty `BackendEffectReport` (so
     /// `complete_execution_preserving_physical`, which builds its own empty
     /// one, is not a legal destination), and unlike `TmemLoads` it offers no
     /// `PhysicalTmemState` successor -- a color-target write does not touch
@@ -2582,7 +2605,7 @@ fn execute_raw_dpc_inner(
         StagedOutcome::TmemLoads(effects, next_physical) => coordinator
             .complete_execution(bound, effects, next_physical)
             .map_err(WgpuRawDpcExecutionError::Coordinator)?,
-        // Mechanical, not inferred: `StagedOutcome::TriangleOnly` is only
+        // Mechanical, not inferred: `StagedOutcome::NoPhysicalSuccessor` is only
         // ever produced when `stage_and_report` observed zero completed
         // TMEM loads AND at least one admitted triangle (§1c) -- a mixed
         // plan (loads + triangles) always takes the `TmemLoads` arm above,
@@ -2594,7 +2617,7 @@ fn execute_raw_dpc_inner(
         // any writes) -- this branch selection and that internal
         // validation are two independent enforcements of the same
         // invariant, not one relying on the other.
-        StagedOutcome::TriangleOnly => coordinator
+        StagedOutcome::NoPhysicalSuccessor => coordinator
             .complete_execution_preserving_physical(bound)
             .map_err(WgpuRawDpcExecutionError::Coordinator)?,
         // A fill-only plan: real guest-visible writes, no physical-TMEM
@@ -2657,9 +2680,10 @@ fn execute_raw_dpc_inner(
 /// `PendingTmemTransaction`, compute the exact `BackendEffectReport` from
 /// its own proposed effects, and derive this transaction's
 /// `into_physical_successor` (T3 Phase A) candidate. Returns
-/// `StagedOutcome::TriangleOnly` instead of staging anything when the
-/// plan has zero TMEM loads but at least one admitted triangle (§1c) --
-/// still `NoCompletedLoads` when the plan has neither.
+/// `StagedOutcome::NoPhysicalSuccessor` instead of staging anything when
+/// the plan has zero TMEM loads but still carries a completable command --
+/// an admitted triangle (§1c) or a `SYNC_FULL` site -- and
+/// `NoCompletedLoads` only when the plan carries none of the three.
 fn stage_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
@@ -2945,15 +2969,48 @@ fn stage_and_report(
         Some(packet_transaction) => packet_transaction,
         None => {
             // No TMEM load completed a transaction -- mechanically
-            // distinguish "this plan has triangles instead" (§1c: route
-            // to the coordinator's preserving-physical completion, never
-            // to `complete_execution`, which has no successor to offer
-            // for an empty transaction) from "this plan has nothing at
-            // all" (still `NoCompletedLoads`, unchanged).
-            return if collector.plan.triangles.is_empty() {
+            // distinguish "this plan still carries a completable command"
+            // (§1c: route to the coordinator's preserving-physical
+            // completion, never to `complete_execution`, which has no
+            // successor to offer for an empty transaction) from "this plan
+            // carries no command at all" (still `NoCompletedLoads`).
+            //
+            // **A `SYNC_FULL` site is such a command, and refusing it was
+            // this guard's defect.** Measured on the real ROM through the
+            // all-Rust lane (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`), WM2000
+            // aborts here on a packet of exactly one wire command --
+            // `wire_opcode = 0xE9` (`G_RDPFULLSYNC`), raw words
+            // `[0xE9000000, 0x07000000]` -- with zero loads, triangles,
+            // texrects and fills, and a single `ResourceAccess`:
+            // `Read`/`CommandDecode` over the 8 `RspDmem` bytes of the sync
+            // command itself. Its site carried `dp_slot_reserved: true`, so
+            // `plan_raw_dpc` deliberately admitted it and then execution
+            // refused it.
+            //
+            // `PlanCollector`'s own `FullSyncSite` arm already states the
+            // semantics this branch now honours: the site is "collected,
+            // not executed ... retained so the executed plan still accounts
+            // for every command the plan carried". Dropping the packet is
+            // the failure mode that arm calls out in the other direction.
+            //
+            // This is not a widening. The zero-write property is *proved*
+            // at the destination, not assumed here: `SYNC_FULL` declares no
+            // `ResourceAccess` by construction (`RdpFullSyncSite`: "a sync
+            // reads and writes no resource"), and
+            // `complete_execution_preserving_physical` independently
+            // rechecks an explicitly empty write list against the packet's
+            // real journal, rejecting any write-bearing packet with
+            // `EffectCountMismatch` regardless of how it got routed.
+            //
+            // A plan carrying literally nothing -- no load, no triangle, no
+            // sync -- is still `NoCompletedLoads`: there is no command whose
+            // completion this backend could account for.
+            return if collector.plan.triangles.is_empty()
+                && collector.plan.full_sync_sites.is_empty()
+            {
                 Err(WgpuRawDpcExecutionError::NoCompletedLoads)
             } else {
-                Ok(StagedOutcome::TriangleOnly)
+                Ok(StagedOutcome::NoPhysicalSuccessor)
             };
         }
     };
@@ -4325,7 +4382,7 @@ mod tests {
 
     /// A triangle-only plan: `SetOtherMode`/`SetCombine`/one admitted
     /// `RawTriangle`, zero TMEM loads -- exercises `stage_and_report`'s
-    /// `StagedOutcome::TriangleOnly` arm and
+    /// `StagedOutcome::NoPhysicalSuccessor` arm and
     /// `RawDpcCoordinator::complete_execution_preserving_physical`.
     fn triangle_only_words() -> Vec<u32> {
         let mut words = Vec::new();
@@ -8104,6 +8161,120 @@ mod tests {
         }
     }
 
+    /// **The sync-only packet: the shape WM2000 aborts this backend on.**
+    ///
+    /// Measured on the real ROM through the all-Rust lane
+    /// (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`), the packet that reached
+    /// `NoCompletedLoads` is exactly one wire command --
+    /// `wire_opcode = 0xE9` (`G_RDPFULLSYNC`), raw words
+    /// `[0xE9000000, 0x07000000]` -- with **zero** loads, triangles,
+    /// texrects and fills, and a single `ResourceAccess`:
+    /// `Read`/`CommandDecode` over the 8 `RspDmem` bytes of the sync
+    /// command itself. Its site carried `dp_slot_reserved: true` and
+    /// `interrupt_after: Clear`, so it planned cleanly and was
+    /// deliberately admitted -- and then refused at execution.
+    ///
+    /// A sync-only packet has nothing to *raster*, which is what the
+    /// refusal's doc meant, but that is not the same as having nothing to
+    /// *do*: `SYNC_FULL`'s whole effect is on the RDP pipeline and the DP
+    /// interrupt line, and this backend's own `PlanCollector` already says
+    /// so at the `FullSyncSite` arm -- "collected, not executed ... the
+    /// site is retained so the executed plan still accounts for every
+    /// command the plan carried". Refusing the packet drops the very
+    /// command that arm went out of its way to retain.
+    ///
+    /// The completion route is not a widening of the refusal. A sync
+    /// declares zero `ResourceAccess` writes by construction
+    /// (`RdpFullSyncSite`'s own doc: "Pushes zero `ResourceAccess`
+    /// entries: a sync reads and writes no resource"), so
+    /// `complete_execution_preserving_physical` -- which builds its own
+    /// explicitly-empty write list and lets
+    /// `BackendEffectReport::try_new` check it against the packet's real
+    /// journal -- *proves* the zero-write property here rather than
+    /// assuming it. A packet that secretly declared a write is still
+    /// rejected there with `EffectCountMismatch`, independently of this
+    /// branch.
+    ///
+    /// Hand-derived, not captured: `word(FULL_SYNC, 0)` is
+    /// `0x29 << 24 == 0x29000000`, the RDP-side `SYNC_FULL` opcode this
+    /// module's decoder reads (the 0xE9 seen on the wire is the same
+    /// command in the ABI's own command-byte space).
+    #[test]
+    fn a_sync_only_packet_executes_instead_of_being_refused_as_having_zero_loads() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+
+        let request = session.plan_request(full_sync_capture(sync_only_words()));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("a reserved sync-only capture must plan cleanly");
+        assert!(
+            planned.guest_read_plan().reads().is_empty(),
+            "a sync-only plan declares no TmemLoadSource reads"
+        );
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+        let submission = bound.submission();
+        let initial_identity = backend.physical_tmem().identity();
+
+        let prepared = backend.execute_raw_dpc(bound).expect(
+            "a sync-only packet must execute: it declares zero writes and zero raster work, and              refusing it aborts the real WM2000 boot",
+        );
+        assert!(
+            !backend.has_pending_fill_publication(),
+            "a sync-only packet stages no color-target write, so it must leave no redeemable              fill token"
+        );
+        let committed = session.commit_zero_guest_writes(prepared).unwrap();
+
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+
+        let outcome = backend.publish_raw_dpc(capsule);
+        assert_eq!(outcome.submission(), submission);
+        assert_eq!(
+            backend.physical_tmem().identity(),
+            initial_identity,
+            "a sync touches no TMEM, so it has no successor to flip to -- an identity change              would mean complete_execution (the flipping route) was used instead of the              preserving one"
+        );
+    }
+
+    /// **Positive control for the fixture above.** Without this, the
+    /// sync-only test could pass against a plan that silently carried a
+    /// load, a triangle or a fill, and would then be proving nothing about
+    /// the refused shape at all. Pins every count the real measurement
+    /// reported, plus the one access being a `Read` rather than a write.
+    ///
+    /// Measured through the real decoder via `ExecutionCollector`, exactly
+    /// as `plan_of` does -- not re-derived from the wire words, since a
+    /// second parser here could agree with the fixture while disagreeing
+    /// with what execution actually sees.
+    #[test]
+    fn the_sync_only_fixture_really_is_one_sync_command_with_no_executable_work() {
+        let plan = plan_of_no_reads(sync_only_words());
+
+        assert_eq!(plan.full_sync_sites.len(), 1, "exactly one SYNC_FULL site");
+        assert!(plan.loads.is_empty(), "no TMEM loads");
+        assert!(plan.triangles.is_empty(), "no admitted triangles");
+        assert!(plan.texrect_commands.is_empty(), "no texrects");
+        assert!(plan.fills.is_empty(), "no fills");
+        assert_eq!(
+            plan.next_command_index, 1,
+            "the packet is exactly one wire command"
+        );
+        assert!(
+            !plan.accesses.is_empty(),
+            "the sync's own command-decode read must be declared, or the access assertion below              is vacuous"
+        );
+        assert!(
+            plan.accesses
+                .iter()
+                .all(|access| access.mode() == fn64_render_ir::AccessMode::Read),
+            "a sync declares no write access -- only its own command-decode read"
+        );
+    }
+
     /// Ordering: a submission whose triangle draw FAILS must leave no
     /// redeemable fill token behind.
     ///
@@ -11053,6 +11224,58 @@ mod tests {
     /// is to measure what the real decoder produced, and a second wire
     /// parser here would be a different model that could agree with the
     /// fixture while disagreeing with execution.
+    /// The exact packet WM2000 aborts this backend on: one
+    /// `G_RDPFULLSYNC` wire command and nothing else. `word(FULL_SYNC, 0)`
+    /// is `0x29 << 24`, and the trailing zero is the command's second
+    /// word -- every RDP command in this module's fixtures is two words.
+    fn sync_only_words() -> Vec<u32> {
+        vec![word(FULL_SYNC, 0), 0]
+    }
+
+    /// [`plan_of`] for a fixture that declares no `TmemLoadSource` reads
+    /// and carries its own `FullSyncBoundary` records -- the sync-only
+    /// shape, which `plan_with_deterministic_reads` cannot plan (it fills
+    /// a load's read, and there is no load).
+    fn plan_of_no_reads(words: Vec<u32>) -> PlanCollector {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let request = session.plan_request(full_sync_capture(words));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("a reserved sync-only capture must plan cleanly");
+        let bound = session
+            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+            .unwrap();
+
+        let mut plan_visitor =
+            PlanCollector::seeded(None, None, None, None, None, None, None, [(None, None); 8]);
+        let mut color_targets = None;
+        let configured_target_extent = backend.configured_target_extent;
+        let coordinator = &backend.coordinator;
+        let mut view = ExecutionCollector {
+            plan: PlanCollector::seeded(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [(None, None); 8],
+            ),
+            reads: Vec::new(),
+            outcome: None,
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            physical: coordinator.physical(),
+            color_targets: &mut color_targets,
+            configured_target_extent,
+            draw_tmem: None,
+        };
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+        view.plan
+    }
+
     fn plan_of(words: Vec<u32>) -> PlanCollector {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
