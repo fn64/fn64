@@ -688,9 +688,15 @@ three-way split of `func_8012079C_bank3_text` in a scratch `dump.toml`.
 | split | see below | **cleared swap 1901 with zero traps** |
 
 The split lane cleared swap 1901 with `traps=0` and kept going, reaching
-swap **2424** and beyond -- past the exact swap where both unsplit runs
-died, and past the 2397 that was the best any unsplit solo run had ever
-managed. In the split crate every call site
+swap **3314** with `traps=0`, `panicked at`=0 and `non-unwinding`=0 -- 1.7x
+past the exact swap where both unsplit runs died, and well past the 2397
+that was the best any unsplit solo run had ever managed.
+
+One split run is reported, not three. The three were queued sequentially and
+each takes roughly 40 minutes; run 1 passing 1901 by this margin is the
+decisive comparison against a 2/2 unsplit failure at exactly 1901, so the
+remaining two were left running rather than blocking the result. **A second
+and third confirmation are still owed** before calling the lane stable. In the split crate every call site
 is now a direct call --
 `call_host_or_recompiled(0x80120854, func_80120854_bank3_text, ctx, mem)` --
 and `0x80120854` is a row in `LOOKUP_TABLE`, so the trap is removed
