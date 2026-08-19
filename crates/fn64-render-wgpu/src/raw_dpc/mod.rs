@@ -4601,7 +4601,7 @@ mod tests {
             panic!("expected SetEnvColor");
         };
         assert_eq!(color.rgba8(), [0x11, 0x22, 0x33, 0x44]);
-        assert_eq!(decoded.staged_state().env_color(), Some(color));
+        assert_eq!(decoded.staged_state().env_color(), color);
     }
 
     #[test]
@@ -4629,7 +4629,7 @@ mod tests {
             panic!("expected SetBlendColor");
         };
         assert_eq!(color.rgba8(), [0xAA, 0xBB, 0xCC, 0xDD]);
-        assert_eq!(decoded.staged_state().blend_color(), Some(color));
+        assert_eq!(decoded.staged_state().blend_color(), color);
     }
 
     #[test]
@@ -4641,7 +4641,7 @@ mod tests {
             panic!("expected SetFogColor");
         };
         assert_eq!(color.rgba8(), [0x01, 0x02, 0x03, 0x04]);
-        assert_eq!(decoded.staged_state().fog_color(), Some(color));
+        assert_eq!(decoded.staged_state().fog_color(), color);
     }
 
     // -- SetScissor (tracked state only) --------------------------------
@@ -4819,7 +4819,7 @@ mod tests {
         assert_eq!(prim.lod().lod_frac(), 0x3c);
         assert_eq!(prim.lod().lod_min(), 0x0a);
         assert_eq!(prim.color().rgba8(), [0x11, 0x22, 0x33, 0x44]);
-        assert_eq!(decoded.staged_state().prim_color(), Some(prim));
+        assert_eq!(decoded.staged_state().prim_color(), prim);
     }
 
     #[test]
@@ -4952,16 +4952,16 @@ mod tests {
         assert_eq!(decoded.commands().len(), 10);
         let staged = decoded.staged_state();
         assert_eq!(
-            staged.env_color().unwrap().value(),
+            staged.env_color().value(),
             0x2222_2222,
             "last SetEnvColor in the packet must win"
         );
-        let prim = staged.prim_color().unwrap();
+        let prim = staged.prim_color();
         assert_eq!(prim.color().value(), 0x4444_4444);
         assert_eq!(prim.lod().lod_min(), 0x0b);
         assert_eq!(prim.lod().lod_frac(), 0x4d);
-        assert_eq!(staged.blend_color().unwrap().value(), 0x6666_6666);
-        assert_eq!(staged.fog_color().unwrap().value(), 0x8888_8888);
+        assert_eq!(staged.blend_color().value(), 0x6666_6666);
+        assert_eq!(staged.fog_color().value(), 0x8888_8888);
         let depth = staged.prim_depth().unwrap();
         assert_eq!(depth.z(), 300);
         assert_eq!(depth.dz(), 400);
@@ -5023,10 +5023,12 @@ mod tests {
         // this assertion documents that invariant rather than proving new
         // behavior a compile error would already catch.
         assert_eq!(durable, RdpState::default());
-        assert!(durable.env_color().is_none());
-        assert!(durable.prim_color().is_none());
-        assert!(durable.blend_color().is_none());
-        assert!(durable.fog_color().is_none());
+        // The four constant-color registers are not `Option`: untouched
+        // means still holding their power-on zero, not "absent".
+        assert_eq!(durable.env_color(), Color4::from_wire(0));
+        assert_eq!(durable.prim_color(), PrimColor::from_wire(0, 0));
+        assert_eq!(durable.blend_color(), Color4::from_wire(0));
+        assert_eq!(durable.fog_color(), Color4::from_wire(0));
         assert!(durable.prim_depth().is_none());
     }
 
@@ -5056,7 +5058,7 @@ mod tests {
         assert_eq!(staged.other_mode(), expected_other_mode);
         assert_eq!(staged.color_image(), expected_color_image);
         assert_eq!(staged.fill_color(), expected_fill_color);
-        assert_eq!(staged.env_color().unwrap().value(), 0x0102_0304);
+        assert_eq!(staged.env_color().value(), 0x0102_0304);
     }
 
     #[test]
