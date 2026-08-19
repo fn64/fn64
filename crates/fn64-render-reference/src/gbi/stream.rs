@@ -1011,6 +1011,15 @@ pub(super) fn decode_stream_impl(
                 // this path as well as the F3DEX2 partial setters.
                 state.other_mode.high = w0 & 0x00FF_FFFF;
                 state.other_mode.low = w1;
+                // Read-only tally of the depth bits in the word just
+                // latched, off unless `FN64_GBI_OTHERMODE_CENSUS` is set.
+                // Reads `state.other_mode` rather than `w0`/`w1` so the
+                // count is of what the renderer will act on.
+                super::census::othermode::note(
+                    state.other_mode.high,
+                    state.other_mode.low,
+                    raw_rdp,
+                );
             }
             G_SETOTHERMODE_H => {
                 // F3DEX2 gSPSetOtherMode (`gbi.h:3353-3369`) stores
