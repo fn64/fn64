@@ -10653,14 +10653,34 @@ mod tests {
         let (submission, result) = plan_and_execute_composed(&mut backend, &mut session, all_three);
         match result {
             Ok(_) => {
-                // Only the RENDER-TARGET writes are compared: this packet's
-                // journal also declares the TMEM load's own destination
-                // write, which the fill-only control has no counterpart for.
+                // Compared on range + byte count + content digest, not on
+                // the whole `CompletedWrite`: this packet's journal also
+                // declares the TMEM load's destination accesses, which
+                // precede the fill's and shift its `OperationId` (measured:
+                // 4 here versus 1 in the fill-only control). That index is a
+                // position in a longer journal, not a difference in what the
+                // fill wrote -- and the digest, which IS what it wrote, must
+                // be byte-identical.
+                let shape = |writes: &[CompletedWrite]| -> Vec<((u32, u32), u32, String)> {
+                    writes
+                        .iter()
+                        .map(|write| {
+                            let range = match write.access().region() {
+                                fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                                    (range.start().get(), range.len())
+                                }
+                                other => panic!("expected an RDRAM range, got {other:?}"),
+                            };
+                            (range, write.byte_count(), format!("{:?}", write.content()))
+                        })
+                        .collect()
+                };
                 let staged = backend.staged_guest_render_target_writes(submission);
                 assert_eq!(
-                    staged, fill_only_writes,
+                    shape(&staged),
+                    shape(&fill_only_writes),
                     "in the three-source merge too, a triangle declaring no write must leave \
-                     the fill's render-target writes untouched"
+                     the fill's render-target ranges and content digests untouched"
                 );
             }
             Err(error) => assert!(
@@ -15751,26 +15771,33 @@ mod tests {
         words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
         words.extend(flat_triangle_in_target_words());
 
-        // The journal's own declared render-target ranges, read through the
-        // decoder rather than through the executor -- an independent
-        // derivation of the list the executor must match exactly.
-        let declared = declared_render_target_writes(words.clone());
-        // Hand-derived: the whole-target fill declares one contiguous
-        // 16x8 RGBA16 range at 0x2000 (256 bytes), then the triangle
-        // declares one 8-byte run per covered scanline at 0x2004, 0x2024,
-        // 0x2044 (rows 0..3, columns 2..6). Four accesses, in stream order.
-        assert_eq!(
-            declared,
-            vec![
-                (FILL_TARGET_ADDRESS, FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2),
-                (0x2004, 8),
-                (0x2024, 8),
-                (0x2044, 8),
-            ],
-            "the journal must declare the fill's whole-target range followed by the \
-             triangle's three per-scanline runs -- if this list is wrong every comparison \
-             below is comparing the executor against itself"
-        );
+        // **The expectation, hand-derived from the wire layout alone.**
+        //
+        // Deliberately NOT read from `declared_render_target_writes`: that
+        // helper re-decodes against `RdpState::default()`, which carries no
+        // `color_target_height`, and `plan_raw_triangle` declines to declare
+        // a row when the height is unknown. Measured, it therefore reports
+        // the fill's access only. That is correct for the state it decodes
+        // against and wrong as an oracle for a backend that HAS had
+        // `create` called on it, so the expectation is derived here instead.
+        //
+        // The fill covers the whole 16x8 RGBA16 target at 0x2000: one
+        // contiguous 256-byte range (`plan_fill`'s `x0 == 0 && x1 + 1 ==
+        // width` collapse). The triangle covers rows 0..3, columns 2..6
+        // (see `flat_triangle_in_target_words`' own derivation), so it
+        // declares one 8-byte run per scanline at
+        // 0x2000 + (16y + 2) * 2 = 0x2004, 0x2024, 0x2044. Four accesses,
+        // in stream order -- the fill's first, because it is the earlier
+        // wire command.
+        let declared = vec![
+            (
+                FILL_TARGET_ADDRESS,
+                FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2,
+            ),
+            (0x2004, 8),
+            (0x2024, 8),
+            (0x2044, 8),
+        ];
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);

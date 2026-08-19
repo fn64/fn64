@@ -3785,23 +3785,42 @@ fn both_composed_orders_dispatch_and_land_both_halves() {
     );
 }
 
-/// A composition this slice still does NOT admit fails with a named error,
-/// and leaves nothing published on either side.
+/// **RETARGET.** This was
+/// `a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam`,
+/// asserting `MixedFillAndTrianglePacket` for a fill + TMEM + triangle
+/// packet at the real ABI seam.
 ///
-/// Fill + TMEM + a triangle is the case: `stage_and_report` still refuses it
-/// with `MixedFillAndTrianglePacket`, because a triangle raster declares no
-/// write access in the journal at all, so unlike the fill+TMEM pair there is
-/// no declared order to compose onto. Admitting fill+TMEM must not have
-/// opened a back door for a triangle to ride along with them.
+/// That refusal is gone. Its stated reason -- "a triangle raster declares no
+/// write access in the journal at all, so there is no declared order to
+/// compose onto" -- was measured false on WM2000's own stream: at VI swap
+/// 2873 the ROM issues 60 fill-cycle FillRectangles beside a raw triangle
+/// whose declared span is five per-scanline `RenderTarget` accesses (see
+/// `docs/WM2000-FILL-TRIANGLE-EVIDENCE.txt`). See
+/// `fn64-render-wgpu`'s `stage_and_report` for the code citations.
 ///
-/// Driven through the real producer seam, where the refusal surfaces as a
-/// panic inside `dispatch_dpc_submission` (an `execute_raw_dpc` error is not
-/// a recoverable outcome at that seam). The panic message is asserted to
-/// carry the variant's own name, so a DIFFERENT failure cannot pass as this
-/// one -- and guest RDRAM is checked untouched afterwards, which is the
-/// "loud rejection, never a quiet partial publish" half of the claim.
+/// **The test is retargeted, not deleted, because its real subject survives
+/// the removal.** What it was actually protecting is the second half of its
+/// own name: "leaves nothing published on either side". The concern was
+/// never the shape; it was a half-execution in which one source's bytes
+/// reach guest RDRAM while the other's are silently dropped. That property
+/// is now asserted directly, and at the same producer seam, in the direction
+/// that admitting the packet makes checkable:
+///
+/// - The packet **completes** through `dispatch_dpc_submission` rather than
+///   panicking.
+/// - Guest RDRAM afterwards is **exactly** the whole-target image the fill
+///   half alone produces, hand-derived from the RDP's own even/odd column
+///   rule by `expected_whole_target_image` -- not read back from the run.
+///
+/// The triangle in this fixture declares no journal write (it carries eight
+/// zero edge words, so it covers no scanline), so "changes nothing" is its
+/// correct contribution and any deviation is a real defect. A fill half that
+/// was dropped to admit the triangle would leave the poison in place and
+/// fail the comparison; a triangle that wrote anything at all would displace
+/// the fill's bytes and fail it too. Both are the failures the old refusal
+/// existed to prevent, and both are still caught here.
 #[test]
-fn a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam() {
+fn a_fill_tmem_and_triangle_packet_completes_and_publishes_exactly_the_fill_image() {
     const FILL_COLOR: u32 = 0x0842_1085;
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
     const SET_COMBINE: u8 = 0x3c;
@@ -3811,14 +3830,13 @@ fn a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam() 
     register_session_backend_for_fills(rdram.len());
     let poisoned = poison_fill_target(&mut rdram);
 
-    // Fill + TMEM (now admitted on its own) PLUS a triangle (not admitted
-    // in combination with a fill).
     let mut words = tmem_then_fill_words(FILL_COLOR);
     words.extend([word(SET_OTHER_MODE, 0), 0]);
     words.extend([word(SET_COMBINE, 0), 0]);
     // A minimal non-shade, non-texture, non-Z base-edge triangle: eight
-    // words, all edge coefficients, matching `fn64-render-wgpu`'s own
-    // `triangle_base_edge_words` fixture shape.
+    // words, all edge coefficients. Every coefficient is zero, so it covers
+    // no scanline and declares no journal write -- which is exactly the
+    // contribution this test pins.
     words.extend([word(RAW_TRIANGLE_BASE_EDGE, 0), 0, 0, 0, 0, 0, 0, 0]);
 
     let bytes = words_to_rdram_bytes(&words);
@@ -3831,56 +3849,29 @@ fn a_composition_this_slice_does_not_admit_fails_by_name_at_the_producer_seam() 
         crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
     }));
     assert!(
-        outcome.is_err(),
-        "a fill + TMEM + triangle packet must be refused loudly at the producer seam -- \
-         admitting fill + TMEM must not have let a triangle ride along silently"
+        outcome.is_ok(),
+        "a fill + TMEM + triangle packet must complete at the producer seam; the shape gate \
+         that refused it was removed after WM2000 measured its stated reason false. Reason: \
+         {:?}",
+        crate::last_render_error()
     );
 
-    let reason = crate::last_render_error().unwrap_or_default();
-    let panic_text = outcome
-        .err()
-        .map(|payload| {
-            payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| {
-                    payload
-                        .downcast_ref::<&str>()
-                        .map(|text| (*text).to_string())
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let named = format!("{reason}{panic_text}");
-    // The exact refusal, not merely "something failed": measured, this is
-    // `MixedFillAndTrianglePacket`'s own Display text, reached through
-    // `render-wgpu/raw-dpc-execute`. Both fragments are asserted so a
-    // DIFFERENT rejection -- a decode failure, a TMEM staging error, a
-    // panic from somewhere else entirely -- cannot pass as this one.
-    assert!(
-        named.contains("render-wgpu/raw-dpc-execute"),
-        "the refusal must come from the raw-DPC executor, got: {named}"
+    // The guest image, hand-derived, compared whole. The poison is the
+    // discriminator in the other direction: if the fill half had been
+    // dropped this would still hold `poisoned`, and if the triangle had
+    // written anything it would hold neither.
+    let published = read_fill_target_logical(&rdram);
+    assert_ne!(
+        published, poisoned,
+        "the fill half must actually have reached guest RDRAM -- an unchanged target would \
+         mean the packet completed while publishing nothing"
     );
-    assert!(
-        named
-            .contains("declares both an admitted FillRectangle and at least one admitted triangle"),
-        "the refusal must be MixedFillAndTrianglePacket's own named text, got: {named}"
-    );
-
-    // The loud-rejection half: nothing was half-published into guest memory.
-    //
-    // Read through the lane authority for the same reason as the sibling
-    // composition tests (see
-    // `a_composed_fill_and_tmem_packet_lands_both_halves`). This assertion
-    // compares against `poisoned`, which `poison_fill_target` also writes and
-    // returns in logical order, so both sides moved together -- and the
-    // claim is unweakened: a fill half that leaked through would still
-    // displace the poison and still fail here.
     assert_eq!(
-        read_fill_target_logical(&rdram),
-        poisoned,
-        "a refused composition must leave every guest target byte at its poisoned value -- \
-         never the fill half applied while the triangle half was dropped"
+        published,
+        expected_whole_target_image(FILL_COLOR),
+        "guest RDRAM must hold exactly the fill's own whole-target image: the triangle \
+         declares no journal write, so its correct contribution is zero bytes, and any \
+         deviation is either a dropped fill half or a triangle writing undeclared bytes"
     );
     teardown();
 }
