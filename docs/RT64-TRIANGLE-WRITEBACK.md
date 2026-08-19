@@ -642,3 +642,83 @@ steps, and a mid-run 825/1087/1355 has fooled a sibling lane before):
 
 2149 is the baseline. No run regressed it, and none introduced a panic. The
 probe's 1087 is correct for half the step budget.
+
+## The texture rung, landed
+
+`CombinerInputs::tex_val0` is a real sampled texel. The admitted subset is
+now every DEPTH-FREE opcode -- 0x08, 0x0a, 0x0c and 0x0e -- which includes
+the 0x0e that is 100% of what WM2000 emits.
+
+### The two scale factors, used as cited
+
+`triangle_span::texture_coordinates_s10_5` carries both verbatim from
+`fn64-render-reference`'s `draw.rs:898`, and neither was re-derived:
+perspective is `(S / |W|) * 1024`, `G_TP_NONE` is `plane / 2^21`. The
+`w <= 0` rule divides by `unsigned_abs().max(1)`.
+
+### One thing the reference did not have to decide
+
+`TextureCoordinateS10_5` is an `i16` in this crate, so the float result must
+be NARROWED, and the `w <= 0` tolerance is exactly what makes an
+out-of-range coordinate reachable. It SATURATES: a coordinate that ran off
+the right edge clamps to the tile's last texel, where a wrapping `as i16`
+would fold it back to the FIRST -- a tear rather than a stretched edge.
+`an_overflowing_texture_coordinate_saturates_to_the_last_texel_not_the_first`
+pins it, and a wrapping mutant survived every other test in the file.
+
+### TMEM prefix selection: the texrect machinery, reused
+
+The brief flagged this as the hard part, and it needed no parallel
+implementation. `stage_color_commands`' `RawTriangle` arm now matches the
+same `TexrectTmemSource` the `Texrect` arm matches, calls the same
+`prefix_before` over the same `prefixes` slice with the triangle's own
+`command_index`, and hands `execute_raw_triangle` the resolved image. Same
+`verify_tmem_identity` check on the way in.
+
+Two things a triangle needed that the texrect path did not supply:
+
+1. **The tile index.** `execute_scheduled_raw_triangle` reads
+   `RawTriangle::tile()` -- wire word 0 bits 18:16. `PlanCollector`'s
+   `bound_tile_index` freezes a raw triangle's tile to 0 for the GPU uniform
+   path, with a comment claiming "it carries no tile field of its own to
+   read". That comment is wrong; the field exists and the CPU executor reads
+   it. The GPU path was left alone -- correcting it is a separate card.
+2. **The opcode.** `execute_scheduled_raw_triangle` decoded with a frozen
+   `0x08`, which sizes the optional coefficient blocks. Harmless until a
+   textured triangle was admitted, then a hard length refusal. It now reads
+   the command's own first wire byte.
+
+### Mutation: 14 run, 13 killed, 1 proven equivalent
+
+Four survived the first pass and each needed its own distinguishing case:
+freezing `first_row_parity` (every fixture had `low_t = 0`), freezing the
+tile index at 0 (every fixture used tile 0), wrapping instead of saturating
+(no fixture left `i16` range), and dropping the opcode/binding guard
+(unreachable from any end-to-end fixture). **That is four of fourteen, all
+for the same reason: a fixture reading the arm where correct and incorrect
+answers coincide.** It remains the first thing to look for here.
+
+M4 (dropping the `max(1)` floor) is EQUIVALENT and was proven so rather
+than assumed: with a saturating narrow, `W = 0` yields +inf/-inf/NaN for
+positive/negative/zero S, which clamp to `i16::MAX`/`i16::MIN`/0 -- the same
+three answers `max(1)` gives.
+
+### What the ROM found that no unit test did
+
+A latent defect PREDATING this rung, and the reason the first ROM run
+aborted at 280 VI swaps: `plan_raw_triangle` bounded its row walk by
+installed RDRAM and a 4096-row cap, not by the target's height. On WM2000's
+480x237 target a taller triangle declares ranges past the target's end, and
+`verify_accesses_inside` refuses the whole PACKET. It applies to flat and
+shaded triangles identically and was unreachable only because the decoder
+refused every triangle the ROM emits.
+
+The fix threads `RenderConfig`'s height into `RdpState` at `create_inner`,
+beside `configured_target_extent` and from the same field. The harness
+reproduces it in 0.047 s; the ROM took about nine minutes to reach it.
+
+**The lesson worth keeping: the fast harness found nothing here, and could
+not have.** No synthetic fixture had a triangle taller than its target,
+because nobody thought to write one. The ROM run is not a formality after
+the harness work -- it is the only thing that exercises geometry the ROM
+actually emits.
