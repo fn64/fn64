@@ -5303,7 +5303,11 @@ mod tests {
     /// discrete tile rows. But the READ side (`tmem_rgba16_texel_address`/
     /// `tmem/read.rs`'s `linear_byte_address`+`odd_row_exchange`) DOES
     /// apply the XOR4 swap to any texel whose TILE-relative row is odd,
-    /// under this slice's frozen `TmemFirstRowParity::Even` (card §6): row
+    /// because this fixture's tile has an EVEN T origin (`low_t == 0`, so
+    /// `TmemFirstRowParity::Even` is the parity the tile itself derives --
+    /// it is not a frozen constant; `tmem_sample.wgsl`'s
+    /// `tmem_first_row_parity_odd` and `targets/texrect.rs`'s own
+    /// derivation both read `low_t.integer() & 1`): row
     /// 1 (odd) XORs its computed address by 4. Since the write never
     /// exchanged but the read always will for row 1, this fixture's source
     /// bytes for row-1 texels must be placed at their POST-XOR4 TMEM
