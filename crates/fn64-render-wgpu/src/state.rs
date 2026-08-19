@@ -59,11 +59,16 @@
 //! return the field **masked in place, unshifted**, leaving callers to shift
 //! or to compare against pre-shifted constants (`cvgDst() == CVG_DST_WRAP`);
 //! `blenderInputs` is the one exception that does shift down. The accessors
-//! here shift down and decode to typed enums instead, preserving reserved
-//! encodings as distinct variants (`TextureFilter::Reserved`,
-//! `AlphaCompare::Reserved`, `TextureLutModeError::ReservedEncoding`) rather
-//! than folding them into a neighboring mode. No claim is made about byte
-//! layout, `repr(C)`, or ABI compatibility with the C++ struct.
+//! here shift down and decode to typed enums instead. Where RT64's *headers*
+//! name an encoding "reserved" but the silicon decodes the field as
+//! independent bits, this module follows the silicon: the texture-LUT field
+//! (high 15:14) and the alpha-compare field (low 1:0) each decode two
+//! independent bits, so their nominally-reserved encodings mean "feature off"
+//! and are not distinct variants (angrylion `src/core/n64video/rdp.c:630-631`
+//! and `:659-660`; `docs/RT64-GUARD-AUDIT.md` findings A2 and A3). Encodings
+//! that are genuinely unverified are still preserved as distinct variants
+//! (`TextureFilter::Reserved`). No claim is made about byte layout,
+//! `repr(C)`, or ABI compatibility with the C++ struct.
 //!
 //! This module does not import `fn64-render-reference` (no such crate
 //! dependency exists for `fn64-render-wgpu`); it is a self-contained literal
@@ -82,36 +87,33 @@ use crate::tmem::TmemState;
 /// Texture lookup-table interpretation selected by `SetOtherModes` high bits
 /// 15:14 (`G_MDSFT_TEXTLUT`).
 ///
-/// The encodings follow the permitted MIT RT64 source pinned by
-/// `docs/RT64-PORT-AUTHORITY.md` (`shared/rt64_f3d_defines.h` and
-/// `shared/rt64_other_mode.h`): zero disables the TLUT, two selects RGBA16,
-/// and three selects IA16. Encoding one is reserved and is rejected rather
-/// than treated as a disabled table.
+/// **There is no two-bit TLUT enum on hardware.** angrylion-rdp-plus decodes
+/// bits 15 and 14 as two *independent* one-bit fields
+/// (`src/core/n64video/rdp.c:630-631`):
+///
+/// ```c
+/// wstate->other_modes.en_tlut   = (args[0] >> 15) & 1;
+/// wstate->other_modes.tlut_type = (args[0] >> 14) & 1;
+/// ```
+///
+/// Every consumer gates on `en_tlut` alone (`rdp/rasterizer.c:73`, `:89`;
+/// `rdp/tex.c:180`, `:243`, `:385`; `rdp/tmem.c:2014`, `:2043`) and reads
+/// `tlut_type` only *inside* an `en_tlut`-true branch (`rasterizer.c:76`:
+/// `tformat = tlut_type ? FORMAT_IA : FORMAT_RGBA`; `tmem.c:1612`, `:1799`
+/// live inside `fetch_texel_entlut_quadro*`, only reached when the TLUT is
+/// on). Wire encoding 1 is therefore `en_tlut = 0, tlut_type = 1`: the TLUT
+/// is simply **off** and the type bit is dead. It is decoded as
+/// [`TextureLutMode::Disabled`], not refused.
+///
+/// The earlier "reserved encoding" refusal came from RT64's *header macros*
+/// (`shared/rt64_f3d_defines.h`), which name only 0/2/3. A missing macro is
+/// not an illegal encoding. See `docs/RT64-GUARD-AUDIT.md` finding A2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextureLutMode {
     Disabled,
     Rgba16,
     Ia16,
 }
-
-/// Why `SetOtherModes`' texture-LUT field could not be decoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextureLutModeError {
-    ReservedEncoding { encoding: u8 },
-}
-
-impl core::fmt::Display for TextureLutModeError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ReservedEncoding { encoding } => write!(
-                formatter,
-                "SetOtherModes texture-LUT field uses reserved encoding {encoding}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TextureLutModeError {}
 
 /// RDP cycle type, other-mode high bits 20:21 (`G_MDSFT_CYCLETYPE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +160,6 @@ pub enum AlphaDither {
 pub enum AlphaCompare {
     None,
     Threshold,
-    Reserved,
     Dither,
 }
 
@@ -226,15 +227,19 @@ impl OtherMode {
         }
     }
 
-    /// Decodes the two-bit texture-LUT selector without normalizing its
-    /// reserved encoding into a supported mode.
-    pub const fn texture_lut_mode(self) -> Result<TextureLutMode, TextureLutModeError> {
-        let encoding = ((self.high >> 14) & 0x3) as u8;
-        match encoding {
-            0 => Ok(TextureLutMode::Disabled),
-            2 => Ok(TextureLutMode::Rgba16),
-            3 => Ok(TextureLutMode::Ia16),
-            _ => Err(TextureLutModeError::ReservedEncoding { encoding }),
+    /// Decodes other-mode high bits 15:14 as the two independent hardware
+    /// bits they are: bit 15 is `en_tlut`, bit 14 is `tlut_type`
+    /// (angrylion `src/core/n64video/rdp.c:630-631`). With `en_tlut` clear
+    /// the type bit is dead, so both encodings 0 and 1 are `Disabled`.
+    pub const fn texture_lut_mode(self) -> TextureLutMode {
+        let enabled = self.high & (1 << 15) != 0;
+        let ia = self.high & (1 << 14) != 0;
+        if !enabled {
+            TextureLutMode::Disabled
+        } else if ia {
+            TextureLutMode::Ia16
+        } else {
+            TextureLutMode::Rgba16
         }
     }
 
@@ -304,15 +309,29 @@ impl OtherMode {
         self.high & (1 << 23) != 0
     }
 
-    /// Other-mode low bits 0:1 (`G_MDSFT_ALPHACOMPARE`). Encoding 2 is
-    /// reserved and is surfaced as `AlphaCompare::Reserved` rather than
-    /// normalized into `None` or `Threshold`.
+    /// Other-mode low bits 0:1 (`G_MDSFT_ALPHACOMPARE`). **Not a two-bit
+    /// enum on hardware:** angrylion decodes two independent bits
+    /// (`src/core/n64video/rdp.c:659-660`):
+    ///
+    /// ```c
+    /// wstate->other_modes.dither_alpha_en  = (args[1] >> 1) & 1;
+    /// wstate->other_modes.alpha_compare_en = (args[1] >> 0) & 1;
+    /// ```
+    ///
+    /// `rdp/blender.c`'s `alpha_compare` short-circuits on bit 0 alone
+    /// (`if (!alpha_compare_en) return 1;`), and the separate copy-mode
+    /// inline compare gates on the same bit alone
+    /// (`rdp/rasterizer.c:1971`). Wire encoding 2 is therefore
+    /// `alpha_compare_en = 0, dither_alpha_en = 1`: the compare is **off**
+    /// and the dither bit is ignored, i.e. behaviourally `G_AC_NONE`.
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     pub const fn alpha_compare(self) -> AlphaCompare {
-        match self.low & 0x3 {
-            0 => AlphaCompare::None,
-            1 => AlphaCompare::Threshold,
-            2 => AlphaCompare::Reserved,
-            _ => AlphaCompare::Dither,
+        if self.low & 0x1 == 0 {
+            AlphaCompare::None
+        } else if self.low & 0x2 != 0 {
+            AlphaCompare::Dither
+        } else {
+            AlphaCompare::Threshold
         }
     }
 
@@ -1096,22 +1115,31 @@ mod tests {
     }
 
     #[test]
-    fn texture_lut_mode_decodes_all_four_wire_encodings_without_normalization() {
+    /// Hand-derived from the bit layout, not from the code under test:
+    /// bit 15 is `en_tlut`, bit 14 is `tlut_type` (angrylion
+    /// `src/core/n64video/rdp.c:630-631`). With `en_tlut` clear the type bit
+    /// is dead, so encodings 0 and 1 both mean the TLUT is off; with it set,
+    /// `tlut_type` picks IA16 over RGBA16 (`rdp/rasterizer.c:76`).
+    ///
+    /// Retargeted from `..._without_normalization`, which pinned encoding 1
+    /// as a refusal. See `docs/RT64-GUARD-AUDIT.md` finding A2.
+    fn texture_lut_mode_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0 << 14, u32::MAX).texture_lut_mode(),
-            Ok(TextureLutMode::Disabled)
+            TextureLutMode::Disabled
         );
         assert_eq!(
             OtherMode::from_wire(1 << 14, 0).texture_lut_mode(),
-            Err(TextureLutModeError::ReservedEncoding { encoding: 1 })
+            TextureLutMode::Disabled,
+            "encoding 1 is en_tlut=0 with a dead tlut_type bit: the TLUT is simply off"
         );
         assert_eq!(
             OtherMode::from_wire(2 << 14, 0).texture_lut_mode(),
-            Ok(TextureLutMode::Rgba16)
+            TextureLutMode::Rgba16
         );
         assert_eq!(
             OtherMode::from_wire(3 << 14, 0).texture_lut_mode(),
-            Ok(TextureLutMode::Ia16)
+            TextureLutMode::Ia16
         );
     }
 
@@ -1120,18 +1148,29 @@ mod tests {
         let high = 0x00ff_ffff & !(0x3 << 14);
         assert_eq!(
             OtherMode::from_wire(high | (2 << 14), u32::MAX).texture_lut_mode(),
-            Ok(TextureLutMode::Rgba16)
+            TextureLutMode::Rgba16
         );
     }
 
     #[test]
-    fn reserved_texture_lut_encoding_is_a_public_typed_error() {
-        let error = OtherMode::from_wire(1 << 14, 0)
-            .texture_lut_mode()
-            .unwrap_err();
-        assert_eq!(error, TextureLutModeError::ReservedEncoding { encoding: 1 });
-        assert!(!error.to_string().is_empty());
-        let _: &dyn std::error::Error = &error;
+    /// Retargeted from `reserved_texture_lut_encoding_is_a_public_typed_error`.
+    /// Encoding 1 is no longer an error at all; it is the TLUT being off, and
+    /// it must be *observably distinct* from the enabled encodings, so that a
+    /// decoder that collapsed everything to one answer cannot pass.
+    /// angrylion `src/core/n64video/rdp.c:630-631`.
+    fn tlut_type_bit_alone_does_not_enable_the_table() {
+        let type_bit_only = OtherMode::from_wire(1 << 14, 0);
+        assert_eq!(type_bit_only.texture_lut_mode(), TextureLutMode::Disabled);
+        // The same tlut_type bit *with* en_tlut set must select IA16, or the
+        // "off" answer above would be indistinguishable from ignoring bit 14.
+        assert_eq!(
+            OtherMode::from_wire(3 << 14, 0).texture_lut_mode(),
+            TextureLutMode::Ia16
+        );
+        assert_ne!(
+            type_bit_only.texture_lut_mode(),
+            OtherMode::from_wire(3 << 14, 0).texture_lut_mode()
+        );
     }
 
     #[test]
@@ -1263,7 +1302,16 @@ mod tests {
     }
 
     #[test]
-    fn alpha_compare_decodes_all_four_wire_encodings_including_reserved() {
+    /// Hand-derived from the bit layout, not from the code under test: bit 0
+    /// is `alpha_compare_en`, bit 1 is `dither_alpha_en` (angrylion
+    /// `src/core/n64video/rdp.c:659-660`), and `rdp/blender.c`'s
+    /// `alpha_compare` returns 1 unconditionally when bit 0 is clear. So
+    /// encoding 2 (`dither_alpha_en` set, `alpha_compare_en` clear) is
+    /// behaviourally `G_AC_NONE`, exactly like encoding 0.
+    ///
+    /// Retargeted from `..._including_reserved`, which pinned encoding 2 as a
+    /// distinct `Reserved` variant. See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    fn alpha_compare_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0, 0).alpha_compare(),
             AlphaCompare::None
@@ -1274,11 +1322,19 @@ mod tests {
         );
         assert_eq!(
             OtherMode::from_wire(0, 2).alpha_compare(),
-            AlphaCompare::Reserved
+            AlphaCompare::None,
+            "encoding 2 clears alpha_compare_en; the dither bit alone never enables the compare"
         );
         assert_eq!(
             OtherMode::from_wire(0, 3).alpha_compare(),
             AlphaCompare::Dither
+        );
+        // Distinguishing check: the dither bit must still be live when the
+        // enable bit is set, so "2 -> None" cannot be produced by a decoder
+        // that simply ignores bit 1.
+        assert_ne!(
+            OtherMode::from_wire(0, 3).alpha_compare(),
+            OtherMode::from_wire(0, 1).alpha_compare()
         );
     }
 
@@ -1465,7 +1521,7 @@ mod tests {
         assert_eq!(OtherMode::from_wire(!(0x3 << 17), 0).texture_detail(), 0);
         assert_eq!(
             OtherMode::from_wire(!(0x3 << 14), 0).texture_lut_mode(),
-            Ok(TextureLutMode::Disabled)
+            TextureLutMode::Disabled
         );
     }
 
@@ -1526,7 +1582,7 @@ mod tests {
         assert_eq!(reset.alpha_dither(), AlphaDither::Disabled);
         assert!(!reset.combine_key());
         assert_eq!(reset.texture_convert(), 6);
-        assert_eq!(reset.texture_lut_mode(), Ok(TextureLutMode::Disabled));
+        assert_eq!(reset.texture_lut_mode(), TextureLutMode::Disabled);
         assert!(!reset.texture_lod());
         assert_eq!(reset.texture_detail(), 0);
         assert!(reset.texture_perspective());
@@ -1568,7 +1624,9 @@ mod tests {
         let compares = [
             AlphaCompare::None,
             AlphaCompare::Threshold,
-            AlphaCompare::Reserved,
+            // Encoding 2 clears `alpha_compare_en` (angrylion rdp.c:660), so
+            // it is `None`, not a fourth distinct mode.
+            AlphaCompare::None,
             AlphaCompare::Dither,
         ];
         for (value, expected) in compares.iter().enumerate() {
