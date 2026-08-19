@@ -89,3 +89,35 @@ RT64 `5473732a` derives framebuffer geometry from VI_WIDTH and never assumes
 RT64 also handles the interlaced double-stride case explicitly at
 `rt64_vi.cpp:99-106` -- evidence that VI_WIDTH, not a constant, is the
 authority for the row stride.
+
+## The fix, and who owns it
+
+The defect is in the **WM2000 harness**, not in fn64:
+`~/Code/recomps/wm2000/packages/wm2000-boot/src/main.rs`, `capture_framebuffer`.
+
+    const FB_WIDTH: usize = 320;
+    const FB_HEIGHT: usize = 240;
+    const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2;
+
+should read the geometry the VI actually programs, which `fn64-abi` already
+exports beside the `vi_swap_count()` the harness calls two lines away:
+
+    let fb_width  = fn64_abi::vi_width().unwrap_or(320) as usize;
+    let fb_height = fn64_abi::vi_output_height().unwrap_or(240) as usize;
+
+Verified: with that change and no renderer change at all, the same ROM on the
+same all-Rust stack dumps `docs/frames/wm2000-swap240-true-geometry-480x237.png`
+-- 480x237, no striping, vertical coherence 0.958 versus 0.508 before.
+
+This file is left in fn64 because the measurement and the RT64 citations
+belong with the renderer; the one-line change belongs to the harness repo,
+which was deliberately not modified from this lane.
+
+## Not fixed here, and why
+
+- The harness one-liner itself: `~/Code/recomps/wm2000` is a separate,
+  currently dirty repo and outside this lane's scope. The change is written
+  out above and was verified by patching the lane script's scratch copy.
+- The renderer needed no change: both `vi_scanout.rs` and the CPU compose
+  path already derive their stride from the right register, and mutation
+  testing confirms both are guarded.
