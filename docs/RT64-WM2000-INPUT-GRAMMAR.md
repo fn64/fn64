@@ -703,3 +703,41 @@ and `0x80120854` is a row in `LOOKUP_TABLE`, so the trap is removed
 structurally rather than suppressed. The body it now reaches is an ordinary
 12-instruction bounds-checked table lookup (`sltiu $v0, $a0, 50`), which is
 what a function entry should look like.
+
+## Update -- the swap-1901 trap is fixed in fn64, and confirmed on the ROM
+
+Superseding the update above, which concluded the fix could only live upstream
+in `aki-recomp`. That conclusion was wrong, and the reason is worth keeping.
+
+`0x80120854` is reached by five plain static `jal`s. fn64's own discovery
+engine (`fn64-discover/src/cfg.rs`) already promotes every in-range `jal`
+target to a proven root -- and documents the exact distinction that matters
+here, deliberately NOT promoting `j` targets because those are ordinary
+intra-function jumps that spimdisasm represents as `alabel`s. So fn64 already
+knew how to identify this address correctly. Nothing consumed that knowledge:
+`recompile_rom` loaded the external symbol dump and trusted it outright.
+
+The fix is that cross-check. `recompile_rom` now compares the dump against
+`jal`-proven roots, repairs the entries a containing function swallowed when
+the boundary is provable (a `jr $ra` plus delay slot ends the head, and a real
+`J`/`JAL` immediate targets the address exactly), and REPORTS the ones that
+are not provable rather than guessing. WM2000 goes from 2,471 to 2,480
+emitted functions.
+
+**Measured on the real ROM, on this branch.** Before: 2 of 2 runs aborted at
+exactly swap 1901. After: `vi_swaps=2149`, zero panics, zero traps, and the
+only mention of `0x80120854` in the log is the build-time repair report
+(`repair: SPLIT`).
+
+Three findings this produced that are larger than the one bug:
+
+- **The class is not rare.** 17 swallowed entries in WM2000 (one with 23 call
+  sites), 332 in Super Mario 64, 2 in Ocarina of Time, zero false positives.
+- **Refusing is load-bearing.** 8 WM2000 candidates were refused because their
+  apparent `jal` sites sit in embedded data tables whose words merely decode
+  as `jal`. Splitting on those would have corrupted 8 live function bodies.
+- **Three targets remain live traps** (`0x801226A0`, `0x80122F2C`,
+  `0x80127D54`): bank-overlap cases where two overlays decode the same words
+  differently, so `jr $ra` is ambiguous. Declining to split them is correct;
+  they should route to the residency machinery the bank-ambiguous vrams
+  already use rather than stay silent.
