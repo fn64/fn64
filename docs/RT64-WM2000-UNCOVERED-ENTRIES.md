@@ -235,7 +235,7 @@ The harness reports the stack it is on, and it is the intended one:
 | | before (recorded in RT64-WM2000-VERSUS-PLATEAU.md) | after |
 |---|---|---|
 | outcome | `lookup: no recompiled function or host shim at vram 0x801226A0` | **no trap** |
-| swap | died at ~2483 | **past 2519 and running** |
+| swap | died at ~2483 | **2842 and still running** (359 swaps past) |
 | traps | 1 | **0** |
 | panics | 1 (+ SIGABRT teardown) | **0** |
 
