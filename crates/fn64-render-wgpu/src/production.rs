@@ -1613,24 +1613,6 @@ pub enum WgpuRawDpcExecutionError {
     MergedWriteUndeclared {
         access_index: u32,
     },
-    /// This packet declared both an admitted `FillRectangle` and at least
-    /// one admitted triangle. The two run entirely disjoint render paths:
-    /// the fill is executed CPU-side into an owned buffer staged behind
-    /// `PendingFillPublication`, while `draw_admitted_triangles` clears and
-    /// rasterizes into a GPU color attachment that never composes back into
-    /// that buffer. Executing both would publish a resident generation
-    /// carrying only the fill while the triangles landed somewhere the
-    /// guest can never observe -- with no defined ordering between them.
-    /// Composing the two sources is a follow-on slice; this is the loud
-    /// refusal in the meantime. Note that the fill+TMEM sibling this
-    /// variant's doc used to point at is no longer a refusal -- that
-    /// composition is admitted (`StagedOutcome::MixedFillAndTmemLoads`).
-    /// Fill+triangle is not, and for a materially different reason: a TMEM
-    /// load and a fill write disjoint declared regions the journal already
-    /// orders, whereas a triangle raster has no declared write access in
-    /// the journal at all and no defined composition onto the fill's
-    /// CPU-side buffer.
-    MixedFillAndTrianglePacket,
     /// A `TextureRectangle` reached the executor but its own
     /// `SetTile`/`SetTileSize` were never staged at its stream position, so
     /// there is no tile descriptor to sample through. Never defaulted to a
@@ -1834,12 +1816,6 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "a staged write claiming access #{access_index} matches no write access this \
                  packet's own journal declares"
-            ),
-            Self::MixedFillAndTrianglePacket => formatter.write_str(
-                "this packet declares both an admitted FillRectangle and at least one admitted \
-                 triangle; the CPU-side fill and the GPU triangle raster target are disjoint \
-                 with no defined composition or ordering between them, so the combination is \
-                 rejected loudly here rather than half-executed silently",
             ),
             Self::TexrectUnboundTile { triangle_index } => write!(
                 formatter,
@@ -2903,41 +2879,67 @@ fn stage_and_report(
     collector: &mut ExecutionCollector<'_>,
     packet: &WorkloadPacket,
 ) -> Result<StagedOutcome, WgpuRawDpcExecutionError> {
-    // Mixed fill-plus-triangle packets are still refused, before either
-    // source stages anything. `stage_fills_and_report` never inspects
-    // `plan.triangles`, and `execute_raw_dpc` draws them afterwards into a
-    // color attachment `draw_admitted_triangles` clears itself -- disjoint
-    // from the CPU-side fill buffer this packet staged. Admitting the pair
-    // would silently drop one of two render results with no ordering
-    // defined between them. A FLAT raw triangle now declares per-row
-    // journal writes and composes through the same accumulation seam as a
-    // texrect, so the "no journal order to read the composition off" reason
-    // no longer applies to it. The refusal is kept anyway, and narrowly: a
-    // fill packet with no texrect routes through `stage_fills_and_report`,
-    // and the fill+raw-triangle pair has never been measured in WM2000's
-    // stream, so admitting it would be widening on inference rather than
-    // evidence. Composing them is a follow-on slice.
-    // A texture rectangle is admitted as two triangles, so "has triangles"
-    // no longer implies "has a raster with no declared write". Partition
-    // first: a texrect DOES declare its own journal `ColorFramebuffer`
-    // writes (`raw_dpc::mod`'s `plan_texture_rectangle`), which is exactly
-    // the thing a raw triangle lacks and exactly what makes composition
-    // derivable rather than invented. The refusal below therefore narrows
-    // to the case that still has no declared order: a fill next to a RAW
-    // triangle.
-    let raw_triangle_count = collector
-        .plan
-        .triangles
-        .iter()
-        .filter(|draw| {
-            draw.as_ref()
-                .map(|draw| draw.source == TriangleSource::RawTriangle)
-                .unwrap_or(false)
-        })
-        .count();
-    if !collector.plan.fills.is_empty() && raw_triangle_count > 0 {
-        return Err(WgpuRawDpcExecutionError::MixedFillAndTrianglePacket);
-    }
+    // **A fill composed with a raw triangle is admitted, and the ordering
+    // the old refusal asked for already exists.**
+    //
+    // This was `MixedFillAndTrianglePacket`, reading "the CPU-side fill and
+    // the GPU triangle raster target are disjoint with no defined
+    // composition or ordering between them". That sentence described the
+    // code at the commit that wrote it. It does not describe this file any
+    // more, and measuring WM2000's own packet is what forced the re-read.
+    //
+    // **The measured packet.** Instrumented at this site and run on the
+    // real ROM through the all-Rust lane (`FN64_RECOMP=rs`,
+    // `FN64_RENDER=wgpu`, two controllers, the committed match lead-in),
+    // WM2000 raises this refusal at VI swap 2873 with the shape recorded in
+    // `docs/WM2000-FILL-TRIANGLE-EVIDENCE.txt`.
+    //
+    // **Why no composition is missing.** Every colour-target-writing
+    // command in a packet -- `FillRectangle`, `TextureRectangle`, and a
+    // flat `RawTriangle` that declared a write -- is executed by
+    // `stage_color_commands` against ONE shared full-extent accumulation
+    // buffer, in the packet's own stream order, recovered by sorting on the
+    // decoder's `command_index`. `ColorCommandKind` has an arm for each of
+    // the three; each arm's output becomes the next command's resident
+    // bytes ("the single line that makes N compose"); and every declared
+    // access's digest is computed once at the end against the final composed
+    // buffer. `targets/raw_triangle.rs`'s own module doc states the point
+    // directly: it is a CPU rasterizer "producing the same
+    // `CompletedColorTargetWrite` the fill and texrect executors produce",
+    // chosen over the GPU path precisely because "the guest-visible path has
+    // no GPU in it".
+    //
+    // So the fill is not CPU-side while the triangle is GPU-side. They are
+    // both CPU-side, in one buffer, in journal order -- the identical seam
+    // the fill+texrect pair has composed through since the N-command
+    // accumulation landed, and which `merged_fill_and_tmem_writes` then
+    // re-derives from the resource journal independently.
+    //
+    // **A raw triangle that declared NO write is also fine, for the reason
+    // the texrect sibling below already establishes at length.** Such a
+    // triangle contributes no `ResourceAccess`, stages no `CompletedWrite`,
+    // and reaches only `draw_admitted_triangles` -- whose output `present`
+    // refuses to scan out by name and which nothing copies into guest
+    // RDRAM. The effect report is byte-for-byte the one the same packet
+    // without the triangle produces. That was already true, and already
+    // admitted, when the other command in the packet was a texrect; a fill
+    // does not make it less true.
+    //
+    // **What still refuses, and it is not a shape gate.** The invariant
+    // that actually protects this seam is journal exactness, checked per
+    // access rather than per packet shape: `merged_fill_and_tmem_writes`
+    // refuses `MergedWriteUnclaimed` when the journal declares a write no
+    // source staged and `MergedWriteUndeclared` when a source staged a write
+    // the journal never declared, and `fill_completed_writes` refuses
+    // `FillAccessOutsideTarget` for any declared range outside the target.
+    // Those are kept and are what the retargeted tests now pin. A shape gate
+    // could only ever approximate them, and here it approximated them by
+    // dropping six real guest-visible commands to withhold one that was
+    // never going to be visible either way.
+    //
+    // **What is NOT claimed.** Admitting this packet does not make the GPU
+    // triangle raster guest-visible; that writeback gap is separate,
+    // pre-existing, and documented in `docs/RT64-TRIANGLE-WRITEBACK.md`.
     // **A texrect composed with a raw triangle is admitted, and the
     // ordering the refusal asked for already exists.**
     //
@@ -2990,16 +2992,17 @@ fn stage_and_report(
     // with the triangle absent. The effect report this packet produces is
     // byte-for-byte the one the same packet minus its last command produces.
     //
-    // **This is not the fill+triangle sibling, and that one stays refused.**
-    // `MixedFillAndTrianglePacket` is kept, unchanged, immediately above.
-    // Its stated defect is real and different: a fill packet with no
-    // texrect reaches `stage_fills_and_report`, whose `StagedOutcome`
-    // routing turns on whether a color command declared a write, and the
-    // fill+triangle pair was never measured in WM2000's stream. The pair
-    // measured here is the one the ROM actually issues, and it is refused
-    // for a property -- "a raw triangle declares no write" -- that is not a
-    // conflict with a texrect but the precondition that makes the two
-    // independent.
+    // **The fill+triangle sibling reached the same conclusion, later, from
+    // its own measurement.** This paragraph used to end "that one stays
+    // refused", on the reasoning that the fill+raw-triangle pair had never
+    // been measured in WM2000's stream so admitting it would be widening on
+    // inference. It has now been measured -- VI swap 2873, 60 fill-cycle
+    // fills and one raw triangle that DECLARED a five-row write -- and the
+    // refusal was removed for the reasons recorded above this function's
+    // first paragraph. The two cases were never actually different: both
+    // reduce to "the GPU raster is guest-invisible for every packet shape,
+    // and every declared write is journal-ordered regardless of which
+    // command produced it".
     //
     // **What is NOT claimed.** Admitting this packet does not make the raw
     // triangle guest-visible. It is not visible today in a triangle-only
@@ -9028,52 +9031,140 @@ mod tests {
         words
     }
 
-    /// Hostile, and the reason this refusal exists: a packet carrying both
-    /// an admitted fill and an admitted triangle is rejected by name.
+    /// **RETARGET.** This was
+    /// `execute_raw_dpc_rejects_a_mixed_fill_and_triangle_packet`, which
+    /// asserted `MixedFillAndTrianglePacket` for a packet carrying an
+    /// admitted fill and an admitted raw triangle. It pinned a shape gate,
+    /// and the shape gate's stated reason stopped being true.
     ///
-    /// Before this check, `stage_and_report` routed straight into
-    /// `stage_fills_and_report` -- which never inspects `plan.triangles` --
-    /// and `execute_raw_dpc` then drew those triangles into a color
-    /// attachment `draw_admitted_triangles` clears itself, disjoint from
-    /// the CPU-side fill buffer the same packet had just staged. The
-    /// renderer reported success while one of the two render results went
-    /// nowhere the guest could observe, with no ordering between them.
+    /// The reason it gave was "the fill is executed CPU-side into an owned
+    /// buffer while `draw_admitted_triangles` rasterizes into a GPU colour
+    /// attachment that never composes back". That described the file at the
+    /// commit that wrote it. It does not describe it now: a flat non-Fill-
+    /// cycle raw triangle that declares a write is executed by
+    /// `targets/raw_triangle.rs`'s CPU rasterizer -- "producing the same
+    /// `CompletedColorTargetWrite` the fill and texrect executors produce"
+    /// -- and `stage_color_commands` composes it with the fill into ONE
+    /// accumulation buffer in the packet's own stream order.
     ///
-    /// The assertion is against the named variant's own `Display` text, not
-    /// a substring: `RenderBackend::execute_raw_dpc` converts the typed
-    /// `WgpuRawDpcExecutionError` into `RenderError::Backend`'s string, so
-    /// comparing to `MixedFillAndTrianglePacket.to_string()` is how this
-    /// module pins the *specific* refusal rather than merely "some error".
+    /// WM2000 forced the re-read: at VI swap 2873 it issues 60 fill-cycle
+    /// FillRectangles and one raw triangle whose declared span is five
+    /// per-scanline `RenderTarget` accesses (see
+    /// `docs/WM2000-FILL-TRIANGLE-EVIDENCE.txt`). The gate cost the ROM all
+    /// 60 guest-visible fills.
     ///
-    /// The whole-target fill runs first for the same reason every other
-    /// first-fill fixture here does: a partial rectangle cannot honestly
-    /// initialize a fresh target.
+    /// What is asserted here is not "no longer refused" -- that alone would
+    /// be satisfied by a backend that silently dropped one half, which is
+    /// exactly the failure the old gate feared. Both halves' PIXELS are
+    /// read back out of the published resident and checked:
+    ///
+    /// 1. Every pixel inside the triangle carries the triangle's own
+    ///    primitive colour, hand-derived from the wire as
+    ///    `TRIANGLE_PRIM_RGBA16`.
+    /// 2. Every pixel outside it differs from that colour -- so the fill
+    ///    underneath was not blanked by a triangle output that replaced the
+    ///    buffer instead of composing into it.
+    ///
+    /// FAILS BEFORE this change: `execute_raw_dpc` returns
+    /// `MixedFillAndTrianglePacket` and there is nothing to read back.
     #[test]
-    fn execute_raw_dpc_rejects_a_mixed_fill_and_triangle_packet() {
+    fn a_fill_and_a_raw_triangle_in_one_packet_both_reach_the_published_pixels() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
 
-        let planned = plan_with_no_reads(&mut backend, &session, fill_then_triangle_words());
+        // The whole-target fill and the flat triangle IN ONE PACKET. The
+        // fill runs first (command order), establishing generation 1
+        // honestly, and the triangle then patches into the buffer the fill
+        // just produced -- the single accumulation seam under test.
+        //
+        // The triangle half is `flat_triangle_packet_words` minus its own
+        // `set_color_image_rgba16` (the fill already staged the identical
+        // image; a second one would be a different fact under test).
+        let (low, high) =
+            crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);
+        let mut words = whole_target_fill_words();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(low, high));
+        words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
+        words.extend(flat_triangle_in_target_words());
+
+        let planned = plan_with_no_reads(&mut backend, &session, words);
         let bound = session
             .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
             .unwrap();
+        let submission = bound.submission();
+        let prepared = match backend.execute_raw_dpc(bound) {
+            Ok(prepared) => prepared,
+            // The GPU raster runs after this card's CPU staging and refuses
+            // on an adapterless host. That says nothing about the guest
+            // bytes -- but it must never be the removed shape gate, which
+            // no longer exists to be hit.
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("TriangleDrawBeforeCreate")
+                        || message.contains("no GPU adapter"),
+                    "the only tolerated failure is the adapterless GPU raster path, got: {error}"
+                );
+                return;
+            }
+        };
 
-        let error = backend
-            .execute_raw_dpc(bound)
-            .expect_err("a fill+triangle packet must be refused, never half-executed");
-        match error {
-            RenderError::Backend { reason, .. } => assert_eq!(
-                reason,
-                WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string(),
-                "the refusal must be the named MixedFillAndTrianglePacket variant, not some \
-                 other error that happens to also reject this packet"
-            ),
-            other => panic!("expected a backend rejection, got {other:?}"),
-        }
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "a refused fill+triangle packet must stage no redeemable fill token"
+        let staged = backend.staged_guest_render_target_writes(submission);
+        // The fill declares one whole-target write; the triangle declares
+        // one per covered scanline (rows 0, 1, 2). Four in journal order --
+        // and the count is the discriminating half: three would mean the
+        // fill was dropped, one would mean the triangle was.
+        assert_eq!(
+            staged.len(),
+            4,
+            "one whole-target fill write plus the triangle's three per-row writes; got {staged:?}"
         );
+
+        let committed = session
+            .commit_guest_render_target_writes(prepared, staged)
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+
+        let registry = backend
+            .color_targets()
+            .expect("the composed packet published a resident");
+        let resident = registry
+            .residents()
+            .iter()
+            .find(|resident| resident.key().address().get() == FILL_TARGET_ADDRESS)
+            .expect("the target is resident");
+        let bytes = resident.device_bytes().device_bytes();
+        for y in 0..FILL_TARGET_HEIGHT as usize {
+            for x in 0..FILL_TARGET_WIDTH as usize {
+                let offset = (y * FILL_TARGET_WIDTH as usize + x) * 2;
+                let pixel = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+                let inside = y < 3 && (2..6).contains(&x);
+                if inside {
+                    assert_eq!(
+                        pixel, TRIANGLE_PRIM_RGBA16,
+                        "pixel ({x},{y}) is inside the triangle, so the triangle half of the \
+                         composition must have reached the published buffer"
+                    );
+                } else {
+                    // Hand-derived from the fill's own wire colour, not read
+                    // back from the buffer: an assert_ne against the
+                    // triangle colour alone would pass for a buffer of
+                    // zeros, i.e. for a fill that never ran.
+                    assert_eq!(
+                        pixel,
+                        expected_fill_halfword(COMPOSED_FILL_COLOR, x as u32),
+                        "pixel ({x},{y}) is outside the triangle, so it must still carry the \
+                         fill's own colour -- a triangle output that replaced the buffer rather \
+                         than composing into it would blank it"
+                    );
+                }
+            }
+        }
     }
 
     /// The new refusal did not over-reject: a fill with no triangle beside
@@ -9094,22 +9185,27 @@ mod tests {
         );
     }
 
-    /// The mirror of the test above, from the triangle side: a triangle
-    /// with no fill beside it still reaches `draw_admitted_triangles`
-    /// rather than being caught by the new check.
+    /// A triangle-only packet reaches `draw_admitted_triangles` rather
+    /// than being caught by anything in `stage_and_report`.
+    ///
+    /// This was the mirror of the fill+triangle shape gate, and asserted
+    /// `assert_ne!(reason, MixedFillAndTrianglePacket)`. That gate is gone
+    /// (see `a_fill_and_a_raw_triangle_in_one_packet_both_reach_the_
+    /// published_pixels`), so the negative half would now be vacuous and is
+    /// removed. The positive half is what always carried the claim and is
+    /// kept unchanged.
     ///
     /// The draw itself needs a real adapter, so on an adapterless host the
     /// packet's execution ends in `TriangleDrawBeforeCreate`. That is the
     /// *evidence* this test wants, not a limitation of it: reaching that
     /// error proves `stage_and_report` admitted the plan and
-    /// `execute_raw_dpc` went on to attempt the draw. Being caught by
-    /// `MixedFillAndTrianglePacket` instead would mean the new check fires
-    /// on triangles alone. (The full real-GPU success path for a
+    /// `execute_raw_dpc` went on to attempt the draw. (The full real-GPU
+    /// success path for a
     /// triangle-only plan is covered under `host-gpu-tests` by
     /// `triangle_only_plan_completes_via_preserving_physical_and_never_
     /// flips_the_slot`.)
     #[test]
-    fn a_triangle_only_packet_still_reaches_the_draw_after_the_fill_refusal() {
+    fn a_triangle_only_packet_reaches_the_draw_rather_than_a_stage_and_report_refusal() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
 
         let planned = plan_with_no_reads(&mut backend, &session, triangle_only_words());
@@ -9117,20 +9213,15 @@ mod tests {
             .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
             .unwrap();
 
-        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
         match backend.execute_raw_dpc(bound) {
             // A host that DOES have an adapter AND has had create() called
             // on it draws the triangle and succeeds; this test calls no
             // create(), so on every host today it takes the Err arm below.
             // The arm is kept rather than made `unreachable!()` because the
-            // claim under test is "not caught by the fill+triangle refusal",
-            // which a success satisfies just as well as the draw's own error.
+            // claim under test is "went PAST stage_and_report", which a
+            // success satisfies just as well as the draw's own error.
             Ok(_) => {}
             Err(RenderError::Backend { reason, .. }) => {
-                assert_ne!(
-                    reason, refused,
-                    "a triangle with no fill beside it must never hit the fill+triangle refusal"
-                );
                 assert_eq!(
                     reason,
                     WgpuRawDpcExecutionError::TriangleDrawBeforeCreate.to_string(),
@@ -10477,23 +10568,50 @@ mod tests {
         }
     }
 
-    /// The still-unadmitted compositions keep failing by NAME, not silently.
+    /// **RETARGET.** This was
+    /// `compositions_this_slice_does_not_admit_still_fail_by_name`,
+    /// asserting `MixedFillAndTrianglePacket` for fill+triangle and for
+    /// fill+TMEM+triangle. Both are now admitted; see
+    /// `a_fill_and_a_raw_triangle_in_one_packet_both_reach_the_published_
+    /// pixels` for why the shape gate's stated reason stopped being true.
     ///
-    /// Two of them, each a different reason:
+    /// The two shapes are kept, with the assertion inverted to the property
+    /// the gate was standing in for. A triangle that declares NO write --
+    /// `triangle_base_edge_words(7, 2, 0)`, whose `yl` of 0 covers no row --
+    /// must ride along **contributing nothing to the journal**. That is the
+    /// discriminating claim, and it is the one the old refusal's own
+    /// justification actually rested on:
     ///
-    /// - fill + triangle: refused with `MixedFillAndTrianglePacket`, because
-    ///   a triangle raster declares no write access in the journal at all,
-    ///   so unlike fill + TMEM there is no declared order to compose onto.
-    /// - fill + TMEM + triangle: the SAME refusal must win, and must win
-    ///   before either source stages anything -- admitting fill + TMEM must
-    ///   not have opened a back door where a triangle rides along with them.
+    /// 1. The packet executes rather than being refused for its shape.
+    /// 2. Its staged writes are EXACTLY the fill's own, byte for byte
+    ///    identical to the writes the same fill produces with no triangle
+    ///    beside it. A triangle that quietly declared or staged anything
+    ///    would change this list, and a fill half that was dropped to make
+    ///    room for the triangle would empty it.
     ///
-    /// The refusal is compared against the variant's own `to_string()`, so a
-    /// future rename cannot leave this test asserting a stale literal, and a
-    /// DIFFERENT rejection cannot pass as this one.
+    /// Assertion 2 is what keeps this from being "the refusal was deleted":
+    /// it is a strictly stronger statement than "no error was returned",
+    /// and it fails for every half-execution the old gate feared.
+    ///
+    /// FAILS BEFORE this change: both halves return
+    /// `MixedFillAndTrianglePacket`.
     #[test]
-    fn compositions_this_slice_does_not_admit_still_fail_by_name() {
-        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
+    fn a_write_declaring_nothing_triangle_rides_along_without_touching_the_journal() {
+        // The control: the same fill, alone, in its own backend. Every
+        // expectation below is this list -- derived from a run of the code
+        // under test in a DIFFERENT shape, not from the shape under test.
+        let fill_only_writes = {
+            let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+            configure_fill_target_height(&mut backend);
+            let (submission, result) =
+                plan_and_execute_fill(&mut backend, &mut session, whole_target_fill_words());
+            result.expect("the fill-only control must execute");
+            backend.staged_guest_render_target_writes(submission)
+        };
+        assert!(
+            !fill_only_writes.is_empty(),
+            "the control must stage the fill's writes, or every comparison below is vacuous"
+        );
 
         // fill + triangle, no TMEM load.
         let mut fill_and_triangle = whole_target_fill_words();
@@ -10503,19 +10621,27 @@ mod tests {
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
-        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
-        let error = result.expect_err("fill + triangle must still be refused");
-        assert!(
-            error.to_string().contains(&refused),
-            "the refusal must be the named MixedFillAndTrianglePacket variant, got: {error}"
-        );
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "a refused composition must leave no redeemable fill token behind"
-        );
+        let (submission, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
+        match result {
+            Ok(_) => {
+                assert_eq!(
+                    backend.staged_guest_render_target_writes(submission),
+                    fill_only_writes,
+                    "a triangle declaring no write must leave the fill's staged writes exactly \
+                     as they are with no triangle present"
+                );
+            }
+            // The GPU raster half refuses on an adapterless host. That is
+            // downstream of the staging under test and is not the removed
+            // shape gate.
+            Err(error) => assert!(
+                error.to_string().contains("TriangleDrawBeforeCreate")
+                    || error.to_string().contains("no GPU adapter"),
+                "the only tolerated failure is the adapterless GPU raster path, got: {error}"
+            ),
+        }
 
-        // fill + TMEM + triangle: admitting fill + TMEM must not have let a
-        // triangle through alongside them.
+        // fill + TMEM + triangle: the three-source merge, same claim.
         let mut all_three = one_load_block_words();
         all_three.extend(whole_target_fill_words());
         all_three.extend(set_other_mode(0, 0));
@@ -10524,23 +10650,25 @@ mod tests {
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
-        let (_, result) = plan_and_execute_composed(&mut backend, &mut session, all_three);
-        let error = result.expect_err(
-            "fill + TMEM + triangle must still be refused -- admitting fill + TMEM must not \
-             have opened a path for a triangle to ride along",
-        );
-        assert!(
-            error.to_string().contains(&refused),
-            "the three-way refusal must also be MixedFillAndTrianglePacket, got: {error}"
-        );
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "the refused three-way composition must leave no redeemable fill token behind"
-        );
-        assert!(
-            backend.color_targets().is_none(),
-            "the refusal must fire before the fill executor ever built the registry"
-        );
+        let (submission, result) = plan_and_execute_composed(&mut backend, &mut session, all_three);
+        match result {
+            Ok(_) => {
+                // Only the RENDER-TARGET writes are compared: this packet's
+                // journal also declares the TMEM load's own destination
+                // write, which the fill-only control has no counterpart for.
+                let staged = backend.staged_guest_render_target_writes(submission);
+                assert_eq!(
+                    staged, fill_only_writes,
+                    "in the three-source merge too, a triangle declaring no write must leave \
+                     the fill's render-target writes untouched"
+                );
+            }
+            Err(error) => assert!(
+                error.to_string().contains("TriangleDrawBeforeCreate")
+                    || error.to_string().contains("no GPU adapter"),
+                "the only tolerated failure is the adapterless GPU raster path, got: {error}"
+            ),
+        }
     }
 
     /// A composed packet whose fill half is rejected leaves NOTHING behind:
@@ -15590,34 +15718,93 @@ mod tests {
         );
     }
 
-    /// The fill + **raw triangle** refusal, unchanged: still
-    /// `MixedFillAndTrianglePacket`, and still for its original reason -- a
-    /// raw triangle declares no journal write access at all, so there is no
-    /// declared order to compose it onto the fill with.
+    /// **RETARGET, and the anti-workaround half of this change.** This was
+    /// `a_fill_composed_with_a_raw_triangle_is_still_refused_by_name`,
+    /// asserting `MixedFillAndTrianglePacket`. The gate is gone.
     ///
-    /// Kept as its own test after the texrect case split away from it,
-    /// because the two now have materially different causes and a single
-    /// test asserting one variant for both would hide a regression in
-    /// either.
+    /// It is retargeted rather than deleted because the concern it was
+    /// standing in for is real and must still be enforced: a colour-target
+    /// command must never write bytes this packet's own journal did not
+    /// declare, and the journal must never declare bytes no command wrote.
+    /// The shape gate approximated that per-packet; the invariant is checked
+    /// per-access, by `merged_fill_and_tmem_writes`
+    /// (`MergedWriteUnclaimed`/`MergedWriteUndeclared`) and by
+    /// `fill_completed_writes` (`FillAccessOutsideTarget`). Those are the
+    /// checks that actually protect this seam, and they are the ones a
+    /// reader arriving from the removed gate needs pointed at.
+    ///
+    /// Asserted here on the **fill + declared-write raw triangle** pair --
+    /// WM2000's own measured shape, and the pair the removed gate refused --
+    /// through the strongest observable this module has: the journal's
+    /// declared render-target ranges, hand-derived, compared against the
+    /// staged writes one for one.
+    ///
+    /// FAILS BEFORE this change: `plan_and_execute_fill` returns
+    /// `MixedFillAndTrianglePacket` and nothing is staged.
     #[test]
-    fn a_fill_composed_with_a_raw_triangle_is_still_refused_by_name() {
-        let refused = WgpuRawDpcExecutionError::MixedFillAndTrianglePacket.to_string();
-        let mut fill_and_triangle = whole_target_fill_words();
-        fill_and_triangle.extend(set_other_mode(0, 0));
-        fill_and_triangle.extend(set_combine(0, 0));
-        fill_and_triangle.extend(triangle_base_edge_words(7, 2, 0));
+    fn a_fill_and_a_declaring_raw_triangle_stage_exactly_the_writes_the_journal_declares() {
+        let (low, high) =
+            crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);
+        let mut words = whole_target_fill_words();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(low, high));
+        words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
+        words.extend(flat_triangle_in_target_words());
+
+        // The journal's own declared render-target ranges, read through the
+        // decoder rather than through the executor -- an independent
+        // derivation of the list the executor must match exactly.
+        let declared = declared_render_target_writes(words.clone());
+        // Hand-derived: the whole-target fill declares one contiguous
+        // 16x8 RGBA16 range at 0x2000 (256 bytes), then the triangle
+        // declares one 8-byte run per covered scanline at 0x2004, 0x2024,
+        // 0x2044 (rows 0..3, columns 2..6). Four accesses, in stream order.
+        assert_eq!(
+            declared,
+            vec![
+                (FILL_TARGET_ADDRESS, FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT * 2),
+                (0x2004, 8),
+                (0x2024, 8),
+                (0x2044, 8),
+            ],
+            "the journal must declare the fill's whole-target range followed by the \
+             triangle's three per-scanline runs -- if this list is wrong every comparison \
+             below is comparing the executor against itself"
+        );
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
-        let (_, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
-        let error = result.expect_err("fill + raw triangle must still be refused");
-        assert!(
-            error.to_string().contains(&refused),
-            "the refusal must be the named MixedFillAndTrianglePacket variant, got: {error}"
-        );
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "a refused fill+triangle composition must leave no redeemable fill token behind"
+        let (submission, result) = plan_and_execute_fill(&mut backend, &mut session, words);
+        let Ok(_prepared) = result else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("TriangleDrawBeforeCreate")
+                    || error.to_string().contains("no GPU adapter"),
+                "the only tolerated failure is the adapterless GPU raster path, got: {error}"
+            );
+            return;
+        };
+
+        // Every declared access is claimed by exactly one staged write, in
+        // the journal's own order. `merged_fill_and_tmem_writes` and
+        // `BackendEffectReport::try_new` both already refuse any other
+        // outcome by name; this asserts the outcome they permit is the one
+        // hand-derived above, not merely self-consistent.
+        let staged = backend.staged_guest_render_target_writes(submission);
+        let staged_ranges: Vec<(u32, u32)> = staged
+            .iter()
+            .map(|write| match write.access().region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                    (range.start().get(), range.len())
+                }
+                other => panic!("a render-target write must name an RDRAM range, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            staged_ranges, declared,
+            "the staged writes must be exactly the journal's declared render-target accesses, \
+             in the journal's order -- no extra write the journal never declared, and no \
+             declared write left unstaged"
         );
     }
 
