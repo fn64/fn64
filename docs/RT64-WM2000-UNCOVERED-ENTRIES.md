@@ -177,3 +177,38 @@ One mutant is EQUIVALENT and was removed rather than papered over: the second
 change any answer (same exhaustive comparison). Untestable code that looks
 load-bearing is its own hazard, so it is deleted with the reasoning kept in a
 comment.
+
+## The class is not WM2000-specific, and finding it exposed a second defect
+
+Running the new check across the corpus:
+
+| ROM | uncovered found | adopted | refused | total functions |
+|---|---|---|---|---|
+| WM2000 (NWXE) | 3 | 2 | 1 | 2482 |
+| SM64 (SM64U) | 154 | 8 | 146 | 4247 |
+| OoT (OOTU) | 0 | 0 | 0 | 13361 |
+
+The refusal rate is the interesting number. SM64 refuses 146 of 154 -- almost
+all are mid-gap words inside large unmapped spans that merely decode as `jal`
+targets, exactly like WM2000's `0x800400CC`. The precondition is doing real
+work; a "split on any proven root" sweep would have corrupted 146 ranges.
+
+### The second defect: section names are not unique
+
+The first SM64 run reported **"154 entries ... 805 adopted"** -- more
+adoptions than entries found, which is impossible, with total functions
+inflated from 4247 to 5044.
+
+`repair_symbol_dump` scoped each section's findings by NAME
+(`filter(|e| e.region == section.name)`). SM64's dump declares **154 sections
+all called `_main`** (plus `_engine` x8 and `_goddard` x19), so every
+same-named section received every other's findings and applied them at its own
+ROM offsets.
+
+Entries now carry `region_index`, and repairs scope on that. The name is kept
+for reporting only. The pre-existing split path shared the flaw but was masked:
+a split also has to match a containing function by name AND vram, which a
+wrong section rarely satisfies.
+
+This is worth keeping as a general caution: **anything in this codebase that
+keys on a config section name is wrong.** Only the index is unique.
