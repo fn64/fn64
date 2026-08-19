@@ -511,10 +511,12 @@ pub fn classify_gap_adoption(
                 Some(GapRefusal::GapDoesNotReturn)
             };
         }
-        // Only `nop` may sit between a return's delay slot and the end.
-        if word_at(ret.wrapping_add(8)).is_some_and(|w| w != NOP) && ret.wrapping_add(8) < gap_end {
-            return Some(GapRefusal::GapDoesNotReturn);
-        }
+        // NOTE: no second "only nop may precede the end" guard here, unlike
+        // `classify_split`. It would be redundant: the padding check above
+        // already refuses every range this guard could, verified by
+        // exhaustively comparing both forms over all small gaps built from
+        // {jr $ra, nop, live}. Keeping it would be an equivalent-mutant trap
+        // — untestable code that looks load-bearing.
         match ret.checked_sub(4) {
             Some(previous) => ret = previous,
             None => break,
@@ -930,6 +932,221 @@ mod tests {
         assert_eq!(check.uncovered.len(), 1);
         assert_eq!(check.uncovered[0].refusal, None, "nop tail padding is fine");
         assert_eq!(check.uncovered[0].adopted_size(), 0x14);
+    }
+
+    /// MUTATION GUARD, added after a surviving mutant, then RE-derived after
+    /// the first attempt still failed to kill it.
+    ///
+    /// Replacing the tail-padding check with `true` survived every earlier
+    /// fixture, because in each of them an *earlier* guard already refused
+    /// the range, so the mutated expression was never evaluated. This is the
+    /// trap the brief warns about: a fixture that samples a point where the
+    /// correct and incorrect answers coincide.
+    ///
+    /// The shape that actually reaches it, derived by exhaustively searching
+    /// small gaps for a divergence between the real and mutated classifier:
+    /// the return sits at `gap_end - 12`, so the backward scan's first step
+    /// lands on the delay slot, whose own `+8` probe is at `gap_end` and is
+    /// therefore skipped — leaving the padding check as the only thing that
+    /// can refuse.
+    ///
+    /// ```text
+    ///   0x80000010  jr $ra                  <- proven root / gap start
+    ///   0x80000014  nop                        (delay slot)
+    ///   0x80000018  addiu $sp, $sp, -0x18   <- LIVE word, not padding
+    ///   ---- gap ends at 0x8000001C ----
+    /// ```
+    ///
+    /// Control returns at `0x80000010` and then `0x80000018` still executes
+    /// and runs off the adopted entry's end, so the range is not a
+    /// self-contained body and must be REFUSED.
+    #[test]
+    fn a_gap_whose_trailing_words_are_live_instructions_is_refused() {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            JR_RA,       // 0x80000010: gap start, and the return
+            NOP,         // 0x80000014: its delay slot
+            0x27BD_FFE8, // 0x80000018: a live word, NOT nop padding
+            NOP,         // 0x8000001C: the tail function
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_001C,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1, "still reported");
+        assert_eq!(
+            check.uncovered[0].refusal,
+            Some(GapRefusal::GapDoesNotReturn),
+            "trailing live instructions are not nop padding"
+        );
+        let mut repaired = functions.clone();
+        assert_eq!(apply_gap_adoptions(&mut repaired, &check), 0);
+        assert_eq!(repaired, functions);
+    }
+
+    /// MUTATION GUARD: `gap_end` must be the NEAREST declared function above
+    /// the root (`min`), not the farthest (`max`). With two functions above
+    /// the gap, `max` would claim bytes that the intervening function
+    /// already declares. Earlier fixtures had exactly one function above the
+    /// gap, so `min` and `max` coincided and the mutant survived.
+    ///
+    /// ```text
+    ///   0x80000010  addiu $sp, $sp, -0x18   <- root / gap start
+    ///   0x80000014  jr $ra
+    ///   0x80000018  nop                        (delay slot)
+    ///   0x8000001C  `mid`   (declared, size 4) <- the NEAREST neighbour
+    ///   0x80000020  `far`   (declared, size 4)
+    /// ```
+    #[test]
+    fn the_gap_ends_at_the_nearest_declared_function_not_the_farthest() {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            0x27BD_FFE8,
+            JR_RA,
+            NOP,
+            NOP,
+            NOP,
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "head".into(),
+                vram: 0x8000_0000,
+                size: 0x10,
+            },
+            DumpFunction {
+                name: "mid".into(),
+                vram: 0x8000_001C,
+                size: 0x4,
+            },
+            DumpFunction {
+                name: "far".into(),
+                vram: 0x8000_0020,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1);
+        assert_eq!(
+            check.uncovered[0].gap_end, 0x8000_001C,
+            "the gap must stop at `mid`, never swallow it to reach `far`"
+        );
+        assert_eq!(check.uncovered[0].adopted_size(), 0xC);
+    }
+
+    /// MUTATION GUARD, the `gap_start` mirror of the `gap_end` test above:
+    /// the gap must begin at the END of the NEAREST declared function below
+    /// the root (`max` of the ends), not the farthest. Earlier fixtures had
+    /// exactly one function below the gap, so both coincided.
+    ///
+    /// ```text
+    ///   0x80000000  `first`  (declared, size 0x8)
+    ///   0x80000008  `second` (declared, size 0x8)  <- the NEAREST below
+    ///   0x80000010  addiu $sp, $sp, -0x18          <- root / true gap start
+    ///   0x80000014  jr $ra
+    ///   0x80000018  nop                               (delay slot)
+    ///   0x8000001C  `tail`   (declared, size 4)
+    /// ```
+    #[test]
+    fn the_gap_starts_at_the_nearest_declared_function_below_the_root() {
+        let words = [
+            jal(0x8000_0010),
+            NOP,
+            JR_RA,
+            NOP,
+            0x27BD_FFE8,
+            JR_RA,
+            NOP,
+            NOP,
+        ];
+        let functions = vec![
+            DumpFunction {
+                name: "first".into(),
+                vram: 0x8000_0000,
+                size: 0x8,
+            },
+            DumpFunction {
+                name: "second".into(),
+                vram: 0x8000_0008,
+                size: 0x8,
+            },
+            DumpFunction {
+                name: "tail".into(),
+                vram: 0x8000_001C,
+                size: 0x4,
+            },
+        ];
+        let region = CodeRegion {
+            name: "sec".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1);
+        assert_eq!(
+            check.uncovered[0].gap_start, 0x8000_0010,
+            "the gap must start after `second`, not back at `first`"
+        );
+        // And with the correct start the root IS at the start, so it adopts.
+        assert_eq!(check.uncovered[0].refusal, None);
+        assert_eq!(check.uncovered[0].adopted_size(), 0xC);
+    }
+
+    /// MUTATION GUARD for `apply_gap_adoptions`' overlap check. If the
+    /// function list already claims the range (for instance because another
+    /// repair ran first, or the caller mutated it after the check), adoption
+    /// must decline rather than push a second, overlapping entry.
+    #[test]
+    fn adoption_declines_when_the_range_is_already_claimed() {
+        let (words, functions) = uncovered_fixture();
+        let region = CodeRegion {
+            name: "bank4_text".into(),
+            vram: 0x8000_0000,
+            words: &words,
+        };
+        let check = cross_check_region(&region, &functions);
+        assert_eq!(check.uncovered.len(), 1);
+        assert_eq!(check.uncovered[0].refusal, None, "adoptable in isolation");
+
+        // Now simulate the range having been claimed since the check ran.
+        let mut claimed = functions.clone();
+        claimed.push(DumpFunction {
+            name: "already_there".into(),
+            vram: 0x8000_0010,
+            size: 0xC,
+        });
+        claimed.sort_by_key(|f| f.vram);
+        let before = claimed.clone();
+        assert_eq!(
+            apply_gap_adoptions(&mut claimed, &check),
+            0,
+            "must not double-claim an occupied range"
+        );
+        assert_eq!(claimed, before);
     }
 
     /// The diagnostic must NAME an uncovered entry and its evidence, so the
