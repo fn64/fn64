@@ -1359,3 +1359,27 @@ its one-cycle count keeps climbing -- those writes happen during boot and do
 not recur in the steady-state attract loop -- whereas the menu run's keeps
 rising throughout. Menu screens use two-cycle continuously; the attract
 plateau does not.
+
+## An unpinned behavior found by the frozen-value sweep (test gap, not a defect)
+
+A proactive sweep for the frozen-value/stale-comment defect shape examined 44
+candidates and cleared 42 of them: the comments were correct, and the values
+they said were unavailable genuinely are. Zero new behavioral defects. Two
+stale comments were corrected, no behavior changed.
+
+One candidate is worth recording rather than filing as clean. The texrect path
+passes a literal `0` for `max_level` (`gbi/stream.rs:1378`) where the triangle
+path passes the latched `tex_max_level`. The value IS available and a sibling
+call site does read it, so this matched the defect shape exactly.
+
+It was cleared on an architectural argument: a texrect names its own tile on
+the RDP wire (`w1 >> 24`), and the texrect path already ignores G_TEXTURE's
+on-bit and tile field, which live in the same word as its level field. Ignoring
+max-level is the consistent choice, not an oversight.
+
+**But that clearing rests on reasoning, not evidence.** Mutating the literal
+`0` to `tex_max_level` passes all 499 `fn64-render-reference` tests -- nothing
+pins the behavior in either direction. If this needs to be defended rather than
+argued, the test to add is a LOD-enabled minified texrect fixture, which would
+distinguish the two readings. Recorded so the next reader inherits the argument
+and its limit together, instead of re-investigating from the same grep hit.
