@@ -358,3 +358,110 @@ Reproduce with `docs/tools/wm2000-run-probe.sh`; judge with
 | probeB | `2500..2510:4000` and B taps at 2600, 2700, 2800 |
 
 Run one or two at a time, never four: see the swap-1901 note above.
+
+## Measured: the frozen frame is NOT a triangle refusal, and not a wrong target
+
+The card above ended by pointing at S1 triangle composition: "a screen whose
+content is drawn entirely from triangles the rasterizer cannot compose would
+look exactly like this". That inference was reasonable when it was written and
+it is **wrong**, measured on the real ROM after the texture rung landed.
+
+`plan_raw_triangle` has eight `return Ok(())` arms that decline to declare a
+write. All eight are silent by design -- the function's own doc says so, and
+that silence is correct for the render path, because a triangle that declares
+nothing behaves exactly as it did before the planner existed. It is useless
+for diagnosis: a frozen frame cannot say which arm it fell into. So each arm
+got a counter (commit `85993520`, diagnostic only, no behaviour change), and
+the probeA lead-in was re-run against them.
+
+### Across 1,600,000 raw-triangle planning decisions, only two outcomes occur
+
+| outcome | count | share |
+|---|---|---|
+| **ADMITTED** | **1,402,856** | **87.7%** |
+| `no_covered_rows` | 197,144 | 12.3% |
+| `depth_bit_set` | **0** | 0% |
+| `no_other_mode` | 0 | 0% |
+| `fill_cycle` | 0 | 0% |
+| `no_color_image` | 0 | 0% |
+| `color_image_format` | 0 | 0% |
+| `no_target_height` | 0 | 0% |
+| `row_outside_rdram` | 0 | 0% |
+
+**The depth hypothesis is refuted outright.** `raw_triangle_is_executable` is
+`!triangle.flags().depth()`, and the depth bit is set on **zero** of 1.6
+million triangles. This agrees with `RT64-TRIANGLE-WRITEBACK.md`'s independent
+finding that exactly one flag combination appears in WM2000's whole stream --
+`s=true t=true d=false`, opcode 0x0e -- and with the five-flat-deltas census
+("Z-variant triangles: still zero"). Depth is not what is blocking this screen,
+and implementing depth would not unblock it.
+
+`no_covered_rows` is not a gap either: it is `covered_rows` returning empty for
+a degenerate, sub-scanline, or fully off-screen triangle, which is the correct
+answer for one. Between tick 1,400,000 and 1,500,000 it did not increment at
+all -- **100,000 consecutive triangles, every one admitted, none refused for
+any reason.**
+
+### The admitted triangles target the buffers that ARE being scanned out
+
+A second instrumented run recorded the `SetColorImage` address each admitted
+triangle declares its rows against. Across 300,000 admitted triangles there are
+exactly **two** destination addresses and no others:
+
+```
+admitted_target 0x0038f800 = 122,838
+admitted_target 0x003c7c00 = 121,414
+```
+
+Those are the same two framebuffers the harness reports alternating in the swap
+rotation (`framebuffer at 0x0038f800` / `at 0x003c7c00`, 216 dumps each in the
+window checked). So the **wrong-target hypothesis is refuted too**: the guest is
+drawing into precisely the buffers the VI displays, split ~50/50 as
+double-buffering requires.
+
+### And the picture is live, not frozen
+
+The card above measured 2,147 frames / **133 distinct** and read that as a
+frozen screen. On the post-texture-rung tree the same lead-in gives, at swap
+1,853: **1,851 frames / 1,118 distinct**, and per 400-swap window:
+
+| swaps | frames | distinct |
+|---|---|---|
+| 0-400 | 397 | 195 |
+| 400-800 | 400 | **397** |
+| 800-1200 | 400 | 325 |
+| 1200-1600 | 400 | 108 |
+| 1600-2000 | 254 | 102 |
+
+An 8.4x increase in distinct frames over the pre-rung baseline. The 400-800
+window is very nearly one distinct frame per swap. The freeze the card
+described was a property of the **pre-texture-rung tree**, and the texture rung
+closed it.
+
+### What this run did NOT establish, stated plainly
+
+**It never reached the plateau.** The run aborted at **VI swap 1901**, before
+swap 2500 where the plateau begins, so the specific 3000-4156 "3 lists per
+field, frame frozen" regime is **not re-measured here** and the claim that it
+too is now unfrozen is **not made**. What is established is that the two
+mechanisms the card proposed for it -- triangle refusal and wrong target -- are
+both false everywhere they could be measured, across 1.6 million triangles.
+
+**The ~1900 abort now has a named cause**, which the card above left open after
+refuting three explanations:
+
+```
+swap #1901
+panicked at fn64-cpu-runtime/src/runtime/host.rs:549:
+lookup: no recompiled function or host shim at vram 0x80120854
+thread caused non-unwinding panic. aborting.
+```
+
+That is `trap_unsupported`, reached through `lookup` -- an indirect dispatch to
+a vram address with no recompiled body and no host shim. It is the **R1/R2
+recompiler gap** (`RT64-WM2000-REMAINING.md` section 2), the same class as
+`osDriveRomInit`, and it is **not a renderer defect at all**. The prior card
+was right that ~1900 "is not a fact about the guest"; it is a fact about which
+function the guest happens to reach, and different input schedules reach it at
+different swaps. Reaching the plateau needs that lookup gap closed, or a lead-in
+that routes around `0x80120854`.
