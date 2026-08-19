@@ -22,28 +22,59 @@ V1/V4/V5/V7 rows are the predecessor to this table),
 
 ## 1. Headline
 
-**Nine pinned divergences. Six are wgpu-side defects — the reference lane
-already implements the behavior — and one of those six sits on WM2000's very
-first frame.**
+**Twenty-one pinned divergences. Fifteen are wgpu-side defects — the reference
+lane already implements the behavior, in five cases citing the very source the
+wgpu side quotes and then declines to act on. One of the fifteen aborts
+WM2000's first frame, and five more sit directly in its measured texrect
+path.**
 
-| Verdict | Count |
-|---|---|
-| **Reference-correct** (wgpu refuses, reference implements) | 6 |
-| **wgpu-correct** (wgpu refuses correctly, or reference over-claims) | 0 |
-| **UNKNOWN** (no evidence in this repo settles it) | 3 |
+| Verdict | Count | Rows |
+|---|---|---|
+| **Reference-correct** (wgpu refuses, reference implements) | 15 | D1–D9, D11–D14, D16, D20 |
+| **wgpu-correct** (wgpu right, reference over-claims) | 0 | — |
+| **UNKNOWN** (no evidence in this repo settles it) | 6 | D10, D15, D17, D18, D19, D21 |
 
-The single largest structural cause is not nine independent bugs: **five of the
-six reference-correct rows trace to one missing datum.** `fn64-render-reference`
-keeps a 195-line per-pixel coverage sidecar
-(`crates/fn64-render-reference/src/backend/hidden_bits.rs`, `RdramHiddenBits`)
-that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
-"coverage this backend does not track" is downstream of that one absence.
+D20 is scored reference-correct on the narrow ground that the *inconsistency*
+is a defect regardless of which table wins; which table wins is D19 and is
+UNKNOWN.
+
+Three structural causes account for eleven of the fifteen. This matters for
+sequencing: they are not eleven independent fixes.
+
+1. **One missing datum.** `fn64-render-reference` keeps a 195-line per-pixel
+   coverage sidecar
+   (`crates/fn64-render-reference/src/backend/hidden_bits.rs`,
+   `RdramHiddenBits`) that `fn64-render-wgpu` does not maintain. Every wgpu
+   refusal naming "coverage this backend does not track" is downstream of that
+   one absence: **D1, D5, D8, D9.**
+2. **Wiring gaps described as capability gaps.** `fn64-render-wgpu`'s own
+   `combiner.rs`, `blend.rs`, `coverage.rs`, and `alpha_compare.rs` already
+   implement behaviors that `targets/texrect.rs` refuses as unimplementable.
+   Four refusal doc comments are factually contradicted by sibling modules in
+   the same crate: **D2, D4, D5, D7.**
+3. **Cite-then-decline.** A doc comment names n64brew, RT64's
+   `TextureDecoder.hlsli`, the SGI RDP Command Summary, or the reference lane,
+   states what the source establishes, and then declares it out of scope:
+   **D3, D6, D11, D14, D17.**
+
+A fourth pattern appears twice and deserves its own name: **wgpu refusing a
+state wgpu itself can produce.** Its TLUT loader deliberately supports wrapping
+bases whose result its TLUT reader then rejects (D13), and its TMEM reader
+handles 4-bit texels its loader will not load (D12).
 
 ---
 
-## 2. The table, ranked by whether WM2000's measured path reaches it
+## 2. The table
 
-### D1 — VI silhouette antialiasing (AA modes 0/1) · **REACHES WM2000: FIRST FRAME**
+Ranked by whether WM2000's measured path reaches it: **Tier A** is proven
+reachable, **Tier B** is plausibly on the path but unmeasured, **Tier C** is
+unreachable today or blocked behind another row.
+
+---
+
+### Tier A — proven to sit in WM2000's measured path
+
+#### D1 — VI silhouette antialiasing (AA modes 0/1) · **REACHES WM2000: FIRST FRAME**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:72`
   (`ViScanoutRefusal::SilhouetteAntialias`), raised at
@@ -68,8 +99,156 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   or 1); this scanout implements only AA mode 3`
   ([`RT64-WM2000-REMAINING.md:25`](RT64-WM2000-REMAINING.md)). This is the
   highest-priority row in the table.
+#### D2 — Two-cycle texture rectangles · **REACHES WM2000: yes, by census**
 
-### D2 — Blender `B = FramebufferAlpha` / destination coverage · **REACHES WM2000: unmeasured, same root cause as D1**
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:369`
+  (`UnsupportedCycleType`), raised at
+  `texrect.rs:1158-1163` in `admitted_cycle_evaluates_combiner`.
+- **reference** `crates/fn64-render-reference/src/backend/validate.rs:131`
+  admits `TwoCycle`; `crates/fn64-render-reference/src/raster/draw.rs:438-441`
+  asserts `OneCycle | TwoCycle`;
+  `crates/fn64-render-reference/src/raster/combiner.rs:65` runs both cycles.
+- **Disagreement.** wgpu's variant doc says two-cycle "needs the `Combined`
+  carry and a second texel, neither of which this executor supplies."
+  **That reason is factually wrong about its own crate.**
+  `crates/fn64-render-wgpu/src/combiner.rs:1021` is a public
+  `run_two_cycle`; the cross-cycle carry is modeled by
+  `CyclePass::SecondOfTwoCycles` (`combiner.rs:815`, `carries_wrap` at
+  `combiner.rs:829`); `Texel1` inputs exist at `combiner.rs:576` and `:633`.
+  The capability is present and unwired.
+- **Which lane is right: REFERENCE.** The refusal's stated cause is
+  contradicted by a sibling module in the same crate. **The refusal site says
+  so itself**: `texrect.rs:1153-1155` records "Measured, not stylistic: while
+  this match was inline, widening it to admit two-cycle left the entire suite
+  green."
+- **WM2000 reach.** The census measured **0 two-cycle texrects of 2,520** in
+  the boot-through-attract window
+  ([`RT64-WM2000-CYCLE-MODES.md`](RT64-WM2000-CYCLE-MODES.md) §1), so this is
+  Tier A on the *texrect path* rather than on a proven two-cycle draw. Read the
+  zero correctly: it means "not seen in boot/logo/attract," never "does not
+  occur." Gameplay has never been reached on either lane.
+
+#### D3 — Fill-cycle texture rectangles · **REACHES WM2000: unmeasured; broke a sibling ROM**
+
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:369`
+  (`UnsupportedCycleType`), same site as D2.
+- **reference** `crates/fn64-render-reference/src/backend/validate.rs:147`
+  (admits Fill, checking only the genuine fill-cycle blender hazard) and
+  `crates/fn64-render-reference/src/backend/imp.rs:911-919`, which executes it
+  as `draw_fill_rectangle(&rectangle.as_fill_cycle_rectangle(), target)`.
+- **Disagreement.** wgpu refuses Fill-cycle texrect because it "samples no
+  texture at all." The reference agrees sampling is bypassed and draws the
+  rectangle anyway, from the fill color register.
+- **Which lane is right: REFERENCE, with a primary source and a regression
+  witness.** The reference's comment
+  (`validate.rs:133-140`) quotes **n64brew's RDP command table, Texture
+  Rectangle section**, verbatim: *"In FILL mode this behaves identically to
+  Fill Rectangle, the texturing properties are ignored."* It further records
+  that refusing this **aborted a real WCW/nWo Revenge frame** — a shipped
+  AKI-engine sibling of WM2000. wgpu's variant doc
+  (`texrect.rs:365-368`) offers only a WM2000 measurement showing zero Fill
+  texrects in one window: an absence-of-evidence argument that does not
+  contradict spec text.
+- **WM2000 reach.** UNKNOWN for WM2000 itself; **proven** for its engine
+  sibling. Listed in Tier A because the failure mode is already witnessed on
+  the same engine.
+
+#### D4 — Combiner inputs the executor refuses but its own combiner implements · **REACHES WM2000: yes, texrects are its entire title path**
+
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:376` / `:381`
+  (`UnsupportedColorInput` / `UnsupportedAlphaInput`). The admitted set is
+  `ADMITTED_COLOR_INPUTS` / `ADMITTED_ALPHA_INPUTS`
+  (`texrect.rs:750-766`) — only `Texel0`, `Primitive`, `Environment`, `One`,
+  `Zero`. Raised at `texrect.rs:821` and `:836`.
+- **reference** `crates/fn64-render-reference/src/raster/combiner.rs:119-147`
+  (`color_input`, all 21 `ColorSource` variants) and `:149-162` (`alpha_input`,
+  all 10). Rect-specific gating at
+  `crates/fn64-render-reference/src/backend/validate.rs:476-489`.
+- **Disagreement.** The reference refuses **only** `Shade`/`ShadeAlpha`,
+  `Combined` in cycle 0, and `Texel1` with no decoded tile+1. It implements
+  `Texel1`, `Texel0Alpha`, `PrimitiveAlpha`, `EnvironmentAlpha`,
+  `LodFraction`, `PrimLodFrac`, `K4`, `K5`, `KeyCenter`, `KeyScale`, `Noise`,
+  and cycle-1 `Combined`. wgpu refuses all twelve — **and
+  `crates/fn64-render-wgpu/src/combiner.rs:574-641` implements every one of
+  them.**
+- **Which lane is right: REFERENCE**, for all twelve. `Shade`/`ShadeAlpha` is
+  excluded from this row and is genuine agreement (see §3).
+- **WM2000 reach.** WM2000's title path is texrects — 2,520 in the measured
+  window, all one-cycle
+  ([`RT64-WM2000-CYCLE-MODES.md`](RT64-WM2000-CYCLE-MODES.md) §1). The census
+  records only three distinct combiner programs with `Shade`/`Texel1`/
+  `Combined` unread, so the *measured* programs stay inside the admitted set.
+  Any program outside it aborts, and the window has never reached gameplay.
+
+#### D5 — Blender `blend_enabled` derivation · **REACHES WM2000: same texrect path as D4**
+
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:498`
+  (`BlendEnabledNotDerivable`), raised at `texrect.rs:1583`.
+- **reference** `crates/fn64-render-reference/src/raster/coverage.rs:68-69` —
+  `blend_enabled = force_blend() || (antialias_enabled() && !wraps)`, with
+  `wraps` read from real memory coverage.
+- **Disagreement.** wgpu refuses the `FORCE_BL`-clear + `AA_EN`-set case as
+  underivable. The reference computes it exactly.
+  `crates/fn64-render-wgpu/src/coverage.rs:148` computes the identical
+  expression already; it is gated only on the missing coverage source (D1's
+  sidecar).
+- **Which lane is right: REFERENCE — and wgpu's own doc comment cites
+  `fn64-render-reference/src/raster/coverage.rs:68-69` as the authority, then
+  declines to follow it.**
+- **WM2000 reach.** Same texrect path as D4; the specific mode bits are
+  unmeasured because the census does not decode `G_RDPSETOTHERMODE` payloads.
+
+#### D6 — RGBA4 / RGBA8 aliasing to I4 / I8 · **REACHES WM2000: unmeasured; cite-then-decline**
+
+- **wgpu** `crates/fn64-render-wgpu/src/tmem/texel.rs:510`
+  (`DirectTexelDecodeError::UnsupportedPair`), reached by `(Rgba, Bits4)` and
+  `(Rgba, Bits8)`. Pinned at `crates/fn64-render-wgpu/src/tmem/read.rs:797-806`.
+- **reference** `crates/fn64-render-reference/src/gbi/state.rs:962-963` and
+  `crates/fn64-render-reference/src/gbi/tmem.rs:459-465`.
+- **Disagreement.** wgpu treats RGBA at 4 and 8 bits as an unsupported pair.
+  The reference aliases both to the intensity decoders, exactly as hardware
+  does.
+- **Which lane is right: REFERENCE, decisively. This is the sharpest
+  cite-then-decline in the audit.** wgpu's module header
+  (`tmem/texel.rs:41-49`) names the RT64 lines, states what they establish, and
+  then declines: *"`sampleTMEM4b`/`sampleTMEM8b`/… select `I*ToFloat4` for
+  `G_IM_FMT_I` and reuse it for `G_IM_FMT_RGBA` at 4/8 bit, citing hardware
+  observation rather than a distinct real format; that RGBA/I aliasing at 4/8
+  bit is out of scope here."* Verified against upstream in this audit: RT64's
+  `sampleTMEM4b`
+  (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/TextureDecoder.hlsli:51-52`)
+  falls `G_IM_FMT_RGBA` through to `sampleTMEMI4` under its own comment
+  *"Not a real format. Replicated by observing hardware behavior."* The
+  reference cites the same lines **and** an observed OoT 250-swap C-boot trace
+  that exercises the pair (`gbi/tmem.rs:461-463`), then implements it.
+- **WM2000 reach.** UNKNOWN. The census records no tile-format operand data.
+
+#### D7 — Alpha-dither refused by citing the *other* module's disagreement · **REACHES WM2000: same texrect path**
+
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:460`
+  (`OrderedDitherAuthorityUnsettled`), raised at `texrect.rs:1424` for the
+  **alpha-dither** stage.
+- **reference** `crates/fn64-render-reference/src/raster/blend.rs:82-95`
+  (`apply_alpha_dither` and its substitution rule).
+- **Disagreement.** The refusal declines the alpha-dither stage on the grounds
+  that the RT64 and reference Bayer tables disagree — a disagreement that lives
+  in `rgb_dither.rs` (the *RGB* stage). But
+  `crates/fn64-render-wgpu/src/alpha_compare.rs:174-176` holds a second Bayer
+  table that is **byte-identical to the reference's**, and `apply_alpha_dither`
+  (`alpha_compare.rs:204-227`) is a declared literal port of the reference. For
+  the stage actually being refused, wgpu already agrees with the reference
+  cell-for-cell.
+- **Which lane is right: REFERENCE.** The cited authority conflict does not
+  apply to the stage it is being used to refuse. This is distinct from D17,
+  which is the genuine unresolved table question.
+- **WM2000 reach.** Same texrect path as D4.
+
+
+---
+
+### Tier B — plausibly on WM2000's path, reach unmeasured
+
+#### D8 — Blender `B = FramebufferAlpha` / destination coverage · **REACHES WM2000: unmeasured; same root cause as D1**
 
 - **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:470`
   (`DestinationCoverageUnavailable`) and `:486`
@@ -87,8 +266,7 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
 - **WM2000 reach.** UNKNOWN. The census counts opcodes and does not decode
   `G_RDPSETOTHERMODE` payload bits, so no evidence shows WM2000 selecting a
   coverage-consuming blend mode. Absence in the census window is not absence.
-
-### D3 — VI divot filter · **REACHES WM2000: unmeasured**
+#### D9 — VI divot filter · **REACHES WM2000: unmeasured**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:82`
   (`ViScanoutRefusal::Divot`), raised at `vi_scanout.rs:337`.
@@ -104,10 +282,135 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   changing exactly twelve componentwise-median pixels
   ([`BASE-RENDERER-BEHAVIOR-MATRIX.md:54`](BASE-RENDERER-BEHAVIOR-MATRIX.md)).
   Note the coverage gate makes this partly downstream of D1's missing sidecar.
-- **WM2000 reach.** UNKNOWN. Whether WM2000 latches VI filters beyond D1 has
-  never been measured; the run aborts at D1 before reaching the divot check.
+- **WM2000 reach.** UNKNOWN. Whether WM2000 latches any VI filter beyond D1
+  has never been measured; the run aborts at D1 before reaching the divot
+  check.
+#### D10 — `G_AC_DITHER` alpha compare · **REACHES WM2000: same texrect path**
 
-### D4 — VI `osViFade` two-row interpolation · **REACHES WM2000: unmeasured**
+- **wgpu** `crates/fn64-render-wgpu/src/targets/texrect.rs:446`
+  (`NoiseThresholdUnavailable`), raised at `texrect.rs:1381` and `:1812`.
+- **reference** `crates/fn64-render-reference/src/raster/blend.rs:113` —
+  `alpha * 256 > noise.byte() * 255`, cited to Programming Manual §15.5.4.
+  Noise source at `crates/fn64-render-reference/src/raster/mod.rs:83-109`.
+- **Disagreement.** The reference implements `G_AC_DITHER` and draws; wgpu
+  refuses for want of an authoritative noise sequence.
+  `crates/fn64-render-wgpu/src/alpha_compare.rs:129` already implements the
+  identical arithmetic and lacks only the feed.
+- **Which lane is right: UNKNOWN on the noise *byte*; REFERENCE on whether to
+  draw at all.** Neither lane claims silicon authority for the sequence — the
+  reference says so explicitly (`raster/mod.rs:88-90`, "deliberately not
+  described as the silicon sequence") and wgpu quotes that accurately. The
+  asymmetry worth naming: wgpu **already accepts** the "bounded endpoint"
+  argument for `NOISE_DITHER_THRESHOLD` (`texrect.rs:1298`) and declines to
+  accept it here, where the same bounding does not hold. That makes this the
+  most defensible refusal in the table, and it is not scored as a wgpu defect.
+- **WM2000 reach.** Same texrect path as D4.
+
+#### D11 — YUV: refused at four layers, fully implemented by the reference · **REACHES WM2000: unmeasured**
+
+- **wgpu refuses at four independent layers.**
+  `crates/fn64-render-wgpu/src/tmem/texel.rs:509`
+  (`YuvConversionDeferred`, decode);
+  `crates/fn64-render-wgpu/src/tmem/wire.rs:631-634` ("YUV destination
+  execution is deferred pending a public pairing contract", so no transfer plan
+  is ever built); `crates/fn64-render-wgpu/src/tmem/types.rs:1116-1118`
+  (`transfer_plan()` errors on `DeferredYuv`); and
+  `crates/fn64-render-wgpu/src/tmem/execute/packet.rs:147-152`, where a YUV
+  load **rejects the entire packet**, including the non-YUV loads sharing it.
+- **reference implements the complete contract.**
+  `crates/fn64-render-reference/src/gbi/state.rs:780-802` (`write_yuv_pair`:
+  chroma U/V in the low 2 KiB, luma Y0/Y1 at `low + TMEM_HALF_BYTES`);
+  `:884-897` (`TmemTexture::sample` YUV16, `high + (x & 1)` luma selection);
+  `crates/fn64-render-reference/src/gbi/tmem.rs:202-229` (YUV `G_LOADTILE`,
+  even-S/even-width validated); `:285-318` (YUV `G_LOADBLOCK` with DXT
+  stepping); `:430-442` (direct texrect YUV16 decode, cited to the **SGI RDP
+  Command Summary, Set Tile / Load Tile** notes). Tests at
+  `crates/fn64-render-reference/src/gbi/tests/group4.rs:1015-1030`,
+  `:118-132`, `:946-961`.
+- **Disagreement.** wgpu's refusal rests on "a public pairing contract" not
+  existing. It does exist — in the sibling lane, with a primary-source citation
+  and byte-exact tests.
+- **Which lane is right: REFERENCE.** Note also the blast radius: wgpu's packet
+  layer fails *neighbouring* loads over this, which is a second defect
+  independent of the YUV question.
+- **WM2000 reach.** UNKNOWN. WM2000's known tiles are IA4 under `G_TT_RGBA16`
+  and RGBA16; no YUV has been observed, in a window that has never reached
+  gameplay.
+
+#### D12 — Direct four-bit TMEM loads · **REACHES WM2000: plausible — IA4 tiles are measured**
+
+- **wgpu** `crates/fn64-render-wgpu/src/tmem/execute/load_tile.rs:323`
+  (`LoadTileExecutionError::DirectFourBit`, message at `:455`), and
+  `crates/fn64-render-wgpu/src/tmem/wire.rs:776-778`, `:793-796` — *"direct
+  four-bit TMEM loads are unsupported; load through a public 16-bit form."*
+- **reference** `crates/fn64-render-reference/src/gbi/tmem.rs:127-130`
+  (`source_texel` 4-bit via `packed_nibble`), `:154`
+  (`assert_texture_source_range` 4-bit byte count), `:232-249` (the generic
+  LoadTile loop passes `timg_siz` through unchanged, so 4-bit works), and
+  `crates/fn64-render-reference/src/gbi/state.rs:757-759` (`write_texel`
+  `G_IM_SIZ_4B` → `write_nibble` with per-nibble validity masking).
+- **Disagreement.** wgpu has no 4-bit load path and directs callers to reshape
+  the load. The reference does 4-bit source addressing and nibble-granular TMEM
+  writes with exactly the partial-validity mask wgpu says it lacks.
+- **Which lane is right: REFERENCE.** The asymmetry is *inside* wgpu: its
+  **reader** already handles `Bits4` correctly
+  (`crates/fn64-render-wgpu/src/tmem/read.rs:506-521`, `unpack_ci4_texel`).
+  Only the load side refuses.
+- **WM2000 reach.** Elevated. WM2000's measured tiles include **IA4 under
+  `G_TT_RGBA16`** — a 4-bit format. Whether those tiles arrive by a direct
+  4-bit load or a 16-bit-form load is not recorded by the census, so reach is
+  plausible but unproven.
+
+#### D13 — `NonCanonicalTlutEntry`: a write-side convention enforced as a read-side precondition · **REACHES WM2000: plausible — TLUT is on its path**
+
+- **wgpu** `crates/fn64-render-wgpu/src/tmem/read.rs:578-611`
+  (`read_canonical_tlut_entry`) requires **all eight bytes valid**
+  (`:589-593`, `IncompleteTlutEntry`) **and all four 16-bit lanes equal**
+  (`:601-606`, `NonCanonicalTlutEntry`).
+- **reference** `crates/fn64-render-reference/src/gbi/state.rs:854-877`
+  (`read_tlut`) reads **lane 0 only** — two bytes at
+  `TMEM_HALF_BYTES + index * 8` and `+1` — and never inspects lanes 1-3.
+- **Disagreement, stated precisely.** The reference *writer* does quadricate
+  (`state.rs:841-852`, four banks), but its *reader* imposes no cross-lane
+  agreement and no eight-byte validity requirement. wgpu promotes the write
+  convention into a read precondition.
+- **Which lane is right: REFERENCE on `NonCanonicalTlutEntry`.** The decisive
+  point is an internal inconsistency: wgpu's own
+  `crates/fn64-render-wgpu/src/tmem/execute/load_tlut.rs:811-822` deliberately
+  supports arbitrary wrapping TLUT bases (base 511 across the bank), which
+  produces exactly the unequal lanes `read.rs` then hard-refuses. **wgpu can
+  write a state it will not read.** wgpu's own header concedes the refusal is
+  not authority-backed (`read.rs:10-13`: "a conservative admitted subset;
+  partial/unequal sample-lane behavior remains deferred to hardware
+  measurement"). For `IncompleteTlutEntry` the two lanes differ only in
+  strictness (reference traps on 2 invalid bytes, wgpu on 8) — same class,
+  wgpu strictly broader; that half is **UNKNOWN**, not a defect.
+- **WM2000 reach.** Elevated. WM2000 measurably runs tiles under
+  `G_TT_RGBA16`, so the TLUT read path is live. Whether any of its TLUT state
+  is non-canonical is unmeasured.
+
+#### D14 — `EnabledCiSourceOutsideLowHalf`: a low-half constraint neither lane's sources impose · **REACHES WM2000: plausible — TLUT is on its path**
+
+- **wgpu** `crates/fn64-render-wgpu/src/tmem/read.rs:493-500` — a CI read under
+  an enabled TLUT whose first physical byte is at or above
+  `TMEM_HIGH_HALF_BASE` is refused. Pinned at `read.rs:857-861` (a CI8 tile at
+  `tmem: 256` under `Rgba16`).
+- **reference** `crates/fn64-render-reference/src/gbi/state.rs:806-838`
+  (`read_texel`) applies a low-half constraint **only** for `G_IM_SIZ_32B`
+  (`:826-827`); the 4/8/16-bit arms address `base + x` across all 4 KiB.
+  `state.rs:883-966` (`sample`) applies none on the TLUT-enabled path.
+- **Disagreement.** wgpu restricts the *index source* to low-half TMEM. The
+  reference's only low-half rules are for RGBA32 (`state.rs:766-767`,
+  `:826-827`) and YUV (`:790-791`) — both genuine split-bank formats. A CI tile
+  is not a split-bank format.
+- **Which lane is right: REFERENCE on the divergence; UNKNOWN on hardware.**
+  wgpu's header calls this "the canonical low-half source … frozen by
+  M4.3.3b" — a self-citation, not a hardware citation. Neither lane cites a
+  measurement of what silicon does with a high-half CI tile, so this row is
+  scored reference-correct on *provenance* (one lane invents a constraint, the
+  other does not) while the silicon answer stays open.
+- **WM2000 reach.** Elevated, same reasoning as D13.
+#### D15 — VI `osViFade` two-row interpolation · **REACHES WM2000: unmeasured**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:92`
   (`ViScanoutRefusal::Fade`), raised at `vi_scanout.rs:322-324`.
@@ -119,20 +422,28 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   behavior with a published two-row rule; the reference implements it and names
   its one real precondition. wgpu names no precondition — it refuses the whole
   feature.
-- **WM2000 reach.** UNKNOWN, same reason as D3.
+- **WM2000 reach.** UNKNOWN, same reason as D9.
 
-### D5 — VI `osViRepeatLine` · **REACHES WM2000: unmeasured**
+---
+
+### Tier C — unreachable today, or blocked behind another row
+
+The VI rows here (D16–D18) are ordered behind D1 in
+`admitted_filters` (`crates/fn64-render-wgpu/src/vi_scanout.rs:315-345`), so
+the run aborts on silhouette AA before it ever evaluates them; D19–D21 are
+gated behind an unresolved authority question or another row's refusal.
+
+#### D16 — VI `osViRepeatLine` · **REACHES WM2000: unmeasured**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:94`
   (`ViScanoutRefusal::RepeatLine`), raised at `vi_scanout.rs:325-327`.
 - **reference** `crates/fn64-render-reference/src/vi.rs:71-72`.
-- **Disagreement.** Identical shape to D4 — wgpu refuses, the reference
+- **Disagreement.** Identical shape to D15 — wgpu refuses, the reference
   implements the row-repeat.
 - **Which lane is right: REFERENCE.** This is the smallest item in the table:
   the reference's implementation is a single branch.
-- **WM2000 reach.** UNKNOWN, same reason as D3.
-
-### D6 — VI gamma dither · **REACHES WM2000: unmeasured**
+- **WM2000 reach.** UNKNOWN, same reason as D9.
+#### D17 — VI gamma dither · **REACHES WM2000: unmeasured**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:90`
   (`ViScanoutRefusal::GammaDither`).
@@ -152,9 +463,9 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   correct here — but it is the workspace's declared policy, RT64's native lane
   ports the same mechanism (`vi-gamma-dither:v1`), and wgpu's refusal reason
   cites an unavailability that is factually not the case.
-- **WM2000 reach.** UNKNOWN, same reason as D3.
+- **WM2000 reach.** UNKNOWN, same reason as D9.
 
-### D7 — VI gamma curve · **UNKNOWN**
+#### D18 — VI gamma curve · **UNKNOWN**
 
 - **wgpu** `crates/fn64-render-wgpu/src/vi_scanout.rs:86`
   (`ViScanoutRefusal::Gamma`): "The silicon gamma ROM is not publicly
@@ -171,11 +482,10 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   [a] silicon-identical claim" (`vi.rs:3-7`). Neither lane claims hardware
   fidelity. This is a policy split (produce a documented approximation vs.
   refuse), not a correctness defect, and no evidence in this repo settles it.
-  **Distinguish this row from D3/D4/D5**, where the mechanism *is* publicly
+  **Distinguish this row from D9/D15/D16**, where the mechanism *is* publicly
   specified and only wgpu declines to implement it.
-- **WM2000 reach.** UNKNOWN, same reason as D3.
-
-### D8 — Bayer dither tile phase: RT64 vs reference · **UNKNOWN**
+- **WM2000 reach.** UNKNOWN, same reason as D9.
+#### D19 — Bayer dither tile phase: RT64 vs reference · **UNKNOWN**
 
 - **wgpu** `crates/fn64-render-wgpu/src/rgb_dither.rs:17-47` (module header,
   "Matrix cross-check against the existing reference oracle (frontier)") and
@@ -205,8 +515,7 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
 - **WM2000 reach.** UNKNOWN — recorded as V4 in
   [`RT64-WM2000-REMAINING.md`](RT64-WM2000-REMAINING.md) with reach also
   unknown.
-
-### D9 — `fn64-render-wgpu` disagrees with *itself* on the Bayer table · **INTRA-CRATE, one-line fix candidate**
+#### D20 — `fn64-render-wgpu` disagrees with *itself* on the Bayer table · **INTRA-CRATE, one-line fix candidate**
 
 - **site A** `crates/fn64-render-wgpu/src/alpha_compare.rs:176` — `BAYER` is
   `[[0,4,1,5],[6,2,7,3],[1,5,0,4],[7,3,6,2]]`, the **reference** table, ported
@@ -223,14 +532,30 @@ that `fn64-render-wgpu` does not maintain. Every wgpu refusal that names
   alpha-dither path and the RGB-dither path are required to read the **same**
   tile. Today they read different ones whenever Bayer is selected. At most one
   can be right, and they cannot both be right simultaneously.
-- **Which lane is right: UNKNOWN which *table* is right (that is D8), but the
-  *inconsistency* is unambiguously a defect.** Unlike D8 this needs no hardware
+- **Which lane is right: UNKNOWN which *table* is right (that is D19), but the
+  *inconsistency* is unambiguously a defect.** Unlike D19 this needs no hardware
   evidence to act on: whichever table wins, both sites must use it.
-- **WM2000 reach.** Gated behind D8's `OrderedDitherAuthorityUnsettled` refusal
-  in the texrect path, so unreachable today. It becomes live the moment D8 is
+- **WM2000 reach.** Gated behind D19's `OrderedDitherAuthorityUnsettled`
+  refusal in the texrect path, so unreachable today. It becomes live the moment
+  D19 is
   resolved — which is exactly when a silent wrong answer would ship.
 
 ---
+
+#### D21 — Disabled-TLUT CI4: wgpu implements *more* than the reference · **reverse direction**
+
+- **wgpu** `crates/fn64-render-wgpu/src/tmem/texel.rs:377` aliases the
+  normalized index to I8 on the TLUT-**disabled** CI4 path and returns a color.
+- **reference** `crates/fn64-render-reference/src/gbi/state.rs:957-960` still
+  routes to `tlut_color`, which **panics** on mode 0.
+- **Disagreement.** This is the only row where wgpu is the broader lane. The
+  two will disagree on output for disabled-TLUT CI4: wgpu returns a color,
+  the reference aborts.
+- **Which lane is right: UNKNOWN.** No source in this repo establishes the
+  hardware behavior of a CI4 tile with the TLUT off. Recorded because it is a
+  real behavioral split that this audit's search pattern would otherwise miss,
+  and because a future convergence pass must decide it in one direction.
+- **WM2000 reach.** UNKNOWN.
 
 ## 3. Refusals checked and found to be genuine agreement
 
@@ -254,6 +579,37 @@ same stated reason. Listed so a later lane does not re-audit them.
   duplicates the reference's `filter_three_nearest_s10_5`
   (`gbi/types.rs:954-972`) literally, only because that function is
   `pub(super)` and not cross-crate reachable. Same arithmetic, no disagreement.
+- **`UnsupportedIndexSize` at 32-bit under an enabled TLUT.** Both lanes refuse,
+  for the same stated reason, near-verbatim: wgpu
+  (`crates/fn64-render-wgpu/src/tmem/texel.rs:344-348`, `:374`) says the index
+  byte "would have to be re-derived against the RGBA32 low/high bank split";
+  the reference (`crates/fn64-render-reference/src/gbi/state.rs:934-941`, test
+  `gbi/tests/group4.rs:1277-1295`) argues the same. Converged — but note that
+  because the *reason* is shared, a future fix must land on both lanes.
+- **`ReservedAlphaCompare`** (`targets/texrect.rs:476`). The reference panics on
+  the same reserved encoding (`raster/blend.rs:8`, `:116`). wgpu's typed error
+  is the better shape; the behavior agrees.
+- **`InvalidTexelByte`** (`tmem/read.rs:309`). The reference has the identical
+  uninitialized-TMEM trap (`gbi/state.rs:726-737`, matching panic text at
+  `gbi/tests/group4.rs:943`). Converged. *This is the current all-Rust
+  blocker's error type and it is **not** a lane divergence* — another lane owns
+  the coverage bug behind it.
+- **`Rgba32BaseOutsideLowHalf`** (`tmem/read.rs:310`). The reference asserts the
+  same low-half rule for 32-bit (`gbi/state.rs:826-827`). Converged — and it is
+  the contrast that makes D14's CI-tile constraint stand out as invented.
+- **`PackedByteMustBeBits8`, `EntryMustBeBits16`, `IndexedDecodeIsSeparate`,
+  `Ci4PaletteError`.** Internal type-narrowing preconditions on already-isolated
+  values, not behavior refusals. No reference counterpart exists to disagree
+  with.
+- **`NonIntegralTexcoord` / `TexcoordOutOfRange`** (`targets/texrect.rs:402`,
+  `:406`). Artifacts of wgpu's `f32`-to-S10.5 recovery in
+  `try_from_viewport_and_texcoords`. The reference takes `rect.s`/`rect.t`
+  already decoded and interpolates in `f32`
+  (`raster/draw.rs:494-496`), so it never performs the recovery. **Different
+  input contracts, no shared behavior to disagree about** — not scored.
+- **`UnsetConstantRegister`** (`targets/texrect.rs:389`). No reference
+  counterpart: the reference carries registers in `CombinerState` and never
+  defaults them, so there is nothing to contradict.
 - **VI five-bit channel expansion, `HeldLast` edge, `interpolate_u2_10`,
   `AxisSample` split, dither restoration** (`vi_scanout.rs:196-197`, `225-226`,
   `783-784`, `830-831`, `738-740`). All cite the reference and match it; the
@@ -271,35 +627,66 @@ same stated reason. Listed so a later lane does not re-audit them.
 
 ## 5. Named for a follow-up lane
 
-Ranked by evidence quality, not size. **Nothing here was changed by this
-audit.**
+Ranked by evidence quality against cost, not by size. **Nothing here was
+changed by this audit** — each needs its own verification pass.
 
-1. **D9** — the intra-crate Bayer inconsistency. The only row that needs no new
-   evidence to be worth acting on, because the two sites must agree regardless
-   of which table wins.
-2. **D6** — wgpu's `GammaDither` refusal cites a generator it "does not own"
-   that is public in `fn64-render::vi_public_filters` and already imported one
-   line away. At minimum the refusal text is wrong and should be corrected even
-   if the refusal stands.
-3. **D5** — `osViRepeatLine`, one branch in the reference.
-4. **D1** — the highest-value row and the largest: it needs the hidden-bits
-   sidecar, which also unblocks D2 and D3.
+1. **D2 — widen `admitted_cycle_evaluates_combiner` to admit two-cycle.** The
+   strongest one-line candidate in the table. `run_two_cycle` already exists
+   and is public (`combiner.rs:1021`), and the refusal site itself records
+   that "widening it to admit two-cycle left the entire suite green"
+   (`targets/texrect.rs:1153-1155`). A follow-up lane still owes a test that
+   *fails* before the widening — a green suite proves nothing was broken, not
+   that anything was fixed.
+2. **D20 — the intra-crate Bayer inconsistency.** The only row that needs no
+   new hardware evidence to be worth acting on, because the two sites must
+   agree regardless of which table wins.
+3. **D3 — Fill-cycle texrect.** One match arm, an n64brew quote, and a
+   witnessed WCW/nWo Revenge abort. The reference's route
+   (`as_fill_cycle_rectangle` into the existing fill rasterizer) is already
+   the shape to copy.
+4. **D17 — correct the `GammaDither` refusal text at minimum.** It cites a
+   generator it "does not own" that is public in
+   `fn64-render::vi_public_filters` and already imported one line away
+   (`vi_scanout.rs:55`). Even if the refusal stands, the stated reason is
+   wrong.
+5. **D16 — `osViRepeatLine`,** one branch in the reference.
+6. **D1 — the highest-value row and the largest.** It needs the hidden-bits
+   sidecar, which also unblocks D5, D8 and D9. Not a one-liner; it is the item
+   that actually gets WM2000 past its first frame.
+
+**Not recommended as quick fixes**, despite appearing in the reference-correct
+column: D4 (twelve combiner inputs, each needing its own evidence), D11 (YUV, a
+four-layer contract), and D13/D14 (both require deciding what wgpu's loader
+should be allowed to produce before changing what its reader accepts).
 
 ## 6. What this audit could not establish
 
-- **Which Bayer tile is the RDP's** (D8). Not settled by `gbi.h`, not settled by
+- **Which Bayer tile is the RDP's** (D19). Not settled by `gbi.h`, not settled by
   RT64 (RT64 *is* one of the two disputants), and no parallel-RDP checkout
   exists on this machine. Prior lanes' notes cite parallel-RDP second-hand only;
   that is recorded here as second-hand and was not used as evidence.
 - **Whether WM2000 latches any VI filter beyond D1.** The run aborts at the
-  first present, so D3–D7 have never been reached. The census decodes opcodes,
+  first present, so D9 and D15–D18 have never been reached. The census decodes
+  opcodes,
   not `G_RDPSETOTHERMODE` payload bits or VI STATUS, so it cannot answer this
   either.
-- **Whether WM2000 selects a coverage-consuming blend mode** (D2). Same census
+- **Whether WM2000 selects a coverage-consuming blend mode** (D8). Same census
   limitation.
 - **The `RT64-WM2000-CENSUS.md` window caveat applies to every "unmeasured" row
   above.** Those counts describe a 219-decode-entry window since superseded
   twice (to 2,219 then 5,792 entries). An absence there means "not seen in
   boot/logo/attract" and never "does not occur"; that misreading already caused
   one wrong refusal.
+- **What silicon does with a high-half CI tile** (D14). Neither lane cites a
+  measurement. The row is scored on provenance — one lane invents a constraint,
+  the other does not — and the hardware answer stays open.
+- **What silicon does with a disabled-TLUT CI4 tile** (D21). The two lanes
+  actively disagree in output (wgpu returns a color, the reference panics) and
+  nothing here settles it.
+- **Whether unequal TLUT sample lanes are readable** (D13). wgpu's own header
+  concedes the question is "deferred to hardware measurement"
+  (`tmem/read.rs:10-13`).
+- **The RDP's per-pixel random sequence** (D10, and D19's noise arm). Both
+  lanes state plainly that their generators are policies, not silicon. This is
+  a permanent caveat, not a gap to close.
 - **No hardware comparison has ever been made** for any row in this table.
