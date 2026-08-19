@@ -135,20 +135,20 @@ pub struct RetrievedTriangleDraw {
     /// retrieval time; blend-cycle's `BlendColorInput::Blend`/
     /// `BlendAlphaInput`-independent gate at draw-submission time) rather
     /// than this struct duplicating one register behind two fields.
-    pub blend_color: Option<Color4>,
+    pub blend_color: Color4,
     /// `G_SETENVCOLOR` current at this triangle's own stream position --
     /// mirrors `blend_color`'s same command-time-snapshot pattern,
     /// unconditionally tracked.
-    pub env_color: Option<Color4>,
+    pub env_color: Color4,
     /// `G_SETPRIMCOLOR` current at this triangle's own stream position --
     /// mirrors `env_color` exactly.
-    pub prim_color: Option<PrimColor>,
+    pub prim_color: PrimColor,
     /// `G_SETFOGCOLOR` current at this triangle's own stream position --
     /// mirrors `blend_color`/`env_color`/`prim_color` exactly. Needed by
     /// the production blend-cycle wiring whenever a resolved cycle's `P`/
     /// `M` selects [`crate::blend::BlendColorInput::Fog`] or its `A`
     /// selects [`crate::blend::BlendAlphaInput::Fog`].
-    pub fog_color: Option<Color4>,
+    pub fog_color: Color4,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -179,17 +179,17 @@ pub struct TriangleDrawStateCollector {
     /// `G_SETBLENDCOLOR` current at the walk's current stream position --
     /// mirrors `current_other_mode`/`current_combine` exactly, a fourth
     /// instance of the same command-time-snapshot pattern (card §4a).
-    current_blend_color: Option<Color4>,
+    current_blend_color: Color4,
     /// `G_SETENVCOLOR` current at the walk's current stream position --
     /// mirrors `current_blend_color`, unconditionally tracked (no
     /// `AlphaCompare` gate).
-    current_env_color: Option<Color4>,
+    current_env_color: Color4,
     /// `G_SETPRIMCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color` exactly.
-    current_prim_color: Option<PrimColor>,
+    current_prim_color: PrimColor,
     /// `G_SETFOGCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color`/`current_prim_color` exactly.
-    current_fog_color: Option<Color4>,
+    current_fog_color: Color4,
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -232,11 +232,13 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                              this pipeline (no frame-count uniform exists to seed it honestly; \
                              see fn64-alpha-compare-production-card.md \u{a7}2)"
                         ),
-                        AlphaCompare::Threshold => {
-                            self.current_blend_color
-                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?;
-                        }
-                        AlphaCompare::None => {}
+                        // `Threshold` compares fragment alpha against
+                        // `G_SETBLENDCOLOR.a`, a register that always holds
+                        // a value (zero until written), so there is nothing
+                        // to refuse -- see the twin gate in
+                        // `production.rs` and `RdpState`'s constant-color
+                        // field doc for the citations.
+                        AlphaCompare::Threshold | AlphaCompare::None => {}
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
@@ -263,19 +265,19 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         Some(CombineParams::from_wire(combine.low, combine.high));
                 }
                 RdpStateCommand::SetBlendColor { color, .. } => {
-                    self.current_blend_color = Some(Color4::from_wire(color.value));
+                    self.current_blend_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetEnvColor { color, .. } => {
-                    self.current_env_color = Some(Color4::from_wire(color.value));
+                    self.current_env_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetPrimColor { color, .. } => {
-                    self.current_prim_color = Some(PrimColor::from_wire(
+                    self.current_prim_color = PrimColor::from_wire(
                         u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
                         color.color,
-                    ));
+                    );
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
-                    self.current_fog_color = Some(Color4::from_wire(color.value));
+                    self.current_fog_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
