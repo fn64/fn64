@@ -175,24 +175,34 @@ the very evidence a plateau claim rests on.** What separated them was a solo
 run of the same script reaching swap 2397 without incident. `WM2000_TRACE_PATH`
 gives each run its own sink.
 
-**Swap 1901 recurs with per-run trace paths, and the cause is still open.** A
-later wave with separate sinks aborted at swap 1901 in all four runs. Host
-memory looked like the answer -- three traces were *byte-identically*
-61,940,485 bytes where the successful wave reached ~142 MB per run -- but
-halving the concurrency to two runs did not help: all four of those aborted at
-swap 1901 too. **So the memory explanation is not established, and is recorded
-here as tried and insufficient rather than as a finding.**
+**The ~1900 abort is nondeterministic, and three explanations for it were
+tried and refuted.** Four experiments, each killing the explanation before it:
 
-What is solid is the negative: **swap 1901 is not a fact about the guest.** The
-same lead-in reached swap 2397 solo and swaps 4156-4431 in the four wave-1 runs
-that completed, so nothing in the ROM stops there. What separates the waves that
-complete from the waves that abort is not yet identified. Until it is, treat any
-run ending at 1901 as an infrastructure result, and confirm a plateau claim with
-a run that got past it.
+| Hypothesis | Test | Result |
+|---|---|---|
+| Shared trace file | Give each run its own `WM2000_TRACE_PATH` | Still aborts |
+| Host memory under 4-way concurrency | Halve to two concurrent runs | Still aborts |
+| Concurrency at all | Run one alone | **Still aborts, swap 1901** |
+| The trace sink itself | `WM2000_NO_TRACE=1` | **Still aborts, swap ~1855** |
 
-The abort itself is always the same shape -- a coroutine unwound through the
-`extern "C"` `_osRecvMesg_recomp` during `Executor` drop, which cannot unwind --
-so it is a teardown failure, and the frames written before it are still valid.
+The last two are the decisive ones. A *solo* run aborts, so it is not
+contention. A run with the trace sink entirely disabled aborts, so it is not the
+sink -- and the suspicious detail that made memory look right (three traces
+stopping at a byte-identical 61,940,485) is a consequence of the runs dying at
+the same place, not a cause.
+
+**It is also not a shutdown failure, which is what the backtrace makes it look
+like.** The no-trace run stopped at 300,000 of its 700,000 steps and never
+printed the harness's "step budget exhausted" line, so it died mid-run. The
+`Executor` drop in the trace is the unwind path, not the origin: a coroutine is
+being unwound through the `extern "C"` `_osRecvMesg_recomp`, which cannot
+unwind, so the real failure is upstream and gets converted into an abort here.
+
+What remains solid is the negative, and it is what the plateau numbers rest on:
+**~1900 is not a fact about the guest.** The identical lead-in reached swap 2397
+solo and swaps 4156-4431 in the four wave-1 runs that completed. Runs that abort
+must be discarded and re-run, not read as evidence; every number reported in
+this card comes from a run that finished with `rc=0`.
 
 Note that `WM2000_NO_TRACE=1` is not the fix, because the harness computes
 `dumps_disabled = trace_disabled || ...` -- turning off the trace also turns off
