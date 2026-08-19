@@ -534,6 +534,27 @@ task ~#27) hit it.
 
 Cite these; do not re-derive them.
 
+## Measured at the EXECUTION seam: zero WM2000 triangles reach the rasterizer
+
+The earlier census counted triangles at DECODE. This measures the question
+that actually matters -- how many reach `execute_scheduled_raw_triangle` and
+produce guest bytes -- by instrumenting both seams on a scratch worktree
+(`/private/tmp/fn64-tri-exec`, never merged) and running the real ROM.
+
+```
+TRIDECL (raw triangles reaching the admission check)  116,958+
+TRIEXEC (raw triangles reaching the CPU executor)           0
+```
+
+Every one carries `textured=true`, which `raw_triangle_is_executable`
+refuses. So the answer to "is a raw triangle visible in a captured guest
+framebuffer from the real ROM?" is **no**, and the reason is not a bug in
+this lane -- it is the missing texture rung.
+
+This is a stronger statement than the decode-side census: it is measured at
+the seam that writes guest memory, not at the one that decides whether to
+declare.
+
 ## Follow-up card (NOT this card's work): nine duplicated wire-word encoders
 
 Noted while writing fixtures, recorded here so it is not lost, and
