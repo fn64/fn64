@@ -1396,6 +1396,25 @@ fn decode_stream(
                 // opcode -- so this length can never actually mismatch here.
                 let triangle = triangle::RawTriangle::decode(opcode, command)
                     .expect("command slice length was already proven exact above");
+                // Same span-recording contract as `FILL_RECTANGLE` and
+                // `TEXTURE_RECTANGLE` above: `commands.len()` is this
+                // command's own decode-order index, and the access run is
+                // recorded by `plan_raw_triangle` at the moment it pushes,
+                // so the span can never drift from the pushed accesses.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_raw_triangle(
+                    location,
+                    command_index,
+                    &triangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                )?;
                 RawDpcCommandKind::RawTriangle(triangle)
             }
             TEXRECT | TEXRECT_FLIP => {
@@ -1672,6 +1691,167 @@ fn plan_texture_rectangle(
         planned,
         fill_spans,
     )
+}
+
+/// The narrowest raw triangle this backend can produce guest bytes for, and
+/// therefore the only one it declares a write for: **flat, opaque,
+/// untextured, unshaded, no depth**.
+///
+/// This is an *admission*, not an approximation. A triangle outside the
+/// subset declares nothing and behaves exactly as it did before this
+/// planner existed -- it still decodes, still pushes its command, still
+/// reaches the GPU triangle path. Declaring a write the CPU executor cannot
+/// fill would be strictly worse than declaring none: `fill_completed_writes`
+/// slices the full-extent buffer for every declared range without checking
+/// the raster touched it, so a declared-but-undrawn row yields a real digest
+/// of STALE bytes that passes `validate_effects` and reaches guest RDRAM.
+/// Convincing garbage beats a loud error nowhere.
+///
+/// The subset widens by widening the executor first, then this predicate --
+/// never the other way round.
+fn raw_triangle_is_flat_opaque(triangle: &triangle::RawTriangle) -> bool {
+    let flags = triangle.flags();
+    !flags.shaded() && !flags.textured() && !flags.depth()
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// raw triangle covers -- **one access per covered scanline** -- and records
+/// the run as a [`FillAccessSpan`].
+///
+/// Not routed through [`plan_render_target_rows`], which takes a single
+/// rectangle: a triangle's covered X range differs per scanline, so its rows
+/// are N genuinely different ranges rather than N copies of one. Feeding it
+/// the triangle's bounding box instead would declare, for every scanline,
+/// every pixel between the leftmost and rightmost the triangle reaches
+/// anywhere -- the exact over-declaration `plan_render_target_rows`' own
+/// per-row rule exists to prevent, one level up.
+///
+/// **The row list is `triangle_span::covered_rows`, and so is the
+/// rasterizer's.** That shared call is what makes the declaration honest:
+/// there is no row here that the raster will skip and no row the raster
+/// visits that is not here.
+///
+/// Declares nothing (and does not fail) when the triangle is outside the
+/// admitted subset, when no compatible `SetColorImage` is staged, or when
+/// any covered row would fall outside installed RDRAM -- the same
+/// "decode succeeds, journal stays silent" shape `plan_texture_rectangle`
+/// uses, because a triangle that declares no write is exactly today's
+/// behaviour and must stay decodable.
+fn plan_raw_triangle(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    triangle: &triangle::RawTriangle,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    state: &RdpState,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    if !raw_triangle_is_flat_opaque(triangle) {
+        return Ok(());
+    }
+    // A triangle before any `SetOtherMode` has no defined blend or cycle
+    // state and the production adapter already refuses it by name
+    // (`TriangleBeforeAnyOtherMode`); declaring a write for one here would
+    // declare a write for a command that never executes.
+    let Some(other_mode) = state.other_mode() else {
+        return Ok(());
+    };
+    // Fill cycle consults no combiner and no blender at all -- the RDP fills
+    // with the fill colour through a path this executor does not implement
+    // for triangles. Refused by declaring nothing rather than drawn as an
+    // approximation.
+    if matches!(other_mode.cycle_type(), CycleType::Fill) {
+        return Ok(());
+    }
+    let Some(image) = state.color_image() else {
+        return Ok(());
+    };
+    // The same narrow colour-image subset `plan_fill` and
+    // `plan_texture_rectangle` admit.
+    if image.format() != ImageFormat::Rgba
+        || !matches!(image.size(), PixelSize::Bits16 | PixelSize::Bits32)
+    {
+        return Ok(());
+    }
+    let bytes_per_pixel = image
+        .size()
+        .bytes_per_pixel()
+        .expect("RGBA16/32 are byte-addressed");
+    // **Height is bounded by installed RDRAM, not by a target extent.**
+    // `SetColorImage` carries a width and no height, and the executor's own
+    // extent (`configured_target_extent`) does not exist at decode time. So
+    // the honest decode-time bound is "every row whose bytes are inside
+    // installed RDRAM", derived below by `layout.range` refusing the first
+    // row that is not. `MAX_RAW_TRIANGLE_ROWS` caps the walk itself so a
+    // wildly out-of-range YL cannot make this loop unbounded.
+    const MAX_RAW_TRIANGLE_ROWS: u32 = 4096;
+    let rows = triangle_span::covered_rows(triangle, image.width(), MAX_RAW_TRIANGLE_ROWS);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if planned
+        .len()
+        .checked_add(rows.len())
+        .is_none_or(|accesses| accesses > MAX_RESOURCE_ACCESSES)
+    {
+        return Err(RawDpcDecodeError::InvalidCommand {
+            location,
+            reason: "raw triangle exceeds the bounded resource-plan access count",
+        });
+    }
+    // Every row's range is derived and validated BEFORE any is pushed, so a
+    // triangle whose last row leaves installed RDRAM declares nothing at all
+    // rather than a truncated prefix that the rasterizer would then overrun.
+    let mut ranges = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(range) = row
+            .y
+            .checked_mul(image.width())
+            .and_then(|pixel| pixel.checked_add(row.x0))
+            .and_then(|pixel| pixel.checked_mul(bytes_per_pixel))
+            .and_then(|offset| image.address().get().checked_add(offset))
+            .and_then(|start| {
+                let bytes = (row.x1 - row.x0).checked_mul(bytes_per_pixel)?;
+                let end = start.checked_add(bytes)?;
+                layout.range(start, end).ok()
+            })
+        else {
+            return Ok(());
+        };
+        ranges.push(range);
+    }
+    let first_access_index =
+        u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        })?;
+    for range in ranges {
+        push_access(
+            location.workload,
+            planned,
+            AccessMode::Write,
+            AccessPurpose::RenderTarget,
+            ResourceRegion::Rdram {
+                resource: RdramResource::ColorFramebuffer,
+                range,
+            },
+        )?;
+    }
+    let count = u32::try_from(planned.len() - first_access_index as usize).map_err(|_| {
+        RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        }
+    })?;
+    debug_assert_eq!(
+        count as usize,
+        rows.len(),
+        "plan_raw_triangle pushed a different number of accesses than it planned"
+    );
+    fill_spans.push(FillAccessSpan {
+        command_index,
+        first_access_index,
+        count,
+    });
+    Ok(())
 }
 
 /// One admitted command's whole-pixel destination rectangle in the staged
@@ -5287,6 +5467,175 @@ mod tests {
         assert!(
             decoded.state_delta().combine().is_none(),
             "packet N+1's own delta must not record a SetCombine it never decoded"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Raw triangle -> declared per-row ColorFramebuffer writes
+    // -----------------------------------------------------------------
+
+    /// One-cycle `OtherMode` (cycle_type 0) and an RGBA16 colour image 8
+    /// pixels wide at address 0 -- the narrowest staging a flat raw
+    /// triangle needs to declare a write.
+    ///
+    /// One cycle, not Fill: `plan_raw_triangle` refuses Fill cycle, where
+    /// the RDP consults no combiner at all.
+    fn flat_triangle_state_words(prefix: u8) -> Vec<u32> {
+        vec![
+            word(prefix, SET_OTHER_MODE, 0),
+            0,
+            // RGBA16: format 0 (RGBA) and size 2 (`PixelSize::Bits16`) in
+            // bits 21:19; width 8 (the wire field is width-1); address 0.
+            word(prefix, SET_COLOR_IMAGE, 2 << 19 | 7),
+            0,
+        ]
+    }
+
+    /// The eight wire words of one flat (opcode 0x08) left-major triangle
+    /// whose two edges are vertical at x = 2 and x = 6, spanning scanlines
+    /// 0..3.
+    ///
+    /// Hand-derived footprint, from the wire fields and nothing else:
+    ///   yh = 0, yl = 3<<2 = 12 (S11.2) -> yh_eighth 0, yl_eighth 24
+    ///   min_y = ceil((0-7)/8) = 0, max_y = ceil((24-1)/8) = 3  -> rows 0,1,2
+    ///   xh = 2<<16, dxhdy = 0 -> left edge parked at 2.0
+    ///   xm = xl = 6<<16, slopes 0 -> right edge parked at 6.0
+    ///   x0 = ceil((2*65536 - 7*65536/8)/65536) = ceil(1.125) = 2
+    ///   x1 = ceil((6*65536 - 65536/8)/65536)   = ceil(5.875) = 6
+    /// So each row covers pixels 2..6 = 4 pixels = 8 bytes at RGBA16, and
+    /// row y starts at byte (y*8 + 2)*2 = 16y + 4: bytes 4, 20, 36.
+    fn flat_triangle_words(prefix: u8) -> Vec<u32> {
+        vec![
+            // lft (bit 23) set, tile 0, level 0, YL = 12.
+            word(prefix, 0x08, 1 << 23 | 12),
+            // YM = 12, YH = 0.
+            12u32 << 16,
+            // XL, dXLdy
+            6 << 16,
+            0,
+            // XH, dXHdy
+            2 << 16,
+            0,
+            // XM, dXMdy
+            6 << 16,
+            0,
+        ]
+    }
+
+    #[test]
+    fn a_flat_raw_triangle_declares_one_exact_access_per_covered_row() {
+        let mut words = flat_triangle_state_words(0);
+        words.extend(flat_triangle_words(0));
+        // The three hand-derived per-row ranges, in row order. A collapsed
+        // single span would be (4, 44) and this would fail.
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses(),
+            decoded.submitted().packet().journal().accesses(),
+            "the declared run must equal the journal's, access for access"
+        );
+        // The command is still decoded as a triangle, not swallowed.
+        assert!(matches!(
+            decoded.commands().last().map(|command| command.kind()),
+            Some(RawDpcCommandKind::RawTriangle(_))
+        ));
+    }
+
+    #[test]
+    fn a_flat_raw_triangles_declared_rows_bind_back_as_its_own_span() {
+        let mut words = flat_triangle_state_words(0);
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        // The triangle is command index 2 (two state commands precede it).
+        let accesses = decoded
+            .resource_plan()
+            .bind_texture_rectangle(2)
+            .expect("the triangle's own span binds");
+        assert_eq!(accesses.len(), 3, "one access per covered scanline");
+        for access in accesses {
+            assert_eq!(access.mode(), AccessMode::Write);
+            assert_eq!(access.purpose(), AccessPurpose::RenderTarget);
+        }
+    }
+
+    #[test]
+    fn a_shaded_or_textured_or_depth_triangle_declares_no_write() {
+        // Everything outside the flat-opaque subset must declare nothing --
+        // declaring a row the CPU executor cannot fill would digest stale
+        // resident bytes into guest RDRAM.
+        for opcode in [0x09u8, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f] {
+            let mut words = flat_triangle_state_words(0);
+            let mut triangle = flat_triangle_words(0);
+            triangle[0] = word(0, opcode, 1 << 23 | 12);
+            // Word count straight off the opcode bits, per the RDP command
+            // summary: 4 base words, +8 shade (bit 2), +8 texture (bit 1),
+            // +2 depth (bit 0). Each 64-bit word is two u32 halves.
+            let extra_words = 8 * u32::from(opcode & 0x4 != 0)
+                + 8 * u32::from(opcode & 0x2 != 0)
+                + 2 * u32::from(opcode & 0x1 != 0);
+            triangle.extend(core::iter::repeat_n(0u32, (extra_words * 2) as usize));
+            words.extend(triangle);
+            let submitted = submit(packet(7, words, &[]));
+            let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+            assert!(
+                decoded.resource_plan().accesses().len() == 1,
+                "opcode {opcode:#04x} declared a write it cannot fill"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_triangle_in_fill_cycle_or_without_a_colour_image_declares_no_write() {
+        // Fill cycle: the RDP consults no combiner, a path this executor
+        // does not implement for triangles.
+        let mut words = vec![word(0, SET_OTHER_MODE, 3 << 20), 0];
+        words.extend([word(0, SET_COLOR_IMAGE, 2 << 19 | 7), 0]);
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(decoded.resource_plan().accesses().len(), 1);
+
+        // No staged colour image at all: nothing to write into.
+        let mut words = vec![word(0, SET_OTHER_MODE, 0), 0];
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(decoded.resource_plan().accesses().len(), 1);
+    }
+
+    #[test]
+    fn a_flat_triangle_reaching_outside_installed_rdram_declares_nothing_at_all() {
+        // Not a truncated prefix: a partially-declarable triangle must
+        // declare NO row, because the rasterizer walks every row the span
+        // claims and a prefix would leave it writing rows nobody declared.
+        //
+        // Same vertical edges as `flat_triangle_words`, but 200 scanlines
+        // tall (YL = 200<<2) against an RGBA16 image 8 pixels wide parked at
+        // 0x3fc0, the last 64-byte-aligned address in the 0x4000 layout. Row
+        // 0 fits (bytes 0x3fc4..0x3fcc); row 4 already needs 0x4000, which is
+        // past installed RDRAM. So SOME rows are placeable and the whole
+        // triangle must still declare nothing.
+        let base = LAYOUT_BYTES - 64;
+        let mut words = vec![word(0, SET_OTHER_MODE, 0), 0];
+        words.extend([word(0, SET_COLOR_IMAGE, 2 << 19 | 7), base]);
+        words.extend([
+            word(0, 0x08, 1 << 23 | (200 << 2)),
+            (200u32 << 2) << 16,
+            6 << 16,
+            0,
+            2 << 16,
+            0,
+            6 << 16,
+            0,
+        ]);
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses().len(),
+            1,
+            "one command-decode read and no render-target write"
         );
     }
 }
