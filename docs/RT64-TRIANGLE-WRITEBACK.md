@@ -268,3 +268,35 @@ equally protected. The journal's per-row truth is strongly tested; the present
 path's field write is not tested in-crate at all.
 
 Both mutants reverted; both baselines re-confirmed clean.
+
+---
+
+# Lane `lane/tri-cpu-raster` (worktree /private/tmp/fn64-tri-cpu, from 272bf781)
+
+Baseline re-measured on this worktree (the doc above was written at an older
+commit, so its 4746 is stale):
+  cargo nextest run -p fn64-render-wgpu --offline -> 4755 passed / 3 skipped
+
+## Plan, taking the prior lane's chosen design (ii) as given
+
+Land Half A and Half B **in one commit**, per the prior lane's measured proof
+that Half A alone breaks plan seal. Narrowest first: flat-shaded, opaque,
+untextured, no depth, RGBA16 target.
+
+Seam-by-seam, all three touched together:
+1. decoder `raw_dpc/mod.rs` 0x08..=0x0f -- derive covered rows from the
+   triangle's own edge coefficients, call the EXISTING
+   `plan_render_target_rows` once per covered row, record a span.
+2. adapter `raw_dpc/production_adapter.rs` -- bind that span and push the
+   decoder's own access slice before `push_triangle`, exactly as the texrect
+   arm already does. Replaces the `texrect_accesses: None` line.
+3. executor -- a new in-crate CPU rasterizer producing
+   `CompletedColorTargetWrite`, scheduled in `stage_color_commands` alongside
+   Fill and Texrect so it composes into the same accumulated buffer and is
+   digested by the same single `fill_completed_writes` call.
+
+The declared-vs-drawn hazard the doc names (fill_completed_writes slices
+without checking the raster touched it) is closed by construction if and only
+if the decoder's row derivation and the executor's raster derive their covered
+X range from ONE function. That is the single most load-bearing constraint in
+this lane, so the span math lives in one module used by both.
