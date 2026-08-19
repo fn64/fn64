@@ -6592,6 +6592,9 @@ mod tests {
             env_color: Color4::from_wire(0),
             prim_color: PrimColor::default(),
             fog_color: Color4::from_wire(0),
+            // This fixture drives the GPU triangle path, which reads no
+            // scissor; the texrect executor is the only consumer today.
+            scissor: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -6772,6 +6775,9 @@ mod tests {
             env_color: Color4::from_wire(0),
             prim_color: PrimColor::default(),
             fog_color: Color4::from_wire(0),
+            // This fixture drives the GPU triangle path, which reads no
+            // scissor; the texrect executor is the only consumer today.
+            scissor: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -7628,16 +7634,13 @@ mod tests {
     fn a_latched_scissor_wins_over_the_full_target_fallback() {
         let extent = crate::targets::ColorTargetExtent::try_new(320, 240).unwrap();
         let latched = crate::targets::RdpScissorRect::from_wire_quarter_pixels(1, 8, 12, 400, 2000);
-        assert_eq!(texrect_scissor_or_full_target(Some(latched), extent), latched);
+        assert_eq!(
+            texrect_scissor_or_full_target(Some(latched), extent),
+            latched
+        );
     }
 
-    fn fixture_set_scissor(
-        mode: u8,
-        ulx: u16,
-        uly: u16,
-        lrx: u16,
-        lry: u16,
-    ) -> RdpStateCommand {
+    fn fixture_set_scissor(mode: u8, ulx: u16, uly: u16, lrx: u16, lry: u16) -> RdpStateCommand {
         let scissor = fn64_render::NeutralScissor {
             mode,
             upper_left_x: ulx,
@@ -7976,6 +7979,9 @@ mod tests {
             env_color: Color4::from_wire(0),
             prim_color: PrimColor::default(),
             fog_color: Color4::from_wire(0),
+            // This fixture drives the GPU triangle path, which reads no
+            // scissor; the texrect executor is the only consumer today.
+            scissor: None,
         };
         let error = backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)
@@ -8051,6 +8057,9 @@ mod tests {
             env_color: Color4::from_wire(0),
             prim_color: PrimColor::default(),
             fog_color: Color4::from_wire(0),
+            // This fixture drives the GPU triangle path, which reads no
+            // scissor; the texrect executor is the only consumer today.
+            scissor: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)
@@ -10675,7 +10684,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
-            None,
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -11004,7 +11013,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
-            None,
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -12183,7 +12192,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
-            None,
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -12838,7 +12847,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
-            None,
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -12886,7 +12895,7 @@ mod tests {
                 Color4::from_wire(0),
                 PrimColor::from_wire(0, 0),
                 Color4::from_wire(0),
-            None,
+                None,
                 None,
                 [(None, None); 8],
             ),
@@ -15153,7 +15162,7 @@ mod tests {
                 backend.rdp_state.prim_color(),
                 backend.rdp_state.fog_color(),
                 backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
+                backend.rdp_state.color_image(),
                 seed,
             ),
             reads: Vec::new(),
