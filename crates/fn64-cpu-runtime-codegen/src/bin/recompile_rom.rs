@@ -105,19 +105,8 @@ fn main() -> std::process::ExitCode {
     // signal at all; this turns that into a named build-time diagnostic, and
     // repairs the entries whose containing function provably returned first.
     let mut cfg = cfg;
-    let check = cross_check_symbol_dump(&cfg, &rom);
-    if !check.is_clean() {
-        eprint!("{}", check.render_diagnostic());
-        let applied = repair_symbol_dump(&mut cfg, &check);
-        eprintln!(
-            "swallowed-entry cross-check: {} proven root(s) examined, {} missing entry/entries, \
-             {} repaired by splitting, {} reported only",
-            check.proven_roots,
-            check.swallowed.len(),
-            applied,
-            check.refused().count(),
-        );
-    }
+    let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+    eprint!("{diagnostic}");
 
     let report = run(&cfg, &rom, &force_recompile);
 
@@ -1012,6 +1001,28 @@ fn outcome_label(o: Outcome) -> &'static str {
 /// into `pause_self()`. Unapplied, the emitted body is a tight non-yielding
 /// `loop` and cooperative scheduling never resumes another thread — measured
 /// on WM2000: 100% of samples inside `func_800004D0`, no VI swap ever.
+/// The whole pre-pass `main` runs: cross-check the dump, report every
+/// swallowed entry, and repair the ones whose containing function provably
+/// returned. Returns the text to print (empty when the dump is clean), so the
+/// orchestration itself is testable rather than living inline in `main`.
+fn check_and_repair_symbol_dump(cfg: &mut RecompConfig, rom: &[u8]) -> String {
+    let check = cross_check_symbol_dump(cfg, rom);
+    if check.is_clean() {
+        return String::new();
+    }
+    let mut out = check.render_diagnostic();
+    let applied = repair_symbol_dump(cfg, &check);
+    out.push_str(&format!(
+        "swallowed-entry cross-check: {} proven root(s) examined, {} missing entry/entries, \
+         {} repaired by splitting, {} reported only\n",
+        check.proven_roots,
+        check.swallowed.len(),
+        applied,
+        check.refused().count(),
+    ));
+    out
+}
+
 /// Cross-check every configured section's function list against the `jal`
 /// evidence in the section's own ROM bytes.
 ///
@@ -1795,6 +1806,127 @@ mod tests {
             cfg.sections[0].functions, before,
             "config must be untouched"
         );
+    }
+
+    /// MUTATION GUARD for the orchestration `main` actually runs.
+    ///
+    /// The individual pieces are tested above, but nothing exercised the
+    /// wiring: a build that detected and reported the defect yet silently
+    /// skipped the repair would still pass every other test here. This pins
+    /// that one call to the pre-pass both reports AND repairs.
+    #[test]
+    fn the_pre_pass_reports_and_repairs_in_one_call() {
+        let (mut cfg, rom) = swallowed_entry_config();
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        assert!(
+            diagnostic.contains("SWALLOWED-FUNCTION-ENTRY"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("0x80000010"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("1 repaired by splitting"),
+            "the pre-pass must actually apply the repair: {diagnostic}"
+        );
+        assert!(diagnostic.contains("0 reported only"), "{diagnostic}");
+        // ...and the config really was mutated, not just described.
+        let shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+    }
+
+    #[test]
+    fn a_clean_dump_makes_the_pre_pass_print_nothing() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        cfg.sections[0].functions[0].size = 0x10;
+        cfg.sections[0].functions.push(Function {
+            name: "tail".to_string(),
+            vram: 0x8000_0010,
+            size: 0x0C,
+        });
+
+        assert_eq!(check_and_repair_symbol_dump(&mut cfg, &rom), "");
+    }
+
+    /// MUTATION GUARD for per-section repair scoping.
+    ///
+    /// Two sections each swallow an entry at the SAME vram offset within
+    /// their own address window. If repairs were applied without filtering by
+    /// section, each section would be handed the other's entry as well, and
+    /// the second (non-matching) repair would silently do nothing or split
+    /// the wrong function. Both sections must come out correctly split.
+    #[test]
+    fn repairs_are_scoped_to_the_section_that_owns_them() {
+        // Each section holds the identical 7-word shape from
+        // `swallowed_entry_config`, but at different vrams. The `jal`
+        // immediate is region-relative, so the same word works in both.
+        let words = [
+            0x0C00_0004u32, // jal <region>+0x10
+            0x0000_0000,
+            0x03E0_0008, // jr $ra
+            0x0000_0000,
+            0x0000_0000, // <region>+0x10: swallowed entry
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let one: Vec<u8> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+        let mut rom = one.clone();
+        rom.extend_from_slice(&one);
+        let section = |name: &str, rom_off: u32, vram: u32| Section {
+            name: name.to_string(),
+            rom: rom_off,
+            vram,
+            size: one.len() as u32,
+            functions: vec![Function {
+                name: format!("head_{name}"),
+                vram,
+                size: 0x1C,
+            }],
+        };
+        let mut cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![
+                section("alpha", 0, 0x8000_0000),
+                // 0x0C000004 in this window resolves to 0x80000010 as well,
+                // because `jal`'s target is region-relative -- so give the
+                // second section a vram whose 0x0FFFFFFF bits differ, forcing
+                // a genuinely different proven root.
+                section("beta", one.len() as u32, 0x8000_0100),
+            ],
+            patches: Patches::default(),
+        };
+        // Rewrite beta's jal so it targets 0x80000110, its own entry.
+        let beta_jal = (3u32 << 26) | (0x8000_0110 >> 2) & 0x03FF_FFFF;
+        let base = one.len();
+        rom[base..base + 4].copy_from_slice(&beta_jal.to_be_bytes());
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        assert!(
+            diagnostic.contains("2 repaired by splitting"),
+            "both sections must be repaired: {diagnostic}"
+        );
+        // By hand: each head shrinks to 0x10 and each tail covers 0xC.
+        for (index, base_vram) in [(0usize, 0x8000_0000u32), (1, 0x8000_0100)] {
+            let shape: Vec<(u32, u32)> = cfg.sections[index]
+                .functions
+                .iter()
+                .map(|f| (f.vram, f.size))
+                .collect();
+            assert_eq!(
+                shape,
+                vec![(base_vram, 0x10), (base_vram + 0x10, 0x0C)],
+                "section {index}"
+            );
+        }
     }
 
     /// A dump with no swallowed entries must produce an empty diagnostic and
