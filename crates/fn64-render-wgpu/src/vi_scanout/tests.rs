@@ -2049,3 +2049,88 @@ fn silhouette_aa_still_refuses_because_the_coverage_magnitude_is_unavailable() {
         );
     }
 }
+
+/// **D1's second missing datum, which the audit does not name.**
+///
+/// `docs/RT64-LANE-DIVERGENCES.md` D1 attributes
+/// [`ViScanoutRefusal::SilhouetteAntialias`] to one absence:
+/// `fn64-render-reference`'s 195-line `RdramHiddenBits` sidecar, which
+/// holds the two coverage bits RGBA16 has no room for. That is real, and
+/// the sibling test above pins its consequence -- the reconstruction can
+/// produce only 1 or 8, never 2..=7.
+///
+/// It is not the whole blocker, and the difference changes the sizing.
+/// The reference's sidecar is *populated by its own rasterizer*:
+/// `write_rgba5551_framebuffer` takes `Coverage::stored()` and splits it,
+/// bit 2 into the visible halfword and bits 0..=1 into the sidecar
+/// (`fn64-render-reference/src/backend/framebuffer_io.rs:143-190`). On that
+/// lane the visible low bit really is the coverage MSB, so a sidecar
+/// completes a count that is already two-thirds present.
+///
+/// **On this lane that bit is not coverage at all.** Every RGBA16 packer in
+/// this crate writes it from `alpha >> 7`:
+/// `targets::pack_device_pixels` (`targets/oracle.rs:128-131`) and the
+/// private `write_pixel`s in `targets/fill.rs` and `targets/texrect.rs`.
+/// `crate::coverage::Coverage::stored()` -- the function that would produce
+/// a real 3-bit count -- has no production caller at all.
+///
+/// So this lane's committed RDRAM carries no coverage information in any
+/// bit, and adding the sidecar would widen a field that holds alpha. This
+/// test pins the composition that makes silhouette AA unsafe here: a
+/// fragment's alpha crossing `0x80` flips what the VI reads back as the
+/// coverage count, with no coverage stage ever having run.
+///
+/// Hand-derived: the two probe values differ only in their low bit, chosen
+/// as the images of alpha `0x7f` and `0x80` under `alpha >> 7`, and the
+/// expected counts are read off `from_stored` rather than off a run.
+#[test]
+fn this_lanes_rgba16_low_bit_is_alpha_not_a_coverage_msb() {
+    // The two halfwords a black pixel produces at the alphas straddling
+    // the packer's `>> 7` boundary.
+    const BLACK_ALPHA_LOW: u16 = 0x0000; // alpha 0x7f -> `alpha >> 7` == 0
+    const BLACK_ALPHA_HIGH: u16 = 0x0001; // alpha 0x80 -> `alpha >> 7` == 1
+
+    // **Pinned against the crate's own shared codec, not restated.**
+    // `targets::unpack_device_pixels` is `pack_device_pixels`'s declared
+    // inverse, and it reads this bit back as *alpha* -- 0 or 255. So the
+    // crate's colour path and this module's `coverage` disagree about what
+    // the bit means, which is the whole finding.
+    for (packed, expected_alpha) in [(BLACK_ALPHA_LOW, 0u8), (BLACK_ALPHA_HIGH, u8::MAX)] {
+        let unpacked = crate::targets::unpack_device_pixels(
+            crate::targets::ColorTargetFormat::Rgba16,
+            &packed.to_be_bytes(),
+        )
+        .expect("a single well-formed RGBA16 halfword");
+        assert_eq!(
+            unpacked[0].alpha, expected_alpha,
+            "the colour path reads {packed:#06x}'s low bit as alpha \
+             {expected_alpha}, not as a coverage MSB"
+        );
+    }
+
+    // And the VI reads that same bit back as a coverage count, because it
+    // has no way to tell alpha from coverage once it is in RDRAM.
+    let geometry = SourceGeometry {
+        origin: 0,
+        stride_pixels: 1,
+        rows: 1,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    for (packed, alpha, expected) in [(BLACK_ALPHA_HIGH, 0x80u8, 8u8), (BLACK_ALPHA_LOW, 0x7f, 1)] {
+        let mut rdram = fresh_rdram();
+        write_rgba16(&mut rdram, 0, packed);
+        let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+        assert_eq!(
+            geometry.coverage(&memory, 0, 0),
+            expected,
+            "a fragment with alpha {alpha:#04x} scans out as coverage \
+             {expected}; silhouette AA would weight its blend by that"
+        );
+    }
+
+    // The two alphas differ by one and produce the two extremes of the
+    // coverage range. That is the whole hazard in one line: on this lane
+    // the "coverage" silhouette AA would consume is a thresholded alpha.
+    assert_ne!(BLACK_ALPHA_LOW, BLACK_ALPHA_HIGH);
+}
