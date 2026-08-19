@@ -2387,6 +2387,343 @@ mod host_gpu_tests {
 
 
 
+    /// WM2000's OWN sprite-strip tile, rebuilt from its measured wire
+    /// fields -- the shape `tlut_fixture` above cannot express, because
+    /// that fixture's `low_t` is 0 (**even**) and it has only two rows, so
+    /// its differential agreed about first-row parity vacuously.
+    ///
+    /// Every constant here is the value instrumented off the real ROM
+    /// through the all-Rust lane, and is the same set
+    /// `tmem::read::tests`'s two `wm2000_texrect_*` tests already name.
+    /// `low_t.integer()` is `188 >> 2 == 47`, which is **ODD**.
+    mod wm2000_strip_fixture {
+        use crate::tmem::{TmemGpuProjection, TMEM_VALIDITY_WORDS};
+        use crate::{
+            ImageFormat, PixelSize, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
+            TmemWordAddress,
+        };
+
+        pub const LINE_WORDS: u16 = 5;
+        pub const LOW_S_RAW: u16 = 252;
+        pub const LOW_T_RAW: u16 = 188;
+        pub const HIGH_S_RAW: u16 = 512;
+        pub const HIGH_T_RAW: u16 = 384;
+        /// 5 destination words per row, of which the last carries only 2
+        /// defined source bytes -- 34 defined bytes per row, a 6-byte tail
+        /// gap. That gap is what an inverted parity walks into.
+        pub const WORDS_PER_ROW: u16 = 5;
+        pub const DEFINED_TAIL_BYTES: u16 = 2;
+        pub const ROWS: u16 = 50;
+        pub const PALETTE: u8 = 0;
+
+        /// The one CI4 index every payload byte in this fixture produces
+        /// (`palette == 0`, all-zero payload), and the RGBA16 palette entry
+        /// it resolves to. Deliberately NOT `0x0000`: an all-transparent
+        /// entry would make an unblended black readback pass vacuously.
+        pub const RESOLVED_INDEX: u8 = 0x00;
+        pub const RESOLVED_ENTRY: u16 = 0xf801;
+
+        pub fn descriptor() -> TileDescriptor {
+            TileDescriptor::from_wire(
+                ImageFormat::IntensityAlpha,
+                PixelSize::Bits4,
+                LINE_WORDS,
+                TmemWordAddress::try_new(0).unwrap(),
+                PALETTE,
+                TileAddressMode::from_wire(0b10),
+                0,
+                0,
+                TileAddressMode::from_wire(0b10),
+                0,
+                0,
+            )
+        }
+
+        pub fn size() -> TileSize {
+            TileSize::from_wire(
+                TileCoordinate::try_new(LOW_S_RAW).unwrap(),
+                TileCoordinate::try_new(LOW_T_RAW).unwrap(),
+                TileCoordinate::try_new(HIGH_S_RAW).unwrap(),
+                TileCoordinate::try_new(HIGH_T_RAW).unwrap(),
+            )
+        }
+
+        /// The exact byte set WM2000's `cmd 39` `LoadTile` validates, built
+        /// from the WRITER's own two rules rather than from a capture --
+        /// character-for-character the derivation
+        /// `tmem::read::tests::wm2000_load_tile_source` uses, so the CPU
+        /// and GPU halves of this differential cannot describe different
+        /// TMEM:
+        ///
+        /// - `project_tmem_transfer_word`'s `Tile` arm places transfer word
+        ///   `w` at destination word `tmem + (w / words_per_row) *
+        ///   line_words + (w % words_per_row)`.
+        /// - `tmem/execute/load_tile.rs`'s `map_physical_lanes` writes lane
+        ///   `source_lane ^ (4 * odd_row_exchange)` with
+        ///   `odd_row_exchange = (low_t.integer() + row) & 1`.
+        pub fn bytes() -> std::collections::BTreeMap<u16, u8> {
+            let mut bytes = std::collections::BTreeMap::new();
+            let low_t_integer = LOW_T_RAW >> 2;
+            for word in 0..WORDS_PER_ROW * ROWS {
+                let row = word / WORDS_PER_ROW;
+                let within = word % WORDS_PER_ROW;
+                let destination_word = row * LINE_WORDS + within;
+                let exchange = if (low_t_integer + row) & 1 == 1 { 4 } else { 0 };
+                let defined = if within + 1 < WORDS_PER_ROW {
+                    8
+                } else {
+                    DEFINED_TAIL_BYTES
+                };
+                for lane in 0..defined {
+                    bytes.insert(destination_word * 8 + (lane ^ exchange), 0x00);
+                }
+            }
+            // The quadricated palette entry index 0 resolves through.
+            let base = 0x0800u16 + u16::from(RESOLVED_INDEX) * 8;
+            for lane in 0..4u16 {
+                bytes.insert(base + lane * 2, (RESOLVED_ENTRY >> 8) as u8);
+                bytes.insert(base + lane * 2 + 1, (RESOLVED_ENTRY & 0xff) as u8);
+            }
+            bytes
+        }
+
+        pub fn source() -> super::tlut_fixture::FixtureTmem {
+            super::tlut_fixture::FixtureTmem { bytes: bytes() }
+        }
+
+        pub fn projection() -> TmemGpuProjection {
+            let mut projection = TmemGpuProjection {
+                bytes: [0u8; fn64_render_ir::TMEM_BYTES as usize],
+                validity_words: [0u32; TMEM_VALIDITY_WORDS],
+            };
+            for (address, byte) in bytes() {
+                let address = address as usize;
+                projection.bytes[address] = byte;
+                projection.validity_words[address / 32] |= 1 << (address % 32);
+            }
+            projection
+        }
+
+        /// The raw S10.5 pair that addresses tile texel `(column, row)`.
+        /// The shader subtracts `low * 8` (S10.2 origin in texel-fraction
+        /// units) and floors by 32, so adding the origin back and scaling
+        /// by 32 lands exactly on the texel with both fractions zero --
+        /// which makes the three-nearest filter over four equal corners the
+        /// identity.
+        pub fn raw_coordinates(column: u32, row: u32) -> (f32, f32) {
+            (
+                (u32::from(LOW_S_RAW) * 8 + column * 32) as f32,
+                (u32::from(LOW_T_RAW) * 8 + row * 32) as f32,
+            )
+        }
+    }
+
+    /// **Positive control for the WM2000 fixture, adapter-free.** Proves,
+    /// without a GPU, that this fixture is genuinely the shape the defect
+    /// needs: an IA4 tile under an enabled `G_TT_RGBA16` TLUT whose T
+    /// origin is ODD, whose failing texel's two candidate addresses are
+    /// exactly the production pair (`0x048` written, `0x04c` not), and
+    /// whose CPU reader resolves cleanly under the writer's parity and
+    /// fails under the inverted one. Without this, a green GPU test below
+    /// could be passing over a tile that never triggers the exchange.
+    #[test]
+    fn wm2000_strip_fixture_is_genuinely_an_odd_origin_ia4_tile_under_an_enabled_tlut() {
+        let descriptor = wm2000_strip_fixture::descriptor();
+        let size = wm2000_strip_fixture::size();
+
+        assert_eq!(descriptor.format(), crate::ImageFormat::IntensityAlpha);
+        assert_eq!(descriptor.size(), crate::PixelSize::Bits4);
+        assert_eq!(
+            size.low_t().integer() & 1,
+            1,
+            "this fixture is only meaningful while its T origin is ODD -- \
+             an even origin agrees with the old frozen constant vacuously"
+        );
+        assert_eq!(size.low_t().integer(), 47);
+
+        // The measured production pair, from the writer's own rule.
+        let source = wm2000_strip_fixture::source();
+        assert!(
+            crate::TmemByteSource::valid_byte(&source, 0x048).is_some(),
+            "tile row 1's own un-exchanged byte must be one the load wrote"
+        );
+        assert!(
+            crate::TmemByteSource::valid_byte(&source, 0x04c).is_none(),
+            "its XOR4 partner must be a byte the load never wrote -- that \
+             is the byte the frozen-Even shader addressed"
+        );
+
+        // And the CPU reader's own two verdicts on the failing texel.
+        let read = |parity| {
+            crate::read_texel(
+                &source,
+                descriptor,
+                crate::AddressedTmemTexel::new(64, 1, parity),
+                crate::TextureLutMode::Rgba16,
+            )
+        };
+        assert!(
+            read(crate::TmemFirstRowParity::Odd).is_ok(),
+            "under the writer's own parity the CPU reader samples cleanly"
+        );
+        assert_eq!(
+            read(crate::TmemFirstRowParity::Even),
+            Err(crate::PhysicalTexelReadError::InvalidTexelByte { address: 0x04c }),
+            "under the inverted parity it reproduces the production abort"
+        );
+    }
+
+    /// Adapter-free half of the parity pinning: the host-side
+    /// [`TileBindingParams`] must carry, in its uploaded `low_t`, the same
+    /// parity bit `targets/texrect.rs` derives for the CPU reader. The
+    /// shader reads `(low_t >> 2) & 1`; this asserts the uploaded word
+    /// really answers that question for both an odd- and an even-origin
+    /// tile, so a projection that dropped or rescaled `low_t` is caught
+    /// without a GPU.
+    #[test]
+    fn the_uploaded_low_t_carries_the_same_first_row_parity_the_cpu_reader_is_given() {
+        for (size, expected) in [
+            (
+                wm2000_strip_fixture::size(),
+                crate::TmemFirstRowParity::Odd,
+            ),
+            (tlut_fixture::size(), crate::TmemFirstRowParity::Even),
+        ] {
+            // `targets/texrect.rs`'s derivation, the CPU reader's input.
+            let cpu = if size.low_t().integer() & 1 == 1 {
+                crate::TmemFirstRowParity::Odd
+            } else {
+                crate::TmemFirstRowParity::Even
+            };
+            assert_eq!(cpu, expected);
+
+            // `tmem_sample.wgsl`'s `tmem_first_row_parity_odd`, over the
+            // word this binding actually uploads.
+            let params = TileBindingParams::bound(wm2000_strip_fixture::descriptor(), size);
+            let shader_says_odd = ((params.low_t >> 2) & 1) != 0;
+            assert_eq!(
+                shader_says_odd,
+                cpu == crate::TmemFirstRowParity::Odd,
+                "the shader's parity expression over the uploaded low_t must \
+                 equal the parity the CPU reader is handed for the same tile"
+            );
+        }
+    }
+
+    /// **The blocker, as a test: WM2000's odd-T-origin IA4 strip tile must
+    /// sample on the GPU triangle path, at the exact texel that aborted.**
+    ///
+    /// Before the fix, `tmem_sample.wgsl` froze
+    /// `TMEM_FIRST_ROW_PARITY_ODD = false`, so for tile row 1 it XOR4'd
+    /// address `0x048` -- a byte the `cmd 39` `LoadTile` wrote -- to
+    /// `0x04c`, which it did not, and every fragment reported
+    /// `TMEM_SAMPLE_STATUS_INVALID_BYTE` (2). That is the abort at
+    /// `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202`.
+    ///
+    /// Differential, not a frozen expectation: the color is compared
+    /// against `crate::read_texel` -- the SAME reader
+    /// `execute_scheduled_texrect` uses -- over the SAME byte map, handed
+    /// the parity `targets/texrect.rs` derives. The test sweeps both an ODD
+    /// and an EVEN tile row so a fix that merely inverted the constant
+    /// cannot pass.
+    ///
+    /// Adapter-gated (`host-gpu-tests`): panics with a typed reason rather
+    /// than skipping when the host has no native adapter, matching this
+    /// module's own required-host convention. Its positive control
+    /// (`wm2000_strip_fixture_is_genuinely_an_odd_origin_ia4_tile_...`)
+    /// runs without an adapter.
+    #[test]
+    fn required_host_an_odd_t_origin_tile_samples_the_same_byte_the_cpu_reader_does() {
+        let mut renderer = tlut_renderer();
+        let descriptor = wm2000_strip_fixture::descriptor();
+        let size = wm2000_strip_fixture::size();
+        let tile_binding = TileBindingParams::bound(descriptor, size)
+            .with_lut_mode(crate::TextureLutMode::Rgba16);
+        assert_eq!(
+            (tile_binding.low_t >> 2) & 1,
+            1,
+            "the binding this draw uploads must carry the ODD origin, or \
+             the shader is never asked the question this test is about"
+        );
+
+        // Tile row 1 is the row the production abort landed on; row 0 is
+        // its opposite parity. Column 64 is the production column. Both
+        // rows must sample, so inverting the frozen constant fails too.
+        for (column, row) in [(64u32, 1u32), (64, 0), (0, 1), (0, 0)] {
+            let (raw_s, raw_t) = wm2000_strip_fixture::raw_coordinates(column, row);
+            let vertex = |x: f32, y: f32| fn64_render::NeutralTriangleVertex {
+                x,
+                y,
+                z: 0.5,
+                w: 1.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                texcoord: [raw_s, raw_t],
+            };
+            let output = renderer
+                .submit_admitted_triangle(
+                    [vertex(0.0, 0.0), vertex(8.0, 0.0), vertex(0.0, 8.0)],
+                    OtherMode::from_wire(0, 0),
+                    texel0_passthrough_combine_params(),
+                    identity_raster_params(),
+                    EXTENT,
+                    wm2000_strip_fixture::projection(),
+                    tile_binding,
+                    None,
+                    None,
+                    None,
+                    ResolvedFragmentBlendParams::NO_OP,
+                    false,
+                )
+                .expect("odd-origin palettized draw must submit cleanly")
+                .complete()
+                .expect("odd-origin palettized draw must complete cleanly");
+
+            // THE assertion that failed before the fix, for (64, 1).
+            // `!= OK` and not `== INVALID_BYTE`: this tile is entirely in
+            // the low half, so the merged `D-LOWHALF` guard
+            // (`TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF`) must stay
+            // silent here too, and asserting on OK catches it if it does
+            // not -- the guard tests the post-XOR4 address, so a wrong
+            // parity could have tripped it rather than INVALID_BYTE.
+            assert_eq!(
+                output
+                    .tmem_sample_status
+                    .iter()
+                    .copied()
+                    .find(|&status| status != TMEM_SAMPLE_STATUS_OK),
+                None,
+                "texel ({column},{row}): the shader must address the byte \
+                 this tile's own T origin says it should, not the XOR4 \
+                 partner a frozen parity picks"
+            );
+
+            // Differential against the CPU reader, handed the parity
+            // `targets/texrect.rs` derives for this same tile.
+            let expected = crate::read_texel(
+                &wm2000_strip_fixture::source(),
+                descriptor,
+                crate::AddressedTmemTexel::new(
+                    column as u16,
+                    row as u16,
+                    crate::TmemFirstRowParity::Odd,
+                ),
+                crate::TextureLutMode::Rgba16,
+            )
+            .expect("the CPU reader samples this tile under the writer's parity")
+            .texel()
+            .rgba8888();
+            assert_close_rgba8(rgba8_at(&output, 1, 1), expected, 2);
+
+            // Liveness: an all-black readback must not pass.
+            assert_ne!(
+                expected,
+                [0, 0, 0, 0],
+                "texel ({column},{row}) must be a visible color, not the \
+                 cleared attachment"
+            );
+        }
+    }
+
     fn rgba8_at(output: &TriangleDrawOutput, x: u32, y: u32) -> [u8; 4] {
         let index = pixel_index(x, y) * 4;
         [
