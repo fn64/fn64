@@ -2616,6 +2616,21 @@ mod tests {
         words: Vec<u32>,
         effect_ranges: &[(u32, u32)],
     ) -> WorkloadPacket {
+        packet_with_seed(transaction_sequence, words, effect_ranges, None)
+    }
+
+    /// `packet`, plus the colour-image SEED read a partial `FillRectangle`
+    /// declares (`raw_dpc::plan_fill`).
+    ///
+    /// Ordered before the write accesses because `plan_fill` pushes the
+    /// seed before `plan_render_target_rows` pushes the span, and the
+    /// journal comparison is access-for-access.
+    fn packet_with_seed(
+        transaction_sequence: u64,
+        words: Vec<u32>,
+        effect_ranges: &[(u32, u32)],
+        seed_range: Option<(u32, u32)>,
+    ) -> WorkloadPacket {
         let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let bytes = u32::try_from(words.len() * 4).unwrap();
         let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
@@ -2644,18 +2659,36 @@ mod tests {
             .unwrap(),
         );
         let mut accesses = vec![command_access(layout, bytes, 0)];
-        accesses.extend(
-            effect_ranges
-                .iter()
-                .enumerate()
-                .map(|(index, &(start, end))| effect_access(layout, index as u32 + 1, start, end)),
-        );
+        if let Some((start, end)) = seed_range {
+            accesses.push(
+                ResourceAccess::try_new(
+                    OperationId::new(1),
+                    AccessMode::Read,
+                    AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        range: layout.range(start, end).unwrap(),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let first_effect = accesses.len() as u32;
+        accesses.extend(effect_ranges.iter().enumerate().map(|(index, &(start, end))| {
+            effect_access(layout, index as u32 + first_effect, start, end)
+        }));
         let journal = ResourceJournal::try_new(
             ResourceJournalLimits::try_new(64, LAYOUT_BYTES).unwrap(),
             accesses,
         )
         .unwrap();
-        WorkloadPacket::try_new(
+        // Through the preflight + capture pair rather than
+        // `WorkloadPacket::try_new`, because a journal that declares any
+        // guest read must be finalized against captured bytes for it --
+        // the same two-step `packet_with_tmem_sources` uses, and for the
+        // identical reason. With no seed the plan declares no reads and the
+        // capture is empty, so the packets this builds are unchanged.
+        let preflight = WorkloadPacketPreflight::try_new(
             layout,
             WorkloadAdmission::RawDpc {
                 transaction_sequence,
@@ -2663,7 +2696,22 @@ mod tests {
             vec![stream],
             journal,
         )
-        .unwrap()
+        .unwrap();
+        let capture = DeferredGuestReadCapture::new(
+            preflight
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    CapturedGuestRead::try_new(
+                        *read,
+                        vec![read.operation().get() as u8; read.range().len() as usize],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        preflight.finalize(capture).unwrap()
     }
 
     fn submit(packet: WorkloadPacket) -> SubmittedTicket {
@@ -3893,7 +3941,17 @@ mod tests {
             0x0102_0304,
         ];
         words.extend([word(0, FILL_RECTANGLE, 8 << 12 | 4), 4 << 12]);
-        let submitted = submit(packet(7, words, &[(4, 12), (20, 28)]));
+        // The fill covers x 1..=2 of rows 0..=1 in a 4-wide image, so it is
+        // partial and declares a colour-image seed over the whole target.
+        // Hand-derived: `SET_COLOR_IMAGE 3 << 19 | 3` gives width 4, RGBA16
+        // (2 bytes/pixel), address 0; no height is configured, so the seed
+        // spans the fill's own last row -- 4 x 2 pixels x 2 bytes = 32.
+        let submitted = submit(packet_with_seed(
+            7,
+            words,
+            &[(4, 12), (20, 28)],
+            Some((0, 32)),
+        ));
         let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
         assert_eq!(
             decoded.resource_plan().accesses(),
