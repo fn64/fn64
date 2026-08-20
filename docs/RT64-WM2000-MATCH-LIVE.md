@@ -89,3 +89,21 @@ capturing and restoring native stacks, which is the hard part of savestates for
 recompiler-based emulators. RDRAM and the device models are the easy half. If
 it is ever attempted, the tractable version is a snapshot at a quiescent point
 -- between VI retraces, with no guest thread mid-syscall -- not a general one.
+
+## CONFIRMED by hand: basic input works
+
+The project owner ran the interactive shell (`scripts/play-wm2000.sh`) with a
+controller and confirmed **basic input works**. That closes the question three
+scripted differential attempts failed to answer, at a cost of about thirty
+seconds against roughly ninety minutes of ROM time spent failing to answer it.
+
+Worth recording as a method lesson, not just a result: the scripted attempts
+failed for three different reasons, each of which looked like progress at the
+time -- a probe whose output I misread as unarmed, a 40M-step budget that would
+have taken 12+ hours to answer what 2M answers, and a control run that pressed
+buttons in-match and so was not a control at all. A human with a pad settled it
+immediately. **When a question is cheap for a person and expensive for a
+script, ask the person.**
+
+Still open after this, and both named by the owner: **rendering fidelity and
+frame rate**. Neither is blocked on input any more.
