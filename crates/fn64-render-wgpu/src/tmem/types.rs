@@ -531,7 +531,7 @@ pub(crate) fn project_tmem_transfer_word(
     let word = u64::from(word);
     let line = u64::from(descriptor.line_words());
     let (destination_word, row_advance, odd_row_exchange) = match kind {
-        TmemLoadKind::Block { source_t, dxt, .. } => {
+        TmemLoadKind::Block { dxt, .. } => {
             let advance = word
                 .checked_mul(u64::from(dxt.get()))
                 .ok_or("TMEM LoadBlock DXT product overflows")?
@@ -566,7 +566,7 @@ pub(crate) fn project_tmem_transfer_word(
             // in `docs/RT64-WM2000-TEXTURE-STATE.md`.
             ((destination & mask) as u16, advance, advance & 1 != 0)
         }
-        TmemLoadKind::Tile { bounds } => {
+        TmemLoadKind::Tile { .. } => {
             if words_per_row == 0 {
                 return Err("TMEM LoadTile row word count is zero");
             }
