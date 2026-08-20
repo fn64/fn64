@@ -1141,22 +1141,28 @@ fn try_dispatch_raw_dpc_via_session(
 
     let observation = dpc_observation(xbus, observation_start, observation_end, &observation_words);
 
-    let planned = RENDER_BACKEND.with(|backend_cell| {
-        RAW_DPC_SESSION.with(|session_cell| {
-            let mut backend = backend_cell.borrow_mut();
-            let backend = backend
-                .as_mut()
-                .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-            let session = session_cell.borrow();
-            let session = session
-                .as_ref()
-                .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
-            let request = session.plan_request(capture);
-            backend
-                .plan_raw_dpc(request)
-                .unwrap_or_else(|error| panic!("plan_raw_dpc: {error}"))
-        })
-    });
+    crate::session_phase_census::note_submission();
+    let planned = crate::session_phase_census::timed(
+        crate::session_phase_census::Phase::Plan,
+        || {
+            RENDER_BACKEND.with(|backend_cell| {
+                RAW_DPC_SESSION.with(|session_cell| {
+                    let mut backend = backend_cell.borrow_mut();
+                    let backend = backend.as_mut().expect(
+                        "try_dispatch_raw_dpc_via_session: no render backend registered",
+                    );
+                    let session = session_cell.borrow();
+                    let session = session.as_ref().expect(
+                        "try_dispatch_raw_dpc_via_session: session vanished under this borrow",
+                    );
+                    let request = session.plan_request(capture);
+                    backend
+                        .plan_raw_dpc(request)
+                        .unwrap_or_else(|error| panic!("plan_raw_dpc: {error}"))
+                })
+            })
+        },
+    );
 
     let guest_capture = fn64_render::ir::DeferredGuestReadCapture::new(
         planned
@@ -1187,9 +1193,14 @@ fn try_dispatch_raw_dpc_via_session(
         let session = session
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
-        session
-            .finalize_and_submit(planned, guest_capture)
-            .unwrap_or_else(|error| panic!("finalize_and_submit: {error}"))
+        crate::session_phase_census::timed(
+            crate::session_phase_census::Phase::Finalize,
+            || {
+                session
+                    .finalize_and_submit(planned, guest_capture)
+                    .unwrap_or_else(|error| panic!("finalize_and_submit: {error}"))
+            },
+        )
     });
 
     let prepared = RENDER_BACKEND.with(|cell| {
@@ -1197,9 +1208,14 @@ fn try_dispatch_raw_dpc_via_session(
         let backend = backend
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-        backend
-            .execute_raw_dpc(bound)
-            .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
+        crate::session_phase_census::timed(
+            crate::session_phase_census::Phase::Execute,
+            || {
+                backend
+                    .execute_raw_dpc(bound)
+                    .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
+            },
+        )
     });
 
     // The guest-visible `RenderTarget` writes the backend staged for THIS
@@ -1227,15 +1243,22 @@ fn try_dispatch_raw_dpc_via_session(
         let session = session
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
-        if staged_writes.is_empty() {
-            session
-                .commit_zero_guest_writes(prepared)
-                .unwrap_or_else(|error| panic!("commit_zero_guest_writes: {error}"))
-        } else {
-            session
-                .commit_guest_render_target_writes(prepared, staged_writes)
-                .unwrap_or_else(|error| panic!("commit_guest_render_target_writes: {error}"))
-        }
+        crate::session_phase_census::timed(
+            crate::session_phase_census::Phase::Commit,
+            || {
+                if staged_writes.is_empty() {
+                    session
+                        .commit_zero_guest_writes(prepared)
+                        .unwrap_or_else(|error| panic!("commit_zero_guest_writes: {error}"))
+                } else {
+                    session
+                        .commit_guest_render_target_writes(prepared, staged_writes)
+                        .unwrap_or_else(|error| {
+                            panic!("commit_guest_render_target_writes: {error}")
+                        })
+                }
+            },
+        )
     });
 
     // The RDRAM copyback, and the ONLY place this path writes a guest byte.
