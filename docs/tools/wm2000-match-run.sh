@@ -28,6 +28,15 @@ mkdir -p "$ROOT/frames"
 RUNNER=$ROOT/run.sh
 cp "$HOME/Code/recomps/wm2000/packages/wm2000-boot/rs/run-rs-lane.sh" "$RUNNER"
 
+# run-rs-lane.sh copies the harness from the sibling repo into $SCRATCH/sib on
+# every run, so the WM2000_WATCH guest-memory probe has to be re-applied after
+# that copy and before the build. Splice the patcher in at the copy site rather
+# than editing the sibling repo (which fn64 lanes do not own).
+/usr/bin/sed -i '' \
+  's|^ln -sfn "\$EMIT" \(.*\)$|python3 '"$FN64"'/docs/tools/wm2000-watch-patch.py "$SIB/recomps/wm2000/packages/wm2000-boot/src/main.rs"\
+ln -sfn "$EMIT" \1|' "$RUNNER"
+grep -q wm2000-watch-patch "$RUNNER" || { echo "[match-run] FATAL: watch probe not spliced into runner" >&2; exit 1; }
+
 if [[ "$MODE" == "--frames" ]]; then
   # Strip the harness's own WM2000_NO_TRACE=1 -- it also disables the PNG dumps
   # (dumps_disabled = trace_disabled || ...), which is the documented trap.
@@ -47,6 +56,7 @@ env FN64="$FN64" SCRATCH="$ROOT/scratch" \
   WM2000_PORTS=${WM2000_PORTS:-2} \
   WM2000_INPUT_SCRIPT="$SCRIPT" \
   WM2000_MAX_STEPS="$STEPS" \
+  ${WM2000_WATCH:+WM2000_WATCH=$WM2000_WATCH} \
   ${WM2000_STOP_AT_SWAP:+WM2000_STOP_AT_SWAP=$WM2000_STOP_AT_SWAP} \
   "${EXTRA[@]}" \
   zsh "$RUNNER" > "$LOG" 2>&1
