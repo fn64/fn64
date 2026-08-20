@@ -28,13 +28,18 @@ if [[ ! -f "$LEADIN" ]]; then
   exit 1
 fi
 
-# The harness disables frame dumps whenever the trace is disabled
-# (dumps_disabled = trace_disabled || ...), so the ladder keeps tracing on and
-# simply gives this run its own sink -- a shared trace path is what once made
-# four concurrent runs abort at an identical swap and counterfeit a plateau.
+# The ladder needs ONE number -- the last vi_swaps line -- and no pictures, so
+# it runs with the harness's own WM2000_NO_TRACE=1 intact. Measured cost of not
+# doing that: a traced run wrote a 996 MB JSONL sink and ran roughly three
+# times slower for output the gate never reads. Frame dumps are disabled along
+# with the trace (dumps_disabled = trace_disabled || ...), which is exactly
+# what this gate wants. A run that DOES want frames should grep the flag out
+# itself and supply its own WM2000_TRACE_PATH, never share the default sink --
+# a shared sink once made four concurrent runs abort at an identical swap and
+# counterfeit a plateau.
 RUNNER=$SCRATCH_ROOT-run.sh
 mkdir -p "$SCRATCH_ROOT"
-grep -v "WM2000_NO_TRACE=1" "$HOME/Code/recomps/wm2000/packages/wm2000-boot/rs/run-rs-lane.sh" > "$RUNNER"
+cp "$HOME/Code/recomps/wm2000/packages/wm2000-boot/rs/run-rs-lane.sh" "$RUNNER"
 
 echo "[ladder] floor=$FLOOR  scratch=$SCRATCH_ROOT"
 set +e
@@ -43,7 +48,6 @@ SCRATCH="$SCRATCH_ROOT/scratch" \
 WM2000_PORTS=2 \
 WM2000_INPUT_SCRIPT="$(cat "$LEADIN")" \
 WM2000_MAX_STEPS=${WM2000_LADDER_STEPS:-8000000} \
-WM2000_TRACE_PATH="$SCRATCH_ROOT-trace.jsonl" \
   zsh "$RUNNER" > "$LOG" 2>&1
 set -e
 
