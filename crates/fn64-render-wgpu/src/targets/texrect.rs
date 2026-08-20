@@ -1535,6 +1535,34 @@ impl TexrectShading {
                 reads_prim |= matches!(input, AlphaInput::Primitive | AlphaInput::PrimLodFrac);
             }
         }
+        // **Diagnostic-only census, over exactly the slices just walked.**
+        // Placed inside this function, sharing its `evaluated_slices()`
+        // walk, so the tally cannot disagree with the admission gate about
+        // WHICH bitfield slice runs -- a census of the other slice would
+        // report selectors the hardware never consults, which is the exact
+        // silent-wrong-answer shape this probe exists to rule out.
+        // Only programs that pass admission are counted: a refused one
+        // never draws a pixel.
+        if crate::combiner::census::enabled() {
+            for slice in cycles.evaluated_slices() {
+                let second_cycle = slice.reads_second_bitfield_slice();
+                crate::combiner::census::note_program(
+                    [
+                        combine.decode_color(ColorInputSlot::A, second_cycle),
+                        combine.decode_color(ColorInputSlot::B, second_cycle),
+                        combine.decode_color(ColorInputSlot::C, second_cycle),
+                        combine.decode_color(ColorInputSlot::D, second_cycle),
+                    ],
+                    [
+                        combine.decode_alpha(AlphaInputSlot::A, second_cycle),
+                        combine.decode_alpha(AlphaInputSlot::B, second_cycle),
+                        combine.decode_alpha(AlphaInputSlot::C, second_cycle),
+                        combine.decode_alpha(AlphaInputSlot::D, second_cycle),
+                    ],
+                    texel_available,
+                );
+            }
+        }
         // No refusal for a never-written `SetEnvColor`/`SetPrimColor`: both
         // are RDP registers holding their power-on zero until the guest
         // writes them (see this type's own doc). `reads_env`/`reads_prim`
