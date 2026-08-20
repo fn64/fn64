@@ -69,6 +69,26 @@ an hour and nearly produced the opposite answer.
 
 ## Evidence
 
+**An aggregate histogram cannot answer a per-primitive question.** WM2000's
+flat models were chased through a frame-wide texel histogram that looked
+broad and healthy -- sixteen populated buckets, no bucket over 16% -- and
+that measurement refuted both surviving hypotheses and would have closed the
+investigation with no defect found. The truth was that 87% of triangles each
+read a DIFFERENT single texel, which produces exactly that frame-wide shape.
+One extra `HashSet` in the same loop, counting distinct texels PER TRIANGLE,
+was unambiguous. Before trusting an aggregate, ask what per-primitive
+pathology would produce the same aggregate. See
+`docs/RT64-WM2000-COMBINER-CENSUS.md`.
+
+**A fixture that inverts the constant under test cannot detect a wrong
+constant.** Two `rdp_harness` perspective fixtures derived their expected
+plane values by inverting fn64's own `PERSPECTIVE_TEXEL_SCALE`, so they
+asserted the implementation against itself and passed happily under a scale
+32x away from hardware -- both with detailed, confident doc comments about
+what they proved. This is the "derive expectations BY HAND from the wire
+layout" rule failing in the wild, and it is worth grepping a fixture for the
+very constant it is meant to pin.
+
 **Mutation-test every fix, including the arms you keep.** The recurring failure
 is a fixture that samples a point where the correct and incorrect answers
 coincide: testing tile 0 when the bug is "always returns 0", or a mask width
