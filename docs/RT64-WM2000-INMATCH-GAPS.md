@@ -108,3 +108,67 @@ pad onto every plugged port, so both wrestlers made the same move on the same
 frame -- a stalemate by construction. A per-port script (`WM2000_INPUT_SCRIPT_P1`)
 is required for any real test of whether input reaches gameplay; mirrored input
 would read as "input does nothing", a false negative on exactly that question.
+
+---
+
+## MEASURED, in the interactive shell: triangles are NOT being dropped
+
+**Status: CONFIRMED.** Measured 2026-08-20 on the branch that first made the
+windowed shell buildable on the all-Rust stack (see `scripts/play-wm2000.sh`),
+against the real ROM, with `FN64_TRI_DROP_STATS=1` -- the instrument this
+document's "instrumentation asymmetry" section says has "no exit hook and no
+external callers". It has one now: the shell.
+
+Four consecutive 100,000-decision ticks, `FN64_RENDER=wgpu`, rs lane:
+
+```
+[fn64-tri-drop] tick=400000 total=400000
+[fn64-tri-drop]   no_covered_rows = 58850
+[fn64-tri-drop]   ADMITTED = 341150
+[fn64-tri-drop]   admitted_target 0x0038f800 = 169518
+[fn64-tri-drop]   admitted_target 0x003c7c00 = 171632
+```
+
+**85.3% of raw triangles are ADMITTED**, and the proportion is stable across
+all four ticks (82.8 / 83.3 / 85.2 / 85.3%). The ONLY non-admitting reason that
+fires at all is `no_covered_rows` -- a triangle covering no scanline, which is
+a degenerate or fully-offscreen triangle and is correct to drop. **Seven of the
+nine drop reasons are ZERO**, including every one that would indicate a
+texture, tile, or TMEM problem.
+
+Two further facts from the same run:
+
+- **The two admitted targets alternate almost exactly evenly** (169,518 vs
+  171,632, a 0.6% split). That is a double-buffer flip, and it means triangles
+  are landing in the buffers the VI actually scans out -- not into an orphan
+  surface nobody presents. This retires the question `note_address` was added
+  to answer.
+- **The run logged zero refusals and zero errors.** `grep -icE
+  'refus|unbound|unsupported|error|panic|out of scope'` over the whole session
+  log returns **0**. In particular `TexrectUnboundTile` -- the refusal a
+  textured triangle with an unresolved tile binding MUST produce
+  (`production.rs:4203`) -- never fires.
+
+### What this refutes
+
+**The first hypothesis in this document is wrong as stated.** "Every model is
+untextured/flat-shaded ... this is likely a TMEM/tile *binding* problem, the
+same class already fixed for texrects" predicts a binding failure. A binding
+failure is not silent in this code: `production.rs:4198-4212` refuses by name
+with `TexrectUnboundTile` rather than defaulting to a zeroed tile, and
+`raw_triangle.rs:158-166` refuses `TriangleTextureBindingDisagreesWithOpcode`
+if the opcode's textured bit and the binding ever disagree. Neither fired once
+in 400,000 decisions.
+
+So the triangles reaching the rasterizer are being admitted, bound, and drawn
+into the presented buffer. Whatever makes the models look flat is **downstream
+of admission** -- in the sampled value or the combiner -- or the triangles
+carry no texture bit in the first place. Those are different investigations
+from the one this document scoped, and the cheap next measurement is a count of
+`triangle.flags().textured()` true-vs-false among ADMITTED triangles, which
+distinguishes them in one run.
+
+**Method note.** This is the first of these hypotheses tested against the real
+ROM rather than read from source, and it took one run of a committed script
+because the shell now builds on this stack. That is the cheaper instrument this
+document was waiting for.
