@@ -2141,6 +2141,42 @@ pub mod raw_triangle_drop_stats {
     static ADDRESSES: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
         std::sync::Mutex::new(None);
 
+    /// Whether each ADMITTED triangle carried the wire opcode's texture bit.
+    ///
+    /// Split out from `COUNTS` rather than added as two more `REASONS`
+    /// because these are not drop reasons: every triangle counted here was
+    /// admitted, and the two buckets sum to the `ADMITTED` count rather than
+    /// partitioning the same total the drop reasons partition. Folding them
+    /// into `REASONS` would make `total` double-count every admitted
+    /// triangle and silently corrupt the percentage the whole report exists
+    /// to state.
+    ///
+    /// This is the measurement named as the cheap next step in
+    /// `docs/RT64-WM2000-INMATCH-GAPS.md` once admission was shown not to be
+    /// the cause of flat-shaded models: it distinguishes "textured triangles
+    /// are drawn but sample wrongly" from "the game issues untextured
+    /// triangles here", which are different investigations and were not
+    /// separable from the drop counters alone.
+    static ADMITTED_TEXTURED: AtomicU64 = AtomicU64::new(0);
+    static ADMITTED_UNTEXTURED: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note_textured(textured: bool) {
+        if textured {
+            &ADMITTED_TEXTURED
+        } else {
+            &ADMITTED_UNTEXTURED
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The two admitted-triangle texture-bit counts, `(textured, untextured)`.
+    pub fn textured_snapshot() -> (u64, u64) {
+        (
+            ADMITTED_TEXTURED.load(Ordering::Relaxed),
+            ADMITTED_UNTEXTURED.load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn note_address(address: u32) {
         let mut guard = ADDRESSES.lock().expect("address histogram poisoned");
         guard
@@ -2159,6 +2195,14 @@ pub mod raw_triangle_drop_stats {
             if *count > 0 {
                 eprintln!("[fn64-tri-drop]   {name} = {count}");
             }
+        }
+        // Reported separately and NEVER summed into `total`: these two
+        // partition the ADMITTED bucket, not the whole decision stream.
+        let (textured, untextured) = textured_snapshot();
+        if textured > 0 || untextured > 0 {
+            eprintln!(
+                "[fn64-tri-drop]   of ADMITTED: textured = {textured}, untextured = {untextured}"
+            );
         }
         if let Some(map) = ADDRESSES
             .lock()
@@ -2334,6 +2378,11 @@ fn plan_raw_triangle(
         count,
     });
     raw_triangle_drop_stats::note_address(image.address().get());
+    // The wire opcode's own texture bit, read from the same `flags()` the
+    // executor's binding equality check reads (`raw_triangle.rs:158`), at the
+    // moment of admission -- so the count is over exactly the triangles that
+    // went on to draw.
+    raw_triangle_drop_stats::note_textured(triangle.flags().textured());
     raw_triangle_drop_stats::bump(8);
     Ok(())
 }
@@ -2513,6 +2562,65 @@ mod tests {
 
     const LAYOUT_BYTES: u32 = 0x4000;
     const COMMAND_START: u32 = 0x1000;
+
+    /// `note_textured` must route each arm to its OWN counter.
+    ///
+    /// Written against DELTAS rather than absolute values on purpose: the two
+    /// counters are process-global `AtomicU64`s that every other test in this
+    /// binary can also advance, so an absolute assertion would pass or fail
+    /// depending on test order. Deltas are order-independent.
+    ///
+    /// The fixture presses on the mutants that matter. Both arms are driven,
+    /// with a DIFFERENT number of calls each (2 textured, 3 untextured), so:
+    ///
+    /// - swapping the two arms is caught (2 and 3 would trade places, which
+    ///   equal counts would have hidden -- the exact fixture mistake
+    ///   `RT64-WM2000-HARNESS-TRAPS.md` names, where correct and incorrect
+    ///   answers coincide at the sampled point),
+    /// - routing both arms to one counter is caught (one delta goes to 0),
+    /// - dropping the `fetch_add` entirely is caught (both go to 0).
+    ///
+    /// Mutation-verified: each of those three mutants was applied and each
+    /// fails this test.
+    #[test]
+    fn admitted_texture_bit_counts_route_to_their_own_buckets() {
+        let (textured_before, untextured_before) =
+            raw_triangle_drop_stats::textured_snapshot();
+
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(false);
+        raw_triangle_drop_stats::note_textured(false);
+        raw_triangle_drop_stats::note_textured(false);
+
+        let (textured_after, untextured_after) = raw_triangle_drop_stats::textured_snapshot();
+        assert_eq!(
+            textured_after - textured_before,
+            2,
+            "two textured notes must land in the textured bucket"
+        );
+        assert_eq!(
+            untextured_after - untextured_before,
+            3,
+            "three untextured notes must land in the untextured bucket"
+        );
+    }
+
+    /// The texture-bit counters must NOT be folded into the drop-reason
+    /// `total`, which partitions the decision stream. Adding them would make
+    /// `total` double-count every admitted triangle and corrupt the
+    /// percentage the whole report exists to state.
+    #[test]
+    fn texture_bit_counts_are_not_part_of_the_drop_reason_total() {
+        let before: u64 = raw_triangle_drop_stats::snapshot().iter().sum();
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(false);
+        let after: u64 = raw_triangle_drop_stats::snapshot().iter().sum();
+        assert_eq!(
+            before, after,
+            "note_textured must not advance any REASONS counter"
+        );
+    }
 
     use crate::wire_words::word_with_prefix as word;
 
