@@ -100,68 +100,35 @@ enum Authority {
     /// the oracle is the one not modelling the hardware.
     /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
-    /// **wgpu and RT64 sample a raw triangle's texture planes 32x apart, and
-    /// this fixture's edge words mean different geometry to each.**
+    /// **This case is authored in RT64's VERTEX terms at the HARDWARE
+    /// scale, and RT64 matches the key. wgpu does not.**
     ///
-    /// Both facts are CONFIRMED by instrumenting RT64 itself (a probe in
-    /// `RDP::drawTris` and the renderer, run against a clone so the pinned
-    /// oracle stayed clean).
+    /// The hardware chain, read from angrylion
+    /// (`/Users/jer/Code/angrylion-rdp-plus`): the wire plane is s15.16,
+    /// `ss = s >> 16` takes it to S10.5 (`rasterizer.c:479`),
+    /// `tcdiv_nopersp` applies NO scale at all (`tcoord.c:1024`), and
+    /// `*S = locs >> 5` takes S10.5 to whole texels (`tcoord.c:143`). So
+    /// **one texel is `2^21` plane units**, which is what
+    /// [`PLANE_PER_TEXEL`] carries.
     ///
-    /// **1. The scale, accounted end to end:**
+    /// MEASURED at that scale: RT64 reproduces the hand-derived key
+    /// exactly -- four distinct texels, one per column -- while wgpu reads
+    /// texel 0 everywhere. At `2^26` the two swap. fn64's rasterizer wants
+    /// planes `2^5` larger than hardware for the same texel, because
+    /// `texture_coordinates_s10_5` divides by `PLANE_TO_TEXEL = 2^21` and
+    /// its result is then consumed as S10.5, so the `2^5` is applied twice.
     ///
-    /// | lane | plane -> texels |
-    /// |---|---|
-    /// | fn64 | `plane / 2^21` to S10.5, then `/32` = `plane / 2^26` |
-    /// | RT64 | `plane / 2^20` at decode, then `x0.5` at the sampler = `plane / 2^21` |
+    /// **That makes this case evidence AGAINST wgpu, not against RT64** --
+    /// the opposite of what this variant claimed when the fixture was
+    /// authored in per-pixel plane terms. It is kept in the
+    /// non-authoritative partition because the wgpu-side defect is not yet
+    /// fixed, so the pair still disagrees; once it is, this case should
+    /// become `Rt64Authoritative`.
     ///
-    /// = **32x**, not the 64x an earlier revision of this comment claimed and
-    /// not the 2x a decode-only reading gives. The trap is
-    /// `perspCorrectionMod` (`TextureSampler.hlsli:222`), a 0.5 applied for
-    /// non-perspective non-rect draws that neither a look at
-    /// `rt64_gbi_rdp.cpp:535-537` nor a look at `PLANE_TO_TEXEL` shows.
-    /// RT64's UV is in TEXELS at `floor(uvCoord)` (`:148`), which the
-    /// measurement discriminates: only the texel reading predicts the
-    /// all-clamped output actually observed, while an S10.5 reading predicts
-    /// four distinct texels.
-    ///
-    /// PROBE-CONFIRMED: RT64's v0 texcoord is `24.0` for this fixture's
-    /// `s_base`, which is `s_base / 2^20` exactly.
-    ///
-    /// So RT64 reads this case's four columns as texels 16, 48, 80 and 112 of
-    /// a 4-texel tile and clamps every one to the last -- and every pixel it
-    /// writes here is `TEXTURE_TEXELS[3]`.
-    ///
-    /// **2. The geometry: these edge words are a RECTANGLE to fn64 and a
-    /// RIGHT TRIANGLE to RT64.** Probe-measured vertices are
-    /// `(2,0) (2,3) (6,3)`: with `XH` on the left, `XL`/`XM` on the right and
-    /// every `dxdy` zero, fn64 walks a box and RT64 walks the triangle
-    /// between the major and minor edges.
-    ///
-    /// **FIXED in the fixture.** The case now emits TWO triangles that tile
-    /// the box -- the lower-left and upper-right halves -- so RT64 covers
-    /// every pixel of it: measured, zero pixels left at the background value
-    /// where a single command previously left seven of twelve. The
-    /// `the_triangle_case_emits_two_triangles_tiling_its_box` guard pins the
-    /// emitted vertices against RT64's own rule, mutation-verified.
-    ///
-    /// What a single command produced, for the record: a triangle whose
-    /// right edge advanced 4/3 columns per row -- RT64's own hypotenuse
-    /// slope -- quantised to even-aligned pixel PAIRS, a span ending
-    /// mid-pair writing only that pair's ODD pixel. See
-    /// `RT64-WM2000-TEXEL-LOCALISATION.md` for the grid.
-    ///
-    /// So the remaining difference on this case is the SCALE alone.
-    ///
-    /// **Note what was WRONG before:** this variant once claimed RT64 "does
-    /// not rasterize raw triangles". It does -- `drawTris` is entered exactly
-    /// once with a non-empty scissor `(0,0,1280,960)`, a non-null
-    /// `drawRect (8,0,24,12)`, and reaches `RENDER drawCall` with
-    /// `faceCount=1`. Nothing is skipped or culled.
-    ///
-    /// A difference here is therefore not evidence against either lane. The
-    /// case earns its place by holding wgpu to a hand-derived key on a path
-    /// no texrect reaches, and by pinning both disagreements so neither is
-    /// re-diagnosed as a texel defect.
+    /// The other half of authoring this correctly is per-VERTEX planes:
+    /// RT64 evaluates S at three vertices and only `v3` carries `Dx`, so
+    /// each half of the box needs `base` at its OWN H edge. See
+    /// `textured_triangle_words` and the two guards below.
     RawTrianglePlaneScaleDisagreement,
 }
 
@@ -625,7 +592,7 @@ fn one_ci4_rect() -> Vec<(u32, u32)> {
 /// constant before being re-derived; `2^21` is the independent one. A
 /// perspective case is worth adding but must derive its expectation from
 /// angrylion, not from either renderer.
-const PLANE_PER_TEXEL: i32 = 1 << 26;
+const PLANE_PER_TEXEL: i32 = 1 << 21;
 
 /// Half a texel, the anti-coincidence offset every plane base carries.
 ///
@@ -633,7 +600,7 @@ const PLANE_PER_TEXEL: i32 = 1 << 26;
 /// before the sampled texel changes, so a boundary fixture cannot see a
 /// half-texel bug. Sampling at the midpoint makes an error of half a texel in
 /// either direction visible.
-const PLANE_HALF_TEXEL: i32 = 16 << 21;
+const PLANE_HALF_TEXEL: i32 = 1 << 20;
 
 /// The X distance in Q16.16 from the major edge to the first covered
 /// subsample of the pixel that edge starts in: the sampler takes X column
@@ -719,7 +686,14 @@ fn coefficient_block(value: [i32; 4], dx: [i32; 4], de: [i32; 4], dy: [i32; 4]) 
 ///
 /// `x_h`/`x_l` are whole pixels; every slope is zero, so both non-major
 /// edges are vertical and the two triangles below tile exactly.
-fn textured_triangle_words(x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32) -> Vec<(u32, u32)> {
+fn textured_triangle_words(
+    x_h: u32,
+    x_l: u32,
+    y_h: u32,
+    y_l: u32,
+    y_m: u32,
+    s_base: i32,
+) -> Vec<(u32, u32)> {
     // All three Y bounds are S11.2. YL is the last covered scanline's LOWER
     // bound -- a triangle spanning rows 0..3 covers 0, 1 and 2, so YL is
     // line 3 and the raster's `y < yl` bound stops after row 2.
@@ -736,10 +710,31 @@ fn textured_triangle_words(x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32) -> 
         ((x_h << 16), 0),
         ((x_l << 16), 0),
     ];
-    // S advances one texel per pixel of X; T is constant, so every row reads
-    // TMEM row 0. W is 1 and unused: `G_TP_NONE` never divides by it. The
-    // plane is a function of X alone, so BOTH triangles share it unchanged.
-    let s_base = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
+    // **Authored in RT64's VERTEX terms, which is what makes this fixture
+    // readable by both lanes.**
+    //
+    // RT64 does not evaluate the plane per pixel; it evaluates S at three
+    // vertices and lets the GPU interpolate (`decodeTriangles`):
+    //
+    // ```text
+    // tc1 = base + De*dy_1                     dy_n = y_n - floor(yh)
+    // tc2 = base + De*dy_2
+    // tc3 = base + De*dy_3 + Dx*dx_3           dx_3 = x3 - (H edge at y3)
+    // ```
+    //
+    // Only `tc3` carries the `Dx` term, so with `De = 0` -- which a texcoord
+    // depending on X alone wants -- `tc1` and `tc2` BOTH take `base`.
+    // Therefore **`base` must be the S of the H edge**, which is where those
+    // two vertices sit, and `Dx` supplies the step out to `v3`.
+    //
+    // Both halves of the box want the SAME `Dx` of one texel per pixel of X:
+    // the upper-right half's `dx_3` is NEGATIVE (its `v3` is to the left of
+    // its H edge), so the sign cancels and no negative gradient is needed.
+    // Only `base` differs between them. An earlier attempt that negated `Dx`
+    // for that half double-counted the sign and read as texel 0 everywhere.
+    //
+    // T is constant, so every row reads TMEM row 0. W is 1 and unused:
+    // `G_TP_NONE` never divides by it.
     let texture = coefficient_block(
         [s_base, PLANE_HALF_TEXEL, 1, 0],
         [PLANE_PER_TEXEL, 0, 0, 0],
@@ -764,12 +759,18 @@ fn textured_triangle_words(x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32) -> 
 /// Their union is the closed rectangle and their interiors are disjoint, so
 /// the pair covers every pixel of the box exactly once.
 fn textured_triangle_pair() -> Vec<(u32, u32)> {
+    // Each half's `base` is the S at its OWN H edge, per the vertex rule in
+    // `textured_triangle_words`: the lower-left half's H edge is the left
+    // side, the upper-right half's is the right side.
+    let left_s = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
+    let right_s = left_s + PLANE_PER_TEXEL * (TRI_RIGHT - TRI_LEFT) as i32;
     let mut words = textured_triangle_words(
         TRI_LEFT,
         TRI_RIGHT,
         TRI_TOP,
         TRI_BOTTOM,
         TRI_BOTTOM,
+        left_s,
     );
     words.extend(textured_triangle_words(
         TRI_RIGHT,
@@ -777,6 +778,7 @@ fn textured_triangle_pair() -> Vec<(u32, u32)> {
         TRI_TOP,
         TRI_BOTTOM,
         TRI_TOP,
+        right_s,
     ));
     words
 }
@@ -1900,6 +1902,65 @@ mod tests {
                     Authority::CoverageDependentRt64NotAuthoritative,
                     "case {} enables AA_EN but claims RT64 authority",
                     case.name
+                );
+            }
+        }
+    }
+
+    /// **The triangle case's S planes are authored in RT64's VERTEX terms.**
+    ///
+    /// RT64 evaluates S at three vertices, not per pixel, and only `v3`
+    /// carries the `Dx` term. With `De = 0` that makes `base` the S of the H
+    /// edge -- where `v1` and `v2` both sit -- so the two halves of the box
+    /// need DIFFERENT bases (left edge, right edge) and the SAME `Dx`.
+    ///
+    /// This reproduces RT64's own arithmetic on the emitted words and checks
+    /// the three per-vertex texcoords land on the texel midpoints the key
+    /// expects. Without it, a shared base silently reverses the upper-right
+    /// half's gradient and the whole box reads texel 0 -- measured.
+    #[test]
+    fn the_triangle_planes_land_on_texel_midpoints_at_every_vertex() {
+        let words = textured_triangle_pair();
+        let per_texel = f64::from(PLANE_PER_TEXEL);
+
+        // RT64's rule, with every dxdy zero so the H edge is vertical.
+        let vertices = |chunk: &[(u32, u32)]| {
+            let yl = f64::from((chunk[0].0 & 0xffff) as i32) / 4.0;
+            let ym = f64::from((chunk[0].1 >> 16) as i32) / 4.0;
+            let yh = f64::from((chunk[0].1 & 0xffff) as i32) / 4.0;
+            let x_l = f64::from(chunk[1].0 >> 16);
+            let x_h = f64::from(chunk[2].0 >> 16);
+            // dy_n = y_n - floor(yh); dx_3 = x3 - (H edge at y3) = x_l - x_h.
+            ([(x_h, yh), (x_h, yl), (x_l, ym)], x_l - x_h)
+        };
+        // The split-halfword coefficient block: S's integer half is word 0's
+        // high 16 bits, its fraction half word 4's high 16 bits.
+        let s_plane = |chunk: &[(u32, u32)], index: usize| {
+            let integer = (chunk[index].0 >> 16) as u16 as i32;
+            let fraction = (chunk[index + 4].0 >> 16) as u16 as i32;
+            f64::from((integer << 16) | fraction)
+        };
+
+        for (half, offset) in [("lower-left", 0usize), ("upper-right", 12)] {
+            let base_words = &words[offset..offset + 4];
+            let tex_words = &words[offset + 4..offset + 12];
+            let (vertex, dx_3) = vertices(base_words);
+            let base = s_plane(tex_words, 0);
+            let d_dx = s_plane(tex_words, 1);
+
+            // tc1 = tc2 = base (De is zero); tc3 = base + Dx * dx_3.
+            let tc = [base, base, base + d_dx * dx_3];
+            for (index, (x, _)) in vertex.iter().enumerate() {
+                // The midpoint, less the eighth-of-a-pixel first-subsample
+                // offset the base deliberately cancels -- the sampler's first
+                // covered column is at `x + 1/8`, so the plane is authored an
+                // eighth low and arrives on the midpoint when evaluated there.
+                let want = (x - f64::from(TRI_LEFT)) + 0.5 - 0.125;
+                let got = tc[index] / per_texel;
+                assert!(
+                    (got - want).abs() < 1.0 / 16.0,
+                    "{half} vertex {index} at x={x} should sample texel {want}, \
+                     the plane gives {got}"
                 );
             }
         }
