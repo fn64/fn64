@@ -22,7 +22,14 @@ MODE=${1:?usage: wm2000-match-run.sh --long|--frames <name>}
 NAME=${2:?usage: wm2000-match-run.sh --long|--frames <name>}
 ROOT=/private/tmp/match-end/$NAME
 LOG=$ROOT.log
-SCRIPT=${WM2000_SCHEDULE:-$(python3 "$FN64/docs/tools/wm2000-schedule.py" --mode grapple --until 200000)}
+# WM2000_MODE=grapple (default) drives the in-match cycle throughout;
+# WM2000_MODE=leadin-only stops pressing at swap 6000, which is the CONTROL arm
+# of the input differential -- identical lead-in, nothing after it.
+SCHED_MODE=${WM2000_MODE:-grapple}
+SCRIPT=${WM2000_SCHEDULE:-$(python3 "$FN64/docs/tools/wm2000-schedule.py" --mode "$SCHED_MODE" --until 200000)}
+# Default watch set: both plugged ports' HELD/PRESSED in the record the ROM's
+# own gameplay code reads (D_80095180 stride 0xC). See RT64-WM2000-MATCH-GRAMMAR.md.
+: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192}
 
 mkdir -p "$ROOT/frames"
 RUNNER=$ROOT/run.sh
@@ -48,7 +55,8 @@ else
   STEPS=${WM2000_MAX_STEPS:-40000000}
 fi
 
-echo "[match-run] mode=$MODE name=$NAME steps=$STEPS root=$ROOT"
+echo "[match-run] mode=$MODE sched=$SCHED_MODE name=$NAME steps=$STEPS root=$ROOT"
+echo "[match-run] watch=$WM2000_WATCH"
 echo "[match-run] schedule bytes=${#SCRIPT} last=${SCRIPT##*;}"
 
 set +e
@@ -66,5 +74,6 @@ set -e
 echo "[match-run] rc=$RC"
 echo "[match-run] last progress: $(grep -oE 'vi_swaps=[0-9]+ gfx_tasks=[0-9]+ audio_tasks=[0-9]+' "$LOG" | tail -1)"
 echo "[match-run] termination: $(grep -E 'step budget|BOOT SUMMARY|STOP_AT_SWAP' "$LOG" | tail -1)"
+echo "[match-run] watch changes: $(grep -c 'wm2000-watch. swap' "$LOG" || true)"
 echo "[match-run] panics=$(grep -c 'panicked at' "$LOG" || true) backend_errors=$(grep -c 'backend error' "$LOG" || true)"
 echo "[match-run] log=$LOG"
