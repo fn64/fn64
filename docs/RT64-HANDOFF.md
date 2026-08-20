@@ -203,19 +203,33 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
      the same observation. Now `0x7fff`. This was live: the triangle case
      under-reported 9 differing pixels of 12 because of it.
 
-   **The open item this created, and it is a real one:** RT64 writes no
-   pixels for a raw triangle. VERIFIED to be triangles as such, not
-   texturing -- a flat `0x08` triangle also draws nothing while a texrect
-   over the identical tile, scissor and target draws correctly in the same
-   list. NOT a dispatch problem: fn64's lane forwards without opcode
-   filtering, RT64's LLE GBI registers all eight triangle opcodes and gets
-   this command's length right, its own `decodeTriangles` arithmetic on
-   these words yields the intended non-degenerate box, culling is forced off
-   for triangle projections, the word carries the loaded tile, and the list
-   scissors the whole target. Cause **not determined**; the pixels are lost
-   somewhere in RT64's draw-call assembly. Note **no test in this workspace
-   has ever driven a raw triangle through the RT64 lane**, so there is no
-   known-good setup to copy -- establishing one is its own piece of work.
+   **RESOLVED, and it turned into a real wgpu fix.** The raw-triangle case
+   went through three wrong readings before landing; the resolved chain is:
+
+   - RT64 **does** rasterize raw triangles. "Writes no pixels" came from a
+     triangle-ONLY list; with a texrect in the same packet it draws both.
+   - The same edge words mean a RECTANGLE to fn64 and a RIGHT TRIANGLE to
+     RT64, because RT64 derives `v1 = (XH at YH)`, `v2 = (XH at YL)`,
+     `v3 = (XL, YM)` -- `v1`/`v2` share the H edge's X, so one command
+     cannot be a box. The case emits TWO triangles that tile it.
+   - RT64 evaluates S at three VERTICES and only `v3` carries `Dx`, so with
+     `De = 0` each half's `base` must be the S of its OWN H edge. Authored
+     that way, at the hardware scale, **RT64 reproduces the key exactly**.
+   - The hardware scale, derived from angrylion (now cloned durably at
+     `/Users/jer/Code/angrylion-rdp-plus`): `ss = s >> 16` to S10.5
+     (`rasterizer.c:479`), `tcdiv_nopersp` applies NO scale
+     (`tcoord.c:1024`), `*S = locs >> 5` to texels (`tcoord.c:143`). One
+     texel = `2^21` plane units.
+   - **That exposed a live wgpu defect.** `PLANE_TO_TEXEL` was `2^21` and
+     its result is consumed as S10.5, so the sampler applied the `>>5`
+     AGAIN -- the `2^5` counted twice. Fixed to `2^16`. The case is now
+     `identical` and `Rt64Authoritative`; the corpus went 14 -> 15.
+     Confirmed on screen: a full ROM run renders frame 4090 identically to
+     the committed pre-fix image, zero panics, zero backend errors.
+
+   Note the four `rdp_harness` tests had been asserting the DEFECT's output
+   -- they passed with the bug and failed on the fix -- which is why the
+   corpus was needed to find it at all.
 
    Still missing: other combiner programs, other triangle shapes, and CI8
    / bilerp / two-cycle variants. Also still missing is a **captured-from-ROM** case: the reader for
@@ -223,15 +237,33 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    but the dump is produced by `fn64-render-reference`'s GBI census under
    `FN64_GBI_PACKET_DUMP`, so it needs a reference-lane ROM run to generate
    and is deliberately never committed (game content).
-4. **DONE -- see `docs/RT64-WM2000-TEXTURE-STATE.md`.** The screen was checked
-   after the fix. Surfaces went from flat solid colour to dense per-pixel
-   variation, confirming the fix at the pixel level, but the variation is
-   **noise, not imagery**. Geometry and shading are visibly correct; the texel
-   VALUES are wrong. The defect is now well-bounded: coordinates are right,
-   the fetch at those coordinates is not -- so suspect the TMEM address
-   computation, the tile descriptor's format/size/line fields, the palette, or
-   the byte-lane mapping. Colour bands and blocky glyphs plausibly share this
-   cause; do not scope them separately yet.
+
+   **One open corpus case, and it is an RT64 difference:**
+   `scissor-narrower-than-rect`. RT64 paints all 38,400 pixels the scissor
+   excludes; wgpu leaves them and matches the key. The scissor's encoding
+   was verified against angrylion's `rdp_set_scissor` first and found
+   wrong in the fixture -- the bounds split across BOTH words and the
+   corpus packed them into word 0 -- but correcting that did NOT change the
+   outcome, so it is a real difference on a correctly formed command.
+   **NOT the perspective path**, which is untouched: fn64's `(S/W) * 32768`
+   on raw planes versus angrylion's reciprocal-table divide on the shifted
+   `ss` is a structural difference inspection cannot settle, and guessing
+   is how that constant got its earlier wrong value of `1024`.
+4. **DONE, and the texel noise is CLOSED.** The cause was the deferred
+   guest-read capture handing the renderer raw ABI storage bytes where
+   `CapturedGuestRead`'s contract is N64-logical, so every 32-bit word of
+   texture reached the sampler byte-reversed. Fixed in `9168bb9a` on both
+   the production and conformance paths; confirmed on screen (see
+   `docs/RT64-WM2000-TEXTURE-STATE.md`): skin tones, facial detail, a
+   legible "AUSTIN 3:16" shirt, readable text.
+
+   **Still open and separate: a scene-specific colour cast.** At in-match
+   swap 644 skin reads green and the WWF logo magenta. CONFIRMED
+   pre-existing -- the same swap from the run before the `PLANE_TO_TEXEL`
+   fix is pixel-identical -- and not global, since the entrance scene in
+   the same run is correct. Likely the combiner or environment-colour path.
+   The comparison MUST use the same swap from both runs; comparing against
+   a different scene blames the wrong change.
 5. **Then optimise the rasterizer.** ~150 cycles/pixel at 8x overdraw where
    20-30 should do; `pixel_coverage` and `attribute_sample` each rescan the
    same subsamples, and every admitted triangle samples a texture per pixel.
