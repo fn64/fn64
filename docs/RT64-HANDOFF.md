@@ -75,8 +75,11 @@ discarded" are dead. The defect reports success somewhere.
 the glyph explanation.
 
 **f. In one-cycle mode wgpu is right and `fn64-render-reference` is wrong.**
-Worth remembering before treating the reference as an oracle: it has been the
-better oracle repeatedly, and here it is not.
+**RT64 is the oracle for this port.** `fn64-render-reference` is a second fn64
+implementation, not an authority -- it has happened to be right where wgpu was
+wrong several times, which made it a useful cross-check, but this case is the
+counter-example: here wgpu is right and the reference is wrong. Cross-check
+against it freely; do not promote it to oracle.
 
 ## 4. What to do next, in order
 
