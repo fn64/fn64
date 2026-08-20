@@ -471,7 +471,7 @@ fn coefficient_components(
 /// `stw` is the three planes' Q16.16 values at that point, already evaluated
 /// by [`attribute_plane`]; `perspective` is `OtherMode::texture_perspective`.
 ///
-/// # The two scale factors are EMPIRICAL and are cited, not re-derived
+/// # The perspective factor is DERIVED from angrylion; the other is cited
 ///
 /// Both come from `fn64-render-reference`'s `draw_raw_rdp_triangle_impl`
 /// (`raster/draw.rs:898`), which derived them against WM2000's own title
@@ -482,10 +482,23 @@ fn coefficient_components(
 ///    multiplies by a 2^15-normalized reciprocal of W, so the output is
 ///    `(S/W) * 2^15` in S10.5 units = `(S/W) * 2^10` texels (angrylion's
 ///    `tcdiv` perspective path; RT64 divides `s.w` by `w` and scales
-///    identically). The reference records that without the `* 1024.0` "the
-///    whole title-screen quad collapsed onto texel (0,0) -- every pixel
-///    sampled the image's corner and the presented frame was a uniform
-///    field."
+///    identically). So the RAW S10.5 value this function returns carries
+///    `2^15`, and `2^10` is what that same value denotes in TEXELS -- the
+///    two differ by the field's five fractional bits, and confusing them is
+///    exactly the defect fixed here.
+///
+///    **This constant was `1024.0` until measured.** It was fitted
+///    empirically against WM2000's title screen, where the reference had
+///    recorded that without a scale at all "the whole title-screen quad
+///    collapsed onto texel (0,0) -- every pixel sampled the image's corner
+///    and the presented frame was a uniform field." Going from 1 to 1024
+///    fixed that total collapse and left a 32x residue, which on one large
+///    flat quad reads as mild mis-scaling. On in-match geometry -- 100%
+///    perspective, small polygons -- the same residue collapsed each
+///    triangle onto a single texel: 72% of textured triangles requested
+///    zero whole texels of span and 87% sampled one distinct texel, while
+///    the frame-wide texel histogram stayed broad and healthy-looking. See
+///    `docs/RT64-WM2000-COMBINER-CENSUS.md`.
 /// 2. **Non-perspective (`G_TP_NONE`).** The divide is skipped entirely and
 ///    the plane's own s15.16 value converts to S10.5 by dividing by `2^21`
 ///    (`2^16 * 2^5`) -- angrylion's `tcdiv_nopersp`.
@@ -541,6 +554,15 @@ pub(crate) fn texture_coordinates_s10_5(stw: [i64; 3], perspective: bool) -> (i1
 }
 
 /// One float S10.5 coordinate clamped into `i16` before narrowing.
+///
+/// **The NaN arm is unreachable from this crate and correspondingly
+/// untested**, recorded rather than removed. `texture_coordinates_s10_5`
+/// floors its denominator at 1, so neither `0/0` nor `inf/inf` can arise
+/// there, and mutating `return 0` to `return 1` leaves the whole suite
+/// green -- verified, not assumed. It is kept because `clamp` on a NaN
+/// would otherwise propagate an arbitrary bit pattern through `as i16`,
+/// and a future caller without the flooring guarantee would get that
+/// silently. If a caller ever can supply NaN, this arm needs a fixture.
 fn saturate_s10_5(value: f32) -> i16 {
     if value.is_nan() {
         return 0;
@@ -548,9 +570,27 @@ fn saturate_s10_5(value: f32) -> i16 {
     value.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
-/// tcdiv's perspective output scale: `(S/W) * 2^15` in S10.5 units is
-/// `(S/W) * 2^10` texels. See [`texture_coordinates_s10_5`].
-const PERSPECTIVE_TEXEL_SCALE: f32 = 1024.0;
+/// tcdiv's perspective output scale: `(S/W) * 2^15` in RAW S10.5 units,
+/// which is `(S/W) * 2^10` texels once the field's five fractional bits are
+/// divided out. This function returns the RAW value, so the constant is
+/// `2^15`. See [`texture_coordinates_s10_5`].
+///
+/// **Was `1024.0` (`2^10`), and that was a crossed unit domain**: `2^10` is
+/// the TEXEL-domain scale, written into the field that holds the RAW one, so
+/// every perspective coordinate came out 32x too small. Measured on WM2000
+/// with `FN64_COMBINER_CENSUS=1`: 72% of textured triangles requested a span
+/// of zero whole texels and 87% sampled exactly one distinct texel across
+/// their whole span -- flat-shaded models with a correctly varied frame-wide
+/// texel histogram, which is why every aggregate instrument missed it. See
+/// `docs/RT64-WM2000-COMBINER-CENSUS.md`.
+///
+/// The value is angrylion's, not a refit: `tcdiv_persp`
+/// (`src/core/n64video/rdp/tcoord.c:1027`) returns `(ss/sw) * 2^15`
+/// (verified by building its `tcdiv_table` exactly and evaluating it),
+/// `tcshift_cycle` (`:83`) takes `SIGN16` of that, and
+/// `texture_pipeline_cycle` reads `sfrac = sss1 & 0x1f` (`tex.c:182`) --
+/// five fractional bits over a `2^15`-scaled value.
+const PERSPECTIVE_TEXEL_SCALE: f32 = 32768.0;
 
 /// s15.16 plane value -> S10.5 texel coordinate, for the `G_TP_NONE` path:
 /// `2^16 * 2^5`. See [`texture_coordinates_s10_5`].
