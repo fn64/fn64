@@ -80,9 +80,23 @@ def main():
     ap.add_argument("--mode", choices=["leadin-only", "grapple"], default="grapple")
     ap.add_argument("--until", type=int, default=60000)
     ap.add_argument("--start", type=int, default=6000)
+    ap.add_argument("--port1", action="store_true",
+                    help="emit port 1's schedule instead of port 0's: the same "
+                         "cycle rotated and phase-shifted, so the two wrestlers "
+                         "are not performing identical moves on identical frames")
     ap.add_argument("--gap", type=int, default=10,
                     help="neutral swaps between presses (clears the 4-frame repeat delay)")
     a = ap.parse_args()
+    if a.port1:
+        # Port 1 gets NO lead-in: the menus are navigated by port 0, and a
+        # second pad pressing confirm on the same frames would double-advance
+        # them. It joins only for the match, with the cycle rotated (so the two
+        # are in different moves) and phase-shifted by half a step (so they are
+        # not even on the same frames).
+        global CYCLE
+        CYCLE = CYCLE[len(CYCLE) // 2:] + CYCLE[: len(CYCLE) // 2]
+        print(";".join(inmatch(a.start + 23, a.until, a.gap)))
+        return
     parts = leadin()
     if a.mode == "grapple":
         parts += inmatch(a.start, a.until, a.gap)
