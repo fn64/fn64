@@ -47,6 +47,46 @@ and is reachable, in which case no budget ends the match at all.
 A run has to either produce a pin or a countout, or measure its progress
 against the game's own clock and report that.
 
+### And a scripted schedule cannot produce a pin either (CONFIRMED)
+
+The remaining five end conditions were then read, and they close the other
+door. `func_80123F34` (`0x80123F34`) tests `D_8016722E[idx] & arg` across the
+four slots; an exhaustive scan of every writer of that field in all five
+overlays shows:
+
+- **Four of the six checked bits (`0x40`, `0x20`, `0x100`, `0x200`) have no
+  writer anywhere in the ROM.** They are unreachable in this build.
+- The two that are reachable, `0x8` (set at `0x800F8714`) and `0x10` (set at
+  `0x800F8F8C`), are set only inside move-script handlers reachable only
+  through the dispatch table at `0x8014CFB0` -- i.e. only as a consequence of a
+  specific grapple animation running to a specific frame.
+- The pinfall itself (count `D_801589E6` against target `D_801589E4`) is gated
+  on `D_8016722E & 0x1` at `0x8012318C`, plus the opponent being downed
+  (`D_80167220 & 0x20`) in a particular animation (`D_801671EA`). **No button
+  test gates the pin at any of these sites.**
+
+A script can press buttons, and the presses provably reach the game's input
+records. It cannot *choose to land a grapple*: that needs the two wrestlers in
+the right relative position with the opponent in the right state, a closed-loop
+condition no open-loop button schedule controls.
+
+**The honest consequence for this card.** Whether a match ends is not, at root,
+a question about fn64 at all -- it is a question about whether the guest's own
+AI and physics bring the wrestlers together while the script happens to be
+pressing the right button. That can happen; it cannot be scheduled. So the
+deliverable a run can honestly produce is:
+
+1. whether the ROM sustains in-match execution indefinitely (a real, useful
+   answer, and the one the step budget has always hidden);
+2. whether input demonstrably reaches gameplay (`0x80095184`/`86`/`90`/`92`);
+3. how far the match got against the game's own clock (`0x8016F0AC` vs
+   `D_8014E1C4[D_800961D2]`), and whether any fighting actually occurred
+   (`0x801589E6` nonzero means a pin was genuinely in progress).
+
+A run that reports those four things has answered the card. A run that waits
+for a victory screen may wait forever for reasons that have nothing to do with
+the emulator.
+
 ## What a run must therefore do
 
 Point the long run at a **variable**, not a picture. The instruments:
@@ -59,6 +99,7 @@ Point the long run at a **variable**, not a picture. The instruments:
 | match clock | `0x8016F0AC` (min), `0x80166F88` (sec) | how far into the match |
 | limit + setting | `0x8014E1C4`, `0x800961D2` | which of the five cost rows this run is in |
 | gameplay input | `0x80095184/86` p0, `/90/92` p1 | **did the button reach gameplay** |
+| **pin count** | `0x801589E6` vs `0x801589E4` | **is a pin actually in progress** |
 | spirit | `0x801671F0` p0, `0x801672F4` p1 | is damage accumulating |
 | referee count | `0x8016ECC0` | is a countout in progress |
 

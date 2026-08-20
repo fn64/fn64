@@ -61,6 +61,11 @@ fi
 #   0x8016ECC0 (s8)      the referee count, loaded from D_8014E198 = {0,10,20,0}
 #                        by match type; counts DOWN to 0. (D_801567B0/B2 are
 #                        HUD digits only and were refuted as the counter.)
+#   0x801589E6 (s16)     THE LIVE PIN COUNT, against the target 0x801589E4
+#                        (advanced 0x801231E8, compared 0x80123238). Nonzero
+#                        only while a pin is actually in progress, which makes
+#                        it the cheapest way to tell "the wrestlers are really
+#                        fighting" from "the wrestlers are milling about".
 #   0x801671F0 (s16)     player-0 spirit/health (record base 0x801671E2, stride
 #                        0x104); tested slti 0x32 at 0x801239DC.
 #   0x801672F4           player-1 spirit/health (0x801671F0 + 0x104).
@@ -68,7 +73,7 @@ fi
 #   0x8014E1C4           entry 0 of the time-limit table -- so a run reports the
 #                        configured bound instead of anyone having to guess
 #                        whether the wait is 3 minutes or 60.
-: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192,0x801589D6:1,0x8016ED2A:1,0x801589D2,0x801589D4,0x8016F0AC,0x80166F88,0x8016ECC0:1,0x801671F0,0x801672F4,0x800961D2,0x8014E1C4}
+: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192,0x801589D6:1,0x8016ED2A:1,0x801589D2,0x801589D4,0x8016F0AC,0x80166F88,0x8016ECC0:1,0x801589E6,0x801589E4,0x801671F0,0x801672F4,0x800961D2,0x8014E1C4}
 
 mkdir -p "$ROOT/frames"
 RUNNER=$ROOT/run.sh
