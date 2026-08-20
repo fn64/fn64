@@ -3798,48 +3798,7 @@ pub mod census {
     /// A, B, C, D order -- decoded by the CALLER from the slice it will
     /// actually evaluate, so this module never re-derives which slice is
     /// live and cannot disagree with the evaluator about it.
-    /// Whether the census is switched on, read ONCE.
-    ///
-    /// `var_os` allocates and the call site is per-draw; a live lane is
-    /// measuring frame rate and a probe must not become the thing it
-    /// measures.
-    pub fn enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some())
-    }
-
-    /// Which evaluated pass a note came from. Recorded because the whole
-    /// census turns on reading the slice the hardware reads, and a tally
-    /// that cannot say whether a program was one-cycle or two-cycle cannot
-    /// be checked against that rule by a later reader.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Pass {
-        /// One-cycle mode: the single pass, over the CYCLE-1 slice.
-        OneCycleOnly,
-        /// Two-cycle mode, first pass, over the cycle-0 slice.
-        TwoCycleFirst,
-        /// Two-cycle mode, second pass, over the cycle-1 slice.
-        TwoCycleSecond,
-    }
-
-    static PASS_COUNTS: [AtomicU64; 3] = {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const INIT: AtomicU64 = AtomicU64::new(0);
-        [INIT; 3]
-    };
-
-    pub fn note_program(
-        color: [ColorInput; 4],
-        alpha: [AlphaInput; 4],
-        textured: bool,
-        pass: Pass,
-    ) {
-        PASS_COUNTS[match pass {
-            Pass::OneCycleOnly => 0,
-            Pass::TwoCycleFirst => 1,
-            Pass::TwoCycleSecond => 2,
-        }]
-        .fetch_add(1, Ordering::Relaxed);
+    pub fn note_program(color: [ColorInput; 4], alpha: [AlphaInput; 4]) {
         for (slot, input) in [
             ColorInputSlot::A,
             ColorInputSlot::B,
@@ -3864,138 +3823,22 @@ pub mod census {
             ALPHA_COUNTS[alpha_slot_index(slot) * 10 + alpha_index(input)]
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // The headline split, and it is restricted twice over.
-        //
-        // First to draws that HAVE a texel: an untextured draw ignoring
-        // Texel0 is correct and uninteresting, and counting it would
-        // dilute the ratio the card turns on.
-        //
-        // Second, and this one was earned by a wrong reading, to the FIRST
-        // evaluated pass. A two-cycle program's second pass routinely reads
-        // no texel: WM2000's dominant program is
-        // `cycle0 = (Texel0 - Zero) * ShadeAlpha + Zero` followed by
-        // `cycle1 = (Environment - Combined) * Primitive + Combined`, a fog
-        // lerp over the textured result. Counting that second pass as a
-        // Texel-ignoring draw made 54% of draws appear to discard their
-        // texture when they had sampled it in the pass immediately before.
-        // The ratio exists to answer "does this program consult the texel
-        // at all", and `Combined` carries the first pass's answer forward,
-        // so the first pass is where that question is decided.
-        if textured && pass != Pass::TwoCycleSecond {
-            if color.iter().any(|input| {
-                matches!(
-                    input,
-                    ColorInput::Texel0
-                        | ColorInput::Texel0Alpha
-                        | ColorInput::Texel1
-                        | ColorInput::Texel1Alpha
-                )
-            }) {
-                &COLOR_READS_TEXEL0
-            } else {
-                &COLOR_IGNORES_TEXEL0
-            }
-            .fetch_add(1, Ordering::Relaxed);
+        if color.iter().any(|input| {
+            matches!(
+                input,
+                ColorInput::Texel0 | ColorInput::Texel0Alpha | ColorInput::Texel1 | ColorInput::Texel1Alpha
+            )
+        }) {
+            &COLOR_READS_TEXEL0
+        } else {
+            &COLOR_IGNORES_TEXEL0
         }
+        .fetch_add(1, Ordering::Relaxed);
 
         let note = NOTES.fetch_add(1, Ordering::Relaxed) + 1;
-        if note % 100_000 == 0 {
-            // The caller only reaches this function when the env flag is
-            // set (it gates the call site behind a `OnceLock`), so the
-            // flag is not re-read here; doing so would allocate on the
-            // per-triangle path a live perf lane is measuring.
+        if note % 100_000 == 0 && std::env::var_os("FN64_COMBINER_CENSUS").is_some() {
             report(&format!("note={note}"));
         }
-    }
-
-    /// The raw `SetCombine` wire words of the programs actually evaluated,
-    /// with a count each.
-    ///
-    /// The per-slot tallies above answer "which selectors appear"; they
-    /// cannot answer "which PROGRAM appears", because four independent
-    /// histograms do not reconstruct the joint distribution. Two different
-    /// programs can produce identical per-slot marginals. This map keeps the
-    /// wire words themselves, so the dominant program can be hand-decoded
-    /// from the layout rather than guessed from the margins.
-    static PROGRAMS: std::sync::Mutex<Option<std::collections::BTreeMap<(u32, u32), u64>>> =
-        std::sync::Mutex::new(None);
-
-    pub fn note_wire(low: u32, high: u32) {
-        let Ok(mut guard) = PROGRAMS.lock() else {
-            return;
-        };
-        *guard
-            .get_or_insert_with(std::collections::BTreeMap::new)
-            .entry((low, high))
-            .or_insert(0) += 1;
-    }
-
-    /// The distinct evaluated programs, most frequent first.
-    pub fn program_histogram() -> Vec<((u32, u32), u64)> {
-        let Ok(guard) = PROGRAMS.lock() else {
-            return Vec::new();
-        };
-        let mut out: Vec<_> = guard
-            .as_ref()
-            .map(|map| map.iter().map(|(k, v)| (*k, *v)).collect())
-            .unwrap_or_default();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
-        out
-    }
-
-    /// Coarse histograms of the two multiplicands WM2000's dominant program
-    /// actually multiplies: the sampled texel's luma and the interpolated
-    /// shade alpha, both bucketed into sixteenths.
-    ///
-    /// This is the measurement `docs/RT64-WM2000-INMATCH-GAPS.md` names as
-    /// the one that distinguishes its two surviving candidates -- "a texel
-    /// histogram with one or two distinct values indicts (1); a varied texel
-    /// histogram with a flat output indicts (2)" -- extended with the second
-    /// multiplicand, because the dominant program is
-    /// `texel.rgb * shade.a` and a constant shade alpha flattens a
-    /// perfectly-sampled texture just as effectively as a constant texel.
-    ///
-    /// Sixteen buckets, not 256, deliberately: the question is "is this
-    /// varying at all", which a coarse histogram answers, and a 256-wide
-    /// atomic bank on the per-PIXEL path would be a real cost to a lane
-    /// that is measuring frame rate.
-    static TEXEL_LUMA: [AtomicU64; 16] = {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const INIT: AtomicU64 = AtomicU64::new(0);
-        [INIT; 16]
-    };
-    static SHADE_ALPHA: [AtomicU64; 16] = {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const INIT: AtomicU64 = AtomicU64::new(0);
-        [INIT; 16]
-    };
-
-    /// Records one drawn pixel's texel and shade alpha.
-    ///
-    /// `texel` is the raw RGBA8888 the sampler returned, before any
-    /// normalization, so a decode fault shows up here as it was read rather
-    /// than after a float round trip. `shade_alpha` is the already-clamped
-    /// `0..=255` channel value.
-    pub fn note_pixel(texel: [u8; 4], shade_alpha: u8) {
-        // Luma rather than one channel: a wrong FORMAT decode usually moves
-        // all three, and a single channel would miss a texture that is
-        // varying in the other two.
-        let luma = (u32::from(texel[0]) + u32::from(texel[1]) + u32::from(texel[2])) / 3;
-        TEXEL_LUMA[(luma >> 4).min(15) as usize].fetch_add(1, Ordering::Relaxed);
-        SHADE_ALPHA[(shade_alpha >> 4) as usize].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `(texel luma buckets, shade alpha buckets)`, each sixteen wide.
-    pub fn pixel_histograms() -> ([u64; 16], [u64; 16]) {
-        let mut luma = [0u64; 16];
-        let mut alpha = [0u64; 16];
-        for (index, slot) in luma.iter_mut().enumerate() {
-            *slot = TEXEL_LUMA[index].load(Ordering::Relaxed);
-        }
-        for (index, slot) in alpha.iter_mut().enumerate() {
-            *slot = SHADE_ALPHA[index].load(Ordering::Relaxed);
-        }
-        (luma, alpha)
     }
 
     /// `([slot][selector] color counts, alpha counts, (reads_texel, ignores_texel))`.
@@ -4027,15 +3870,7 @@ pub mod census {
     pub fn report(label: &str) {
         let (color, alpha, (reads, ignores)) = snapshot();
         eprintln!("[fn64-combiner] {label} programs={}", reads + ignores);
-        eprintln!(
-            "[fn64-combiner]   passes: one_cycle={} two_cycle_first={} two_cycle_second={}",
-            PASS_COUNTS[0].load(Ordering::Relaxed),
-            PASS_COUNTS[1].load(Ordering::Relaxed),
-            PASS_COUNTS[2].load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[fn64-combiner]   TEXTURED draws: color reads Texel* = {reads}, ignores Texel* = {ignores}"
-        );
+        eprintln!("[fn64-combiner]   color reads Texel* = {reads}, ignores Texel* = {ignores}");
         for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
             let mut line = String::new();
             for (index, count) in color[slot].iter().enumerate() {
@@ -4053,33 +3888,6 @@ pub mod census {
                 }
             }
             eprintln!("[fn64-combiner]   alpha {name}:{line}");
-        }
-        let (luma, shade_alpha) = pixel_histograms();
-        let render = |buckets: &[u64; 16]| {
-            buckets
-                .iter()
-                .enumerate()
-                .filter(|(_, count)| **count > 0)
-                .map(|(index, count)| format!(" {}:{count}", index * 16))
-                .collect::<String>()
-        };
-        eprintln!(
-            "[fn64-combiner]   texel luma /16 (pixels={}):{}",
-            luma.iter().sum::<u64>(),
-            render(&luma)
-        );
-        eprintln!(
-            "[fn64-combiner]   shade alpha /16 (pixels={}):{}",
-            shade_alpha.iter().sum::<u64>(),
-            render(&shade_alpha)
-        );
-        let histogram = program_histogram();
-        eprintln!(
-            "[fn64-combiner]   distinct programs = {}, top 8 by count:",
-            histogram.len()
-        );
-        for ((low, high), count) in histogram.iter().take(8) {
-            eprintln!("[fn64-combiner]     {low:#010x} {high:#010x} x{count}");
         }
     }
 }
@@ -4145,82 +3953,6 @@ mod census_tests {
                 params.decode_color(slot, false),
                 ColorInput::Shade,
                 "the cycle-0 slice of this fixture is Shade, so the two differ"
-            );
-        }
-    }
-
-    /// WM2000's dominant measured program, hand-decoded from the wire words
-    /// the ROM actually issued, and pinned because misreading it is what
-    /// made 54% of draws look like they discarded their texture.
-    ///
-    /// `0xfc15fea3 / 0xf00ff23f`, measured at 73,925 of ~115,000 draws in
-    /// one in-match window. Expectations below are derived BY HAND from
-    /// gbi.h's `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1` bit positions, not
-    /// from the decoder under test.
-    ///
-    /// **Mutation scope, stated honestly.** Rewriting
-    /// `color_input_c`'s index 11 from `ShadeAlpha` to `PrimitiveAlpha`
-    /// fails this test. Narrowing `parse_color_c`'s second-cycle mask from
-    /// `0x1F` to `0xF` does NOT -- this program's `c1` is 3, which reads
-    /// identically under either mask, the coincident-fixture trap
-    /// `docs/RT64-WM2000-HARNESS-TRAPS.md` names. That mutant is caught by
-    /// three tests elsewhere in this crate
-    /// (`set_combine_w0_is_passed_through_completely_unmasked`,
-    /// `two_cycle_wire_program_decodes_to_both_slices`, and
-    /// `the_one_cycle_fixtures_really_do_admit_a_combining_texture_rectangle`),
-    /// verified by running the mutant against the full suite, so it is
-    /// covered -- just not here. This fixture's job is the ROM's real
-    /// program, not the mask widths.
-    #[test]
-    fn the_wm2000_fog_program_samples_the_texture_in_its_first_cycle() {
-        let params = CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f);
-
-        // Cycle 0 (two-cycle first pass, `second_cycle = false`).
-        // a0 = w0>>20 & 0xF = 0x1 = TEXEL0; b0 = w1>>28 & 0xF = 0xf -> ZERO;
-        // c0 = w0>>15 & 0x1F = 0x1b = 11 -> SHADE_ALPHA;
-        // d0 = w1>>15 & 0x7 = 0x7 -> ZERO.
-        assert_eq!(params.decode_color(ColorInputSlot::A, false), ColorInput::Texel0);
-        assert_eq!(params.decode_color(ColorInputSlot::B, false), ColorInput::Zero);
-        assert_eq!(
-            params.decode_color(ColorInputSlot::C, false),
-            ColorInput::ShadeAlpha
-        );
-        assert_eq!(params.decode_color(ColorInputSlot::D, false), ColorInput::Zero);
-
-        // Cycle 1: a1 = w0>>5 & 0xF = 0x5 = ENVIRONMENT;
-        // b1 = w1>>24 & 0xF = 0x0 = COMBINED; c1 = w0 & 0x1F = 0x3 = PRIMITIVE;
-        // d1 = w1>>6 & 0x7 = 0x0 = COMBINED. A fog lerp over cycle 0's result.
-        assert_eq!(
-            params.decode_color(ColorInputSlot::A, true),
-            ColorInput::Environment
-        );
-        assert_eq!(
-            params.decode_color(ColorInputSlot::B, true),
-            ColorInput::Combined
-        );
-        assert_eq!(
-            params.decode_color(ColorInputSlot::C, true),
-            ColorInput::Primitive
-        );
-        assert_eq!(
-            params.decode_color(ColorInputSlot::D, true),
-            ColorInput::Combined
-        );
-
-        // The point of the whole fixture: the SECOND cycle names no texel,
-        // and reading only that cycle would conclude this draw throws its
-        // texture away. It does not -- cycle 0 sampled it and `Combined`
-        // carries it forward.
-        for slot in [
-            ColorInputSlot::A,
-            ColorInputSlot::B,
-            ColorInputSlot::C,
-            ColorInputSlot::D,
-        ] {
-            assert_ne!(
-                params.decode_color(slot, true),
-                ColorInput::Texel0,
-                "cycle 1 of the fog program names no Texel0 -- that is the trap"
             );
         }
     }
