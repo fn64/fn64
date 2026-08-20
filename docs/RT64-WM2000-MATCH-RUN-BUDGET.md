@@ -34,6 +34,30 @@ That makes the ratio a cheap scene detector. A run holding ~150 steps/swap is
 almost certainly *not* in a match, whatever its framebuffer looks like -- which
 is worth checking before concluding that a long run reached gameplay.
 
+**Measured live on a boot-ladder run using the committed lead-in** (2026-08-19,
+swaps 7,531 to 9,212 -- 1,700 swaps, roughly 28 in-game seconds):
+
+| swap | steps/swap | gfx/swap | audio/swap |
+|---|---|---|---|
+| 7,531 | 144.9 | 3.00 | 1.83 |
+| 7,874 | 145.8 | 3.00 | 1.84 |
+| 8,221 | 144.1 | 3.00 | 1.83 |
+| 8,550 | 152.0 | 3.01 | 1.84 |
+| 8,884 | 149.7 | 2.99 | 1.83 |
+| 9,212 | 152.4 | 3.00 | 1.83 |
+
+All three rates are flat to within 5%, sustained for 1,700 consecutive swaps,
+with input having stopped at swap 5,990. **HYPOTHESIS: that is a stable screen,
+not evolving gameplay** -- two animated wrestlers, a moving camera and a live
+HUD would not hold a constant 3.00 display lists and a constant guest cost for
+that long. It is consistent with the versus-screen plateau this project has
+recorded before, and inconsistent with the run being in a match.
+
+This matters for the card, because it means the committed lead-in reaching
+in-match gameplay is **not** something that reproduces unconditionally. It is
+also exactly the shape the older `RT64-WM2000-INPUT-GRAMMAR.md` describes and
+the newer in-match capture contradicts, so the two are not yet reconciled.
+
 The table below is given at both rates for that reason.
 
 ## What that buys
