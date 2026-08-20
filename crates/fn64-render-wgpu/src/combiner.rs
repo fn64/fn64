@@ -3985,6 +3985,49 @@ pub mod census {
         SHADE_ALPHA[(shade_alpha >> 4) as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// How many DISTINCT texel values each drawn triangle sampled, bucketed.
+    ///
+    /// The luma histogram above is blind to spatial arrangement: a texture
+    /// sampled through wrong coordinates yields an identically varied
+    /// whole-frame histogram while every individual triangle comes out one
+    /// flat colour. This separates the two. A population concentrated in the
+    /// `1` bucket means each triangle is reading a single texel over and
+    /// over -- flat models with a varied frame -- which is exactly the state
+    /// the whole-frame histogram cannot distinguish from correct texturing.
+    ///
+    /// Buckets are `1`, `2`, `3-4`, `5-8`, `9-16`, `17-64`, `65-256`, `>256`.
+    static DISTINCT_PER_TRIANGLE: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+
+    pub const DISTINCT_BUCKETS: [&str; 8] =
+        ["1", "2", "3-4", "5-8", "9-16", "17-64", "65-256", ">256"];
+
+    /// Records one finished triangle's distinct-texel count.
+    pub fn note_triangle_distinct_texels(distinct: usize) {
+        let bucket = match distinct {
+            0 | 1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=64 => 5,
+            65..=256 => 6,
+            _ => 7,
+        };
+        DISTINCT_PER_TRIANGLE[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn distinct_histogram() -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = DISTINCT_PER_TRIANGLE[index].load(Ordering::Relaxed);
+        }
+        out
+    }
+
     /// `(texel luma buckets, shade alpha buckets)`, each sixteen wide.
     pub fn pixel_histograms() -> ([u64; 16], [u64; 16]) {
         let mut luma = [0u64; 16];
@@ -4072,6 +4115,18 @@ pub mod census {
             "[fn64-combiner]   shade alpha /16 (pixels={}):{}",
             shade_alpha.iter().sum::<u64>(),
             render(&shade_alpha)
+        );
+        let distinct = distinct_histogram();
+        let distinct_line: String = distinct
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, count)| format!(" {}:{count}", DISTINCT_BUCKETS[index]))
+            .collect();
+        eprintln!(
+            "[fn64-combiner]   distinct texels per triangle (triangles={}):{}",
+            distinct.iter().sum::<u64>(),
+            distinct_line
         );
         let histogram = program_histogram();
         eprintln!(
