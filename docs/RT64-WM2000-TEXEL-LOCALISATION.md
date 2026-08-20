@@ -780,10 +780,37 @@ RT64's own vertex arithmetic on the emitted words and checks all six
 vertices land on their texel midpoints (sharing one base fails it), and
 `the_triangle_case_emits_two_triangles_tiling_its_box` pins the geometry.
 
-## What is still open
+## FIXED: the wgpu-side `2^5`
 
-**The wgpu-side `2^5`.** This documents where it comes from and measures
-its effect, but does not fix it: `texture_coordinates_s10_5`'s contract,
-its callers, and the tests that pin its current behaviour all have to move
-together, and `fn64-render-reference` carries the same convention. That is
-its own change with its own verification, not a constant edit.
+`PLANE_TO_TEXEL` is now `2^16`, the plane->S10.5 divisor, leaving the
+`>>5` to whole texels where it belongs -- the sampler's
+`div_euclid(TEXEL_FRACTION_SCALE)` in `tmem/sample.rs`. Total `2^21` from
+plane to texel, matching hardware.
+
+**MEASURED: the triangle case is now `identical`** -- key, RT64 and wgpu
+agree byte-for-byte, and the corpus goes 14 -> 15 identical. The case is
+promoted to `Rt64Authoritative`.
+
+Two fixture constants moved with it. `rdp_harness/tests.rs`'s
+`PLANE_PER_TEXEL` was `2^26`, derived in its own comment from the premise
+that `2^21` is the plane->S10.5 divisor -- the same wrong premise. It is
+now `2^21`, and `PLANE_HALF_TEXEL` derives from it rather than restating a
+literal. Those four harness tests had been asserting the DEFECT's output;
+they now assert the corrected texels, and they were written independently
+of the parity corpus, so their agreement is real cross-confirmation.
+
+Mutation-verified: reverting `PLANE_TO_TEXEL` to `2^21` fails four
+`rdp_harness` tests. Before this change those same tests PASSED with the
+defect, because their constants encoded it.
+
+`fn64-render-reference` needed no change: its `PLANE_TO_TEXEL` at
+`raster/draw.rs:943` is a separate code path with its own conversion, and
+the whole workspace is green.
+
+**NOT touched: the perspective path.** fn64 computes `(S/W) * 32768` on
+the RAW s15.16 planes; angrylion's `tcdiv_persp` is a reciprocal-table
+algorithm operating on the already-shifted `ss = s >> 16`. Whether
+`32768` is right depends on that structural difference, which inspection
+cannot settle -- and guessing at it is exactly how that constant got its
+earlier wrong value of `1024`. It needs its own perspective fixture
+measured against RT64, which the corpus can now express.
