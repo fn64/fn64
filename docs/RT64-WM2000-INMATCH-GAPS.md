@@ -67,3 +67,44 @@ RT64, but none for `fn64-render-wgpu` -- the backend fn64 ships. Wiring that
 runner turns "which hypothesis explains the colour bands" into "here are the
 packets where wgpu and the reference disagree, ranked", and keeps working as a
 regression net afterwards. That work supersedes this census.
+
+## OPEN: is the committed lead-in reaching a match, or a stable screen?
+
+**Status: unresolved, and it qualifies claims already made in this repo.**
+
+A lane mapping the match state machine observed that a live boot-ladder run --
+the committed two-controller lead-in -- holds constant guest cost for over
+1,700 consecutive swaps: ~150 steps/swap, 3.00 gfx tasks/swap, 1.83 audio
+tasks/swap, flat to within 5%. Independently confirmed here from the ladder's
+own log: gfx tasks track swaps at almost exactly 3.00 from swap 8,550 through
+9,881.
+
+Animated wrestlers with a moving camera would not hold constant cost that long.
+So one of two things is true, and nobody has yet measured which:
+
+- The lead-in reaches a match and then IDLES, which is expected: the committed
+  schedule stops issuing presses at swap 6000, so by swap 9,881 nothing has
+  been pressed for ~4,000 swaps. A match with neither player pressing anything
+  is a plausible source of a flat rate.
+- The lead-in does not reproduce a match unconditionally, and the in-match
+  frames captured earlier came from a run whose conditions differ from the
+  committed lead-in's.
+
+**Why this matters.** `docs/frames/wm2000-swap-12000-in-match-groundwork.png`
+and its sibling are cited as evidence that fn64 renders in-match gameplay. That
+evidence stands -- those frames were captured and inspected. What is NOT
+established is that the committed lead-in reproduces them on demand, which is
+what a regression gate needs.
+
+**To settle it:** the same instrument the input-grammar work used -- watch the
+guest's own match state rather than the frame hash, which is documented in this
+repo as the wrong instrument here. `0x801589D6` is a one-byte match-state probe
+(2 = live, 3 = decision). One run with `WM2000_WATCH` on that address answers
+it directly.
+
+**A related harness defect, found by the same lane and worth knowing before
+anyone tests input in a match:** the harness previously MIRRORED the scripted
+pad onto every plugged port, so both wrestlers made the same move on the same
+frame -- a stalemate by construction. A per-port script (`WM2000_INPUT_SCRIPT_P1`)
+is required for any real test of whether input reaches gameplay; mirrored input
+would read as "input does nothing", a false negative on exactly that question.
