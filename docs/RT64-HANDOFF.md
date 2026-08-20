@@ -127,8 +127,31 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    on them.
 2. **Correct `RT64-PERF-CEILING.md`** per §3a. It currently argues against the
    work the measurement says to do.
-3. **Extend the parity corpus to textured triangles. THIS IS NOW THE BLOCKER,
-   not a preparatory step.** Two confirmed, angrylion-cited fixes have landed
+3. **Finish the textured-triangle parity corpus. IT IS ~60% BUILT AND IS THE
+   BLOCKER.** See `docs/RT64-WM2000-TEXEL-LOCALISATION.md` for what exists and
+   what remains -- read it before writing any code, it also lists ruled-out
+   causes and two documented dead ends.
+
+   **Committed and working:** wire helpers, a hand-derived one-cycle textured
+   other-modes word, a both-cycles Texel0 `SetCombine`, an eight-texel image
+   chosen so wrong-row / wrong-bank / wrong-lane each give a DISTINCT answer,
+   two cases, texture-source seeding through the guest byte-lane map, 18/18
+   guard tests.
+
+   **Not working, and the next step:** wgpu refuses both textured cases on a
+   *legitimate* `resident_bytes` guard -- **plumbing is needed; do not widen
+   the guard**. RT64 completes but does not match the hand-derived key,
+   undiagnosed. Re-run the corpus (exact command in the doc) and read the
+   answer: wgpu returning `0x003f` at target (0,1) where the key says `0x8421`
+   is a 4-byte bank error; a byte-swap means the lane mapping; `0xf801` means
+   the row stride.
+
+   **CAVEAT before quoting parity:** the two textured cases are committed in a
+   state where neither backend completes, so they sit as `one-refused`. The
+   denominator moved 10 -> 12 without two usable results. Do not read the
+   ratio as a fidelity change.
+
+   Historical note on why this is the blocker rather than a detour: Two confirmed, angrylion-cited fixes have landed
    against the texel-noise defect -- the perspective scale (2^10 -> 2^15) and
    the odd-row XOR4 rule -- and the symptom is unchanged. Each cost a 20-minute
    ROM run and a human reading a PNG to learn only "still wrong". See
