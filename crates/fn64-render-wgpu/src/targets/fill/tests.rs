@@ -590,3 +590,129 @@ fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectan
         "the proof must name the rectangle actually covered, not the whole target"
     );
 }
+
+/// **The scissor must clip on BOTH axes, and each axis is pinned alone.**
+///
+/// A parallel three-way differential (wgpu vs RT64 vs reference) measured
+/// this backend honouring the scissor horizontally and IGNORING it
+/// vertically before the fill clip landed: its `scissor-top-rows-only` case
+/// differed by exactly 320x120 pixels -- precisely the scissored-out region
+/// -- with RT64, the reference backend and an independent hand-derived key
+/// all agreeing against wgpu, while the X-axis counterpart case was
+/// byte-identical.
+///
+/// That asymmetry is the reason these are two tests over one helper rather
+/// than one test with a scissor narrowed on both axes. A rectangle clipped
+/// correctly in X and not at all in Y still LOOKS clipped, so a fixture that
+/// narrows both would pass while Y silently regressed -- the coincidence
+/// trap `docs/RT64-WM2000-HARNESS-TRAPS.md` names.
+///
+/// Each expectation is derived from the wire, not the executor: the scissor
+/// is latched in quarter-pixels and its pixel bounds are `ceil(q / 4)` on
+/// every edge (`RdpScissorRect::quarter_to_pixel_ceil`, whose derivation is
+/// angrylion's `rasterizer.c:2349-2363` for X and `:2284-2305` for Y).
+fn fill_clipped_by(scissor: RdpScissorRect) -> (TargetRectangle, Vec<u8>) {
+    // A 4x4 RGBA16 target, seeded 0x1234 everywhere -- neither the fill
+    // colour nor zero, so "kept the seed", "painted the fill" and
+    // "fabricated a zero" stay three distinguishable outcomes.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 4, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    let seed = [0x12u8, 0x34].repeat(16);
+    let completed = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        // The whole 4x4 target, in quarter-pixels: 0..=12 on both axes.
+        rect(0, 0, 12, 12),
+        scissor,
+        Some(&seed),
+    )
+    .unwrap();
+    let bytes = completed.device_bytes().device_bytes().to_vec();
+    (completed.rectangle(), bytes)
+}
+
+#[test]
+fn the_scissor_clips_columns_leaving_every_row_present() {
+    // Scissor admits columns 0..2 (lrx = 8 quarter-pixels -> ceil(8/4) = 2)
+    // and every row. The fill asks for all four columns.
+    let (rectangle, bytes) = fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(
+        0, 0, 0, 8, 16,
+    ));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(0, 0, 2, 4).unwrap(),
+        "two columns, all four rows"
+    );
+    for row in 0..4 {
+        let base = row * 8;
+        assert_eq!(
+            &bytes[base..base + 4],
+            &[0xF8, 0x01].repeat(2)[..],
+            "row {row} columns 0..2 must be painted"
+        );
+        assert_eq!(
+            &bytes[base + 4..base + 8],
+            &[0x12, 0x34].repeat(2)[..],
+            "row {row} columns 2..4 are outside the scissor and must keep the seed"
+        );
+    }
+}
+
+#[test]
+fn the_scissor_clips_rows_leaving_every_column_present() {
+    // The Y counterpart, and the axis the differential measured as broken.
+    // Scissor admits rows 0..2 (lry = 8 -> ceil(8/4) = 2) and every column.
+    //
+    // A backend that clipped X and ignored Y would return a 4x4 rectangle
+    // here and paint rows 2 and 3, which the seed assertion below catches.
+    let (rectangle, bytes) = fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(
+        0, 0, 0, 16, 8,
+    ));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(0, 0, 4, 2).unwrap(),
+        "all four columns, two rows"
+    );
+    assert_eq!(
+        &bytes[0..16],
+        &[0xF8, 0x01].repeat(8)[..],
+        "rows 0..2 must be painted across their full width"
+    );
+    assert_eq!(
+        &bytes[16..32],
+        &[0x12, 0x34].repeat(8)[..],
+        "rows 2..4 are outside the scissor and must keep the seed"
+    );
+}
+
+#[test]
+fn the_scissor_clips_the_low_edge_on_both_axes() {
+    // The high edges alone would pass a backend that clamped only `lrx`/
+    // `lry`. This narrows `ulx`/`uly` instead: columns 1..4 and rows 1..4
+    // (ceil(4/4) = 1 on each low edge).
+    let (rectangle, bytes) = fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(
+        0, 4, 4, 16, 16,
+    ));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(1, 1, 3, 3).unwrap(),
+        "origin moves to (1, 1) and the extent shrinks to 3x3"
+    );
+    assert_eq!(
+        &bytes[0..8],
+        &[0x12, 0x34].repeat(4)[..],
+        "row 0 is above the scissor and must keep the seed"
+    );
+    assert_eq!(
+        &bytes[8..10],
+        &[0x12, 0x34],
+        "row 1 column 0 is left of the scissor and must keep the seed"
+    );
+    assert_eq!(
+        &bytes[10..16],
+        &[0xF8, 0x01].repeat(3)[..],
+        "row 1 columns 1..4 must be painted"
+    );
+}
