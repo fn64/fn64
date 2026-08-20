@@ -44,6 +44,7 @@ wgpu-runner = [
 # gated behind its own feature.
 parity-runner = [
     "dep:fn64-render",
+    "dep:libc",
     "dep:fn64-render-reference",
     "dep:fn64-render-rt64",
     "dep:fn64-render-wgpu",
