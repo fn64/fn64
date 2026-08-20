@@ -361,6 +361,10 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
 ) -> Result<(), TexrectExecutionError> {
+    // Hoisted out of the pixel loop: this is the per-PIXEL path, and a live
+    // lane is measuring frame rate. `enabled()` is itself a `OnceLock` read,
+    // but binding it here keeps even that out of the inner loop.
+    let census_pixels = crate::combiner::census::enabled();
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
     // **First-row parity comes from the tile's own T origin, not a
     // constant** -- `execute_texture_rectangle`'s own rule, applied here for
@@ -488,6 +492,19 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                 }
                 (None, _, _) => [0; 4],
             };
+            // **Diagnostic-only, and gated on the same flag as the program
+            // census.** Records the two values the dominant measured program
+            // multiplies together, so "the texel is wrong" and "the shade
+            // alpha is flat" can be told apart from one run. Both are read
+            // here, at the one place both are final: `texel` is the
+            // sampler's own output and `inputs.shade_color[3]` is the
+            // interpolated plane after the same clamp the combiner sees.
+            if census_pixels {
+                crate::combiner::census::note_pixel(
+                    texel,
+                    (inputs.shade_color[3] * 255.0).round() as u8,
+                );
+            }
             let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
             let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
