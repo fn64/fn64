@@ -9713,12 +9713,30 @@ mod tests {
         );
     }
 
-    /// Hostile: a mixed TMEM-load-plus-fill packet is rejected loudly at
-    /// execution rather than silently reordering two write sources into one
-    /// effect report. This slice does not implement the journal-order merge;
-    /// the refusal is named, not implicit.
+    /// A mixed TMEM-load-plus-fill packet composes, and stages exactly the
+    /// writes its fill declared.
+    ///
+    /// **Retargeted, and the old assertion was measuring something else.**
+    /// This asserted that such a packet is REFUSED, on the stated reasoning
+    /// that "this slice does not implement the journal-order merge". That
+    /// reasoning expired: `stage_color_commands` composes fills, texrects
+    /// and raw triangles in the decoder's own stream order, which is
+    /// exactly that merge, and `docs/RT64-GUARD-AUDIT.md` records
+    /// `MixedFillAndTrianglePacket` being removed for the same reason.
+    ///
+    /// What actually produced the `Err` was incidental:
+    /// `fill_rectangle(4, 2, 14, 4)` covers columns 1..=3 of a 16-wide
+    /// target, so it was a partial fill of a brand-new target and tripped
+    /// `PartialNewTargetInitialization` -- a guard about seeding, not about
+    /// mixing. Now that a partial fill carries a colour-image seed, the
+    /// packet completes, and asserting a refusal here would be asserting
+    /// the seeding bug.
+    ///
+    /// So this pins the property the fixture can still honestly show: the
+    /// mixed packet composes, and the writes it stages are its fill's own
+    /// declared rows -- never another source's, and never none.
     #[test]
-    fn execute_raw_dpc_rejects_a_mixed_tmem_and_fill_packet() {
+    fn a_mixed_tmem_and_fill_packet_composes_and_stages_its_own_writes() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
 
@@ -9731,14 +9749,33 @@ mod tests {
         let (planned, source_bytes) = plan_with_deterministic_reads(&mut backend, &session, words);
         let guest_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, guest_capture).unwrap();
+        let submission = bound.submission();
+        backend
+            .execute_raw_dpc(bound)
+            .expect("a mixed TMEM+fill packet composes in journal order");
         assert!(
-            backend.execute_raw_dpc(bound).is_err(),
-            "a mixed TMEM+fill packet must be rejected, never merged in an unverified order"
+            backend.has_pending_fill_publication(),
+            "a composed mixed packet must stage its fill's publication"
         );
-        assert!(
-            !backend.has_pending_fill_publication(),
-            "a rejected mixed packet must stage nothing"
-        );
+        // Hand-derived from the wire. `fill_rectangle` takes WHOLE pixels
+        // and shifts them left by two itself, so (4,2)..(14,4) is columns
+        // 4..=14 and rows 2..=4 of a 16-wide RGBA16 target -- 11 columns,
+        // 3 rows. `x0 != 0`, so `plan_render_target_rows` takes its per-row
+        // branch and declares one access PER ROW rather than collapsing to
+        // one contiguous run: 3 writes of 11 pixels x 2 bytes = 22 bytes.
+        //
+        // (First written as quarter-pixels, which gave 2 rows of 6 bytes
+        // and failed -- the helper's own units are the fact to read, not
+        // the wire encoding it produces.)
+        let staged = backend.staged_guest_render_target_writes(submission);
+        assert_eq!(staged.len(), 3, "one declared write per covered row");
+        for write in &staged {
+            assert_eq!(
+                write.byte_count(),
+                22,
+                "eleven columns of RGBA16 is twenty-two bytes per row"
+            );
+        }
     }
 
     /// Hostile: a submission mismatch yields an EMPTY staged-write list, not
