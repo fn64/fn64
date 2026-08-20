@@ -100,37 +100,45 @@ enum Authority {
     /// the oracle is the one not modelling the hardware.
     /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
-    /// **The RT64 lane writes no pixels for a raw triangle, cause not yet
-    /// determined.**
+    /// **wgpu and RT64 read a raw triangle's texture planes on scales that
+    /// differ by 64x, so no one display list can satisfy both.**
     ///
-    /// MEASURED: a raw triangle issued through
-    /// `Rt64Backend::process_rdp_commands` completes with no error and writes
-    /// nothing. It is a property of triangles as such, not of texturing --
-    /// the same geometry as a FLAT triangle (opcode `0x08`, no coefficient
-    /// blocks) also draws nothing, while a texture RECTANGLE over the
-    /// identical tile, scissor and target draws correctly in the same list.
+    /// CONFIRMED by reading both implementations:
     ///
-    /// **NOT dispatch, and not the obvious state.** VERIFIED by reading:
-    /// fn64's lane forwards the whole word range without opcode filtering
-    /// (`fn64-render-rt64/src/lib.rs`'s `process_rdp_commands`), and RT64's
-    /// LLE GBI registers all eight `G_RDPTRI_BASE` opcodes to its `tri`
-    /// handler (`src/gbi/rt64_gbi_rdp.cpp`), computing this command's length
-    /// correctly. Simulating `decodeTriangles`' own arithmetic on these
-    /// words yields the intended non-degenerate box, and culling is forced
-    /// off for `Projection::Type::Triangle`. This case's word 0 carries tile
-    /// 0 -- the loaded tile -- and its list sets a scissor covering the whole
-    /// target, so neither is the explanation either.
+    /// | lane | non-perspective plane -> texels |
+    /// |---|---|
+    /// | fn64 | `plane / 2^21` to S10.5 then `/32` = `plane / 2^26` |
+    /// | RT64 | `(plane / 2^16 * 1024) / 16384` = `plane / 2^20` |
     ///
-    /// So the pixels are lost somewhere in RT64's draw-call assembly, and
-    /// **no test in this workspace has ever driven a raw triangle through
-    /// this lane**, so there is no known-good setup to copy. Establishing one
-    /// is its own piece of work.
+    /// fn64's is `triangle_span.rs`'s `PLANE_TO_TEXEL`, whose own doc derives
+    /// it from **angrylion's `tcdiv_nopersp`**; RT64's is
+    /// `src/gbi/rt64_gbi_rdp.cpp:535-537`. Both end in TEXEL units -- RT64's
+    /// sampler does `floor(uvCoord)` and subtracts the tile origin as
+    /// `/ 4.0` (`TextureSampler.hlsli:148,245`) -- so this is a real
+    /// disagreement, not a units artifact.
     ///
-    /// A difference here is therefore NOT evidence against wgpu. The case
-    /// still earns its place: it holds wgpu to a hand-derived key on a path
-    /// no texrect case reaches, and it pins the RT64 gap so a later session
-    /// does not re-diagnose it as a wgpu defect.
-    RawTriangleRt64DoesNotRasterize,
+    /// This case's planes are authored for fn64's scale (one texel per pixel
+    /// of X), so RT64 reads its four columns as texels 32, 96, 160 and 224 of
+    /// a 4-texel tile and clamps every one to the last. MEASURED: every pixel
+    /// RT64 writes here is `TEXTURE_TEXELS[3]`. Rescaling the planes by 1/64
+    /// makes wgpu sample texel 0 everywhere, exactly as its own rule
+    /// predicts.
+    ///
+    /// **Note what was WRONG before:** this variant previously claimed RT64
+    /// "does not rasterize raw triangles". It does. That reading came from a
+    /// triangle-only list; with a texrect and the triangle in the SAME
+    /// packet, RT64 draws the texrect in agreement with wgpu AND writes
+    /// triangle pixels, deterministically across runs.
+    ///
+    /// A difference here is therefore not evidence against either lane on its
+    /// own. The case earns its place by holding wgpu to a hand-derived key on
+    /// a path no texrect reaches, and by pinning the scale disagreement so it
+    /// is not re-diagnosed as a texel defect.
+    ///
+    /// STILL OPEN: RT64's coverage here is partial and ragged rather than a
+    /// clean box. The clamped texel explains the wrong colour, not the
+    /// missing pixels; that is a separate effect.
+    RawTrianglePlaneScaleDisagreement,
 }
 
 impl Authority {
@@ -138,7 +146,7 @@ impl Authority {
         match self {
             Self::Rt64Authoritative => "rt64-authoritative",
             Self::CoverageDependentRt64NotAuthoritative => "rt64-not-authoritative-coverage",
-            Self::RawTriangleRt64DoesNotRasterize => "rt64-does-not-rasterize-raw-triangles",
+            Self::RawTrianglePlaneScaleDisagreement => "raw-triangle-plane-scale-disagreement",
         }
     }
 }
@@ -1045,7 +1053,7 @@ fn cases() -> Vec<Case> {
                      walking. S advances one texel per pixel of X and T is \
                      constant, so the three covered rows are three \
                      independent readings of the same claim.",
-            authority: Authority::RawTriangleRt64DoesNotRasterize,
+            authority: Authority::RawTrianglePlaneScaleDisagreement,
             commands: one_textured_triangle(),
             expected: triangle_expected,
         },
@@ -1626,7 +1634,7 @@ fn run() -> Value {
             // Counted with the other non-authoritative partition for the same
             // reason: the oracle is the lane that is not modelling the
             // command, so a difference is not evidence against wgpu.
-            Authority::RawTriangleRt64DoesNotRasterize => non_authoritative.record(verdict),
+            Authority::RawTrianglePlaneScaleDisagreement => non_authoritative.record(verdict),
         }
 
         let matches_key = |outcome: &Result<Vec<u8>, String>| match outcome {
@@ -1833,7 +1841,7 @@ mod tests {
     }
 
     /// **The raw-triangle authority means what it says.** A case may only
-    /// claim `RawTriangleRt64DoesNotRasterize` if it actually issues a raw
+    /// claim `RawTrianglePlaneScaleDisagreement` if it actually issues a raw
     /// triangle (opcode 0x08..=0x0f), and a case that issues one may not
     /// claim RT64 authority -- RT64 draws no pixels for it, so a
     /// wgpu-vs-RT64 difference there is not a wgpu finding.
@@ -1848,7 +1856,7 @@ mod tests {
                 .commands
                 .iter()
                 .any(|&(word0, _)| (0x08..=0x0f).contains(&(word0 >> 24)));
-            if case.authority == Authority::RawTriangleRt64DoesNotRasterize {
+            if case.authority == Authority::RawTrianglePlaneScaleDisagreement {
                 assert!(
                     has_triangle,
                     "case {} claims the raw-triangle authority without issuing a raw triangle",
@@ -1859,8 +1867,8 @@ mod tests {
                 assert_ne!(
                     case.authority,
                     Authority::Rt64Authoritative,
-                    "case {} issues a raw triangle, which RT64 does not rasterize, so it cannot \
-                     claim RT64 authority",
+                    "case {} issues a raw triangle, whose texture planes the two lanes read on \
+                     scales differing by 64x, so it cannot claim RT64 authority",
                     case.name
                 );
             }
