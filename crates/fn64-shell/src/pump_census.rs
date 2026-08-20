@@ -373,7 +373,69 @@ impl PumpCensus {
         }
         self.reported = true;
         print!("{}", render_report(&self.samples, renderer, sequence_len()));
+        print!("{}", render_session_phase_report());
     }
+}
+
+/// The raw-DPC SESSION phase split, printed beside the pump census.
+///
+/// WHY IT PRINTS FROM HERE rather than from its own `atexit` hook in
+/// `fn64-abi`: the hook demonstrably did not fire on this route -- a run with
+/// `FN64_SESSION_PHASE_CENSUS=1` produced a full pump census attributing
+/// 66.021 ms to `gfx_lle_rdp_ns` and not one line of phase split. Rather than
+/// argue about why (`std::process::exit` and per-image handler ordering both
+/// have plausible stories, and perf-method's "cause unknown beats a mechanism
+/// that fits" applies), this reads the running totals directly at the one
+/// boundary already proven to print. Same reason this module reads
+/// `dpc_census_running_totals` rather than waiting for that census's at-exit
+/// summary.
+///
+/// NOT ARMED is reported as NOT ARMED. An unarmed counter reads a constant
+/// zero, and presenting that zero as "these phases cost nothing" is the
+/// check-that-cannot-fail error (perf-method rule 6a) every gate in this file
+/// exists to keep visible.
+fn render_session_phase_report() -> String {
+    use std::fmt::Write as _;
+    let (plan, finalize, execute, commit, submissions) = fn64_abi::session_phase_running_totals();
+    let mut out = String::new();
+    if submissions == 0 {
+        let _ = writeln!(
+            out,
+            "[session-phase] NOT ARMED or no session submissions observed \
+             (FN64_SESSION_PHASE_CENSUS): the zeros below are not costs."
+        );
+        return out;
+    }
+    let total = plan + finalize + execute + commit;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let share = |ns: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * ns as f64 / total as f64
+        }
+    };
+    let _ = writeln!(
+        out,
+        "[session-phase] submissions={submissions} attributed_total={:.1} ms \
+         (compare against the `gfx_lle_rdp_ns` row above -- same run, same thread)",
+        ms(total)
+    );
+    for (name, ns) in [
+        ("plan", plan),
+        ("finalize", finalize),
+        ("execute", execute),
+        ("commit", commit),
+    ] {
+        let _ = writeln!(
+            out,
+            "[session-phase]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/submission",
+            ms(ns),
+            share(ns),
+            ms(ns) / submissions as f64,
+        );
+    }
+    out
 }
 
 /// Summary statistics over one population of pumps.
