@@ -544,11 +544,27 @@ pub(crate) fn project_tmem_transfer_word(
                 TmemTransferLayout::Linear64 => 0x01ff,
                 TmemTransferLayout::SplitBanks64 => 0x00ff,
             };
-            (
-                (destination & mask) as u16,
-                advance,
-                (u64::from(source_t.raw()) + advance) & 1 != 0,
-            )
+            // **The exchange bit is the TILE-RELATIVE row, with no T-origin
+            // term.** See `odd_row_exchange`'s doc in `tmem/read.rs` for the
+            // full angrylion derivation; the short form is that
+            // `rdp_load_block` seeds the edgewalker's span T with `tl << 3`
+            // (`src/core/n64video/rdp/tex.c:929`) and `tc_pipeline_load`
+            // immediately subtracts that same `tl << 3` back off via
+            // `TRELATIVE` (`tcoord.c:998-999`), so `dswap = sst & 1`
+            // (`tex.c:583`) is taken on a row that starts at zero for every
+            // load whatever `tl` is.
+            //
+            // This previously read `(source_t.raw() + advance) & 1`. The
+            // `source_t` term is not on hardware, and it did not cancel
+            // against anything: the READER derives its own parity from the
+            // tile's `low_t` (a different field, and `.integer()` = `raw >> 2`
+            // rather than `.raw()`, so a different unit). Enumerated over
+            // `low_t` x `source_t` x `row`, writer and reader disagreed in 256
+            // of 512 cases, and on a disagreeing row every texel was fetched
+            // from the wrong 4-byte half of its 64-bit word -- wrong colour at
+            // correct coordinates, which is the "noise, not imagery" signature
+            // in `docs/RT64-WM2000-TEXTURE-STATE.md`.
+            ((destination & mask) as u16, advance, advance & 1 != 0)
         }
         TmemLoadKind::Tile { bounds } => {
             if words_per_row == 0 {
@@ -567,11 +583,18 @@ pub(crate) fn project_tmem_transfer_word(
                 TmemTransferLayout::Linear64 => 0x01ff,
                 TmemTransferLayout::SplitBanks64 => 0x00ff,
             };
-            (
-                (destination & mask) as u16,
-                row,
-                (u64::from(bounds.low_t().integer()) + row) & 1 != 0,
-            )
+            // Same rule as the Block arm above, and the same citation:
+            // `tile_tlut_common_cs_decoder` (`tex.c:939-970`) seeds the span
+            // from `tl` and `tc_pipeline_load`'s `TRELATIVE` takes it back
+            // off, so the exchange bit is the tile-relative row alone.
+            //
+            // This arm's previous `(low_t.integer() + row) & 1` was harmless
+            // in isolation -- the reader carried the identical term, so the
+            // two cancelled and LoadTile texels came back correct -- but it
+            // placed every odd-origin tile's bytes at non-hardware addresses,
+            // and it is the term whose LoadBlock counterpart did NOT cancel.
+            // Removing it from both sides makes the layout hardware's own.
+            ((destination & mask) as u16, row, row & 1 != 0)
         }
         TmemLoadKind::Tlut { .. } => {
             // SGI RDP Command Summary Table 10 / libultra `gbi.h`
