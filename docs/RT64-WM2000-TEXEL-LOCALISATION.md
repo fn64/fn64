@@ -370,3 +370,173 @@ Then, in order:
    diagnosis -- which is the entire point of extending the corpus.
 
 That comparison is the thing this session was trying to reach and did not.
+
+---
+
+# The corpus is finished, and it localised a NEW defect
+
+Written after completing the textured corpus (commit `3109ff66`). Every
+claim is **CONFIRMED** (measured) or **HYPOTHESIS**.
+
+## The corpus now produces a usable result
+
+Both blockers in the previous section are fixed:
+
+1. **wgpu's `resident_bytes` refusal** -- answered from inside the packet.
+   The textured command list now opens with a full-extent fill, which needs
+   no seed itself and leaves the accumulated buffer the texrect composes
+   into. The guard was NOT widened, and no seed-read plumbing was threaded
+   through the decoder/IR/planner. The fill paints `STALE`, exactly what
+   `seeded` writes and what the key already required outside the rectangle,
+   so the key was unchanged.
+
+2. **The key was wrong.** CONFIRMED. Texrect high edges are **exclusive**;
+   `G_FILLRECT`'s are **inclusive**. The fixture used `extent - 1` by
+   analogy with the fill cases, so it drew one fewer row and column: every
+   backend correctly left row 1 as `STALE` while the key demanded texels
+   there. **This is the "RT64 completes but does not match the key,
+   undiagnosed" item from the handoff.** It was a fixture defect, not a
+   finding. `targets/texrect.rs` already pinned the rule ("the fill rule is
+   inclusive and the texrect rule is half-open"); the corpus now pins it
+   too, mutation-verified.
+
+**CONFIRMED: RT64 matches the hand-derived key exactly**, all eight texels,
+both cases. The key is independently confirmed and can now be trusted.
+
+## CONFIRMED: what wgpu does, and what it is NOT
+
+| lane | row 0 | row 1 |
+|---|---|---|
+| key | `07c1 f801 ffff 003f` | `c631 8421 fc01 4211` |
+| RT64 | `07c1 f801 ffff 003f` | `c631 8421 fc01 4211` |
+| wgpu | `01f9 c107 3f01 ffff` | `2185 31c7 1143 01fd` |
+
+The wgpu values are **not** in the diagnosis table the previous section
+laid out, and that table's three named outcomes are all refuted:
+
+- **Not a wrong texel.** No wgpu value is any member of `TEXTURE_TEXELS`.
+- **Not a byte-swap, rotation, or any bit-permutation** of the correct
+  value. Checked exhaustively over all 16 rotations, bit-reversal, and
+  byte-swap of both the key and every texel.
+- **Not a TMEM addressing error at all.** The values do not appear anywhere
+  in the TMEM byte image, at any bit offset (swept every offset in the
+  128-bit image). A wrong address returns *some real texel*; these are not
+  real texels.
+- **Not a stream misalignment.** Sweeping a 16-bit window across the
+  concatenated pixel stream, and testing `prev << n | key >> n` in both
+  directions, produces no match.
+- **Not an RGBA5551/1555/0555 repacking**, not a 5->8->5 expansion, and not
+  an RGBA8888 two-byte window.
+
+## CONFIRMED: the corruption is a pure function of the texel value
+
+The same texel maps to the same wrong value in **both cases**, at
+**different target positions**, reading **different TMEM rows**:
+
+| texel | case 1 | case 2 |
+|---|---|---|
+| `0xc631` | `0x2185` | `0x2185` |
+| `0x8421` | `0x31c7` | `0x31c7` |
+| `0xfc01` | `0x1143` | `0x1143` |
+| `0x4211` | `0x01fd` | `0x01fd` |
+
+**This is the most constraining result here.** Every position-dependent
+cause is refuted by it, because each would vary with position and this does
+not: TMEM address computation, tile `line` / row stride, the 4-byte bank
+selection, the byte-lane mapping, and the odd-row XOR4 exchange. The defect
+is a **value transform applied to a correctly-fetched texel**, downstream
+of the sampler.
+
+Note this retires, for the wgpu texrect lane, the entire class of cause the
+previous sections were investigating. The XOR4 work there remains correct
+on its own merits; it is not what this measures.
+
+## CONFIRMED: the fill lane is unaffected
+
+wgpu matches the key on **every** fill case in the corpus, including the
+RGBA16 colour cases. So the 16-bit pack/write path is correct where it is
+shared, and the defect is specific to the textured path: sampler output ->
+combiner -> written pixel.
+
+## CONFIRMED ROOT CAUSE: the sampler reads RAW STORAGE, skipping the `^3` map
+
+A probe dumping `(s, t, decoded texel)` per pixel, immediately before
+`combine_one_texel` (`targets/texrect.rs:1888`), settled it in one run.
+
+**Texture COORDINATES are correct.** `s` steps `0x00, 0x20, 0x40, 0x60` and
+`t` steps `0x00, 0x20` -- exactly one texel per pixel on both axes, and the
+second case's rows both land on TMEM row 1 as designed. Addressing,
+stride, shift/clamp and the tile descriptor are all doing the right thing.
+
+**The texels the sampler returns are already wrong before the combiner
+runs**, so the combiner and blender are exonerated. (Independently: the
+crate's exhaustive `read_pixel_inverts_write_pixel_over_every_rgba16_
+halfword` passes, `write_pixel` is byte-identical to the fill lane's, and
+wgpu matches the key on every fill case in this corpus.)
+
+The eight sampled values are explained by ONE rule, with no exceptions:
+
+> fn64 reads the texture source as **raw RDRAM storage bytes**, without
+> applying the guest's `^3` logical-to-storage byte-lane mapping.
+
+| texel | raw storage BE | fn64 sampled | correct |
+|---|---|---|---|
+| 0 | `0xc107` | `0xc107` | `0xf801` |
+| 1 | `0x01f8` | `0x01f8` | `0x07c1` |
+| 2 | `0xffff` | `0xffff` | `0x003f` |
+| 3 | `0x3f00` | `0x3f00` | `0xffff` |
+| 4 | `0x31c6` | `0x31c6` | `0x8421` |
+| 5 | `0x2184` | `0x2184` | `0xc631` |
+| 6 | `0x01fc` | `0x01fc` | `0x4211` |
+| 7 | `0x1142` | `0x1142` | `0xfc01` |
+
+Equivalently, as a composite: each texel is read little-endian from byte
+offset `correct ^ 2`. Both descriptions are the same defect.
+
+### CONFIRMED: the fixture's staging is CORRECT, and this is not a harness bug
+
+Worth stating explicitly, because it was checked the wrong way round once.
+`seeded` stages the texels with `write_u16`, whose storage image is
+`c10701f8 ffff3f00 31c62184 01fc1142`. Read back through the guest's `^3`
+logical mapping that is exactly `f80107c1 003fffff 8421c631 4211fc01` --
+the intended texels, in RDP-visible big-endian order.
+
+Restaging it instead as `write_logical_bytes` over a big-endian image
+produces a **byte-identical** buffer (verified), so that change is a no-op
+and was reverted. Both spellings are correct; the storage image is right
+either way.
+
+**The decisive evidence is that RT64 reads the SAME buffer and returns the
+key exactly.** Both backends receive the identical `rdram` from `seeded`.
+One reads it correctly and one does not, so the defect cannot be in the
+staging.
+
+### Why this is the WM2000 defect, and why every earlier fix missed it
+
+The signature matches `RT64-WM2000-TEXTURE-STATE.md` precisely: correct
+geometry, correct coordinates, dense per-pixel wrong colour. A `^3` lane
+error scrambles bytes WITHIN each 32-bit word, so neighbouring texels swap
+halves -- noise, not imagery, on correctly shaped and lit surfaces.
+
+It also explains why the perspective-scale fix and the odd-row XOR4 fix
+were both real, both cited, and both insufficient: neither touches the byte
+lane on the RDRAM->TMEM path, so the texels stayed scrambled no matter how
+correctly they were addressed.
+
+Note what this retires: the previous sections' entire investigation of
+LoadBlock/LoadTile write-vs-read parity was searching for a
+position-dependent cause. The corruption measured here is a pure function
+of the texel VALUE -- the same texel maps to the same wrong value at
+different target positions and different TMEM rows -- which no
+position-dependent rule can produce.
+
+### The open question
+
+Whether the live ROM path shares this defect or only the conformance
+harness does. The conformance lane slices `rdram.get(start..end)` directly
+(`conformance.rs`, the `guest_rdram` arm), which is raw storage; the
+production lane stages guest reads through `fn64-abi`. If both read raw
+storage the defect is in the shared sampler and WM2000 is affected; if only
+the conformance path does, the corpus needs the fix and the ROM defect is
+still open. **Settle this before fixing anything** -- and note the fix site
+differs completely between the two answers.
