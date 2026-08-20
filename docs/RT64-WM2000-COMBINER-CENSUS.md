@@ -65,3 +65,42 @@ highest bit any w0 field reaches is 23.
 
 So a mis-decoded combiner program is **not** the explanation. The census
 below measures what the correctly-decoded programs actually select.
+
+## REFUTED: the CI-aliases-to-I8 path is not a defect
+
+`docs/RT64-WM2000-INMATCH-GAPS.md` raises, as "a silent wrong-colour path the
+guard audit could not see", that with `en_tlut` clear a CI4/CI8 texel is
+aliased to I8 -- the palette index rendered as greyscale intensity -- and
+proposes it as a candidate explanation for the blocky dark glyphs.
+
+**fn64 does exactly that, and so does the hardware.** The alias is real
+(`crates/fn64-render-wgpu/src/tmem/texel.rs:375`,
+`TextureLutMode::Disabled => Ok(ResolvedIndexedTexel::Direct(decode_i8(index)))`,
+with `decode_i8` at `:571` setting `r = g = b = a = index`, and the index
+itself formed at `:365` as `(palette << 4) | nibble` for CI4).
+
+angrylion, the cycle-accurate oracle, does the same thing byte for byte
+(`src/core/n64video/rdp/tmem.c:260-288`):
+
+```c
+case TEXEL_CI4:
+    p = wstate->tmem[taddr & 0xfff];
+    p = (s & 1) ? (p & 0xf) : (p >> 4);
+    p = (uint8_t)(tpal << 4) | p;
+    color->r = color->g = color->b = color->a = p;
+case TEXEL_CI8:
+    p = wstate->tmem[taddr & 0xfff];
+    color->r = color->g = color->b = color->a = p;
+```
+
+Same `tpal << 4` fold for CI4, same splat to all four channels, same
+absence of a refusal. So this alias is not fn64 losing a colour: it is the
+RDP's own documented-by-silicon behaviour for a CI tile drawn with the TLUT
+off, and any game relying on it gets greyscale on real hardware too.
+
+**Consequence for this card:** candidate 3 is closed. If WM2000's glyphs are
+dark and blocky, either the guest genuinely programs a TLUT and fn64 loses
+it somewhere upstream of `lut_mode` (a different defect, in `SetOtherMode`
+latching or TLUT residency, not in this decode), or the glyphs are a
+downstream artifact. Widening this decode would take fn64 further from
+hardware, not closer.
