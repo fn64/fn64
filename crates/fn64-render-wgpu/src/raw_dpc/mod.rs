@@ -1739,12 +1739,21 @@ fn plan_fill(
     // so those paths decode exactly as they did. Making the height
     // mandatory instead broke twenty-odd decode tests that legitimately
     // have none, which is how this arm got written.
-    let covers_target = rectangle.x0 == 0
-        && rectangle.y0 == 0
-        && rectangle.x1 + 1 == image.width()
-        && state
-            .color_target_height()
-            .is_none_or(|height| rectangle.y1 + 1 == height);
+    //
+    // **A zero height declares no seed.** A degenerate target holds no
+    // pixels to seed from, and the honest refusal for a fill against one is
+    // the named downstream rejection the executor already produces
+    // (`resize_to_zero_is_recorded_and_rejected_by_name_at_the_fill`), not
+    // "color image lies outside installed RDRAM" raised while sizing a
+    // zero-pixel read. Preempting it here replaced a specific diagnosis
+    // with a misleading one, which is how this arm was found.
+    let covers_target = state.color_target_height().is_some_and(|height| height == 0)
+        || (rectangle.x0 == 0
+            && rectangle.y0 == 0
+            && rectangle.x1 + 1 == image.width()
+            && state
+                .color_target_height()
+                .is_none_or(|height| rectangle.y1 + 1 == height));
     let seed = if covers_target {
         None
     } else {
