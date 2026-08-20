@@ -740,9 +740,50 @@ fn64's rasterizer evaluates the plane per PIXEL, so `Dx` applies at every
 column regardless. The two models are not reconcilable by a scale factor
 alone, which is why the scale sweep fails.
 
+## RESOLVED: authored in vertex terms, RT64 matches the key
+
+Two changes together, both derived rather than fitted:
+
+1. **Per-vertex planes.** RT64 evaluates S at three vertices and only `v3`
+   carries `Dx`, so with `De = 0` the `base` must be the S of the H edge --
+   where `v1` and `v2` both sit. The two halves of the box therefore need
+   DIFFERENT bases (left edge, right edge) and the SAME `Dx` of one texel
+   per pixel of X: the upper-right half's `dx_3` is negative, so the sign
+   cancels and no negative gradient is needed. An earlier attempt that
+   negated `Dx` for that half double-counted the sign.
+2. **The hardware scale**, `2^21` plane units per texel, from the chain
+   above.
+
+MEASURED, same fixture, the two scales:
+
+| planes | RT64 | wgpu |
+|---|---|---|
+| `2^21` (hardware) | **matches the key** | texel 0 everywhere |
+| `2^26` | clamps | matches the key |
+
+So RT64 agrees with hardware and **fn64's rasterizer does not**: it wants
+planes `2^5` larger for the same texel. The cause is visible in
+`texture_coordinates_s10_5`, which divides by `PLANE_TO_TEXEL = 2^21` and
+returns a value the caller consumes as S10.5 through
+`TextureCoordinateS10_5::from_raw` -- so the sampler applies the `>>5` to
+texels a second time. Hardware's `2^21` is plane -> TEXELS; fn64 treats it
+as plane -> S10.5 and then divides again.
+
+**This inverts what the corpus case measures.** It is now evidence against
+wgpu rather than against RT64. The case stays in the non-authoritative
+partition only because the wgpu-side defect is unfixed; once it is, the
+case should become `Rt64Authoritative`.
+
+Two guards pin the derivation, both mutation-verified:
+`the_triangle_planes_land_on_texel_midpoints_at_every_vertex` reproduces
+RT64's own vertex arithmetic on the emitted words and checks all six
+vertices land on their texel midpoints (sharing one base fails it), and
+`the_triangle_case_emits_two_triangles_tiling_its_box` pins the geometry.
+
 ## What is still open
 
-Which scale each lane effectively uses, expressed in the same units, and
-whether RT64's vertex-interpolation model can be made to agree with a
-per-pixel plane at all for this fixture shape. The hardware chain is now
-known; the mapping from it to each renderer is not.
+**The wgpu-side `2^5`.** This documents where it comes from and measures
+its effect, but does not fix it: `texture_coordinates_s10_5`'s contract,
+its callers, and the tests that pin its current behaviour all have to move
+together, and `fn64-render-reference` carries the same convention. That is
+its own change with its own verification, not a constant edit.
