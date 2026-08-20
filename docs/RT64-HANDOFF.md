@@ -131,10 +131,15 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    It is 10 hand-authored **fill-rectangle** cases today -- it cannot see any
    open bug. This is the highest-leverage item: the fast layer does not cover
    the code under change.
-4. **Look at the screen after the texel-scale fix lands.** With 87% of
-   textured triangles previously collapsing to a single texel, the visual
-   result should change substantially. Re-check the colour bands and blocky
-   glyphs before scoping either as separate work -- they may share this cause.
+4. **DONE -- see `docs/RT64-WM2000-TEXTURE-STATE.md`.** The screen was checked
+   after the fix. Surfaces went from flat solid colour to dense per-pixel
+   variation, confirming the fix at the pixel level, but the variation is
+   **noise, not imagery**. Geometry and shading are visibly correct; the texel
+   VALUES are wrong. The defect is now well-bounded: coordinates are right,
+   the fetch at those coordinates is not -- so suspect the TMEM address
+   computation, the tile descriptor's format/size/line fields, the palette, or
+   the byte-lane mapping. Colour bands and blocky glyphs plausibly share this
+   cause; do not scope them separately yet.
 5. **Then optimise the rasterizer.** ~150 cycles/pixel at 8x overdraw where
    20-30 should do; `pixel_coverage` and `attribute_sample` each rescan the
    same subsamples, and every admitted triangle samples a texture per pixel.
