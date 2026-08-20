@@ -1196,3 +1196,19 @@ mod tests {
         assert_eq!(crate::next_vi_deadline(), Some(40));
     }
 }
+
+/// Running totals for the raw-DPC SESSION phase split, for per-pump sampling.
+///
+/// `(plan_ns, finalize_ns, execute_ns, commit_ns, submissions)`. Exported for
+/// the same reason `dpc_census_running_totals` is: `fn64-shell` samples per
+/// PUMP, and one pump is not one VI field, so an at-exit total cannot answer
+/// what a slow pump contains.
+///
+/// Five relaxed atomic loads, read unconditionally. When
+/// `FN64_SESSION_PHASE_CENSUS` is unset every counter reads zero, which is
+/// the true answer -- nothing was counted. A caller must report that as NOT
+/// ARMED rather than as "these phases cost nothing", which is the
+/// check-that-cannot-fail error the census gates exist to keep visible.
+pub fn session_phase_running_totals() -> (u64, u64, u64, u64, u64) {
+    crate::session_phase_census::running_totals()
+}
