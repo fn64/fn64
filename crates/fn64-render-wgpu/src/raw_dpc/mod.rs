@@ -4567,7 +4567,15 @@ mod tests {
         assert_eq!(transfer.words()[1].destination_word(), 0);
         assert_eq!(transfer.words()[0].defined_source_byte_mask(), 0xff);
         assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0x03);
-        assert!(transfer.words().iter().all(|word| word.odd_row_exchange()));
+        // **Neither word exchanges: both are tile-relative row 0.** This
+        // LoadBlock carries `DXT = 0`, so no word advances a row, and the
+        // block's own TL does not enter the exchange. This used to assert
+        // that ALL words exchanged, which was the writer's removed
+        // `source_t` term; see `tmem/read.rs::odd_row_exchange`.
+        assert!(transfer
+            .words()
+            .iter()
+            .all(|word| !word.odd_row_exchange()));
         assert_eq!(
             transfer
                 .destination_accesses()
@@ -4608,7 +4616,12 @@ mod tests {
                     word.odd_row_exchange()
                 ))
                 .collect::<Vec<_>>(),
-            vec![(0, 10, true), (0, 11, true), (1, 14, false)]
+            // The exchange column is the TILE-RELATIVE row's parity alone --
+            // words 0-1 are row 0, word 2 is row 1. This used to read
+            // `true, true, false`, folding in the writer's removed
+            // `source_t` term (TL is 1 here). See
+            // `tmem/read.rs::odd_row_exchange` for the angrylion citation.
+            vec![(0, 10, false), (0, 11, false), (1, 14, true)]
         );
         assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0x03);
         assert_transfer_geometry_matches_destination_union(&decoded, load);
@@ -4775,19 +4788,26 @@ mod tests {
                 .iter()
                 .map(|word| (word.destination_word(), word.physical()))
                 .collect::<Vec<_>>(),
+            // **Both words are tile-relative row 0, so neither exchanges.**
+            // This LoadBlock carries `DXT = 0`, and a word lands on row
+            // `(word * dxt) >> 11`, so no word here advances a row -- the
+            // block's own TL does not enter the exchange at all. The ranges
+            // used to be the exchanged ones (`2044`/`4`), which was the
+            // writer's removed `source_t` term; see
+            // `tmem/read.rs::odd_row_exchange`.
             vec![
                 (
                     255,
                     crate::TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap(),
                     },
                 ),
                 (
                     0,
                     crate::TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(4, 8).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(0, 4).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(2048, 2052).unwrap(),
                     },
                 ),
             ]
@@ -4798,11 +4818,13 @@ mod tests {
                 .iter()
                 .map(|access| access.region())
                 .collect::<Vec<_>>(),
+            // The union of the two unexchanged split-bank words above, in
+            // ascending order. Shifted down four bytes with them.
             vec![
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4, 8).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(0, 4).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2048, 2052).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap()),
             ]
         );
         assert_transfer_geometry_matches_destination_union(&odd_wrapped, odd_load);
@@ -4857,11 +4879,14 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>(),
+            // Words 0-1 are tile-relative row 0 and words 2-3 are row 1;
+            // the parity column used to be inverted by the writer's removed
+            // `low_t.integer()` term (1 for this fixture's S10.2 `low_t = 4`).
             vec![
-                (0, 0xff, 0, true),
-                (8, 0x03, 1, true),
-                (10, 0xff, 3, false),
-                (18, 0x03, 4, false)
+                (0, 0xff, 0, false),
+                (8, 0x03, 1, false),
+                (10, 0xff, 3, true),
+                (18, 0x03, 4, true)
             ]
         );
         assert_transfer_geometry_matches_destination_union(&decoded, load);
