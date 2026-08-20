@@ -113,3 +113,43 @@ Every claim above is CONFIRMED by reading the cited line in this worktree at
 `fn64-render-reference` behaviour was traced through its own source, not
 executed in isolation -- though the differential does execute it, and its
 agreement with the hand-derived key is the measured half of that claim.
+
+## Cross-lane notes
+
+A parallel lane built a three-way differential (wgpu vs RT64 vs reference)
+while this work was in flight. Three of its findings bear on this card.
+
+**1. The Y axis was the broken one -- CONFIRMED by that lane, not by me.**
+Before the fill clip landed, this backend honoured the scissor horizontally
+and ignored it vertically: their `scissor-top-rows-only` case differed by
+exactly 320x120 pixels (the scissored-out region), with RT64, the reference
+backend and an independent hand-derived key all agreeing against wgpu, while
+the X counterpart case was byte-identical.
+
+That is a coincidence trap worth naming: a rectangle clipped correctly in X
+and not at all in Y still *looks* clipped, so a fixture that narrows both
+axes at once passes while Y silently regresses. The fill tests here
+therefore pin each axis alone -- `the_scissor_clips_columns_leaving_every_row_present`,
+`the_scissor_clips_rows_leaving_every_column_present`, and
+`the_scissor_clips_the_low_edge_on_both_axes` -- and six axis mutants are
+killed, including "Y ignored entirely while X still clipped" and
+"row_limit derived from column_limit".
+
+**2. The partial-fill refusals were one guard, not three defects.** That
+lane's three refusing cases all trip the same
+`PartialNewTargetInitialization`, and RT64 renders all three. Matches what
+this branch found from the other direction, and all three shapes
+(`top-left-quadrant`, `single-pixel`, `last-column-last-row`) now agree with
+0 differing pixels.
+
+**3. Their `scissor-narrower-than-rect` is NOT this one, despite the shared
+name.** They report RT64 and wgpu byte-identical and both disagreeing with
+the key, hypothesising an RT64/angrylion subpixel scissor-rounding
+disagreement.
+
+This repository's fill fixture of that name cannot be evidence either way:
+its scissor edges are `ulx=0, uly=0, lrx=16, lry=16` quarter-pixels, every
+one a whole-pixel multiple, so `ceil`, `floor` and `round` all give the same
+answer. Nothing in this branch's clip decides a subpixel rounding rule, and
+nothing here should be cited as having validated one. The open question that
+lane raises stays open. HYPOTHESIS, theirs, untested here.
