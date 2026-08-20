@@ -113,6 +113,16 @@ RC=$?
 set -e
 
 echo "[match-run] rc=$RC"
+echo "[match-run] ---- match state machine (D_801589D6: 2=live 3=decision 4=post) ----"
+grep -E '0x801589d6' "$LOG" | tail -8 || echo "  (no state transitions observed)"
+echo "[match-run] ---- end flags 0x8016ED2A (0x40 finish, 0x10 draw, 0x80 fade) ----"
+grep -E '0x8016ed2a' "$LOG" | tail -6 || echo "  (never changed)"
+echo "[match-run] ---- match clock / limit ----"
+grep -E '0x8016f0ac|0x800961d2|0x8014e1c4' "$LOG" | tail -6 || echo "  (no clock ticks)"
+echo "[match-run] ---- winner index 0x801589D4 ----"
+grep -E '0x801589d4' "$LOG" | tail -3 || echo "  (never set)"
+echo "[match-run] ---- gameplay-visible input (ports 0/1 HELD+PRESSED) ----"
+echo "  port0 changes: $(grep -cE '0x80095184|0x80095186' "$LOG" || true)   port1 changes: $(grep -cE '0x80095190|0x80095192' "$LOG" || true)"
 echo "[match-run] last progress: $(grep -oE 'vi_swaps=[0-9]+ gfx_tasks=[0-9]+ audio_tasks=[0-9]+' "$LOG" | tail -1)"
 echo "[match-run] termination: $(grep -E 'step budget|BOOT SUMMARY|STOP_AT_SWAP' "$LOG" | tail -1)"
 echo "[match-run] watch changes: $(grep -c 'wm2000-watch. swap' "$LOG" || true)"
