@@ -33,17 +33,34 @@ SCRIPT=${WM2000_SCHEDULE:-$(python3 "$FN64/docs/tools/wm2000-schedule.py" --mode
 #                        record D_80095180 (stride 0xC) that the GAMEPLAY code
 #                        reads -- proves an injected button arrived where the
 #                        game looks for it, independent of the renderer.
-#   0x8016ED2A (u8)      THE MATCH-END FLAG. bit 0x80 set == match over: the
-#                        frame loop's only call to the exiting fade
-#                        func_800EE4AC is gated on it at 0x800E1C9C, and that
-#                        fade is what sets the loop-exit register $s4.
-#   0x801589D2 (s16)     post-match sequence counter, ticked in func_801229E0;
-#                        func_80122AF4 sets 0x8016ED2A bit 0x80 once it passes
-#                        0x7530 (slti at 0x80122AFC).
-#   0x801589D0 (s16)     the adjacent intro/entrance timer (slti 0x1F) -- watched
-#                        so it is not mistaken for the match clock.
-#   0x801567B0           referee-count / display index (func_800E9D8C).
-: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192,0x8016ED2A:1,0x801589D2,0x801589D0,0x801567B0}
+#   0x801589D6 (u8)      THE MATCH STATE. func_801226A0 switches on it through
+#                        jtbl_80151970: 0 init, 1 entrance, 2 LIVE MATCH,
+#                        3 decision (one frame, picks the winner), 4 post-match.
+#                        This is the single best progress probe: 2 -> 3 IS the
+#                        match ending.
+#   0x8016ED2A (u8)      the end flags. bit 0x40 normal finish, bit 0x10
+#                        time-limit draw, bit 0x80 sequence over -> the frame
+#                        loop's only call to the exiting fade func_800EE4AC
+#                        (gated at 0x800E1C9C) which sets loop-exit $s4.
+#   0x801589D2 (s16)     post-match sequence counter (state 4), ticked in
+#                        func_801229E0; func_80122AF4 sets bit 0x80 once it
+#                        passes 0x7530.
+#   0x801589D4 (s16)     the WINNER index, stored in state 3 from func_80127388.
+#   0x8016F0AC/0x80166F88 the match clock, ticked every 30 frames by
+#                        func_801444E0 inside the time-limit check func_80123D64.
+#                        The match ends when 0x8016F0AC reaches
+#                        D_8014E1C4[D_800961D2].
+#   0x8016ECC0 (s8)      the referee count, loaded from D_8014E198 = {0,10,20,0}
+#                        by match type; counts DOWN to 0. (D_801567B0/B2 are
+#                        HUD digits only and were refuted as the counter.)
+#   0x801671F0 (s16)     player-0 spirit/health (record base 0x801671E2, stride
+#                        0x104); tested slti 0x32 at 0x801239DC.
+#   0x801672F4           player-1 spirit/health (0x801671F0 + 0x104).
+#   0x800961D2           the time-limit SETTING, the index into D_8014E1C4.
+#   0x8014E1C4           entry 0 of the time-limit table -- so a run reports the
+#                        configured bound instead of anyone having to guess
+#                        whether the wait is 3 minutes or 60.
+: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192,0x801589D6:1,0x8016ED2A:1,0x801589D2,0x801589D4,0x8016F0AC,0x80166F88,0x8016ECC0:1,0x801671F0,0x801672F4,0x800961D2,0x8014E1C4}
 
 mkdir -p "$ROOT/frames"
 RUNNER=$ROOT/run.sh
