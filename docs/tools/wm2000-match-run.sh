@@ -27,9 +27,23 @@ LOG=$ROOT.log
 # of the input differential -- identical lead-in, nothing after it.
 SCHED_MODE=${WM2000_MODE:-grapple}
 SCRIPT=${WM2000_SCHEDULE:-$(python3 "$FN64/docs/tools/wm2000-schedule.py" --mode "$SCHED_MODE" --until 200000)}
-# Default watch set: both plugged ports' HELD/PRESSED in the record the ROM's
-# own gameplay code reads (D_80095180 stride 0xC). See RT64-WM2000-MATCH-GRAMMAR.md.
-: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192}
+# Default watch set, all read out of the ROM (see RT64-WM2000-MATCH-GRAMMAR.md):
+#
+#   0x80095184/86/90/92  both plugged ports' HELD/PRESSED, in the per-port
+#                        record D_80095180 (stride 0xC) that the GAMEPLAY code
+#                        reads -- proves an injected button arrived where the
+#                        game looks for it, independent of the renderer.
+#   0x8016ED2A (u8)      THE MATCH-END FLAG. bit 0x80 set == match over: the
+#                        frame loop's only call to the exiting fade
+#                        func_800EE4AC is gated on it at 0x800E1C9C, and that
+#                        fade is what sets the loop-exit register $s4.
+#   0x801589D2 (s16)     post-match sequence counter, ticked in func_801229E0;
+#                        func_80122AF4 sets 0x8016ED2A bit 0x80 once it passes
+#                        0x7530 (slti at 0x80122AFC).
+#   0x801589D0 (s16)     the adjacent intro/entrance timer (slti 0x1F) -- watched
+#                        so it is not mistaken for the match clock.
+#   0x801567B0           referee-count / display index (func_800E9D8C).
+: ${WM2000_WATCH:=0x80095184,0x80095186,0x80095190,0x80095192,0x8016ED2A:1,0x801589D2,0x801589D0,0x801567B0}
 
 mkdir -p "$ROOT/frames"
 RUNNER=$ROOT/run.sh
