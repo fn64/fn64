@@ -91,6 +91,37 @@ enum Authority {
     /// the oracle is the one not modelling the hardware.
     /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
+    /// **The RT64 lane writes no pixels for a raw triangle, cause not yet
+    /// determined.**
+    ///
+    /// MEASURED: a raw triangle issued through
+    /// `Rt64Backend::process_rdp_commands` completes with no error and writes
+    /// nothing. It is a property of triangles as such, not of texturing --
+    /// the same geometry as a FLAT triangle (opcode `0x08`, no coefficient
+    /// blocks) also draws nothing, while a texture RECTANGLE over the
+    /// identical tile, scissor and target draws correctly in the same list.
+    ///
+    /// **NOT dispatch, and not the obvious state.** VERIFIED by reading:
+    /// fn64's lane forwards the whole word range without opcode filtering
+    /// (`fn64-render-rt64/src/lib.rs`'s `process_rdp_commands`), and RT64's
+    /// LLE GBI registers all eight `G_RDPTRI_BASE` opcodes to its `tri`
+    /// handler (`src/gbi/rt64_gbi_rdp.cpp`), computing this command's length
+    /// correctly. Simulating `decodeTriangles`' own arithmetic on these
+    /// words yields the intended non-degenerate box, and culling is forced
+    /// off for `Projection::Type::Triangle`. This case's word 0 carries tile
+    /// 0 -- the loaded tile -- and its list sets a scissor covering the whole
+    /// target, so neither is the explanation either.
+    ///
+    /// So the pixels are lost somewhere in RT64's draw-call assembly, and
+    /// **no test in this workspace has ever driven a raw triangle through
+    /// this lane**, so there is no known-good setup to copy. Establishing one
+    /// is its own piece of work.
+    ///
+    /// A difference here is therefore NOT evidence against wgpu. The case
+    /// still earns its place: it holds wgpu to a hand-derived key on a path
+    /// no texrect case reaches, and it pins the RT64 gap so a later session
+    /// does not re-diagnose it as a wgpu defect.
+    RawTriangleRt64DoesNotRasterize,
 }
 
 impl Authority {
@@ -98,6 +129,7 @@ impl Authority {
         match self {
             Self::Rt64Authoritative => "rt64-authoritative",
             Self::CoverageDependentRt64NotAuthoritative => "rt64-not-authoritative-coverage",
+            Self::RawTriangleRt64DoesNotRasterize => "rt64-does-not-rasterize-raw-triangles",
         }
     }
 }
@@ -205,7 +237,13 @@ const TEXTURE_TEXELS: [u16; 8] = [
     0xf801, // row 0, col 0: r=31 g=0  b=0  a=1
     0x07c1, // row 0, col 1: r=0  g=31 b=0  a=1
     0x003f, // row 0, col 2: r=0  g=0  b=31 a=1
-    0xffff, // row 0, col 3: r=31 g=31 b=31 a=1
+    // **Deliberately NOT 0xffff.** `STALE` is 0xffff, so a texel equal to it
+    // would make "drew this pixel correctly" and "did not draw this pixel at
+    // all" the same observation -- a backend that skipped the column would
+    // pass. Measured: with 0xffff here, the textured-triangle case reported
+    // only 9 differing pixels of 12 because column 4's texel aliased the
+    // background. 0x7fff keeps the all-high-channel shape without the alias.
+    0x7fff, // row 0, col 3: r=15 g=31 b=31 a=1
     0x8421, // row 1, col 0: r=16 g=16 b=16 a=1
     0xc631, // row 1, col 1: r=24 g=24 b=24 a=1
     0x4211, // row 1, col 2: r=8  g=8  b=8  a=1
@@ -235,8 +273,9 @@ const WIDE_LINE_WORDS: u32 = 2;
 /// Within a row every texel differs from every other, so a wrong column is
 /// visible too, and no texel is a byte-swap of another.
 const WIDE_TEXELS: [u16; 16] = [
-    // row 0: bit 0x0040 clear in every entry.
-    0xf801, 0x07c1, 0x003f, 0xffff, 0x8421, 0xc631, 0x4211, 0xfc01,
+    // row 0: bit 0x0040 clear in every entry. 0x7fff rather than 0xffff for
+    // the same anti-alias reason `TEXTURE_TEXELS` states.
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01,
     // row 1: bit 0x0040 set in every entry.
     0xf841, 0x0641, 0x0079, 0xffbf, 0x8461, 0xc671, 0x4251, 0xfc41,
 ];
@@ -414,6 +453,167 @@ fn texture_rectangle(ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> 
 /// add RGB at code 7, and every alpha input at code 7. `Texel0` is code 1 in
 /// the add-RGB and add-alpha tables alike.
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
+
+// ---------------------------------------------------------------------------
+// Textured raw triangle
+// ---------------------------------------------------------------------------
+//
+// **Why this exists.** Every case above draws with `TextureRectangle`, and
+// WM2000 does not: its packets carry raw TRIANGLES, nine TMEM loads each.
+// `production.rs` dispatches triangles through their own arm with their own
+// coefficient decode, plane evaluation and span walk -- none of which a
+// texrect case can reach. A defect there is invisible to the whole corpus so
+// far.
+
+/// **One texel of S, in the non-perspective plane's own units.**
+///
+/// Derived from the cited scale, not read back from any implementation:
+/// `G_TP_NONE` converts an s15.16 plane value to S10.5 by dividing by `2^21`,
+/// and one whole texel is 32 in S10.5, so one texel is `32 * 2^21 = 2^26`.
+///
+/// **Non-perspective deliberately.** The perspective path's own scale carries
+/// a documented history of having been fitted circularly against fn64's
+/// constant before being re-derived; `2^21` is the independent one. A
+/// perspective case is worth adding but must derive its expectation from
+/// angrylion, not from either renderer.
+const PLANE_PER_TEXEL: i32 = 1 << 26;
+
+/// Half a texel, the anti-coincidence offset every plane base carries.
+///
+/// A sample landing exactly on a texel boundary needs a FULL texel of error
+/// before the sampled texel changes, so a boundary fixture cannot see a
+/// half-texel bug. Sampling at the midpoint makes an error of half a texel in
+/// either direction visible.
+const PLANE_HALF_TEXEL: i32 = 16 << 21;
+
+/// The X distance in Q16.16 from the major edge to the first covered
+/// subsample of the pixel that edge starts in: the sampler takes X column
+/// 1/8, so a left edge on a whole pixel is one eighth short. The base cancels
+/// it, so a column evaluates to exactly its intended plane value.
+const FIRST_SUBSAMPLE_DELTA_X: i32 = 65536 / 8;
+
+/// The triangle's covered box: columns [2, 6), rows [0, 3).
+const TRI_LEFT: u32 = 2;
+const TRI_RIGHT: u32 = 6;
+const TRI_TOP: u32 = 0;
+const TRI_BOTTOM: u32 = 3;
+
+/// The expected pixel for the textured-triangle case.
+///
+/// Inside the box, column `x` reads texel `x - TRI_LEFT` of row 0 -- the S
+/// plane advances exactly one texel per pixel of X and the T plane is
+/// constant, so all three rows are three independent readings of the same
+/// claim. Outside, the seeded `STALE` survives.
+fn triangle_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x >= TRI_LEFT && x < TRI_RIGHT && y >= TRI_TOP && y < TRI_BOTTOM {
+        TEXTURE_TEXELS[(x - TRI_LEFT) as usize]
+    } else {
+        STALE
+    }
+}
+
+/// One 8-word coefficient block from four Q16.16 component groups.
+///
+/// The block is NOT sixteen consecutive Q16.16 values. As sixteen `u32`
+/// halves (half `n` is byte `4n`), each component's HIGH 16 bits sit at its
+/// integer offset and its LOW 16 bits sixteen bytes later; components 0 and 2
+/// occupy their word's high half, 1 and 3 the low half. Byte offsets:
+/// value (0, 16), d/dx (8, 24), d/de (32, 48), d/dy (40, 56).
+fn coefficient_block(value: [i32; 4], dx: [i32; 4], de: [i32; 4], dy: [i32; 4]) -> [u32; 16] {
+    let mut halves = [0u32; 16];
+    let mut put = |integer_byte: usize, fraction_byte: usize, components: [i32; 4]| {
+        for (index, component) in components.iter().enumerate() {
+            let high = integer_byte / 4 + index / 2;
+            let low = fraction_byte / 4 + index / 2;
+            let shift = if index % 2 == 0 { 16 } else { 0 };
+            halves[high] |= ((((*component >> 16) as u32) & 0xffff) << shift) as u32;
+            halves[low] |= (((*component as u32) & 0xffff) << shift) as u32;
+        }
+    };
+    put(0, 16, value);
+    put(8, 24, dx);
+    put(32, 48, de);
+    put(40, 56, dy);
+    halves
+}
+
+/// A textured, unshaded, depthless raw triangle (opcode `0x0a`) covering
+/// [`TRI_LEFT`, `TRI_RIGHT`) x [`TRI_TOP`, `TRI_BOTTOM`).
+///
+/// Wire, from the triangle decoder's own field reads: word 0 carries `lft` at
+/// bit 23, `level` 21:19, `tile` 18:16 and YL in its low half; word 0's
+/// second half is YM high / YH low, all three S11.2. Words 1..=3 are
+/// XL/dXLdy, XH/dXHdy, XM/dXMdy as Q16.16 pairs. Then the eight-word texture
+/// coefficient block.
+///
+/// A vertical-sided box rather than a sloped triangle: every dXdy is zero and
+/// the left and right edges are constant, so the covered set is exactly the
+/// rectangle above and the key is arithmetic rather than a rasterization
+/// argument. The point of this case is the TEXTURE path, not edge walking.
+fn textured_triangle_words() -> Vec<(u32, u32)> {
+    // All three Y bounds are S11.2. YL is the last covered scanline's LOWER
+    // bound -- a triangle spanning rows 0..3 covers 0, 1 and 2, so YL is
+    // line 3 and the raster's `y < yl` bound stops after row 2. YM defaults
+    // to YL when no crossover row is wanted.
+    let yl = ((TRI_BOTTOM as i32) << 2) as u16 as u32;
+    let ym = yl;
+    let yh = ((TRI_TOP as i32) << 2) as u16 as u32;
+    // `lft` set: the major edge is the left one, which is what the plane
+    // derivation above measures its X deltas from.
+    let word0 = 0x0a00_0000 | (1 << 23) | yl;
+    let base = [
+        (word0, (ym << 16) | yh),
+        // **XL is the RIGHT edge and XH is the LEFT one.** Not a naming
+        // accident to paper over: XH is the major edge, which for a
+        // left-major triangle is the left side, and XL/XM are the minor
+        // edges on the right. Swapping them yields an inverted span that
+        // covers nothing, which is silent -- no refusal, just an unpublished
+        // colour target.
+        ((TRI_RIGHT << 16), 0),
+        ((TRI_LEFT << 16), 0),
+        ((TRI_RIGHT << 16), 0),
+    ];
+    // S advances one texel per pixel of X; T is constant, so every row reads
+    // TMEM row 0. W is 1 and unused: `G_TP_NONE` never divides by it.
+    let s_base = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
+    let texture = coefficient_block(
+        [s_base, PLANE_HALF_TEXEL, 1, 0],
+        [PLANE_PER_TEXEL, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    );
+    let mut words: Vec<(u32, u32)> = base.to_vec();
+    for pair in texture.chunks_exact(2) {
+        words.push((pair[0], pair[1]));
+    }
+    words
+}
+
+/// The command list for the textured-triangle case: seed fill, state, load,
+/// triangle, sync. The texture staging is the 4x2 image the texrect cases
+/// use, so a disagreement here against those is a triangle-path difference
+/// and not a different texture.
+fn one_textured_triangle() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        set_tile(TEXTURE_LINE_WORDS, 0),
+        set_tile_size(TEXTURE_WIDTH, 1),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, 1),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(textured_triangle_words());
+    words.push((0xe900_0000, 0));
+    words
+}
 
 /// The command list for a textured case: seed fill, state, load, draw, sync.
 ///
@@ -699,6 +899,22 @@ fn cases() -> Vec<Case> {
                     STALE
                 }
             },
+        },
+        Case {
+            name: "textured-triangle-point-sampled",
+            intent: "the first RAW TRIANGLE in the corpus, and the first case \
+                     on the path WM2000 actually draws through. Every case \
+                     above uses TextureRectangle; a triangle carries its own \
+                     coefficient decode, plane evaluation and span walk, none \
+                     of which a texrect can reach. Vertical-sided so the \
+                     covered set is exactly a rectangle and the key stays \
+                     arithmetic -- this measures the TEXTURE path, not edge \
+                     walking. S advances one texel per pixel of X and T is \
+                     constant, so the three covered rows are three \
+                     independent readings of the same claim.",
+            authority: Authority::RawTriangleRt64DoesNotRasterize,
+            commands: one_textured_triangle(),
+            expected: triangle_expected,
         },
         Case {
             name: "textured-rect-wide-line-two",
@@ -1258,6 +1474,10 @@ fn run() -> Value {
         match case.authority {
             Authority::Rt64Authoritative => authoritative.record(verdict),
             Authority::CoverageDependentRt64NotAuthoritative => non_authoritative.record(verdict),
+            // Counted with the other non-authoritative partition for the same
+            // reason: the oracle is the lane that is not modelling the
+            // command, so a difference is not evidence against wgpu.
+            Authority::RawTriangleRt64DoesNotRasterize => non_authoritative.record(verdict),
         }
 
         let matches_key = |outcome: &Result<Vec<u8>, String>| match outcome {
@@ -1457,6 +1677,41 @@ mod tests {
                     case.authority,
                     Authority::CoverageDependentRt64NotAuthoritative,
                     "case {} enables AA_EN but claims RT64 authority",
+                    case.name
+                );
+            }
+        }
+    }
+
+    /// **The raw-triangle authority means what it says.** A case may only
+    /// claim `RawTriangleRt64DoesNotRasterize` if it actually issues a raw
+    /// triangle (opcode 0x08..=0x0f), and a case that issues one may not
+    /// claim RT64 authority -- RT64 draws no pixels for it, so a
+    /// wgpu-vs-RT64 difference there is not a wgpu finding.
+    ///
+    /// Without this, the variant becomes a place to park any inconvenient
+    /// disagreement, which is exactly the failure the partition exists to
+    /// prevent.
+    #[test]
+    fn the_raw_triangle_authority_is_used_only_for_raw_triangles() {
+        for case in cases() {
+            let has_triangle = case
+                .commands
+                .iter()
+                .any(|&(word0, _)| (0x08..=0x0f).contains(&(word0 >> 24)));
+            if case.authority == Authority::RawTriangleRt64DoesNotRasterize {
+                assert!(
+                    has_triangle,
+                    "case {} claims the raw-triangle authority without issuing a raw triangle",
+                    case.name
+                );
+            }
+            if has_triangle {
+                assert_ne!(
+                    case.authority,
+                    Authority::Rt64Authoritative,
+                    "case {} issues a raw triangle, which RT64 does not rasterize, so it cannot \
+                     claim RT64 authority",
                     case.name
                 );
             }
