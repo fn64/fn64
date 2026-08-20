@@ -1019,8 +1019,13 @@ mod tests {
             let row = word / WM2000_WORDS_PER_ROW;
             let within = word % WM2000_WORDS_PER_ROW;
             let destination_word = row * WM2000_LINE_WORDS + within;
-            // The writer's own parity, not the reader's.
-            let exchange = if (low_t_integer + row) & 1 == 1 { 4 } else { 0 };
+            // The writer's own parity, not the reader's -- and the writer's
+            // rule is the TILE-RELATIVE row alone, with no T-origin term.
+            // See `odd_row_exchange` above for the angrylion citation. This
+            // line used to read `(low_t_integer + row) & 1`, mirroring a
+            // writer term that has since been removed from
+            // `tmem/types.rs` as not being on hardware.
+            let exchange = if row & 1 == 1 { 4 } else { 0 };
             let defined = if within + 1 < WM2000_WORDS_PER_ROW {
                 8
             } else {
@@ -1076,12 +1081,12 @@ mod tests {
     /// rectangle that never leaves column 0.
     ///
     /// Pixel `(63, 0)` addresses texel column 64, row 1. Row 1's own
-    /// un-exchanged byte is `0 * 8 + 1 * 5 * 8 + 64 / 2 == 0x048`, which the
-    /// load DID write; `TmemFirstRowParity::Even` XORs it to `0x04c`, which
+    /// un-exchanged address is `0 * 8 + 1 * 5 * 8 + 64 / 2 == 0x048`, and the
+    /// row's exchange sends it to `0x04c`, which
     /// the load did NOT. `0x04c` is the exact address the production abort
     /// named.
     #[test]
-    fn wm2000_texrect_pixel_sixty_three_reproduces_the_production_invalid_byte() {
+    fn wm2000_texrect_pixel_sixty_three_reads_the_byte_its_own_load_wrote() {
         let addressed = wm2000_addressed(63, 0, TmemFirstRowParity::Even);
         assert_eq!(
             (addressed.column(), addressed.row()),
@@ -1089,28 +1094,48 @@ mod tests {
             "the fixture must reach texel column 64 of tile row 1, not column 0"
         );
         let source = wm2000_load_tile_source();
-        // The un-exchanged address is inside the load; only the XOR4 moves
-        // it out. That is the whole claim, so assert both halves.
+        // Tile-relative row 1 takes the XOR4 exchange, on BOTH sides. The
+        // writer put this row's bytes at the exchanged addresses, so the
+        // exchanged address is the one inside the load and the un-exchanged
+        // one is outside it. Both halves are asserted so the claim is
+        // falsifiable either way.
+        //
+        // These two used to be the other way round, and the read below used
+        // to be an `InvalidTexelByte { address: 0x04c }` -- the production
+        // abort this fixture was written to reproduce. That abort was the
+        // origin-term defect: the writer exchanged row 1 by
+        // `(low_t.integer() + row) & 1` while the reader un-exchanged it by
+        // `first_is_odd ^ (row & 1)`, so the reader addressed a byte the
+        // load had never written. With both sides on the tile-relative row
+        // (`odd_row_exchange` above) the read lands on the byte the load
+        // wrote and SUCCEEDS.
         assert!(
-            source.valid_byte(0x048).is_some(),
-            "row 1's own un-exchanged byte must be one the load wrote"
+            source.valid_byte(0x04c).is_some(),
+            "row 1 is exchanged, so its exchanged byte is the one the load wrote"
         );
         assert!(
-            source.valid_byte(0x04c).is_none(),
-            "the XOR4 partner must be a byte the load never wrote"
+            source.valid_byte(0x048).is_none(),
+            "row 1's un-exchanged partner must be a byte the load never wrote"
         );
-        assert_eq!(
-            read_texel(&source, wm2000_tile(), addressed, TextureLutMode::Rgba16),
-            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x04c }),
-            "this fixture must reproduce the production abort exactly"
+        assert!(
+            read_texel(&source, wm2000_tile(), addressed, TextureLutMode::Rgba16).is_ok(),
+            "the pixel that used to abort production must now read a byte its \
+             own load wrote"
         );
     }
 
-    /// **The defect.** Every one of the 3,072 pixels WM2000's texrect draws
-    /// samples a byte its own `LoadTile` wrote -- but only when the reader
-    /// is told the first row's real parity. `low_t.integer()` is 47, so the
-    /// tile's first row is ODD, and `TmemFirstRowParity::Odd` is the value
-    /// that matches the writer.
+    /// **Every one of the 3,072 pixels WM2000's texrect draws samples a byte
+    /// its own `LoadTile` wrote.** Real measured content: this tile's
+    /// `low_t.integer()` is 47, an ODD T origin, which is the case every
+    /// origin-term defect in this crate has surfaced through.
+    ///
+    /// The reader derives the exchange from the tile-relative row alone
+    /// (`odd_row_exchange` above), so the caller-supplied
+    /// `TmemFirstRowParity` no longer participates. The sweep therefore runs
+    /// both parity values and requires BOTH to read clean -- which is the
+    /// real property now: the origin must not perturb the read at all. A
+    /// reader that reintroduced an origin term would fail one of the two
+    /// arms, because they differ by exactly that term.
     ///
     /// Swept over the whole rectangle rather than one pixel so a fix that
     /// merely moves the failure along the strip cannot pass.
@@ -1171,15 +1196,18 @@ mod tests {
 
         assert_eq!(
             odd_failures, 0,
-            "under the writer's own first-row parity every sampled byte is one the load wrote"
+            "every sampled byte must be one the load wrote"
         );
-        assert!(
-            even_failures > 0,
-            "the frozen Even parity must still fail, or this test proves nothing"
-        );
+        // **Both arms must be clean, and that is the assertion.** The two
+        // differ only in the caller-supplied first-row parity, which the
+        // reader no longer consults; an origin term reintroduced on the read
+        // side would make exactly one of them fail. Before that term was
+        // removed this read `even_failures == 48` -- one pixel per rectangle
+        // row -- which was the defect, not a property worth preserving.
         assert_eq!(
-            even_failures, 48,
-            "the frozen Even parity fails exactly one pixel per rectangle row"
+            even_failures, 0,
+            "the tile's T origin must not perturb the read: both parity values \
+             address the same bytes, so neither may leave the load's footprint"
         );
     }
 
