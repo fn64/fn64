@@ -376,3 +376,71 @@ narrowed the search rather than closing it.
    pixels being written are varied. Both can be true if the variation is
    spatially wrong -- but it is also worth confirming what is on screen with
    the same rigour applied to the counters.
+
+## THE DEFECT, MEASURED: 87% of textured triangles sample exactly ONE texel
+
+**Status: CONFIRMED.** Fourth run, same script and stack, with the
+per-triangle distinct-texel count. Three consecutive ticks:
+
+```
+[fn64-combiner]   distinct texels per triangle (triangles=50494):  1:44657 2:4821  3-4:315  5-8:693  9-16:8
+[fn64-combiner]   distinct texels per triangle (triangles=99607):  1:87115 2:10859 3-4:606  5-8:1019 9-16:8
+[fn64-combiner]   distinct texels per triangle (triangles=148740): 1:129443 2:16499 3-4:1183 5-8:1601 9-16:14
+```
+
+**87.0% of textured triangles read exactly one distinct texel across their
+entire span**, and the ratio is stable across all three ticks. **No triangle
+in 148,740 exceeded 16 distinct texels.** For comparison, a correctly
+textured wrestler polygon covering a few hundred pixels of a 32x32 texture
+should read hundreds of distinct texels.
+
+**This is the flat shading, measured directly at the sampler.** The models
+are not flat because the combiner discards the texel, and not because the
+sampler returns a constant -- they are flat because each triangle samples
+one texel and paints its whole span with it.
+
+### Why every earlier instrument missed it, and why that is the lesson
+
+The whole-frame luma histogram in the previous section is *completely
+consistent with this*: 87% of triangles each reading a DIFFERENT single
+texel produces a broad, healthy-looking sixteen-bucket distribution over the
+frame. Both facts are true at once, and only the per-triangle count
+separates them.
+
+That is the general trap, stated plainly: **an aggregate histogram cannot
+answer a per-primitive question.** The frame-wide texel histogram was
+proposed in `docs/RT64-WM2000-INMATCH-GAPS.md` as the measurement that would
+"indict (1) or (2)", and taken at face value it refuted BOTH candidates and
+would have closed the investigation with no defect found. The measurement
+was not wrong; the inference drawn from its shape was, in exactly the way
+this repo's own traps document warns about aggregates. The distinct-texel
+count is one extra `HashSet` in the same loop and it is unambiguous.
+
+So the earlier section's "candidate 1 REFUTED" stands only in its narrow
+sense -- the sampler does not return one constant value frame-wide -- and
+must NOT be read as "the sampled texel is fine". Candidate 1 is alive in its
+per-triangle form, and this is it.
+
+### Where the fault must be
+
+The texel is chosen by `(s, t)` from
+`triangle_span::texture_coordinates_s10_5`. One texel per triangle means
+those coordinates are effectively constant within a triangle, which points
+at either:
+
+1. **The coordinate derivation** -- the S/T/W planes, their per-pixel
+   evaluation, or the perspective divide in
+   `crates/fn64-render-wgpu/src/raw_dpc/triangle_span.rs:519`. That function
+   is a float port of angrylion's integer reciprocal-table `tcdiv_persp`
+   (`src/core/n64video/rdp/tcoord.c:1027`), and its own doc records the
+   precedent exactly: without the empirical `* 1024.0` scale "the whole
+   title-screen quad collapsed onto texel (0,0) -- every pixel sampled the
+   image's corner and the presented frame was a uniform field." That is the
+   symptom now measured, one primitive at a time.
+2. **The addressing** -- `tmem/sample.rs`'s shift/mask/mirror/clamp folding
+   a varying coordinate onto one texel.
+
+These live in different files, and the S/T-spread census committed on this
+branch tells them apart: if the requested coordinates span many texels and
+one texel comes back, the fault is addressing; if the coordinates themselves
+barely move across the span, it is the derivation.
