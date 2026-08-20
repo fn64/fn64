@@ -1622,6 +1622,13 @@ pub enum WgpuRawDpcExecutionError {
     /// fill half nor the TMEM half produced. Rejected by name here rather
     /// than handed to `BackendEffectReport::try_new` as a short list, whose
     /// count mismatch would not say *which* access went unproduced.
+    /// A fill declared a colour-image seed read, but no captured bytes
+    /// arrived for that access index. Never downgraded to "no seed": the
+    /// untouched pixels would then be fabricated zeros, which is the exact
+    /// defect the seed exists to remove.
+    MissingFillSeedBytes {
+        access_index: u32,
+    },
     MergedWriteUnclaimed {
         access_index: u32,
     },
@@ -1825,6 +1832,11 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "FillRectangle access #{access_index} names a range outside its own color \
                  target's full extent"
+            ),
+            Self::MissingFillSeedBytes { access_index } => write!(
+                formatter,
+                "fill declared a color-image seed read at access {access_index} but no captured \
+                 bytes arrived for it; the untouched pixels would be fabricated zeros"
             ),
             Self::MergedWriteUnclaimed { access_index } => write!(
                 formatter,
@@ -3960,6 +3972,43 @@ fn color_target_key(
     Ok(key)
 }
 
+/// Converts one captured guest-RDRAM range from the storage byte order the
+/// capture delivers into the flat logical order [`crate::DeviceColorBytes`]
+/// is expressed in.
+///
+/// **Not cosmetic, and not a guess.** `fn64-runtime`'s RDRAM stores guest
+/// bytes in native words under a per-width XOR byte-lane mapping --
+/// `write_u8` indexes `range(addr, 1, 3)`, i.e. `offset ^ 3` on a
+/// little-endian host (`fn64-runtime/src/rdram.rs:623-627`), which is
+/// exactly why `copy_committed_guest_writes` copies OUT through
+/// `write_logical_bytes` rather than a raw `copy_from_slice`. The ABI's
+/// guest-read capture slices the live allocation directly
+/// (`fn64-abi/src/task_dispatch/rsp_commit.rs`), so what arrives here is
+/// storage order, and reading it as logical bytes byte-swaps every pixel.
+///
+/// The conformance runner records the same trap from the other direction:
+/// a raw slice copy there "reported every pixel as byte-swapped against the
+/// reference backend -- a runner defect that would have been read as a
+/// renderer defect".
+///
+/// This is the inverse of that copy: `logical[i] = storage[i ^ 3]`, applied
+/// within each aligned 4-byte word so a range that is not word-aligned or
+/// not a whole number of words still maps every byte it does carry.
+fn logical_bytes_from_captured_rdram(captured: &[u8]) -> Vec<u8> {
+    captured
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            // The lane swap is defined within each aligned word; `^ 3` on
+            // the index inside the word, not on the whole-buffer index,
+            // so the tail of a partial word is still addressed correctly.
+            let word = index & !3;
+            let lane = (index & 3) ^ 3;
+            captured[word + lane]
+        })
+        .collect()
+}
+
 /// Executes the fill at `index` of the plan's own fill list against the
 /// accumulated buffer, returning its completion and its declared accesses.
 fn execute_scheduled_fill(
@@ -3969,6 +4018,7 @@ fn execute_scheduled_fill(
     accumulated: Option<&[u8]>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let (_, fill, fill_other_mode, fill_scissor) = &collector.plan.fills[index];
+    let fill_seed_access = &fill.seed_access_index;
 
     // This fill's OWN `OtherMode`, snapshotted at its stream position --
     // not the walk's running value, which a later `SetOtherMode` (a
@@ -3989,6 +4039,43 @@ fn execute_scheduled_fill(
     // `texrect_scissor_or_full_target` rather than writing a second
     // fallback keeps one model of "no SetScissor means the whole target".
     let scissor = texrect_scissor_or_full_target(*fill_scissor, candidate.key().extent());
+
+    // **The seed for a partial fill's untouched pixels.**
+    //
+    // Preference order, and each rung is a different fact rather than a
+    // fallback chain looking for something that works:
+    //
+    // 1. `accumulated` -- an earlier command in THIS packet already
+    //    composed into the buffer, so it is the freshest content and
+    //    already in device byte order.
+    // 2. the declared colour-image seed read -- the guest's own framebuffer
+    //    bytes, which is what hardware leaves outside a fill and what
+    //    `fn64-render-reference` loads (`backend/imp.rs:440-447`).
+    // 3. `None` -- the fill is full extent and declared no seed, so every
+    //    byte comes from the command itself.
+    //
+    // A declared seed that failed to thread is NOT silently downgraded to
+    // `None`: that would resurrect the fabricated zeros this whole path
+    // exists to remove, and the differential measured them as
+    // `wgpu: 0x0000` against a `0xffff` key. `MissingSeedBytes` names it.
+    let seed_owned;
+    let seed = match (accumulated, fill_seed_access) {
+        (Some(bytes), _) => Some(bytes),
+        (None, Some(access_index)) => {
+            let captured = collector
+                .reads
+                .iter()
+                .find(|(index, _)| *index == *access_index)
+                .map(|(_, bytes)| bytes)
+                .ok_or(WgpuRawDpcExecutionError::MissingFillSeedBytes {
+                    access_index: *access_index,
+                })?;
+            seed_owned = logical_bytes_from_captured_rdram(captured);
+            Some(seed_owned.as_slice())
+        }
+        (None, None) => None,
+    };
+
     let completed = execute_fill_rectangle(
         candidate,
         other_mode,
@@ -4000,7 +4087,7 @@ fn execute_scheduled_fill(
             fill.lower_right_y,
         ),
         scissor,
-        accumulated,
+        seed,
     )?;
     let accesses = fill_accesses(&collector.plan.accesses, fill)?.to_vec();
     Ok((completed, accesses))

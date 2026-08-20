@@ -417,6 +417,7 @@ fn render(rdram: &mut [u8]) -> Result<WgpuOutcome, Box<dyn std::error::Error>> {
         words: command_words(&COMMANDS),
         transaction_sequence: 1,
         guest_read_sources: Vec::new(),
+        guest_rdram: Some(rdram.to_vec()),
         target_width: WIDTH,
         target_height: HEIGHT,
     };
@@ -728,6 +729,7 @@ mod sweep {
             words: command_words(commands),
             transaction_sequence: 1,
             guest_read_sources: Vec::new(),
+        guest_rdram: Some(rdram.to_vec()),
             target_width: WIDTH,
             target_height: HEIGHT,
         };
