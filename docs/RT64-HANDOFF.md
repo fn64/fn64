@@ -176,7 +176,7 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    fixed.
 
 3b. **The rest of the corpus: PARTLY DONE.** It was 10 fill-rectangle cases;
-   it is now **16**, and the textured half of it found and confirmed the
+   it is now **17**, and the textured half of it found and confirmed the
    byte-lane defect above.
 
    Landed since:
@@ -190,6 +190,14 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    - **`textured-triangle-point-sampled`** -- the first raw triangle, and the
      first case on the path WM2000 actually draws through. **wgpu matches the
      hand-derived key on all twelve covered pixels; RT64 writes nothing.**
+   - **`textured-rect-ci4-tlut`** -- the first colour-indexed case. CI4
+     indices in low TMEM, an RGBA16 palette in high TMEM via `LoadTlut`,
+     and `en_tlut` switching the sampler onto the lookup. `identical`, both
+     backends match the key across a non-identity index permutation. Note
+     the index image must be LOADED through a 16-bit form and then
+     redescribed as CI4 -- fn64 refuses a direct four-bit load by name, and
+     that is what real N64 code does anyway. This clears the palette as a
+     suspect for CI4 point sampling.
    - **A texel that aliased the background.** `TEXTURE_TEXELS[3]` was
      `0xffff` = `STALE`, so a skipped pixel and a correctly drawn one were
      the same observation. Now `0x7fff`. This was live: the triangle case
@@ -209,10 +217,8 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    has ever driven a raw triangle through the RT64 lane**, so there is no
    known-good setup to copy -- establishing one is its own piece of work.
 
-   Still missing: a **CI/TLUT** case (`LoadTlut` is opcode 0x30 and the
-   other-modes `en_tlut` bit is already documented in the runner, so this is
-   well-specified and cheap), other combiner programs, and other triangle
-   shapes. Also still missing is a **captured-from-ROM** case: the reader for
+   Still missing: other combiner programs, other triangle shapes, and CI8
+   / bilerp / two-cycle variants. Also still missing is a **captured-from-ROM** case: the reader for
    it is already built (`mod captured`, driven by `FN64_WM2000_PACKET_TSV`),
    but the dump is produced by `fn64-render-reference`'s GBI census under
    `FN64_GBI_PACKET_DUMP`, so it needs a reference-lane ROM run to generate
