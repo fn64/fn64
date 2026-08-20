@@ -3798,7 +3798,17 @@ pub mod census {
     /// A, B, C, D order -- decoded by the CALLER from the slice it will
     /// actually evaluate, so this module never re-derives which slice is
     /// live and cannot disagree with the evaluator about it.
-    pub fn note_program(color: [ColorInput; 4], alpha: [AlphaInput; 4]) {
+    /// Whether the census is switched on, read ONCE.
+    ///
+    /// `var_os` allocates and the call site is per-draw; a live lane is
+    /// measuring frame rate and a probe must not become the thing it
+    /// measures.
+    pub fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some())
+    }
+
+    pub fn note_program(color: [ColorInput; 4], alpha: [AlphaInput; 4], textured: bool) {
         for (slot, input) in [
             ColorInputSlot::A,
             ColorInputSlot::B,
@@ -3823,17 +3833,26 @@ pub mod census {
             ALPHA_COUNTS[alpha_slot_index(slot) * 10 + alpha_index(input)]
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if color.iter().any(|input| {
-            matches!(
-                input,
-                ColorInput::Texel0 | ColorInput::Texel0Alpha | ColorInput::Texel1 | ColorInput::Texel1Alpha
-            )
-        }) {
-            &COLOR_READS_TEXEL0
-        } else {
-            &COLOR_IGNORES_TEXEL0
+        // The headline split, and it is deliberately restricted to draws
+        // that HAVE a texel. An untextured draw whose program ignores
+        // Texel0 is correct and uninteresting; counting it here would
+        // dilute exactly the ratio the card turns on.
+        if textured {
+            if color.iter().any(|input| {
+                matches!(
+                    input,
+                    ColorInput::Texel0
+                        | ColorInput::Texel0Alpha
+                        | ColorInput::Texel1
+                        | ColorInput::Texel1Alpha
+                )
+            }) {
+                &COLOR_READS_TEXEL0
+            } else {
+                &COLOR_IGNORES_TEXEL0
+            }
+            .fetch_add(1, Ordering::Relaxed);
         }
-        .fetch_add(1, Ordering::Relaxed);
 
         let note = NOTES.fetch_add(1, Ordering::Relaxed) + 1;
         if note % 100_000 == 0 {
@@ -3874,7 +3893,9 @@ pub mod census {
     pub fn report(label: &str) {
         let (color, alpha, (reads, ignores)) = snapshot();
         eprintln!("[fn64-combiner] {label} programs={}", reads + ignores);
-        eprintln!("[fn64-combiner]   color reads Texel* = {reads}, ignores Texel* = {ignores}");
+        eprintln!(
+            "[fn64-combiner]   TEXTURED draws: color reads Texel* = {reads}, ignores Texel* = {ignores}"
+        );
         for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
             let mut line = String::new();
             for (index, count) in color[slot].iter().enumerate() {
