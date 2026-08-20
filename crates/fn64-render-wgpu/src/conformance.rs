@@ -57,6 +57,24 @@ pub struct ConformanceReplay {
     /// order. A count mismatch against the plan is a refusal, not a silent
     /// zip-truncation.
     pub guest_read_sources: Vec<Vec<u8>>,
+    /// The fixture's own guest RDRAM, in storage byte order, used to satisfy
+    /// declared reads that `guest_read_sources` does not enumerate.
+    ///
+    /// **Why a second source rather than more entries in the first.**
+    /// `guest_read_sources` is positional and hand-written per fixture: it
+    /// exists so a TMEM-load fixture can state its texels without owning a
+    /// whole RDRAM image. A partial `FillRectangle` now also declares a
+    /// read -- its colour-image seed -- which no fixture author chose and
+    /// whose size follows the target rather than the display list. Making
+    /// every existing fixture grow an entry for it would be asking authors
+    /// to hand-maintain a copy of memory they already supplied.
+    ///
+    /// When present, a declared read is served by slicing this at the
+    /// read's own range, which is exactly what `fn64-abi` does with the
+    /// live allocation (`task_dispatch/rsp_commit.rs`). `guest_read_sources`
+    /// still takes precedence in declaration order, so existing fixtures
+    /// replay unchanged.
+    pub guest_rdram: Option<Vec<u8>>,
     /// Render-target extent handed to `create`. This is the host-configured
     /// extent, not a claim about the color image's own width.
     pub target_width: u32,
@@ -86,6 +104,11 @@ pub enum ConformanceRefusal {
     NoResident {
         address: u32,
     },
+    /// A declared read named a range outside the RDRAM the replay supplied.
+    GuestReadOutOfBounds {
+        start: usize,
+        end: usize,
+    },
 }
 
 impl core::fmt::Display for ConformanceRefusal {
@@ -107,6 +130,10 @@ impl core::fmt::Display for ConformanceRefusal {
             Self::NoResident { address } => write!(
                 out,
                 "no color-target resident published at {address:#010x}"
+            ),
+            Self::GuestReadOutOfBounds { start, end } => write!(
+                out,
+                "a declared guest read [{start:#x}, {end:#x}) lies outside the replay's RDRAM"
             ),
         }
     }
@@ -213,28 +240,52 @@ impl ConformanceSession {
             .plan_raw_dpc(request)
             .map_err(|error| ConformanceRefusal::Plan(error.to_string()))?;
         let reads = planned.guest_read_plan().reads();
-        if reads.len() != replay.guest_read_sources.len() {
+        // Only the reads NOT served by `guest_rdram` have to be enumerated
+        // positionally. With no RDRAM supplied that is all of them, which is
+        // the original contract; with RDRAM supplied a fixture may still
+        // enumerate a prefix, and the remainder is sliced from memory.
+        let enumerated = replay.guest_read_sources.len();
+        if replay.guest_rdram.is_none() && reads.len() != enumerated {
             return Err(ConformanceRefusal::GuestReadCount {
                 declared: reads.len(),
-                staged: replay.guest_read_sources.len(),
+                staged: enumerated,
             });
         }
-        let capture = DeferredGuestReadCapture::new(
-            reads
-                .iter()
-                .zip(&replay.guest_read_sources)
-                .map(|(read, bytes)| {
-                    // A declared read may be LONGER than the texels the
-                    // fixture supplied (`LoadBlock` reads whole 64-bit
-                    // words). Zero-padded rather than refused, matching
-                    // `rdp_harness::publish_packet` exactly.
-                    let mut padded = bytes.clone();
-                    padded.resize(read.range().len() as usize, 0);
-                    CapturedGuestRead::try_new(*read, padded)
-                        .expect("a capture sized to its own declared read is well formed")
-                })
-                .collect(),
-        );
+        if enumerated > reads.len() {
+            return Err(ConformanceRefusal::GuestReadCount {
+                declared: reads.len(),
+                staged: enumerated,
+            });
+        }
+        let mut captured = Vec::with_capacity(reads.len());
+        for (ordinal, read) in reads.iter().enumerate() {
+            let len = read.range().len() as usize;
+            let bytes = if let Some(source) = replay.guest_read_sources.get(ordinal) {
+                // A declared read may be LONGER than the texels the
+                // fixture supplied (`LoadBlock` reads whole 64-bit
+                // words). Zero-padded rather than refused, matching
+                // `rdp_harness::publish_packet` exactly.
+                let mut padded = source.clone();
+                padded.resize(len, 0);
+                padded
+            } else {
+                let rdram = replay
+                    .guest_rdram
+                    .as_deref()
+                    .expect("the count check above proves every read is enumerated without RDRAM");
+                let start = read.range().start().get() as usize;
+                let end = start + len;
+                rdram
+                    .get(start..end)
+                    .ok_or(ConformanceRefusal::GuestReadOutOfBounds { start, end })?
+                    .to_vec()
+            };
+            captured.push(
+                CapturedGuestRead::try_new(*read, bytes)
+                    .expect("a capture sized to its own declared read is well formed"),
+            );
+        }
+        let capture = DeferredGuestReadCapture::new(captured);
         let bound = self
             .session
             .finalize_and_submit(planned, capture)
