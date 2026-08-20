@@ -947,18 +947,34 @@ mod tests {
         );
     }
 
+    /// An empty state names the exact byte the read would have needed.
+    ///
+    /// Row 0 does not exchange, so a tile based at TMEM word 0 addresses byte
+    /// 0 -- and it does so for BOTH first-row parity values, because the
+    /// caller-supplied parity no longer participates in the exchange (see
+    /// `odd_row_exchange`). Asserting both arms is what makes a reintroduced
+    /// origin term fail here: it would send the `Odd` arm to byte 4.
+    ///
+    /// This previously asserted `address: 4` for the `Odd` arm alone, which
+    /// was the removed term.
     #[test]
     fn supported_empty_state_read_reports_the_exact_first_physical_byte() {
         let state = PhysicalTmemState::try_new().unwrap();
-        assert!(matches!(
-            read_committed_texel(
-                &state,
-                tile(ImageFormat::Intensity, PixelSize::Bits8, 0, 0),
-                AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Odd),
-                TextureLutMode::Disabled,
-            ),
-            Err(PhysicalTexelReadError::InvalidTexelByte { address: 4 })
-        ));
+        for parity in [TmemFirstRowParity::Even, TmemFirstRowParity::Odd] {
+            assert!(
+                matches!(
+                    read_committed_texel(
+                        &state,
+                        tile(ImageFormat::Intensity, PixelSize::Bits8, 0, 0),
+                        AddressedTmemTexel::new(0, 0, parity),
+                        TextureLutMode::Disabled,
+                    ),
+                    Err(PhysicalTexelReadError::InvalidTexelByte { address: 0 })
+                ),
+                "row 0 never exchanges, whatever first-row parity the caller \
+                 supplies: {parity:?}"
+            );
+        }
     }
 
     // --- WM2000's failing texrect: reader/writer odd-row parity ---------
@@ -974,15 +990,22 @@ mod tests {
     //                             t_at(0)=1536 t_at(47)=3040
     //     lut=Rgba16
     //
-    // `low_t.integer() == 188 >> 2 == 47`, which is **odd**. That single
-    // fact is what these tests are about: the WRITER
-    // (`tmem/types.rs`'s `project_tmem_transfer_word`, `Tile` arm) derives
-    // its XOR4 exchange as `(bounds.low_t().integer() + row) & 1`, so with
-    // an odd `low_t` it exchanges the EVEN tile rows. The READER's
-    // `odd_row_exchange` derives it as `first_is_odd ^ (row & 1)`, so a
-    // caller passing `TmemFirstRowParity::Even` exchanges the ODD rows --
-    // exactly inverted, and every texel whose row lands in the 6-byte
-    // per-row tail gap then reads an address the load never wrote.
+    // `low_t.integer() == 188 >> 2 == 47`, which is **odd**, and that is why
+    // this tile is the one every origin-term defect in this crate has
+    // surfaced through.
+    //
+    // Historically the WRITER (`tmem/types.rs`'s
+    // `project_tmem_transfer_word`, `Tile` arm) derived its XOR4 exchange as
+    // `(bounds.low_t().integer() + row) & 1`, so an odd `low_t` exchanged the
+    // EVEN tile rows, while the READER's `odd_row_exchange` derived it as
+    // `first_is_odd ^ (row & 1)` -- invertible by the caller. Every texel
+    // whose row landed in the 6-byte per-row tail gap then read an address
+    // the load never wrote.
+    //
+    // Both sides now use the tile-relative row alone, which is what
+    // angrylion does (see `odd_row_exchange`), so the origin cannot perturb
+    // the pairing at all. These tests are retained as the regression guard
+    // for that, on real measured content.
 
     /// WM2000's own wire fields, named once so the two tests below cannot
     /// drift apart from each other or from the measured packet.
