@@ -2471,15 +2471,18 @@ mod host_gpu_tests {
         ///   line_words + (w % words_per_row)`.
         /// - `tmem/execute/load_tile.rs`'s `map_physical_lanes` writes lane
         ///   `source_lane ^ (4 * odd_row_exchange)` with
-        ///   `odd_row_exchange = (low_t.integer() + row) & 1`.
+        ///   `odd_row_exchange = row & 1` -- the tile-relative row's parity
+        ///   alone, with no T-origin term. See
+        ///   `tmem/read.rs::odd_row_exchange` for the angrylion citation;
+        ///   this line used to read `(low_t.integer() + row) & 1`, mirroring
+        ///   a writer term that has since been removed.
         pub fn bytes() -> std::collections::BTreeMap<u16, u8> {
             let mut bytes = std::collections::BTreeMap::new();
-            let low_t_integer = LOW_T_RAW >> 2;
             for word in 0..WORDS_PER_ROW * ROWS {
                 let row = word / WORDS_PER_ROW;
                 let within = word % WORDS_PER_ROW;
                 let destination_word = row * LINE_WORDS + within;
-                let exchange = if (low_t_integer + row) & 1 == 1 { 4 } else { 0 };
+                let exchange = if row & 1 == 1 { 4 } else { 0 };
                 let defined = if within + 1 < WORDS_PER_ROW {
                     8
                 } else {
@@ -2552,19 +2555,24 @@ mod host_gpu_tests {
         );
         assert_eq!(size.low_t().integer(), 47);
 
-        // The measured production pair, from the writer's own rule.
+        // The measured production pair, from the writer's own rule. Tile
+        // row 1 takes the exchange on BOTH sides, so the exchanged address
+        // is the one inside the load. These two used to be the other way
+        // round, under a writer that folded in the tile's T origin.
         let source = wm2000_strip_fixture::source();
         assert!(
-            crate::TmemByteSource::valid_byte(&source, 0x048).is_some(),
-            "tile row 1's own un-exchanged byte must be one the load wrote"
+            crate::TmemByteSource::valid_byte(&source, 0x04c).is_some(),
+            "tile row 1 is exchanged, so its exchanged byte is the one the load wrote"
         );
         assert!(
-            crate::TmemByteSource::valid_byte(&source, 0x04c).is_none(),
-            "its XOR4 partner must be a byte the load never wrote -- that \
-             is the byte the frozen-Even shader addressed"
+            crate::TmemByteSource::valid_byte(&source, 0x048).is_none(),
+            "its un-exchanged partner must be a byte the load never wrote"
         );
 
-        // And the CPU reader's own two verdicts on the failing texel.
+        // And the CPU reader's verdict on the texel that used to abort
+        // production. The caller-supplied first-row parity no longer
+        // participates in the exchange, so BOTH values must read cleanly --
+        // which is the property a reintroduced origin term would break.
         let read = |parity| {
             crate::read_texel(
                 &source,
@@ -2573,15 +2581,15 @@ mod host_gpu_tests {
                 crate::TextureLutMode::Rgba16,
             )
         };
-        assert!(
-            read(crate::TmemFirstRowParity::Odd).is_ok(),
-            "under the writer's own parity the CPU reader samples cleanly"
-        );
-        assert_eq!(
-            read(crate::TmemFirstRowParity::Even),
-            Err(crate::PhysicalTexelReadError::InvalidTexelByte { address: 0x04c }),
-            "under the inverted parity it reproduces the production abort"
-        );
+        for parity in [
+            crate::TmemFirstRowParity::Even,
+            crate::TmemFirstRowParity::Odd,
+        ] {
+            assert!(
+                read(parity).is_ok(),
+                "the tile's T origin must not perturb the read: {parity:?}"
+            );
+        }
     }
 
     /// Adapter-free half of the parity pinning: the host-side
