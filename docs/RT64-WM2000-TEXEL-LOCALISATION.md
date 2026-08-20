@@ -154,3 +154,55 @@ observed "noise, not imagery".
 requires WM2000's textured surfaces to be loaded with `LoadBlock` rather than
 `LoadTile`, and requires the parity mismatch to actually occur for its tiles.
 Both are measurable and are the next step.
+
+## CONFIRMED: hardware's exchange term is the tile-relative row, and nothing else
+
+The earlier note above guessed that the load command ought to latch its
+SL/TL/SH/TH into the tile (which it does -- `rdp_load_block` `tex.c:907-917`,
+`tile_tlut_common_cs_decoder` `:939-970`). That is true but is NOT the fix,
+because on hardware the T origin **cancels out of the exchange entirely**.
+
+`rdp_load_block` seeds the edgewalker's span T with `tl << 3`
+(`lewdata[5] = ((sl << 3) << 16) | (tl << 3)`, `tex.c:929`). `loading_pipeline`
+then takes `st = t >> 16` and hands it to `tc_pipeline_load`, which applies
+`TRELATIVE(sst1, tile->tl)` -- subtracting the very `tl << 3` the span was
+seeded with (`tcoord.c:998-999`). The write parity `dswap = sst & 1`
+(`tex.c:583`) is therefore taken on a **tile-relative** row that starts at zero
+for every load, whatever `tl` is.
+
+The read side is the same: `fetch_texel` uses `(t & 1)` on the equally
+tile-relative row and never reads `tile->tl` at all.
+
+**So the hardware rule, on both sides and for every load kind, is exactly
+`row & 1`.** There is no `tl`, `low_t` or `source_t` term anywhere.
+
+### What fn64 has instead
+
+| site | fn64's term | hardware |
+|---|---|---|
+| LoadTile writer | `(low_t.integer() + row) & 1` | `row & 1` |
+| LoadBlock writer | `(source_t.raw() + advance) & 1` | `row & 1` |
+| reader (both) | `(low_t.integer() & 1) ^ (row & 1)` | `row & 1` |
+
+Enumerated over `low_t` 0..8 x `source_t` 0..8 x `row` 0..8 (512 cases):
+
+- Each of the three sites differs from hardware in **256 / 512** cases.
+- **LoadTile writer vs reader: 0 / 512 disagree.** The spurious `low_t` term
+  is present on both sides and cancels, so LoadTile texels come back correct
+  despite sitting at non-hardware absolute addresses.
+- **LoadBlock writer vs reader: 256 / 512 disagree.** The writer's term is
+  `source_t.raw()` and the reader's is `low_t.integer()` -- a different field
+  in a different unit -- so nothing cancels.
+
+**That is the defect.** On a disagreeing LoadBlock row every texel is fetched
+from the wrong 4-byte half of its 64-bit word: wrong colour, at correct
+coordinates, on correctly shaped and lit geometry.
+
+### The fix
+
+Remove the spurious origin term from all three sites so every one reads
+`row & 1`, as angrylion does. This simultaneously:
+
+- makes the LoadBlock writer and reader agree (the defect), and
+- puts fn64's absolute TMEM addresses on hardware's own layout, which the
+  LoadTile pair currently only emulates up to a cancelling displacement.
