@@ -9,6 +9,10 @@ description = "Pure-Rust wgpu renderer backend for fn64."
 [features]
 default = []
 host-gpu-tests = []
+# Exposes `crate::conformance`, the adapterless public entry point
+# `fn64-render-conformance`'s wgpu runner drives. Additive and inert when
+# off: it gates one module and adds no dependency.
+conformance-runner = []
 
 [dependencies]
 fn64-render = { path = "../fn64-render" }
