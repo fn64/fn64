@@ -30,14 +30,6 @@ WM2000_WATCH=<hex>[:<width>][,...]  -- width is 1, 2 (default) or 4.
 The probe samples once per VI swap and prints only on CHANGE, so an idle
 watch costs one comparison per swap and produces no output.
 
-PER-PORT INPUT. The harness mirrors ONE composed pad state onto every plugged
-port, so both wrestlers receive identical buttons. For "does the ROM render two
-players" that is fine; for "does a match RESOLVE" it is a real hazard, because
-two wrestlers executing the same move on the same frame is the shape of a
-stalemate rather than a fight. This patch adds WM2000_INPUT_SCRIPT_P1, parsed
-by the harness's own existing grammar, which -- when present -- drives port 1
-independently. When it is absent, behaviour is exactly the mirrored default.
-
 Usage:  wm2000-watch-patch.py <path-to-main.rs>
 """
 import re
@@ -96,17 +88,8 @@ PROBE = '''            if !watch_specs.is_empty() {
             }
 '''
 
-P1_DECL_ANCHOR = "    let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);\n"
-DECL_ANCHOR = P1_DECL_ANCHOR
-P1_DECL = '    // WM2000_INPUT_SCRIPT_P1: an independent schedule for port 1, in the same\n    // grammar as WM2000_INPUT_SCRIPT. Without it the harness mirrors one pad\n    // state onto every plugged port, which makes both wrestlers perform the\n    // same move on the same frame -- fine for proving two players render, bad\n    // for proving a match resolves. See docs/tools/wm2000-watch-patch.py.\n    let mut input_script_p1: Vec<InputScriptEntry> = Vec::new();\n    if let Ok(raw) = std::env::var("WM2000_INPUT_SCRIPT_P1") {\n        for entry in raw.split(\';\').filter(|s| !s.trim().is_empty()) {\n            let mut parts = entry.trim().split(\':\');\n            let range = parts.next().unwrap_or_default();\n            let (from, to) = range\n                .split_once("..")\n                .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))\n                .unwrap_or_else(|| {\n                    panic!("WM2000_INPUT_SCRIPT_P1 entry {entry:?}: range must be <from>..<to>")\n                });\n            let buttons = parts\n                .next()\n                .and_then(|s| u16::from_str_radix(s, 16).ok())\n                .unwrap_or_else(|| {\n                    panic!("WM2000_INPUT_SCRIPT_P1 entry {entry:?}: buttons must be hex u16")\n                });\n            let stick_x = parts.next().map_or(0, |s| s.parse::<i8>().unwrap_or(0));\n            let stick_y = parts.next().map_or(0, |s| s.parse::<i8>().unwrap_or(0));\n            assert!(from < to, "WM2000_INPUT_SCRIPT_P1 entry {entry:?}: empty swap range");\n            input_script_p1.push(InputScriptEntry { from, to, buttons, stick_x, stick_y });\n        }\n        println!("[wm2000-input] port 1 driven INDEPENDENTLY: {} entries", input_script_p1.len());\n    }\n    let mut last_applied_input_p1: (u16, i8, i8) = (0, 0, 0);\n'
-P1_APPLY = '            if !input_script_p1.is_empty() && populated_ports > 1 {\n                let mut buttons = 0u16;\n                let mut stick = (0i8, 0i8);\n                for e in &input_script_p1 {\n                    if swap_count >= e.from && swap_count < e.to {\n                        buttons |= e.buttons;\n                        if e.stick_x != 0 || e.stick_y != 0 {\n                            stick = (e.stick_x, e.stick_y);\n                        }\n                    }\n                }\n                let desired = (buttons, stick.0, stick.1);\n                if desired != last_applied_input_p1 {\n                    fn64_abi::set_controller_state(1, desired.0, desired.1, desired.2);\n                    println!(\n                        "[wm2000-input] swap #{swap_count}: pad1 -> buttons={:#06x} stick=({}, {})",\n                        desired.0, desired.1, desired.2\n                    );\n                    let _ = std::io::stdout().flush();\n                    last_applied_input_p1 = desired;\n                }\n            }\n'
+DECL_ANCHOR = "    let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);\n"
 PROBE_ANCHOR = "        if swap_count > last_swap_count {\n"
-MIRROR_OLD = '                    for port in 0..populated_ports {\n                        fn64_abi::set_controller_state(port, desired.0, desired.1, desired.2);\n                    }'
-MIRROR_TAIL = """                    last_applied_input = desired;
-                }
-            }
-"""
-MIRROR_NEW = '                    for port in 0..populated_ports {\n                        // Never mirror onto a port that has its own schedule:\n                        // this loop runs after the per-port block and would\n                        // otherwise silently overwrite it, which is exactly the\n                        // shape of bug that makes a differential read as "input\n                        // does nothing".\n                        if port == 1 && !input_script_p1.is_empty() {\n                            continue;\n                        }\n                        fn64_abi::set_controller_state(port, desired.0, desired.1, desired.2);\n                    }'
 
 
 def main():
@@ -115,19 +98,13 @@ def main():
     if "WM2000_WATCH" in src:
         print(f"[watch-patch] {path}: already patched, nothing to do")
         return
-    for anchor, name in ((DECL_ANCHOR, "declaration"), (PROBE_ANCHOR, "probe"),
-                         (MIRROR_OLD, "mirror loop"), (MIRROR_TAIL, "mirror tail")):
+    for anchor, name in ((DECL_ANCHOR, "declaration"), (PROBE_ANCHOR, "probe")):
         n = src.count(anchor)
         if n != 1:
             sys.exit(f"[watch-patch] FATAL: {name} anchor found {n} times, expected 1. "
                      "The harness moved; fix this script rather than loosening the anchor.")
-    src = src.replace(DECL_ANCHOR, DECL + P1_DECL + DECL_ANCHOR)
+    src = src.replace(DECL_ANCHOR, DECL + DECL_ANCHOR)
     src = src.replace(PROBE_ANCHOR, PROBE_ANCHOR + PROBE)
-    # The per-port block goes AFTER the mirror loop, and the mirror loop is
-    # taught to skip a port that has its own schedule. Order and exclusion are
-    # both required: either alone leaves port 1 driven by port 0's script.
-    src = src.replace(MIRROR_OLD, MIRROR_NEW)
-    src = src.replace(MIRROR_TAIL, MIRROR_TAIL + P1_APPLY)
     open(path, "w").write(src)
     print(f"[watch-patch] {path}: WM2000_WATCH probe applied")
 
