@@ -3808,7 +3808,38 @@ pub mod census {
         *ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some())
     }
 
-    pub fn note_program(color: [ColorInput; 4], alpha: [AlphaInput; 4], textured: bool) {
+    /// Which evaluated pass a note came from. Recorded because the whole
+    /// census turns on reading the slice the hardware reads, and a tally
+    /// that cannot say whether a program was one-cycle or two-cycle cannot
+    /// be checked against that rule by a later reader.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Pass {
+        /// One-cycle mode: the single pass, over the CYCLE-1 slice.
+        OneCycleOnly,
+        /// Two-cycle mode, first pass, over the cycle-0 slice.
+        TwoCycleFirst,
+        /// Two-cycle mode, second pass, over the cycle-1 slice.
+        TwoCycleSecond,
+    }
+
+    static PASS_COUNTS: [AtomicU64; 3] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 3]
+    };
+
+    pub fn note_program(
+        color: [ColorInput; 4],
+        alpha: [AlphaInput; 4],
+        textured: bool,
+        pass: Pass,
+    ) {
+        PASS_COUNTS[match pass {
+            Pass::OneCycleOnly => 0,
+            Pass::TwoCycleFirst => 1,
+            Pass::TwoCycleSecond => 2,
+        }]
+        .fetch_add(1, Ordering::Relaxed);
         for (slot, input) in [
             ColorInputSlot::A,
             ColorInputSlot::B,
@@ -3864,6 +3895,41 @@ pub mod census {
         }
     }
 
+    /// The raw `SetCombine` wire words of the programs actually evaluated,
+    /// with a count each.
+    ///
+    /// The per-slot tallies above answer "which selectors appear"; they
+    /// cannot answer "which PROGRAM appears", because four independent
+    /// histograms do not reconstruct the joint distribution. Two different
+    /// programs can produce identical per-slot marginals. This map keeps the
+    /// wire words themselves, so the dominant program can be hand-decoded
+    /// from the layout rather than guessed from the margins.
+    static PROGRAMS: std::sync::Mutex<Option<std::collections::BTreeMap<(u32, u32), u64>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn note_wire(low: u32, high: u32) {
+        let Ok(mut guard) = PROGRAMS.lock() else {
+            return;
+        };
+        *guard
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .entry((low, high))
+            .or_insert(0) += 1;
+    }
+
+    /// The distinct evaluated programs, most frequent first.
+    pub fn program_histogram() -> Vec<((u32, u32), u64)> {
+        let Ok(guard) = PROGRAMS.lock() else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = guard
+            .as_ref()
+            .map(|map| map.iter().map(|(k, v)| (*k, *v)).collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
     /// `([slot][selector] color counts, alpha counts, (reads_texel, ignores_texel))`.
     #[allow(clippy::type_complexity)]
     pub fn snapshot() -> ([[u64; 21]; 4], [[u64; 10]; 4], (u64, u64)) {
@@ -3894,6 +3960,12 @@ pub mod census {
         let (color, alpha, (reads, ignores)) = snapshot();
         eprintln!("[fn64-combiner] {label} programs={}", reads + ignores);
         eprintln!(
+            "[fn64-combiner]   passes: one_cycle={} two_cycle_first={} two_cycle_second={}",
+            PASS_COUNTS[0].load(Ordering::Relaxed),
+            PASS_COUNTS[1].load(Ordering::Relaxed),
+            PASS_COUNTS[2].load(Ordering::Relaxed),
+        );
+        eprintln!(
             "[fn64-combiner]   TEXTURED draws: color reads Texel* = {reads}, ignores Texel* = {ignores}"
         );
         for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
@@ -3913,6 +3985,14 @@ pub mod census {
                 }
             }
             eprintln!("[fn64-combiner]   alpha {name}:{line}");
+        }
+        let histogram = program_histogram();
+        eprintln!(
+            "[fn64-combiner]   distinct programs = {}, top 8 by count:",
+            histogram.len()
+        );
+        for ((low, high), count) in histogram.iter().take(8) {
+            eprintln!("[fn64-combiner]     {low:#010x} {high:#010x} x{count}");
         }
     }
 }
