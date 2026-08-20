@@ -127,37 +127,54 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    on them.
 2. **Correct `RT64-PERF-CEILING.md`** per §3a. It currently argues against the
    work the measurement says to do.
-3. **Finish the textured-triangle parity corpus. IT IS ~60% BUILT AND IS THE
-   BLOCKER.** See `docs/RT64-WM2000-TEXEL-LOCALISATION.md` for what exists and
-   what remains -- read it before writing any code, it also lists ruled-out
-   causes and two documented dead ends.
+3. **DONE. The corpus is finished and it found the root cause.** See
+   `docs/RT64-WM2000-TEXEL-LOCALISATION.md`'s final sections.
 
-   **Committed and working:** wire helpers, a hand-derived one-cycle textured
-   other-modes word, a both-cycles Texel0 `SetCombine`, an eight-texel image
-   chosen so wrong-row / wrong-bank / wrong-lane each give a DISTINCT answer,
-   two cases, texture-source seeding through the guest byte-lane map, 18/18
-   guard tests.
+   Both blockers are fixed (`3109ff66`): wgpu's `resident_bytes` refusal is
+   answered from inside the packet by opening the textured command list with
+   a full-extent fill (the guard was NOT widened), and the KEY ITSELF WAS
+   WRONG -- texrect high edges are exclusive while `G_FILLRECT`'s are
+   inclusive, so the fixture drew one fewer row and column. That was the
+   handoff's undiagnosed "RT64 completes but does not match the key": a
+   fixture defect, not a finding.
 
-   **Not working, and the next step:** wgpu refuses both textured cases on a
-   *legitimate* `resident_bytes` guard -- **plumbing is needed; do not widen
-   the guard**. RT64 completes but does not match the hand-derived key,
-   undiagnosed. Re-run the corpus (exact command in the doc) and read the
-   answer: wgpu returning `0x003f` at target (0,1) where the key says `0x8421`
-   is a 4-byte bank error; a byte-swap means the lane mapping; `0xf801` means
-   the row stride.
+   **CONFIRMED ROOT CAUSE, fixed in `9168bb9a`:** deferred guest reads were
+   captured as RAW ABI STORAGE bytes on both the production and conformance
+   paths, while `CapturedGuestRead`'s contract is N64-LOGICAL bytes and the
+   TMEM load executors index the capture linearly. Every 32-bit word of
+   texture data reached the sampler byte-reversed. A 32-bit command word
+   survives a raw read by accident (`^3` composed with a little-endian host
+   load cancels for an aligned word), which is why this was invisible in
+   command decode and fatal only for byte-granular texture data.
 
-   **CAVEAT before quoting parity:** the two textured cases are committed in a
-   state where neither backend completes, so they sit as `one-refused`. The
-   denominator moved 10 -> 12 without two usable results. Do not read the
-   ratio as a fidelity change.
+   Both textured corpus cases now report `identical` -- key, RT64 and wgpu
+   agree byte-for-byte on all eight texels of both. Mutation-verified:
+   reverting the capture to a raw `to_vec()` fails
+   `a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram`.
 
-   Historical note on why this is the blocker rather than a detour: Two confirmed, angrylion-cited fixes have landed
-   against the texel-noise defect -- the perspective scale (2^10 -> 2^15) and
-   the odd-row XOR4 rule -- and the symptom is unchanged. Each cost a 20-minute
-   ROM run and a human reading a PNG to learn only "still wrong". See
-   `docs/RT64-WM2000-TEXTURE-STATE.md`. A textured-triangle case measured
-   against RT64 localises the wrong byte in seconds. Do not attempt a third
-   blind fix.
+   **CONFIRMED ON SCREEN. WM2000's textures render.**
+   `docs/frames/wm2000-after-byte-lane-fix-swap4090.png` is committed; the
+   before image `wm2000-after-xor4-fix-swap5192.png` is the same scene under
+   the previous two fixes. The contrast is not subtle:
+
+   - **Before:** dense magenta/green/black per-pixel speckle across every
+     surface; two wrestler silhouettes and yellow hair blocks discernible
+     only as shapes.
+   - **After:** real imagery. Skin tones and facial detail (beards,
+     eyebrows), a black t-shirt with legible orange "AUSTIN 3:16" print, the
+     steel-truss arena background correctly shaded, and readable text --
+     "Single Match", "STEVE AUSTIN VS STEVE AUSTIN", the red "RAW IS WAR"
+     logo.
+
+   Zero panics and zero backend errors across 4,200+ dumped frames.
+
+   So the texel-noise defect recorded in
+   `RT64-WM2000-TEXTURE-STATE.md` is CLOSED. The remaining known visual gaps
+   (colour bands, blocky glyphs) were never separately scoped and should be
+   re-checked against a current frame before anyone scopes them -- the
+   handoff's own advice was not to scope them separately until this was
+   fixed.
+
 3b. **Then the rest of the corpus:** other triangle shapes and combiner
    programs.
    It is 10 hand-authored **fill-rectangle** cases today -- it cannot see any
