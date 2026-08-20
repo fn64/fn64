@@ -177,7 +177,11 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     // the same `SECOND_CYCLE = true` `run_one_cycle` passes. Two-cycle mode
     // starts at cycle 0. Reading the other slice would report selectors the
     // hardware never consults.
-    if std::env::var_os("FN64_COMBINER_CENSUS").is_some() {
+    // Read ONCE, not per triangle. `var_os` allocates and this is the
+    // per-triangle path; a live lane is measuring frame rate and a probe
+    // must not be the thing it measures.
+    static CENSUS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CENSUS_ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some()) {
         let second_cycle = matches!(evaluation, TexrectCombinerEvaluation::OneCycle);
         let combine = shading.combine();
         crate::combiner::census::note_program(
