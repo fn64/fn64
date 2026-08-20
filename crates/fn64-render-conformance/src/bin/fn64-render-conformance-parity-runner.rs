@@ -38,8 +38,13 @@
 //! backend's output.
 
 #![cfg(target_os = "macos")]
+#![allow(unsafe_code)]
 
-use std::io::{self, Write};
+use std::{
+    fs::File,
+    io::{self, Write},
+    os::fd::FromRawFd,
+};
 
 use fn64_render::{
     AspectTarget, RenderAspectRatio, RenderBackend, RenderConfig, RenderFiltering,
@@ -686,11 +691,49 @@ fn run() -> Value {
     })
 }
 
+/// RT64's native side writes device diagnostics ("Device Name: Apple M5
+/// Pro") straight to the process C stdout stream, which the C runtime flushes
+/// at exit -- i.e. AFTER this runner has written its JSON. That appends
+/// non-JSON lines to the document and makes the output unparseable, which is
+/// exactly what happened on the first run of this binary.
+///
+/// The RT64 deferred-history runner solved this before us and this is its
+/// approach, verbatim: duplicate the real stdout to a private descriptor to
+/// write the protocol on, then point fd 1 at stderr so every native
+/// diagnostic lands on the already-captured stderr pipe.
+fn redirect_native_stdout() -> Result<File, Box<dyn std::error::Error>> {
+    io::stdout().lock().flush()?;
+    // SAFETY: flushing the process C stream before duplicating descriptors
+    // prevents buffered native diagnostics from crossing the redirection.
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+    }
+    // SAFETY: dup returns a new owned descriptor or -1. No Rust owner exists
+    // until the success branch constructs exactly one File below.
+    let protocol_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if protocol_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: both descriptors are valid process descriptors. Native stdout
+    // is sent to the already-captured stderr pipe before RT64 starts.
+    if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: protocol_fd is the still-unowned successful dup above.
+        unsafe {
+            libc::close(protocol_fd);
+        }
+        return Err(error.into());
+    }
+    // SAFETY: protocol_fd is a unique owned descriptor after successful dup.
+    Ok(unsafe { File::from_raw_fd(protocol_fd) })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut protocol = redirect_native_stdout()?;
     let value = run();
-    let mut stdout = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, &value)?;
-    writeln!(stdout)?;
+    serde_json::to_writer_pretty(&mut protocol, &value)?;
+    writeln!(protocol)?;
+    protocol.flush()?;
     Ok(())
 }
 
