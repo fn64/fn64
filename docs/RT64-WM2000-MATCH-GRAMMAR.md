@@ -86,10 +86,74 @@ tests at struct `+0x1A`/`+0x40`. L and R *do* participate in gameplay, but via
 the counter mask `0xC030` at `0x8013EEEC` -- the right conclusion reached at
 the wrong sites.
 
-## How a match ENDS: NOT FOUND
+## How a match ENDS: FOUND, and it is pollable (CONFIRMED)
 
-Stated plainly, because a guess here is worse than nothing. Three candidate
-leads were read and all three are something else:
+**Poll guest address `0x8016ED2A` (u8). While a match is running bit `0x80` is
+clear; at match end it is set, and one frame later the gameplay loop exits.**
+
+The chain, read end-to-end:
+
+**1. The loop exit is gated on exactly that bit** (`0x800E1C9C`). This is the
+only call to `func_800EE4AC` in `D2720.s`, and `$s4` is the register whose
+being set ends the frame loop:
+
+```
+800E1C9C  lbu   $v0, %lo(D_8016ED2A)($v0)
+800E1CA0  andi  $v0, $v0, 0x80
+800E1CA4  beqz  $v0, .L800E1CC4      # not set -> skip the fade, keep playing
+800E1CB4  jal   func_800EE4AC        # fade to FF,FF,FF
+800E1CC0  addiu $s4, $zero, 0x1      # <- loop exit
+```
+
+(The other fade, `func_800EE550` at `0x800E1C90`, is gated on `$s5` and is the
+fade-*in*.)
+
+**2. Bit `0x80` has exactly one writer**, `func_80122AF4`. Every other write to
+`D_8016ED2A` in the bank touches a different bit -- `0x800F0074`/`0x80122ABC`
+clear `0x20` via `0xDF`, `0x800EF774` sets `0x20`, `0x80123F00` sets `0x10`,
+`0x80122940` sets `0x40`, `0x801221B4` zeroes the byte:
+
+```
+80122AF4  lh    $v0, %lo(D_801589D2)
+80122AFC  slti  $v0, $v0, 0x7530     # 30000
+80122B00  bnez  $v0, func_80122C7C   # below 30000 -> do nothing
+80122B18  ori   $v0, $v0, 0x80
+80122B20  sb    $v0, %lo(D_8016ED2A)
+```
+
+**3. `D_801589D2` (`0x801589D2`, s16) is the post-match sequence counter**,
+ticked once per state-machine tick in `func_801229E0` (the state machine is
+`func_801226A0`, called from the frame loop at `0x800E1CD0`):
+
+```
+801229E0  lhu   $v0, %lo(D_801589D2)
+801229EC  addiu $v0, $v0, 0x1
+801229F4  sh    $v0, %lo(D_801589D2)
+80122A00  bne   $v0, 0x5A, ...       # at frame 90 -> func_800E3A24(D_801589E0)
+80122A1C  slti  $v0, $v1, 0x5B       # < 91 keep counting
+80122A40/A48                         # else force $v0 = 0x7530 -> immediate end
+```
+
+It is reset to 0 at `0x80122950` and set from `$a2` at `0x80122AD4`.
+
+**Do not confuse it with `D_801589D0`** (adjacent, +0), which is incremented at
+`0x80122758` and compared `slti 0x1F` (31) -- an intro/entrance timer, not the
+match clock. Both are zeroed at `0x801226E0`/`E4` on state entry.
+
+`D_801567B0`/`B2` (thresholds `0xA`/`0x14`, referenced by `func_800E9D8C`) is a
+referee-count / display index. It never touches `D_8016ED2A`, so it is not the
+loop terminator.
+
+Both per-frame ticks the previous pass suspected are display code, not rules:
+`func_800E4C94` is a 2D HUD/sprite interpolator (4 slots, stride `0x24`, over
+`D_8015862E..D_80158649`, decrementing a per-slot tween countdown at
+`0x800E4FE0`), and `func_800E9C50` draws one glyph, ramping `D_801581E5` toward
+`0x6E`. Neither writes a terminal flag.
+
+## Earlier candidates, refuted
+
+Recorded so the next reader does not re-read them. Three candidate leads were
+followed before the real one above was found, and all three are something else:
 
 | Candidate | What it actually is | Evidence |
 |---|---|---|
@@ -99,7 +163,7 @@ leads were read and all three are something else:
 
 Also not found, with the negative evidence:
 
-- **Pin / 3-count:** no counter compared against 3 in a per-second-tick context.
+- **Pin / 3-count as such:** no counter compared against 3 in a per-second-tick context.
   The 68 `slti`/`sltiu ...,0x3` sites in `D2720.s` are loop bounds and mode
   comparisons (`D_801586F2 < 3` at `0x800E7864` is a match-*type* check).
 - **Submission meter:** not found.
@@ -123,8 +187,5 @@ gameplay frame loop `.L800E1C6C` (`0x800E1C6C`-`0x800E1F34`) exits on register
 `$s4`, which is set only by the fade-completion helpers `func_800EE4AC` /
 `func_800EE550`.
 
-**HYPOTHESIS, and the next thing to read:** a match ending plausibly runs
-exactly that fade, so the callers of `func_800EE4AC`/`func_800EE550` inside
-`D2720.s`, and the per-frame ticks `func_800E4C94` / `func_800E9C50` (both
-called unconditionally from `func_800E7978` at `0x800E7978`/`0x800E7980`), are
-where the match-end condition should be. Neither has been read.
+That hypothesis is the one the section above confirmed: the match end does run
+exactly that fade, and `D_8016ED2A & 0x80` is its gate.
