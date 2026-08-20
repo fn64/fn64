@@ -196,6 +196,65 @@ actually got against its own bound. Both `D_800961D2` and `D_8014E1C4` are in
 the default watch set for exactly this reason: the first thing a run should
 establish is which of these five rows it is living in.
 
+### The end conditions are unreachable by a fixed button schedule (CONFIRMED)
+
+This is the structural answer to "can a scripted run finish a match", and it is
+a negative.
+
+`func_80123F34` (`0x80123F34`) takes a mask, loops slots 0..3 computing
+`idx * 0x104`, and tests `D_8016722E[idx] & arg` (`lhu` at `0x80123FE0`, `and`
+at `0x80123FE4`). On a hit it clears the bit and returns 1, which advances the
+state. So the question reduces to: **what sets those bits?**
+
+An exhaustive scan of every `sh` to `%lo(D_8016722E)` and every `sh ..., 0x4C($reg)`
+across all five overlays answers it. (`D_801588F8` is a wrestler-record pointer,
+set at `0x800EE6FC` from `base + idx*0x104`, so `0x4C($ptr)` *is* `D_8016722E`.)
+
+**Four of the six checked conditions have no writer anywhere in the ROM.**
+Bits `0x40`, `0x20`, `0x100` and `0x200` are never set. They are permanently
+unreachable in this build.
+
+**The two that are reachable are set only from move-script handlers:**
+
+| bit | set at | inside | gate |
+|---|---|---|---|
+| `0x8` | `0x800F8714` (`ori $v0, $v0, 0x8`) | `func_800F8674` | move-script state word `0xC($a0) == 1` |
+| `0x10` | `0x800F8F8C` | `func_800F8E94` | move-script state word `0xC($a0) == 2` |
+
+Both functions are entered only through thunks in the **move-script dispatch
+table at `0x8014CFB0`** (`asm/data/13D1D0.data.s:1473`) -- that is, only as a
+consequence of a specific grapple animation being selected and run to a
+specific frame.
+
+**The pinfall confirms the shape.** The count lives in `D_801589E6` (current)
+against `D_801589E4` (target), advanced at `0x801231E8` and compared at
+`0x80123238`. Entry requires `D_8016722E & 0x1` (`andi $v0, $a2, 0x1` at
+`0x8012318C`). The cancel path at `0x8012B1B0` additionally requires
+`D_80167239 & 0x1`, `D_80167220 & 0x20` (downed), and `D_801671EA` in
+`{1, 0x34}` (animation id). **No button test gates the pin at any of these
+sites** -- the pin flag arrives from a move script, never from an input read.
+
+**And spirit damage has no arithmetic site (CONFIRMED NEGATIVE).** Every store
+to record `+0xE` in the whole disassembly is `sh $zero` (15 sites, e.g.
+`0x800F4EEC`, `0x800F7938`) or an `andi 0xFF` restore at `0x80126530`. There is
+no decrement anywhere; damage is applied through the move-script system
+indirectly. Per-strike damage and the starting value cannot be read out of the
+disassembly, so "how many strikes until a pin is possible" has no static answer.
+
+**What this means for the card.** A scripted schedule can press buttons, and
+those presses provably reach the game's input records. It cannot *choose to land
+a grapple*: that requires the two wrestlers to be in the right relative position
+and the opponent in the right state, which is a closed-loop condition no
+open-loop button script controls. Ending a match therefore depends on the
+guest's own AI and physics bringing the wrestlers together while the script
+happens to be pressing the right button -- possible, but not schedulable, and
+not something a run can be designed to guarantee.
+
+**The best observable progress signal is `D_801589E6`** (`0x801589E6`, s16, the
+live pin count against `D_801589E4`). It is nonzero only once a pin is actually
+in progress, which makes it the cheapest way to tell "the wrestlers are really
+fighting" from "the wrestlers are milling about".
+
 ### The referee count
 
 **`D_8016ECC0`** (`0x8016ECC0`, s8) is the real count, loaded from
