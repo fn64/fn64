@@ -303,3 +303,76 @@ integer reciprocal-table path (`tcdiv_table[0x8000]`, shift/log2 based) with
 its own overflow and out-of-bounds handling. Those are not the same
 function, and a coordinate error lands squarely in candidate 1. Whether they
 agree closely enough to be invisible has not been measured here.
+
+## MEASURED, and it refutes candidate 1 too: the texel is NOT constant
+
+**Status: CONFIRMED.** Third run, same script and stack, with the per-pixel
+histograms. 35,141,022 drawn pixels in one tick:
+
+```
+[fn64-combiner]   TEXTURED draws: color reads Texel* = 52114, ignores Texel* = 9896
+[fn64-combiner]   texel luma /16 (pixels=35141022): 0:4223419 16:3465814 32:3519217
+  48:590388 64:1615920 80:2451609 96:4493175 112:3611297 128:5475595 144:2081631
+  160:2171107 176:545283 192:448160 208:334372 224:37197 240:76838
+[fn64-combiner]   shade alpha /16 (pixels=35141022): 64:325441 80:335495 96:363971
+  112:394935 128:4386568 144:3617304 160:3622402 176:3786463 192:3773787
+  208:3571048 224:3584695 240:7378913
+```
+
+- **Texel luma occupies all 16 buckets.** The largest holds 15.6% of pixels
+  and the top two together only 28.4%. This is a broad, populated
+  distribution -- exactly what sampling real texture data looks like.
+- **Shade alpha occupies 12 of 16 buckets**, 96% of pixels at or above 128
+  and none below 64. Varied, and in the range a lighting term lives in.
+
+`docs/RT64-WM2000-INMATCH-GAPS.md` set the decision rule for this
+measurement in advance: "A texel histogram with one or two distinct values
+indicts (1); a varied texel histogram with a flat output indicts (2)." The
+histogram has sixteen populated values. **By that rule candidate 1 is
+refuted**, and candidate 2 was already refuted by the program histogram
+above.
+
+Note also the corrected ratio in the same tick: **52,114 textured draws
+consult a Texel input against 9,896 that do not -- 84%**, where the
+uncorrected metric had reported 46%. That is the two-cycle fix from the
+previous section showing up in the number it was distorting.
+
+## Where this leaves the card
+
+Every hypothesis the brief named is now measured and refuted:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| Combiner never selects `Texel0` | **REFUTED** | dominant program is `Texel0 * ShadeAlpha` then fog; 84% of textured draws read a Texel input |
+| Sampled texel is wrong-but-valid (constant/aliased) | **REFUTED** | texel luma occupies all 16 buckets, largest 15.6% |
+| CI-without-TLUT aliases to I8 | **REFUTED as a defect** | byte-exact with angrylion `tmem.c:260-288` |
+| Combiner decode reads the wrong bitfield slice | **REFUTED** | agrees with gbi.h, angrylion and RT64 three ways |
+
+**So the renderer is sampling varied texels, selecting them in the combiner,
+modulating them by a varied shade alpha, and fogging the result -- and the
+models still look flat.** The defect is therefore NOT in the combiner and
+NOT in whether the sampler returns varying data. It is somewhere that this
+card's instruments cannot see, and the honest statement is that this card
+narrowed the search rather than closing it.
+
+### What the evidence now points at, all HYPOTHESIS
+
+1. **The texel varies, but does it vary in the RIGHT PLACE?** A histogram is
+   blind to spatial arrangement: a texture sampled with wrong coordinates
+   produces an identically varied histogram and a smeared or single-colour
+   *triangle*. This is the largest remaining gap, and it is not expensive to
+   close -- a per-triangle count of DISTINCT texels would separate "varied
+   across the frame" from "varied within each triangle". The present
+   histogram cannot, and should not be read as if it could.
+2. **`texture_coordinates_s10_5` is a float port of an integer algorithm.**
+   `crates/fn64-render-wgpu/src/raw_dpc/triangle_span.rs:519` does the
+   perspective divide in `f32` against a `PERSPECTIVE_TEXEL_SCALE` of 1024;
+   angrylion's `tcdiv_persp` (`src/core/n64video/rdp/tcoord.c:1027`) is a
+   reciprocal-table integer path with its own shift/log2 handling. These are
+   different functions, and per (1) a coordinate error is exactly the shape
+   the current evidence cannot exclude.
+3. **The observation itself deserves re-checking.** "Every model renders
+   flat" was an eyeball reading of a moving window. The census says the
+   pixels being written are varied. Both can be true if the variation is
+   spatially wrong -- but it is also worth confirming what is on screen with
+   the same rigour applied to the counters.
