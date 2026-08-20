@@ -540,3 +540,82 @@ storage the defect is in the shared sampler and WM2000 is affected; if only
 the conformance path does, the corpus needs the fix and the ROM defect is
 still open. **Settle this before fixing anything** -- and note the fix site
 differs completely between the two answers.
+
+---
+
+# The raw-triangle gap: a 64x plane->texel scale disagreement
+
+Investigating why RT64 produced no pixels for the corpus's raw-triangle
+case. Every claim is **CONFIRMED** (measured or read) or **HYPOTHESIS**.
+
+## CONFIRMED: "RT64 does not rasterize raw triangles" was WRONG
+
+The earlier reading came from a triangle-only display list. Putting a
+texture RECTANGLE and the triangle in the SAME packet shows otherwise:
+
+- columns 8..11 (the texrect): RT64 and wgpu **agree** -- both drew it.
+- columns 2..5 (the triangle): only these differ, and **RT64 wrote pixels
+  at 5 of the 12** covered positions.
+
+Deterministic across three consecutive runs, so not uninitialised memory.
+RT64 rasterizes the triangle. The earlier "writes nothing" was an artifact
+of the list, and the corpus case's `Authority` doc needs correcting.
+
+## CONFIRMED: every pixel RT64 wrote was the tile's LAST texel
+
+All five were `0x7fff` -- `TEXTURE_TEXELS[3]` of a 4-wide tile. That is the
+signature of an S coordinate clamped past the tile's right edge, and
+reading RT64's own decode explains it exactly.
+
+## CONFIRMED: the two backends disagree by 64x on the non-perspective scale
+
+| backend | non-perspective plane -> texels | source |
+|---|---|---|
+| fn64 | `plane / 2^21` to S10.5, `/32` to texels = `plane / 2^26` | `triangle_span.rs`'s `PLANE_TO_TEXEL`, cited to angrylion's `tcdiv_nopersp` |
+| RT64 | `(plane / 2^16 * 1024) / 16384` = `plane / 2^20` | `src/gbi/rt64_gbi_rdp.cpp:535-537`, the `texturePerspective` else-branch |
+
+**Both end in TEXEL units**, so this is not a units artifact -- RT64's
+`sampleTextureLevel` does `texelBaseInt = floor(uvCoord)`
+(`TextureSampler.hlsli:148`) and subtracts the tile origin as
+`(uls, ult) / 4.0` (`:245`), i.e. its UV is whole texels. For the same
+plane word fn64 says **1 texel** and RT64 says **64**.
+
+With the corpus's planes (one texel per pixel of X under fn64's rule), RT64
+therefore reads columns 2..5 as texels 32, 96, 160 and 224 of a 4-texel
+tile -- all far past the right edge, all clamping to texel 3. Which is
+exactly the measured `0x7fff`.
+
+**Verified in the direction that can be controlled:** rescaling the corpus
+planes by 1/64 (to `2^20` per texel) makes **wgpu** sample texel 0
+everywhere, exactly as `plane / 2^26` predicts for a 64x-too-small plane.
+
+## Which one is right: fn64, on the evidence available
+
+**CONFIRMED** that fn64's constant is the cited one. `PLANE_TO_TEXEL`'s own
+doc derives `2^21` as `2^16 * 2^5` from **angrylion's `tcdiv_nopersp`**, the
+hardware authority, and records the history of an earlier wrong constant
+being corrected against it. `fn64-render-reference` cites the same function
+independently (`raster/draw.rs:932`).
+
+**CONFIRMED** that fn64's scale is self-consistent end to end:
+`a_non_perspective_textured_triangles_texels_reach_guest_rdram`
+(`rdp_harness/tests.rs:641`) stages planes at `2^26` per texel and asserts
+four DISTINCT texels at four columns -- it passes, so the rasterizer really
+does step one texel per pixel at that scale.
+
+**NOT established:** that RT64 is wrong *as an emulator*. Its value feeds a
+GPU sampler through `gpuTile.tcScale` and a tile-origin subtraction that
+fn64's CPU path does not have, so the comparison is not literally
+constant-for-constant. What IS established is that a display list authored
+for one lane's scale cannot be read by the other, which is why the corpus
+case shows the two disagreeing.
+
+## Still open
+
+Why RT64's coverage is PARTIAL and ragged (row 0 empty; rows 1-2 written at
+2 of 4 and 3 of 4 columns) rather than a clean 4x3 box. The clamped texel
+explains the wrong COLOUR, not the missing pixels, so this is a second and
+separate effect. `RDP::drawTris` merges the triangle's bbox into
+`fbPair.drawColorRect` and the renderer skips any call whose scissor is
+empty (`rt64_framebuffer_renderer.cpp:549`), both of which are candidates,
+but neither is confirmed.
