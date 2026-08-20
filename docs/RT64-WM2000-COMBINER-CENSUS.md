@@ -104,3 +104,46 @@ it somewhere upstream of `lut_mode` (a different defect, in `SetOtherMode`
 latching or TLUT residency, not in this decode), or the glyphs are a
 downstream artifact. Widening this decode would take fn64 further from
 hardware, not closer.
+
+## CONFIRMED defect (different crate): `fn64-render-reference` runs the wrong
+## slice in one-cycle mode
+
+Found while establishing which slice is authoritative. Recorded here, not
+fixed under this card, because the reference renderer is another lane's
+surface -- but it is a live defect on that crate's raster path, not a
+latent one, and it disqualifies the reference as an oracle for one-cycle
+combiner questions.
+
+`evaluate_combiner` (`crates/fn64-render-reference/src/raster/combiner.rs:64`)
+maps `CycleType::OneCycle => 1` and then runs
+`state.mode.cycles.into_iter().take(cycle_count)`, evaluating `cycles[0]`.
+`CombinerMode::decode` (`gbi/types.rs:276-309`) fills `cycles[0]` from the
+cycle-**0** wire fields (`w0>>20`, `w0>>15`, `w1>>28`, `w1>>15`, ...). There
+is no compensating swap anywhere between them.
+
+angrylion's `combiner_1cycle` (`combiner.c:173-220`) dereferences index
+`[1]` for all eight inputs, and `rdp_set_combine` (`:522-560`) fills index
+`[1]` from the cycle-1 wire fields. So one-cycle mode evaluates the SECOND
+programmed cycle, and the reference renderer evaluates the first.
+
+**Why it has gone unnoticed, and why that is the interesting part.** This is
+precisely the coincident-fixture trap `docs/RT64-WM2000-HARNESS-TRAPS.md`
+warns about, occurring naturally:
+
+- `CombinerMode::default()` (`types.rs:330-353`) builds ONE `modulate` cycle
+  and stores `cycles: [modulate; 2]` -- both slices identical, so every
+  fixture on the default path reads the same answer either way.
+- Games conventionally write `gsDPSetCombineMode(G_CC_X, G_CC_X)`
+  (`ultra64/gbi.h:3610`, `gsDPSetCombineMode(a, b) -> gsDPSetCombineLERP(a, b)`
+  with `a` = cycle 0 and `b` = cycle 1) in one-cycle mode, passing the same
+  mode twice. A ROM that does so is also indistinguishable.
+
+So the bug is invisible until a title programs two DIFFERENT slices and runs
+one-cycle. `fn64-render-wgpu` is correct here (`run_one_cycle`'s
+`SECOND_CYCLE = true`), which means the two lanes silently disagree on
+exactly those programs -- and a differential run between them would blame
+the wrong side.
+
+**Consequence for this card:** the brief names `fn64-render-reference` as
+"repeatedly the better oracle for CPU-side questions". For one-cycle
+combiner output specifically, it is not, until this is reconciled.
