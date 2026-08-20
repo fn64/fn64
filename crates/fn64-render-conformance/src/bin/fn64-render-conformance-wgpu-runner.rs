@@ -433,9 +433,19 @@ fn render(rdram: &mut [u8]) -> Result<WgpuOutcome, Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let start = FRAMEBUFFER as usize;
-    rdram[start..start + FRAMEBUFFER_BYTES as usize]
-        .copy_from_slice(&published[..FRAMEBUFFER_BYTES as usize]);
+    // **Through `write_logical_bytes`, not a raw slice copy.** This is the
+    // exact call `fn64-abi`'s `copy_committed_guest_writes` makes
+    // (`task_dispatch/rsp_commit.rs`), and the difference is load-bearing:
+    // `device_bytes` are flat big-endian device bytes, while guest RDRAM is
+    // stored in native words under the `^3` byte-lane mapping `write_u8`
+    // applies. A raw `copy_from_slice` here reported every pixel as
+    // byte-swapped against the reference backend -- a runner defect that
+    // would have been read as a renderer defect. Copying the way production
+    // copies is what makes the two backends' observations comparable at all.
+    RdramViewMut::from_storage(rdram).write_logical_bytes(
+        RdramAddr::from_offset(FRAMEBUFFER),
+        &published[..FRAMEBUFFER_BYTES as usize],
+    );
     Ok(WgpuOutcome::Rendered(published))
 }
 
