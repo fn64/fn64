@@ -118,6 +118,30 @@ One workspace, separate crates, each publishable alone:
 `fn64-recomp` was once "planned, once the runtime earns it" — it exists and
 boots OoT. See `docs/DESIGN.md` §1.1 for the two lanes it introduces.
 
+## Play WM2000 in a window, on the all-Rust stack
+
+```sh
+./scripts/play-wm2000.sh
+```
+
+That builds and launches the interactive shell on fn64's own recompiler
+(`fn64-cpu-runtime`) driving fn64's own renderer (`fn64-render-wgpu`) — no
+N64Recomp C bodies, no RT64 C++ adapter, and **no `--features rt64`.**
+Keyboard works out of the box; a gamepad is picked up by hotplug, before or
+after launch. In the window: **F1** settings (including gamepad rebinding),
+**F2** screenshot, **F3** stack/fps HUD, **F11** fullscreen, **Esc** exit.
+
+It needs the ROM and the title's rs-lane host lookup table, neither of which
+ships here; the script names both and fails loudly if either is missing.
+Override with `ROM=`, `RECOMP_RS_HOST_LOOKUP=`, or `FN64_RENDER=reference` to
+compare against the software oracle. Pass `FN64_SKIP_EMIT=1` to reuse an
+already-emitted crate and skip the recompile.
+
+**Check the banner, not the request.** The shell prints a `[fn64-stack]` block
+at startup and exit naming the lane and the *resolved* renderer. If it says
+`reference-fallback`, wgpu failed to construct and the reason is on the line
+above. Paste that block into any symptom report.
+
 ## Status
 
 Pre-alpha, but not speculative and no longer design-only: fn64 boots OoT with
