@@ -3864,11 +3864,24 @@ pub mod census {
             ALPHA_COUNTS[alpha_slot_index(slot) * 10 + alpha_index(input)]
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // The headline split, and it is deliberately restricted to draws
-        // that HAVE a texel. An untextured draw whose program ignores
-        // Texel0 is correct and uninteresting; counting it here would
-        // dilute exactly the ratio the card turns on.
-        if textured {
+        // The headline split, and it is restricted twice over.
+        //
+        // First to draws that HAVE a texel: an untextured draw ignoring
+        // Texel0 is correct and uninteresting, and counting it would
+        // dilute the ratio the card turns on.
+        //
+        // Second, and this one was earned by a wrong reading, to the FIRST
+        // evaluated pass. A two-cycle program's second pass routinely reads
+        // no texel: WM2000's dominant program is
+        // `cycle0 = (Texel0 - Zero) * ShadeAlpha + Zero` followed by
+        // `cycle1 = (Environment - Combined) * Primitive + Combined`, a fog
+        // lerp over the textured result. Counting that second pass as a
+        // Texel-ignoring draw made 54% of draws appear to discard their
+        // texture when they had sampled it in the pass immediately before.
+        // The ratio exists to answer "does this program consult the texel
+        // at all", and `Combined` carries the first pass's answer forward,
+        // so the first pass is where that question is decided.
+        if textured && pass != Pass::TwoCycleSecond {
             if color.iter().any(|input| {
                 matches!(
                     input,
@@ -4058,6 +4071,82 @@ mod census_tests {
                 params.decode_color(slot, false),
                 ColorInput::Shade,
                 "the cycle-0 slice of this fixture is Shade, so the two differ"
+            );
+        }
+    }
+
+    /// WM2000's dominant measured program, hand-decoded from the wire words
+    /// the ROM actually issued, and pinned because misreading it is what
+    /// made 54% of draws look like they discarded their texture.
+    ///
+    /// `0xfc15fea3 / 0xf00ff23f`, measured at 73,925 of ~115,000 draws in
+    /// one in-match window. Expectations below are derived BY HAND from
+    /// gbi.h's `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1` bit positions, not
+    /// from the decoder under test.
+    ///
+    /// **Mutation scope, stated honestly.** Rewriting
+    /// `color_input_c`'s index 11 from `ShadeAlpha` to `PrimitiveAlpha`
+    /// fails this test. Narrowing `parse_color_c`'s second-cycle mask from
+    /// `0x1F` to `0xF` does NOT -- this program's `c1` is 3, which reads
+    /// identically under either mask, the coincident-fixture trap
+    /// `docs/RT64-WM2000-HARNESS-TRAPS.md` names. That mutant is caught by
+    /// three tests elsewhere in this crate
+    /// (`set_combine_w0_is_passed_through_completely_unmasked`,
+    /// `two_cycle_wire_program_decodes_to_both_slices`, and
+    /// `the_one_cycle_fixtures_really_do_admit_a_combining_texture_rectangle`),
+    /// verified by running the mutant against the full suite, so it is
+    /// covered -- just not here. This fixture's job is the ROM's real
+    /// program, not the mask widths.
+    #[test]
+    fn the_wm2000_fog_program_samples_the_texture_in_its_first_cycle() {
+        let params = CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f);
+
+        // Cycle 0 (two-cycle first pass, `second_cycle = false`).
+        // a0 = w0>>20 & 0xF = 0x1 = TEXEL0; b0 = w1>>28 & 0xF = 0xf -> ZERO;
+        // c0 = w0>>15 & 0x1F = 0x1b = 11 -> SHADE_ALPHA;
+        // d0 = w1>>15 & 0x7 = 0x7 -> ZERO.
+        assert_eq!(params.decode_color(ColorInputSlot::A, false), ColorInput::Texel0);
+        assert_eq!(params.decode_color(ColorInputSlot::B, false), ColorInput::Zero);
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, false),
+            ColorInput::ShadeAlpha
+        );
+        assert_eq!(params.decode_color(ColorInputSlot::D, false), ColorInput::Zero);
+
+        // Cycle 1: a1 = w0>>5 & 0xF = 0x5 = ENVIRONMENT;
+        // b1 = w1>>24 & 0xF = 0x0 = COMBINED; c1 = w0 & 0x1F = 0x3 = PRIMITIVE;
+        // d1 = w1>>6 & 0x7 = 0x0 = COMBINED. A fog lerp over cycle 0's result.
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, true),
+            ColorInput::Environment
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, true),
+            ColorInput::Combined
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::Primitive
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, true),
+            ColorInput::Combined
+        );
+
+        // The point of the whole fixture: the SECOND cycle names no texel,
+        // and reading only that cycle would conclude this draw throws its
+        // texture away. It does not -- cycle 0 sampled it and `Combined`
+        // carries it forward.
+        for slot in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ] {
+            assert_ne!(
+                params.decode_color(slot, true),
+                ColorInput::Texel0,
+                "cycle 1 of the fog program names no Texel0 -- that is the trap"
             );
         }
     }
