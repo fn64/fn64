@@ -212,6 +212,75 @@ const TEXTURE_TEXELS: [u16; 8] = [
     0xfc01, // row 1, col 3: r=31 g=0  b=0  a=1 with g's top bit set
 ];
 
+/// **The wide texture, for the `line > 1` case.** Its own source address so
+/// the 4x2 image above is untouched and the two committed textured cases
+/// cannot regress when this one changes.
+///
+/// 8x2 RGBA16 texels: one row is 16 bytes = TWO 64-bit TMEM words, so
+/// `SetTile`'s `line` is 2. That is the field every case above leaves at 1,
+/// and it is the multiplier in angrylion's own row address
+/// (`tile->line * (t & 0xff)`, `tmem.c:65`) -- a stride defect is invisible
+/// while `line` is 1, because a wrong multiplier times one row index is
+/// still the right address on row 0.
+const WIDE_SOURCE: u32 = 0x3000;
+const WIDE_WIDTH: u32 = 8;
+const WIDE_HEIGHT: u32 = 2;
+const WIDE_LINE_WORDS: u32 = 2;
+
+/// Sixteen distinct RGBA16 texels, row-major.
+///
+/// **Row 1 is what this case is for.** Every row-1 texel has bit 0x0040 set
+/// (green's low bit) and no row-0 texel does, so reading row 0 where row 1
+/// was meant is visible in one bit even if the columns happen to line up.
+/// Within a row every texel differs from every other, so a wrong column is
+/// visible too, and no texel is a byte-swap of another.
+const WIDE_TEXELS: [u16; 16] = [
+    // row 0: bit 0x0040 clear in every entry.
+    0xf801, 0x07c1, 0x003f, 0xffff, 0x8421, 0xc631, 0x4211, 0xfc01,
+    // row 1: bit 0x0040 set in every entry.
+    0xf841, 0x0641, 0x0079, 0xffbf, 0x8461, 0xc671, 0x4251, 0xfc41,
+];
+
+/// The expected pixel for the wide case, by linear target index.
+///
+/// Half-open on both axes, the texrect rule. Inside, pixel `(x, y)` reads
+/// texel `(x, y)` of the 8x2 image; outside, the seeded `STALE` survives.
+/// Arithmetic over [`WIDE_TEXELS`] -- no backend is consulted.
+fn wide_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < WIDE_WIDTH && y < WIDE_HEIGHT {
+        WIDE_TEXELS[(y * WIDE_WIDTH + x) as usize]
+    } else {
+        STALE
+    }
+}
+
+/// The command list for the wide (`line = 2`) textured case.
+///
+/// Same shape as [`one_textured_rect`] -- seed fill, state, load, draw, sync
+/// -- but every texture parameter comes from the WIDE constants, so the tile
+/// carries `line = 2` and the rectangle is 8 columns wide.
+fn wide_textured_rect() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(WIDE_WIDTH, WIDE_SOURCE),
+        set_tile(WIDE_LINE_WORDS, 0),
+        set_tile_size(WIDE_WIDTH, WIDE_HEIGHT),
+        (0xe600_0000, 0),
+        load_tile(WIDE_WIDTH, WIDE_HEIGHT),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(texture_rectangle(0, 0, WIDE_WIDTH, WIDE_HEIGHT));
+    words.push((0xe900_0000, 0));
+    words
+}
+
 /// Where the textured rectangle lands on the target: 4 columns by 2 rows at
 /// the origin, so the rectangle steps exactly one texel per pixel on both
 /// axes and pixel `(x, y)` samples texel `(x, y)` with no filtering
@@ -631,6 +700,21 @@ fn cases() -> Vec<Case> {
                 }
             },
         },
+        Case {
+            name: "textured-rect-wide-line-two",
+            intent: "the first case with a tile `line` other than 1. An 8x2 \
+                     RGBA16 texture puts TWO 64-bit words in each TMEM row, \
+                     so the row stride is `line * t` rather than just `t` -- \
+                     angrylion's own `tile->line * (t & 0xff)`. A wrong \
+                     multiplier is INVISIBLE at line 1 (any multiplier times \
+                     row 0 is still row 0), which is exactly why every case \
+                     above can be green while a stride defect ships. Row 1 \
+                     carries a bit no row-0 texel has, so reading the wrong \
+                     row shows up even if the columns coincide.",
+            authority: Authority::Rt64Authoritative,
+            commands: wide_textured_rect(),
+            expected: wide_expected,
+        },
         // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
         // does not model, so RT64's answer is NOT evidence about wgpu.
@@ -705,6 +789,16 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
         for (index, texel) in TEXTURE_TEXELS.iter().enumerate() {
             view.write_u16(
                 RdramAddr::from_offset(TEXTURE_SOURCE + index as u32 * 2),
+                *texel,
+            );
+        }
+        // The wide (`line = 2`) source, staged the same way and for the same
+        // reason: unconditionally, so `seeded` stays a single function of the
+        // command list, and through `write_u16` so the guest byte-lane
+        // mapping is applied in exactly one place.
+        for (index, texel) in WIDE_TEXELS.iter().enumerate() {
+            view.write_u16(
+                RdramAddr::from_offset(WIDE_SOURCE + index as u32 * 2),
                 *texel,
             );
         }
@@ -1229,8 +1323,8 @@ fn run() -> Value {
                 Ok(bytes) => {
                     let got = pixels(bytes);
                     let mut out = Vec::new();
-                    for y in 0..TEXTURE_HEIGHT {
-                        for x in 0..TEXTURE_WIDTH {
+                    for y in 0..WIDE_HEIGHT {
+                        for x in 0..WIDE_WIDTH {
                             out.push(format!("{:#06x}", got[(y * WIDTH + x) as usize]));
                         }
                     }
@@ -1239,8 +1333,8 @@ fn run() -> Value {
                 Err(_) => Value::Null,
             };
             let mut expected = Vec::new();
-            for y in 0..TEXTURE_HEIGHT {
-                for x in 0..TEXTURE_WIDTH {
+            for y in 0..WIDE_HEIGHT {
+                for x in 0..WIDE_WIDTH {
                     expected.push(format!("{:#06x}", key[(y * WIDTH + x) as usize]));
                 }
             }
