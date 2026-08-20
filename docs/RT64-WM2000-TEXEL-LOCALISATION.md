@@ -543,79 +543,81 @@ differs completely between the two answers.
 
 ---
 
-# The raw-triangle gap: a 64x plane->texel scale disagreement
+# The raw-triangle gap: a 32x plane scale AND different geometry
 
-Investigating why RT64 produced no pixels for the corpus's raw-triangle
-case. Every claim is **CONFIRMED** (measured or read) or **HYPOTHESIS**.
+Resolved by instrumenting RT64 itself (probes in `RDP::drawTris` and the
+framebuffer renderer, built against a CLONE so the pinned oracle stayed
+clean). Every claim below is **CONFIRMED** by that probe or by measurement.
 
 ## CONFIRMED: "RT64 does not rasterize raw triangles" was WRONG
 
-The earlier reading came from a triangle-only display list. Putting a
-texture RECTANGLE and the triangle in the SAME packet shows otherwise:
+`drawTris` is entered exactly once, with `triCount=1 tile=0`, a non-empty
+scissor `(0,0,1280,960)`, a non-null `drawRect (8,0,24,12)` and a non-null
+`intRect`, and reaches `RENDER drawCall type=3 faceCount=1` with a bound
+pipeline. Nothing is skipped, culled, or scissored away. The earlier reading
+came from a triangle-only display list; with a texrect in the SAME packet
+RT64 draws both.
 
-- columns 8..11 (the texrect): RT64 and wgpu **agree** -- both drew it.
-- columns 2..5 (the triangle): only these differ, and **RT64 wrote pixels
-  at 5 of the 12** covered positions.
+## CONFIRMED: two separate defects, and BOTH are in the fixture's favour
 
-Deterministic across three consecutive runs, so not uninitialised memory.
-RT64 rasterizes the triangle. The earlier "writes nothing" was an artifact
-of the list, and the corpus case's `Authority` doc needs correcting.
+### 1. The plane scale is 32x -- not 64x, not 2x
 
-## CONFIRMED: every pixel RT64 wrote was the tile's LAST texel
+| lane | plane -> texels |
+|---|---|
+| fn64 | `plane / 2^21` to S10.5, then `/32` = `plane / 2^26` |
+| RT64 | `plane / 2^20` at decode, then **`x0.5` at the sampler** = `plane / 2^21` |
 
-All five were `0x7fff` -- `TEXTURE_TEXELS[3]` of a 4-wide tile. That is the
-signature of an S coordinate clamped past the tile's right edge, and
-reading RT64's own decode explains it exactly.
+**The trap is `perspCorrectionMod`** (`TextureSampler.hlsli:222`): a `0.5`
+applied for non-perspective, non-rect draws, visible in neither
+`rt64_gbi_rdp.cpp:535-537` nor `PLANE_TO_TEXEL`. Two earlier readings of
+this both missed it and landed on 64x (comparing RT64's decode against
+fn64's TEXEL figure) and 2x (comparing decode against fn64's S10.5 divisor).
+The end-to-end factor is **32x**.
 
-## CONFIRMED: the two backends disagree by 64x on the non-perspective scale
+RT64's UV is in TEXELS at `floor(uvCoord)` (`:148`). The measurement
+discriminates: only the texel reading predicts the all-clamped output
+observed; an S10.5 reading predicts four DISTINCT texels, which is not what
+happened.
 
-| backend | non-perspective plane -> texels | source |
-|---|---|---|
-| fn64 | `plane / 2^21` to S10.5, `/32` to texels = `plane / 2^26` | `triangle_span.rs`'s `PLANE_TO_TEXEL`, cited to angrylion's `tcdiv_nopersp` |
-| RT64 | `(plane / 2^16 * 1024) / 16384` = `plane / 2^20` | `src/gbi/rt64_gbi_rdp.cpp:535-537`, the `texturePerspective` else-branch |
+PROBE-CONFIRMED: RT64's v0 texcoord is `24.0` for this fixture's
+`s_base = 25165824`, exactly `s_base / 2^20`.
 
-**Both end in TEXEL units**, so this is not a units artifact -- RT64's
-`sampleTextureLevel` does `texelBaseInt = floor(uvCoord)`
-(`TextureSampler.hlsli:148`) and subtracts the tile origin as
-`(uls, ult) / 4.0` (`:245`), i.e. its UV is whole texels. For the same
-plane word fn64 says **1 texel** and RT64 says **64**.
+Consequence: RT64 reads the four columns as texels 16, 48, 80, 112 of a
+4-texel tile and clamps every one to the last. Every pixel it writes is
+`TEXTURE_TEXELS[3]`.
 
-With the corpus's planes (one texel per pixel of X under fn64's rule), RT64
-therefore reads columns 2..5 as texels 32, 96, 160 and 224 of a 4-texel
-tile -- all far past the right edge, all clamping to texel 3. Which is
-exactly the measured `0x7fff`.
+### 2. The same edge words are a RECTANGLE to fn64 and a TRIANGLE to RT64
 
-**Verified in the direction that can be controlled:** rescaling the corpus
-planes by 1/64 (to `2^20` per texel) makes **wgpu** sample texel 0
-everywhere, exactly as `plane / 2^26` predicts for a 64x-too-small plane.
+Probe-measured vertices: **`(2,0) (2,3) (6,3)`** -- a right triangle with its
+vertical leg on the left, not the intended box. Its pixel-centre coverage
+grows one column per scanline from the left, which is exactly the
+left-biased partial coverage measured (row 0 empty, then widening).
 
-## Which one is right: fn64, on the evidence available
+So the "partial, ragged coverage" recorded earlier as a separate open effect
+is not a defect at all: it is what these edge words MEAN to RT64. With `XH`
+on the left, `XL`/`XM` on the right and every `dxdy` zero, fn64 walks a box
+and RT64 walks the triangle between major and minor edges.
 
-**CONFIRMED** that fn64's constant is the cited one. `PLANE_TO_TEXEL`'s own
-doc derives `2^21` as `2^16 * 2^5` from **angrylion's `tcdiv_nopersp`**, the
-hardware authority, and records the history of an earlier wrong constant
-being corrected against it. `fn64-render-reference` cites the same function
-independently (`raster/draw.rs:932`).
+## What is NOT established
 
-**CONFIRMED** that fn64's scale is self-consistent end to end:
-`a_non_perspective_textured_triangles_texels_reach_guest_rdram`
-(`rdp_harness/tests.rs:641`) stages planes at `2^26` per texel and asserts
-four DISTINCT texels at four columns -- it passes, so the rasterizer really
-does step one texel per pixel at that scale.
+That either lane is wrong against hardware. fn64's `2^21` is cited to
+angrylion's `tcdiv_nopersp` and is self-consistent end to end
+(`a_non_perspective_textured_triangles_texels_reach_guest_rdram` stages
+`2^26`-per-texel planes and asserts four distinct texels). But RT64's value
+passes through `perspCorrectionMod` and `gpuTile.tcScale`, which fn64's CPU
+path has no equivalent of, so this is not a constant-for-constant
+comparison. `fn64-render-reference` produces a third answer again and is not
+an authority. **Hardware evidence is needed to settle `2^20` vs `2^21`.**
 
-**NOT established:** that RT64 is wrong *as an emulator*. Its value feeds a
-GPU sampler through `gpuTile.tcScale` and a tile-origin subtraction that
-fn64's CPU path does not have, so the comparison is not literally
-constant-for-constant. What IS established is that a display list authored
-for one lane's scale cannot be read by the other, which is why the corpus
-case shows the two disagreeing.
+## Operational note
 
-## Still open
+**Do not run two parity-runner instances concurrently.** Both hang at 0% CPU
+in `Fn64Rt64Context::~Fn64Rt64Context` -> `RasterShaderCache` ->
+`CompilationThread` join, and since the JSON is written after that drop, a
+hung run leaves a ZERO-BYTE output file rather than partial output. Run
+alone it completes in well under a minute.
 
-Why RT64's coverage is PARTIAL and ragged (row 0 empty; rows 1-2 written at
-2 of 4 and 3 of 4 columns) rather than a clean 4x3 box. The clamped texel
-explains the wrong COLOUR, not the missing pixels, so this is a second and
-separate effect. `RDP::drawTris` merges the triangle's bbox into
-`fbPair.drawColorRect` and the renderer skips any call whose scissor is
-empty (`rt64_framebuffer_renderer.cpp:549`), both of which are candidates,
-but neither is confirmed.
+Instrumenting RT64 in place is blocked: `fn64-render-rt64/build.rs` asserts
+HEAD matches `docs/rt64-port-authority.json` AND the tree is clean. Use a
+clone plus a temporary manifest edit, and do not build against the shared
+tree concurrently.
