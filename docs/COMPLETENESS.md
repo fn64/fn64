@@ -338,7 +338,7 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1601` |
 | RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1711` |
 | RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:2089` |
-| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:2348` |
+| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:2374` |
 | RSP/SP | `__osSpSetPc_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:12` |
 | Voice/ISV | `osVoiceSetWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:233` |
 | Voice/ISV | `osVoiceCheckWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:200` |
