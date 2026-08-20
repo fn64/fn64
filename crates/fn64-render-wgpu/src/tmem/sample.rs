@@ -1205,8 +1205,12 @@ mod tests {
                 request(0, 0, TmemFirstRowParity::Odd),
                 TextureLutMode::Disabled,
             ),
+            // Row 0 does not exchange, whatever first-row parity the caller
+            // supplies, so the addressed byte is 0 -- see
+            // `tmem/read.rs::odd_row_exchange`. This asserted 4 while the
+            // reader still folded the caller's parity into the exchange.
             Err(PointSampleError::Read(
-                PhysicalTexelReadError::InvalidTexelByte { address: 4 }
+                PhysicalTexelReadError::InvalidTexelByte { address: 0 }
             ))
         );
         let cell_error = gather_committed_texture_cell(
@@ -1221,12 +1225,13 @@ mod tests {
             cell_error,
             TextureCellSampleError::Read {
                 corner: TextureCellCorner::UpperLeft,
-                source: PhysicalTexelReadError::InvalidTexelByte { address: 4 },
+                // Row 0 does not exchange; see the sibling assertion above.
+                source: PhysicalTexelReadError::InvalidTexelByte { address: 0 },
             }
         );
         assert_eq!(
             std::error::Error::source(&cell_error).unwrap().to_string(),
-            "physical TMEM texel byte 0x004 is invalid"
+            "physical TMEM texel byte 0x000 is invalid"
         );
         assert_eq!(observe(&state), before);
     }
