@@ -554,10 +554,18 @@ const TEXELS: [u16; 4] = [0xF801, 0x07C1, 0x003F, 0xFFFF];
 
 /// **One texel of S, in the non-perspective plane's own units.**
 ///
-/// Derived from the cited constant, not from the code: `G_TP_NONE` converts
-/// an s15.16 plane value to S10.5 by dividing by `2^21`, and one whole texel
-/// is 32 in S10.5. So one texel is `32 * 2^21 = 2^26` plane units.
-const PLANE_PER_TEXEL: i32 = 1 << 26;
+/// Derived from angrylion, not from fn64's code: `G_TP_NONE` converts an
+/// s15.16 plane value to S10.5 with `ss = s >> 16` (`rasterizer.c:479`) --
+/// `tcdiv_nopersp` itself applies no scale -- and one whole texel is 32 in
+/// S10.5 (`*S = locs >> 5`, `tcoord.c:143`). So one texel is
+/// `32 * 2^16 = 2^21` plane units.
+///
+/// **This was `2^26`, derived from the premise that `2^21` is the
+/// plane->S10.5 divisor.** That premise was the `PLANE_TO_TEXEL` defect: the
+/// `2^5` from S10.5 to texels was counted twice, once there and once in the
+/// sampler. Both are corrected together; see `PLANE_TO_TEXEL`'s own doc for
+/// the parity measurement that caught it.
+const PLANE_PER_TEXEL: i32 = 1 << 21;
 
 /// Half a texel in plane units, the offset every fixture's base carries.
 ///
@@ -566,7 +574,7 @@ const PLANE_PER_TEXEL: i32 = 1 << 26;
 /// sampled texel changes, so a boundary fixture cannot see a half-texel bug.
 /// Sampling at the texel's midpoint means an error of half a texel in either
 /// direction is visible.
-const PLANE_HALF_TEXEL: i32 = 16 << 21;
+const PLANE_HALF_TEXEL: i32 = PLANE_PER_TEXEL / 2;
 
 /// The X distance, in Q16.16, from the major edge to the first covered
 /// subsample of the pixel the major edge itself starts in.

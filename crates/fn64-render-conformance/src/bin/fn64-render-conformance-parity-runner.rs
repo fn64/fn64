@@ -100,35 +100,26 @@ enum Authority {
     /// the oracle is the one not modelling the hardware.
     /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
-    /// **This case is authored in RT64's VERTEX terms at the HARDWARE
-    /// scale, and RT64 matches the key. wgpu does not.**
+    /// **HISTORICAL: the raw-triangle plane-scale disagreement, now fixed.**
     ///
-    /// The hardware chain, read from angrylion
-    /// (`/Users/jer/Code/angrylion-rdp-plus`): the wire plane is s15.16,
-    /// `ss = s >> 16` takes it to S10.5 (`rasterizer.c:479`),
-    /// `tcdiv_nopersp` applies NO scale at all (`tcoord.c:1024`), and
-    /// `*S = locs >> 5` takes S10.5 to whole texels (`tcoord.c:143`). So
-    /// **one texel is `2^21` plane units**, which is what
-    /// [`PLANE_PER_TEXEL`] carries.
+    /// Kept as a named partition because the defect it describes was real,
+    /// shipped, and is exactly the kind of thing that comes back. No case
+    /// currently claims it -- `textured-triangle-point-sampled` is
+    /// `Rt64Authoritative` and both lanes match its key.
     ///
-    /// MEASURED at that scale: RT64 reproduces the hand-derived key
-    /// exactly -- four distinct texels, one per column -- while wgpu reads
-    /// texel 0 everywhere. At `2^26` the two swap. fn64's rasterizer wants
-    /// planes `2^5` larger than hardware for the same texel, because
-    /// `texture_coordinates_s10_5` divides by `PLANE_TO_TEXEL = 2^21` and
-    /// its result is then consumed as S10.5, so the `2^5` is applied twice.
+    /// What it was: fn64's `texture_coordinates_s10_5` divided the plane by
+    /// `PLANE_TO_TEXEL = 2^21` and returned a value its caller consumed as
+    /// S10.5 through `TextureCoordinateS10_5::from_raw`, so the sampler
+    /// applied its own `>>5` on top and the S10.5 `2^5` was counted TWICE --
+    /// a plane of `2^26` per texel where hardware and RT64 use `2^21`.
     ///
-    /// **That makes this case evidence AGAINST wgpu, not against RT64** --
-    /// the opposite of what this variant claimed when the fixture was
-    /// authored in per-pixel plane terms. It is kept in the
-    /// non-authoritative partition because the wgpu-side defect is not yet
-    /// fixed, so the pair still disagrees; once it is, this case should
-    /// become `Rt64Authoritative`.
-    ///
-    /// The other half of authoring this correctly is per-VERTEX planes:
-    /// RT64 evaluates S at three vertices and only `v3` carries `Dx`, so
-    /// each half of the box needs `base` at its OWN H edge. See
-    /// `textured_triangle_words` and the two guards below.
+    /// Hardware, from angrylion: `ss = s >> 16` to S10.5
+    /// (`rasterizer.c:479`), `tcdiv_nopersp` applies no scale
+    /// (`tcoord.c:1024`), `*S = locs >> 5` to whole texels
+    /// (`tcoord.c:143`). The corpus found it: at `2^21` RT64 reproduced the
+    /// key and wgpu read texel 0 everywhere; at `2^26` they swapped. Fixing
+    /// `PLANE_TO_TEXEL` to `2^16` -- the plane->S10.5 divisor, leaving the
+    /// `>>5` to the sampler where it belongs -- made all three agree.
     RawTrianglePlaneScaleDisagreement,
 }
 
@@ -1120,7 +1111,7 @@ fn cases() -> Vec<Case> {
                      walking. S advances one texel per pixel of X and T is \
                      constant, so the three covered rows are three \
                      independent readings of the same claim.",
-            authority: Authority::RawTrianglePlaneScaleDisagreement,
+            authority: Authority::Rt64Authoritative,
             commands: one_textured_triangle(),
             expected: triangle_expected,
         },
@@ -2047,15 +2038,12 @@ mod tests {
                     case.name
                 );
             }
-            if has_triangle {
-                assert_ne!(
-                    case.authority,
-                    Authority::Rt64Authoritative,
-                    "case {} issues a raw triangle, whose texture planes the two lanes read on \
-                     scales differing by 64x, so it cannot claim RT64 authority",
-                    case.name
-                );
-            }
+            // NOTE: a raw triangle may now claim RT64 authority. It could
+            // not while the two lanes read the non-perspective plane on
+            // different scales -- fn64 counted the S10.5 `2^5` twice, once
+            // in `PLANE_TO_TEXEL` and again in the sampler. That is fixed,
+            // both lanes match the key, and the constraint would now block
+            // an honest case. Only the positive direction is still pinned.
         }
     }
 
