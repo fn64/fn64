@@ -1615,6 +1615,18 @@ mod production {
         /// belong to this fill. `1` for a full-width fill, the rectangle's
         /// pixel height otherwise.
         pub access_count: u32,
+        /// Index into the owning plan's ordered access list of this fill's
+        /// colour-image SEED read, or `None` when the fill covers the whole
+        /// target and needs no seed.
+        ///
+        /// A partial fill patches into pixels it does not itself write, and
+        /// those pixels must carry their real guest value rather than a
+        /// fabricated zero -- the same thing `fn64-render-reference` gets by
+        /// seeding its target from RDRAM before every raw-RDP task
+        /// (`backend/imp.rs:440-447`). The declaring backend records which
+        /// declared read carries those bytes; `None` is a positive statement
+        /// that none is needed, not an absence of information.
+        pub seed_access_index: Option<u32>,
         pub before: Option<RdpStateIdentity>,
         pub after: RdpStateIdentity,
     }
