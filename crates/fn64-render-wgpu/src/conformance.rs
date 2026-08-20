@@ -275,10 +275,34 @@ impl ConformanceSession {
                     .expect("the count check above proves every read is enumerated without RDRAM");
                 let start = read.range().start().get() as usize;
                 let end = start + len;
-                rdram
-                    .get(start..end)
-                    .ok_or(ConformanceRefusal::GuestReadOutOfBounds { start, end })?
-                    .to_vec()
+                if end > rdram.len() {
+                    return Err(ConformanceRefusal::GuestReadOutOfBounds { start, end });
+                }
+                // **Logical order, not raw storage.** `CapturedGuestRead`'s
+                // contract is N64-logical bytes (`fn64-render-ir`'s
+                // `guest_read.rs`: "One independently owned logical-byte
+                // capture"), and the TMEM load executors index the capture
+                // linearly with no lane mapping of their own. Guest RDRAM
+                // stores bytes under the `^3` logical-to-storage map, so a
+                // bare `rdram.get(start..end)` hands the sampler each 32-bit
+                // word byte-reversed.
+                //
+                // Measured before this fix: an eight-texel RGBA16 fixture
+                // came back as the raw storage halfwords -- `0xc107` where
+                // `0xf801` was staged, all eight explained by that one rule
+                // -- while RT64, reading the identical buffer, returned the
+                // key exactly.
+                //
+                // A 32-bit command word survives the raw read by accident
+                // (`^3` composed with a little-endian host load cancels), but
+                // texture bytes are byte-granular and arbitrarily aligned, so
+                // nothing cancels for them.
+                let mut bytes = vec![0; len];
+                fn64_runtime::RdramView::from_storage(rdram).copy_logical_bytes(
+                    fn64_runtime::RdramAddr::from_offset(read.range().start().get()),
+                    &mut bytes,
+                );
+                bytes
             };
             captured.push(
                 CapturedGuestRead::try_new(*read, bytes)
