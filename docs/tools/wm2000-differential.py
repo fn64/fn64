@@ -36,6 +36,7 @@ LABELS = {
     "0x801589d2": "post-match counter", "0x801589d4": "winner index",
     "0x8016f0ac": "match clock", "0x80166f88": "match clock (2)",
     "0x8016ecc0": "referee count",
+    "0x801589e6": "PIN COUNT", "0x801589e4": "pin count target",
     "0x801671f0": "P0 spirit", "0x801672f4": "P1 spirit",
     "0x800961d2": "time-limit setting", "0x8014e1c4": "time-limit table[0]",
 }
@@ -105,11 +106,18 @@ def main():
             print(f"  {name:10s} {path}")
             if any(v >= 3 for _, v in hist):
                 print(f"  {'':10s} *** REACHED THE DECISION STATE -- THE MATCH ENDED ***")
-    for addr in ("0x8016ed2a", "0x801589d4", "0x8016f0ac", "0x800961d2", "0x8014e1c4"):
+    for addr in ("0x8016ed2a", "0x801589d4", "0x801589e6", "0x8016ecc0",
+                 "0x8016f0ac", "0x800961d2", "0x8014e1c4"):
         for name, r in (("treatment", t), ("control", c)):
             hist = r["watch"].get(addr, [])
             if hist:
                 print(f"  {LABELS.get(addr, addr):20s} {name:10s} last={hist[-1][1]:#x} @swap {hist[-1][0]} ({len(hist)} changes)")
+
+    for name, r in (("treatment", t), ("control", c)):
+        pins = [(s_, v) for s_, v in r["watch"].get("0x801589e6", []) if v]
+        if pins:
+            print(f"  *** {name}: PIN IN PROGRESS -- count reached {max(v for _, v in pins)} "
+                  f"(first at swap {pins[0][0]}) ***")
 
     print("\n-- 3. gfx-task rate (secondary; the frame hash is the wrong instrument here) --")
     hi = min(t["swaps"], c["swaps"])
