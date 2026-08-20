@@ -13023,7 +13023,7 @@ mod tests {
         let mut schedule: Vec<(u32, &str)> = plan
             .fills
             .iter()
-            .map(|(command_index, _, _)| (*command_index, "fill"))
+            .map(|(command_index, _, _, _)| (*command_index, "fill"))
             .chain(
                 plan.texrect_commands
                     .iter()

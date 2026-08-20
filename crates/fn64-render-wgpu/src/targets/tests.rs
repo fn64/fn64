@@ -398,6 +398,7 @@ fn candidate_generation_promotes_once_and_stale_peer_is_rejected() {
 fn exhausted_generation_rejects_a_successor_candidate() {
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let proof = InitializedRegionProof {
+        covered: TargetRectangle::try_new(0, 0, 1, 1).unwrap(),
         range: key.range(),
         rows: key.extent().height(),
         generation: TargetGeneration(u64::MAX),
