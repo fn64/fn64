@@ -110,3 +110,27 @@ Zero panics and zero backend errors across 4,200+ dumped frames.
 and blocky glyphs -- were explicitly NOT scoped separately, on the grounds
 that they plausibly shared this cause. Re-check them against a current frame
 before scoping; do not assume they survived.
+
+
+---
+
+# Open, separate: a scene-specific colour cast
+
+**CONFIRMED pre-existing, and NOT caused by the `PLANE_TO_TEXEL` fix.**
+
+At in-match swap 644 the frame shows green skin and a magenta WWF logo
+where red and white belong. The same swap from the run BEFORE that fix is
+pixel-identical, so the sampler change is not responsible. Frames from the
+same post-fix run at the entrance scene (swap ~400) show correct skin
+tones, black trunks and a legible crowd/arena backdrop, so this is not a
+global colour break either.
+
+That makes it scene-specific: something this in-match scene exercises and
+the entrance scene does not. The likely area is the combiner or the
+environment-colour path rather than the texture sampler, since the texels
+themselves clearly resolve into imagery.
+
+**Method note worth keeping.** The comparison that settles this needs the
+SAME swap from both runs. Comparing the new in-match frame against the
+older INTRO frame would have shown a difference that is entirely explained
+by the scene changing, and would have blamed the wrong change.
