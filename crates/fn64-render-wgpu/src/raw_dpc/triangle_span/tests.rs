@@ -550,3 +550,89 @@ fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
         "the fraction is 0.5"
     );
 }
+
+/// The perspective texture-coordinate scale, pinned against angrylion's
+/// `tcdiv_persp` rather than against fn64's own constant.
+///
+/// **Expectations derived by hand from the cycle-accurate oracle, and NOT
+/// from the code under test.** angrylion's chain, traced through three
+/// files:
+///
+/// 1. `tcdiv_persp` (`src/core/n64video/rdp/tcoord.c:1027-1101`) is fed
+///    `s >> 16`, `t >> 16`, `w >> 16` -- the INTEGER parts of the Q16.16
+///    attribute planes (`rasterizer.c:689-691`). Building its
+///    `tcdiv_table` exactly from `norm_point_table`/`norm_slope_table`
+///    (`tcoord.c:3-24`, construction at `:1127-1146`) and evaluating it
+///    gives, with the two overflow flag bits masked off:
+///
+///    | ss | sw | ss/sw | out | out/(ss/sw) |
+///    |---|---|---|---|---|
+///    | 64 | 64 | 1.0000 | 32768 | 32768.0 |
+///    | 31 | 16 | 1.9375 | 63488 | 32768.0 |
+///    | 300 | 100 | 3.0000 | 98306 | 32768.7 |
+///
+///    So `tcdiv_persp` returns `(ss/sw) * 2^15`.
+///
+/// 2. `tcshift_cycle` (`tcoord.c:83-102`) takes `SIGN16` of that -- the low
+///    sixteen bits, signed.
+///
+/// 3. `texture_pipeline_cycle` reads `sfrac = sss1 & 0x1f` (`tex.c:182`):
+///    five fractional bits, i.e. the field is S10.5.
+///
+/// Therefore the RAW S10.5 coordinate the RDP addresses with is
+/// `(S/W) * 2^15`, which is `(S/W) * 2^10` **texels**. This function returns
+/// the RAW value, so its scale is `2^15 = 32768`.
+///
+/// **Why this test did not exist and the bug shipped.** The constant was
+/// fitted empirically against WM2000's title screen (see
+/// `texture_coordinates_s10_5`'s own doc), where going from 1 to 1024 fixed
+/// a total collapse onto texel (0,0) and left a 32x residue that reads as
+/// mild mis-scaling on one large flat quad. In-match geometry is 100%
+/// perspective with small polygons, where the same residue collapses each
+/// triangle onto a single texel: measured at 72% of triangles requesting
+/// zero whole texels of span, and 87% sampling exactly one distinct texel.
+///
+/// **Mutation note.** The fixture uses `S/W = 2` rather than `S/W = 1`
+/// deliberately: at 1 the correct answer 32768 saturates the `i16` return to
+/// 32767 under BOTH the right scale and several wrong ones, so a
+/// unit-ratio fixture cannot distinguish them. A ratio of 2 with a
+/// half-magnitude S keeps the expected value inside `i16` while still
+/// depending on the full scale.
+#[test]
+fn the_perspective_scale_matches_angrylions_tcdiv_persp() {
+    // Q16.16 planes. S/W = 0.25, so the expected RAW S10.5 value is
+    // 0.25 * 32768 = 8192, comfortably inside i16 and 32x away from the
+    // 256 the old 1024 scale would produce.
+    let s = 1_i64 << 16;
+    let w = 4_i64 << 16;
+    let (out_s, out_t) = super::texture_coordinates_s10_5([s, s, w], true);
+
+    assert_eq!(
+        out_s, 8192,
+        "S/W = 0.25 must give 0.25 * 2^15 raw S10.5 units, per angrylion's \
+         tcdiv_persp scale of 2^15"
+    );
+    assert_eq!(out_t, 8192, "T takes the identical path");
+
+    // The texel coordinate that raw value denotes: 8192 / 2^5 = 256 texels,
+    // which is 0.25 * 2^10 -- angrylion's own "(S/W) * 2^10 texels".
+    assert_eq!(out_s >> 5, 256);
+}
+
+/// A second ratio, so the test pins a SCALE rather than one point.
+///
+/// A single fixture is satisfied by any function passing through that one
+/// point -- including `s * constant` for the wrong constant paired with a
+/// compensating offset. Two ratios in a fixed proportion pin the slope.
+#[test]
+fn the_perspective_scale_is_linear_in_the_ratio() {
+    let quarter = super::texture_coordinates_s10_5([1 << 16, 1 << 16, 4 << 16], true).0;
+    let eighth = super::texture_coordinates_s10_5([1 << 16, 1 << 16, 8 << 16], true).0;
+    assert_eq!(quarter, 8192);
+    assert_eq!(eighth, 4096);
+    assert_eq!(
+        quarter,
+        eighth * 2,
+        "halving the ratio must halve the coordinate"
+    );
+}
