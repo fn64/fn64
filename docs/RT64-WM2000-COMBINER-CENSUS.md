@@ -147,3 +147,72 @@ the wrong side.
 **Consequence for this card:** the brief names `fn64-render-reference` as
 "repeatedly the better oracle for CPU-side questions". For one-cycle
 combiner output specifically, it is not, until this is reconciled.
+
+## MEASURED: the combiner-input tally
+
+**Status: CONFIRMED**, measured 2026-08-20 on the real ROM through
+`scripts/play-wm2000.sh` (rs recompiler, wgpu renderer, no `--features
+rt64`, banner confirmed `renderer : wgpu` and not `reference-fallback`),
+with `FN64_COMBINER_CENSUS=1 FN64_TRI_DROP_STATS=1`. Four consecutive
+100,000-note ticks; the ratios below are stable across all four.
+
+Cumulative at note=300,000, every counted draw textured:
+
+```
+[fn64-combiner]   TEXTURED draws: color reads Texel* = 137728, ignores Texel* = 162272
+[fn64-combiner]   color A: Texel0=117068 Primitive=3575 Shade=15271 Environment=141238 Zero=22848
+[fn64-combiner]   color B: Combined=130434 Texel0=10804 Environment=2339 Zero=156423
+[fn64-combiner]   color C: Texel0=3575 Primitive=142343 ShadeAlpha=131234 Zero=22848
+[fn64-combiner]   color D: Combined=130434 Texel0=17085 Primitive=16567 Environment=2339 Zero=133575
+[fn64-combiner]   alpha A: Combined=127055 Texel0=18531 Primitive=7517 Zero=146897
+[fn64-combiner]   alpha B: Zero=300000
+[fn64-combiner]   alpha C: Texel0=7517 Primitive=145586 Zero=146897
+[fn64-combiner]   alpha D: Combined=3379 Texel0=111680 Primitive=16567 Shade=15271 Zero=153103
+```
+
+The `[fn64-tri-drop]` control ran in the same process and reproduced the
+prior lane's numbers exactly (tick=400000: ADMITTED=341150, textured=341150,
+untextured=0, only `no_covered_rows` firing), so this is the same population
+that lane measured, not a different one.
+
+### CANDIDATE 2 IS REFUTED: Texel0 IS selected
+
+**45.9% of textured draws (137,728 of 300,000) select a Texel input in
+colour**, and `Texel0` is the single most common slot-A selector after
+`Environment` (117,068). It also dominates `alpha D` (111,680). So the
+sampled texel is NOT being universally discarded, and the bug is not "the
+combiner never names Texel0".
+
+That closes the cheap candidate the brief said to test first, in the
+direction the brief said would send the investigation to candidate 1.
+
+### But the tally names something the brief did not anticipate
+
+**54.1% of textured draws (162,272) read no Texel input at all in colour.**
+Within one 100,000-note window the marginals coincide exactly:
+
+```
+window color A: Environment=46382  Texel0=39549  Shade=6802  Zero=6378  Primitive=889
+window color C: Primitive=46382    ShadeAlpha=46351  Zero=6378  Texel0=889
+```
+
+`A.Environment` and `C.Primitive` are the **same number**, 46,382. Four
+independent per-slot histograms cannot prove those two selectors co-occur in
+one program -- that is exactly the joint-vs-marginal gap -- but an exact tie
+across a 100,000-note window is strong evidence of a single dominant program
+of the shape `(Environment - B) * Primitive + D`, which reads no texel.
+
+**This is a textured draw whose program ignores its texture.** That is
+legal: a game may bind a texture and then not sample it. But at 54% of all
+textured draws it is a large enough population to explain flat models by
+itself, and it is NOT the "combiner fails to select Texel0" defect the brief
+described -- the programs that do select Texel0 select it correctly.
+
+**HYPOTHESIS, not yet measured:** these draws are correct and WM2000 really
+does draw over half its geometry with an env/prim program, in which case
+flatness comes from candidate 1 on the OTHER 46%. The distinguishing
+measurement is the raw-program histogram added in this branch
+(`census::note_wire` / `program_histogram`), which keeps the `(low, high)`
+`SetCombine` words themselves so the dominant program can be hand-decoded
+from the wire layout rather than inferred from margins. That run has not
+been made yet.
