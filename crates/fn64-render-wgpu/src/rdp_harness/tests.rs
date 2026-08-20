@@ -703,30 +703,44 @@ fn a_textured_triangles_committed_writes_digest_the_sampled_texels() {
 }
 
 /// A constant W for the perspective fixtures. `2^20`, chosen so that one
-/// texel of S is `32 * W / 1024 = W / 32 = 32768` -- a round number in plane
-/// units that leaves every derived S comfortably inside `i32`.
+/// texel of S is `32 * W / 32768 = W / 1024 = 1024` -- a round number in
+/// plane units that leaves every derived S comfortably inside `i32`.
 const PERSPECTIVE_W: i32 = 1 << 20;
 
 /// The S plane value that samples S10.5 coordinate `s10_5` at [`PERSPECTIVE_W`].
 ///
-/// Inverts the CITED perspective rule -- `s10_5 = (S / |W|) * 1024` -- rather
+/// Inverts the CITED perspective rule -- `s10_5 = (S / |W|) * 2^15` -- rather
 /// than reading anything back from the implementation.
+///
+/// **The scale here was `1024` and that made this fixture circular.** It was
+/// derived by inverting fn64's own constant, so it asserted the
+/// implementation against itself and passed under a scale that is 32x short
+/// of the hardware's. The value is now angrylion's: `tcdiv_persp`
+/// (`src/core/n64video/rdp/tcoord.c:1027`) returns `(ss/sw) * 2^15` into a
+/// field whose five fractional bits `texture_pipeline_cycle` reads as
+/// `sfrac = sss1 & 0x1f` (`tex.c:182`). See
+/// `docs/RT64-WM2000-COMBINER-CENSUS.md` and
+/// `the_perspective_scale_matches_angrylions_tcdiv_persp`.
+///
+/// Everything these fixtures actually CLAIM -- that the divide happens, that
+/// the two paths differ, that W's magnitude is used -- is unchanged and
+/// still asserted; only the constant the expectation is built from moved.
 const fn perspective_s_for(s10_5: i32) -> i32 {
-    s10_5 * PERSPECTIVE_W / 1024
+    s10_5 * (PERSPECTIVE_W / 32768)
 }
 
 /// The perspective twin of [`non_perspective_texture_planes`]: the same four
-/// columns sampling the same four texels, through the `* 1024.0` path.
+/// columns sampling the same four texels, through the `* 32768.0` path.
 ///
 /// W is held CONSTANT across the triangle, so the divide is exact and the
 /// expected texels are hand-computable. A varying W is a different claim (the
 /// divide is per pixel) and belongs in its own fixture.
 ///
-/// One texel of S is `32 * W / 1024 = W / 32`, so `dx = W / 32` advances one
-/// texel per pixel of X, and the base cancels the 1/8-pixel first-subsample
-/// offset and adds the half-texel anti-coincidence offset.
+/// One texel of S is `32 * W / 32768 = W / 1024`, so `dx = W / 1024` advances
+/// one texel per pixel of X, and the base cancels the 1/8-pixel
+/// first-subsample offset and adds the half-texel anti-coincidence offset.
 fn perspective_texture_planes() -> ([i32; 4], [i32; 4], [i32; 4], [i32; 4]) {
-    let per_texel = PERSPECTIVE_W / 32;
+    let per_texel = PERSPECTIVE_W / 1024;
     let s_base = perspective_s_for(16) - per_texel / 8;
     let t_base = perspective_s_for(16);
     (
@@ -740,12 +754,14 @@ fn perspective_texture_planes() -> ([i32; 4], [i32; 4], [i32; 4], [i32; 4]) {
 /// **The perspective path -- the one WM2000's own triangles take.**
 ///
 /// FAILS BEFORE this lane (no texture rung at all). It also fails if the
-/// `* 1024.0` factor is dropped: without it every S10.5 coordinate here
-/// collapses to well under one texel and all four columns sample texel 0,
-/// which is precisely the "uniform field" the reference recorded on the real
-/// title screen.
+/// `* 32768.0` factor is dropped or shrunk: without it every S10.5
+/// coordinate here collapses to well under one texel and all four columns
+/// sample texel 0, which is precisely the "uniform field" the reference
+/// recorded on the real title screen -- and, at the 1024 this constant used
+/// to hold, precisely the one-texel-per-triangle flatness measured in
+/// WM2000 gameplay (`docs/RT64-WM2000-COMBINER-CENSUS.md`).
 #[test]
-fn a_perspective_textured_triangle_divides_by_w_and_scales_by_1024() {
+fn a_perspective_textured_triangle_divides_by_w_and_scales_by_2_pow_15() {
     let (value, dx, de, dy) = perspective_texture_planes();
     let frame = Rdp::new(16, 8)
         .cycle(CycleType::One)
@@ -777,7 +793,7 @@ fn a_perspective_textured_triangle_divides_by_w_and_scales_by_1024() {
 ///
 /// The planes are the perspective fixture's, whose W is `2^20`: through the
 /// perspective path column 2 reads texel 0 (by construction), while through
-/// `G_TP_NONE` the same S of 16384 divides by `2^21` to S10.5 0.0078 -- also
+/// `G_TP_NONE` the same S divides by `2^21` to a coordinate well inside
 /// texel 0. So the DISTINGUISHING column is the last one, where perspective
 /// reads texel 3 and non-perspective still reads texel 0.
 #[test]
@@ -808,7 +824,7 @@ fn the_perspective_and_non_perspective_paths_sample_different_texels() {
     assert_eq!(
         perspective.pixel(5, 0),
         TEXELS[3],
-        "the perspective path scales by 1024, putting column 5 on texel 3"
+        "the perspective path scales by 2^15, putting column 5 on texel 3"
     );
     assert_eq!(
         none.pixel(5, 0),
