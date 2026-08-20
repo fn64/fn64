@@ -716,3 +716,37 @@ fn the_scissor_clips_the_low_edge_on_both_axes() {
         "row 1 columns 1..4 must be painted"
     );
 }
+
+#[test]
+fn a_rectangle_entirely_outside_the_scissor_refuses_rather_than_drawing_nothing() {
+    // **Mutation-driven.** Replacing the `ScissoredAway` return with
+    // `Ok(rectangle)` -- a silent no-op -- survived every other test in this
+    // file and the whole differential sweep, because no fixture placed a
+    // rectangle wholly outside its scissor.
+    //
+    // The distinction is not cosmetic. A silent `Ok` here returns the
+    // UNCLIPPED rectangle, so the executor would then paint the full span
+    // the scissor was supposed to suppress, and `plan_rows` would declare
+    // writes for it. The refusal is what stops that.
+    //
+    // Scissor admits columns 0..1 only (lrx = 4 quarter-pixels -> 1); the
+    // rectangle starts at column 2, so nothing survives.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 4, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    let seed = [0x12u8, 0x34].repeat(16);
+    let error = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        rect(8, 0, 12, 12), // columns 2..=3
+        RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 4, 16),
+        Some(&seed),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, FillExecutionError::ScissoredAway { .. }),
+        "expected ScissoredAway, got {error:?}"
+    );
+    assert!(registry.residents().is_empty(), "nothing may be published");
+}

@@ -5534,6 +5534,79 @@ mod tests {
         ]
     }
 
+    /// **The DECLARED write rows follow the scissor, not just the painted
+    /// ones.**
+    ///
+    /// Mutation-driven: making `plan_fill` declare the unclipped extent --
+    /// while the executor still clips -- survived the whole unit suite and
+    /// the differential sweep. It is nonetheless the hazard `plan_fill`'s
+    /// own doc names: `fill_completed_writes` slices the full-extent buffer
+    /// for every declared range WITHOUT checking the raster touched it, so a
+    /// declared-but-unpainted row publishes a real digest of whatever the
+    /// buffer held and carries it into guest RDRAM.
+    ///
+    /// Pinned on `clip_fill_rows_to_scissor` directly rather than through a
+    /// decoded packet: `plan_fill` is reached by two decode passes and the
+    /// retained plan is not the one a journal probe reports, so a
+    /// packet-level fixture asserts the wrong pass. This is the function
+    /// whose result `plan_render_target_rows` is handed.
+    ///
+    /// Every expectation is hand-derived from the wire. The scissor latches
+    /// quarter-pixels and each edge becomes `ceil(q / 4)`
+    /// (`RdpScissorRect::quarter_to_pixel_ceil`, derived from angrylion
+    /// `rasterizer.c:2349-2363` for X and `:2284-2305` for Y).
+    #[test]
+    fn a_scissored_fill_declares_only_the_rows_that_survive_the_clip() {
+        let rect = |x0, y0, x1, y1| RenderTargetRectangle { x0, y0, x1, y1 };
+        // Rows 0..=1 requested; scissor `lry = 4` admits `ceil(4/4) = 1`
+        // row, so only row 0 survives. Full width either way.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 16, 4)),
+            ),
+            Some(rect(0, 0, 3, 0)),
+            "the high row edge must clip y1 from 1 to 0"
+        );
+        // The X counterpart, asserted separately: a clip correct in Y and
+        // absent in X still narrows the rectangle, so one combined case
+        // would pass with either axis broken.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 8, 16)),
+            ),
+            Some(rect(0, 0, 1, 1)),
+            "the high column edge must clip x1 from 3 to 1"
+        );
+        // Low edges, which a backend clamping only lrx/lry would miss.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 3),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 4, 8, 16, 16)),
+            ),
+            Some(rect(1, 2, 3, 3)),
+            "ulx = 4 -> first column 1; uly = 8 -> first row 2"
+        );
+        // Nothing survives: the rectangle sits entirely right of the
+        // scissor, which must be `None` rather than a silently empty rect.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(2, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 4, 16)),
+            ),
+            None,
+            "an empty intersection declares nothing"
+        );
+        // No scissor staged: the rectangle passes through untouched, so an
+        // unscissored stream declares exactly what it always did.
+        assert_eq!(
+            clip_fill_rows_to_scissor(rect(0, 0, 3, 1), None),
+            Some(rect(0, 0, 3, 1)),
+            "absent scissor is not an empty scissor"
+        );
+    }
+
     #[test]
     fn set_scissor_is_admitted_rather_than_rejected_as_unsupported() {
         // Before admission this exact stream returned
