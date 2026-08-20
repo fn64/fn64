@@ -516,3 +516,95 @@ quad reads as slightly wrong texture scale rather than as flatness. Applied
 to in-match geometry -- 100% perspective, small polygons -- the same residue
 collapses each triangle onto one texel. The constant was fitted on the one
 piece of content least able to expose it.
+
+## THE FIX, MEASURED ON THE ROM
+
+`PERSPECTIVE_TEXEL_SCALE` 1024.0 -> 32768.0
+(`crates/fn64-render-wgpu/src/raw_dpc/triangle_span.rs`).
+
+**Status: CONFIRMED.** Sixth run, same script, same stack, same census,
+same tick size. Directly comparable to the fifth run above.
+
+| measurement, at the 99,607-triangle tick | before | after |
+|---|---|---|
+| triangles sampling exactly **1** distinct texel | 87,115 (**87.5%**) | 11,987 (**12.0%**) |
+| triangles sampling 5-8 distinct texels | 1,019 (1.0%) | 35,564 (35.7%) |
+| triangles sampling 9-16 | 8 (0.008%) | 21,106 (21.2%) |
+| triangles sampling 17-64 | 0 | 163 |
+| S spread of **zero** whole texels | 36,341 (**72.2%**) | 3,469 (**3.5%**) |
+| S spread of 17-64 texels | 145 (0.3%) | 22,323 (22.4%) |
+
+```
+before: distinct texels per triangle (triangles=99607): 1:87115 2:10859 3-4:606 5-8:1019 9-16:8
+after:  distinct texels per triangle (triangles=99607): 1:11987 2:7690 3-4:23097 5-8:35564 9-16:21106 17-64:163
+```
+
+**A 7.3x reduction in one-texel triangles, and a 20x reduction in
+zero-spread ones.** The distribution moved from a spike at "1" to a broad
+population centred on 5-8 distinct texels per triangle, which is what
+sampling a real texture across a small polygon looks like.
+
+The residual 12.0% at one texel is expected rather than suspicious: WM2000
+draws genuinely tiny triangles, and a triangle covering a sub-texel
+footprint is *entitled* to one distinct texel. The measured S spread agrees
+-- 3.5% of triangles still span under one whole texel, and those are the
+same primitives.
+
+### What is claimed, and what is not
+
+**CLAIMED, and measured:** the sampler now reads varied texels within each
+triangle instead of one, on the real ROM, in gameplay. That is the mechanism
+of flat shading, and it is fixed at its cause with a hardware citation.
+
+**NOT claimed:** that a frame now "looks right". No frame was captured under
+this card -- the shell's screenshot is an F2 keypress in an interactive
+window and this lane ran headless. An owner running `scripts/play-wm2000.sh`
+can confirm or refute the visual result in seconds, and that check is worth
+doing before anyone treats the symptom as closed. The honest statement is
+that the per-triangle texel variation is fixed; whether every remaining
+artifact (the horizontal colour bands, the blocky glyphs) shares this cause
+is untested, and the bands in particular have a documented alternative
+explanation in the harness traps (a framebuffer read at the wrong stride).
+
+### Suite counts
+
+- `cargo nextest run --workspace --offline`: **8679 passed, 13 skipped**
+  (baseline 8673/13; +6 are this branch's new tests).
+- `cargo nextest run -p fn64-render-wgpu --features host-gpu-tests
+  --offline`: **4914 passed, 3 skipped** (baseline 4908/3; same +6).
+
+### The two circular fixtures this fix exposed
+
+`rdp_harness/tests.rs`'s `perspective_s_for` derived its expected S plane by
+inverting fn64's own `1024`, so both perspective fixtures asserted the
+implementation against itself and passed under a scale 32x from hardware.
+They were re-derived from angrylion's `tcdiv_persp`; every claim they
+actually make -- that the divide happens, that the perspective and
+non-perspective paths differ, that W's magnitude rather than its sign is
+used -- is unchanged and still asserted.
+
+This is the checklist's "derive expectations BY HAND from the wire layout,
+never from the code under test", failing in the wild. A test that inverts
+the constant under test cannot detect a wrong constant, and both of these
+had detailed, confident doc comments.
+
+### Mutation results
+
+| mutant | outcome |
+|---|---|
+| `PERSPECTIVE_TEXEL_SCALE` -> 1024.0 (the original bug) | **killed**, 3 tests |
+| `PERSPECTIVE_TEXEL_SCALE` -> 16384.0 (half) | **killed**, 5 tests |
+| KEPT ARM: `PLANE_TO_TEXEL` 2^21 -> 2^16 | **killed**, 5 tests |
+| KEPT ARM: `unsigned_abs().max(1)` -> `max(1)` | **killed**, 1 test |
+| KEPT ARM: `saturate_s10_5` NaN `return 0` -> `return 1` | **SURVIVED** |
+
+The surviving mutant is recorded in the code rather than papered over: the
+NaN arm is unreachable from this crate, because `texture_coordinates_s10_5`
+floors its denominator at 1, so no fixture can currently reach it. It is
+kept for a future caller without that guarantee, and its doc now says
+plainly that it is untested.
+
+The new scale test uses `S/W = 0.25` rather than `1.0` deliberately: at a
+unit ratio the correct answer 32768 saturates the `i16` return to 32767
+under both the right scale and several wrong ones, so a unit-ratio fixture
+could not distinguish them.
