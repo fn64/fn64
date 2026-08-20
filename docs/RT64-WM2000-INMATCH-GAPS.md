@@ -172,3 +172,44 @@ distinguishes them in one run.
 ROM rather than read from source, and it took one run of a committed script
 because the shell now builds on this stack. That is the cheaper instrument this
 document was waiting for.
+
+### Follow-up, same instrument: every admitted triangle IS textured
+
+**Status: CONFIRMED.** The measurement named above as "the cheap next
+measurement" was built (`raw_triangle_drop_stats::note_textured`) and run.
+Three consecutive ticks on the real ROM:
+
+```
+[fn64-tri-drop] tick=100000  of ADMITTED: textured = 82806,  untextured = 0
+[fn64-tri-drop] tick=200000  of ADMITTED: textured = 166654, untextured = 0
+[fn64-tri-drop] tick=300000  of ADMITTED: textured = 255654, untextured = 0
+```
+
+**Not one untextured triangle in 255,654.** Every admitted triangle carries
+the wire opcode's texture bit, so every one of them takes the `Some(binding)`
+arm at `raw_triangle.rs:447` and calls `sample_point`. Combined with the zero
+refusals above -- and `TriangleTextureBindingDisagreesWithOpcode`
+(`raw_triangle.rs:159`) refuses loudly if the opcode's bit and the binding ever
+disagree -- the texture path is not merely reached, it is reached for 100% of
+drawn triangles with a resolved tile binding behind it.
+
+**This closes the hypothesis as stated.** "Every model is untextured" is false
+at the wire and false at the binding. The remaining candidates are strictly
+downstream of `sample_point`'s inputs:
+
+1. the **sampled texel value** -- TMEM contents, tile addressing, or format
+   decode returning a wrong-but-valid colour (note this is the same class as
+   the `en_tlut`/CI-aliasing path recorded above, which is silent by
+   construction and would look exactly like flat shading), or
+2. the **combiner**, selecting something other than `Texel0` into the output,
+   in which case a correct texel is fetched and then discarded.
+
+Those are distinguishable, and the distinguishing measurement is again cheap:
+histogram the returned texel values against the combiner's selected inputs for
+one packet. A texel histogram with one or two distinct values indicts (1); a
+varied texel histogram with a flat output indicts (2).
+
+**What NOT to do next.** Do not widen any guard on this path. Nothing here
+refused anything -- the counters, the binding equality check, and the tile
+resolution all report success, which is precisely why the defect is somewhere
+that reports success.
