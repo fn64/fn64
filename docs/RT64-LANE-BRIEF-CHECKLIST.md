@@ -74,6 +74,40 @@ evidence is a valid and valuable outcome. A lane that stops at a well-scoped
 negative has done real work; a lane that forces a fix to satisfy a brief has
 produced something worse than nothing.
 
+## Make the finding durable, not just reported
+
+A lane's report is read once by the controller and then lost to context. Several
+near-misses this session were lanes rediscovering something an earlier lane had
+already established and reported. **Require every lane to land its finding as a
+commit, not only as a report.**
+
+Concretely, in the brief:
+
+> Append your finding to a durable doc under `docs/` and commit it. A report to
+> the controller is not a deliverable; a committed doc is. If your card produces
+> no code change, the doc IS the deliverable.
+
+This costs a lane almost nothing -- most already write one -- and it is the
+difference between a finding that survives and one that has to be re-derived at
+full cost. The guard audit, the harness traps, and the versus-plateau analysis
+are all reusable today only because they were committed.
+
+**Corollary: mark the provenance of every number.** A later reader cannot tell a
+measured count from one lifted out of an older doc. One census sub-agent quoted
+"60 full-width one-cycle FillRectangles" as though it had measured them; it had
+copied the figure from a comment and never ran the ROM. Require CONFIRMED
+(measured, this run) versus HYPOTHESIS (read, inferred, or quoted) on every
+claim, and require quoted figures to name their source.
+
+## Do not let a stood-down lane's reading masquerade as measurement
+
+When a card is cancelled or redirected mid-flight, its partial work is often a
+static code read with no run behind it. That reading can be genuinely useful --
+but it is a hypothesis list, not a result. State plainly in the stand-down
+instruction that the lane must label it as such, and it generally will: the
+census lane cancelled this session correctly refused to launder its sub-agents'
+source inspection into "CONFIRMED", and caught one of them doing exactly that.
+
 ## Scope the collision surface
 
 When more than one lane is live, name the files each owns and tell them to stay
