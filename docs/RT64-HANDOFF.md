@@ -127,7 +127,16 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    on them.
 2. **Correct `RT64-PERF-CEILING.md`** per §3a. It currently argues against the
    work the measurement says to do.
-3. **Extend the parity corpus to triangles, textures, and combiner programs.**
+3. **Extend the parity corpus to textured triangles. THIS IS NOW THE BLOCKER,
+   not a preparatory step.** Two confirmed, angrylion-cited fixes have landed
+   against the texel-noise defect -- the perspective scale (2^10 -> 2^15) and
+   the odd-row XOR4 rule -- and the symptom is unchanged. Each cost a 20-minute
+   ROM run and a human reading a PNG to learn only "still wrong". See
+   `docs/RT64-WM2000-TEXTURE-STATE.md`. A textured-triangle case measured
+   against RT64 localises the wrong byte in seconds. Do not attempt a third
+   blind fix.
+3b. **Then the rest of the corpus:** other triangle shapes and combiner
+   programs.
    It is 10 hand-authored **fill-rectangle** cases today -- it cannot see any
    open bug. This is the highest-leverage item: the fast layer does not cover
    the code under change.
