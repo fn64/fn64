@@ -316,6 +316,11 @@
 
 mod alpha_compare;
 mod blend;
+// Public only under `conformance-runner`: the adapterless entry point the
+// renderer-conformance harness's wgpu runner drives. Off by default, so the
+// default build's public surface is unchanged.
+#[cfg(feature = "conformance-runner")]
+pub mod conformance;
 mod color_converter;
 mod color_hlsli;
 mod combiner;
