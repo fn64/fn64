@@ -1677,15 +1677,6 @@ fn plan_fill(
     // fallback `texrect_scissor_or_full_target` supplies on the execute
     // side. The clip below is then a no-op, so an unscissored stream
     // declares exactly what it declared before this change.
-    // The host-configured colour-target height, which `SetColorImage` does
-    // not carry (see `RdpState::color_target_height`'s own doc). Needed only
-    // to size the seed read; a fill that needs no seed never asks for it.
-    let Some(height) = state.color_target_height() else {
-        return Err(RawDpcDecodeError::InvalidCommand {
-            location,
-            reason: "FillRectangle requires a configured color-target height",
-        });
-    };
     let full_extent = RenderTargetRectangle { x0, y0, x1, y1 };
     let Some(rectangle) = clip_fill_rows_to_scissor(full_extent, state.scissor()) else {
         // Nothing survives the clip, so this command writes no guest byte
@@ -1738,11 +1729,31 @@ fn plan_fill(
     // are unscissored, so the clip is a no-op and `rectangle == full_extent`
     // held for every one of them -- while each covers a small corner of an
     // 8x4 target and needs a seed badly.
-    let covers_target =
-        rectangle.x0 == 0 && rectangle.y0 == 0 && rectangle.x1 + 1 == image.width() && rectangle.y1 + 1 == height;
+    //
+    // **The height is the host-configured one, and its absence is not an
+    // error here.** `SetColorImage` carries no height (see
+    // `RdpState::color_target_height`), and plenty of decode-only paths
+    // never configure one. A fill that spans the full image width and
+    // starts at row 0 with no known height is treated as covering the
+    // target -- the same thing this planner assumed before seeds existed,
+    // so those paths decode exactly as they did. Making the height
+    // mandatory instead broke twenty-odd decode tests that legitimately
+    // have none, which is how this arm got written.
+    let covers_target = rectangle.x0 == 0
+        && rectangle.y0 == 0
+        && rectangle.x1 + 1 == image.width()
+        && state
+            .color_target_height()
+            .is_none_or(|height| rectangle.y1 + 1 == height);
     let seed = if covers_target {
         None
     } else {
+        // A seed is only reachable when the fill does NOT cover the target,
+        // which above requires a known height whenever the rectangle is
+        // otherwise full-image -- but a partial-width fill can reach here
+        // with none, and the seed must still be sized. The colour image's
+        // own last covered row is the honest bound in that case.
+        let height = state.color_target_height().unwrap_or(rectangle.y1 + 1);
         let pixels = image
             .width()
             .checked_mul(height)
@@ -2979,7 +2990,7 @@ mod tests {
                 &mut planned,
                 &mut commands,
                 &mut Vec::new(),
-            )
+            &mut Vec::new())
             .unwrap_err();
             assert!(matches!(
                 error,
@@ -3019,7 +3030,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
-        )
+            &mut Vec::new())
         .unwrap_err();
         let RawDpcDecodeError::UnknownCommandWidth { location } = error else {
             panic!("expected unknown command width");
@@ -3447,8 +3458,8 @@ mod tests {
             other_mode,
             fill_color,
             fill_rectangle_command,
-            None,
-        )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+            None)
         .unwrap();
         // RGBA32, period 1: every pixel is the fill color's RGB + expanded
         // low-5-bit alpha-coverage byte. 0x59 & 0x1f = 0x19; expand_five(0x19)
@@ -5884,7 +5895,7 @@ mod tests {
             &mut planned,
             &mut commands,
             &mut Vec::new(),
-        )
+            &mut Vec::new())
         .unwrap_err();
         assert!(matches!(error, RawDpcDecodeError::TruncatedCommand { .. }));
         // The type system already guarantees `decode_raw_dpc`/`decode_stream`
