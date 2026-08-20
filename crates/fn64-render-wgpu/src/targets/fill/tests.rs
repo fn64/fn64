@@ -229,8 +229,8 @@ fn non_fill_cycle_is_rejected_before_touching_the_target() {
         one_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap_err();
     assert!(matches!(error, FillExecutionError::NotFillCycle));
 }
@@ -245,8 +245,8 @@ fn z_cmp_bypass_hazard_is_rejected_before_touching_the_target() {
         other_mode_with_hazard(0x0010),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap_err();
     assert!(matches!(
         error,
@@ -270,8 +270,8 @@ fn z_upd_and_im_rd_bypass_hazards_are_each_rejected() {
             other_mode_with_hazard(bit),
             FillColor::from_wire(0xF801_F801),
             rect(0, 0, 12, 4),
-            None,
-        )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+            None)
         .unwrap_err();
         assert!(matches!(
             error,
@@ -299,6 +299,7 @@ fn full_extent_new_target_writes_exact_bytes() {
         fill_cycle_other_mode(),
         fill_color,
         rect(0, 0, 12, 4), // (12>>2)=3 -> x1=3, width 4; (4>>2)=1 -> y1=1, height 2
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -323,8 +324,8 @@ fn resident_sub_rectangle_write_patches_only_the_claimed_rows_exact_bytes() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap();
     let initialized = candidate.admit_completed_initialization(seed).unwrap();
     registry.commit_initialized(initialized).unwrap();
@@ -346,9 +347,9 @@ fn resident_sub_rectangle_write_patches_only_the_claimed_rows_exact_bytes() {
         &candidate2,
         fill_cycle_other_mode(),
         FillColor::from_wire(0x07C1_07C1),
-        rect(0, 4, 12, 4), // uly raw 4 -> y0=1; lry raw 4 -> y1=1 (single row)
-        Some(&resident_bytes_before),
-    )
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff), // uly raw 4 -> y0=1; lry raw 4 -> y1=1 (single row)
+        Some(&resident_bytes_before))
     .unwrap();
     assert_eq!(completed.rectangle().y(), 1);
     assert_eq!(completed.rectangle().height(), 1);
@@ -386,8 +387,8 @@ fn resident_candidate_without_resident_bytes_is_rejected_not_zero_filled() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap();
     let initialized = candidate.admit_completed_initialization(seed).unwrap();
     registry.commit_initialized(initialized).unwrap();
@@ -403,8 +404,8 @@ fn resident_candidate_without_resident_bytes_is_rejected_not_zero_filled() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0x07C1_07C1),
         rect(0, 4, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap_err();
     assert!(matches!(
         error,
@@ -431,8 +432,8 @@ fn out_of_bounds_rectangle_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap();
     let initialized = candidate.admit_completed_initialization(seed).unwrap();
     registry.commit_initialized(initialized).unwrap();
@@ -452,8 +453,8 @@ fn out_of_bounds_rectangle_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0x0000_0000),
         rect(0, 0, 20, 4),
-        Some(&before),
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        Some(&before))
     .unwrap_err();
     assert!(matches!(
         error,
@@ -481,8 +482,8 @@ fn resident_byte_length_mismatch_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
-        Some(&wrong_length_bytes),
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        Some(&wrong_length_bytes))
     .unwrap_err();
     assert!(matches!(
         error,
@@ -505,8 +506,8 @@ fn rgba32_target_format_stride_is_four_bytes_per_pixel() {
         fill_cycle_other_mode(),
         fill_color,
         rect(0, 0, 12, 4),
-        None,
-    )
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        None)
     .unwrap();
     let bytes = completed.device_bytes().device_bytes();
     assert_eq!(bytes.len(), 32); // 8 pixels * 4 bytes
@@ -528,9 +529,9 @@ fn admission_still_rejects_partial_write_to_a_brand_new_target() {
         &candidate,
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
-        rect(0, 4, 12, 4), // partial: only row 1
-        None,
-    )
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff), // partial: only row 1
+        None)
     .unwrap();
     let error = candidate
         .admit_completed_initialization(completed)
