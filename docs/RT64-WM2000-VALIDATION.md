@@ -356,9 +356,16 @@ measured**, and this card reports that rather than a number.
 ## 5. Commands
 
 Capture (unchanged, see [`RT64-WM2000-REPLAY.md`](RT64-WM2000-REPLAY.md) §2).
-The fixture used here is the corrected capture, sha256
-`a35515bca662ce9d1b007300553484d28650ae1c238c316b00399033bbe0650e`, 426
-entry-0 rows, 3,408 wire bytes.
+The fixture used here is the corrected capture: **426 entry-0 rows, 3,408
+wire bytes**.
+
+Those two counts identify it and an operator can check them against their
+own dump. A sha256 was cited here as well, and is deliberately not any
+more: the capture is a game's own RDP command words, so it cannot be
+committed (`README.md`'s no-game-content rule) and no test can gate the
+hash. An ungated hash is a claim about a file nobody can verify, which is
+exactly what `lint-docs.py`'s content-hash rule exists to stop -- it had
+been failing on this line since before this branch.
 
 ```sh
 FN64_WM2000_PACKET_TSV=<scratch>/packet.tsv \

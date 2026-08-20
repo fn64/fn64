@@ -114,6 +114,20 @@ before scoping; do not assume they survived.
 
 ---
 
+# CONFIRMED: the `PLANE_TO_TEXEL` fix did not regress the screen
+
+A full ROM run after the fix (`rc=0`, 4,080 swaps, 9,982 gfx tasks, **zero
+panics and zero backend errors** across 4,198 dumped frames) renders frame
+4090 -- the same swap as the committed
+`wm2000-after-byte-lane-fix-swap4090.png` -- indistinguishable from it:
+correct skin tones, facial detail, legible orange "AUSTIN 3:16" shirt
+print, shaded steel trusses, readable "Single Match" / "STEVE AUSTIN VS
+STEVE AUSTIN" / "RAW IS WAR".
+
+So the constant that made the parity corpus agree with hardware and RT64
+is safe on real content. Worth stating because it is a live-rasterizer
+change, and the corpus alone could not have told us that.
+
 # Open, separate: a scene-specific colour cast
 
 **CONFIRMED pre-existing, and NOT caused by the `PLANE_TO_TEXEL` fix.**
