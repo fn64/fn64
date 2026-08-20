@@ -4830,6 +4830,50 @@ fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
 
 #[cfg(test)]
 mod tests {
+    /// **The seed's byte-lane inversion, pinned against a hand-built pair.**
+    ///
+    /// Mutation-driven: replacing `captured[word + lane]` with
+    /// `captured[index]` -- dropping the inversion entirely -- survived the
+    /// whole unit suite AND the differential sweep. The sweep misses it
+    /// because its fixture seeds every framebuffer halfword to the same
+    /// value (`STALE = 0xffff`), which is a palindrome under any byte
+    /// permutation, so a swapped seed reads back identical.
+    ///
+    /// This fixture uses four DISTINCT bytes per word, so every one of the
+    /// 24 possible permutations gives a different answer.
+    ///
+    /// Expectation derived from `fn64-runtime`'s own mapping, not from the
+    /// function: `RdramViewMut::write_u8` indexes `range(addr, 1, 3)`, i.e.
+    /// `offset ^ 3` within the word, and this is that inverse. So storage
+    /// `[0, 1, 2, 3]` is logical `[3, 2, 1, 0]`.
+    #[test]
+    fn a_captured_rdram_seed_is_unswizzled_into_logical_order() {
+        assert_eq!(
+            super::logical_bytes_from_captured_rdram(&[0, 1, 2, 3]),
+            vec![3, 2, 1, 0],
+            "one word: logical[i] must be storage[i ^ 3]"
+        );
+        // Two words, so a mutant that inverts across the WHOLE buffer
+        // rather than within each word is also caught: whole-buffer
+        // inversion would give [7, 6, 5, 4, 3, 2, 1, 0].
+        assert_eq!(
+            super::logical_bytes_from_captured_rdram(&[0, 1, 2, 3, 4, 5, 6, 7]),
+            vec![3, 2, 1, 0, 7, 6, 5, 4],
+            "the swap is per aligned word, never across the buffer"
+        );
+        // Round trip: applying it twice is the identity, which a mutant
+        // using a different XOR constant (^1 or ^2) would still satisfy --
+        // so this is an additional check, not the load-bearing one above.
+        let storage: Vec<u8> = (0..16).collect();
+        assert_eq!(
+            super::logical_bytes_from_captured_rdram(&super::logical_bytes_from_captured_rdram(
+                &storage
+            )),
+            storage,
+            "the lane swap is its own inverse"
+        );
+    }
+
     use fn64_render::OwnedRawDpcSubmission;
     use fn64_render_ir::{
         CapturedGuestRead, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
