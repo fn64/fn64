@@ -111,8 +111,7 @@ hardware, not closer.
 Found while establishing which slice is authoritative. Recorded here, not
 fixed under this card, because the reference renderer is another lane's
 surface -- but it is a live defect on that crate's raster path, not a
-latent one, and it disqualifies the reference as an oracle for one-cycle
-combiner questions.
+latent one.
 
 `evaluate_combiner` (`crates/fn64-render-reference/src/raster/combiner.rs:64`)
 maps `CycleType::OneCycle => 1` and then runs
@@ -144,9 +143,13 @@ one-cycle. `fn64-render-wgpu` is correct here (`run_one_cycle`'s
 exactly those programs -- and a differential run between them would blame
 the wrong side.
 
-**Consequence for this card:** the brief names `fn64-render-reference` as
-"repeatedly the better oracle for CPU-side questions". For one-cycle
-combiner output specifically, it is not, until this is reconciled.
+**Correction to the brief, not to this lane's work.** The brief that produced
+this card called `fn64-render-reference` "repeatedly the better oracle for
+CPU-side questions". That framing was the controller's invention and is
+withdrawn: **RT64 is the oracle for this port.** The reference is a second fn64
+implementation and a useful cross-check -- it has been right where wgpu was
+wrong more than once -- but it carries no authority, and this finding is a
+clean counter-example, with wgpu right and the reference wrong.
 
 ## MEASURED: the combiner-input tally
 
