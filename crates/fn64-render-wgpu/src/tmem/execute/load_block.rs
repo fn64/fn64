@@ -838,11 +838,26 @@ mod tests {
         );
     }
 
+    /// A full 8-byte word landing on an ODD tile-relative row swaps its two
+    /// 4-byte halves into physical lanes, even though the defined-byte mask
+    /// stays `0xff` either way.
+    ///
+    /// **The odd row is reached with DXT, not with `source_t`.** The row a
+    /// LoadBlock word lands on is `(word * dxt) >> 11`, so `dxt = 2048`
+    /// advances exactly one row per word and word 1 is row 1. This fixture
+    /// used to set `source_t: 1` and assert that word 0 -- row ZERO --
+    /// exchanged, which asserted fn64's own removed `source_t` term rather
+    /// than anything hardware does. angrylion's write parity is `dswap =
+    /// sst & 1` on a row made tile-relative by `TRELATIVE` (`tex.c:583`,
+    /// `tcoord.c:998-999`), and a load's first row is always zero; see
+    /// `tmem/read.rs::odd_row_exchange`.
+    ///
+    /// `source_t` is kept at 1 deliberately, so that the assertion below
+    /// FAILS if the removed term is ever reintroduced on either side: with
+    /// it back, word 0 would exchange and word 1 would not -- the exact
+    /// inverse of what is asserted here.
     #[test]
     fn linear_odd_row_full_word_exchanges_lane_halves() {
-        // RGBA16, source_t odd (1): odd_row_exchange set for word 0; a full
-        // 8-byte word's two 4-byte halves swap physical lanes even though
-        // the defined-byte mask stays 0xff both ways.
         let spec = BlockFixtureSpec {
             format: 0,
             size: 2,
@@ -852,41 +867,48 @@ mod tests {
             tile_tmem: 0,
             source_s: 0,
             source_t: 1,
-            high_s: 3,
-            dxt: 0,
-            source_byte_len: 8,
+            high_s: 7,
+            dxt: 2048,
+            source_byte_len: 16,
         };
         let words = prepared_lanes(spec);
-        assert_eq!(words.len(), 1);
-        assert!(words[0].0.odd_row_exchange());
-        assert_eq!(words[0].0.defined_source_byte_mask(), 0xff);
-        // source_t=1 offsets the logical source by one row (8 texels * 2
-        // bytes = 16 bytes) from image_address, so the captured source
-        // bytes are [0x10..0x18) -- the odd-row exchange swaps their two
-        // 4-byte halves into physical lanes.
+        assert_eq!(words.len(), 2);
+        // Row 0: no exchange. Row 1: exchange.
+        assert!(!words[0].0.odd_row_exchange(), "word 0 is tile-relative row 0");
+        assert!(words[1].0.odd_row_exchange(), "word 1 is tile-relative row 1");
+        assert_eq!(words[1].0.defined_source_byte_mask(), 0xff);
+        // `source_t = 1` offsets the logical source by one image row
+        // (8 texels * 2 bytes = 16 bytes), so the captured bytes start at
+        // 0x10; word 1 takes the following eight, 0x18..0x20 = 24..32, and
+        // the odd-row exchange swaps their two 4-byte halves.
         assert_eq!(
-            words[0].1,
+            words[1].1,
             [
-                Some(20),
-                Some(21),
-                Some(22),
-                Some(23),
-                Some(16),
-                Some(17),
-                Some(18),
-                Some(19),
+                Some(28),
+                Some(29),
+                Some(30),
+                Some(31),
+                Some(24),
+                Some(25),
+                Some(26),
+                Some(27),
             ]
         );
     }
 
+    /// A PARTIAL tail word landing on an odd tile-relative row must move its
+    /// payload into the exchanged high lanes -- matching
+    /// `physical.rs::physical_defined_lane_mask`'s `rotate_left(4)` for mask
+    /// `0x03 -> 0x30`, not the stale unexchanged `0x03 -> lanes 0-1`.
+    ///
+    /// The odd row is reached with `dxt = 2048` (one row per word), so word 1
+    /// is tile-relative row 1. This fixture previously relied on `source_t: 1`
+    /// making BOTH words exchange, which asserted fn64's own removed
+    /// `source_t` term; see `linear_odd_row_full_word_exchanges_lane_halves`
+    /// above for the citation. `source_t: 1` is retained so the row-0/row-1
+    /// split below inverts if that term is ever reintroduced.
     #[test]
     fn linear_odd_row_partial_tail_exchanges_into_the_high_half() {
-        // RGBA8 (Bits8), source_t odd (1), a two-word transfer whose second
-        // word carries only two defined source bytes: the odd-row exchange
-        // must move that partial payload into physical lanes 4-5, matching
-        // `physical.rs::physical_defined_lane_mask`'s `rotate_left(4)` for
-        // mask 0x03 -> 0x30, not the stale unexchanged mask 0x03 -> lanes
-        // 0-1.
         let spec = BlockFixtureSpec {
             format: 0,
             size: 1,
@@ -897,19 +919,19 @@ mod tests {
             source_s: 0,
             source_t: 1,
             high_s: 9,
-            dxt: 0,
+            dxt: 2048,
             source_byte_len: 10,
         };
         let words = prepared_lanes(spec);
         assert_eq!(words.len(), 2);
-        assert!(words[0].0.odd_row_exchange());
-        assert!(words[1].0.odd_row_exchange());
+        assert!(!words[0].0.odd_row_exchange(), "word 0 is tile-relative row 0");
+        assert!(words[1].0.odd_row_exchange(), "word 1 is tile-relative row 1");
         assert_eq!(words[1].0.defined_source_byte_mask(), 0x03);
 
-        // source_t=1 offsets the logical source by one row (8 texels * 1
-        // byte = 8 bytes) from image_address; word 1's two defined bytes are
-        // the row's bytes 8-9, i.e. absolute source bytes 16-17 (0x10,
-        // 0x11).
+        // `source_t = 1` offsets the logical source by one image row
+        // (8 texels * 1 byte = 8 bytes) from `image_address`; word 1's two
+        // defined bytes are the row's bytes 8-9, i.e. absolute source bytes
+        // 16-17 (0x10, 0x11).
         let expected_tail = [None, None, None, None, Some(16), Some(17), None, None];
         assert_eq!(words[1].1, expected_tail);
         assert_ne!(
@@ -1433,11 +1455,11 @@ mod tests {
         let writer_exchange = words[0].0.odd_row_exchange();
 
         // The reader's rule, applied to the same word. `row_advance` is the
-        // row this word lands on; the reader's first-row parity comes from
-        // the tile's own `low_t`, which this fixture never sets, so it is 0.
+        // tile-relative row this word lands on, and that row's parity is the
+        // whole rule -- see `tmem/read.rs::odd_row_exchange` for the
+        // angrylion citation that there is no T-origin term on either side.
         let row = words[0].0.row_advance();
-        let reader_first_row_is_odd = false; // low_t.integer() & 1, low_t == 0
-        let reader_exchange = reader_first_row_is_odd ^ (row & 1 != 0);
+        let reader_exchange = row & 1 != 0;
 
         assert_eq!(
             writer_exchange, reader_exchange,
@@ -1470,7 +1492,7 @@ mod tests {
         assert_eq!(words.len(), 1);
         let writer_exchange = words[0].0.odd_row_exchange();
         let row = words[0].0.row_advance();
-        let reader_exchange = false ^ (row & 1 != 0);
+        let reader_exchange = row & 1 != 0;
         assert_eq!(writer_exchange, reader_exchange);
         assert!(
             !writer_exchange,

@@ -697,9 +697,38 @@ fn linear_byte_address(tile: TileDescriptor, addressed: AddressedTmemTexel) -> u
         + column_offset
 }
 
+/// The odd-row XOR4 bank exchange: the TILE-RELATIVE row's parity, and
+/// nothing else.
+///
+/// angrylion takes this bit on both sides of TMEM from a row that is already
+/// tile-relative, and neither side carries a T-origin term:
+///
+/// - **Read.** `fetch_texel` (`src/core/n64video/rdp/tmem.c:63-129`) does
+///   `taddr ^= ((t & 1) ? WORD_XOR_DWORD_SWAP : WORD_ADDR_XOR)`. It never
+///   reads `tile->tl` -- the field does not appear in the function.
+/// - **Write.** `loading_pipeline` takes `dswap = sst & 1`
+///   (`tex.c:583`) after `tc_pipeline_load` has applied
+///   `TRELATIVE(sst1, tile->tl)` (`tcoord.c:998-999`), and the span was
+///   seeded with exactly `tl << 3` in the first place
+///   (`rdp_load_block`'s `lewdata[5]`, `tex.c:929`). The origin cancels.
+///
+/// The true-hardware macro values are `WORD_ADDR_XOR = 0`,
+/// `WORD_XOR_DWORD_SWAP = 2` and `BYTE_ADDR_XOR = 0`,
+/// `BYTE_XOR_DWORD_SWAP = 4` (`src/core/common.h:10-20`) -- a 4-byte swap in
+/// both the byte and the 16-bit-word domain. The `LSB_FIRST` arm of those
+/// macros is host byte-order compensation for angrylion's own swapped TMEM
+/// array and is NOT hardware semantics.
+///
+/// **This used to XOR in a `first_row_parity` derived from the tile's
+/// `low_t`.** That term is not on hardware. It was self-cancelling for
+/// LoadTile, whose writer carried the identical term, but the LoadBlock
+/// writer derived its parity from `source_t.raw()` instead -- a different
+/// field in a different unit (`.raw()` versus `.integer()` = `raw >> 2`). The
+/// two disagreed in 256 of 512 enumerated cases, and a disagreeing row
+/// fetched every texel from the wrong 4-byte half of its 64-bit word. See
+/// `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
 fn odd_row_exchange(addressed: AddressedTmemTexel) -> bool {
-    let first_is_odd = addressed.first_row_parity() == TmemFirstRowParity::Odd;
-    first_is_odd ^ (addressed.row() & 1 != 0)
+    addressed.row() & 1 != 0
 }
 
 #[cfg(test)]
