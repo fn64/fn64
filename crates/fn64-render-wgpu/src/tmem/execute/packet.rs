@@ -1143,6 +1143,21 @@ mod tests {
         assert_eq!(wrapped_even_second_row.texel().rgba8888(), [0x10; 4]);
     }
 
+    /// The point sampler preserves its snapshot identity, and the
+    /// caller-selected first-row parity is carried on the addressed texel
+    /// while NOT changing which byte is read.
+    ///
+    /// The exchange follows the tile-relative row alone (see
+    /// `tmem/read.rs::odd_row_exchange` for the angrylion citation), so the
+    /// two parity values must decode the SAME texel. This test previously
+    /// asserted they decoded different ones -- `0x0c` versus `0x08`, four
+    /// bytes apart, which is precisely the bank the removed origin term used
+    /// to move the read into. Requiring equality here is what makes a
+    /// reintroduced term fail: it would split these two apart again.
+    ///
+    /// The parity is still plumbed through to `AddressedTmemTexel`, and the
+    /// corner assertions below still pin that it round-trips, so the field
+    /// being inert in the address computation does not go unnoticed.
     #[test]
     fn committed_point_sampler_preserves_snapshot_and_caller_selected_row_parity() {
         let (words, ranges) = direct_reader_words();
@@ -1179,8 +1194,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(even.texel().rgba8888(), [0x0c; 4]);
-        assert_eq!(odd.texel().rgba8888(), [0x08; 4]);
+        // Row 0, so neither parity exchanges: both read byte 8.
+        assert_eq!(even.texel().rgba8888(), [0x08; 4]);
+        assert_eq!(
+            odd.texel().rgba8888(),
+            even.texel().rgba8888(),
+            "the caller's first-row parity must not change which byte is read"
+        );
         assert_eq!(even.snapshot(), odd.snapshot());
         assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
         assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
@@ -1201,13 +1221,24 @@ mod tests {
             TextureLutMode::Disabled,
         )
         .unwrap();
+        // The cell spans rows 0 and 1. Hand-derived from the fixture's own
+        // two rules: the tile is `line_words = 1` based at TMEM word 511, so
+        // row 0's texel 0 is byte `511 * 8 = 0xff8` and row 1's wraps to
+        // `0x000` and then exchanges to `0x004`. The fixture's payload
+        // generator (`physical.rs::defined_physical_lanes`) numbers bytes by
+        // PHYSICAL lane as `first_byte + word.index() * 8 + ordinal`, so the
+        // exchange moves where a byte lands without renumbering it: word 0
+        // (row 0) carries 0x08..0x10 and word 2 (row 1) carries 0x10..0x18.
+        // Upper corners therefore read 0x08/0x09 and lower corners
+        // 0x10/0x11.
         assert_eq!(
             cell_colors(even_cell),
-            [[0x0c; 4], [0x14; 4], [0x0d; 4], [0x15; 4]]
+            [[0x08; 4], [0x10; 4], [0x09; 4], [0x11; 4]]
         );
         assert_eq!(
             cell_colors(odd_cell),
-            [[0x08; 4], [0x10; 4], [0x09; 4], [0x11; 4]]
+            cell_colors(even_cell),
+            "the caller's first-row parity must not change which bytes the cell reads"
         );
         for corner in [
             TextureCellCorner::UpperLeft,
