@@ -1626,15 +1626,89 @@ fn plan_fill(
             reason: "FillRectangle exceeds the staged color-image width",
         });
     }
+    // **The scissor narrows what this command WRITES, so it must narrow what
+    // the journal DECLARES.**
+    //
+    // angrylion clips every span against the `clip` rect latched by
+    // `rdp_set_scissor` (`rasterizer.c:2779-2784`) inside the edgewalker --
+    // X at `:2349-2363`, Y at `:2284-2305` -- so a scissored fill never
+    // touches the pixels outside the clip, and the executor
+    // (`targets::execute_fill_rectangle`, via `clip_fill_rectangle`) now
+    // does the same.
+    //
+    // Declaring the UNCLIPPED extent while executing the clipped one is
+    // precisely the hazard this function's own doc names sixty lines above:
+    // `fill_completed_writes` slices the full-extent buffer for every
+    // declared range *without checking the raster touched it*, so a
+    // declared-but-unpainted row would publish a real digest of whatever the
+    // buffer held there and carry it into guest RDRAM. Declaration and
+    // execution must agree on the geometry, and the scissor is part of that
+    // geometry.
+    //
+    // `None` means no `SetScissor` has been staged, in which case the
+    // consumer's honest widest bound is the whole target -- the same
+    // fallback `texrect_scissor_or_full_target` supplies on the execute
+    // side. The clip below is then a no-op, so an unscissored stream
+    // declares exactly what it declared before this change.
+    let Some(rectangle) = clip_fill_rows_to_scissor(
+        RenderTargetRectangle { x0, y0, x1, y1 },
+        state.scissor(),
+    ) else {
+        // Nothing survives the clip, so this command writes no guest byte
+        // and the journal must declare none. Not an error: a fully
+        // scissored-away rectangle is ordinary content (a sprite walked off
+        // the clip window), and the executor names the same case loudly as
+        // `FillExecutionError::ScissoredAway` only when it is asked to
+        // execute one, which it now never is.
+        return Ok(());
+    };
     plan_render_target_rows(
         location,
         command_index,
-        RenderTargetRectangle { x0, y0, x1, y1 },
+        rectangle,
         image,
         layout,
         planned,
         fill_spans,
     )
+}
+
+/// Intersects one fill's whole-pixel destination rectangle with the staged
+/// scissor, in the scissor's own quarter-pixel domain, returning `None` when
+/// nothing survives.
+///
+/// Uses [`crate::targets::RdpScissorRect`]'s own pixel accessors rather than
+/// re-deriving the quarter-pixel rounding, so the decoder and the executor
+/// round the scissor identically by construction instead of by two
+/// agreeing-looking copies of `div_ceil`. That rounding is angrylion's, and
+/// `RdpScissorRect::quarter_to_pixel_ceil` carries its derivation.
+///
+/// The target-extent bound is deliberately NOT applied here: `plan_fill`
+/// has already rejected `x1 >= image.width()` loudly, and the row planner
+/// derives its own ranges from the image, so adding a second extent clamp
+/// would silently admit a rectangle the width check exists to refuse.
+fn clip_fill_rows_to_scissor(
+    rectangle: RenderTargetRectangle,
+    scissor: Option<crate::targets::RdpScissorRect>,
+) -> Option<RenderTargetRectangle> {
+    let Some(scissor) = scissor else {
+        return Some(rectangle);
+    };
+    let RenderTargetRectangle { x0, y0, x1, y1 } = rectangle;
+    // Half-open intersection, then back to this struct's inclusive edges.
+    let first_x = x0.max(scissor.first_column());
+    let limit_x = (x1 + 1).min(scissor.column_limit());
+    let first_y = y0.max(scissor.first_row());
+    let limit_y = (y1 + 1).min(scissor.row_limit());
+    if first_x >= limit_x || first_y >= limit_y {
+        return None;
+    }
+    Some(RenderTargetRectangle {
+        x0: first_x,
+        y0: first_y,
+        x1: limit_x - 1,
+        y1: limit_y - 1,
+    })
 }
 
 /// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
