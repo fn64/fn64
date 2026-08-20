@@ -70,9 +70,9 @@
 //    decodes are still not ported here; a disabled-TLUT footprint requiring
 //    any of them reports `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`.
 //
-// First-row parity is DERIVED PER TILE from the bound tile's own `low_t`,
-// never frozen -- see `tmem_first_row_parity_odd` below, which carries the
-// same rule `targets/texrect.rs` applies on the CPU side.
+// The odd-row XOR4 bank exchange follows the TILE-RELATIVE row alone -- see
+// the block above `TEXEL_FRACTION_BITS` below, and the CPU oracle's
+// `tmem/read.rs::odd_row_exchange`, which carries the angrylion citation.
 //
 // GPU-side validity-sentinel encoding (card §6, matching
 // `tmem/gpu_projection.rs`'s own doc verbatim): a parallel bitmap, one bit
@@ -107,37 +107,27 @@ const TMEM_ADDRESS_MASK: u32 = 0x0fffu;
 // refusal. Mirrors `tmem/read.rs`'s `AddressScope::LowHalf`.
 const TMEM_LOW_HALF_MASK: u32 = 0x07ffu;
 
-// **First-row parity is derived per tile, never frozen.**
-// `tmem/read.rs`'s `TmemFirstRowParity` is explicit caller input -- the
-// reader never infers it -- so this shader owes the reader the same parity
-// the *writer* used, exactly as `targets/texrect.rs`'s
-// `execute_scheduled_texrect` does on the CPU side (fixed at `aa6f644e`).
-// The writer's rule is `tmem/types.rs`'s `project_tmem_transfer_word`,
-// `TmemLoadKind::Tile` arm: `odd_row_exchange = (bounds.low_t().integer()
-// + row) & 1`. The reader's rule is `tmem/read.rs`'s `odd_row_exchange`:
-// `first_is_odd ^ (row & 1)`. The two agree exactly when `first_is_odd ==
-// low_t.integer() & 1`, and `tmem_first_row_parity_odd` below is that
-// equality -- the SAME one-line expression `targets/texrect.rs:1237` uses,
-// over the SAME `low_t` this tile binding already uploads.
+// **The odd-row XOR4 exchange is the TILE-RELATIVE row's parity, and nothing
+// else** -- the same rule, and the same one-line expression, as the CPU
+// oracle's `tmem/read.rs::odd_row_exchange`, which carries the full
+// angrylion citation. In short: `fetch_texel` (`tmem.c:63-129`) XORs on
+// `(t & 1)` and never reads `tile->tl`, and `loading_pipeline`'s write-side
+// `dswap = sst & 1` (`tex.c:583`) is taken after `TRELATIVE` has made the
+// row tile-relative (`tcoord.c:998-999`), so the T origin cancels out of
+// both sides.
 //
-// A frozen `false` ("first row even") was previously used here. That is
-// correct only for a tile whose T origin is even. Measured on the real ROM,
-// WM2000's sprite-strip tile has `low_t.integer() == 47`, an ODD origin, so
-// the frozen constant inverted the exchange for every row and each
-// rectangle row's last texel addressed a byte the load never wrote --
-// surfacing as `TMEM_SAMPLE_STATUS_INVALID_BYTE` on the GPU triangle path
-// while the CPU texel reader, which had already been fixed, sampled the
-// same tile cleanly.
+// This module used to derive a `first_row_parity` from the bound tile's
+// `low_t` and XOR it in, mirroring a CPU reader that did the same. That term
+// is not on hardware. It was self-cancelling for LoadTile, whose writer
+// carried the identical term, but the LoadBlock writer derived its own
+// parity from `source_t.raw()` -- a different field in a different unit --
+// so the two disagreed and every texel on a disagreeing row was fetched from
+// the wrong 4-byte half of its 64-bit word. See
+// `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
 //
-// The low-half TLUT guard below depends on this too: its own doc requires
-// the FULLY addressed byte, "post odd-row XOR4 exchange", so a frozen
-// parity would have had it testing the wrong address as well.
-//
-// `TileCoordinate::integer()` is `raw >> 2` (S10.2), so the parity bit is
-// bit 2 of the raw field.
-fn tmem_first_row_parity_odd(tile: TileBindingParams) -> bool {
-    return ((tile.low_t >> 2u) & 1u) != 0u;
-}
+// The `low_t` the tile binding uploads is still used for the tile-relative
+// coordinate itself (the origin subtraction in `relative_axis_coordinate`);
+// it simply no longer participates in the bank exchange.
 
 const TEXEL_FRACTION_BITS: i32 = 5;
 const TEXEL_FRACTION_SCALE: i32 = 32; // 1 << TEXEL_FRACTION_BITS
@@ -342,10 +332,7 @@ fn tmem_rgba16_linear_base(
 // masks first, and this matches it.
 fn tmem_indexed_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
     let address = linear & TMEM_LOW_HALF_MASK;
-    let first_is_odd = tmem_first_row_parity_odd(tile);
-    let row_is_odd = (row & 1u) != 0u;
-    let exchange = first_is_odd != row_is_odd;
-    if exchange {
+    if (row & 1u) != 0u {
         return address ^ 4u;
     }
     return address;
@@ -353,10 +340,7 @@ fn tmem_indexed_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> 
 
 fn tmem_rgba16_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
     let address = linear & TMEM_ADDRESS_MASK;
-    let first_is_odd = tmem_first_row_parity_odd(tile);
-    let row_is_odd = (row & 1u) != 0u;
-    let exchange = first_is_odd != row_is_odd;
-    if exchange {
+    if (row & 1u) != 0u {
         return address ^ 4u;
     }
     return address;
