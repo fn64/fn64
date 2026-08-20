@@ -243,13 +243,25 @@ pub fn resolve_fill_pixel_rectangle(
 /// `.max(clip_min_x)` / `.min(clip_max_x - 1).min(self.width - 1)` and
 /// returning early only when the result is empty.
 ///
-/// ## Precedence: scissor AND target extent, neither substituting
+/// ## Precedence: the SCISSOR clips; the target extent still refuses
 ///
-/// Both bounds are applied, exactly as [`super::clip_texrect_extent`]
-/// applies them. A scissor tighter than the framebuffer really does suppress
-/// pixels the framebuffer could hold; separately, no span may name memory
-/// outside this executor's sized target. The intersection is strictly
-/// narrower than either.
+/// Deliberately not symmetric, and not the same rule
+/// [`super::clip_texrect_extent`] uses.
+///
+/// The scissor is hardware state whose whole function is to clip, so a
+/// rectangle overhanging it is ordinary content and is narrowed. The target
+/// extent is not hardware state at all -- it is this executor's own sized
+/// buffer, and `plan_fill` already refuses any `FillRectangle` whose
+/// `x1 >= image.width()` before the wire can reach here
+/// (`raw_dpc/mod.rs`). A rectangle that still overhangs the extent at this
+/// point therefore did not come from a decoded stream, and clamping it
+/// would convert a caller error into a silently smaller draw.
+///
+/// So the extent is left to [`super::CandidateColorTarget::plan_rows`],
+/// which refuses it as `TargetError::RectangleOutOfBounds`. Clamping here
+/// instead was tried and measured: it turned
+/// `out_of_bounds_rectangle_is_rejected_without_touching_the_target` from a
+/// refusal into an accepted 4x2 completion.
 ///
 /// ## What this refuses
 ///
@@ -260,18 +272,15 @@ fn clip_fill_rectangle(
     scissor: RdpScissorRect,
     key: ColorTargetKey,
 ) -> Result<FillPixelRectangle, FillExecutionError> {
-    let extent = key.extent();
-    // Half-open intersection of three spans -- the rectangle's own
-    // (inclusive `x1`, hence the `+ 1`), the scissor's, and the target's --
-    // then converted back to this module's inclusive-edge representation.
+    let _ = key.extent();
+    // Half-open intersection of the rectangle's own span (inclusive `x1`,
+    // hence the `+ 1`) with the scissor's, then converted back to this
+    // module's inclusive-edge representation. The target extent is
+    // deliberately absent -- see this function's own doc.
     let first_x = rectangle.x0().max(scissor.first_column());
-    let limit_x = (rectangle.x1() + 1)
-        .min(scissor.column_limit())
-        .min(extent.width());
+    let limit_x = (rectangle.x1() + 1).min(scissor.column_limit());
     let first_y = rectangle.y0().max(scissor.first_row());
-    let limit_y = (rectangle.y1() + 1)
-        .min(scissor.row_limit())
-        .min(extent.height());
+    let limit_y = (rectangle.y1() + 1).min(scissor.row_limit());
     if first_x >= limit_x || first_y >= limit_y {
         return Err(FillExecutionError::ScissoredAway {
             key,
