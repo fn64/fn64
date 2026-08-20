@@ -475,6 +475,13 @@ fn wgpu_bytes(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
         words: command_words(commands),
         transaction_sequence: 1,
         guest_read_sources: Vec::new(),
+        // Serve declared reads from this fixture's own RDRAM image, exactly
+        // as `fn64-abi` slices the live allocation. A partial `FillRectangle`
+        // declares a colour-image seed read that no fixture author wrote into
+        // `guest_read_sources`; without this the replay supplies 0 sources
+        // for 1 declared read and every partial fill is refused, which would
+        // read as a wgpu defect when it is a runner gap.
+        guest_rdram: Some(rdram.to_vec()),
         target_width: WIDTH,
         target_height: HEIGHT,
     };
