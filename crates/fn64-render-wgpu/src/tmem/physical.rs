@@ -2897,8 +2897,30 @@ mod tests {
             .resource_plan()
             .bind_tmem_transfer(load(&fixture.decoded, 0))
             .unwrap();
-        let odd_tail = transfer.words()[1];
-        assert!(odd_tail.odd_row_exchange());
+        // **Word 3, not word 1.** This LoadTile spans two rows (`low_t = 4`,
+        // `high_t = 8`) at three words per row, so words 0-1 are
+        // tile-relative row 0 and words 2-3 are row 1; the tail word that
+        // actually takes the exchange is word 3. This used to read word 1 and
+        // assert it exchanged, which held only while the writer folded the
+        // tile's `low_t` into the exchange -- a term that is not on hardware
+        // and has been removed (see `tmem/read.rs::odd_row_exchange`).
+        //
+        // Word 1 is asserted alongside as the row-0 control, so the pair
+        // discriminates "the exchange follows the row" from "the exchange is
+        // a constant" in either direction.
+        let even_tail = transfer.words()[1];
+        assert!(
+            !even_tail.odd_row_exchange(),
+            "words 0-1 are tile-relative row 0"
+        );
+        assert_eq!(even_tail.defined_source_byte_mask(), 0x03);
+        assert_eq!(physical_defined_lane_mask(even_tail).unwrap(), 0x03);
+
+        let odd_tail = transfer.words()[3];
+        assert!(
+            odd_tail.odd_row_exchange(),
+            "words 2-3 are tile-relative row 1"
+        );
         assert_eq!(odd_tail.defined_source_byte_mask(), 0x03);
         assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0x30);
 
