@@ -1544,7 +1544,6 @@ impl TexrectShading {
         // Only programs that pass admission are counted: a refused one
         // never draws a pixel.
         if crate::combiner::census::enabled() {
-            crate::combiner::census::note_wire(combine.low(), combine.high());
             for slice in cycles.evaluated_slices() {
                 let second_cycle = slice.reads_second_bitfield_slice();
                 crate::combiner::census::note_program(
@@ -1561,17 +1560,6 @@ impl TexrectShading {
                         combine.decode_alpha(AlphaInputSlot::D, second_cycle),
                     ],
                     texel_available,
-                    match slice {
-                        CombinerProgramSlice::OnlyCycleOfOneCycleMode => {
-                            crate::combiner::census::Pass::OneCycleOnly
-                        }
-                        CombinerProgramSlice::FirstOfTwoCycles => {
-                            crate::combiner::census::Pass::TwoCycleFirst
-                        }
-                        CombinerProgramSlice::SecondOfTwoCycles => {
-                            crate::combiner::census::Pass::TwoCycleSecond
-                        }
-                    },
                 );
             }
         }
