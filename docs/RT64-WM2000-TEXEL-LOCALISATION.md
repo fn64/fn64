@@ -664,3 +664,85 @@ Instrumenting RT64 in place is blocked: `fn64-render-rt64/build.rs` asserts
 HEAD matches `docs/rt64-port-authority.json` AND the tree is clean. Use a
 clone plus a temporary manifest edit, and do not build against the shared
 tree concurrently.
+
+
+---
+
+# The hardware derivation, from angrylion
+
+angrylion-rdp-plus is cloned at `/Users/jer/Code/angrylion-rdp-plus`
+(durable, not `/private/tmp` -- the previous checkout was lost to a reboot).
+Everything below is read from that source.
+
+## CONFIRMED: the non-perspective chain, end to end
+
+```
+wire   s    = (ewdata[24] & 0xffff0000) | (ewdata[28] >> 16)   rasterizer.c:2106
+             -> s15.16: integer half from word 24, fraction from word 28
+span   .s   = ((s & ~0x1ff) + dsdiff - (xfrac * dsdxh)) & ~0x3ff   :2253
+             -> subpixel adjust; units unchanged
+pixel  ss   = s >> 16                                              :479
+             -> drops the 16 fractional bits
+tcdiv  sss  = SIGN16(ss) & 0x1ffff                          tcoord.c:1024
+             -> tcdiv_nopersp does NO division and NO scaling
+texel  sfrac = sss & 0x1f ; *S = locs >> 5                  tex.c:182, tcoord.c:143
+             -> sss is S10.5; whole texel = sss >> 5
+```
+
+So **one texel = `2^21` plane units** on hardware: `>>16` to S10.5, `>>5`
+to whole texels.
+
+This is worth stating plainly because `tcdiv_nopersp` is the function fn64's
+`PLANE_TO_TEXEL` cites, and it does not contain a scale at all -- the `2^21`
+lives in the rasterizer's `>>16` composed with the texture pipeline's `>>5`.
+
+## MEASURED: neither backend samples at that scale
+
+Authoring the fixture's planes at `2^21` per texel and running it:
+
+| lane | columns 2..5 |
+|---|---|
+| key | `07c1 f801 7fff 003f` (texels 0,1,2,3) |
+| RT64 | `7fff 7fff 7fff 7fff` (clamped HIGH) |
+| wgpu | `f801 f801 f801 f801` (texel 0, clamped LOW) |
+
+RT64's effective scale is therefore **higher** than hardware's and fn64's is
+**lower**; `2^21` sits between them. A sweep of `2^21 .. 2^28` finds no value
+where RT64 steps one texel per column.
+
+**So the earlier "32x" framing is not the whole story and should not be
+quoted as settled.** What is settled is the hardware chain above.
+
+## CONFIRMED: RT64 is a VERTEX renderer, and that is the deeper difference
+
+`decodeTriangles` evaluates S at three vertices and lets the GPU
+interpolate:
+
+```
+v1 = base + De*dy_1     v2 = base + De*dy_2     v3 = base + De*dy_3 + Dx*dx_3
+```
+
+**Only `v3` carries the `Dx` term.** With `De = 0` -- which a fixture whose
+texcoord depends on X alone naturally wants -- `v1` and `v2` both take
+`base`, so `base` must be the S of whichever edge those two vertices sit on
+and `Dx` must carry the sign of the step to `v3`.
+
+Probe-confirmed on the one-triangle case: `v0` and `v1` both `24.0`, `v2`
+`280.0`.
+
+This has a direct consequence for the two-triangle rectangle. The
+upper-right half's `v1`/`v2` sit on the RIGHT edge, so with a shared plane
+its gradient is REVERSED. Measured: sharing one plane makes the whole box
+read texel 0. Splitting the plane per triangle (base at the right edge, a
+negative `Dx`) restores RT64 to a clamp -- but still not to the key.
+
+fn64's rasterizer evaluates the plane per PIXEL, so `Dx` applies at every
+column regardless. The two models are not reconcilable by a scale factor
+alone, which is why the scale sweep fails.
+
+## What is still open
+
+Which scale each lane effectively uses, expressed in the same units, and
+whether RT64's vertex-interpolation model can be made to agree with a
+per-pixel plane at all for this fixture shape. The hardware chain is now
+known; the mapping from it to each renderer is not.
