@@ -2240,6 +2240,17 @@ impl RenderBackend for WgpuBackend {
             height: h,
         };
         self.configured_target_extent = Some(extent);
+        // **The decoder's height bound follows the resize too.**
+        //
+        // `create` sets both from the same `cfg` field and its comment there
+        // says the two "cannot drift apart" -- but this method updated only
+        // one of them, so every resize left the decoder bounding against the
+        // height `create` configured. That was latent while nothing sized
+        // anything from it; a partial fill's colour-image seed does, and the
+        // drift produced a 256-byte seed for a 128-byte target
+        // (`the_adapterless_fill_path_still_works_after_a_resize`, which is
+        // how it was found).
+        self.rdp_state.set_color_target_height(h);
         if let Some(triangle_target_extent) = self.triangle_target_extent.as_mut() {
             *triangle_target_extent = extent;
         }
