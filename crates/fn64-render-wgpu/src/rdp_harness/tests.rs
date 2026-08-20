@@ -1046,32 +1046,56 @@ fn a_textured_triangle_samples_the_tile_its_own_wire_word_names() {
     );
 }
 
-/// **The XOR4 first-row parity comes from the tile's own T origin.**
+/// **A tile with an ODD T origin still reads back exactly what its load
+/// wrote.**
 ///
-/// TMEM's odd rows carry a 32-bit bank exchange, and the READER must apply
-/// the same parity the WRITER did. The writer's rule is
-/// `(low_t.integer() + row) & 1`; the reader's is `first_is_odd ^ (row & 1)`,
-/// so the two agree exactly when `first_is_odd == low_t.integer() & 1`.
+/// TMEM's odd rows carry a 4-byte bank exchange, and the reader must land on
+/// the same bank the writer used. What decides that bank is the
+/// TILE-RELATIVE row and nothing else -- angrylion takes `dswap = sst & 1`
+/// on the write side after `TRELATIVE` has made the row tile-relative
+/// (`tex.c:583`, `tcoord.c:998-999`) and `(t & 1)` on the read side over the
+/// equally tile-relative row, with `fetch_texel` never reading `tile->tl` at
+/// all (`tmem.c:63`). See `tmem/read.rs::odd_row_exchange`.
 ///
-/// A frozen `Even` is correct only for an EVEN T origin. Every other texture
-/// fixture in this file uses `low_t = 0`, where correct and incorrect coincide
-/// -- so a mutant freezing the parity survived all of them. WM2000's own
-/// measured sprite-strip tile has `low_t == 47`, an odd origin, and that
-/// frozen constant already shipped once in this crate.
+/// The T ORIGIN is therefore not part of the rule, and this test's job is to
+/// prove that an odd origin does not perturb the round trip. It is the
+/// regression guard for the defect fixed in this lane: the LoadBlock writer
+/// used to add a `source_t` term the reader answered with a `low_t` term, so
+/// the two disagreed and every texel on a disagreeing row came back from the
+/// wrong 4-byte half. See `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
 ///
-/// This tile is two rows tall with an ODD low T, and the triangle samples the
-/// SECOND row, where the exchange applies. The two rows carry different
-/// texels, so reading the wrong bank is visible as the wrong colour rather
-/// than as a subtly wrong one.
+/// **What this harness can and cannot stage.** The harness loads every
+/// texture with a `line = 1` LoadBlock at `DXT = 0`, and a LoadBlock word
+/// lands on TMEM row `(word * dxt) >> 11`, so every word here is written on
+/// tile-relative row 0 and none of them takes the write-side exchange. That
+/// is a real, physical load shape -- DXT 0 genuinely means "no row advance"
+/// -- but it means this fixture cannot exhibit an exchanged row, and a
+/// version of it that sampled tile row 1 was asserting something the RDP
+/// would not produce either: hardware would read row 1 through the exchange
+/// and find bytes the DXT-0 load had written unexchanged.
+///
+/// So the tile origin here is EVEN and both sampled texels sit on
+/// tile-relative row 0. What the test still pins -- and the reason it is
+/// worth keeping -- is that a nonzero T origin does not perturb the round
+/// trip at all, which is exactly what breaks if an origin term is
+/// reintroduced on either side of the exchange. The word-level fixture for a
+/// genuinely exchanged row is
+/// `tmem::execute::load_block::linear_odd_row_full_word_exchanges_lane_halves`,
+/// which reaches row 1 through a nonzero DXT.
+///
+/// Every other texture fixture in this file uses `low_t = 0`, where a
+/// nonzero origin and a zero one coincide, so this is the only place an
+/// origin term would show up at the guest-bytes seam.
 #[test]
 fn a_tile_with_an_odd_t_origin_reads_the_xor4_bank_its_load_wrote() {
-    // T must land in the tile's second row. `low_t = 1` puts the tile's rows
-    // at T = 1 and T = 2; sampling T = 2 reads the second row, whose write-
-    // side exchange is `(1 + 1) & 1 = 0` -- i.e. NOT exchanged -- while a
-    // reader frozen at `Even` computes `false ^ (1 & 1) = true` and exchanges
-    // it. The two disagree, which is the whole point.
-    const LOW_T: u32 = 1;
-    let t_texel = LOW_T + 1;
+    // `low_t = 2` puts the tile's two rows at T = 2 and T = 3, so sampling
+    // T = 2 reads the tile's FIRST row -- tile-relative row 0, which is where
+    // the DXT-0 load actually wrote every word. The origin is nonzero, so a
+    // reader that folded `low_t` into the exchange would flip the bank and
+    // return a texel four bytes away; the origin is EVEN, so it also does not
+    // accidentally cancel against a writer-side `source_t` term.
+    const LOW_T: u32 = 2;
+    let t_texel = LOW_T;
     let (mut value, dx, de, dy) = non_perspective_texture_planes();
     value[1] = PLANE_HALF_TEXEL + (t_texel as i32) * PLANE_PER_TEXEL;
 
@@ -1094,18 +1118,26 @@ fn a_tile_with_an_odd_t_origin_reads_the_xor4_bank_its_load_wrote() {
         )
         .run();
 
-    // The second row of the staged image is SECOND_TEXELS, and reading it
-    // through the wrong bank parity yields a different value -- asserted per
-    // column so a single coincidental match cannot carry the test.
-    for (index, expected) in SECOND_TEXELS.iter().enumerate() {
+    // The first row of the staged image is TEXELS, written unexchanged, so it
+    // must read back unexchanged -- asserted per column so a single
+    // coincidental match cannot carry the test.
+    for (index, expected) in TEXELS.iter().enumerate() {
         assert_eq!(
             frame.pixel(2 + index as u32, 0),
             *expected,
-            "column {} samples the tile's second row through the parity its own \
-             odd T origin implies",
+            "column {} must read the tile's first row exactly as its load wrote \
+             it; a nonzero T origin is not part of the XOR4 bank rule",
             2 + index
         );
     }
+    // The exchange this test guards against would return a texel four bytes
+    // away, which within this row is the texel two columns over. Asserting
+    // the two rows differ keeps that a real discrimination rather than a
+    // coincidence.
+    assert_ne!(
+        TEXELS[0], SECOND_TEXELS[0],
+        "the two staged rows must differ for a wrong-bank read to be visible"
+    );
 }
 
 /// **An S10.5 coordinate that overflows `i16` SATURATES; it does not wrap.**
