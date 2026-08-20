@@ -4028,6 +4028,68 @@ pub mod census {
         out
     }
 
+    /// The S/T coordinate SPREAD within each drawn triangle, in whole
+    /// texels, plus whether it took the perspective path.
+    ///
+    /// This is the follow-on to the distinct-texel count: once a triangle is
+    /// known to read one texel, the question is whether its coordinates were
+    /// constant (a coordinate-derivation fault) or whether they varied and
+    /// the addressing collapsed them (a masking/clamp fault). The two live
+    /// in different files and this tells them apart without a third run.
+    static SPREAD_S: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+    static SPREAD_T: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+    static PERSPECTIVE: [AtomicU64; 2] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 2]
+    };
+
+    /// Same bucket edges as [`DISTINCT_BUCKETS`], read as whole texels.
+    pub fn note_triangle_spread(spread_s: i32, spread_t: i32, perspective: bool) {
+        let bucket = |value: i32| match value {
+            i32::MIN..=0 => 0,
+            1 => 1,
+            2..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=64 => 5,
+            65..=256 => 6,
+            _ => 7,
+        };
+        SPREAD_S[bucket(spread_s)].fetch_add(1, Ordering::Relaxed);
+        SPREAD_T[bucket(spread_t)].fetch_add(1, Ordering::Relaxed);
+        PERSPECTIVE[usize::from(perspective)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub const SPREAD_BUCKETS: [&str; 8] =
+        ["0", "1", "2-4", "5-8", "9-16", "17-64", "65-256", ">256"];
+
+    pub fn spread_histograms() -> ([u64; 8], [u64; 8], [u64; 2]) {
+        let load = |bank: &[AtomicU64; 8]| {
+            let mut out = [0u64; 8];
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = bank[index].load(Ordering::Relaxed);
+            }
+            out
+        };
+        (
+            load(&SPREAD_S),
+            load(&SPREAD_T),
+            [
+                PERSPECTIVE[0].load(Ordering::Relaxed),
+                PERSPECTIVE[1].load(Ordering::Relaxed),
+            ],
+        )
+    }
+
     /// `(texel luma buckets, shade alpha buckets)`, each sixteen wide.
     pub fn pixel_histograms() -> ([u64; 16], [u64; 16]) {
         let mut luma = [0u64; 16];
@@ -4115,6 +4177,27 @@ pub mod census {
             "[fn64-combiner]   shade alpha /16 (pixels={}):{}",
             shade_alpha.iter().sum::<u64>(),
             render(&shade_alpha)
+        );
+        let (spread_s, spread_t, perspective) = spread_histograms();
+        let render8 = |buckets: &[u64; 8]| {
+            buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, count)| format!(" {}:{count}", SPREAD_BUCKETS[index]))
+                .collect::<String>()
+        };
+        eprintln!(
+            "[fn64-combiner]   S spread/triangle (texels):{}",
+            render8(&spread_s)
+        );
+        eprintln!(
+            "[fn64-combiner]   T spread/triangle (texels):{}",
+            render8(&spread_t)
+        );
+        eprintln!(
+            "[fn64-combiner]   perspective: off={} on={}",
+            perspective[0], perspective[1]
         );
         let distinct = distinct_histogram();
         let distinct_line: String = distinct

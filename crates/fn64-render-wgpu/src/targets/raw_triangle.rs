@@ -377,6 +377,11 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     } else {
         None
     };
+    // The S/T range this triangle actually requested, in S10.5 raw units,
+    // tracked alongside the distinct-texel count so a one-texel triangle can
+    // be attributed to constant COORDINATES rather than to collapsing
+    // ADDRESSING without a further run.
+    let mut coordinate_range: Option<(i16, i16, i16, i16)> = None;
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
     // **First-row parity comes from the tile's own T origin, not a
     // constant** -- `execute_texture_rectangle`'s own rule, applied here for
@@ -469,6 +474,17 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                         triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
                     });
                     let (s, t) = triangle_span::texture_coordinates_s10_5(stw, perspective);
+                    if census_pixels {
+                        coordinate_range = Some(match coordinate_range {
+                            None => (s, s, t, t),
+                            Some((s_low, s_high, t_low, t_high)) => (
+                                s_low.min(s),
+                                s_high.max(s),
+                                t_low.min(t),
+                                t_high.max(t),
+                            ),
+                        });
+                    }
                     let request = PointSampleRequest::new(
                         PointSampleCoordinates::new(
                             TextureCoordinateS10_5::from_raw(s),
@@ -540,6 +556,17 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     }
     if let Some(seen) = distinct_texels {
         crate::combiner::census::note_triangle_distinct_texels(seen.len());
+        // S10.5 raw units carry five fractional bits, so `>> 5` is the whole
+        // texel count the span covered. A triangle spanning less than one
+        // texel is genuinely entitled to one distinct texel; one spanning
+        // many and still reading one is the defect.
+        if let Some((s_low, s_high, t_low, t_high)) = coordinate_range {
+            crate::combiner::census::note_triangle_spread(
+                (i32::from(s_high) - i32::from(s_low)) >> 5,
+                (i32::from(t_high) - i32::from(t_low)) >> 5,
+                perspective,
+            );
+        }
     }
     Ok(())
 }
