@@ -11,6 +11,7 @@ fn64-render-ir = { path = "../fn64-render-ir" }
 fn64-render = { path = "../fn64-render", optional = true }
 fn64-render-reference = { path = "../fn64-render-reference", optional = true }
 fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false, optional = true }
+fn64-render-wgpu = { path = "../fn64-render-wgpu", optional = true }
 fn64-runtime = { path = "../fn64-runtime", optional = true }
 libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +23,14 @@ reference-runner = [
     "dep:fn64-render",
     "dep:fn64-render-reference",
     "dep:fn64-runtime",
+]
+# The wgpu runner: the first adapter for the backend fn64 actually ships.
+# Adapterless -- it drives `fn64-render-wgpu`'s CPU-side raw-DPC seam and reads
+# `ColorTargetRegistry`'s `device_bytes`, a CPU `Vec<u8>`. No GPU required.
+wgpu-runner = [
+    "dep:fn64-render-wgpu",
+    "dep:fn64-runtime",
+    "fn64-render-wgpu/conformance-runner",
 ]
 rt64-deferred-history-runner = [
     "dep:fn64-render",
@@ -40,6 +49,11 @@ required-features = ["conformance-test-runner"]
 name = "fn64-render-conformance-reference-runner"
 path = "src/bin/fn64-render-conformance-reference-runner.rs"
 required-features = ["reference-runner"]
+
+[[bin]]
+name = "fn64-render-conformance-wgpu-runner"
+path = "src/bin/fn64-render-conformance-wgpu-runner.rs"
+required-features = ["wgpu-runner"]
 
 [[bin]]
 name = "fn64-render-conformance-rt64-deferred-history-runner"
