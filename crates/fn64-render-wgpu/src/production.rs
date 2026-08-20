@@ -876,7 +876,22 @@ struct PlanCollector {
     /// mode it never ran under. Snapshotting per command is the same rule
     /// `triangles` already follows and states in its own doc: "never a
     /// single whole-plan-final value".
-    fills: Vec<(u32, fn64_render::RdpFillRectangleCommand, Option<OtherMode>)>,
+    ///
+    /// The `RdpScissorRect` snapshot is taken at the same stream position
+    /// and for the same reason. angrylion clips every span against the
+    /// `clip` rect latched by `rdp_set_scissor` (`rasterizer.c:2779-2784`),
+    /// applied at `:2349-2363` for X and `:2284-2305` for Y -- so a fill
+    /// observes the scissor current where IT sits, not the one a later
+    /// `SetScissor` installed for a following primitive. `None` here means
+    /// the plan issued no `SetScissor` before this fill, and the consumer
+    /// (`fill_scissor_or_full_target`) supplies the whole-target fallback,
+    /// exactly as the texrect path already does.
+    fills: Vec<(
+        u32,
+        fn64_render::RdpFillRectangleCommand,
+        Option<OtherMode>,
+        Option<crate::targets::RdpScissorRect>,
+    )>,
     /// One entry per admitted `FullSync` site, in plan order, paired with
     /// its own decode-order command index.
     ///
@@ -1295,8 +1310,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
             // here falls into the catch-all below and panics at execute time
             // rather than failing to compile.
             RawDpcSemanticCommandRef::FillRectangle(fill) => {
-                self.fills
-                    .push((command_index, fill.clone(), self.current_other_mode));
+                self.fills.push((
+                    command_index,
+                    fill.clone(),
+                    self.current_other_mode,
+                    self.current_scissor,
+                ));
             }
             // Mandatory alongside `push_full_sync_site`'s admission, for the
             // same `#[non_exhaustive]` reason as the arm above.
@@ -3649,7 +3668,7 @@ fn stage_color_commands(
         .fills
         .iter()
         .enumerate()
-        .map(|(index, (command_index, _, _))| (*command_index, ColorCommandKind::Fill(index)))
+        .map(|(index, (command_index, _, _, _))| (*command_index, ColorCommandKind::Fill(index)))
         .chain(collector.plan.texrect_commands.iter().enumerate().map(
             |(index, (_, _, _, command_index))| (*command_index, ColorCommandKind::Texrect(index)),
         ))
@@ -3908,7 +3927,7 @@ fn color_target_key(
         .plan
         .current_color_image
         .ok_or(WgpuRawDpcExecutionError::NoStagedColorImage)?;
-    if let Some((command_index, fill, _)) = collector.plan.fills.first() {
+    if let Some((command_index, fill, _, _)) = collector.plan.fills.first() {
         let declared = ColorImage::from_wire(
             image_format(fill.color_image.format),
             pixel_size(fill.color_image.size),
@@ -3949,7 +3968,7 @@ fn execute_scheduled_fill(
     index: usize,
     accumulated: Option<&[u8]>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
-    let (_, fill, fill_other_mode) = &collector.plan.fills[index];
+    let (_, fill, fill_other_mode, fill_scissor) = &collector.plan.fills[index];
 
     // This fill's OWN `OtherMode`, snapshotted at its stream position --
     // not the walk's running value, which a later `SetOtherMode` (a
@@ -3961,6 +3980,15 @@ fn execute_scheduled_fill(
         ));
     };
 
+    // **The same scissor the texrect path already honours, from the same
+    // latched state and through the same whole-target fallback.**
+    // angrylion clips a fill's spans against `clip` exactly as it clips a
+    // texrect's -- the edgewalker's X clamp at `rasterizer.c:2349-2363` and
+    // its Y limits at `:2284-2305` are shared by every primitive the
+    // rasterizer walks, not specialised per command. Reusing
+    // `texrect_scissor_or_full_target` rather than writing a second
+    // fallback keeps one model of "no SetScissor means the whole target".
+    let scissor = texrect_scissor_or_full_target(*fill_scissor, candidate.key().extent());
     let completed = execute_fill_rectangle(
         candidate,
         other_mode,
@@ -3971,6 +3999,7 @@ fn execute_scheduled_fill(
             fill.lower_right_x,
             fill.lower_right_y,
         ),
+        scissor,
         accumulated,
     )?;
     let accesses = fill_accesses(&collector.plan.accesses, fill)?.to_vec();
