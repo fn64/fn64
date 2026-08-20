@@ -281,6 +281,10 @@ pub struct RawDpcResourcePlan {
     accesses: Box<[ResourceAccess]>,
     tmem_transfers: Box<[TmemTransferRecord]>,
     fill_spans: Box<[FillAccessSpan]>,
+    /// One entry per admitted `FillRectangle`, naming the declared guest
+    /// read that carries its colour-image seed, or `None` when the fill is
+    /// full-extent and needs none. See [`FillSeedRead`].
+    fill_seeds: Box<[FillSeedRead]>,
 }
 
 /// The exact ordered `ResourceAccess` run one admitted `FillRectangle`
@@ -482,6 +486,23 @@ impl RawDpcResourcePlan {
             return Err(FillAccessSpanError::AccessDescriptorsDiffer { command_index });
         }
         Ok((span, accesses))
+    }
+
+    /// The declared guest read carrying the colour-image seed for the fill
+    /// at decode-order position `command_index`.
+    ///
+    /// `Ok(None)` means that fill covers the whole target and legitimately
+    /// declared no seed -- every byte comes from the command itself.
+    /// `Err(FillNotDeclared)` means no seed record exists for the command at
+    /// all, which is a decoder bug rather than a full-extent fill, and is
+    /// kept distinguishable for exactly that reason.
+    pub fn bind_fill_seed(&self, command_index: u32) -> Result<Option<u32>, FillAccessSpanError> {
+        self.fill_seeds
+            .iter()
+            .copied()
+            .find(|seed| seed.command_index == command_index)
+            .map(|seed| seed.access_index)
+            .ok_or(FillAccessSpanError::FillNotDeclared { command_index })
     }
 
     /// The exact ordered access slice `plan_texture_rectangle` pushed for the
@@ -979,6 +1000,7 @@ fn decode_from_state(
     let mut delta = RdpStateDelta::default();
     let mut commands = Vec::new();
     let mut fill_spans: Vec<FillAccessSpan> = Vec::new();
+    let mut fill_seeds: Vec<FillSeedRead> = Vec::new();
     for (stream_index, stream) in packet.streams().iter().enumerate() {
         let flattened = FlattenedStream::new(workload, stream_index, stream);
         decode_stream(
@@ -990,6 +1012,7 @@ fn decode_from_state(
             &mut planned,
             &mut commands,
             &mut fill_spans,
+            &mut fill_seeds,
         )?;
     }
 
@@ -1030,6 +1053,7 @@ fn decode_from_state(
             accesses: resource_accesses,
             tmem_transfers,
             fill_spans: fill_spans.into_boxed_slice(),
+            fill_seeds: fill_seeds.into_boxed_slice(),
         },
         origin,
     })
@@ -1124,6 +1148,7 @@ fn decode_stream(
     planned: &mut Vec<ResourceAccess>,
     commands: &mut Vec<DecodedRawDpcCommand>,
     fill_spans: &mut Vec<FillAccessSpan>,
+    fill_seeds: &mut Vec<FillSeedRead>,
 ) -> Result<(), RawDpcDecodeError> {
     let mut offset = 0usize;
     while offset < stream.bytes.len() {
@@ -1335,6 +1360,7 @@ fn decode_stream(
                     state,
                     planned,
                     fill_spans,
+                    fill_seeds,
                 )?;
                 RawDpcCommandKind::FillRectangle(rectangle)
             }
@@ -1502,6 +1528,7 @@ fn plan_fill(
     state: &RdpState,
     planned: &mut Vec<ResourceAccess>,
     fill_spans: &mut Vec<FillAccessSpan>,
+    fill_seeds: &mut Vec<FillSeedRead>,
 ) -> Result<(), RawDpcDecodeError> {
     // **A non-Fill cycle type declares no write; it does not fail the
     // decode.** This is the same "decode succeeds, journal stays silent"
@@ -1650,10 +1677,17 @@ fn plan_fill(
     // fallback `texrect_scissor_or_full_target` supplies on the execute
     // side. The clip below is then a no-op, so an unscissored stream
     // declares exactly what it declared before this change.
-    let Some(rectangle) = clip_fill_rows_to_scissor(
-        RenderTargetRectangle { x0, y0, x1, y1 },
-        state.scissor(),
-    ) else {
+    // The host-configured colour-target height, which `SetColorImage` does
+    // not carry (see `RdpState::color_target_height`'s own doc). Needed only
+    // to size the seed read; a fill that needs no seed never asks for it.
+    let Some(height) = state.color_target_height() else {
+        return Err(RawDpcDecodeError::InvalidCommand {
+            location,
+            reason: "FillRectangle requires a configured color-target height",
+        });
+    };
+    let full_extent = RenderTargetRectangle { x0, y0, x1, y1 };
+    let Some(rectangle) = clip_fill_rows_to_scissor(full_extent, state.scissor()) else {
         // Nothing survives the clip, so this command writes no guest byte
         // and the journal must declare none. Not an error: a fully
         // scissored-away rectangle is ordinary content (a sprite walked off
@@ -1662,6 +1696,104 @@ fn plan_fill(
         // execute one, which it now never is.
         return Ok(());
     };
+    // **A partial fill declares a READ of the colour image it is patching
+    // into, so the pixels it does not paint have a real value.**
+    //
+    // A fill that covers the whole target needs no seed: every byte comes
+    // from the command. A partial one does, and the alternative is the
+    // fabricated zeros `targets/mod.rs` used to refuse the draw over --
+    // measured, not assumed: admitting partial fills without this read made
+    // the differential's `top-left-quadrant` report `wgpu: 0x0000` where
+    // both the reference and the hand-derived key say `0xffff`.
+    //
+    // The oracle does exactly this. `fn64-render-reference` seeds its
+    // target from guest RDRAM before rendering every raw-RDP task
+    // (`backend/imp.rs:440-447` calling `framebuffer_io.rs:12-44`), fills
+    // strictly inside the clipped rect, and writes the whole extent back.
+    // Its untouched pixels are the pre-existing guest bytes, which is what
+    // hardware gives: an N64 colour image is RDRAM, and the bytes outside a
+    // fill are whatever was already there.
+    //
+    // `TmemLoadSource` is the purpose because it is the one the deferred
+    // guest-read plan selects on -- `DeferredGuestReadPlan::try_from_journal`
+    // (`fn64-render-ir/src/guest_read.rs`) keys purely on
+    // `purpose == TmemLoadSource` and is otherwise resource-agnostic, and
+    // `ResourceAccess::try_new` explicitly admits
+    // `RdramResource::ColorFramebuffer` for it. Naming it `UploadSource`,
+    // which reads more honestly, would make the plan skip the read and hand
+    // the executor nothing. The narrower name is the load-bearing one here;
+    // `docs/RT64-FILL-PARTIAL-SEED.md` records the seam.
+    //
+    // **Pushed BEFORE the write span, never inside it.** `fill_accesses`
+    // re-checks that every access in a fill's recorded span is
+    // `Write`/`RenderTarget`, and `plan_render_target_rows` records the span
+    // starting at the next index, so a read pushed here stays outside it.
+    // **Full extent of the TARGET, not "unchanged by the scissor clip".**
+    //
+    // The question a seed answers is "are there pixels of this colour image
+    // that this command will not write", and that is a comparison against
+    // the image, not against the pre-clip rectangle. Comparing to
+    // `full_extent` instead was measured wrong: the differential's
+    // `top-left-quadrant`, `single-pixel` and `last-column-last-row` cases
+    // are unscissored, so the clip is a no-op and `rectangle == full_extent`
+    // held for every one of them -- while each covers a small corner of an
+    // 8x4 target and needs a seed badly.
+    let covers_target =
+        rectangle.x0 == 0 && rectangle.y0 == 0 && rectangle.x1 + 1 == image.width() && rectangle.y1 + 1 == height;
+    let seed = if covers_target {
+        None
+    } else {
+        let pixels = image
+            .width()
+            .checked_mul(height)
+            .ok_or(RawDpcDecodeError::InvalidCommand {
+                location,
+                reason: "color image pixel count overflows",
+            })?;
+        let bytes_per_pixel =
+            image
+                .size()
+                .bytes_per_pixel()
+                .ok_or(RawDpcDecodeError::InvalidCommand {
+                    location,
+                    reason: "color image size has no byte width",
+                })?;
+        let start = image.address().get();
+        let end = pixels
+            .checked_mul(bytes_per_pixel)
+            .and_then(|bytes| start.checked_add(bytes))
+            .ok_or(RawDpcDecodeError::InvalidCommand {
+                location,
+                reason: "color image byte range overflows",
+            })?;
+        let range =
+            layout
+                .range(start, end)
+                .map_err(|_| RawDpcDecodeError::InvalidCommand {
+                    location,
+                    reason: "color image lies outside installed RDRAM",
+                })?;
+        let index = u32::try_from(planned.len()).map_err(|_| {
+            RawDpcDecodeError::ResourcePlanOverflow {
+                workload: location.workload,
+            }
+        })?;
+        push_access(
+            location.workload,
+            planned,
+            AccessMode::Read,
+            AccessPurpose::TmemLoadSource,
+            ResourceRegion::Rdram {
+                resource: RdramResource::ColorFramebuffer,
+                range,
+            },
+        )?;
+        Some(index)
+    };
+    fill_seeds.push(FillSeedRead {
+        command_index,
+        access_index: seed,
+    });
     plan_render_target_rows(
         location,
         command_index,
@@ -1671,6 +1803,30 @@ fn plan_fill(
         planned,
         fill_spans,
     )
+}
+
+/// Which declared guest read carries the colour-image seed for one admitted
+/// `FillRectangle`, or `None` when the fill covers the whole target and
+/// needs no seed.
+///
+/// Recorded per command rather than inferred at execute time: the executor
+/// must be able to tell "this fill declared no seed because it is
+/// full-extent" from "this fill declared a seed that failed to thread",
+/// and only the decoder knows which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillSeedRead {
+    command_index: u32,
+    access_index: Option<u32>,
+}
+
+impl FillSeedRead {
+    pub const fn command_index(self) -> u32 {
+        self.command_index
+    }
+
+    pub const fn access_index(self) -> Option<u32> {
+        self.access_index
+    }
 }
 
 /// Intersects one fill's whole-pixel destination rectangle with the staged

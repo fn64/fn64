@@ -186,6 +186,13 @@ impl FillPixelRectangle {
     pub const fn height(self) -> u32 {
         self.y1 - self.y0 + 1
     }
+
+    /// Whether this rectangle covers every pixel of `extent`.
+    ///
+    /// Inclusive edges, so the last covered column is `x1`, not `x1 - 1`.
+    pub const fn covers(self, extent: super::ColorTargetExtent) -> bool {
+        self.x0 == 0 && self.y0 == 0 && self.x1 + 1 == extent.width() && self.y1 + 1 == extent.height()
+    }
 }
 
 fn whole_pixel(field: &'static str, raw: u16) -> Result<u32, FillCoordinateError> {
@@ -339,6 +346,17 @@ pub enum FillExecutionError {
         rectangle: FillPixelRectangle,
         scissor: RdpScissorRect,
     },
+    /// A partial fill into a brand-new target arrived with no seed bytes,
+    /// so the pixels it does not paint have no real value to take.
+    ///
+    /// Loud rather than zero-filled. The zeros are what the old
+    /// `PartialNewTargetInitialization` refusal was protecting against, and
+    /// they are observable: the differential measured `wgpu: 0x0000`
+    /// against a `0xffff` key for exactly this shape.
+    MissingSeedBytes {
+        key: ColorTargetKey,
+        rectangle: FillPixelRectangle,
+    },
 }
 
 impl core::fmt::Display for FillExecutionError {
@@ -359,6 +377,12 @@ impl core::fmt::Display for FillExecutionError {
                 "execute_fill_rectangle requires resident_bytes for already-resident target \
                  {key:?}; treating a resident candidate as if it had no prior content would \
                  silently discard everything outside the claimed rectangle"
+            ),
+            Self::MissingSeedBytes { key, rectangle } => write!(
+                formatter,
+                "partial FillRectangle {rectangle:?} into brand-new target {key:?} has no seed \
+                 bytes; its unpainted pixels would be fabricated zeros rather than the guest's \
+                 own framebuffer content"
             ),
             Self::ScissoredAway {
                 key,
@@ -472,7 +496,22 @@ pub fn execute_fill_rectangle(
             // prior generation's bytes through. Loud trap, not a fallback.
             return Err(FillExecutionError::MissingResidentBytes { key });
         }
-        None => vec![0u8; full_len],
+        // A brand-new target with no seed. Legitimate ONLY when this fill
+        // covers the whole target, because then every byte of the buffer is
+        // about to be overwritten and the initial content is unobservable.
+        //
+        // A partial fill reaching here would publish fabricated zeros
+        // outside its rectangle -- measured, not hypothesised: before the
+        // seed existed, the differential reported `wgpu: 0x0000` where both
+        // the reference and the hand-derived key say `0xffff`. So it is
+        // refused by name instead.
+        None if clipped.covers(extent) => vec![0u8; full_len],
+        None => {
+            return Err(FillExecutionError::MissingSeedBytes {
+                key,
+                rectangle: clipped,
+            })
+        }
     };
 
     for row in plan.rows() {

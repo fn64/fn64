@@ -1200,6 +1200,31 @@ pub fn push_decoded_raw_dpc(
                 let neutral_image = neutral_color_image(color_image, layout);
                 let neutral_fill = neutral_fill_color(fill_color);
                 let after = RdpStateIdentity::of_color_image(neutral_image);
+                // **The colour-image seed read, mirrored into the writer at
+                // the same position the decoder pushed it.**
+                //
+                // `finish`'s check is access-for-access against the real
+                // journal, so an access the decoder declared and the writer
+                // omitted is a hard count mismatch -- which is exactly what
+                // this arm produced before the mirror was added ("accumulated
+                // access count is 5; exact journal requires 6").
+                //
+                // Pushed BEFORE `push_fill_rectangle`, because `plan_fill`
+                // pushes the seed before `plan_render_target_rows` pushes the
+                // write span, and the two orders have to agree.
+                let seed_access_index = resource_plan
+                    .bind_fill_seed(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                if let Some(seed_index) = seed_access_index {
+                    let access = resource_plan
+                        .accesses()
+                        .get(seed_index as usize)
+                        .copied()
+                        .ok_or(PushDecodedRawDpcError::FillAccessSpan(
+                            FillAccessSpanError::AccessSliceOutOfBounds { command_index },
+                        ))?;
+                    writer.push_command_decode_access(access);
+                }
                 writer.push_fill_rectangle(
                     RdpFillRectangleCommand {
                         location,
@@ -1212,6 +1237,13 @@ pub fn push_decoded_raw_dpc(
                         fill_color: neutral_fill,
                         first_access_index: span.first_access_index(),
                         access_count: span.count(),
+                        // A fill that declared a span always declared a seed
+                        // record too -- `plan_fill` pushes both or neither --
+                        // so a missing record is a decoder bug and stays a
+                        // loud rejection rather than being absorbed into
+                        // `None`, which would silently mean "full extent,
+                        // needs no seed".
+                        seed_access_index,
                         before: tracker.color_image,
                         after,
                     },
