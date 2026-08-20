@@ -153,3 +153,70 @@ one a whole-pixel multiple, so `ceil`, `floor` and `round` all give the same
 answer. Nothing in this branch's clip decides a subpixel rounding rule, and
 nothing here should be cited as having validated one. The open question that
 lane raises stays open. HYPOTHESIS, theirs, untested here.
+
+## Mutation results
+
+Two rounds. The first ran every mutant against the differential sweep alone,
+which is the instrument that found the defects; five of eight survived it.
+That is the finding, not a footnote: **the sweep proves the fix, and does not
+by itself protect it.**
+
+Round one, against the sweep only:
+
+| Mutant | Sweep |
+|---|---|
+| executor ignores the scissor's low X edge | SURVIVED |
+| executor ignores the scissor's high X edge | killed (1 case) |
+| decoder declares unclipped rows | killed (1) |
+| seed never declared | killed (4) |
+| seed read raw, byte-lane inversion dropped | SURVIVED |
+| unseeded partial fill silently zero-filled | SURVIVED |
+| `covers_target` uses width for the height bound | SURVIVED |
+| empty-clip refusal replaced by a silent no-op | SURVIVED |
+
+Round two, against the unit suite after writing tests for each survivor: all
+killed except one, plus six axis mutants written specifically for the
+X/Y-asymmetry finding above:
+
+| Mutant | Result |
+|---|---|
+| Y axis ignored entirely, X still clipped | killed (2 tests) |
+| X axis ignored entirely, Y still clipped | killed (2) |
+| Y high edge only ignored | killed (1) |
+| Y low edge only ignored | killed (1) |
+| X low edge only ignored | killed (1) |
+| `row_limit` derived from `column_limit` | killed (2) |
+| seed byte-lane inversion dropped | killed (1) |
+| unseeded partial fill zero-filled (guard deleted) | killed (1) |
+| empty-clip refusal replaced by a silent no-op | killed (1) |
+| seed never declared | killed (2) |
+| `clip_fill_rows_to_scissor` drops its row limit | killed (1) |
+| **clip bypassed at its CALL SITE in `plan_fill`** | **SURVIVED** |
+
+Why two of these hid from the sweep is worth keeping, because both are the
+fixture-coincidence trap in its exact documented form:
+
+- **The byte-lane mutant** hid because the sweep seeds every framebuffer
+  halfword to `STALE = 0xffff`, which is a palindrome under any byte
+  permutation. A swapped seed reads back identical. The replacement test uses
+  four distinct bytes per word, where all 24 permutations differ.
+- **The zero-fill mutant** hid because the sweep's partial cases all now
+  supply a seed, so the no-seed arm is never taken there.
+
+## The one survivor, stated plainly
+
+Bypassing `clip_fill_rows_to_scissor` at its **call site** in `plan_fill`
+survives the whole suite. Mutating the clip *function* is killed, so the
+function and its contract are covered; what is not covered is that
+`plan_fill` actually calls it.
+
+The obstacle is real rather than laziness: `plan_fill` is reached by two
+decode passes, and the plan a `JournalMismatch` probe reports is not the one
+the retained `DecodedRawDpc` carries -- a packet-level fixture written the
+obvious way asserts the wrong pass and passes against the mutant. Closing it
+needs a fixture that reads the retained plan, which is worth doing and is not
+done here.
+
+The sweep does kill this mutant end-to-end (`scissor-narrower-than-rect`
+regains 16 differing pixels), so the behaviour is not unguarded -- it is
+guarded by the differential rather than by the unit suite.
