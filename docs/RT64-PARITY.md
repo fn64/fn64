@@ -86,12 +86,29 @@ color image at `0x100000` and `GUARD` half-words either side of the target.
 | | count |
 |---|---|
 | cases (**the denominator**) | **10** |
-| byte-identical wgpu vs RT64 | **6** |
+| byte-identical wgpu vs RT64 | **9** |
 | differs (both completed, bytes unequal) | **1** |
-| one backend refused | **3** |
+| one backend refused | **0** |
 | both refused | 0 |
 
-**6 of 10.**
+**9 of 10.**
+
+*Was 6 of 10 when this document was first written.* The three
+`one backend refused` cases were wgpu refusing partial-target fills
+(`cannot become resident from partial initialization`); the fill lane closed
+that by seeding a partial fill from the guest's own framebuffer, and closed
+the scissor gap alongside it. All three now render and match the oracle
+byte-for-byte. That is the first time a change in this project was **scored**
+rather than asserted -- the instrument moved, and the number moved with it.
+
+One integration defect surfaced only where the two lanes met, and is worth
+recording because it looked exactly like a renderer regression: the fill work
+added a `guest_rdram` field to `ConformanceReplay`, and this runner -- merged
+from a separate lane -- did not set it. Setting it to `None` compiled, but then
+the replay supplied 0 sources for the 1 read a partial fill now declares, so
+every partial fill was refused and parity read **2 of 10**. The runner already
+built an RDRAM image two lines above; it simply was not passing it. A parity
+drop is not automatically a backend finding.
 
 ### 3.2 Partition B — RT64 NOT authoritative (coverage / AA / dither)
 
@@ -284,8 +301,8 @@ six mutants were killed.
 
 | Mutant | Expected kill | Observed |
 |---|---|---|
-| M1: `wgpu_bytes` returns RT64's bytes | every case becomes identical | Partition A went 6/10 → **10/10**, all refusals vanished |
-| M2: invert the `scissor-top-rows-only` key | parity tally **unchanged**; only key attribution moves | tally identical (6/10, 38,400 px); `rt64_matches_key` true → **false** |
+| M1: `wgpu_bytes` returns RT64's bytes | every case becomes identical | Partition A went 6/10 → **10/10**, all refusals vanished (measured against the 6/10 baseline of the day; the mutant's meaning is unchanged at 9/10) |
+| M2: invert the `scissor-top-rows-only` key | parity tally **unchanged**; only key attribution moves | tally identical (6/10 at the time, 38,400 px); `rt64_matches_key` true → **false** |
 | M3: declare the AA case RT64-authoritative | the partition guard refuses it | **two** tests failed independently |
 | M4: count `BothRefused` as parity | the parity definition refuses it | `only_byte_identical_counts_as_parity` failed |
 | M5: drop the packet-dump contiguity check | a gapped dump must be refused | `captured_parser_refuses_a_gap` failed |
