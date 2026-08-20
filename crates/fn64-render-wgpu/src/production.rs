@@ -8587,6 +8587,49 @@ mod tests {
         words
     }
 
+    /// `finalize_and_submit`, with the declared-read capture built before
+    /// the plan is moved.
+    ///
+    /// A free function rather than an inline expression because
+    /// `capture_declared_reads` borrows the plan and `finalize_and_submit`
+    /// consumes it, and Rust evaluates arguments left to right -- so the
+    /// obvious one-liner is a borrow-after-move.
+    fn finalize_and_submit_pair(
+        session: &mut RawDpcAbiSession,
+        planned: PlannedRawDpcSubmission,
+    ) -> Result<BoundSubmittedRawDpc, fn64_render_ir::ValidationError> {
+        let capture = capture_declared_reads(&planned);
+        session.finalize_and_submit(planned, capture)
+    }
+
+    /// A capture that satisfies every guest read the plan declared, with
+    /// deterministic bytes keyed by access index.
+    ///
+    /// Fixtures used to pass an empty capture, which was correct while the
+    /// only declared reads were TMEM loads that fill fixtures never issue.
+    /// A partial `FillRectangle` now also declares one -- its colour-image
+    /// seed -- so an empty capture fails `GuestReadCountMismatch` rather
+    /// than testing anything.
+    ///
+    /// The bytes are a per-access constant rather than zeros, deliberately:
+    /// zero is the fabricated value the seed exists to displace, so a
+    /// fixture seeded with zeros could not tell a working seed from a
+    /// missing one.
+    fn capture_declared_reads(planned: &PlannedRawDpcSubmission) -> DeferredGuestReadCapture {
+        DeferredGuestReadCapture::new(
+            planned
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    let fill = (read.access_index() as u8).wrapping_mul(17).wrapping_add(3);
+                    CapturedGuestRead::try_new(*read, vec![fill; read.range().len() as usize])
+                        .expect("a capture sized to its own declared read is well formed")
+                })
+                .collect(),
+        )
+    }
+
     /// Runs one fill capture all the way through plan -> execute -> commit
     /// -> seal -> publish, returning the staged writes it committed.
     fn publish_one_fill(
@@ -8598,8 +8641,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("fixture plans cleanly");
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend
@@ -8670,8 +8712,7 @@ mod tests {
         Result<BackendPreparedRawDpc, RenderError>,
     ) {
         let planned = plan_with_no_reads(backend, session, words);
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(session, planned)
             .unwrap();
         let submission = bound.submission();
         (submission, backend.execute_raw_dpc(bound))
@@ -8720,8 +8761,7 @@ mod tests {
              UnadmittedRawDpcCommand",
         );
 
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend
@@ -8788,8 +8828,7 @@ mod tests {
         let request = session.plan_request(capture(full_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
 
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
@@ -8981,8 +9020,7 @@ mod tests {
 
         let request = session.plan_request(capture(partial_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
@@ -9205,8 +9243,7 @@ mod tests {
         words.extend(flat_triangle_in_target_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, words);
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = match backend.execute_raw_dpc(bound) {
@@ -9325,8 +9362,7 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
 
         let planned = plan_with_no_reads(&mut backend, &session, triangle_only_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         match backend.execute_raw_dpc(bound) {
@@ -9399,8 +9435,7 @@ mod tests {
             planned.guest_read_plan().reads().is_empty(),
             "a sync-only plan declares no TmemLoadSource reads"
         );
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let initial_identity = backend.physical_tmem().identity();
@@ -9486,8 +9521,7 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
 
         let planned = plan_with_no_reads(&mut backend, &session, state_only_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         match backend.execute_raw_dpc(bound) {
@@ -9555,8 +9589,7 @@ mod tests {
         configure_fill_target_height(&mut backend);
 
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         let (_prepared, _triangles, pending, _draw_tmem) = execute_raw_dpc_inner(
@@ -9678,8 +9711,7 @@ mod tests {
 
         let request = session.plan_request(capture(partial_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
@@ -9693,8 +9725,7 @@ mod tests {
         // same session.
         let other_request = session.plan_request(capture(full_width_fill_words()));
         let other_planned = backend.plan_raw_dpc(other_request).unwrap();
-        let other_bound = session
-            .finalize_and_submit(other_planned, DeferredGuestReadCapture::new(Vec::new()))
+        let other_bound = finalize_and_submit_pair(&mut session, other_planned)
             .unwrap();
         let other_submission = other_bound.submission();
         assert_ne!(other_submission, submission);
@@ -9941,8 +9972,7 @@ mod tests {
         );
 
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let error = backend
             .execute_raw_dpc(bound)
@@ -9993,8 +10023,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("fixture plans cleanly");
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let prepared = backend
@@ -11442,8 +11471,7 @@ mod tests {
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let result = backend.execute_raw_dpc(bound);
@@ -11556,8 +11584,7 @@ mod tests {
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let submission = bound.submission();
         let Ok(prepared) = backend.execute_raw_dpc(bound) else {
@@ -13085,8 +13112,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("a reserved sync-only capture must plan cleanly");
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         let mut plan_visitor = PlanCollector::seeded(
@@ -15198,8 +15224,7 @@ mod tests {
             5 << 24 | 0x0abc << 12 | 0x0789,
         ];
         let planned = plan_with_no_reads(&mut backend, &session, words);
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
         let _ = backend.execute_raw_dpc(bound);
 
@@ -15389,8 +15414,7 @@ mod tests {
              could read the live registers and still look correct"
         );
 
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         // Seeded from `WgpuBackend`'s OWN choice of table -- the same
@@ -15621,8 +15645,7 @@ mod tests {
              read the live registers and still look correct"
         );
 
-        let bound = session
-            .finalize_and_submit(planned, DeferredGuestReadCapture::new(Vec::new()))
+        let bound = finalize_and_submit_pair(&mut session, planned)
             .unwrap();
 
         // **Driven through `execute_raw_dpc_inner`, the function
