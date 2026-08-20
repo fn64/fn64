@@ -100,44 +100,55 @@ enum Authority {
     /// the oracle is the one not modelling the hardware.
     /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
-    /// **wgpu and RT64 read a raw triangle's texture planes on scales that
-    /// differ by 64x, so no one display list can satisfy both.**
+    /// **wgpu and RT64 sample a raw triangle's texture planes 32x apart, and
+    /// this fixture's edge words mean different geometry to each.**
     ///
-    /// CONFIRMED by reading both implementations:
+    /// Both facts are CONFIRMED by instrumenting RT64 itself (a probe in
+    /// `RDP::drawTris` and the renderer, run against a clone so the pinned
+    /// oracle stayed clean).
     ///
-    /// | lane | non-perspective plane -> texels |
+    /// **1. The scale, accounted end to end:**
+    ///
+    /// | lane | plane -> texels |
     /// |---|---|
-    /// | fn64 | `plane / 2^21` to S10.5 then `/32` = `plane / 2^26` |
-    /// | RT64 | `(plane / 2^16 * 1024) / 16384` = `plane / 2^20` |
+    /// | fn64 | `plane / 2^21` to S10.5, then `/32` = `plane / 2^26` |
+    /// | RT64 | `plane / 2^20` at decode, then `x0.5` at the sampler = `plane / 2^21` |
     ///
-    /// fn64's is `triangle_span.rs`'s `PLANE_TO_TEXEL`, whose own doc derives
-    /// it from **angrylion's `tcdiv_nopersp`**; RT64's is
-    /// `src/gbi/rt64_gbi_rdp.cpp:535-537`. Both end in TEXEL units -- RT64's
-    /// sampler does `floor(uvCoord)` and subtracts the tile origin as
-    /// `/ 4.0` (`TextureSampler.hlsli:148,245`) -- so this is a real
-    /// disagreement, not a units artifact.
+    /// = **32x**, not the 64x an earlier revision of this comment claimed and
+    /// not the 2x a decode-only reading gives. The trap is
+    /// `perspCorrectionMod` (`TextureSampler.hlsli:222`), a 0.5 applied for
+    /// non-perspective non-rect draws that neither a look at
+    /// `rt64_gbi_rdp.cpp:535-537` nor a look at `PLANE_TO_TEXEL` shows.
+    /// RT64's UV is in TEXELS at `floor(uvCoord)` (`:148`), which the
+    /// measurement discriminates: only the texel reading predicts the
+    /// all-clamped output actually observed, while an S10.5 reading predicts
+    /// four distinct texels.
     ///
-    /// This case's planes are authored for fn64's scale (one texel per pixel
-    /// of X), so RT64 reads its four columns as texels 32, 96, 160 and 224 of
-    /// a 4-texel tile and clamps every one to the last. MEASURED: every pixel
-    /// RT64 writes here is `TEXTURE_TEXELS[3]`. Rescaling the planes by 1/64
-    /// makes wgpu sample texel 0 everywhere, exactly as its own rule
-    /// predicts.
+    /// PROBE-CONFIRMED: RT64's v0 texcoord is `24.0` for this fixture's
+    /// `s_base`, which is `s_base / 2^20` exactly.
     ///
-    /// **Note what was WRONG before:** this variant previously claimed RT64
-    /// "does not rasterize raw triangles". It does. That reading came from a
-    /// triangle-only list; with a texrect and the triangle in the SAME
-    /// packet, RT64 draws the texrect in agreement with wgpu AND writes
-    /// triangle pixels, deterministically across runs.
+    /// So RT64 reads this case's four columns as texels 16, 48, 80 and 112 of
+    /// a 4-texel tile and clamps every one to the last -- and every pixel it
+    /// writes here is `TEXTURE_TEXELS[3]`.
     ///
-    /// A difference here is therefore not evidence against either lane on its
-    /// own. The case earns its place by holding wgpu to a hand-derived key on
-    /// a path no texrect reaches, and by pinning the scale disagreement so it
-    /// is not re-diagnosed as a texel defect.
+    /// **2. The geometry: these edge words are a RECTANGLE to fn64 and a
+    /// RIGHT TRIANGLE to RT64.** Probe-measured vertices are
+    /// `(2,0) (2,3) (6,3)`, whose pixel-centre coverage grows one column per
+    /// scanline from the left -- which is exactly the left-biased partial
+    /// coverage measured. With `XH` on the left and `XL`/`XM` on the right
+    /// and every `dxdy` zero, fn64 walks a box and RT64 walks the triangle
+    /// between the major and minor edges.
     ///
-    /// STILL OPEN: RT64's coverage here is partial and ragged rather than a
-    /// clean box. The clamped texel explains the wrong colour, not the
-    /// missing pixels; that is a separate effect.
+    /// **Note what was WRONG before:** this variant once claimed RT64 "does
+    /// not rasterize raw triangles". It does -- `drawTris` is entered exactly
+    /// once with a non-empty scissor `(0,0,1280,960)`, a non-null
+    /// `drawRect (8,0,24,12)`, and reaches `RENDER drawCall` with
+    /// `faceCount=1`. Nothing is skipped or culled.
+    ///
+    /// A difference here is therefore not evidence against either lane. The
+    /// case earns its place by holding wgpu to a hand-derived key on a path
+    /// no texrect reaches, and by pinning both disagreements so neither is
+    /// re-diagnosed as a texel defect.
     RawTrianglePlaneScaleDisagreement,
 }
 
