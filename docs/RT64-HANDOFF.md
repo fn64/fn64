@@ -175,11 +175,48 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    handoff's own advice was not to scope them separately until this was
    fixed.
 
-3b. **Then the rest of the corpus:** other triangle shapes and combiner
-   programs.
-   It is 10 hand-authored **fill-rectangle** cases today -- it cannot see any
-   open bug. This is the highest-leverage item: the fast layer does not cover
-   the code under change.
+3b. **The rest of the corpus: PARTLY DONE.** It was 10 fill-rectangle cases;
+   it is now **16**, and the textured half of it found and confirmed the
+   byte-lane defect above.
+
+   Landed since:
+
+   - **`textured-rect-wide-line-two`** -- the first tile `line` other than 1.
+     An 8x2 RGBA16 tile puts two 64-bit words in a TMEM row, so the row
+     stride is `line * t`; a wrong multiplier is INVISIBLE at `line = 1`
+     because any multiplier times row 0 is still row 0. `identical`, both
+     backends match the key. Mutation-verified: forcing `line = 1` leaves the
+     backends agreeing with each other but makes BOTH stop matching the key.
+   - **`textured-triangle-point-sampled`** -- the first raw triangle, and the
+     first case on the path WM2000 actually draws through. **wgpu matches the
+     hand-derived key on all twelve covered pixels; RT64 writes nothing.**
+   - **A texel that aliased the background.** `TEXTURE_TEXELS[3]` was
+     `0xffff` = `STALE`, so a skipped pixel and a correctly drawn one were
+     the same observation. Now `0x7fff`. This was live: the triangle case
+     under-reported 9 differing pixels of 12 because of it.
+
+   **The open item this created, and it is a real one:** RT64 writes no
+   pixels for a raw triangle. VERIFIED to be triangles as such, not
+   texturing -- a flat `0x08` triangle also draws nothing while a texrect
+   over the identical tile, scissor and target draws correctly in the same
+   list. NOT a dispatch problem: fn64's lane forwards without opcode
+   filtering, RT64's LLE GBI registers all eight triangle opcodes and gets
+   this command's length right, its own `decodeTriangles` arithmetic on
+   these words yields the intended non-degenerate box, culling is forced off
+   for triangle projections, the word carries the loaded tile, and the list
+   scissors the whole target. Cause **not determined**; the pixels are lost
+   somewhere in RT64's draw-call assembly. Note **no test in this workspace
+   has ever driven a raw triangle through the RT64 lane**, so there is no
+   known-good setup to copy -- establishing one is its own piece of work.
+
+   Still missing: a **CI/TLUT** case (`LoadTlut` is opcode 0x30 and the
+   other-modes `en_tlut` bit is already documented in the runner, so this is
+   well-specified and cheap), other combiner programs, and other triangle
+   shapes. Also still missing is a **captured-from-ROM** case: the reader for
+   it is already built (`mod captured`, driven by `FN64_WM2000_PACKET_TSV`),
+   but the dump is produced by `fn64-render-reference`'s GBI census under
+   `FN64_GBI_PACKET_DUMP`, so it needs a reference-lane ROM run to generate
+   and is deliberately never committed (game content).
 4. **DONE -- see `docs/RT64-WM2000-TEXTURE-STATE.md`.** The screen was checked
    after the fix. Surfaces went from flat solid colour to dense per-pixel
    variation, confirming the fix at the pixel level, but the variation is
