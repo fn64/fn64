@@ -220,22 +220,37 @@ fn unsupported_rdp_formats_never_enter_target_ownership() {
 }
 
 #[test]
-fn partial_new_target_rejection_is_loud_and_non_publishing() {
+fn a_partial_new_target_completion_is_admitted_and_names_what_it_covered() {
+    // **Retargeted, not deleted.** This used to assert
+    // `PartialNewTargetInitialization` -- that a brand-new target could not
+    // become resident from a partial rectangle. That refusal is gone: the
+    // pixels outside the rectangle now come from the guest's own
+    // framebuffer (see `targets/fill.rs` and
+    // `docs/RT64-FILL-PARTIAL-SEED.md`), so a partial completion is
+    // ordinary rather than unrepresentable.
+    //
+    // What replaces it is the fact a later reader actually needs, and which
+    // the old `rows` count could not express: the proof must name WHICH
+    // rectangle this generation covered. `rows` is a height with no origin,
+    // so it cannot distinguish "row 0" from "row 1"; `covered` can, and
+    // this fixture uses a rectangle at a nonzero origin so the two answers
+    // genuinely differ.
     let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let candidate = registry.begin_candidate(key).unwrap();
-    let partial = candidate
-        .plan_rows(TargetRectangle::try_new(0, 0, 4, 1).unwrap())
-        .unwrap();
+    let rectangle = TargetRectangle::try_new(0, 1, 4, 1).unwrap();
+    let partial = candidate.plan_rows(rectangle).unwrap();
     let completion = completed(&candidate, partial, &[Rgba8::new(255, 0, 0, 255); 8]);
-    let error = candidate
-        .admit_completed_initialization(completion)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        TargetError::PartialNewTargetInitialization { .. }
-    ));
-    assert!(registry.residents().is_empty());
+    let initialized = candidate.admit_completed_initialization(completion).unwrap();
+    assert_eq!(
+        initialized.initialized_region().covered(),
+        rectangle,
+        "the proof must name the covered rectangle, origin included"
+    );
+    assert!(
+        !initialized.initialized_region().is_full(key.extent()),
+        "a one-row completion of a two-row target is not full"
+    );
 }
 
 #[test]
