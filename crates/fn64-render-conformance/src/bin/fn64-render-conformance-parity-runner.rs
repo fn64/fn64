@@ -145,6 +145,32 @@ struct Case {
     expected: fn(u32) -> u16,
 }
 
+/// `SetScissor` over a whole-pixel box, in the wire's own field order.
+///
+/// **The bounds are SPLIT ACROSS BOTH WORDS**, and getting that wrong is
+/// silent. angrylion's `rdp_set_scissor` (`rasterizer.c:2779`) reads the
+/// UPPER-LEFT from word 0 and the LOWER-RIGHT from word 1:
+///
+/// ```text
+/// clip.xh = (w0 >> 12) & 0xfff     clip.xl = (w1 >> 12) & 0xfff
+/// clip.yh = (w0 >>  0) & 0xfff     clip.yl = (w1 >>  0) & 0xfff
+/// ```
+///
+/// All four are S10.2, so a whole pixel is `<< 2`.
+///
+/// Every scissor in this corpus previously packed the LOWER-RIGHT into word
+/// 0 and left word 1 zero, which decodes as an inverted box -- upper-left
+/// `(160, 240)` to lower-right `(0, 0)` for the half-width case. That is a
+/// degenerate input, and the two backends answered it differently:
+/// `scissor-narrower-than-rect` reported RT64 painting 38,400 pixels the key
+/// excluded, which read as an RT64 finding and was a fixture defect.
+const fn set_scissor(ulx: u32, uly: u32, lrx: u32, lry: u32) -> (u32, u32) {
+    (
+        0xed00_0000 | ((ulx * 4) << 12) | (uly * 4),
+        ((lrx * 4) << 12) | (lry * 4),
+    )
+}
+
 const fn fill_rect(lrx: u32, lry: u32, ulx: u32, uly: u32) -> (u32, u32) {
     (
         0xf600_0000 | ((lrx * 4) << 12) | (lry * 4),
@@ -188,7 +214,7 @@ const OTHER_MODES_ONE_CYCLE_TEXTURED: (u32, u32) = (0xef00_00f0, 0);
 fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
     vec![
         OTHER_MODES_FILL_NO_AA,
-        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         (0xf700_0000, (color as u32) * 0x1_0001),
         fill_rect(lrx, lry, ulx, uly),
@@ -305,7 +331,7 @@ fn wide_textured_rect() -> Vec<(u32, u32)> {
     words.extend([
         OTHER_MODES_ONE_CYCLE_TEXTURED,
         SET_COMBINE_TEXEL0,
-        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         set_texture_image(WIDE_WIDTH, WIDE_SOURCE),
         set_tile(WIDE_LINE_WORDS, 0),
@@ -528,7 +554,7 @@ fn one_ci4_rect() -> Vec<(u32, u32)> {
         // One-cycle textured, TLUT ENABLED.
         (OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15), OTHER_MODES_ONE_CYCLE_TEXTURED.1),
         SET_COMBINE_TEXEL0,
-        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         // -- the palette, into high TMEM through tile 1 (RGBA16 source).
         (0xfd00_0000 | (2 << 19) | (entries - 1), PALETTE_SOURCE),
@@ -784,7 +810,7 @@ fn one_textured_triangle() -> Vec<(u32, u32)> {
     words.extend([
         OTHER_MODES_ONE_CYCLE_TEXTURED,
         SET_COMBINE_TEXEL0,
-        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
         set_tile(TEXTURE_LINE_WORDS, 0),
@@ -829,7 +855,7 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     words.extend([
         OTHER_MODES_ONE_CYCLE_TEXTURED,
         SET_COMBINE_TEXEL0,
-        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
         set_tile(TEXTURE_LINE_WORDS, 0),
@@ -969,14 +995,19 @@ fn cases() -> Vec<Case> {
             name: "scissor-narrower-than-rect",
             intent: "the scissor admits only the left half while the fill asks \
                      for the whole target. A backend that ignores the scissor \
-                     paints the right half too. NOTE: the guard audit records \
-                     that RT64 and angrylion disagree on subpixel scissor \
-                     ROUNDING; this case uses whole-pixel edges, where they \
-                     agree, so it stays RT64-authoritative.",
+                     paints the right half too. MEASURED: RT64 paints it -- \
+                     all 38,400 excluded pixels -- and wgpu does not, so wgpu \
+                     matches the key here. The scissor's own encoding was \
+                     verified against angrylion's `rdp_set_scissor` first: \
+                     the bounds split across BOTH words, and this corpus \
+                     packed them into word 0 until that was measured, which \
+                     made every scissor an inverted box. Correcting it did \
+                     NOT change the outcome, so this is a real difference on \
+                     a correctly encoded command and not a fixture defect.",
             authority: Authority::Rt64Authoritative,
             commands: {
                 let mut words = one_fill(RED, 0, 0, WIDTH - 1, HEIGHT - 1);
-                words[1] = (0xed00_0000, (((WIDTH / 2) * 4) << 12) | (HEIGHT * 4));
+                words[1] = set_scissor(0, 0, WIDTH / 2, HEIGHT);
                 words
             },
             expected: |index| {
@@ -995,7 +1026,7 @@ fn cases() -> Vec<Case> {
             authority: Authority::Rt64Authoritative,
             commands: {
                 let mut words = one_fill(GREEN, 0, 0, WIDTH - 1, HEIGHT - 1);
-                words[1] = (0xed00_0000, ((WIDTH * 4) << 12) | ((HEIGHT / 2) * 4));
+                words[1] = set_scissor(0, 0, WIDTH, HEIGHT / 2);
                 words
             },
             expected: |index| {
@@ -1893,6 +1924,47 @@ mod tests {
                     Authority::CoverageDependentRt64NotAuthoritative,
                     "case {} enables AA_EN but claims RT64 authority",
                     case.name
+                );
+            }
+        }
+    }
+
+    /// **`SetScissor` splits its bounds across BOTH words.**
+    ///
+    /// angrylion reads the upper-left from word 0 and the lower-right from
+    /// word 1 (`rasterizer.c:2779`). Packing both into word 0 -- which every
+    /// scissor in this corpus did until it was measured -- decodes as an
+    /// INVERTED box, and an inverted scissor is a degenerate input the two
+    /// backends answer differently. That is silent: it reads as a renderer
+    /// disagreement rather than a fixture defect.
+    #[test]
+    fn set_scissor_splits_its_bounds_across_both_words() {
+        let (word0, word1) = set_scissor(0, 0, WIDTH / 2, HEIGHT);
+        assert_eq!(word0 >> 24, 0xed, "opcode");
+        // Upper-left in word 0, S10.2.
+        assert_eq!((word0 >> 12) & 0xfff, 0, "upper-left X");
+        assert_eq!(word0 & 0xfff, 0, "upper-left Y");
+        // Lower-right in word 1, S10.2 -- NOT in word 0.
+        assert_eq!((word1 >> 12) & 0xfff, (WIDTH / 2) * 4, "lower-right X");
+        assert_eq!(word1 & 0xfff, HEIGHT * 4, "lower-right Y");
+
+        // And the box is never inverted: every corpus scissor must have its
+        // lower-right at or beyond its upper-left on both axes.
+        for case in cases() {
+            for pair in case.commands.windows(1) {
+                let (word0, word1) = pair[0];
+                if word0 >> 24 != 0xed {
+                    continue;
+                }
+                assert!(
+                    (word1 >> 12) & 0xfff >= (word0 >> 12) & 0xfff
+                        && word1 & 0xfff >= word0 & 0xfff,
+                    "case {} emits an inverted scissor: ul=({}, {}) lr=({}, {})",
+                    case.name,
+                    (word0 >> 12) & 0xfff,
+                    word0 & 0xfff,
+                    (word1 >> 12) & 0xfff,
+                    word1 & 0xfff
                 );
             }
         }
