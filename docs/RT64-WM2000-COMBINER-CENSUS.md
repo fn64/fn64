@@ -444,3 +444,75 @@ These live in different files, and the S/T-spread census committed on this
 branch tells them apart: if the requested coordinates span many texels and
 one texel comes back, the fault is addressing; if the coordinates themselves
 barely move across the span, it is the derivation.
+
+## ROOT CAUSE, derived against angrylion: the perspective scale is 32x short
+
+**Status: CONFIRMED for the derivation; the ROM fix is measured in the next
+section.**
+
+Two further measurements narrowed it to one constant.
+
+**1. The coordinates themselves barely move.** Fifth run, per-triangle S/T
+spread in whole texels:
+
+```
+[fn64-combiner]   S spread/triangle (texels): 0:36341 1:10787 2-4:2314 5-8:210 9-16:570 17-64:145
+[fn64-combiner]   T spread/triangle (texels): 0:36112 1:13213 2-4:1004 5-8:38
+[fn64-combiner]   perspective: off=0 on=50367
+```
+
+**72% of triangles request a spread of ZERO whole texels**, and every single
+triangle takes the perspective path. So the fault is in the coordinate
+DERIVATION, not in the addressing folding varying coordinates together --
+the coordinates never varied.
+
+That also explains why shade is fine while texture is not: both are
+evaluated at the *same* `attribute_sample` point (`triangle_span.rs:383`),
+and shade alpha spans twelve histogram buckets. The sample point varies
+correctly. Only the texture path's post-processing of it does.
+
+**2. The scale constant is wrong by exactly 2^5.** Derived by building
+angrylion's `tcdiv_table` exactly -- both 64-entry `norm_point_table` and
+`norm_slope_table` transcribed from `tcoord.c:3-24`, the same
+shift/normalize/interpolate construction as `tcoord.c:1127-1146` -- and
+evaluating `tcdiv_persp` over known inputs:
+
+| ss | sw | ss/sw | tcdiv out (flags masked) | out / (ss/sw) |
+|---|---|---|---|---|
+| 64 | 64 | 1.0000 | 32768 | 32768.0 |
+| 31 | 16 | 1.9375 | 63488 | 32768.0 |
+| 100 | 50 | 2.0000 | 65537 | 32768.5 |
+| 300 | 100 | 3.0000 | 98306 | 32768.7 |
+
+**angrylion's `tcdiv_persp` returns `(ss/sw) * 2^15`.** Then
+`tcshift_cycle` (`tcoord.c:83-102`) takes `SIGN16` of it -- the low 16 bits
+-- and `texture_pipeline_cycle` reads `sfrac = sss1 & 0x1f`
+(`tex.c:182`), five fractional bits. So the RDP's raw coordinate field is
+S10.5 carrying `(ss/sw) * 2^15`, i.e. `(ss/sw) * 2^10` **texels**.
+
+fn64's `texture_coordinates_s10_5`
+(`crates/fn64-render-wgpu/src/raw_dpc/triangle_span.rs:519-541`) computes
+`(S_q16 / W_q16) * PERSPECTIVE_TEXEL_SCALE` with
+`PERSPECTIVE_TEXEL_SCALE = 1024.0` and returns it as the RAW S10.5 value.
+`S_q16 / W_q16` is the same ratio as `ss/sw`, so fn64's raw value is
+`(ss/sw) * 2^10` -- **which is angrylion's TEXEL value, written into the
+field that wants angrylion's RAW value.** The unit domains were crossed.
+
+**The function's own doc states the correct rule** and the constant
+contradicts it: "the output is `(S/W) * 2^15` in S10.5 units = `(S/W) *
+2^10` texels". 2^15 raw is right; the code writes 2^10 raw. The constant
+should be **32768.0**, not 1024.0.
+
+This is consistent with the measured spread. A 32x under-scale drives 72% of
+triangles below one texel of span; corrected, that bucket becomes 0-31
+texels, which is the footprint a wrestler polygon over a 32x32 or 64x64
+texture should have.
+
+**Why the wrong value survived.** `triangle_span.rs`'s doc records that 1024
+was derived empirically against WM2000's TITLE SCREEN and that without it
+"the whole title-screen quad collapsed onto texel (0,0)". Going from 1 to
+1024 fixed a total collapse and left a 32x residue, which on one large flat
+quad reads as slightly wrong texture scale rather than as flatness. Applied
+to in-match geometry -- 100% perspective, small polygons -- the same residue
+collapses each triangle onto one texel. The constant was fitted on the one
+piece of content least able to expose it.
