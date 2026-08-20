@@ -3846,6 +3846,17 @@ fn stage_color_commands(
         };
         // This command's own output becomes the next command's resident
         // bytes. The single line that makes N compose.
+        //
+        // NOTE for anyone optimising here: this re-materialises the WHOLE
+        // colour target once per command in the schedule, and the session
+        // phase census puts 81.6% of the RDP seam inside the `execute` phase
+        // that contains this loop. That makes it a natural suspect -- but a
+        // large byte count is not a bottleneck (perf-method rule 12, earned
+        // by a 5.92 GB clone whose complete elimination measured +0.84%, the
+        // WRONG direction), so it must be COUNTED before it is restructured.
+        // It is deliberately not instrumented from here: `fn64-render-wgpu`
+        // does not depend on `fn64-abi`, and inverting that layering for a
+        // probe would be a worse change than the one being measured.
         accumulated = Some(completed.device_bytes().device_bytes().to_vec());
         claimed = Some(union_target_rectangle(completed.rectangle(), claimed));
         declared.extend(accesses);
