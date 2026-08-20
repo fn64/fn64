@@ -47,6 +47,21 @@ fn64-cpu-runtime = { path = "../../fn64-cpu-runtime" }
 fn64-render = { path = "../../fn64-render" }
 fn64-render-reference = { path = "../../fn64-render-reference" }
 fn64-render-rt64 = { path = "../../fn64-render-rt64" }
+# The all-Rust renderer half of the target stack (`fn64-cpu-runtime` +
+# `fn64-render-wgpu`), and the ONLY renderer this manifest can reach without a
+# native C++ adapter. It is not optional: `src/main.rs` names
+# `fn64_render_wgpu::WgpuBackend::try_new()` UNCONDITIONALLY in its
+# `FN64_RENDER` dispatch, so omitting it here is not "wgpu is unavailable on
+# the rs lane" -- it is a hard `E0433: unresolved module` that made
+# `FN64_RECOMP=rs` fail to compile at all, for every title and every renderer.
+# The sibling harness manifest (recomps/wm2000/packages/wm2000-boot/rs) has
+# carried this dependency all along, which is why the headless rs lane built
+# while this one did not.
+#
+# Unlike `fn64-render-rt64` it needs no Cargo feature and no C++ toolchain:
+# `WgpuBackend::try_new` is available unconditionally, so `FN64_RENDER=wgpu`
+# works on a plain `cargo build` with no `--features`.
+fn64-render-wgpu = { path = "../../fn64-render-wgpu" }
 fn64-audio = { path = "../../fn64-audio" }
 # Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo
 # `path` cannot interpolate env vars) -- same bridge as oot-boot/rs.
