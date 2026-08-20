@@ -53,3 +53,36 @@ only. A textured-triangle case in it would localise this in seconds against
 RT64 rather than requiring a 20-minute ROM run and a human looking at a PNG.
 Extending the corpus (handoff step 3) is now clearly the cheaper path to the
 next fix, not a detour before it.
+
+## UPDATE: the TMEM XOR4 fix landed, and textures are STILL noise
+
+A second real defect was found and fixed after the above: the LoadBlock
+**writer and reader disagreed on the odd-row XOR4 exchange**. Hardware's rule is
+the **tile-relative row alone**; fn64 had an extra origin term on one side, so
+the load path stored a byte at one address and the sampler read a different
+one. Fixed on both the CPU reader and the WGSL shader, with the rule pinned by
+a failing round-trip test that now passes, and eleven fixtures retargeted off
+the removed term. Suites: 8683 workspace / 4916 host-gpu, both green.
+
+**Checked on the screen: textures are still noise.**
+`docs/frames/wm2000-after-tmem-xor4-fix-swap460.png` -- ring ropes, mat and
+wrestler geometry remain correctly shaped and placed; texel values remain
+wrong. The character of the noise changed, which is consistent with a real
+addressing change, but the defect is not resolved.
+
+**So this is now two confirmed, cited fixes deep with the symptom intact**:
+the perspective texel scale (2^10 -> 2^15) and the odd-row XOR4 rule. Both were
+genuine, both verified against angrylion, neither was sufficient.
+
+**What that says about method, and it is the important part.** Each fix cost a
+20-minute ROM run plus a human reading a PNG to evaluate, and each answered
+only "still wrong". That is an unaffordable loop for a defect that may have
+several contributing causes. **The corpus extension is no longer the cheaper
+path -- it is the only sane one.** A textured-triangle case compared against
+RT64 would say which component returns the wrong byte in seconds, and would
+have distinguished these two fixes from each other without a ROM run at all.
+
+Remaining suspects, unchanged in kind but now narrowed by two eliminations:
+the tile descriptor's format/size/line interpretation, the palette/TLUT path,
+and the byte-lane mapping into TMEM. Do not guess among them -- extend the
+corpus and measure.
