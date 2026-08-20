@@ -589,14 +589,39 @@ Consequence: RT64 reads the four columns as texels 16, 48, 80, 112 of a
 ### 2. The same edge words are a RECTANGLE to fn64 and a TRIANGLE to RT64
 
 Probe-measured vertices: **`(2,0) (2,3) (6,3)`** -- a right triangle with its
-vertical leg on the left, not the intended box. Its pixel-centre coverage
-grows one column per scanline from the left, which is exactly the
-left-biased partial coverage measured (row 0 empty, then widening).
+vertical leg on the left, not the intended box. With `XH` on the left,
+`XL`/`XM` on the right and every `dxdy` zero, fn64 walks a box and RT64
+walks the triangle between major and minor edges.
 
-So the "partial, ragged coverage" recorded earlier as a separate open effect
-is not a defect at all: it is what these edge words MEAN to RT64. With `XH`
-on the left, `XL`/`XM` on the right and every `dxdy` zero, fn64 walks a box
-and RT64 walks the triangle between major and minor edges.
+**The coverage is fully characterised, and a naive pixel-centre fit does NOT
+reproduce it.** Enlarging the case to cols 2..10 x rows 0..6 and dumping raw
+values (rather than a diff mask, which hides the shape because wgpu writes
+the same clamp value in the outer columns) gives, deterministic across runs:
+
+```
+y=0  ..........
+y=1  ..XX......
+y=2  ..XX.X....
+y=3  ..XXXX....
+y=4  ..XXXXXX..
+y=5  ..XXXXXX.X
+```
+
+- The left edge is pinned at x=2 (the `XH` edge) and the right edge advances
+  **8/6 = 1.333 columns per row** -- exactly the hypotenuse slope of RT64's
+  own probe-measured vertices, and the same 4/3 the small case gives.
+- Coverage is quantised to **even-aligned pixel PAIRS** `[2k, 2k+1]`. Rows
+  1, 3 and 4 are complete pairs.
+- Where the span ends mid-pair (rows 2 and 5) the trailing pair writes only
+  its **odd** pixel: x=5 with x=4 skipped, x=9 with x=8 skipped. The
+  rightmost covered pixel is the odd end of the pair containing the ideal
+  edge, in every row.
+
+A plain pixel-centre rasterization of `(2,0) (2,3) (6,3)` predicts
+`(2,0)` and `(4,2)` covered and `(5,2)` not -- the measurement is the
+opposite on all three, so the earlier "its pixel-centre coverage grows one
+column per scanline" was too loose. The pair quantisation is what closes the
+gap.
 
 ## What is NOT established
 
