@@ -137,13 +137,20 @@ enum Authority {
     /// every `dxdy` zero, fn64 walks a box and RT64 walks the triangle
     /// between the major and minor edges.
     ///
-    /// The coverage is characterised, and a naive pixel-centre fit does NOT
-    /// reproduce it. Enlarged to 8x6 and dumped as raw values, RT64's
-    /// covered set is a triangle whose right edge advances 4/3 columns per
-    /// row -- its own hypotenuse slope -- **quantised to even-aligned pixel
-    /// PAIRS**, where a span ending mid-pair writes only that pair's ODD
-    /// pixel (x=5 with x=4 skipped; x=9 with x=8 skipped). Deterministic
-    /// across runs. See `RT64-WM2000-TEXEL-LOCALISATION.md` for the grid.
+    /// **FIXED in the fixture.** The case now emits TWO triangles that tile
+    /// the box -- the lower-left and upper-right halves -- so RT64 covers
+    /// every pixel of it: measured, zero pixels left at the background value
+    /// where a single command previously left seven of twelve. The
+    /// `the_triangle_case_emits_two_triangles_tiling_its_box` guard pins the
+    /// emitted vertices against RT64's own rule, mutation-verified.
+    ///
+    /// What a single command produced, for the record: a triangle whose
+    /// right edge advanced 4/3 columns per row -- RT64's own hypotenuse
+    /// slope -- quantised to even-aligned pixel PAIRS, a span ending
+    /// mid-pair writing only that pair's ODD pixel. See
+    /// `RT64-WM2000-TEXEL-LOCALISATION.md` for the grid.
+    ///
+    /// So the remaining difference on this case is the SCALE alone.
     ///
     /// **Note what was WRONG before:** this variant once claimed RT64 "does
     /// not rasterize raw triangles". It does -- `drawTris` is entered exactly
@@ -694,31 +701,44 @@ fn coefficient_block(value: [i32; 4], dx: [i32; 4], de: [i32; 4], dy: [i32; 4]) 
 /// the left and right edges are constant, so the covered set is exactly the
 /// rectangle above and the key is arithmetic rather than a rasterization
 /// argument. The point of this case is the TEXTURE path, not edge walking.
-fn textured_triangle_words() -> Vec<(u32, u32)> {
+/// One textured raw triangle (opcode `0x0a`) from an explicit H/L edge pair.
+///
+/// **RT64 emits exactly three vertices from these words**
+/// (`rt64_gbi_rdp.cpp:352-406`), and reproducing its own arithmetic is what
+/// makes this fixture predictable rather than guessed:
+///
+/// * `v1 = (XH evaluated at YH, YH)`
+/// * `v2 = (XH evaluated at YL, YL)`
+/// * `v3 = (XL, YM)`
+///
+/// So `v1` and `v2` always share the H edge's X. **A single triangle command
+/// therefore cannot describe a rectangle** -- with every `dxdy` zero it
+/// describes the right triangle between the H edge and the point `(XL, YM)`.
+/// That is not a defect in either renderer; it is what the wire encoding
+/// means, and it is why [`one_textured_triangle`] emits TWO of these.
+///
+/// `x_h`/`x_l` are whole pixels; every slope is zero, so both non-major
+/// edges are vertical and the two triangles below tile exactly.
+fn textured_triangle_words(x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32) -> Vec<(u32, u32)> {
     // All three Y bounds are S11.2. YL is the last covered scanline's LOWER
     // bound -- a triangle spanning rows 0..3 covers 0, 1 and 2, so YL is
-    // line 3 and the raster's `y < yl` bound stops after row 2. YM defaults
-    // to YL when no crossover row is wanted.
-    let yl = ((TRI_BOTTOM as i32) << 2) as u16 as u32;
-    let ym = yl;
-    let yh = ((TRI_TOP as i32) << 2) as u16 as u32;
-    // `lft` set: the major edge is the left one, which is what the plane
-    // derivation above measures its X deltas from.
+    // line 3 and the raster's `y < yl` bound stops after row 2.
+    let yl = ((y_l as i32) << 2) as u16 as u32;
+    let ym = ((y_m as i32) << 2) as u16 as u32;
+    let yh = ((y_h as i32) << 2) as u16 as u32;
     let word0 = 0x0a00_0000 | (1 << 23) | yl;
     let base = [
         (word0, (ym << 16) | yh),
-        // **XL is the RIGHT edge and XH is the LEFT one.** Not a naming
-        // accident to paper over: XH is the major edge, which for a
-        // left-major triangle is the left side, and XL/XM are the minor
-        // edges on the right. Swapping them yields an inverted span that
-        // covers nothing, which is silent -- no refusal, just an unpublished
-        // colour target.
-        ((TRI_RIGHT << 16), 0),
-        ((TRI_LEFT << 16), 0),
-        ((TRI_RIGHT << 16), 0),
+        // Word order is XL/dXLdy, XH/dXHdy, XM/dXMdy -- the H edge is the
+        // MAJOR one that `v1`/`v2` both sit on, and XM is unused here
+        // because YM is pinned to an endpoint rather than a crossover row.
+        ((x_l << 16), 0),
+        ((x_h << 16), 0),
+        ((x_l << 16), 0),
     ];
     // S advances one texel per pixel of X; T is constant, so every row reads
-    // TMEM row 0. W is 1 and unused: `G_TP_NONE` never divides by it.
+    // TMEM row 0. W is 1 and unused: `G_TP_NONE` never divides by it. The
+    // plane is a function of X alone, so BOTH triangles share it unchanged.
     let s_base = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
     let texture = coefficient_block(
         [s_base, PLANE_HALF_TEXEL, 1, 0],
@@ -730,6 +750,34 @@ fn textured_triangle_words() -> Vec<(u32, u32)> {
     for pair in texture.chunks_exact(2) {
         words.push((pair[0], pair[1]));
     }
+    words
+}
+
+/// The two triangles that tile [`TRI_LEFT`, `TRI_RIGHT`) x [`TRI_TOP`,
+/// `TRI_BOTTOM`) exactly, derived from RT64's own vertex rule above.
+///
+/// | | H edge | L edge | YM | vertices |
+/// |---|---|---|---|---|
+/// | lower-left | `TRI_LEFT` | `TRI_RIGHT` | `TRI_BOTTOM` | `(l,t) (l,b) (r,b)` |
+/// | upper-right | `TRI_RIGHT` | `TRI_LEFT` | `TRI_TOP` | `(r,t) (r,b) (l,t)` |
+///
+/// Their union is the closed rectangle and their interiors are disjoint, so
+/// the pair covers every pixel of the box exactly once.
+fn textured_triangle_pair() -> Vec<(u32, u32)> {
+    let mut words = textured_triangle_words(
+        TRI_LEFT,
+        TRI_RIGHT,
+        TRI_TOP,
+        TRI_BOTTOM,
+        TRI_BOTTOM,
+    );
+    words.extend(textured_triangle_words(
+        TRI_RIGHT,
+        TRI_LEFT,
+        TRI_TOP,
+        TRI_BOTTOM,
+        TRI_TOP,
+    ));
     words
 }
 
@@ -752,7 +800,7 @@ fn one_textured_triangle() -> Vec<(u32, u32)> {
         load_tile(TEXTURE_WIDTH, 1),
         (0xe600_0000, 0),
     ]);
-    words.extend(textured_triangle_words());
+    words.extend(textured_triangle_pair());
     words.push((0xe900_0000, 0));
     words
 }
@@ -1855,6 +1903,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The triangle case must emit TWO triangles that tile its box.**
+    ///
+    /// RT64 derives exactly three vertices from one triangle command --
+    /// `v1 = (XH at YH, YH)`, `v2 = (XH at YL, YL)`, `v3 = (XL, YM)` --
+    /// so `v1` and `v2` always share the H edge's X and ONE command can
+    /// never describe a rectangle. A fixture that emits a single command
+    /// gets the right triangle between the H edge and `(XL, YM)`, and the
+    /// half it silently loses reads as "RT64 dropped pixels" rather than as
+    /// a fixture defect. That cost a session.
+    ///
+    /// Asserted on the emitted words rather than on rendered pixels, so it
+    /// fails without a GPU and names the cause directly.
+    #[test]
+    fn the_triangle_case_emits_two_triangles_tiling_its_box() {
+        let words = textured_triangle_pair();
+        let opcodes: Vec<u32> = words
+            .iter()
+            .map(|&(word0, _)| word0 >> 24)
+            .filter(|opcode| (0x08..=0x0f).contains(opcode))
+            .collect();
+        assert_eq!(
+            opcodes.len(),
+            2,
+            "the box needs exactly two triangle commands, got {opcodes:?}"
+        );
+
+        // Each command is 4 base words + 8 texture words.
+        assert_eq!(words.len(), 24, "two textured triangles are 24 wire pairs");
+
+        // Reproduce RT64's own vertex rule for both, with every slope zero.
+        let vertices = |chunk: &[(u32, u32)]| {
+            let yl = (chunk[0].0 & 0xffff) as i32 as f32 / 4.0;
+            let ym = (chunk[0].1 >> 16) as i32 as f32 / 4.0;
+            let yh = (chunk[0].1 & 0xffff) as i32 as f32 / 4.0;
+            let x_l = (chunk[1].0 >> 16) as f32;
+            let x_h = (chunk[2].0 >> 16) as f32;
+            [(x_h, yh), (x_h, yl), (x_l, ym)]
+        };
+        let first = vertices(&words[0..4]);
+        let second = vertices(&words[12..16]);
+
+        let left = TRI_LEFT as f32;
+        let right = TRI_RIGHT as f32;
+        let top = TRI_TOP as f32;
+        let bottom = TRI_BOTTOM as f32;
+        assert_eq!(
+            first,
+            [(left, top), (left, bottom), (right, bottom)],
+            "the first triangle must be the lower-left half of the box"
+        );
+        assert_eq!(
+            second,
+            [(right, top), (right, bottom), (left, top)],
+            "the second triangle must be the upper-right half, or the box is \
+             covered only in part"
+        );
     }
 
     /// **The raw-triangle authority means what it says.** A case may only
