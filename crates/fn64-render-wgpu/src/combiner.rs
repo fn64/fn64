@@ -3639,3 +3639,342 @@ mod tests {
         assert!(params.references_texels_in_first_cycle());
     }
 }
+
+/// **Diagnostic-only.** Tallies which color/alpha selectors the combiner
+/// programs of actually-drawn triangles select, per slot.
+///
+/// Exists to answer one question with counts instead of impressions: when
+/// WM2000's models render flat despite every admitted triangle being
+/// textured and reaching `sample_point` (see
+/// `docs/RT64-WM2000-INMATCH-GAPS.md`), is the sampled texel being
+/// *discarded* by a program that never names `Texel0`, or is it being
+/// *selected* and merely wrong? A tally with `Texel0` near zero indicts the
+/// combiner; a tally where `Texel0` dominates the C or A slot indicts the
+/// sample.
+///
+/// Nothing in the render path reads these. Dumped to stderr every 100,000
+/// notes when `FN64_COMBINER_CENSUS` is set, matching
+/// `raw_dpc::raw_triangle_drop_stats`' self-reporting shape -- the harness
+/// is a separate crate and does not call in, so the dump has to come from
+/// here.
+///
+/// **The slice tallied is the one that will actually be evaluated**, chosen
+/// by the caller from the cycle type: one-cycle mode evaluates the *cycle-1*
+/// bitfield slice (angrylion `combiner_1cycle`, `combiner.c:173-220`,
+/// dereferences index `[1]` throughout), so tallying the cycle-0 slice for a
+/// one-cycle program would report selectors the hardware never reads.
+pub mod census {
+    use super::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `ColorInput` in declaration order, used as the index space for
+    /// [`COLOR_COUNTS`]. A local table rather than a derive so the counter
+    /// index is stable and explicit.
+    pub const COLOR_NAMES: [&str; 21] = [
+        "Combined",
+        "Texel0",
+        "Texel1",
+        "Primitive",
+        "Shade",
+        "Environment",
+        "KeyCenter",
+        "KeyScale",
+        "CombinedAlpha",
+        "Texel0Alpha",
+        "Texel1Alpha",
+        "PrimitiveAlpha",
+        "ShadeAlpha",
+        "EnvAlpha",
+        "LodFraction",
+        "PrimLodFrac",
+        "Noise",
+        "K4",
+        "K5",
+        "One",
+        "Zero",
+    ];
+
+    pub const ALPHA_NAMES: [&str; 10] = [
+        "Combined",
+        "Texel0",
+        "Texel1",
+        "Primitive",
+        "Shade",
+        "Environment",
+        "LodFraction",
+        "PrimLodFrac",
+        "One",
+        "Zero",
+    ];
+
+    const fn color_index(input: ColorInput) -> usize {
+        match input {
+            ColorInput::Combined => 0,
+            ColorInput::Texel0 => 1,
+            ColorInput::Texel1 => 2,
+            ColorInput::Primitive => 3,
+            ColorInput::Shade => 4,
+            ColorInput::Environment => 5,
+            ColorInput::KeyCenter => 6,
+            ColorInput::KeyScale => 7,
+            ColorInput::CombinedAlpha => 8,
+            ColorInput::Texel0Alpha => 9,
+            ColorInput::Texel1Alpha => 10,
+            ColorInput::PrimitiveAlpha => 11,
+            ColorInput::ShadeAlpha => 12,
+            ColorInput::EnvAlpha => 13,
+            ColorInput::LodFraction => 14,
+            ColorInput::PrimLodFrac => 15,
+            ColorInput::Noise => 16,
+            ColorInput::K4 => 17,
+            ColorInput::K5 => 18,
+            ColorInput::One => 19,
+            ColorInput::Zero => 20,
+        }
+    }
+
+    const fn alpha_index(input: AlphaInput) -> usize {
+        match input {
+            AlphaInput::Combined => 0,
+            AlphaInput::Texel0 => 1,
+            AlphaInput::Texel1 => 2,
+            AlphaInput::Primitive => 3,
+            AlphaInput::Shade => 4,
+            AlphaInput::Environment => 5,
+            AlphaInput::LodFraction => 6,
+            AlphaInput::PrimLodFrac => 7,
+            AlphaInput::One => 8,
+            AlphaInput::Zero => 9,
+        }
+    }
+
+    const fn color_slot_index(slot: ColorInputSlot) -> usize {
+        match slot {
+            ColorInputSlot::A => 0,
+            ColorInputSlot::B => 1,
+            ColorInputSlot::C => 2,
+            ColorInputSlot::D => 3,
+        }
+    }
+
+    const fn alpha_slot_index(slot: AlphaInputSlot) -> usize {
+        match slot {
+            AlphaInputSlot::A => 0,
+            AlphaInputSlot::B => 1,
+            AlphaInputSlot::C => 2,
+            AlphaInputSlot::D => 3,
+        }
+    }
+
+    /// A flat counter bank indexed `slot * stride + selector`.
+    ///
+    /// Flat rather than `[[AtomicU64; N]; 4]` because `AtomicU64` is not
+    /// `Copy`, so the nested array cannot be built from a repeat expression
+    /// in a `static` initializer, and spelling out 84 constructors would be
+    /// its own transcription hazard.
+    macro_rules! counter_bank {
+        ($name:ident, $len:expr) => {
+            static $name: [AtomicU64; $len] = {
+                #[allow(clippy::declare_interior_mutable_const)]
+                const INIT: AtomicU64 = AtomicU64::new(0);
+                [INIT; $len]
+            };
+        };
+    }
+
+    counter_bank!(COLOR_COUNTS, 84);
+    counter_bank!(ALPHA_COUNTS, 40);
+    static NOTES: AtomicU64 = AtomicU64::new(0);
+    /// Programs whose evaluated slice names `Texel0`/`Texel0Alpha` anywhere
+    /// in color, versus programs that name it nowhere. This is the headline
+    /// number: a drawn textured triangle in the second bucket has its
+    /// sampled texel discarded outright.
+    static COLOR_READS_TEXEL0: AtomicU64 = AtomicU64::new(0);
+    static COLOR_IGNORES_TEXEL0: AtomicU64 = AtomicU64::new(0);
+
+    /// Records one drawn triangle's evaluated combiner slice.
+    ///
+    /// `color` and `alpha` are the four already-decoded selectors in
+    /// A, B, C, D order -- decoded by the CALLER from the slice it will
+    /// actually evaluate, so this module never re-derives which slice is
+    /// live and cannot disagree with the evaluator about it.
+    pub fn note_program(color: [ColorInput; 4], alpha: [AlphaInput; 4]) {
+        for (slot, input) in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ]
+        .into_iter()
+        .zip(color)
+        {
+            COLOR_COUNTS[color_slot_index(slot) * 21 + color_index(input)]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for (slot, input) in [
+            AlphaInputSlot::A,
+            AlphaInputSlot::B,
+            AlphaInputSlot::C,
+            AlphaInputSlot::D,
+        ]
+        .into_iter()
+        .zip(alpha)
+        {
+            ALPHA_COUNTS[alpha_slot_index(slot) * 10 + alpha_index(input)]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if color.iter().any(|input| {
+            matches!(
+                input,
+                ColorInput::Texel0 | ColorInput::Texel0Alpha | ColorInput::Texel1 | ColorInput::Texel1Alpha
+            )
+        }) {
+            &COLOR_READS_TEXEL0
+        } else {
+            &COLOR_IGNORES_TEXEL0
+        }
+        .fetch_add(1, Ordering::Relaxed);
+
+        let note = NOTES.fetch_add(1, Ordering::Relaxed) + 1;
+        if note % 100_000 == 0 && std::env::var_os("FN64_COMBINER_CENSUS").is_some() {
+            report(&format!("note={note}"));
+        }
+    }
+
+    /// `([slot][selector] color counts, alpha counts, (reads_texel, ignores_texel))`.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot() -> ([[u64; 21]; 4], [[u64; 10]; 4], (u64, u64)) {
+        let mut color = [[0u64; 21]; 4];
+        for (slot, row) in color.iter_mut().enumerate() {
+            for (index, slot_count) in row.iter_mut().enumerate() {
+                *slot_count = COLOR_COUNTS[slot * 21 + index].load(Ordering::Relaxed);
+            }
+        }
+        let mut alpha = [[0u64; 10]; 4];
+        for (slot, row) in alpha.iter_mut().enumerate() {
+            for (index, slot_count) in row.iter_mut().enumerate() {
+                *slot_count = ALPHA_COUNTS[slot * 10 + index].load(Ordering::Relaxed);
+            }
+        }
+        (
+            color,
+            alpha,
+            (
+                COLOR_READS_TEXEL0.load(Ordering::Relaxed),
+                COLOR_IGNORES_TEXEL0.load(Ordering::Relaxed),
+            ),
+        )
+    }
+
+    /// Writes the current tally to stderr, nonzero buckets only.
+    pub fn report(label: &str) {
+        let (color, alpha, (reads, ignores)) = snapshot();
+        eprintln!("[fn64-combiner] {label} programs={}", reads + ignores);
+        eprintln!("[fn64-combiner]   color reads Texel* = {reads}, ignores Texel* = {ignores}");
+        for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
+            let mut line = String::new();
+            for (index, count) in color[slot].iter().enumerate() {
+                if *count > 0 {
+                    line.push_str(&format!(" {}={}", COLOR_NAMES[index], count));
+                }
+            }
+            eprintln!("[fn64-combiner]   color {name}:{line}");
+        }
+        for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
+            let mut line = String::new();
+            for (index, count) in alpha[slot].iter().enumerate() {
+                if *count > 0 {
+                    line.push_str(&format!(" {}={}", ALPHA_NAMES[index], count));
+                }
+            }
+            eprintln!("[fn64-combiner]   alpha {name}:{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::census::{ALPHA_NAMES, COLOR_NAMES};
+    use super::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams};
+
+    /// The census's two name tables must be in the same order as the
+    /// index functions the counters use, or every reported bucket is
+    /// mislabelled while every count stays plausible -- a silent wrong
+    /// answer of exactly the kind this whole card is chasing.
+    ///
+    /// Checked by round-tripping the NAME through a fresh decode rather
+    /// than by re-listing the enum, which would just restate the table.
+    #[test]
+    fn the_census_name_tables_match_the_selector_order() {
+        // Hand-written from `color_input_common`/`color_input_c`, which are
+        // themselves the RT64 tables. Deliberately NOT derived from
+        // `COLOR_NAMES`.
+        assert_eq!(COLOR_NAMES[1], "Texel0");
+        assert_eq!(COLOR_NAMES[4], "Shade");
+        assert_eq!(COLOR_NAMES[9], "Texel0Alpha");
+        assert_eq!(COLOR_NAMES[20], "Zero");
+        assert_eq!(ALPHA_NAMES[1], "Texel0");
+        assert_eq!(ALPHA_NAMES[4], "Shade");
+        assert_eq!(ALPHA_NAMES[9], "Zero");
+    }
+
+    /// The census decodes the slice the evaluator will run. In one-cycle
+    /// mode that is the CYCLE-1 slice, so a program whose two slices name
+    /// different selectors must census as its cycle-1 selectors.
+    ///
+    /// **Fixture chosen to distinguish the two slices**: cycle 0 selects
+    /// `Shade` in every color slot and cycle 1 selects `Texel0`, so reading
+    /// the wrong slice reports the exact opposite of the answer this card
+    /// turns on. A fixture with both slices equal -- the obvious one to
+    /// write -- would pass under either slice and prove nothing.
+    #[test]
+    fn one_cycle_censuses_the_cycle_one_slice_not_the_cycle_zero_slice() {
+        // gbi.h GCCc*w* packing, hand-assembled: cycle 0 = SHADE (index 4)
+        // in a/b/c/d; cycle 1 = TEXEL0 (index 1) in a/b/c/d.
+        const SHADE: u32 = 4;
+        const TEXEL0: u32 = 1;
+        let w0 = (SHADE << 20) | (SHADE << 15) | (TEXEL0 << 5) | TEXEL0;
+        let w1 = (SHADE << 28) | (TEXEL0 << 24) | (SHADE << 15) | (TEXEL0 << 6);
+        let params = CombineParams::from_wire(w0, w1);
+
+        // second_cycle = true is what `run_one_cycle` passes.
+        for slot in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ] {
+            assert_eq!(
+                params.decode_color(slot, true),
+                ColorInput::Texel0,
+                "one-cycle slot {slot:?} must read the cycle-1 slice"
+            );
+            assert_eq!(
+                params.decode_color(slot, false),
+                ColorInput::Shade,
+                "the cycle-0 slice of this fixture is Shade, so the two differ"
+            );
+        }
+    }
+
+    /// Alpha slot C has its OWN index table, shifted from A/B/D's: index 1
+    /// is TEXEL0 there and COMBINED is unreachable. Pinned because the
+    /// census reports all four alpha slots through one name table, and a
+    /// reader comparing slot C's counts against slot A's would otherwise
+    /// silently compare two different index spaces.
+    #[test]
+    fn alpha_slot_c_uses_its_own_table() {
+        // alpha1 C sits at w1>>18; alpha1 A at w1>>21.
+        let params = CombineParams::from_wire(0, (0 << 21) | (0 << 18));
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::A, true),
+            AlphaInput::Combined,
+            "index 0 in the A/B/D table is COMBINED"
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::C, true),
+            AlphaInput::LodFraction,
+            "index 0 in the C table is LOD_FRACTION, not COMBINED"
+        );
+    }
+}
