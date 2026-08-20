@@ -365,6 +365,18 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     // lane is measuring frame rate. `enabled()` is itself a `OnceLock` read,
     // but binding it here keeps even that out of the inner loop.
     let census_pixels = crate::combiner::census::enabled();
+    // Distinct texels THIS triangle samples, for the spatial-variation
+    // question the whole-frame luma histogram cannot answer. Only allocated
+    // when the census is on.
+    // Only for a TEXTURED triangle: an untextured one samples nothing, and
+    // recording its empty set as "1 distinct texel" would put correct
+    // untextured geometry in the bucket that means "flat despite a
+    // texture" -- the exact bucket the measurement turns on.
+    let mut distinct_texels = if census_pixels && texture.is_some() {
+        Some(std::collections::HashSet::new())
+    } else {
+        None
+    };
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
     // **First-row parity comes from the tile's own T origin, not a
     // constant** -- `execute_texture_rectangle`'s own rule, applied here for
@@ -504,6 +516,14 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     texel,
                     (inputs.shade_color[3] * 255.0).round() as u8,
                 );
+                if let Some(seen) = distinct_texels.as_mut() {
+                    // Capped: the question is "is this triangle flat", and a
+                    // triangle past 512 distinct texels has answered it. The
+                    // cap also bounds the set on a full-screen quad.
+                    if seen.len() <= 512 {
+                        seen.insert(texel);
+                    }
+                }
             }
             let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
             let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
@@ -517,6 +537,9 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                 row.y,
             )?;
         }
+    }
+    if let Some(seen) = distinct_texels {
+        crate::combiner::census::note_triangle_distinct_texels(seen.len());
     }
     Ok(())
 }
