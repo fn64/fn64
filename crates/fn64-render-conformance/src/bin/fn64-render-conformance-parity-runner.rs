@@ -212,14 +212,29 @@ const TEXTURE_TEXELS: [u16; 8] = [
     0xfc01, // row 1, col 3: r=31 g=0  b=0  a=1 with g's top bit set
 ];
 
-/// Where the textured rectangle lands on the target, inclusive on both edges
-/// exactly as `G_FILLRECT` is. 4 columns by 2 rows at the origin, so the
-/// rectangle steps exactly one texel per pixel on both axes and pixel
-/// `(x, y)` samples texel `(x, y)` with no filtering ambiguity.
+/// Where the textured rectangle lands on the target: 4 columns by 2 rows at
+/// the origin, so the rectangle steps exactly one texel per pixel on both
+/// axes and pixel `(x, y)` samples texel `(x, y)` with no filtering
+/// ambiguity.
+///
+/// **The high edges are EXCLUSIVE, unlike `G_FILLRECT`'s.** This is the one
+/// place the two rectangle commands disagree, and getting it wrong is silent:
+/// the draw simply covers one fewer row and column, which reads as a texel
+/// defect rather than a fixture defect. fn64 pins the rule in
+/// `targets/texrect.rs` -- "the fill rule is inclusive and the texrect rule
+/// is half-open, so the fill rectangle is exactly one pixel larger on each
+/// axis" -- and a test there asserts the two extents never coincide.
+///
+/// An earlier revision of this fixture wrote `TEXTURE_HEIGHT - 1` here, by
+/// analogy with the fill cases above. That covered row 0 only, so every
+/// backend correctly left row 1 as `STALE` while the key demanded texels
+/// there, and all three lanes reported `matches_key: false` against a key
+/// that was itself wrong. RT64 agreeing with wgpu and the reference about
+/// row 1 is what exposed it.
 const TEXRECT_ULX: u32 = 0;
 const TEXRECT_ULY: u32 = 0;
-const TEXRECT_LRX: u32 = TEXTURE_WIDTH - 1;
-const TEXRECT_LRY: u32 = TEXTURE_HEIGHT - 1;
+const TEXRECT_LRX: u32 = TEXTURE_WIDTH;
+const TEXRECT_LRY: u32 = TEXTURE_HEIGHT;
 
 /// The expected pixel for a textured case, by linear target index.
 ///
@@ -229,7 +244,8 @@ const TEXRECT_LRY: u32 = TEXTURE_HEIGHT - 1;
 fn textured_expected(index: u32) -> u16 {
     let x = index % WIDTH;
     let y = index / WIDTH;
-    if x <= TEXRECT_LRX && y <= TEXRECT_LRY {
+    // Half-open, matching the wire rule in `TEXRECT_LRX`'s own doc.
+    if x < TEXRECT_LRX && y < TEXRECT_LRY {
         TEXTURE_TEXELS[(y * TEXTURE_WIDTH + x) as usize]
     } else {
         STALE
@@ -330,9 +346,35 @@ fn texture_rectangle(ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> 
 /// the add-RGB and add-alpha tables alike.
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
 
-/// The command list for a textured case: state, load, draw, sync.
+/// The command list for a textured case: seed fill, state, load, draw, sync.
+///
+/// **Why it opens with a full-target fill of `STALE`.** A texrect writes a
+/// sub-region, so every pixel outside it must come from real prior content.
+/// `execute_scheduled_texrect` takes that content from the packet's
+/// accumulated buffer and refuses with `MissingResidentBytes` when there is
+/// none -- a legitimate guard: treating a resident target as if it had no
+/// prior content would silently discard everything outside the rectangle.
+///
+/// The fill lane has a second rung the texrect lane does not: a fill with no
+/// accumulated buffer falls back to its declared colour-image seed read, the
+/// guest's own framebuffer bytes. `seed_access_index` exists only on the fill
+/// IR node, so a texrect that is the FIRST command against a resident target
+/// has nothing to seed from and cannot complete.
+///
+/// Opening the list with a full-extent fill answers that from inside the
+/// packet: the fill needs no seed itself (it covers the whole target), and it
+/// leaves an accumulated buffer the texrect then composes into. This is the
+/// same in-packet composition `nested-second-fill` already exercises.
+///
+/// The fill paints `STALE`, which is exactly what `seeded` already writes
+/// across the framebuffer and exactly what [`textured_expected`] already
+/// requires outside the rectangle -- so the hand-derived key is unchanged by
+/// this fill, and the pixels outside the rectangle still assert that the
+/// texrect wrote nothing it should not have.
 fn one_textured_rect() -> Vec<(u32, u32)> {
-    let mut words = vec![
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
         OTHER_MODES_ONE_CYCLE_TEXTURED,
         SET_COMBINE_TEXEL0,
         (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
@@ -343,7 +385,7 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
         (0xe600_0000, 0),
         load_tile(TEXTURE_WIDTH, TEXTURE_HEIGHT),
         (0xe600_0000, 0),
-    ];
+    ]);
     words.extend(texture_rectangle(
         TEXRECT_ULX,
         TEXRECT_ULY,
@@ -582,7 +624,7 @@ fn cases() -> Vec<Case> {
             expected: |index| {
                 let x = index % WIDTH;
                 let y = index / WIDTH;
-                if x <= TEXRECT_LRX && y <= TEXRECT_LRY {
+                if x < TEXRECT_LRX && y < TEXRECT_LRY {
                     TEXTURE_TEXELS[(TEXTURE_WIDTH + x) as usize]
                 } else {
                     STALE
@@ -1152,8 +1194,68 @@ fn run() -> Value {
             _ => Value::Null,
         };
 
+        // Every differing pixel, capped. `first_difference` alone cannot
+        // distinguish a wrong-texel fetch (a permutation of TEXTURE_TEXELS)
+        // from a wrong-colour computation (a value not in the table at all),
+        // because that needs the PATTERN across pixels, not one example.
+        // Capped at 16 so a whole-target disagreement cannot flood the report.
+        let differences = match (&rt64, &wgpu) {
+            (Ok(rt64), Ok(wgpu)) => {
+                let (rt64, wgpu) = (pixels(rt64), pixels(wgpu));
+                let listed: Vec<Value> = (0..PIXEL_COUNT as usize)
+                    .filter(|&index| rt64[index] != wgpu[index])
+                    .take(16)
+                    .map(|index| {
+                        json!({
+                            "x": index as u32 % WIDTH,
+                            "y": index as u32 / WIDTH,
+                            "key": format!("{:#06x}", key[index]),
+                            "rt64": format!("{:#06x}", rt64[index]),
+                            "wgpu": format!("{:#06x}", wgpu[index]),
+                        })
+                    })
+                    .collect();
+                json!(listed)
+            }
+            _ => Value::Null,
+        };
+
+        // The texel-sized window, every backend, every pixel. A wrong-texel
+        // fetch and a wrong-colour computation are told apart by the PATTERN
+        // over the whole window, which neither a first-difference nor a
+        // differences-only list can show.
+        let window = {
+            let read = |outcome: &Result<Vec<u8>, String>| match outcome {
+                Ok(bytes) => {
+                    let got = pixels(bytes);
+                    let mut out = Vec::new();
+                    for y in 0..TEXTURE_HEIGHT {
+                        for x in 0..TEXTURE_WIDTH {
+                            out.push(format!("{:#06x}", got[(y * WIDTH + x) as usize]));
+                        }
+                    }
+                    json!(out)
+                }
+                Err(_) => Value::Null,
+            };
+            let mut expected = Vec::new();
+            for y in 0..TEXTURE_HEIGHT {
+                for x in 0..TEXTURE_WIDTH {
+                    expected.push(format!("{:#06x}", key[(y * WIDTH + x) as usize]));
+                }
+            }
+            json!({
+                "key": expected,
+                "rt64": read(&rt64),
+                "wgpu": read(&wgpu),
+                "reference": read(&reference),
+            })
+        };
+
         rows.push(json!({
             "case": case.name,
+            "window": window,
+            "differences": differences,
             "intent": case.intent,
             "authority": case.authority.wire(),
             "verdict": verdict.wire(),
@@ -1464,6 +1566,43 @@ mod tests {
         assert_eq!(word1, 0);
         let (word0, _) = fill_rect(17, 9, 17, 9);
         assert_eq!((word0 >> 12) & 0xfff, 68);
+    }
+
+    /// **The texrect high edge is EXCLUSIVE and the fill high edge is
+    /// INCLUSIVE.** This is the one place the two rectangle commands
+    /// disagree, and applying the fill rule to a texrect is silent: the draw
+    /// covers one fewer row and column, and the missing pixels keep whatever
+    /// was under them, which reads as a texel-fetch defect rather than a
+    /// fixture defect.
+    ///
+    /// A revision of this corpus made exactly that mistake, and it cost a
+    /// session: every backend was correct, the hand-derived key demanded
+    /// texels on a row no backend drew, and all three lanes reported
+    /// `matches_key: false`. The rule is pinned in `targets/texrect.rs`
+    /// ("the fill rule is inclusive and the texrect rule is half-open, so the
+    /// fill rectangle is exactly one pixel larger on each axis").
+    ///
+    /// So this asserts the corpus's own constants carry the texture's FULL
+    /// extent, not `extent - 1`, and that the key agrees with them.
+    #[test]
+    fn texrect_high_edges_are_exclusive_unlike_the_fill_rule() {
+        assert_eq!(TEXRECT_LRX, TEXTURE_WIDTH);
+        assert_eq!(TEXRECT_LRY, TEXTURE_HEIGHT);
+
+        // The last covered pixel is one inside each high edge, and the first
+        // uncovered one is the edge itself.
+        let at = |x: u32, y: u32| textured_expected(y * WIDTH + x);
+        assert_ne!(at(TEXTURE_WIDTH - 1, TEXTURE_HEIGHT - 1), STALE);
+        assert_eq!(at(TEXTURE_WIDTH, 0), STALE);
+        assert_eq!(at(0, TEXTURE_HEIGHT), STALE);
+
+        // Every texel in the covered window is its own texel, in row-major
+        // order -- the property the whole textured corpus rests on.
+        for y in 0..TEXTURE_HEIGHT {
+            for x in 0..TEXTURE_WIDTH {
+                assert_eq!(at(x, y), TEXTURE_TEXELS[(y * TEXTURE_WIDTH + x) as usize]);
+            }
+        }
     }
 
     /// The contiguity check is the parser's load-bearing invariant: a dump
