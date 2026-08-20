@@ -617,6 +617,24 @@ y=5  ..XXXXXX.X
   rightmost covered pixel is the odd end of the pair containing the ideal
   edge, in every row.
 
+### FIXED: the fixture now emits two triangles
+
+Because `v1` and `v2` always share the H edge's X, one command cannot be a
+rectangle -- so the case emits TWO, the lower-left and upper-right halves:
+
+| | H edge | L edge | YM | vertices |
+|---|---|---|---|---|
+| lower-left | `TRI_LEFT` | `TRI_RIGHT` | `TRI_BOTTOM` | `(l,t) (l,b) (r,b)` |
+| upper-right | `TRI_RIGHT` | `TRI_LEFT` | `TRI_TOP` | `(r,t) (r,b) (l,t)` |
+
+MEASURED after the change: **RT64 covers every pixel of the box** -- zero
+left at the background value, where one command left seven of twelve. The
+`the_triangle_case_emits_two_triangles_tiling_its_box` guard pins the
+emitted vertices against RT64's own rule and is mutation-verified (dropping
+the second triangle fails it).
+
+The remaining difference on this case is the SCALE alone.
+
 A plain pixel-centre rasterization of `(2,0) (2,3) (6,3)` predicts
 `(2,0)` and `(4,2)` covered and `(5,2)` not -- the measurement is the
 opposite on all three, so the earlier "its pixel-centre coverage grows one
