@@ -1,6 +1,15 @@
-//! The three-way parity differential: fn64's shipping wgpu backend against
-//! RT64, the oracle, with the reference backend as an independent third
-//! reading.
+//! The parity differential: fn64's shipping wgpu backend against RT64, the
+//! oracle. The reference backend is run and reported alongside, but it is
+//! NOT an authority and never enters a verdict.
+//!
+//! **`fn64-render-reference` is a second fn64 implementation, not a third
+//! opinion.** It is unproven against hardware, and it has been WRONG on this
+//! corpus's own cases: on every textured case here it returns a third set of
+//! values that matches neither the hand-derived key nor RT64
+//! (`RT64-HANDOFF.md` §3f records the one-cycle case where wgpu was right and
+//! the reference was wrong). Read its column as a hint about where to look,
+//! never as evidence for or against wgpu. Every verdict below is computed
+//! from the wgpu/RT64 pair and the key alone.
 //!
 //! # Why this binary exists
 //!
@@ -486,6 +495,12 @@ const CI_LOAD_TEXELS: u32 = CI_INDICES.len() as u32 / 4;
 
 /// The sixteen-entry RGBA16 palette. Only the eight entries the indices name
 /// are distinguishable values; the rest are a marker that must never appear.
+///
+/// **The lookup is measured, not assumed.** Staging this palette 0x40 bytes
+/// off leaves wgpu and RT64 still agreeing with each other but makes BOTH
+/// stop matching the key -- both return `0x0001`, the decode of an unwritten
+/// palette. So this case really does read the palette through `en_tlut`
+/// rather than sampling the indices as colour.
 const PALETTE: [u16; 16] = [
     0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01, 0x0843,
     0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843,
