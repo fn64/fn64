@@ -27,6 +27,14 @@ LOG=$ROOT.log
 # of the input differential -- identical lead-in, nothing after it.
 SCHED_MODE=${WM2000_MODE:-grapple}
 SCRIPT=${WM2000_SCHEDULE:-$(python3 "$FN64/docs/tools/wm2000-schedule.py" --mode "$SCHED_MODE" --until 200000)}
+# Port 1 fights independently unless WM2000_SOLO=1. It gets no lead-in (port 0
+# navigates the menus; a second pad confirming on the same frames would
+# double-advance them) and a rotated, phase-shifted cycle, so the two wrestlers
+# are not performing identical moves on identical frames -- which is the shape
+# of a stalemate rather than a fight.
+if [[ "$SCHED_MODE" == "grapple" && -z "${WM2000_SOLO:-}" ]]; then
+  : ${WM2000_INPUT_SCRIPT_P1:=$(python3 "$FN64/docs/tools/wm2000-schedule.py" --port1 --until 200000)}
+fi
 # Default watch set, all read out of the ROM (see RT64-WM2000-MATCH-GRAMMAR.md):
 #
 #   0x80095184/86/90/92  both plugged ports' HELD/PRESSED, in the per-port
@@ -88,6 +96,7 @@ fi
 
 echo "[match-run] mode=$MODE sched=$SCHED_MODE name=$NAME steps=$STEPS root=$ROOT"
 echo "[match-run] watch=$WM2000_WATCH"
+echo "[match-run] port1 independent: ${WM2000_INPUT_SCRIPT_P1:+yes (${#WM2000_INPUT_SCRIPT_P1} bytes)}${WM2000_INPUT_SCRIPT_P1:-no (mirrored)}"
 echo "[match-run] schedule bytes=${#SCRIPT} last=${SCRIPT##*;}"
 
 set +e
@@ -96,6 +105,7 @@ env FN64="$FN64" SCRATCH="$ROOT/scratch" \
   WM2000_INPUT_SCRIPT="$SCRIPT" \
   WM2000_MAX_STEPS="$STEPS" \
   ${WM2000_WATCH:+WM2000_WATCH=$WM2000_WATCH} \
+  ${WM2000_INPUT_SCRIPT_P1:+WM2000_INPUT_SCRIPT_P1=$WM2000_INPUT_SCRIPT_P1} \
   ${WM2000_STOP_AT_SWAP:+WM2000_STOP_AT_SWAP=$WM2000_STOP_AT_SWAP} \
   "${EXTRA[@]}" \
   zsh "$RUNNER" > "$LOG" 2>&1
