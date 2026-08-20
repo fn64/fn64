@@ -68,7 +68,7 @@ use crate::state::{CycleType, FillColor, OtherMode};
 
 use super::{
     CandidateColorTarget, ColorTargetFormat, ColorTargetKey, CompletedColorTargetWrite,
-    DeviceColorBytes, Rgba8, TargetError, TargetRectangle,
+    DeviceColorBytes, RdpScissorRect, Rgba8, TargetError, TargetRectangle,
 };
 
 /// One RDP fill-cycle bypass hazard bit, decoded from [`OtherMode`]'s wire
@@ -216,6 +216,70 @@ pub fn resolve_fill_pixel_rectangle(
     Ok(FillPixelRectangle { x0, y0, x1, y1 })
 }
 
+/// Clips one resolved fill rectangle against the scissor and the colour
+/// target extent, returning the surviving whole-pixel rectangle.
+///
+/// ## The scissor clips; it does not reject and it is not ignored
+///
+/// angrylion applies the `clip` rect latched by `rdp_set_scissor`
+/// (`rasterizer.c:2779-2784`) inside the edgewalker, which every primitive
+/// the rasterizer walks shares -- there is no fill-specific bypass. The X
+/// clamp at `:2349-2363` drives a span endpoint out to `clipxhshift` on the
+/// low side and `clipxlshift` on the high side rather than discarding the
+/// span, and the Y limits at `:2284-2305` (`yllimit = yllimit ? yl :
+/// wstate->clip.yl;`) bound the walked scanline range the same way. So a
+/// fill whose rectangle overhangs the scissor paints the intersection and
+/// leaves the remainder holding whatever the framebuffer already held.
+///
+/// fn64's own reference renderer computes the identical intersection at
+/// `fn64-render-reference/src/raster/draw.rs:191-208`, clamping with
+/// `.max(clip_min_x)` / `.min(clip_max_x - 1).min(self.width - 1)` and
+/// returning early only when the result is empty.
+///
+/// ## Precedence: scissor AND target extent, neither substituting
+///
+/// Both bounds are applied, exactly as [`super::clip_texrect_extent`]
+/// applies them. A scissor tighter than the framebuffer really does suppress
+/// pixels the framebuffer could hold; separately, no span may name memory
+/// outside this executor's sized target. The intersection is strictly
+/// narrower than either.
+///
+/// ## What this refuses
+///
+/// An empty result, as [`FillExecutionError::ScissoredAway`] -- never a
+/// silent no-op. See that variant's own doc.
+fn clip_fill_rectangle(
+    rectangle: FillPixelRectangle,
+    scissor: RdpScissorRect,
+    key: ColorTargetKey,
+) -> Result<FillPixelRectangle, FillExecutionError> {
+    let extent = key.extent();
+    // Half-open intersection of three spans -- the rectangle's own
+    // (inclusive `x1`, hence the `+ 1`), the scissor's, and the target's --
+    // then converted back to this module's inclusive-edge representation.
+    let first_x = rectangle.x0().max(scissor.first_column());
+    let limit_x = (rectangle.x1() + 1)
+        .min(scissor.column_limit())
+        .min(extent.width());
+    let first_y = rectangle.y0().max(scissor.first_row());
+    let limit_y = (rectangle.y1() + 1)
+        .min(scissor.row_limit())
+        .min(extent.height());
+    if first_x >= limit_x || first_y >= limit_y {
+        return Err(FillExecutionError::ScissoredAway {
+            key,
+            rectangle,
+            scissor,
+        });
+    }
+    Ok(FillPixelRectangle {
+        x0: first_x,
+        y0: first_y,
+        x1: limit_x - 1,
+        y1: limit_y - 1,
+    })
+}
+
 /// 5-bit-per-channel expansion, matching
 /// `fn64-render-reference/src/raster/draw.rs:132-134` bit-for-bit:
 /// `(value << 3) | (value >> 2)`.
@@ -262,6 +326,19 @@ pub enum FillExecutionError {
     Coordinate(FillCoordinateError),
     Target(TargetError),
     MissingResidentBytes { key: ColorTargetKey },
+    /// The rectangle survived coordinate resolution but nothing of it
+    /// survived the intersection with the scissor and the target extent.
+    ///
+    /// A loud refusal rather than a silent no-op, for the same reason
+    /// [`super::TexrectExecutionError::ScissoredAway`] is one: an empty
+    /// result is either a genuinely off-screen primitive or a reversed or
+    /// degenerate scissor, and the two are worth telling apart. Both the
+    /// rectangle and the scissor are carried so a reader can.
+    ScissoredAway {
+        key: ColorTargetKey,
+        rectangle: FillPixelRectangle,
+        scissor: RdpScissorRect,
+    },
 }
 
 impl core::fmt::Display for FillExecutionError {
@@ -282,6 +359,15 @@ impl core::fmt::Display for FillExecutionError {
                 "execute_fill_rectangle requires resident_bytes for already-resident target \
                  {key:?}; treating a resident candidate as if it had no prior content would \
                  silently discard everything outside the claimed rectangle"
+            ),
+            Self::ScissoredAway {
+                key,
+                rectangle,
+                scissor,
+            } => write!(
+                formatter,
+                "FillRectangle {rectangle:?} against target {key:?} is empty after clipping to \
+                 scissor {scissor:?} and the target extent"
             ),
         }
     }
@@ -330,6 +416,7 @@ pub fn execute_fill_rectangle(
     other_mode: OtherMode,
     fill_color: FillColor,
     rectangle: crate::FillRectangle,
+    scissor: RdpScissorRect,
     resident_bytes: Option<&[u8]>,
 ) -> Result<CompletedColorTargetWrite, FillExecutionError> {
     if !matches!(other_mode.cycle_type(), CycleType::Fill) {
@@ -343,15 +430,16 @@ pub fn execute_fill_rectangle(
         rectangle.lower_right_x(),
         rectangle.lower_right_y(),
     )?;
+    let key = candidate.key();
+    let clipped = clip_fill_rectangle(pixel_rect, scissor, key)?;
     let rectangle = TargetRectangle::try_new(
-        pixel_rect.x0(),
-        pixel_rect.y0(),
-        pixel_rect.width(),
-        pixel_rect.height(),
+        clipped.x0(),
+        clipped.y0(),
+        clipped.width(),
+        clipped.height(),
     )?;
     let plan = candidate.plan_rows(rectangle)?;
 
-    let key = candidate.key();
     let format = key.format();
     let extent = key.extent();
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
