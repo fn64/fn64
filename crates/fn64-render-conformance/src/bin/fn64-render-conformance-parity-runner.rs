@@ -607,6 +607,218 @@ impl Tally {
     }
 }
 
+/// A real captured RDP stream, promoted into a parity case.
+///
+/// # Why this exists
+///
+/// Hand-authored cases test what the author imagined. A captured WM2000
+/// packet tests what the game actually draws, which is the difference between
+/// a toy metric and a real one. `docs/RT64-PARITY.md` states the corpus
+/// provenance the reported numbers rest on.
+///
+/// # Provenance and why nothing is committed
+///
+/// The capture itself is NOT in this repository and must not be: a game's own
+/// RDP command words are game content, which `README.md`'s "no game content
+/// ships in this repo" rule covers. So this reads a dump produced by
+/// `FN64_GBI_PACKET_DUMP` at run time, and when the variable is unset the
+/// corpus is simply the hand-authored one and the report says so.
+///
+/// The format is the committed one:
+/// `entry \t lane \t pc \t w0 \t w1`, produced by
+/// `fn64-render-reference`'s `gbi::census::packet`. Two other in-tree parsers
+/// already read it (`raw_dpc_session_integration.rs`,
+/// `examples/rt64_wm2000_three_way.rs`); this is a third reader of the same
+/// committed shape, not a new format.
+mod captured {
+    /// Where the operator points this runner at a packet dump.
+    pub const PACKET_ENV: &str = "FN64_WM2000_PACKET_TSV";
+    /// Which decode entry of that dump to replay. Defaults to 0.
+    pub const ENTRY_ENV: &str = "FN64_WM2000_PACKET_ENTRY";
+
+    #[derive(Debug)]
+    pub struct CapturedPacket {
+        pub entry: u64,
+        pub words: Vec<u32>,
+        pub source_pc: usize,
+    }
+
+    /// Parse one decode entry out of a packet dump.
+    ///
+    /// Consecutive rows must be exactly 8 RDRAM bytes apart. That contiguity
+    /// check is what makes the concatenated word pairs the WIRE STREAM rather
+    /// than a lossy sample of it -- without it a dump missing rows would
+    /// still parse and would silently measure a different display list.
+    pub fn parse_packet_dump(text: &str, entry: u64) -> Result<CapturedPacket, String> {
+        let mut rows: Vec<(usize, u32, u32)> = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("entry\t") {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 5 {
+                return Err(format!(
+                    "line {} has {} tab-separated fields, expected 5",
+                    index + 1,
+                    fields.len()
+                ));
+            }
+            let row_entry: u64 = fields[0]
+                .parse()
+                .map_err(|e| format!("line {} entry field {:?}: {e}", index + 1, fields[0]))?;
+            if row_entry != entry {
+                continue;
+            }
+            // Only the raw-RDP lane is replayable as a command stream; a GBI
+            // row is a display-list command that has not been decoded yet.
+            if fields[1] != "RDP" {
+                return Err(format!(
+                    "line {} is on the {} lane; parity replays the raw-RDP lane",
+                    index + 1,
+                    fields[1]
+                ));
+            }
+            let parse_hex = |field: &str, name: &str| -> Result<u64, String> {
+                let stripped = field
+                    .strip_prefix("0x")
+                    .ok_or_else(|| format!("line {} {name} is {field:?}, want 0x hex", index + 1))?;
+                u64::from_str_radix(stripped, 16)
+                    .map_err(|e| format!("line {} {name} is {field:?}: {e}", index + 1))
+            };
+            rows.push((
+                parse_hex(fields[2], "pc")? as usize,
+                parse_hex(fields[3], "w0")? as u32,
+                parse_hex(fields[4], "w1")? as u32,
+            ));
+        }
+        if rows.is_empty() {
+            return Err(format!("no rows for decode entry {entry}"));
+        }
+        for pair in rows.windows(2) {
+            if pair[1].0 != pair[0].0 + 8 {
+                return Err(format!(
+                    "rows for entry {entry} are not contiguous: {:#010x} then {:#010x}",
+                    pair[0].0, pair[1].0
+                ));
+            }
+        }
+        let source_pc = rows[0].0;
+        let words = rows
+            .iter()
+            .flat_map(|&(_, w0, w1)| [w0, w1])
+            .collect::<Vec<u32>>();
+        Ok(CapturedPacket {
+            entry,
+            words,
+            source_pc,
+        })
+    }
+
+    /// Walk a raw-RDP word stream into `(byte_offset, cmd6, w0, w1)`.
+    ///
+    /// Deliberately independent of any decoder under test: it knows only that
+    /// a raw-RDP command is 8 bytes except `G_TEXRECT` (`0x24`) and
+    /// `G_TEXRECTFLIP` (`0x25`), which are 16.
+    pub fn walk(words: &[u32]) -> Vec<(usize, u8, u32, u32)> {
+        let mut out = Vec::new();
+        let mut index = 0usize;
+        while index + 1 < words.len() {
+            let w0 = words[index];
+            let w1 = words[index + 1];
+            let cmd6 = ((w0 >> 24) & 0x3f) as u8;
+            out.push((index * 4, cmd6, w0, w1));
+            index += if matches!(cmd6, 0x24 | 0x25) { 4 } else { 2 };
+        }
+        out
+    }
+
+    /// Target extent read from the packet's OWN `SetColorImage` width and
+    /// `SetScissor` lower-right Y, never hardcoded. Reading a captured stream
+    /// at a guessed extent is the documented way to turn coherent geometry
+    /// into convincing "striping" (`docs/RT64-WM2000-HARNESS-TRAPS.md`).
+    pub fn target_extent(commands: &[(usize, u8, u32, u32)]) -> Option<(u32, u32)> {
+        let width = commands
+            .iter()
+            .find(|&&(_, cmd6, _, _)| cmd6 == 0x3f)
+            .map(|&(_, _, w0, _)| (w0 & 0x0fff) + 1)?;
+        let height = commands
+            .iter()
+            .find(|&&(_, cmd6, _, _)| cmd6 == 0x2d)
+            .map(|&(_, _, _, w1)| (w1 & 0x0fff) >> 2)?;
+        Some((width, height))
+    }
+
+    /// The packet's own `SetColorImage` destination address.
+    pub fn color_image_addr(commands: &[(usize, u8, u32, u32)]) -> Option<u32> {
+        commands
+            .iter()
+            .find(|&&(_, cmd6, _, _)| cmd6 == 0x3f)
+            .map(|&(_, _, _, w1)| w1)
+    }
+}
+
+/// Replay a captured packet through all three backends at the packet's own
+/// extent and its own color-image address.
+///
+/// This is reported as its own section rather than folded into the
+/// hand-authored tally: the two have different provenance, and averaging a
+/// real frame together with twelve synthetic fills would produce a number
+/// whose denominator means nothing.
+fn captured_row() -> Value {
+    let Some(path) = std::env::var_os(captured::PACKET_ENV) else {
+        return json!({
+            "available": false,
+            "reason": format!(
+                "{} is unset. The capture is game content and is deliberately \
+                 not committed; produce one with FN64_GBI_PACKET_DUMP on a ROM \
+                 run, then point this variable at it.",
+                captured::PACKET_ENV
+            ),
+        });
+    };
+    let entry: u64 = std::env::var(captured::ENTRY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return json!({"available": false, "reason": format!("{path:?} unreadable: {error}")})
+        }
+    };
+    let packet = match captured::parse_packet_dump(&text, entry) {
+        Ok(packet) => packet,
+        Err(reason) => return json!({"available": false, "reason": reason}),
+    };
+    let walked = captured::walk(&packet.words);
+    let (Some((width, height)), Some(color_image)) = (
+        captured::target_extent(&walked),
+        captured::color_image_addr(&walked),
+    ) else {
+        return json!({
+            "available": false,
+            "reason": "the captured packet sets no color image or no scissor, \
+                       so its target extent cannot be read from the stream",
+        });
+    };
+    json!({
+        "available": true,
+        "provenance": "captured from a real ROM run via FN64_GBI_PACKET_DUMP; not committed",
+        "entry": packet.entry,
+        "source_pc": format!("{:#010x}", packet.source_pc),
+        "words": packet.words.len(),
+        "commands": walked.len(),
+        "target": {"width": width, "height": height},
+        "color_image": format!("{color_image:#010x}"),
+        "note": "Extent and destination are read from the packet's own \
+                 SetColorImage/SetScissor, never guessed. Replaying this \
+                 through the three backends is the next step and is NOT done \
+                 here: docs/RT64-WM2000-THREE-WAY.md already reports 0 of \
+                 115,200 differing for all three pairings on WM2000 frame 0.",
+    })
+}
+
 fn run() -> Value {
     let mut rows = Vec::new();
     let mut authoritative = Tally::default();
@@ -683,6 +895,7 @@ fn run() -> Value {
             "rt64_authoritative": authoritative.wire(),
             "rt64_not_authoritative_coverage": non_authoritative.wire(),
         },
+        "captured_corpus": captured_row(),
         "note": "The two partitions are never summed. RT64 does not model \
                  coverage, AA or dither (docs/RT64-GUARD-AUDIT.md), so a \
                  difference in the second partition is evidence about RT64's \
@@ -930,6 +1143,104 @@ mod tests {
         assert_eq!(word1, 0);
         let (word0, _) = fill_rect(17, 9, 17, 9);
         assert_eq!((word0 >> 12) & 0xfff, 68);
+    }
+
+    /// The contiguity check is the parser's load-bearing invariant: a dump
+    /// missing a row must be REFUSED, not silently concatenated into a
+    /// different display list that would then be measured as if it were the
+    /// game's.
+    #[test]
+    fn captured_parser_refuses_a_gap() {
+        let contiguous = "0\tRDP\t0x1000\t0xef300000\t0x00000000\n\
+                          0\tRDP\t0x1008\t0xe9000000\t0x00000000\n";
+        let packet = captured::parse_packet_dump(contiguous, 0).expect("contiguous rows parse");
+        assert_eq!(packet.words, vec![0xef30_0000, 0, 0xe900_0000, 0]);
+        assert_eq!(packet.source_pc, 0x1000);
+
+        // Same rows, second one 16 bytes on instead of 8: one pair is missing.
+        let gapped = "0\tRDP\t0x1000\t0xef300000\t0x00000000\n\
+                      0\tRDP\t0x1010\t0xe9000000\t0x00000000\n";
+        let error = captured::parse_packet_dump(gapped, 0).expect_err("a gap must be refused");
+        assert!(error.contains("not contiguous"), "{error}");
+    }
+
+    /// Rows for other decode entries must not leak into the replayed stream.
+    #[test]
+    fn captured_parser_selects_one_entry() {
+        let text = "0\tRDP\t0x1000\t0xef300000\t0x00000000\n\
+                    1\tRDP\t0x2000\t0xf7000000\t0x11111111\n\
+                    1\tRDP\t0x2008\t0xe9000000\t0x00000000\n";
+        assert_eq!(
+            captured::parse_packet_dump(text, 1).unwrap().words,
+            vec![0xf700_0000, 0x1111_1111, 0xe900_0000, 0]
+        );
+        assert_eq!(
+            captured::parse_packet_dump(text, 0).unwrap().words,
+            vec![0xef30_0000, 0]
+        );
+        assert!(captured::parse_packet_dump(text, 9).is_err());
+    }
+
+    /// A GBI-lane row is a display-list command that has not been decoded to
+    /// RDP words yet. Replaying it as if it were a raw-RDP stream would
+    /// measure nonsense, so it must be refused rather than accepted.
+    #[test]
+    fn captured_parser_refuses_the_gbi_lane() {
+        let text = "0\tGBI\t0x1000\t0xef300000\t0x00000000\n";
+        let error = captured::parse_packet_dump(text, 0).expect_err("GBI lane must be refused");
+        assert!(error.contains("raw-RDP lane"), "{error}");
+    }
+
+    /// `walk` must give `G_TEXRECT`/`G_TEXRECTFLIP` their 16 bytes and every
+    /// other command 8. Getting this wrong desynchronises the whole stream
+    /// from the first texrect onward.
+    #[test]
+    fn captured_walk_gives_texrect_sixteen_bytes() {
+        // TEXRECT (0x24) then a FullSync (0x29).
+        let words = vec![0x2400_0000, 0, 0, 0, 0xe900_0000, 0];
+        let walked = captured::walk(&words);
+        assert_eq!(walked.len(), 2);
+        assert_eq!((walked[0].0, walked[0].1), (0, 0x24));
+        assert_eq!((walked[1].0, walked[1].1), (16, 0x29));
+        // Without the 16-byte rule the second command would be read at
+        // offset 8, out of the middle of the texrect.
+        let plain = vec![0xf600_0000, 0, 0xe900_0000, 0];
+        let walked = captured::walk(&plain);
+        assert_eq!((walked[1].0, walked[1].1), (8, 0x29));
+    }
+
+    /// The extent must come from the packet's own SetColorImage/SetScissor.
+    /// Reading a captured stream at a guessed width is the documented cause
+    /// of "striping" that has been misreported as a renderer defect three
+    /// times (docs/RT64-WM2000-HARNESS-TRAPS.md).
+    #[test]
+    fn captured_extent_is_read_from_the_stream() {
+        // SetColorImage (0x3f) with width-1 = 479, SetScissor (0x2d) with
+        // lower-right Y in 10.2 fixed point = 237 << 2.
+        let words = vec![
+            0x3f00_0000 | 479,
+            0x0038_f800,
+            0x2d00_0000,
+            (237 << 2) & 0x0fff,
+        ];
+        let walked = captured::walk(&words);
+        assert_eq!(captured::target_extent(&walked), Some((480, 237)));
+        assert_eq!(captured::color_image_addr(&walked), Some(0x0038_f800));
+        // A stream with no color image cannot have an extent invented for it.
+        assert_eq!(captured::target_extent(&captured::walk(&[0xe900_0000, 0])), None);
+    }
+
+    /// With the variable unset the report must say the captured corpus is
+    /// unavailable rather than quietly reporting a hand-authored number as
+    /// though real content backed it.
+    #[test]
+    fn captured_corpus_is_absent_without_the_env_var() {
+        if std::env::var_os(captured::PACKET_ENV).is_some() {
+            return;
+        }
+        let row = captured_row();
+        assert_eq!(row["available"], serde_json::json!(false));
+        assert!(row["reason"].as_str().unwrap().contains(captured::PACKET_ENV));
     }
 
     /// The key must be materialised through the same `^3` guest byte-lane
