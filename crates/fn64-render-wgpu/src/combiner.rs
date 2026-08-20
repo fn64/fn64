@@ -3836,7 +3836,11 @@ pub mod census {
         .fetch_add(1, Ordering::Relaxed);
 
         let note = NOTES.fetch_add(1, Ordering::Relaxed) + 1;
-        if note % 100_000 == 0 && std::env::var_os("FN64_COMBINER_CENSUS").is_some() {
+        if note % 100_000 == 0 {
+            // The caller only reaches this function when the env flag is
+            // set (it gates the call site behind a `OnceLock`), so the
+            // flag is not re-read here; doing so would allocate on the
+            // per-triangle path a live perf lane is measuring.
             report(&format!("note={note}"));
         }
     }
