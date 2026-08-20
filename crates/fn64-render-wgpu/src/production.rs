@@ -376,7 +376,7 @@ impl WgpuBackend {
     ///
     /// Exposed for the adapterless harness, which asserts the extent survived
     /// a `NoAdapter` create rather than reaching into the field itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "conformance-runner"))]
     pub(crate) fn has_configured_target_extent(&self) -> bool {
         self.configured_target_extent.is_some()
     }
