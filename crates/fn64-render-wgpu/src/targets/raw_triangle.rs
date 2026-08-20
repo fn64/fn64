@@ -167,6 +167,34 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     let base_inputs = shading
         .validate_combiner_program_for(cycles, triangle.flags().shaded(), textured)?
         .base_inputs();
+    // **Diagnostic-only census of the program this triangle will actually
+    // evaluate.** Placed after the validation above, so only programs that
+    // reach the pixel loop are counted; a refused one never draws and would
+    // skew the tally toward selectors the screen never sees. The slice
+    // decoded here is chosen from `evaluation`, not assumed: one-cycle mode
+    // evaluates the CYCLE-1 bitfield slice (angrylion `combiner_1cycle`,
+    // `combiner.c:173-220`, dereferences index `[1]` throughout), which is
+    // the same `SECOND_CYCLE = true` `run_one_cycle` passes. Two-cycle mode
+    // starts at cycle 0. Reading the other slice would report selectors the
+    // hardware never consults.
+    if std::env::var_os("FN64_COMBINER_CENSUS").is_some() {
+        let second_cycle = matches!(evaluation, TexrectCombinerEvaluation::OneCycle);
+        let combine = shading.combine();
+        crate::combiner::census::note_program(
+            [
+                combine.decode_color(crate::combiner::ColorInputSlot::A, second_cycle),
+                combine.decode_color(crate::combiner::ColorInputSlot::B, second_cycle),
+                combine.decode_color(crate::combiner::ColorInputSlot::C, second_cycle),
+                combine.decode_color(crate::combiner::ColorInputSlot::D, second_cycle),
+            ],
+            [
+                combine.decode_alpha(crate::combiner::AlphaInputSlot::A, second_cycle),
+                combine.decode_alpha(crate::combiner::AlphaInputSlot::B, second_cycle),
+                combine.decode_alpha(crate::combiner::AlphaInputSlot::C, second_cycle),
+                combine.decode_alpha(crate::combiner::AlphaInputSlot::D, second_cycle),
+            ],
+        );
+    }
     let blend_state = blend_registers.mode_state(other_mode);
     require_blendable_mode(blend_state)?;
     let stages = TexrectFragmentStages::try_new(other_mode, blend_registers.blend_color())?;
