@@ -216,3 +216,90 @@ measurement is the raw-program histogram added in this branch
 `SetCombine` words themselves so the dominant program can be hand-decoded
 from the wire layout rather than inferred from margins. That run has not
 been made yet.
+
+## RESOLVED: the program histogram settles it. Candidate 2 is refuted.
+
+**Status: CONFIRMED**, second run, same script and stack, with the raw
+`(low, high)` histogram and the cycle-mode breakdown added. Two consecutive
+ticks, stable.
+
+```
+[fn64-combiner]   passes: one_cycle=30045 two_cycle_first=84978 two_cycle_second=84977
+[fn64-combiner]   distinct programs = 10, top 8 by count:
+[fn64-combiner]     0xfc15fea3 0xf00ff23f x73925
+[fn64-combiner]     0xfcffffff 0xfffdf6fb x12829
+[fn64-combiner]     0xfc5196a3 0x112cfe7f x10601
+[fn64-combiner]     0xfc45fea3 0xf00ff83f x7762
+[fn64-combiner]     0xfcffb3ff 0xff64fe7f x3022
+[fn64-combiner]     0xfc1596a3 0xf0fffe38 x2423
+[fn64-combiner]     0xfc309661 0x552eff7f x2304
+[fn64-combiner]     0xfc30b261 0xff67ffff x882
+```
+
+**WM2000 uses only ten distinct combiner programs in an in-match window, and
+most draws are TWO-cycle** (`two_cycle_first` and `two_cycle_second` are
+equal, as they must be, and together outnumber `one_cycle` nearly 6:1).
+
+Hand-decoding the dominant program `0xfc15fea3 / 0xf00ff23f` (73,925 draws,
+~64% of the window) from the gbi.h bit positions:
+
+| pass | rgb | alpha |
+|---|---|---|
+| cycle 0 | `(Texel0 - Zero) * ShadeAlpha + Zero` | `(Zero - Zero)*Zero + Texel0` |
+| cycle 1 | `(Environment - Combined) * Primitive + Combined` | `(Combined - Zero)*Primitive + Zero` |
+
+That is **texture modulated by shade alpha, then fog-lerped toward the
+environment colour by the primitive fraction** -- the standard N64 fogged
+texture combiner. The texture is sampled and used.
+
+### The earlier reading was mine, and it was wrong
+
+The per-slot tally in the previous section reported "54.1% of textured draws
+read no Texel input", and flagged an exact `A.Environment == C.Primitive`
+coincidence. Both observations were real. The **inference** was wrong: those
+are the CYCLE-1 fog passes of two-cycle programs whose cycle-0 pass sampled
+the texture. 37,727 of the 47,596 "ignores" notes in the first run -- 79% --
+are the second pass of exactly three programs whose first pass reads
+`Texel0`.
+
+Four per-slot marginals cannot distinguish "a program that ignores the
+texel" from "the second pass of a program that did not", which is precisely
+the joint-vs-marginal gap the histogram was added to close. Recorded rather
+than quietly corrected, because the marginal-only tally was convincing and
+would have sent a fix lane at the combiner decode, which is not defective.
+
+The census now counts only the first evaluated pass for this ratio, and
+`the_wm2000_fog_program_samples_the_texture_in_its_first_cycle` pins the
+ROM's real program against hand-derived expectations.
+
+### Verdict on the card's two candidates
+
+- **Candidate 2 (the combiner discards the texel): REFUTED.** The dominant
+  program samples `Texel0` in cycle 0 and carries it through `Combined`.
+  The programs are decoded correctly -- verified three ways against gbi.h,
+  angrylion and RT64 -- and they select the texture.
+- **Candidate 1 (a wrong-but-valid sampled texel) is the surviving
+  candidate**, now by elimination as well as by the prior lane's evidence.
+
+### The strongest lead for candidate 1, NOT yet measured
+
+**Status: HYPOTHESIS.** The dominant program modulates the texel by
+`ShadeAlpha`, and multiplies the result by nothing else. So the drawn colour
+is `texel.rgb * shade.a`, fogged. Two ways that renders flat:
+
+1. **A wrong texel**, the card's candidate 1 proper.
+2. **A wrong `ShadeAlpha`.** If the interpolated shade alpha were near a
+   constant, every pixel of a triangle would take one scaled copy of its
+   texel -- which is what "flat" looks like -- even with a perfectly correct
+   sample. Nothing in this card measured shade alpha, and it is the second
+   multiplicand of the program 64% of draws use.
+
+A further, separate suspicion worth a lane:
+`triangle_span::texture_coordinates_s10_5`
+(`crates/fn64-render-wgpu/src/raw_dpc/triangle_span.rs:519`) performs the
+perspective divide in **f32** with a `PERSPECTIVE_TEXEL_SCALE` of 1024.
+angrylion's `tcdiv_persp` (`src/core/n64video/rdp/tcoord.c:1027`) is an
+integer reciprocal-table path (`tcdiv_table[0x8000]`, shift/log2 based) with
+its own overflow and out-of-bounds handling. Those are not the same
+function, and a coordinate error lands squarely in candidate 1. Whether they
+agree closely enough to be invisible has not been measured here.
