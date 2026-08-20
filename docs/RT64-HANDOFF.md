@@ -66,10 +66,24 @@ refused on evidence: VI presentation (flat across fast/slow pumps), the
 whole-RDRAM staging copy (`dpc_calls=0.00`, path not taken), and the RSP
 recompiler (0.315 ms here vs 5.09 on the block lane).
 
-**d. Textures are sampled, not discarded.** 255,654 of 255,654 admitted
-triangles take the binding arm and call `sample_point`; the combiner census
-shows the fog program *does* sample the texture. Both "not bound" and "Texel0
-discarded" are dead. The defect reports success somewhere.
+**d. ROOT CAUSE FOUND: `PERSPECTIVE_TEXEL_SCALE` is 2^10; angrylion says
+2^15.** A 32x error collapses texture coordinates, so **87% of textured
+triangles sample exactly one texel** -- the sampler runs, reads real TMEM, and
+every pixel lands on the same texel. That is precisely the "flat/untextured"
+symptom, and it is why every earlier diagnostic said textured-admitted-sampled
+while the screen said otherwise.
+
+It also explains why three prior hypotheses died: binding was fine (255,654 of
+255,654 admitted triangles take the binding arm and call `sample_point`),
+`Texel0` was not discarded (the fog program samples the texture), and
+CI-without-TLUT aliasing matched angrylion byte for byte. The bug was one
+constant, downstream of all of them.
+
+**Note the pattern:** this is the second scale-factor defect today. A prior
+lane recorded two empirical constants -- `x2^10` perspective and `/2^21`
+non-perspective -- with the instruction "cite these; do not re-derive." One of
+them was wrong. Constants carried forward on citation still need an oracle
+check.
 
 **e. CI-without-TLUT aliasing matches angrylion byte for byte** -- REFUTED as
 the glyph explanation.
@@ -93,14 +107,24 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    It is 10 hand-authored **fill-rectangle** cases today -- it cannot see any
    open bug. This is the highest-leverage item: the fast layer does not cover
    the code under change.
-4. **Then optimise the rasterizer.** ~150 cycles/pixel at 8x overdraw where
+4. **Look at the screen after the texel-scale fix lands.** With 87% of
+   textured triangles previously collapsing to a single texel, the visual
+   result should change substantially. Re-check the colour bands and blocky
+   glyphs before scoping either as separate work -- they may share this cause.
+5. **Then optimise the rasterizer.** ~150 cycles/pixel at 8x overdraw where
    20-30 should do; `pixel_coverage` and `attribute_sample` each rescan the
    same subsamples, and every admitted triangle samples a texture per pixel.
-   Needs ~3x, not 20%.
-5. **Wire angrylion as a conformance runner.** The largest unexploited asset
-   here -- cycle-accurate, and currently only read by humans as C source.
-   It would make coverage/AA/dither adjudicable instead of permanently UNKNOWN.
-6. **Gate parity and the boot ladder.** Both instruments exist; neither is
+   Needs ~3x, not 20%. Note the fix above may *raise* cost per pixel by making
+   sampling do real work, so re-measure rather than assuming the 67.4% holds.
+6. **Wire angrylion as a conformance runner.** No longer a theoretical
+   argument: **it is what caught the texel-scale defect** (§3d). Reading its C
+   by hand found a 32x constant error that every in-tree instrument reported as
+   healthy. It is cycle-accurate, currently only read by humans, and wiring it
+   as a runner would catch this class automatically instead of relying on
+   someone thinking to check. It would also make coverage/AA/dither adjudicable
+   instead of permanently UNKNOWN in the guard audit, since RT64 is silent
+   there.
+7. **Gate parity and the boot ladder.** Both instruments exist; neither is
    wired to anything, so a regression ships silently.
 
 ## 5. Hard-won operational rules
