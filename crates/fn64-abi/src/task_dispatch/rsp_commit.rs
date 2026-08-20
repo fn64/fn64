@@ -1173,15 +1173,41 @@ fn try_dispatch_raw_dpc_via_session(
                 let range = read.range();
                 let start = range.start().get() as usize;
                 let end = range.end() as usize;
-                let bytes = real
-                    .get(start..end)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
-                             the captured source"
-                        )
-                    })
-                    .to_vec();
+                assert!(
+                    end <= real.len(),
+                    "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
+                     the captured source"
+                );
+                // **Logical order, not raw storage** -- the same byte-lane
+                // authority the committed-write direction below already
+                // observes, applied to the read direction.
+                //
+                // `CapturedGuestRead`'s contract is N64-logical bytes, and the
+                // TMEM load executors index the capture linearly with no lane
+                // mapping of their own. `real` is a bare pointer slice over
+                // ABI storage, where bytes sit under the `^3` map, so a raw
+                // `to_vec()` handed the sampler every 32-bit word
+                // byte-reversed: "adjacent columns swapped AND each halfword
+                // byte-reversed", exactly the symptom this file's own
+                // write-back doc records for the outlier raw copy that was
+                // fixed there.
+                //
+                // Command words survived the raw read by accident -- `^3`
+                // composed with a little-endian host load cancels for an
+                // aligned 32-bit word -- which is why this was invisible in
+                // command decode and fatal only for byte-granular texture
+                // data.
+                //
+                // Measured: with the raw copy, an eight-texel RGBA16 parity
+                // fixture sampled the raw storage halfwords (`0xc107` where
+                // `0xf801` was staged, all eight explained by that one rule)
+                // while RT64 read the identical buffer and returned the key.
+                // With this, both backends are byte-identical to the key.
+                let mut bytes = vec![0; end - start];
+                fn64_runtime::RdramView::from_storage(real).copy_logical_bytes(
+                    fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                    &mut bytes,
+                );
                 fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
                     .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
             })

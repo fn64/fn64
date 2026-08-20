@@ -78,9 +78,20 @@ fn words_to_be_bytes(words: &[u32]) -> Vec<u8> {
 /// non-garbage content to compare against in hostile hash-continuity tests.
 fn rdram_with_texture_source() -> Vec<u8> {
     let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    // **Staged through the logical writer, not `copy_from_slice`.** Guest
+    // RDRAM holds bytes under the `^3` logical-to-storage map, and the
+    // deferred guest-read capture now honours it (`rsp_commit.rs`), so a raw
+    // `copy_from_slice` here would stage this image byte-reversed within each
+    // 32-bit word. That is not a cosmetic difference for this fixture: the
+    // counter's payload sits entirely in each halfword's LOW byte, which is
+    // blue+alpha in RGBA5551, so a swapped image collapses the env-lerp to a
+    // constant and defeats the `distinct.len() >= 2` claim below.
+    //
+    // Previously the raw write here and a raw read in the capture cancelled;
+    // fixing only the capture exposed this side.
     let source: Vec<u8> = (0..64u16).flat_map(u16::to_be_bytes).collect();
-    let start = TEXTURE_SOURCE_ADDR as usize;
-    rdram[start..start + source.len()].copy_from_slice(&source);
+    fn64_runtime::RdramViewMut::from_storage(&mut rdram)
+        .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR), &source);
     rdram
 }
 
