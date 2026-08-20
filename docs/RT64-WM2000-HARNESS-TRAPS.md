@@ -125,3 +125,44 @@ enforces exactly: every declared write claimed once, every staged write declared
 time it was conservative in a way that dropped real guest-visible commands to
 withhold one that was invisible anyway. When retargeting such a test, point it
 at the per-access invariant rather than deleting it.
+
+**A fixture can be UNPHYSICAL rather than merely wrong.** Chasing the odd-row
+XOR4 defect turned up an `rdp_harness` fixture that staged a `line = 1`
+LoadBlock at `DXT = 0` -- which writes every word on tile-relative row 0,
+unexchanged -- and then sampled the tile's SECOND row, where the reader applies
+the exchange. Real hardware would disagree with itself on that pairing too. The
+fixture passed only because the reader carried a compensating origin term that
+cancelled the missing write-side one, so two bugs held it up. When a fixture
+fails after a correctness fix, ask whether the display list it stages is one
+the RDP could actually produce, before assuming the fix is wrong.
+
+**LoadBlock cannot advance rows AND keep them contiguous when `line` equals the
+natural row width.** A LoadBlock word lands at destination
+`tmem + word + advance * line` with `advance = (word * dxt) >> 11`, so at
+`line = 1` a `dxt` of 2048 gives destinations 0, 2, 4, 6 -- striding, with
+gaps. That is correct RDP behaviour (LoadBlock's `line` is meant to differ from
+the row width), not a defect. A fixture that wants stated, contiguous, genuinely
+exchanged rows wants **LoadTile**, which names its rows directly.
+
+**A test whose two arms differ only by a value the code no longer reads is not
+a test.** Several fixtures here asserted that `TmemFirstRowParity::Even` and
+`::Odd` produced DIFFERENT texels four bytes apart -- which was the defect's own
+signature, frozen into the expectations. After the fix the honest assertion is
+that the two arms are EQUAL, which is what fails if the removed term is ever
+reintroduced. When deleting a parameter's effect, check every fixture that
+varies it: some of them were pinning the bug.
+
+**The parity corpus could not hold a non-fill case, and the blocker was a
+test.** `authoritative_cases_use_the_no_coverage_other_modes_word` required
+every RT64-authoritative case's `SetOtherModes` to equal the fill-cycle word
+exactly. A textured draw cannot run in fill cycle, so the corpus was
+structurally closed to exactly the cases most worth adding. The fix was to
+assert the three PROPERTIES the partition needs (both dither selectors 3;
+AA_EN, ALPHA_CVG_SEL and CVG_TIMES_ALPHA clear) instead of a literal. Watch for
+guards that pin an incidental encoding when they mean a property.
+
+**`FN64_RT64_DIR` is required to build the parity runner even for wgpu-only
+questions.** `--features parity-runner` pulls `fn64-render-rt64/rt64`, whose
+build script panics without it. Set it to
+`/Users/jer/Code/no-mercy-recompiled/third_party/rt64`. Unset, the failure
+looks like a broken build, not a missing env var.
