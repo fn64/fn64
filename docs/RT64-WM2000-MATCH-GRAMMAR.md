@@ -148,11 +148,53 @@ compares `D_8016F0AC` against the configured limit
 
 (otherwise it calls `func_80124668(0x4000)`, decision-by-judges.)
 
-**A fixed button schedule does not have to produce a pin.** The clock expires on
-its own. What it costs in wall time depends on `D_8014E1C4[D_800961D2]`, which
-is why both the setting and the table are in the default watch set -- a run
-should report the configured bound rather than leave anyone guessing whether the
-wait is three minutes or sixty.
+**A fixed button schedule does not have to produce a pin** -- the clock expires
+on its own. But the cost of waiting it out is the finding that reshapes this
+whole card, so the table was read rather than assumed.
+
+### The time limit is in MINUTES, and waiting it out is not viable (CONFIRMED)
+
+`D_8014E1C4` is at `disasm/asm/asm/data/13D1D0.data.s:4486` (ROM `0x13ED54`),
+and the element width is 2 bytes -- the code at `0x80123ECC` does
+`sll $v0, $v0, 1` before `lh $v0, %lo(D_8014E1C4)($at)`. Its 13 entries are a
+plain ramp:
+
+| idx | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| value | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 | 55 | 60 |
+
+**Those are minutes, not ticks.** The carry logic at `0x80123E6C`-`0x80123E90`
+fixes the units: `D_80166F88` is compared against `0x3C` (60) and reset -- a
+seconds counter rolling over at a minute -- while `D_8016F0AC`, the one the
+limit is compared against at `0x80123EDC`, is compared against `0x3E8` and is
+the minutes counter. So entry 6 is 30 minutes, not 15 seconds.
+
+Against the measured host rate (`RT64-WM2000-MATCH-RUN-BUDGET.md`: ~50,000
+steps/min, ~508 steps/swap in a match), that is:
+
+| limit | in-game | swaps | steps | wall clock |
+|---|---|---|---|---|
+| idx 2 | 10 min | 36,000 | 18.3 M | **6.1 h** |
+| idx 6 | 30 min | 108,000 | 54.9 M | **18.3 h** |
+| idx 12 | 60 min | 216,000 | 109.7 M | **36.6 h** |
+
+**And index 0 means no limit at all.** It is reachable: `0x80146AC0` writes
+`sb $zero` to `D_800961D2` on one match-type branch. On that setting the clock
+never ends the match, at any budget.
+
+`D_800961D2` is otherwise the options-menu cursor position (`0x80146AFC` loads
+it from the identity ramp `D_8016861C[D_8009F299]`), and the only hard-coded
+non-zero write is `addiu $v1, $zero, 0xC` at `0x801471FC` -- index 12, i.e.
+**60 minutes** (HYPOTHESIS: that this is the path an exhibition match takes was
+not confirmed).
+
+**The consequence for this card.** "Let the clock run out" is not an available
+strategy at any plausible budget, and may not terminate at all. A run must
+either end the match by pin/countout, or -- much cheaper -- simply *read* the
+configured limit and the clock out of guest memory and report how far the match
+actually got against its own bound. Both `D_800961D2` and `D_8014E1C4` are in
+the default watch set for exactly this reason: the first thing a run should
+establish is which of these five rows it is living in.
 
 ### The referee count
 
