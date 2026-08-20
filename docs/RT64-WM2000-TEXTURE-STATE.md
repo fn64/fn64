@@ -78,3 +78,35 @@ visibility threshold until the last one lands. That is the argument for
 finishing the parity corpus rather than continuing to fix-and-look -- see that
 doc's "next concrete step", which is a specific command with specific expected
 texel values and a named diagnosis for each wrong answer.
+
+
+---
+
+# CLOSED: the texel values are correct on screen
+
+**CONFIRMED by a ROM run and a human reading the frame.** The defect this
+document bounded -- "coordinates are right, the fetch at those coordinates
+is not" -- is fixed.
+
+The cause was NOT in the TMEM address computation, the tile descriptor, the
+palette, or the byte-lane mapping inside the sampler; all four were
+investigated and cleared (see `RT64-WM2000-TEXEL-LOCALISATION.md`). It was
+one layer earlier: the deferred guest-read capture handed the renderer RAW
+ABI STORAGE bytes where `CapturedGuestRead`'s contract is N64-LOGICAL
+bytes, so every 32-bit word of texture source reached the sampler
+byte-reversed. Fixed in `9168bb9a` on both the production and conformance
+paths.
+
+Evidence, same scene, both committed under `docs/frames/`:
+
+| | image | what it shows |
+|---|---|---|
+| before | `wm2000-after-xor4-fix-swap5192.png` | dense magenta/green/black speckle; silhouettes only |
+| after | `wm2000-after-byte-lane-fix-swap4090.png` | skin tones, facial detail, legible "AUSTIN 3:16" shirt print, shaded arena trusses, readable "Single Match" / "STEVE AUSTIN VS STEVE AUSTIN" / "RAW IS WAR" |
+
+Zero panics and zero backend errors across 4,200+ dumped frames.
+
+**The remaining items this document grouped with the noise** -- colour bands
+and blocky glyphs -- were explicitly NOT scoped separately, on the grounds
+that they plausibly shared this cause. Re-check them against a current frame
+before scoping; do not assume they survived.
