@@ -27,7 +27,13 @@ reference-runner = [
 # The wgpu runner: the first adapter for the backend fn64 actually ships.
 # Adapterless -- it drives `fn64-render-wgpu`'s CPU-side raw-DPC seam and reads
 # `ColorTargetRegistry`'s `device_bytes`, a CPU `Vec<u8>`. No GPU required.
+# `fn64-render` and `fn64-render-reference` are here for the `sweep`
+# subcommand only: the differential drives BOTH backends over one family of
+# fixtures in one process, which is the whole point of a comparison harness.
+# The `run` path -- the one the orchestrator drives -- touches neither.
 wgpu-runner = [
+    "dep:fn64-render",
+    "dep:fn64-render-reference",
     "dep:fn64-render-wgpu",
     "dep:fn64-runtime",
     "fn64-render-wgpu/conformance-runner",
