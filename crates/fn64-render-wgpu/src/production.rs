@@ -5211,10 +5211,20 @@ mod tests {
     }
 
     /// Same as `plan_with_deterministic_reads`, but for a fixture that
-    /// declares zero `TmemLoadSource` reads (a triangle-only plan) --
-    /// `plan_with_deterministic_reads`'s own `reads()[0]` indexing would
-    /// panic on an empty guest-read plan, so this asserts the expectation
-    /// explicitly instead of assuming it.
+    /// declares no TMEM-load reads -- `plan_with_deterministic_reads`'s own
+    /// `reads()[0]` indexing would panic on an empty guest-read plan.
+    ///
+    /// **It no longer asserts the plan declares NO reads at all.** That
+    /// assertion held while `TmemLoadSource` meant "a TMEM load", and a
+    /// partial `FillRectangle` now declares one too, for its colour-image
+    /// seed (`raw_dpc::plan_fill`). The two are indistinguishable by
+    /// purpose, which is a real cost of reusing `TmemLoadSource` for the
+    /// seed and is recorded in `docs/RT64-FILL-PARTIAL-SEED.md`.
+    ///
+    /// What it asserts instead is the fact the callers actually depend on:
+    /// no read of a TEXTURE buffer. A seed read names
+    /// `RdramResource::ColorFramebuffer`, so the two remain separable by
+    /// resource even though the purpose no longer separates them.
     fn plan_with_no_reads(
         backend: &mut WgpuBackend,
         session: &RawDpcAbiSession,
@@ -5225,8 +5235,12 @@ mod tests {
             .plan_raw_dpc(request)
             .expect("fixture plans cleanly");
         assert!(
-            planned.guest_read_plan().reads().is_empty(),
-            "a triangle-only plan must declare zero TmemLoadSource reads"
+            planned
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .all(|read| read.resource() == fn64_render_ir::RdramResource::ColorFramebuffer),
+            "this fixture must declare no TMEM-load source reads; only colour-image seeds"
         );
         planned
     }
@@ -5275,6 +5289,20 @@ mod tests {
         )
     }
 
+    /// Every declared read gets `source_bytes`, resized to that read's own
+    /// declared length.
+    ///
+    /// The resize is not cosmetic. This used to hand the same slice to
+    /// every read, which held while all of them were TMEM loads of one
+    /// fixture texture. A partial fill's colour-image seed is declared
+    /// alongside those and is sized by the target, not the texture, so the
+    /// unresized version failed `GuestReadByteCountMismatch` (expected 256,
+    /// actual 48).
+    ///
+    /// Padding is zero, which is safe HERE and nowhere near a seed
+    /// assertion: these fixtures assert on texels the fill overwrites, not
+    /// on seeded pixels. A fixture that asserts seed content must state its
+    /// own bytes -- see `capture_declared_reads`.
     fn guest_read_capture(
         planned: &PlannedRawDpcSubmission,
         source_bytes: &[u8],
@@ -5284,7 +5312,11 @@ mod tests {
                 .guest_read_plan()
                 .reads()
                 .iter()
-                .map(|read| CapturedGuestRead::try_new(*read, source_bytes.to_vec()).unwrap())
+                .map(|read| {
+                    let mut bytes = source_bytes.to_vec();
+                    bytes.resize(read.range().len() as usize, 0);
+                    CapturedGuestRead::try_new(*read, bytes).unwrap()
+                })
                 .collect(),
         )
     }
