@@ -89,6 +89,14 @@ fn rdram_with_texture_source() -> Vec<u8> {
     //
     // Previously the raw write here and a raw read in the capture cancelled;
     // fixing only the capture exposed this side.
+    //
+    // **With this staging correct, the sibling env-lerp test below is the
+    // live guard on the capture's byte order.** Verified by mutation:
+    // reverting `rsp_commit.rs`'s capture to a raw `to_vec()` of the storage
+    // slice fails `a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram`
+    // on its `distinct.len() >= 2` claim. No separate byte-lane unit test is
+    // carried for that, because one asserting the `^3` arithmetic alone does
+    // NOT fail on that mutation -- it would imply coverage it does not have.
     let source: Vec<u8> = (0..64u16).flat_map(u16::to_be_bytes).collect();
     fn64_runtime::RdramViewMut::from_storage(&mut rdram)
         .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR), &source);
