@@ -133,11 +133,17 @@ enum Authority {
     ///
     /// **2. The geometry: these edge words are a RECTANGLE to fn64 and a
     /// RIGHT TRIANGLE to RT64.** Probe-measured vertices are
-    /// `(2,0) (2,3) (6,3)`, whose pixel-centre coverage grows one column per
-    /// scanline from the left -- which is exactly the left-biased partial
-    /// coverage measured. With `XH` on the left and `XL`/`XM` on the right
-    /// and every `dxdy` zero, fn64 walks a box and RT64 walks the triangle
+    /// `(2,0) (2,3) (6,3)`: with `XH` on the left, `XL`/`XM` on the right and
+    /// every `dxdy` zero, fn64 walks a box and RT64 walks the triangle
     /// between the major and minor edges.
+    ///
+    /// The coverage is characterised, and a naive pixel-centre fit does NOT
+    /// reproduce it. Enlarged to 8x6 and dumped as raw values, RT64's
+    /// covered set is a triangle whose right edge advances 4/3 columns per
+    /// row -- its own hypotenuse slope -- **quantised to even-aligned pixel
+    /// PAIRS**, where a span ending mid-pair writes only that pair's ODD
+    /// pixel (x=5 with x=4 skipped; x=9 with x=8 skipped). Deterministic
+    /// across runs. See `RT64-WM2000-TEXEL-LOCALISATION.md` for the grid.
     ///
     /// **Note what was WRONG before:** this variant once claimed RT64 "does
     /// not rasterize raw triangles". It does -- `drawTris` is entered exactly
