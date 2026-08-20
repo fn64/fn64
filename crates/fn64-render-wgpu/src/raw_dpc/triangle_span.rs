@@ -500,8 +500,11 @@ fn coefficient_components(
 ///    the frame-wide texel histogram stayed broad and healthy-looking. See
 ///    `docs/RT64-WM2000-COMBINER-CENSUS.md`.
 /// 2. **Non-perspective (`G_TP_NONE`).** The divide is skipped entirely and
-///    the plane's own s15.16 value converts to S10.5 by dividing by `2^21`
-///    (`2^16 * 2^5`) -- angrylion's `tcdiv_nopersp`.
+///    the plane's own s15.16 value converts to S10.5 by dividing by `2^16`
+///    -- angrylion's `ss = s >> 16` (`rasterizer.c:479`); `tcdiv_nopersp`
+///    itself applies no scale. The further `>>5` to whole texels is the
+///    SAMPLER's, not this function's, so the total is `2^21`. See
+///    [`PLANE_TO_TEXEL`] for the measurement that corrected this.
 ///
 /// # `w <= 0` must not fault
 ///
@@ -592,9 +595,28 @@ fn saturate_s10_5(value: f32) -> i16 {
 /// five fractional bits over a `2^15`-scaled value.
 const PERSPECTIVE_TEXEL_SCALE: f32 = 32768.0;
 
-/// s15.16 plane value -> S10.5 texel coordinate, for the `G_TP_NONE` path:
-/// `2^16 * 2^5`. See [`texture_coordinates_s10_5`].
-const PLANE_TO_TEXEL: f32 = (1u32 << 21) as f32;
+/// s15.16 plane value -> S10.5 texel coordinate, for the `G_TP_NONE` path.
+///
+/// **`2^16`, because this produces S10.5 and NOT texels.** Hardware reaches
+/// the texel in two steps and fn64 does the same, in the same two places:
+///
+/// | step | hardware | fn64 |
+/// |---|---|---|
+/// | plane -> S10.5 | `ss = s >> 16` (angrylion `rasterizer.c:479`) | this constant |
+/// | S10.5 -> texel | `*S = locs >> 5` (`tcoord.c:143`) | `sample.rs`'s `div_euclid(TEXEL_FRACTION_SCALE)` |
+///
+/// `tcdiv_nopersp` itself applies NO scale at all (`tcoord.c:1024`: it is
+/// `SIGN16(ss) & 0x1ffff`), so the whole non-perspective conversion is
+/// `>>16` composed with `>>5` = `2^21` from plane to whole texel.
+///
+/// **This was `2^21` and that was wrong**: the function's result is consumed
+/// as S10.5 by `TextureCoordinateS10_5::from_raw`, so the sampler applied
+/// its own `>>5` on top and the `2^5` was counted TWICE, making a plane
+/// `2^26` per texel instead of `2^21`. Measured on the parity corpus's
+/// `textured-triangle-point-sampled`: with `2^21` here, RT64 reproduced the
+/// hand-derived key and wgpu read texel 0 everywhere; the two swapped at
+/// `2^26`. RT64 agrees with hardware, and this constant is why fn64 did not.
+const PLANE_TO_TEXEL: f32 = (1u32 << 16) as f32;
 
 #[cfg(test)]
 mod tests;
