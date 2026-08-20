@@ -516,29 +516,77 @@ fn rgba32_target_format_stride_is_four_bytes_per_pixel() {
 }
 
 #[test]
-fn admission_still_rejects_partial_write_to_a_brand_new_target() {
-    // Preserves the invariant a brand-new (predecessor: None) target must be
-    // fully initialized before it can become resident -- this slice only
-    // lifts the restriction for resident targets, per the task's explicit
-    // "smallest type-safe mechanism" instruction, not for new ones.
+fn a_partial_fill_of_a_brand_new_target_refuses_without_seed_bytes() {
+    // **Retargeted, not deleted.** This used to assert
+    // `PartialNewTargetInitialization`: that a brand-new target could not
+    // become resident from a partial rectangle at all. That refusal was
+    // wrong -- hardware's untouched pixels are simply the RDRAM bytes that
+    // were already there, and refusing swallowed every partial-rect fill,
+    // which is ordinary content.
+    //
+    // What was RIGHT about it, and what this now pins, is the narrower
+    // fact: the untouched pixels must not be fabricated. A partial fill
+    // with no seed still refuses, by name, and still publishes nothing.
     let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let candidate = registry.begin_candidate(key).unwrap();
     assert_eq!(candidate.predecessor(), None);
-    let completed = execute_fill_rectangle(
+    let error = execute_fill_rectangle(
         &candidate,
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 4, 12, 4),
         crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff), // partial: only row 1
         None)
-    .unwrap();
-    let error = candidate
-        .admit_completed_initialization(completed)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        TargetError::PartialNewTargetInitialization { .. }
-    ));
+    .unwrap_err();
+    assert!(
+        matches!(error, FillExecutionError::MissingSeedBytes { .. }),
+        "expected MissingSeedBytes, got {error:?}"
+    );
     assert!(registry.residents().is_empty());
+}
+
+#[test]
+fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectangle() {
+    // The positive half of the test above, and the one that would have
+    // caught the fabricated zeros: the SAME partial rectangle, now given a
+    // seed, must become resident with the seed's own bytes everywhere it
+    // did not paint.
+    //
+    // Expectation derived by hand from the wire, not from the executor.
+    // Target is 4x2 RGBA16. `rect(0, 4, 12, 4)` is quarter-pixel
+    // (ulx=0, uly=4, lrx=12, lry=4) -> x 0..=3, y 1..=1: the whole of row 1
+    // and none of row 0. Fill colour halfword 0xF801 round-trips exactly
+    // (expand(0x1f)=0xFF; 0xFF>>3=0x1f; alpha bit 0xFF>>7=1).
+    //
+    // The seed is 0x1234 everywhere -- deliberately NOT the fill colour and
+    // deliberately not zero, so "kept the seed", "painted the fill" and
+    // "fabricated a zero" are three distinguishable outcomes. A seed equal
+    // to the fill colour would have passed under the very bug this pins.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    assert_eq!(candidate.predecessor(), None);
+    let seed = [0x12u8, 0x34].repeat(8);
+    let completed = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        Some(&seed))
+    .unwrap();
+    assert_eq!(completed.rectangle(), TargetRectangle::try_new(0, 1, 4, 1).unwrap());
+    let bytes = completed.device_bytes().device_bytes();
+    // Row 0: untouched, so still the seed.
+    assert_eq!(&bytes[0..8], &[0x12, 0x34].repeat(4)[..], "row 0 must keep the seed");
+    // Row 1: painted with the fill colour.
+    assert_eq!(&bytes[8..16], &[0xF8, 0x01].repeat(4)[..], "row 1 must carry the fill");
+    // And it publishes, which the old refusal prevented.
+    let initialized = candidate.admit_completed_initialization(completed).unwrap();
+    assert_eq!(
+        initialized.initialized_region().covered(),
+        TargetRectangle::try_new(0, 1, 4, 1).unwrap(),
+        "the proof must name the rectangle actually covered, not the whole target"
+    );
 }
