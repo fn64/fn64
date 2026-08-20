@@ -122,9 +122,37 @@ const fn fill_rect(lrx: u32, lry: u32, ulx: u32, uly: u32) -> (u32, u32) {
 }
 
 /// `SetOtherModes` for fill cycle with no AA, no coverage read, no dither.
-/// This is the word every RT64-authoritative case uses, and the thing the
-/// coverage-dependent cases deliberately change.
+/// This is the word every RT64-authoritative FILL case uses, and the thing
+/// the coverage-dependent cases deliberately change.
 const OTHER_MODES_FILL_NO_AA: (u32, u32) = (0xef30_00f0, 0);
+
+/// `SetOtherModes` for a ONE-CYCLE textured draw, carrying exactly the same
+/// no-AA / no-dither / no-coverage properties [`OTHER_MODES_FILL_NO_AA`]
+/// does, so a textured case stays inside the RT64-authoritative partition.
+///
+/// Hand-derived field by field from angrylion's `rdp_set_other_modes`
+/// (`src/core/n64video/rdp.c:623-660`), which is the authority for every bit
+/// position below:
+///
+/// | field | bits | value | meaning |
+/// |---|---|---|---|
+/// | `cycle_type` | w0 21:20 | 0 | one cycle |
+/// | `persp_tex_en` | w0 19 | 0 | non-perspective: the `/2^21` plane path |
+/// | `en_tlut` | w0 15 | 0 | TLUT off; the tile's own format decodes |
+/// | `sample_type` | w0 13 | 0 | POINT sample, no bilerp |
+/// | `rgb_dither_sel` | w0 7:6 | 3 | dither disabled |
+/// | `alpha_dither_sel` | w0 5:4 | 3 | dither disabled |
+/// | `antialias_en` | w1 3 | 0 | AA off |
+/// | `alpha_cvg_select` | w1 13 | 0 | coverage not substituted for alpha |
+/// | `cvg_times_alpha` | w1 12 | 0 | no coverage multiply |
+///
+/// Point sampling is the load-bearing choice: it makes the expected pixel a
+/// single named texel rather than a filter of four, so the key stays
+/// hand-derivable. It also keeps the case clear of the three-nearest filter,
+/// whose tie-break this repo records as a preserved convention rather than a
+/// verified hardware fact (`tmem/sample.rs`'s
+/// `filter_three_nearest_committed_cell`).
+const OTHER_MODES_ONE_CYCLE_TEXTURED: (u32, u32) = (0xef00_00f0, 0);
 
 fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
     vec![
@@ -135,6 +163,195 @@ fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32
         fill_rect(lrx, lry, ulx, uly),
         (0xe900_0000, 0),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Textured cases
+// ---------------------------------------------------------------------------
+//
+// **Why these exist.** The corpus was fill-rectangles only, which means it
+// could not see any defect in the path that turns a texture coordinate into a
+// texel: TMEM addressing, the tile descriptor's format/size/line fields, the
+// palette, or the byte-lane mapping. That is exactly the layer
+// `docs/RT64-WM2000-TEXTURE-STATE.md` bounded WM2000's remaining defect to,
+// and localising it took a 20-minute ROM run plus a human reading a PNG.
+//
+// Every expected texel below is derived BY HAND from the RGBA16 wire layout
+// and the TMEM addressing rule, never from any fn64 implementation. See
+// `TEXTURE_TEXELS` for the derivation.
+
+/// Where the texture's source pixels live in the staged RDRAM image. Clear of
+/// the command stream (`0x100`) and the colour target (`0x10_0000`).
+const TEXTURE_SOURCE: u32 = 0x2000;
+
+/// The texture is 4x2 RGBA16 texels, so one row is 8 bytes = one 64-bit TMEM
+/// word, and `SetTile`'s `line` field is 1.
+const TEXTURE_WIDTH: u32 = 4;
+const TEXTURE_HEIGHT: u32 = 2;
+const TEXTURE_LINE_WORDS: u32 = 1;
+
+/// The eight texels staged into TMEM, row-major.
+///
+/// **Chosen so every one is distinguishable from every other**, and so a
+/// wrong TMEM address, a wrong row, a swapped 4-byte bank or a wrong byte
+/// lane each produce a DIFFERENT visible answer rather than coinciding. In
+/// particular the two rows differ in every texel, so reading row 0 where row
+/// 1 was meant is visible; and no texel is a byte-swap of another, so a
+/// lane error cannot alias onto a correct value.
+///
+/// Values are RGBA16 (5/5/5/1) and are stated as the literal 16-bit words the
+/// guest writes big-endian into RDRAM.
+const TEXTURE_TEXELS: [u16; 8] = [
+    0xf801, // row 0, col 0: r=31 g=0  b=0  a=1
+    0x07c1, // row 0, col 1: r=0  g=31 b=0  a=1
+    0x003f, // row 0, col 2: r=0  g=0  b=31 a=1
+    0xffff, // row 0, col 3: r=31 g=31 b=31 a=1
+    0x8421, // row 1, col 0: r=16 g=16 b=16 a=1
+    0xc631, // row 1, col 1: r=24 g=24 b=24 a=1
+    0x4211, // row 1, col 2: r=8  g=8  b=8  a=1
+    0xfc01, // row 1, col 3: r=31 g=0  b=0  a=1 with g's top bit set
+];
+
+/// Where the textured rectangle lands on the target, inclusive on both edges
+/// exactly as `G_FILLRECT` is. 4 columns by 2 rows at the origin, so the
+/// rectangle steps exactly one texel per pixel on both axes and pixel
+/// `(x, y)` samples texel `(x, y)` with no filtering ambiguity.
+const TEXRECT_ULX: u32 = 0;
+const TEXRECT_ULY: u32 = 0;
+const TEXRECT_LRX: u32 = TEXTURE_WIDTH - 1;
+const TEXRECT_LRY: u32 = TEXTURE_HEIGHT - 1;
+
+/// The expected pixel for a textured case, by linear target index.
+///
+/// Inside the rectangle a pixel reads its own texel; outside it the seeded
+/// `STALE` survives. This is the whole key, and it is arithmetic over
+/// [`TEXTURE_TEXELS`] -- no backend is consulted.
+fn textured_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x <= TEXRECT_LRX && y <= TEXRECT_LRY {
+        TEXTURE_TEXELS[(y * TEXTURE_WIDTH + x) as usize]
+    } else {
+        STALE
+    }
+}
+
+/// `SetTextureImage` naming the staged source as RGBA16.
+///
+/// Wire: `format` 0 (RGBA) at bits 23:21, `size` 2 (16-bit) at 20:19, and a
+/// width field of `width - 1` at 11:0, matching angrylion's
+/// `rdp_set_texture_image` (`src/core/n64video/rdp/tex.c:1002-1008`).
+const fn set_texture_image(width: u32, address: u32) -> (u32, u32) {
+    (0xfd00_0000 | (2 << 19) | (width - 1), address)
+}
+
+/// `SetTile` for tile 0, RGBA16, at TMEM word 0.
+///
+/// Wire, from angrylion's `rdp_set_tile` (`tex.c:979-1000`): `format` 23:21,
+/// `size` 20:19, `line` 17:9, `tmem` 8:0 in word 0; `tile` 26:24, `palette`
+/// 23:20, and the S/T clamp/mirror/mask/shift fields in word 1. Everything
+/// not named here is zero: no palette, no mirror, and `mask_s`/`mask_t` zero,
+/// which forces the CLAMP arm so a coordinate cannot wrap onto a neighbour
+/// and hide an addressing error.
+const fn set_tile(line_words: u32, tmem_word: u32) -> (u32, u32) {
+    (0xf500_0000 | (2 << 19) | (line_words << 9) | tmem_word, 0)
+}
+
+/// `SetTileSize` for tile 0 covering the whole texture.
+///
+/// All four coordinates are S10.2 and both high edges are INCLUSIVE, so a
+/// `w`-texel wide tile has `high_s = (w - 1) << 2`.
+const fn set_tile_size(width: u32, height: u32) -> (u32, u32) {
+    (
+        0xf200_0000,
+        (((width - 1) * 4) << 12) | ((height - 1) * 4),
+    )
+}
+
+/// `LoadTile` for tile 0 covering the whole texture, in the same S10.2
+/// inclusive form as `SetTileSize`.
+///
+/// LoadTile rather than LoadBlock deliberately: LoadBlock's row advance is
+/// driven by DXT and its `line` interacts with it, so a multi-row LoadBlock
+/// whose rows stay contiguous is not expressible at `line = 1`. LoadTile
+/// states its rows directly, which is what a fixture wants.
+const fn load_tile(width: u32, height: u32) -> (u32, u32) {
+    (0xf400_0000, (((width - 1) * 4) << 12) | ((height - 1) * 4))
+}
+
+/// `TextureRectangle` sampling tile 0, one texel per pixel on both axes.
+///
+/// Wire: word 0 carries `lrx` at 23:12 and `lry` at 11:0 in S10.2; word 1
+/// carries `tile` at 26:24, `ulx` at 23:12 and `uly` at 11:0. Words 2 and 3
+/// carry the S/T origin in S10.5 and the per-pixel DsDx/DtDy in S5.10.
+/// `1 << 10` is exactly one texel per pixel.
+fn texture_rectangle(ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
+    vec![
+        (
+            0xe400_0000 | ((lrx * 4) << 12) | (lry * 4),
+            ((ulx * 4) << 12) | (uly * 4),
+        ),
+        (0, (1 << 26) | (1 << 10)),
+    ]
+}
+
+/// `SetCombine` selecting `(Zero - Zero) * Zero + Texel0` in BOTH the colour
+/// and the alpha pipe, for both cycles.
+///
+/// A rectangle command carries no shade attributes, so the reset combiner --
+/// which selects SHADE -- is not a legal program for one; the reference lane
+/// refuses it by name. Texel0 passthrough is what makes the drawn pixel the
+/// sampled texel and nothing else, which is what lets the key below be a
+/// single named texel.
+///
+/// **BOTH cycles are set**, because in one-cycle mode the RDP evaluates the
+/// SECOND cycle's fields; leaving cycle 1 at its reset value makes it select
+/// `Combined` before any first-cycle result exists, which the reference lane
+/// refuses by name.
+///
+/// Packed by hand from angrylion's `rdp_set_combine`
+/// (`src/core/n64video/rdp/combiner.c:522-539`), which is the authority for
+/// every bit position:
+///
+/// | field | word | bits |
+/// |---|---|---|
+/// | `sub_a_rgb0` / `sub_a_rgb1` | w0 | 23:20 / 8:5 |
+/// | `mul_rgb0` / `mul_rgb1` | w0 | 19:15 / 4:0 |
+/// | `sub_a_a0` / `mul_a0` | w0 | 14:12 / 11:9 |
+/// | `sub_b_rgb0` / `sub_b_rgb1` | w1 | 31:28 / 27:24 |
+/// | `sub_a_a1` / `mul_a1` | w1 | 23:21 / 20:18 |
+/// | `add_rgb0` / `add_rgb1` | w1 | 17:15 / 8:6 |
+/// | `sub_b_a0` / `sub_b_a1` | w1 | 14:12 / 5:3 |
+/// | `add_a0` / `add_a1` | w1 | 11:9 / 2:0 |
+///
+/// and the `Zero` encodings from the same file's input tables (`:6-100`):
+/// sub_a RGB and sub_b RGB take `Zero` at code >= 8, mul RGB at code >= 16,
+/// add RGB at code 7, and every alpha input at code 7. `Texel0` is code 1 in
+/// the add-RGB and add-alpha tables alike.
+const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
+
+/// The command list for a textured case: state, load, draw, sync.
+fn one_textured_rect() -> Vec<(u32, u32)> {
+    let mut words = vec![
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        set_tile(TEXTURE_LINE_WORDS, 0),
+        set_tile_size(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+    ];
+    words.extend(texture_rectangle(
+        TEXRECT_ULX,
+        TEXRECT_ULY,
+        TEXRECT_LRX,
+        TEXRECT_LRY,
+    ));
+    words.push((0xe900_0000, 0));
+    words
 }
 
 /// The corpus.
@@ -322,6 +539,57 @@ fn cases() -> Vec<Case> {
             },
         },
         // ------------------------------------------------------------------
+        // Textured cases. RT64 IS the oracle for texture behaviour
+        // (`docs/RT64-PARITY.md` section 2), so these stay in partition A.
+        // ------------------------------------------------------------------
+        Case {
+            name: "textured-rect-point-sampled",
+            intent: "the corpus's first textured case, and the reason the \
+                     rest of this block exists. A 4x2 RGBA16 tile is loaded \
+                     with LoadTile and drawn one texel per pixel, so pixel \
+                     (x, y) must be texel (x, y) exactly. This is the case \
+                     that can see a wrong TMEM address, a wrong tile line, a \
+                     swapped 4-byte bank, or a wrong byte lane -- none of \
+                     which any fill-rectangle case can reach.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_textured_rect(),
+            expected: textured_expected,
+        },
+        Case {
+            name: "textured-rect-second-row-only",
+            intent: "the same tile drawn one row DOWN, so every pixel reads \
+                     TMEM row 1 -- the row that carries the odd-row XOR4 bank \
+                     exchange. A reader and writer that disagree about that \
+                     exchange return the right texel's neighbour four bytes \
+                     away, which is wrong colour at correct coordinates: \
+                     exactly the signature in RT64-WM2000-TEXTURE-STATE.md. \
+                     The first case above cannot see it, because its row 0 \
+                     never exchanges.",
+            authority: Authority::Rt64Authoritative,
+            commands: {
+                let mut words = one_textured_rect();
+                // Move the rectangle's T origin one texel down. The texrect
+                // words are the last two before FullSync; word 1 of the pair
+                // carries the S/T origin in S10.5, so one texel is `1 << 5`.
+                let texrect_s_t = words.len() - 2;
+                words[texrect_s_t].0 = 1 << 5;
+                words
+            },
+            // Every pixel row now reads TMEM row 1. The rectangle is still
+            // two rows tall, but the tile clamps at its own last row
+            // (`mask_t == 0` forces the clamp arm), so both target rows read
+            // TMEM row 1.
+            expected: |index| {
+                let x = index % WIDTH;
+                let y = index / WIDTH;
+                if x <= TEXRECT_LRX && y <= TEXRECT_LRY {
+                    TEXTURE_TEXELS[(TEXTURE_WIDTH + x) as usize]
+                } else {
+                    STALE
+                }
+            },
+        },
+        // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
         // does not model, so RT64's answer is NOT evidence about wgpu.
         // ------------------------------------------------------------------
@@ -385,6 +653,19 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
             RdramAddr::from_offset(FRAMEBUFFER + FRAMEBUFFER_BYTES),
             GUARD,
         );
+        // **The texture source, staged for every case.** A fill case never
+        // reads it, so seeding it unconditionally costs nothing and keeps
+        // `seeded` a single function of the command list. Written through the
+        // same `write_u16` the framebuffer uses, so the guest byte-lane
+        // mapping is applied once and in one place -- a raw `copy_from_slice`
+        // here would stage the texels byte-swapped and every textured case
+        // would report a texture defect that was really a runner defect.
+        for (index, texel) in TEXTURE_TEXELS.iter().enumerate() {
+            view.write_u16(
+                RdramAddr::from_offset(TEXTURE_SOURCE + index as u32 * 2),
+                *texel,
+            );
+        }
     }
     for (index, &(word0, word1)) in commands.iter().enumerate() {
         let offset = COMMAND_START as usize + index * 8;
@@ -1000,9 +1281,42 @@ mod tests {
                 .iter()
                 .find(|&&(word0, _)| word0 >> 24 == 0xef)
                 .expect("every case sets other modes");
+            // **The property, not the literal.** This used to require the
+            // exact `OTHER_MODES_FILL_NO_AA` word, which made the corpus
+            // structurally incapable of holding a non-fill case -- a
+            // textured draw cannot run in fill cycle. What the partition
+            // actually requires is that an RT64-authoritative case stay out
+            // of the modes RT64 does not model, so the three coverage/dither
+            // fields are checked directly against angrylion's own bit
+            // positions (`rdp.c:623-660`).
+            assert!(
+                *other_modes == OTHER_MODES_FILL_NO_AA
+                    || *other_modes == OTHER_MODES_ONE_CYCLE_TEXTURED,
+                "RT64-authoritative case {} uses an unvetted other-modes word \
+                 {other_modes:#010x?}; add it here with its own hand-derived \
+                 field table before using it",
+                case.name
+            );
+            let (word0, word1) = *other_modes;
             assert_eq!(
-                *other_modes, OTHER_MODES_FILL_NO_AA,
-                "RT64-authoritative case {} changed its other-modes word",
+                (word0 >> 6) & 3,
+                3,
+                "case {} enables RGB dither, which RT64 does not model \
+                 faithfully (guard audit U2/U3)",
+                case.name
+            );
+            assert_eq!(
+                (word0 >> 4) & 3,
+                3,
+                "case {} enables alpha dither, which RT64 does not model \
+                 faithfully (guard audit U2/U3)",
+                case.name
+            );
+            assert_eq!(
+                word1 & 0b11_0000_0000_1000,
+                0,
+                "case {} enables AA_EN, ALPHA_CVG_SEL or CVG_TIMES_ALPHA, \
+                 none of which RT64 models (guard audit C4-C6)",
                 case.name
             );
         }
