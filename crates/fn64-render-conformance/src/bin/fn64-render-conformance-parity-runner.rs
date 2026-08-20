@@ -455,6 +455,108 @@ fn texture_rectangle(ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> 
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
 
 // ---------------------------------------------------------------------------
+// Colour-indexed (CI4) with a TLUT
+// ---------------------------------------------------------------------------
+//
+// **Why this exists.** Every textured case above is direct-colour RGBA16: the
+// texel bytes ARE the colour. A colour-indexed texture is a different path --
+// the tile holds 4-bit INDICES, a palette is loaded separately into high TMEM
+// by `LoadTlut`, and `en_tlut` in other-modes switches the sampler onto the
+// lookup. None of that is reachable from an RGBA16 case, and
+// `RT64-WM2000-TEXTURE-STATE.md` names the palette as one of the suspects it
+// could not rule out for the blocky-glyph symptom.
+
+/// Where the CI4 index image and its palette live in staged RDRAM.
+const CI_SOURCE: u32 = 0x4000;
+const PALETTE_SOURCE: u32 = 0x4100;
+
+/// The palette's TMEM word address. `LoadTlut` refuses a destination tile
+/// below word 256 by name ("LoadTLUT destination tile is outside high TMEM"),
+/// which is the hardware split: indices live in low TMEM, palettes in high.
+const PALETTE_TMEM_WORD: u32 = 256;
+
+/// Eight CI4 indices, one per pixel of a 8x1 row -- deliberately NOT the
+/// identity permutation, so a sampler that ignored the palette and returned
+/// the index (or that returned palette entry `x` for pixel `x`) is visible.
+const CI_INDICES: [u8; 8] = [3, 0, 5, 1, 7, 2, 6, 4];
+
+/// The same bytes counted as 16-bit texels, which is how they are LOADED:
+/// eight 4-bit indices are four bytes are two 16-bit texels.
+const CI_LOAD_TEXELS: u32 = CI_INDICES.len() as u32 / 4;
+
+/// The sixteen-entry RGBA16 palette. Only the eight entries the indices name
+/// are distinguishable values; the rest are a marker that must never appear.
+const PALETTE: [u16; 16] = [
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01, 0x0843,
+    0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843,
+];
+
+/// The expected pixel for the CI4 case: pixel `x` reads index
+/// `CI_INDICES[x]`, which selects `PALETTE[that]`.
+fn ci_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < CI_INDICES.len() as u32 && y < 1 {
+        PALETTE[CI_INDICES[x as usize] as usize]
+    } else {
+        STALE
+    }
+}
+
+/// The CI4 command list: seed fill, state, palette load, index load, draw.
+///
+/// Wire notes, each from the same field positions the RGBA16 helpers above
+/// cite: `SetTextureImage`/`SetTile` carry format CI (2) at bits 23:21 and
+/// size 4-bit (0) at 20:19 for the index image, while the PALETTE is loaded
+/// through a second tile that is RGBA16 -- libultra's own `gDPLoadTLUT`
+/// macros emit `SetTextureImage(G_IM_FMT_RGBA, G_IM_SIZ_16b, ...)` for the
+/// palette regardless of the indexed tile's format.
+///
+/// `en_tlut` is other-modes w0 bit 15, the one field that switches the
+/// sampler from "the texel bytes are the colour" to "the texel bytes are an
+/// index into high TMEM".
+fn one_ci4_rect() -> Vec<(u32, u32)> {
+    let entries = PALETTE.len() as u32;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        // One-cycle textured, TLUT ENABLED.
+        (OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15), OTHER_MODES_ONE_CYCLE_TEXTURED.1),
+        SET_COMBINE_TEXEL0,
+        (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        // -- the palette, into high TMEM through tile 1 (RGBA16 source).
+        (0xfd00_0000 | (2 << 19) | (entries - 1), PALETTE_SOURCE),
+        (0xf500_0000 | (2 << 19) | PALETTE_TMEM_WORD, 1 << 24),
+        (0xe600_0000, 0),
+        (0xf000_0000, (1 << 24) | ((entries - 1) << 14)),
+        (0xe600_0000, 0),
+        // -- the CI4 index image, into low TMEM through tile 0.
+        //
+        // **Loaded through a 16-bit image, described as CI4.** fn64 refuses a
+        // direct four-bit load by name ("direct four-bit TMEM loads are
+        // unsupported; load through a public 16-bit form", `tmem/wire.rs`),
+        // and that is what real N64 code does anyway: the load moves bytes,
+        // and only the TILE descriptor says how to read them. Eight 4-bit
+        // indices are four bytes, so the loading tile is TWO 16-bit texels.
+        (0xfd00_0000 | (2 << 19) | (CI_LOAD_TEXELS - 1), CI_SOURCE),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(CI_LOAD_TEXELS, 1),
+        (0xe600_0000, 0),
+        load_tile(CI_LOAD_TEXELS, 1),
+        (0xe600_0000, 0),
+        // Now redescribe the SAME TMEM words as a CI4 tile: format CI (2) at
+        // bits 23:21, size 4-bit (0) at 20:19. Nothing is reloaded -- this is
+        // a descriptor change over bytes already in TMEM.
+        (0xf500_0000 | (2 << 21) | (0 << 19) | (1 << 9), 0),
+        set_tile_size(CI_INDICES.len() as u32, 1),
+    ]);
+    words.extend(texture_rectangle(0, 0, CI_INDICES.len() as u32, 1));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+// ---------------------------------------------------------------------------
 // Textured raw triangle
 // ---------------------------------------------------------------------------
 //
@@ -901,6 +1003,22 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
+            name: "textured-rect-ci4-tlut",
+            intent: "the first COLOUR-INDEXED case. Every textured case above \
+                     is direct-colour RGBA16, where the texel bytes ARE the \
+                     colour. CI4 is a different path: the tile holds 4-bit \
+                     indices, a palette is loaded separately into HIGH TMEM \
+                     by LoadTlut, and other-modes `en_tlut` switches the \
+                     sampler onto the lookup. RT64-WM2000-TEXTURE-STATE.md \
+                     names the palette as a suspect it could not rule out for \
+                     the blocky glyphs. The indices are a non-identity \
+                     permutation, so a sampler that returned the index \
+                     itself, or palette entry x for pixel x, is visible.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_ci4_rect(),
+            expected: ci_expected,
+        },
+        Case {
             name: "textured-triangle-point-sampled",
             intent: "the first RAW TRIANGLE in the corpus, and the first case \
                      on the path WM2000 actually draws through. Every case \
@@ -1018,6 +1136,22 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
                 *texel,
             );
         }
+        // The CI4 palette, RGBA16 like every other texel image.
+        for (index, entry) in PALETTE.iter().enumerate() {
+            view.write_u16(
+                RdramAddr::from_offset(PALETTE_SOURCE + index as u32 * 2),
+                *entry,
+            );
+        }
+        // The CI4 index image: two 4-bit indices per byte, high nibble first,
+        // written as logical guest bytes so the `^3` lane map is applied once
+        // -- the same reason every other source here goes through a view
+        // rather than a raw slice write.
+        let packed: Vec<u8> = CI_INDICES
+            .chunks_exact(2)
+            .map(|pair| (pair[0] << 4) | (pair[1] & 0xf))
+            .collect();
+        view.write_logical_bytes(RdramAddr::from_offset(CI_SOURCE), &packed);
     }
     for (index, &(word0, word1)) in commands.iter().enumerate() {
         let offset = COMMAND_START as usize + index * 8;
