@@ -17,7 +17,13 @@
 set -euo pipefail
 
 FN64=${FN64:-/private/tmp/fn64-rt64-main-integration}
-FLOOR=${1:-${WM2000_LADDER_FLOOR:-17000}}
+# Measured: a clean run at the default 8M step budget reaches 53,485 swaps with
+# zero panics and zero raw-DPC backend errors. The floor sits ~10% under that
+# so ordinary variation does not fail the gate, while any real regression --
+# a new refusal, a re-introduced trap -- lands far below it. Raise this when a
+# fix legitimately advances the ROM; lowering it to make a run pass is how a
+# regression ships.
+FLOOR=${1:-${WM2000_LADDER_FLOOR:-48000}}
 RUN_ID="ladder-$$"
 SCRATCH_ROOT=${WM2000_LADDER_SCRATCH:-/private/tmp/$RUN_ID}
 LOG="$SCRATCH_ROOT.log"
