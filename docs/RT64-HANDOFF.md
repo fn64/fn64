@@ -27,19 +27,43 @@ completion -- and per the disassembly a *script* cannot force one (no button
 test gates a pin anywhere; the time limit is 60 game-minutes or unlimited).
 A human on a pad is the only cheap route to that.
 
-## 2. Branch state -- READ THIS FIRST
+## 2. Branch state
 
-- **`port/rt64-conveyor` is pushed and green at `bbe3b3be` (538 commits).**
-- **15 commits sit UNVERIFIED and UNPUSHED** in
-  `/private/tmp/fn64-rt64-main-integration` at `f2d4dc36`, cherry-picked from
-  two lanes that both report green on their own branches. **A verification run
-  was interrupted before it finished.** Do not push these until
-  `cargo nextest run --workspace --offline` (baseline 8673 pass / 13 skipped)
-  and `cargo nextest run -p fn64-render-wgpu --features host-gpu-tests
-  --offline` (baseline 4908/3) both pass on the merged tree. If they fail, the
-  merge is the suspect, not the lanes.
+**`port/rt64-conveyor` is pushed, verified, and green at 575 commits.**
+Workspace **8681 passed / 13 skipped**; `-p fn64-render-wgpu --features
+host-gpu-tests` **4914 passed / 3 skipped**. `main` is untouched. There is no
+unverified work outstanding.
 
-`main` is untouched throughout.
+Integration worktree: `/private/tmp/fn64-rt64-main-integration`. Playable
+worktree: `/private/tmp/fn64-play-window`.
+
+Verify before any push:
+
+```sh
+cargo nextest run --workspace --offline                                  # 8681 / 13 skipped
+cargo nextest run -p fn64-render-wgpu --features host-gpu-tests --offline # 4914 / 3 skipped
+python3 scripts/lint-docs.py    # 1 known error at RT64-WM2000-VALIDATION.md:360
+```
+
+## 2b. Resuming in a new session
+
+From `/Users/jer/Code/fn64`, start a session and paste:
+
+> Read `docs/RT64-HANDOFF.md` on branch `port/rt64-conveyor` and continue from
+> section 4. The integration worktree is `/private/tmp/fn64-rt64-main-integration`.
+> Do not work in `/Users/jer/Code/fn64` -- it is dirty. One ROM run at a time.
+
+That is enough: the handoff carries the state, the priorities, and the
+operational rules. If the worktrees are gone (they live in `/private/tmp` and
+do not survive a reboot), recreate one with
+`git worktree add /private/tmp/fn64-work port/rt64-conveyor` from the main
+checkout -- everything is on the branch, nothing of value lives only in a
+worktree.
+
+To see the game immediately:
+`cd /private/tmp/fn64-play-window && ./scripts/play-wm2000.sh`
+(if that worktree is gone, the script is at `scripts/play-wm2000.sh` on the
+branch and needs `FN64` pointed at a worktree of it).
 
 ## 3. Findings that refute things this repo previously believed
 
