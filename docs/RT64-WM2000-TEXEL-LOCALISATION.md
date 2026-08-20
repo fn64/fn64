@@ -93,3 +93,64 @@ Measured with a C probe over both implementations:
 **HYPOTHESIS** that this is not the noise cause either: it requires a tile with
 `shift_s`/`shift_t` in 11..=15, which is the "negative shift" encoding and is
 uncommon. Needs a census of WM2000's actual tile descriptors to settle.
+
+## The odd-row XOR4 exchange: writer and reader must agree
+
+The RDP interleaves TMEM rows by XOR-ing the address by 4 bytes on odd rows.
+angrylion does this on BOTH sides using the **tile-relative** row:
+
+- Write (`tex.c:487` `loading_pipeline`): `tc_pipeline_load` applies
+  `TRELATIVE(sst1, tile->tl)` (`tcoord.c:998-999`), making `sst` tile-relative,
+  then `dswap = sst & 1` (`tex.c:583`).
+- Read (`tmem.c:63` `fetch_texel`): `taddr ^= ((t & 1) ? ... )` on the equally
+  tile-relative `t`. **`fetch_texel` never reads `tile->tl`** -- confirmed by
+  grep; `tl` does not appear in the function.
+
+So on hardware the exchange term is `row & 1` and there is no `tl` term
+anywhere. What matters for correctness is only that the two sides agree.
+
+### CONFIRMED: fn64's LoadTile is self-consistent
+
+fn64's writer (`tmem/types.rs`, `TmemLoadKind::Tile` arm) uses
+`(bounds.low_t().integer() + row) & 1`; its reader (`tmem/read.rs`,
+`odd_row_exchange`) uses `first_is_odd ^ (row & 1)` with
+`first_is_odd = low_t.integer() & 1`. Since
+`(a + b) & 1 == (a & 1) ^ (b & 1)`, these are the same function. Enumerated
+over `low_t` 0..4 x `row` 0..4: **writer and reader agree in all 16 cases.**
+
+fn64 therefore places LoadTile bytes at different absolute addresses than
+angrylion whenever `low_t` is odd, but reads them back through the same
+displacement, so the texel values are unaffected. **Not the noise cause.**
+
+### CONFIRMED DIVERGENCE: fn64's LoadBlock writer and reader disagree
+
+The `TmemLoadKind::Block` arm uses a DIFFERENT parity source:
+
+```rust
+(u64::from(source_t.raw()) + advance) & 1 != 0
+```
+
+`source_t.raw()`, not `low_t.integer()`. The reader has only one rule and
+always uses `low_t.integer() & 1`. So for a LoadBlock the two sides agree only
+when `source_t.raw() & 1 == low_t.integer() & 1`.
+
+Two independent reasons that equality is not guaranteed:
+
+1. They are **different fields** -- the load's own T origin versus the tile
+   descriptor's T origin.
+2. They are in **different units** -- `.raw()` is S10.5 fixed point while
+   `.integer()` is `raw >> 2`, so even for the same underlying coordinate the
+   parity bit read is a different bit.
+
+Enumerated over `source_t` 0..4 x `low_t` 0..3 x `advance` 0..3: **24 of 36
+combinations disagree.** On a disagreeing row every texel is fetched from the
+wrong 4-byte lane of its 64-bit word.
+
+**Signature match:** wrong lane = wrong bytes = wrong colour, at correct
+coordinates, on correctly shaped and lit geometry. That is exactly the
+observed "noise, not imagery".
+
+**HYPOTHESIS** (not yet confirmed) that this is THE cause for WM2000: it
+requires WM2000's textured surfaces to be loaded with `LoadBlock` rather than
+`LoadTile`, and requires the parity mismatch to actually occur for its tiles.
+Both are measurable and are the next step.
