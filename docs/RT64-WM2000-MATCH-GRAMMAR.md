@@ -86,263 +86,10 @@ tests at struct `+0x1A`/`+0x40`. L and R *do* participate in gameplay, but via
 the counter mask `0xC030` at `0x8013EEEC` -- the right conclusion reached at
 the wrong sites.
 
-## The match state machine (CONFIRMED)
+## How a match ENDS: NOT FOUND
 
-`func_801226A0` (`0x801226A0`), called from the frame loop at `0x800E1CD0`, is
-the match state machine. It switches on **`D_801589D6` (`0x801589D6`, s8)**
-through `jtbl_80151970`:
-
-```
-801226A4  lb    $v1, %lo(D_801589D6)
-          sltiu $v0, $v1, 0x5        # 5 states
-          ... jump via jtbl_80151970
-```
-
-| State | Handler | Role |
-|---|---|---|
-| 0 | `0x801226D0` | one-time init (zeroes `D_801589D0`, `D_801589E2`, `D_8016EE60`), falls through to state 1 |
-| 1 | `0x8012274C` | entrance; `D_801589D0++` gated `slti 0x1F`; then `D_8016ED29 \|= 1`, `func_800EA5A8(9)` |
-| 2 | `0x801227A0` | **the live match** |
-| 3 | `0x80122910` | **decision** -- one frame; picks the winner into `D_801589D4` |
-| 4 | `0x80122974` | **post-match**; ticks `D_801589D2` to `0x7530` |
-
-The byte is only ever incremented (`sb $v0, %lo(D_801589D6)`), never
-decremented. **`D_801589D6` is therefore the single best progress probe there
-is: the 2 -> 3 transition IS the match ending.**
-
-### What moves state 2 -> 3 (CONFIRMED)
-
-Inside state 2, six checks run; **any of them returning nonzero increments the
-state byte**:
-
-- `func_80123D64` -- the **time limit** (see below)
-- `func_80123B48` -- the **all-players-down countout**
-- `func_80123F34(0x8 | 0x40 | 0x20 | 0x10 | 0x100 | 0x200)` -- per-wrestler
-  end-condition flags in `D_8016722E` (per-player array, stride `0x104`)
-
-State 3 then stores `func_80127388`'s return -- the **winner index** -- to
-`D_801589D4`, and branches:
-
-- if `D_8016ED2A & 0x10` (time-limit draw): `D_801589D2 = 0x96` (150), skipping
-  the ~90-frame replay;
-- otherwise `D_8016ED2A |= 0x40` (normal finish) and **`D_801589D2 = 0`**
-  (`0x80122950`).
-
-So `D_8016ED2A` carries three distinct end bits: **`0x40` normal finish,
-`0x10` time-limit draw, `0x80` sequence over / fade out.**
-
-### A match ends WITHOUT any player action (CONFIRMED)
-
-This is the finding that makes the whole question tractable. `func_80123D64` is
-a time-limit expiry. It ticks a 30-frame clock through
-`func_801444E0(D_80166F88, 0x1E)` / `(D_8016F0AC, 0x1E)`, and at `0x80123ECC`
-compares `D_8016F0AC` against the configured limit
-`D_8014E1C4[D_800961D2]`. On equality:
-
-```
-80123EF8  lbu   $v1, %lo(D_8016ED2A)
-80123F00  ori   $v1, $v1, 0x10      # time-limit draw
-80123F08  sb    $v1, %lo(D_8016ED2A)
-80123F10  addiu $v0, $zero, 0x1     # return 1 -> state 2 -> 3
-```
-
-(otherwise it calls `func_80124668(0x4000)`, decision-by-judges.)
-
-**A fixed button schedule does not have to produce a pin** -- the clock expires
-on its own. But the cost of waiting it out is the finding that reshapes this
-whole card, so the table was read rather than assumed.
-
-### The time limit is in MINUTES, and waiting it out is not viable (CONFIRMED)
-
-`D_8014E1C4` is at `disasm/asm/asm/data/13D1D0.data.s:4486` (ROM `0x13ED54`),
-and the element width is 2 bytes -- the code at `0x80123ECC` does
-`sll $v0, $v0, 1` before `lh $v0, %lo(D_8014E1C4)($at)`. Its 13 entries are a
-plain ramp:
-
-| idx | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| value | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 | 55 | 60 |
-
-**Those are minutes, not ticks.** The carry logic at `0x80123E6C`-`0x80123E90`
-fixes the units: `D_80166F88` is compared against `0x3C` (60) and reset -- a
-seconds counter rolling over at a minute -- while `D_8016F0AC`, the one the
-limit is compared against at `0x80123EDC`, is compared against `0x3E8` and is
-the minutes counter. So entry 6 is 30 minutes, not 15 seconds.
-
-Against the measured host rate (`RT64-WM2000-MATCH-RUN-BUDGET.md`: ~50,000
-steps/min, ~508 steps/swap in a match), that is:
-
-| limit | in-game | swaps | steps | wall clock |
-|---|---|---|---|---|
-| idx 2 | 10 min | 36,000 | 18.3 M | **6.1 h** |
-| idx 6 | 30 min | 108,000 | 54.9 M | **18.3 h** |
-| idx 12 | 60 min | 216,000 | 109.7 M | **36.6 h** |
-
-**And index 0 means no limit at all.** It is reachable: `0x80146AC0` writes
-`sb $zero` to `D_800961D2` on one match-type branch. On that setting the clock
-never ends the match, at any budget.
-
-`D_800961D2` is otherwise the options-menu cursor position (`0x80146AFC` loads
-it from the identity ramp `D_8016861C[D_8009F299]`), and the only hard-coded
-non-zero write is `addiu $v1, $zero, 0xC` at `0x801471FC` -- index 12, i.e.
-**60 minutes** (HYPOTHESIS: that this is the path an exhibition match takes was
-not confirmed).
-
-**The consequence for this card.** "Let the clock run out" is not an available
-strategy at any plausible budget, and may not terminate at all. A run must
-either end the match by pin/countout, or -- much cheaper -- simply *read* the
-configured limit and the clock out of guest memory and report how far the match
-actually got against its own bound. Both `D_800961D2` and `D_8014E1C4` are in
-the default watch set for exactly this reason: the first thing a run should
-establish is which of these five rows it is living in.
-
-### The end conditions are unreachable by a fixed button schedule (CONFIRMED)
-
-This is the structural answer to "can a scripted run finish a match", and it is
-a negative.
-
-`func_80123F34` (`0x80123F34`) takes a mask, loops slots 0..3 computing
-`idx * 0x104`, and tests `D_8016722E[idx] & arg` (`lhu` at `0x80123FE0`, `and`
-at `0x80123FE4`). On a hit it clears the bit and returns 1, which advances the
-state. So the question reduces to: **what sets those bits?**
-
-An exhaustive scan of every `sh` to `%lo(D_8016722E)` and every `sh ..., 0x4C($reg)`
-across all five overlays answers it. (`D_801588F8` is a wrestler-record pointer,
-set at `0x800EE6FC` from `base + idx*0x104`, so `0x4C($ptr)` *is* `D_8016722E`.)
-
-**Four of the six checked conditions have no writer anywhere in the ROM.**
-Bits `0x40`, `0x20`, `0x100` and `0x200` are never set. They are permanently
-unreachable in this build.
-
-**The two that are reachable are set only from move-script handlers:**
-
-| bit | set at | inside | gate |
-|---|---|---|---|
-| `0x8` | `0x800F8714` (`ori $v0, $v0, 0x8`) | `func_800F8674` | move-script state word `0xC($a0) == 1` |
-| `0x10` | `0x800F8F8C` | `func_800F8E94` | move-script state word `0xC($a0) == 2` |
-
-Both functions are entered only through thunks in the **move-script dispatch
-table at `0x8014CFB0`** (`asm/data/13D1D0.data.s:1473`) -- that is, only as a
-consequence of a specific grapple animation being selected and run to a
-specific frame.
-
-**The pinfall confirms the shape.** The count lives in `D_801589E6` (current)
-against `D_801589E4` (target), advanced at `0x801231E8` and compared at
-`0x80123238`. Entry requires `D_8016722E & 0x1` (`andi $v0, $a2, 0x1` at
-`0x8012318C`). The cancel path at `0x8012B1B0` additionally requires
-`D_80167239 & 0x1`, `D_80167220 & 0x20` (downed), and `D_801671EA` in
-`{1, 0x34}` (animation id). **No button test gates the pin at any of these
-sites** -- the pin flag arrives from a move script, never from an input read.
-
-**And spirit damage has no arithmetic site (CONFIRMED NEGATIVE).** Every store
-to record `+0xE` in the whole disassembly is `sh $zero` (15 sites, e.g.
-`0x800F4EEC`, `0x800F7938`) or an `andi 0xFF` restore at `0x80126530`. There is
-no decrement anywhere; damage is applied through the move-script system
-indirectly. Per-strike damage and the starting value cannot be read out of the
-disassembly, so "how many strikes until a pin is possible" has no static answer.
-
-**What this means for the card.** A scripted schedule can press buttons, and
-those presses provably reach the game's input records. It cannot *choose to land
-a grapple*: that requires the two wrestlers to be in the right relative position
-and the opponent in the right state, which is a closed-loop condition no
-open-loop button script controls. Ending a match therefore depends on the
-guest's own AI and physics bringing the wrestlers together while the script
-happens to be pressing the right button -- possible, but not schedulable, and
-not something a run can be designed to guarantee.
-
-**The best observable progress signal is `D_801589E6`** (`0x801589E6`, s16, the
-live pin count against `D_801589E4`). It is nonzero only once a pin is actually
-in progress, which makes it the cheapest way to tell "the wrestlers are really
-fighting" from "the wrestlers are milling about".
-
-### The referee count
-
-**`D_8016ECC0`** (`0x8016ECC0`, s8) is the real count, loaded from
-`D_8014E198[D_8009E98C]` = `{0, 10, 20, 0}` by match type and counting **down**
-to 0 (`80123CE0 addiu $v0, $v0, -1`). `func_80123B48` is the all-down countout:
-it scans all four slots (`D_801671E2 != -1`, `D_80167220 & 0x20` downed,
-`D_80167230 & 0x8` decidable) and only counts while **all** qualify, resetting
-if any recovers -- which a fixed schedule cannot reliably produce.
-
-**`D_801567B0`/`D_801567B2` are HUD digits only** (set inside `func_800E9E54`,
-cleared by `func_800E9D8C`) and are refuted as the gameplay counter.
-
-### Per-wrestler record
-
-Base `0x801671E2`, stride `0x104`. `+0x0E` (`D_801671F0`, s16) is the
-spirit/health value -- tested `slti 0x32` (50) at `0x801239DC` and copied into
-the results payload at `0x80122B5C` (HYPOTHESIS that it is the HUD bar).
-Flag words: `D_80167220` bit `0x20` downed, `D_80167230` bit `0x8` decidable,
-`D_8016722E` end-condition bits.
-
-## The fade that ends the loop (CONFIRMED)
-
-**Poll guest address `0x8016ED2A` (u8). While a match is running bit `0x80` is
-clear; at match end it is set, and one frame later the gameplay loop exits.**
-
-The chain, read end-to-end:
-
-**1. The loop exit is gated on exactly that bit** (`0x800E1C9C`). This is the
-only call to `func_800EE4AC` in `D2720.s`, and `$s4` is the register whose
-being set ends the frame loop:
-
-```
-800E1C9C  lbu   $v0, %lo(D_8016ED2A)($v0)
-800E1CA0  andi  $v0, $v0, 0x80
-800E1CA4  beqz  $v0, .L800E1CC4      # not set -> skip the fade, keep playing
-800E1CB4  jal   func_800EE4AC        # fade to FF,FF,FF
-800E1CC0  addiu $s4, $zero, 0x1      # <- loop exit
-```
-
-(The other fade, `func_800EE550` at `0x800E1C90`, is gated on `$s5` and is the
-fade-*in*.)
-
-**2. Bit `0x80` has exactly one writer**, `func_80122AF4`. Every other write to
-`D_8016ED2A` in the bank touches a different bit -- `0x800F0074`/`0x80122ABC`
-clear `0x20` via `0xDF`, `0x800EF774` sets `0x20`, `0x80123F00` sets `0x10`,
-`0x80122940` sets `0x40`, `0x801221B4` zeroes the byte:
-
-```
-80122AF4  lh    $v0, %lo(D_801589D2)
-80122AFC  slti  $v0, $v0, 0x7530     # 30000
-80122B00  bnez  $v0, func_80122C7C   # below 30000 -> do nothing
-80122B18  ori   $v0, $v0, 0x80
-80122B20  sb    $v0, %lo(D_8016ED2A)
-```
-
-**3. `D_801589D2` (`0x801589D2`, s16) is the post-match sequence counter**,
-ticked once per state-machine tick in `func_801229E0` (the state machine is
-`func_801226A0`, called from the frame loop at `0x800E1CD0`):
-
-```
-801229E0  lhu   $v0, %lo(D_801589D2)
-801229EC  addiu $v0, $v0, 0x1
-801229F4  sh    $v0, %lo(D_801589D2)
-80122A00  bne   $v0, 0x5A, ...       # at frame 90 -> func_800E3A24(D_801589E0)
-80122A1C  slti  $v0, $v1, 0x5B       # < 91 keep counting
-80122A40/A48                         # else force $v0 = 0x7530 -> immediate end
-```
-
-It is reset to 0 at `0x80122950` and set from `$a2` at `0x80122AD4`.
-
-**Do not confuse it with `D_801589D0`** (adjacent, +0), which is incremented at
-`0x80122758` and compared `slti 0x1F` (31) -- an intro/entrance timer, not the
-match clock. Both are zeroed at `0x801226E0`/`E4` on state entry.
-
-`D_801567B0`/`B2` (thresholds `0xA`/`0x14`, referenced by `func_800E9D8C`) is a
-referee-count / display index. It never touches `D_8016ED2A`, so it is not the
-loop terminator.
-
-Both per-frame ticks the previous pass suspected are display code, not rules:
-`func_800E4C94` is a 2D HUD/sprite interpolator (4 slots, stride `0x24`, over
-`D_8015862E..D_80158649`, decrementing a per-slot tween countdown at
-`0x800E4FE0`), and `func_800E9C50` draws one glyph, ramping `D_801581E5` toward
-`0x6E`. Neither writes a terminal flag.
-
-## Earlier candidates, refuted
-
-Recorded so the next reader does not re-read them. Three candidate leads were
-followed before the real one above was found, and all three are something else:
+Stated plainly, because a guess here is worse than nothing. Three candidate
+leads were read and all three are something else:
 
 | Candidate | What it actually is | Evidence |
 |---|---|---|
@@ -350,24 +97,16 @@ followed before the real one above was found, and all three are something else:
 | `D_80167230` bit `0x4` | debug-controller display toggle | write gated on `D_8008DC00 & 0x400/0x800`; toggled by a button press (`andi 0xFB` / `ori 0x4`) at `0x80126F3C`-`0x80126F68`. Engine state is not toggled by input. |
 | `D_80166E64` | "entrance/cutscene running" flag | `lh $v0, %lo(D_80166E64); bnez` at `0x800E1DB8` only **skips controller polling**. Set 1 at `0x800E5DB8` and `0x800EA2B0`, cleared at `0x800E78C4` when the entrance list hits sentinel `D_8014C7F0`. Does not exit the loop. |
 
-An earlier pass also recorded four things as "not found". Three of them were
-found later and are documented above; the record is corrected here rather than
-left to mislead, and the reason each search missed is kept because the reasons
-generalise:
+Also not found, with the negative evidence:
 
-| Recorded as not found | Actually | Why the search missed it |
-|---|---|---|
-| pin / 3-count | `D_8016ECC0`, counting **down** from `D_8014E198[type]` = `{0,10,20,0}` | the search looked for a comparison against 3. This engine counts down from 10 or 20, and the threshold is table-driven by match type, so no `slti ...,0x3` exists to find. |
-| health / spirit | `D_801671F0`, per-wrestler record base `0x801671E2` stride `0x104` | the search went looking in the HUD draw code; the value lives in the wrestler record and is only *read* by the HUD. |
-| match time limit | `func_80123D64`, limit from `D_8014E1C4[D_800961D2]` | the search grepped for seven plausible 60-multiple **immediates** and correctly found zero. The limit is loaded from a table, and the clock ticks per 30 frames rather than per frame, so none of the guessed constants could ever have appeared. |
-| submission meter | still not found | -- |
-
-**The generalisable lesson:** three of the four negatives were produced by
-grepping for a constant the engine does not contain. A table-driven threshold,
-a countdown rather than a countup, and a coarse tick all defeat a
-search-for-the-magic-number, and all three are ordinary implementation choices.
-Following the control flow from the loop exit backwards found in one pass what
-constant-grepping had missed in two.
+- **Pin / 3-count:** no counter compared against 3 in a per-second-tick context.
+  The 68 `slti`/`sltiu ...,0x3` sites in `D2720.s` are loop bounds and mode
+  comparisons (`D_801586F2 < 3` at `0x800E7864` is a match-*type* check).
+- **Submission meter:** not found.
+- **Health / spirit meter globals:** not found; the HUD draw code was not reached.
+- **Match time limit:** grep of `D2720.s` for `0x1770`, `0x4650`, `0x8CA0`,
+  `0x2710`, `0x1C20`, `0x3840`, `0x7080` returns **zero hits**. If a match
+  timer exists it is not initialized from an immediate in this bank.
 
 ### The loop structure that a match-end must pass through (CONFIRMED)
 
@@ -384,5 +123,8 @@ gameplay frame loop `.L800E1C6C` (`0x800E1C6C`-`0x800E1F34`) exits on register
 `$s4`, which is set only by the fade-completion helpers `func_800EE4AC` /
 `func_800EE550`.
 
-That hypothesis is the one the section above confirmed: the match end does run
-exactly that fade, and `D_8016ED2A & 0x80` is its gate.
+**HYPOTHESIS, and the next thing to read:** a match ending plausibly runs
+exactly that fade, so the callers of `func_800EE4AC`/`func_800EE550` inside
+`D2720.s`, and the per-frame ticks `func_800E4C94` / `func_800E9C50` (both
+called unconditionally from `func_800E7978` at `0x800E7978`/`0x800E7980`), are
+where the match-end condition should be. Neither has been read.
