@@ -542,11 +542,309 @@ fn diff() -> Result<Value, Box<dyn std::error::Error>> {
     }
 }
 
+
+/// The differential proper: one family of fill fixtures, both backends, every
+/// disagreement reported.
+///
+/// `diff` answers one row. This answers many, which is what converts "which
+/// hypothesis explains the difference" into "here are the fixtures where the
+/// two backends disagree, ranked". Each case varies exactly one thing about
+/// the same display list -- rectangle geometry, fill colour, or the
+/// scissor -- so a disagreement names its own cause.
+///
+/// **Neither backend is the authority here.** The sweep reports where they
+/// differ from each other AND, for each, what the hand-derived key says, so a
+/// disagreement can be attributed rather than merely counted.
+mod sweep {
+    use super::*;
+    use fn64_render::{RenderBackend, RenderConfig};
+    use fn64_render_reference::ReferenceBackend;
+
+    /// One swept fixture: a display list, and the key that says what its
+    /// committed framebuffer must contain.
+    struct Case {
+        name: &'static str,
+        commands: Vec<(u32, u32)>,
+        /// Hand-derived expected pixel, by linear index. Never captured.
+        expected: fn(u32) -> u16,
+    }
+
+    fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
+        vec![
+            (0xef30_00f0, 0),
+            (0xed00_0000, ((WIDTH * 4) << 12) | (HEIGHT * 4)),
+            (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+            (0xf700_0000, (color as u32) * 0x1_0001),
+            fill_rect(lrx, lry, ulx, uly),
+            (0xe900_0000, 0),
+        ]
+    }
+
+    /// Every case's key is stated as arithmetic over its own display list,
+    /// following the same fill-cycle rule the reference runner documents:
+    /// `G_FILLRECT` covers `ceil(ulx) ..= floor(lrx)` INCLUSIVE on both
+    /// edges, so a rectangle stated as `(0,0)..(3,3)` covers four columns and
+    /// four rows, not three.
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "full-target-red",
+                commands: one_fill(RED, 0, 0, WIDTH - 1, HEIGHT - 1),
+                expected: |_| RED,
+            },
+            Case {
+                name: "right-half-blue-over-red",
+                commands: COMMANDS.to_vec(),
+                expected: expected_pixel,
+            },
+            Case {
+                // Inclusive on BOTH edges: columns 0..=3 and rows 0..=1 are
+                // covered, everything else keeps the seeded bytes.
+                name: "top-left-quadrant",
+                commands: one_fill(RED, 0, 0, WIDTH / 2 - 1, HEIGHT / 2 - 1),
+                expected: |index| {
+                    if index % WIDTH < WIDTH / 2 && index / WIDTH < HEIGHT / 2 {
+                        RED
+                    } else {
+                        STALE
+                    }
+                },
+            },
+            Case {
+                // A single pixel. `ulx == lrx` is one column wide under the
+                // inclusive rule, not zero -- the case a half-open reading
+                // would drop entirely.
+                name: "single-pixel",
+                commands: one_fill(BLUE, 3, 2, 3, 2),
+                expected: |index| {
+                    if index == 2 * WIDTH + 3 {
+                        BLUE
+                    } else {
+                        STALE
+                    }
+                },
+            },
+            Case {
+                // The last column and last row, which is where an off-by-one
+                // in either direction shows up first.
+                name: "last-column-last-row",
+                commands: one_fill(RED, WIDTH - 1, HEIGHT - 1, WIDTH - 1, HEIGHT - 1),
+                expected: |index| {
+                    if index == PIXEL_COUNT - 1 {
+                        RED
+                    } else {
+                        STALE
+                    }
+                },
+            },
+            Case {
+                // A colour whose LSB is CLEAR. RED and BLUE both have theirs
+                // set, which is what makes their 5->8->5 round trip exact and
+                // their stored coverage full. This one distinguishes a
+                // backend that preserves the wire value from one that
+                // round-trips it through 8 bits per channel.
+                name: "even-color-lsb-clear",
+                commands: one_fill(0xf800, 0, 0, WIDTH - 1, HEIGHT - 1),
+                expected: |_| 0xf800,
+            },
+            Case {
+                // Two fills where the SECOND is fully contained in the first.
+                // Order matters; a backend that merged or reordered them
+                // would show it here.
+                name: "nested-second-fill",
+                commands: {
+                    let mut words = one_fill(RED, 0, 0, WIDTH - 1, HEIGHT - 1);
+                    words.pop();
+                    words.push((0xf700_0000, (BLUE as u32) * 0x1_0001));
+                    words.push(fill_rect(WIDTH - 2, HEIGHT - 2, 1, 1));
+                    words.push((0xe900_0000, 0));
+                    words
+                },
+                expected: |index| {
+                    let (x, y) = (index % WIDTH, index / WIDTH);
+                    if (1..=WIDTH - 2).contains(&x) && (1..=HEIGHT - 2).contains(&y) {
+                        BLUE
+                    } else {
+                        RED
+                    }
+                },
+            },
+            Case {
+                // A scissor NARROWER than the rectangle. The fill asks for
+                // the whole target; the scissor admits only the left half.
+                // A backend that ignores the scissor paints the right half
+                // too.
+                name: "scissor-narrower-than-rect",
+                commands: {
+                    let mut words = one_fill(RED, 0, 0, WIDTH - 1, HEIGHT - 1);
+                    words[1] = (0xed00_0000, (((WIDTH / 2) * 4) << 12) | (HEIGHT * 4));
+                    words
+                },
+                expected: |index| {
+                    if index % WIDTH < WIDTH / 2 {
+                        RED
+                    } else {
+                        STALE
+                    }
+                },
+            },
+        ]
+    }
+
+    fn seeded(commands: &[(u32, u32)]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        initial_rdram(commands)
+    }
+
+    /// The reference backend's committed guest framebuffer for one case.
+    fn reference_bytes(
+        commands: &[(u32, u32)],
+    ) -> Result<Result<Vec<u8>, String>, Box<dyn std::error::Error>> {
+        let mut rdram = seeded(commands)?;
+        let mut backend = ReferenceBackend::default();
+        if let Err(error) = backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT)) {
+            return Ok(Err(error.to_string()));
+        }
+        let end = COMMAND_START + (commands.len() as u32) * 8;
+        match backend.process_rdp_commands(&mut rdram, COMMAND_START, end, FRAMEBUFFER, true) {
+            Ok(fn64_render::FrameStatus::Complete) => Ok(Ok(observation_bytes(&rdram))),
+            Ok(status) => Ok(Err(format!("nonterminal status {status:?}"))),
+            Err(error) => Ok(Err(error.to_string())),
+        }
+    }
+
+    /// The wgpu backend's committed guest framebuffer for one case, copied
+    /// back exactly the way production copies it.
+    fn wgpu_bytes(
+        commands: &[(u32, u32)],
+    ) -> Result<Result<Vec<u8>, String>, Box<dyn std::error::Error>> {
+        let mut rdram = seeded(commands)?;
+        let mut session = match ConformanceSession::try_new(WIDTH, HEIGHT) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(Err(refusal.to_string())),
+        };
+        let replay = ConformanceReplay {
+            layout_bytes: RDRAM_LEN as u32,
+            command_start: COMMAND_START,
+            words: command_words(commands),
+            transaction_sequence: 1,
+            guest_read_sources: Vec::new(),
+            target_width: WIDTH,
+            target_height: HEIGHT,
+        };
+        let outcome = match session.replay(&replay, FRAMEBUFFER) {
+            Ok(outcome) => outcome,
+            Err(refusal) => return Ok(Err(refusal.to_string())),
+        };
+        let published = outcome.target_bytes;
+        if published.len() < FRAMEBUFFER_BYTES as usize {
+            return Ok(Err(format!(
+                "published {} target bytes, fewer than the declared {FRAMEBUFFER_BYTES}",
+                published.len()
+            )));
+        }
+        RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+            RdramAddr::from_offset(FRAMEBUFFER),
+            &published[..FRAMEBUFFER_BYTES as usize],
+        );
+        Ok(Ok(observation_bytes(&rdram)))
+    }
+
+    /// The hand-derived key for one case, in the same guest byte order both
+    /// backends' observations are read in.
+    fn key_bytes(case: &Case) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut rdram = seeded(&case.commands)?;
+        {
+            let mut view = RdramViewMut::from_storage(&mut rdram);
+            for index in 0..PIXEL_COUNT {
+                view.write_u16(
+                    RdramAddr::from_offset(FRAMEBUFFER + index * 2),
+                    (case.expected)(index),
+                );
+            }
+        }
+        Ok(observation_bytes(&rdram))
+    }
+
+    fn pixels(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    /// Compare both backends against each other and against the key.
+    pub fn run() -> Result<Value, Box<dyn std::error::Error>> {
+        let mut rows = Vec::new();
+        let mut disagreements = 0usize;
+        for case in cases() {
+            let key = pixels(&key_bytes(&case)?);
+            let reference = reference_bytes(&case.commands)?;
+            let wgpu = wgpu_bytes(&case.commands)?;
+            let row = match (&reference, &wgpu) {
+                (Ok(reference), Ok(wgpu)) => {
+                    let (reference, wgpu) = (pixels(reference), pixels(wgpu));
+                    let differing: Vec<Value> = (0..PIXEL_COUNT as usize)
+                        .filter(|&index| reference[index] != wgpu[index])
+                        .map(|index| {
+                            json!({
+                                "pixel": index,
+                                "x": index as u32 % WIDTH,
+                                "y": index as u32 / WIDTH,
+                                "key": format!("{:#06x}", key[index]),
+                                "reference": format!("{:#06x}", reference[index]),
+                                "wgpu": format!("{:#06x}", wgpu[index]),
+                            })
+                        })
+                        .collect();
+                    if !differing.is_empty() {
+                        disagreements += 1;
+                    }
+                    json!({
+                        "case": case.name,
+                        "status": if differing.is_empty() { "agree" } else { "disagree" },
+                        "reference_matches_key": reference == key,
+                        "wgpu_matches_key": wgpu == key,
+                        "differing_pixels": differing.len(),
+                        "differences": differing,
+                    })
+                }
+                // A refusal by exactly one backend IS a disagreement, and the
+                // most consequential kind: one engine renders the stream and
+                // the other declines it.
+                (reference, wgpu) => {
+                    disagreements += 1;
+                    json!({
+                        "case": case.name,
+                        "status": "disagree",
+                        "kind": "one-backend-refused",
+                        "reference": match reference {
+                            Ok(_) => json!("completed"),
+                            Err(message) => json!({"refused": message}),
+                        },
+                        "wgpu": match wgpu {
+                            Ok(_) => json!("completed"),
+                            Err(message) => json!({"refused": message}),
+                        },
+                    })
+                }
+            };
+            rows.push(row);
+        }
+        Ok(json!({
+            "backends": ["fn64-render-reference", "fn64-render-wgpu"],
+            "cases": rows.len(),
+            "disagreeing_cases": disagreements,
+            "rows": rows,
+        }))
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("emit-replay") => stdout_json(io::stdout().lock(), &exact_replay()?)?,
         Some("emit-fixture") => stdout_json(io::stdout().lock(), &fixture_bundle()?)?,
         Some("diff") => stdout_json(io::stdout().lock(), &diff()?)?,
+        Some("sweep") => stdout_json(io::stdout().lock(), &sweep::run()?)?,
         Some("run") => {
             let request = stdin_json::<RunnerRequest>()?;
             stdout_json(io::stdout().lock(), &run(request)?)?;
