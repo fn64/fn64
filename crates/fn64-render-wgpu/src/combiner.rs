@@ -3943,6 +3943,61 @@ pub mod census {
         out
     }
 
+    /// Coarse histograms of the two multiplicands WM2000's dominant program
+    /// actually multiplies: the sampled texel's luma and the interpolated
+    /// shade alpha, both bucketed into sixteenths.
+    ///
+    /// This is the measurement `docs/RT64-WM2000-INMATCH-GAPS.md` names as
+    /// the one that distinguishes its two surviving candidates -- "a texel
+    /// histogram with one or two distinct values indicts (1); a varied texel
+    /// histogram with a flat output indicts (2)" -- extended with the second
+    /// multiplicand, because the dominant program is
+    /// `texel.rgb * shade.a` and a constant shade alpha flattens a
+    /// perfectly-sampled texture just as effectively as a constant texel.
+    ///
+    /// Sixteen buckets, not 256, deliberately: the question is "is this
+    /// varying at all", which a coarse histogram answers, and a 256-wide
+    /// atomic bank on the per-PIXEL path would be a real cost to a lane
+    /// that is measuring frame rate.
+    static TEXEL_LUMA: [AtomicU64; 16] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 16]
+    };
+    static SHADE_ALPHA: [AtomicU64; 16] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 16]
+    };
+
+    /// Records one drawn pixel's texel and shade alpha.
+    ///
+    /// `texel` is the raw RGBA8888 the sampler returned, before any
+    /// normalization, so a decode fault shows up here as it was read rather
+    /// than after a float round trip. `shade_alpha` is the already-clamped
+    /// `0..=255` channel value.
+    pub fn note_pixel(texel: [u8; 4], shade_alpha: u8) {
+        // Luma rather than one channel: a wrong FORMAT decode usually moves
+        // all three, and a single channel would miss a texture that is
+        // varying in the other two.
+        let luma = (u32::from(texel[0]) + u32::from(texel[1]) + u32::from(texel[2])) / 3;
+        TEXEL_LUMA[(luma >> 4).min(15) as usize].fetch_add(1, Ordering::Relaxed);
+        SHADE_ALPHA[(shade_alpha >> 4) as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(texel luma buckets, shade alpha buckets)`, each sixteen wide.
+    pub fn pixel_histograms() -> ([u64; 16], [u64; 16]) {
+        let mut luma = [0u64; 16];
+        let mut alpha = [0u64; 16];
+        for (index, slot) in luma.iter_mut().enumerate() {
+            *slot = TEXEL_LUMA[index].load(Ordering::Relaxed);
+        }
+        for (index, slot) in alpha.iter_mut().enumerate() {
+            *slot = SHADE_ALPHA[index].load(Ordering::Relaxed);
+        }
+        (luma, alpha)
+    }
+
     /// `([slot][selector] color counts, alpha counts, (reads_texel, ignores_texel))`.
     #[allow(clippy::type_complexity)]
     pub fn snapshot() -> ([[u64; 21]; 4], [[u64; 10]; 4], (u64, u64)) {
@@ -3999,6 +4054,25 @@ pub mod census {
             }
             eprintln!("[fn64-combiner]   alpha {name}:{line}");
         }
+        let (luma, shade_alpha) = pixel_histograms();
+        let render = |buckets: &[u64; 16]| {
+            buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, count)| format!(" {}:{count}", index * 16))
+                .collect::<String>()
+        };
+        eprintln!(
+            "[fn64-combiner]   texel luma /16 (pixels={}):{}",
+            luma.iter().sum::<u64>(),
+            render(&luma)
+        );
+        eprintln!(
+            "[fn64-combiner]   shade alpha /16 (pixels={}):{}",
+            shade_alpha.iter().sum::<u64>(),
+            render(&shade_alpha)
+        );
         let histogram = program_histogram();
         eprintln!(
             "[fn64-combiner]   distinct programs = {}, top 8 by count:",
