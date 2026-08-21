@@ -814,3 +814,100 @@ algorithm operating on the already-shifted `ss = s >> 16`. Whether
 cannot settle -- and guessing at it is exactly how that constant got its
 earlier wrong value of `1024`. It needs its own perspective fixture
 measured against RT64, which the corpus can now express.
+
+---
+
+# TMEM loads copy WHOLE 64-bit words (2026-08-20)
+
+Found by running the actual goal — WM2000 on `FN64_RECOMP=rs` +
+`FN64_RENDER=wgpu` — rather than by reading code. The stack aborted at 1,887
+VI swaps: `physical TMEM texel byte 0xa98 is invalid`.
+
+## The measurement
+
+Instrumenting `read_valid_byte` and dumping TMEM's high half at the failure:
+
+- **2004 of 2048** bytes valid, spanning `0x800..0xfff`
+- 44 invalid, in **11 runs of exactly 4 bytes**
+- each hole is one 4-byte HALF of a 64-bit word; the other half IS valid
+- the half **alternates** hi/lo
+- palette entries **15, 32, 49, 66, 83, ...** — exact stride of **17**
+
+So the TLUT loaded fully and was later *partially invalidated*.
+
+## The defect
+
+fn64 modelled a row whose logical texels do not fill its last 64-bit word as
+having a PARTIAL TAIL: the uncovered lanes were `None`, and `physical.rs:656`
+-- the **only** `valid[] = false` in the crate -- CLEARED destination
+validity for them. An overlapping `LoadTile` (row 132 bytes = 16 full words +
+a 4-byte tail, `line` 17 words) therefore punched holes in an already-loaded
+TLUT, and a texrect sampling one aborted the run. Odd-row exchange
+(`lane ^ 4`) alternates which half is cleared, giving the hi/lo pattern.
+
+## The hardware truth
+
+From the **pinned RT64 oracle's LIVE loader** -- `src/hle/rt64_rdp.cpp`, not
+`rt64_hle_geometry.rs`'s `dumpTexture`, which is a debug-dump heuristic whose
+Tile `wordsPerRow` is dead in the source:
+
+```c
+// loadWord, rt64_rdp.cpp:392-395
+// Copy the entire word.
+for (uint32_t i = 0; i < 8; i++) {
+    TMEM[(tmemAddress + i) ^ tmemXorMask] = RDRAM[(textureAddress + (i & offsetMask)) ^ 3];
+}
+```
+
+driven `wordsPerRow` times per row (`:459-468`). **Whole 64-bit words, no
+partial-tail concept, no clamping.** The uncovered bytes are real adjacent
+RDRAM bytes.
+
+## A tempting fix that is WRONG
+
+Deleting the `else` so undefined lanes PRESERVE prior validity. It returns
+stale data where hardware overwrites, while `last_touched_generation` still
+advances and claims a current write. Refused on review before it landed.
+
+## The fix, four parts
+
+1. `wire.rs`'s new `source_row_range` declares **padded** source reads --
+   Block `div_ceil(8) * 8`, Tile `words_per_row * 8`.
+2. Tile emits **one access PER ROW always**. The collapsed full-width path
+   cannot express row-local padding: padded rows overlap in RDRAM because the
+   row stride is the image's own `bytesPerRow`.
+3. `defined_source_byte_mask`'s Block/Tile arms return 8 (`0xff`). TLUT keeps
+   `0x03` source / `0xff` destination -- it captures two bytes and quadricates.
+4. `raw_dpc/mod.rs`'s transfer-word binding is **row-local**
+   (`row = index / words_per_row`, offset `within_row * 8`). Walking
+   concatenated access lengths against a LOGICAL offset mis-binds as soon as
+   rows carry padding.
+
+Part 4 was found by the measurement, not predicted: after parts 1-3 the abort
+MOVED to "raw-DPC command #39's source bytes are missing from the captured
+guest reads", which localised the remaining defect exactly.
+
+## Oracle review: 4 of 5 match
+
+Block padding equals `wordCount << 3` (DXT changes the TMEM destination, not
+the RDRAM bytes read); Tile per-row padded spans match because RT64's row
+stride is the image `bytesPerRow`, so its rows overlap identically; removing
+the full-width collapse reads identical bytes when padding is zero; and
+RGBA32 reads all eight source bytes and merely permutes them across TMEM
+halves, so the unconditional `0xff` is right where a partial `0x0f` would
+have been wrong.
+
+**The one divergence** is RT64's large-wrap leading-row skip
+(`rt64_rdp.cpp:448-456`), whose own comment calls it an optimization for rows
+"that have no effect in the final result". Final TMEM is identical, so it is
+a PERFORMANCE gap rather than a correctness one. Narrow risk worth recording:
+if a skipped row's padded read ran past installed RDRAM, fn64 would fail a
+load RT64 completes.
+
+## What this cost, and the lesson
+
+**19 fn64 unit tests asserted the DEFECT** and failed on the fix --
+`undefined_tail_bytes_are_staged_invalid_not_zero_filled_valid` says so in
+its name. That is the second time this session fn64's own suite encoded the
+bug it should have caught (the first was `PLANE_TO_TEXEL`). For TMEM
+semantics, check the oracle; a green suite is not evidence.
