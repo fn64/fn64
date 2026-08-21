@@ -71,6 +71,27 @@ gated `dumps_disabled = trace_disabled || NO_DUMP`. The flag is read with
 be REMOVED from a copy of the runner. `wgpu` is an accepted dump renderer
 (`main.rs:1095`).
 
+## Cross-lane agreement: the recompiler is renderer-independent
+
+Running the SAME ROM and step budget through both renderers on the rs
+recompiler gives identical guest progress:
+
+| lane | VI swaps | gfx tasks | audio tasks | panics | backend errors |
+|---|---|---|---|---|---|
+| `FN64_RENDER=wgpu` | 7,193 | 15,577 | 13,198 | 0 | 0 |
+| `FN64_RENDER=rt64` | 7,193 | 15,577 | 13,198 | 0 | 0 |
+
+Identical in every counter. The rs recompiler drives both backends to the
+same guest state, so CPU-side execution is deterministic and independent of
+which renderer consumes its display lists. It also means the RT64 lane is
+available as a same-scene oracle on this stack -- which is what settled the
+"colour cast" question (see `RT64-WM2000-TEXTURE-STATE.md`): RT64 renders
+the same green, so the green is the game's own arena lighting, not a defect.
+
+To run the oracle lane, the boot binary needs the `rt64` cargo feature AND
+`FN64_RT64_DIR` pointing at the RT64 source tree; without the latter the
+build fails in `fn64-render-rt64`'s `build.rs`.
+
 ## What "playable" still needs — NOT yet measured
 
 1. **A frame-for-frame comparison against the C lane.** The image above is
