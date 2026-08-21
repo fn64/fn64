@@ -292,6 +292,8 @@ mod game {
         frame_trip_verdict: Option<crate::frame_trip::Verdict>,
         /// Exit code to propagate once the event loop has returned.
         frame_trip_exit_code: Option<i32>,
+        /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
+        frame_dump_dir: Option<std::path::PathBuf>,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
@@ -618,6 +620,7 @@ mod game {
                 frame_trip: crate::frame_trip::FrameTrip::from_env(),
                 frame_trip_verdict: None,
                 frame_trip_exit_code: None,
+                frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
@@ -824,6 +827,27 @@ mod game {
             // extern "C" redraw callback, where `process::exit`'s teardown
             // cannot unwind. `about_to_wait` is ordinary Rust, and is where
             // the pump census already terminates bounded runs safely.
+            // `FN64_FRAME_DUMP=<dir>` writes every tripwire frame as a PNG.
+            // Diagnostic sibling of the tripwire: the tripwire says WHICH
+            // frame changed, this says what it looks like. Same recording
+            // point, so the two always agree about frame numbering.
+            if let Some(dir) = self.frame_dump_dir.as_ref() {
+                let index = self
+                    .frame_trip
+                    .as_ref()
+                    .map_or(0, |t| t.observed_len());
+                let file = format!("frame-{index:04}-{rgba_hash:016x}.png");
+                if let Err(e) = crate::screenshot::capture(
+                    dir,
+                    &file,
+                    self.fb_width,
+                    self.fb_height,
+                    &self.rgba,
+                    self.rgba_holds_a_frame,
+                ) {
+                    eprintln!("[fn64-shell] frame dump failed: {e}");
+                }
+            }
             if let Some(trip) = self.frame_trip.as_mut() {
                 if self.frame_trip_verdict.is_none() {
                     match trip.observe(rgba_hash) {
