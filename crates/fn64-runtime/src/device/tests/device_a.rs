@@ -413,7 +413,17 @@ use super::*;
             fabric.advance_to(deadline, &mut rdram).unwrap();
             assert_eq!(fabric.ai_status() & AI_STATUS_BUSY, 0, "{tv_type:?}");
             assert_eq!(fabric.ai_length(), 0, "{tv_type:?}");
-            assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+            // A completed AI DMA raises AI even with nothing queued behind
+            // it. mupen64plus `ai_end_of_dma_event` raises MI_INTR_AI
+            // unconditionally after `fifo_pop`
+            // (`ai_controller.c:225-239`), and `fifo_pop` (`:123-139`)
+            // handles the lone-buffer case by clearing BUSY. This assertion
+            // previously demanded NO interrupt here, freezing fn64's own
+            // FIFO-full gate rather than any hardware rule.
+            assert!(
+                fabric.interrupt_pending(InterruptSource::Ai),
+                "{tv_type:?}: a completed AI DMA raises AI"
+            );
         }
     }
 
