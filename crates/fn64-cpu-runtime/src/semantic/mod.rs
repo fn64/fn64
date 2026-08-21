@@ -1439,10 +1439,12 @@ fn exec_straight(
         // --- Shifts (32-bit, sign-extended) ---
         Sll { rd, rt, sa } => ctx.set_r32(rd, (ctx.r_u32(rt) << sa) as i32),
         Srl { rd, rt, sa } => ctx.set_r32(rd, (ctx.r_u32(rt) >> sa) as i32),
-        Sra { rd, rt, sa } => ctx.set_r32(rd, ctx.r_s32(rt) >> sa),
+        // Full 64-bit signed source, truncated to 32 (see the note on
+        // the codegen lane's Sra: the C oracle applies ToS64 to Rt).
+        Sra { rd, rt, sa } => ctx.set_r32(rd, (ctx.r_s64(rt) >> sa) as i32),
         Sllv { rd, rt, rs } => ctx.set_r32(rd, (ctx.r_u32(rt) << (ctx.r_u32(rs) & 31)) as i32),
         Srlv { rd, rt, rs } => ctx.set_r32(rd, (ctx.r_u32(rt) >> (ctx.r_u32(rs) & 31)) as i32),
-        Srav { rd, rt, rs } => ctx.set_r32(rd, ctx.r_s32(rt) >> (ctx.r_u32(rs) & 31)),
+        Srav { rd, rt, rs } => ctx.set_r32(rd, (ctx.r_s64(rt) >> (ctx.r_u32(rs) & 31)) as i32),
 
         // --- Mult/Div (write HI/LO; 32x32 -> 64 sign-extended halves) ---
         Mult { rs, rt } => {
