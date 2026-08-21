@@ -1280,6 +1280,15 @@ mod game {
                         println!("[fn64-shell] frame tripwire: PASS -- {n} frames match {path}");
                         0
                     }
+                    Verdict::Unusable(why) => {
+                        // Fails the run. A gate that cannot compare must not
+                        // report success: a comment-only baseline was
+                        // measured reporting "PASS -- 1 frames match".
+                        eprintln!(
+                            "[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})"
+                        );
+                        1
+                    }
                     Verdict::Mismatch { index, expected, actual } => {
                         eprintln!(
                             "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
