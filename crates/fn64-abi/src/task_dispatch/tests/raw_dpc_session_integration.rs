@@ -169,7 +169,7 @@ fn dram_producer_routes_through_the_session_when_registered() {
 
     let submission = admit_dram_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     assert!(
@@ -205,7 +205,7 @@ fn dram_producer_falls_back_to_legacy_path_when_no_session_registered() {
     // the legacy branch, not the session branch (which would have
     // succeeded, per the sibling test above).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }));
     assert!(
         result.is_err(),
@@ -242,7 +242,7 @@ fn dram_producer_admits_a_full_sync_site_and_schedules_dp_completion() {
 
     let submission = admit_dram_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     assert!(
@@ -293,7 +293,7 @@ fn dram_producer_full_sync_is_rejected_when_the_dp_slot_is_already_occupied() {
 
     let submission = admit_dram_submission(start, end);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }));
     assert!(
         result.is_err(),
@@ -343,7 +343,7 @@ fn xbus_producer_routes_through_the_session_when_registered() {
 
     let submission = admit_dmem_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     assert!(
@@ -384,7 +384,7 @@ fn xbus_producer_preserves_exact_source_bytes_into_the_submission_identity() {
 
     let submission = admit_dmem_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     let reconstructed = fn64_render::OwnedRawDpcSubmission::from_xbus_payload(start, end, bytes)
@@ -453,7 +453,7 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     let before_device = with_host(|host| host.device_fabric.snapshot());
     let first_submission = admit_dram_submission(first_start, first_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), first_submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), first_submission, Vec::new());
     }
     let after_first_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -470,7 +470,7 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     rdram[second_start as usize..second_end as usize].copy_from_slice(&bytes);
     let second_submission = admit_dram_submission(second_start, second_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), second_submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), second_submission, Vec::new());
     }
     let after_second_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -683,7 +683,7 @@ fn mismatched_backend_and_session_registration_traps_before_any_mutation() {
     let before_device = with_host(|host| host.device_fabric.snapshot());
     let submission = admit_dram_submission(start, end);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }));
     assert!(
         result.is_err(),
@@ -954,7 +954,7 @@ fn dispatch_words(rdram: &mut [u8], words: &[u32]) {
     rdram[start as usize..end as usize].copy_from_slice(&bytes);
     let submission = admit_dram_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 }
 
@@ -2255,7 +2255,7 @@ fn a_fill_followed_by_a_full_sync_admits_both_independently() {
 
     let submission = admit_dram_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     assert!(
@@ -3022,7 +3022,7 @@ fn shell_shaped_registration_reaches_the_raw_dpc_session_seam() {
     rdram[start as usize..end as usize].copy_from_slice(&bytes);
     let submission = admit_dram_submission(start, end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }
 
     // Reaching here at all is the claim: the production raw-DPC conveyor
@@ -3865,7 +3865,7 @@ fn a_fill_tmem_and_triangle_packet_completes_and_publishes_exactly_the_fill_imag
     let submission = admit_dram_submission(start, end);
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission);
+        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), submission, Vec::new());
     }));
     assert!(
         outcome.is_ok(),

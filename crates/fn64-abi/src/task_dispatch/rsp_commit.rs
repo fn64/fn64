@@ -1781,6 +1781,97 @@ pub(crate) fn require_matching_raw_dpc_completion(
     rendered
 }
 
+
+/// Scan an admitted raw-DPC range and park it if it ends inside a command.
+///
+/// Returns `Some(true)` when the submission was parked (the caller must return
+/// without dispatching) and `None` when the range is whole and dispatch should
+/// proceed. A malformed opcode still panics, as it always has.
+unsafe fn park_incomplete_raw_dpc(
+    rdram: *mut u8,
+    submission: fn64_runtime::DpcSubmission,
+    retained_tail: Vec<u32>,
+) -> Option<bool> {
+    let start = submission.start;
+    let end = submission.end;
+    let retained_bytes = u32::try_from(retained_tail.len() * size_of::<u32>())
+        .expect("retained raw-DPC tail exceeds u32");
+    let newly_exposed_start = start
+        .checked_add(retained_bytes)
+        .expect("retained raw-DPC tail address overflow");
+    assert!(
+        newly_exposed_start <= end,
+        "retained raw-DPC tail extends past admitted END"
+    );
+
+    let mut words = retained_tail;
+    match submission.source {
+        fn64_runtime::DpcSubmissionSource::Rdram => {
+            let real = unsafe { renderer_rdram_slice(rdram) };
+            let from = newly_exposed_start as usize;
+            let to = end as usize;
+            assert!(
+                from <= to && from.is_multiple_of(8) && to.is_multiple_of(8),
+                "DRAM DPC extension [{newly_exposed_start:#010x}, {end:#010x}) must be ordered \
+                 and 8-byte aligned"
+            );
+            assert!(
+                to <= real.len(),
+                "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {:#x}",
+                real.len()
+            );
+            words.extend(
+                real[from..to]
+                    .chunks_exact(4)
+                    .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes"))),
+            );
+        }
+        fn64_runtime::DpcSubmissionSource::Dmem => {
+            let exposed = with_host(|host| {
+                let dmem = host
+                    .device_fabric
+                    .rsp_memory()
+                    .bank(fn64_runtime::RspMemoryBank::Dmem);
+                dmem[newly_exposed_start as usize..end as usize]
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
+                    .collect::<Vec<_>>()
+            });
+            words.extend(exposed);
+        }
+    }
+
+    match fn64_render::count_raw_rdp_full_sync_sites(&words)
+        .unwrap_or_else(|error| panic!("dispatch_raw_rdp: {error}"))
+    {
+        fn64_render::RawRdpScan::Complete(_) => None,
+        fn64_render::RawRdpScan::Incomplete {
+            command_start,
+            bytes_required,
+            ..
+        } => {
+            let offset = u32::try_from(command_start)
+                .expect("stalled raw-DPC command offset exceeds u32");
+            let command_start = start
+                .checked_add(offset)
+                .expect("stalled raw-DPC command address overflow");
+            let retained_words = words[command_start.saturating_sub(start) as usize
+                / size_of::<u32>()..]
+                .to_vec();
+            with_host(|host| {
+                host.device_fabric.park_dpc_submission(
+                    submission.token,
+                    command_start,
+                    end,
+                    bytes_required,
+                    retained_words,
+                )
+            })
+            .unwrap_or_else(|error| panic!("parking incomplete raw DPC transaction: {error}"));
+            Some(true)
+        }
+    }
+}
 /// Submit one fabric-owned CPU DPC transaction to the registered renderer.
 /// DRAM reads the registered physical device; XBUS snapshots persistent DMEM
 /// at the accepted END boundary. Renderer acceptance commits CURRENT before
@@ -1789,9 +1880,24 @@ pub(crate) fn require_matching_raw_dpc_completion(
 pub(crate) unsafe fn dispatch_dpc_submission(
     rdram: *mut u8,
     submission: fn64_runtime::DpcSubmission,
+    retained_tail: Vec<u32>,
 ) {
     let start = submission.start;
     let end = submission.end;
+
+    // **Stall before routing.** The DPC accepts END extensions in 8-byte
+    // increments, so a multiword command straddles several END writes.
+    // Hardware parks CURRENT at that command's start rather than decoding a
+    // truncated stream; this is the raw CPU MMIO counterpart of the
+    // coalescing `coalesce_dp_submissions` performs for RSP streams.
+    //
+    // The retained tail arrives from the fabric rather than being reread:
+    // XBUS DMEM can change between END writes, so the bytes admitted with the
+    // first END are the bytes that must be decoded.
+    if let Some(parked) = unsafe { park_incomplete_raw_dpc(rdram, submission, retained_tail) } {
+        debug_assert!(parked, "park_incomplete_raw_dpc reports whether it parked");
+        return;
+    }
     // T4 routing decision, made BEFORE `LiveDpcTransaction::new` ever runs:
     // whether a production raw-DPC session is registered is read once, up
     // front, so there is exactly one fabric-owning `LiveDpcTransaction` for
@@ -1969,7 +2075,7 @@ pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
     })
     .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DPC submission rejected: {error}"));
     if let Some(submission) = submission {
-        unsafe { dispatch_dpc_submission(rdram, submission) };
+        unsafe { dispatch_dpc_submission(rdram, submission, Vec::new()) };
     }
 }
 
