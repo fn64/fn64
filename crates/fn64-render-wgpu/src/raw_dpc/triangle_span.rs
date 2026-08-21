@@ -178,7 +178,15 @@ pub(crate) fn row_pixel_range(
             continue;
         }
         let (left_x, right_x) = row_span(triangle, row_y_eighth);
-        if right_x > left_x {
+        // `>=`, not `>`. A ZERO-width span still covers a pixel on
+        // hardware: angrylion's span loop is `for (j = 0; j <= length; j++)`
+        // (`rasterizer.c:473`) with `length = xendsc - xstart`, so
+        // `length == 0` draws exactly one pixel, and `validline`
+        // (`rasterizer.c:2398`) is built from scissor and field terms with
+        // NO span-width term at all. Requiring strictly positive width here
+        // dropped the whole triangle whenever every sample line produced a
+        // sliver -- which is what distant and edge-on geometry produces.
+        if right_x >= left_x {
             min_left = min_left.min(left_x);
             max_right = max_right.max(right_x);
         }
@@ -193,8 +201,16 @@ pub(crate) fn row_pixel_range(
     let x0 =
         ceil_ratio(min_left - 7 * Q16_ONE / 8, Q16_ONE).clamp(0, i64::from(clamp_width)) as u32;
     let x1 = ceil_ratio(max_right - Q16_ONE / 8, Q16_ONE).clamp(0, i64::from(clamp_width)) as u32;
+    // A range that rounds to zero width still covers its pixel, for the same
+    // reason as above -- but `[x0, x0)` is empty as a half-open range, so
+    // widen it to one pixel rather than reporting nothing. Only a range
+    // clamped entirely off the right edge (`x0 == clamp_width`) genuinely
+    // covers nothing.
     if x1 <= x0 {
-        return None;
+        if x0 >= clamp_width {
+            return None;
+        }
+        return Some((x0, x0 + 1));
     }
     Some((x0, x1))
 }
