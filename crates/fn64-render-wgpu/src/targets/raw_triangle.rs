@@ -398,14 +398,30 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     });
     for row in rows {
         for x in row.x0..row.x1 {
-            // The coverage this pixel actually has, from the SAME span
-            // module the row list came from. Zero here is a real answer, not
-            // a skip: see this function's own doc.
-            let coverage = triangle_span::pixel_coverage(triangle, x as i32, row.y as i32);
-            if coverage == 0 {
+            // **One subsample scan, not two.**
+            //
+            // This used to call `pixel_coverage` (which counts ALL eight
+            // subsamples) and then `attribute_sample` (which rescans the
+            // same eight, in the same order, and returns the FIRST covered
+            // one). Both walk identical rows, identical checkerboard
+            // columns, and the identical `sample_x >= left_x && < right_x`
+            // predicate -- so the pair did up to 16 sample tests where one
+            // scan stopping at the first hit answers both questions.
+            //
+            // The count itself was never consumed: the only uses were
+            // `coverage == 0` and a `debug_assert!(coverage <= 8)`. The
+            // blender supplies `Coverage::FULL` independently
+            // (`texrect.rs`'s `blend_and_write_pixel` call below), so no
+            // downstream stage reads the number.
+            //
+            // Bit-exact by construction: `attribute_sample` returns `Some`
+            // exactly when at least one subsample is inside, which is
+            // exactly `pixel_coverage(..) > 0`. Same predicate, same
+            // traversal order, same first hit.
+            let sample = triangle_span::attribute_sample(triangle, x as i32, row.y as i32);
+            if sample.is_none() {
                 continue;
             }
-            debug_assert!(coverage <= FULL_COVERAGE);
             // **The shade colour is interpolated per pixel, at the pixel's
             // own covered subsample -- not at its centre.** The RDP
             // evaluates a fragment's attributes at a subsample it actually
@@ -422,7 +438,6 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             // a fragment's attributes at the SAME covered subsample, so
             // sampling the two at different points would put a pixel's colour
             // and its texel a quarter pixel apart.
-            let sample = triangle_span::attribute_sample(triangle, x as i32, row.y as i32);
             let inputs = match (shade, sample) {
                 (Some(planes), Some((delta_y_eighth, delta_x))) => {
                     let shade_color = std::array::from_fn(|component| {
