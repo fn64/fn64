@@ -874,11 +874,14 @@ pub(super) fn emit_straight(
         // SRA/SRAV shift the FULL 64-bit signed register, then truncate to
         // 32 (which `set_r32` sign-extends). The C oracle emits
         // `S32(SIGNED(ctx->rt) >> sa)` -- `operations.cpp:85` applies
-        // `UnaryOpType::ToS64` to Rt before `Sra32` -- and mupen64plus emits
-        // `SE32(rrt >> rsa)` over the full `rrt`. Truncating to 32 FIRST
-        // diverges whenever rt's upper word is not a sign-extension of bit
-        // 31: rt=0x0123456789ABCDEF, sra 16 gives 0x00000000456789AB on
-        // hardware and 0xFFFFFFFFFFFF89AB truncated-first.
+        // `UnaryOpType::ToS64` to Rt before `Sra32`, and `cgenerator.cpp:226`
+        // renders `ToS64` as `SIGNED(...)` -- the whole 64-bit register.
+        //
+        // Truncating to 32 bits FIRST diverges whenever rt's upper word is
+        // not a sign-extension of bit 31: rt=0x0123456789ABCDEF, sra 16
+        // gives 0x00000000456789AB under the oracle and 0xFFFFFFFFFFFF89AB
+        // truncated-first. Well-formed MIPS keeps that invariant, which is
+        // why WM2000 ran either way and no existing test caught it.
         Sra { rd, rt, sa } => {
             line(out, format!("ctx.set_r32({}, ({} >> {}) as i32);", rd, rs64(rt), sa))
         }

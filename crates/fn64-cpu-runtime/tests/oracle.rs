@@ -477,7 +477,8 @@ fn memory_swizzle_matches_macro_semantics() {
 /// The C oracle emits `S32(SIGNED(ctx->rt) >> sa)`: `operations.cpp:85` maps
 /// `cpu_sra` to `BinaryOpType::Sra32` with `UnaryOpType::ToS64` applied to the
 /// `Rt` operand, and `cgenerator.cpp:226` renders `ToS64` as `SIGNED(...)`,
-/// i.e. the whole 64-bit register. mupen64plus agrees independently:
+/// i.e. the whole 64-bit register.
+///
 /// `mips_instructions.def:713` is `rrd = SE32(rrt >> rsa)` over the full
 /// `rrt` (`rrt32` is the separate 32-bit accessor it deliberately does not
 /// use here).
