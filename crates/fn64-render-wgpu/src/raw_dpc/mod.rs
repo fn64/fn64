@@ -22,6 +22,7 @@ pub use triangle::{
     TriangleFlags,
 };
 pub use triangle_draw_data::{
+    bound_tile_index,
     neutral_vertex_to_raster_vertex, retrieve_triangle_draws, MissingTriangleDrawState,
     RetrievedTriangleDraw, TriangleDrawStateCollector,
 };
