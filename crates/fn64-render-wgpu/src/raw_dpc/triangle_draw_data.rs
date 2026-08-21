@@ -164,11 +164,10 @@ pub struct TriangleDrawStateCollector {
     draws: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
-    /// Tile 0's binding current at the walk's current stream position --
-    /// tile 0 is the RDP's default bound texture tile for a standard
-    /// triangle draw (`RdpTriangleCommand` carries no tile index of its
-    /// own). `None` until this plan's own first `SetTile{tile_index: 0,
-    /// ..}`/`SetTileSize{tile_index: 0, ..}` pair is both present;
+    /// Every tile's binding current at the walk's current stream position.
+    ///
+    /// An entry is `(None, None)` until this plan's own
+    /// `SetTile`/`SetTileSize` pair for that index is both present;
     /// [`TileBindingParams::unbound`] is used at snapshot time when either
     /// half is still missing (card §6: a named, non-fatal condition here --
     /// unlike `OtherMode`/`CombineParams`, a missing tile binding does not
@@ -176,8 +175,24 @@ pub struct TriangleDrawStateCollector {
     /// `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` surfaces it per-fragment
     /// instead, since a flat-colored/non-textured triangle legitimately has
     /// no tile bound at all).
-    current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
-    current_tile0_size: Option<fn64_render::NeutralTileSize>,
+    ///
+    /// **This was tile 0 alone, on the claim that "`RdpTriangleCommand`
+    /// carries no tile index of its own". That claim was false** -- the
+    /// decoder reads the index at `triangle.rs:183` and the command retains
+    /// the wire words it came from.
+    ///
+    /// **The whole 8-entry tile table**, not tile 0 alone.
+    ///
+    /// EVERY admitted draw names its own tile in its own wire word -- a
+    /// raw triangle in word 0 bits 18:16, a texture rectangle in word 1
+    /// bits 26:24 -- so tracking only tile 0 silently bound tile 0's
+    /// descriptor for any draw naming another. `production.rs`'s
+    /// `PlanCollector` already carries the whole table for exactly this
+    /// reason; this is the same fix on the copy its doc requires to match.
+    current_tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
     /// `G_SETBLENDCOLOR` current at the walk's current stream position --
     /// mirrors `current_other_mode`/`current_combine` exactly, a fourth
     /// instance of the same command-time-snapshot pattern (card §4a).
@@ -206,10 +221,38 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 vertices,
                 source,
                 viewport,
+                raw_words,
                 ..
             }) => {
                 let triangle_index = self.draws.len();
-                let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
+                // **The draw's OWN tile, read from its retained wire words.**
+                //
+                // This arm previously froze the index to 0. A raw triangle
+                // names its tile in word 0 bits 18:16 -- the same field
+                // `RawTriangle::decode` reads as `tile` -- and a texture
+                // rectangle names its own in word 1 bits 26:24. RT64 does
+                // the same: `drawTris` takes the draw's tile and assigns
+                // `drawCall.textureTile = tile` (`rt64_rdp.cpp:1088-1097`).
+                //
+                // Identical to the recovery `production.rs`'s `PlanCollector`
+                // already performs, so the two collectors resolve the SAME
+                // tile for the same draw.
+                let bound_tile_index = match source {
+                    TriangleSource::TextureRectangle => raw_words
+                        .get(1)
+                        .map(|word| ((word >> 24) & 0x7) as usize)
+                        .unwrap_or(0),
+                    TriangleSource::RawTriangle => raw_words
+                        .first()
+                        .map(|word| ((word >> 16) & 0x7) as usize)
+                        .unwrap_or(0),
+                };
+                let tile_binding = match self
+                    .current_tiles
+                    .get(bound_tile_index)
+                    .copied()
+                    .unwrap_or((None, None))
+                {
                     (Some(descriptor), Some(size)) => {
                         TileBindingParams::from_neutral(descriptor, size)
                     }
@@ -304,13 +347,17 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     tile_index,
                     descriptor,
                     ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_descriptor = Some(*descriptor);
+                } => {
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.0 = Some(*descriptor);
+                    }
                 }
                 RdpStateCommand::SetTileSize {
                     tile_index, size, ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_size = Some(*size);
+                } => {
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.1 = Some(*size);
+                    }
                 }
                 _ => {}
             },
@@ -654,6 +701,97 @@ mod tests {
     /// `alpha_compare_en`, so `rdp/blender.c`'s `alpha_compare` returns 1 and
     /// the triangle is ordinary no-compare content, not a refusal.
     /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    /// **A raw triangle binds ITS OWN tile, not tile 0.**
+    ///
+    /// A triangle names its tile in wire word 0 bits 18:16 -- the field
+    /// `RawTriangle::decode` reads at `triangle.rs:183` -- and RT64 honours
+    /// it: `drawTris` takes the draw's tile and assigns
+    /// `drawCall.textureTile = tile` (`rt64_rdp.cpp:1088-1097`).
+    ///
+    /// This collector previously froze the index to 0 on the claim that
+    /// "`RdpTriangleCommand` carries no tile index of its own", which is
+    /// false, and tracked only `SetTile{tile_index: 0}` so tiles 1-7 were
+    /// discarded outright. The consequence was silent: a triangle naming
+    /// another tile sampled tile 0's descriptor -- wrong TMEM base, format,
+    /// size and palette.
+    ///
+    /// WM2000 cannot catch this: measured, all 1,000,001 of its raw
+    /// triangles name tile 0. So the regression guard has to be a fixture
+    /// that names a NON-zero tile, and it must distinguish the two tiles by
+    /// a field the binding actually carries.
+    #[test]
+    fn a_raw_triangle_binds_the_tile_its_own_wire_word_names() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 2);
+        let combine = combine_command(1, 1, 2);
+
+        // Two tiles that differ in a field the binding carries through.
+        let descriptor = |tmem_word_address: u16| fn64_render::NeutralTileDescriptor {
+            format: fn64_render::NeutralImageFormat::Rgba,
+            size: fn64_render::NeutralPixelSize::Bits16,
+            line_words: 1,
+            tmem_word_address,
+            palette: 0,
+            s_mode: fn64_render::NeutralTileAddressMode { mirror: false, clamp: true },
+            mask_s: 0,
+            shift_s: 0,
+            t_mode: fn64_render::NeutralTileAddressMode { mirror: false, clamp: true },
+            mask_t: 0,
+            shift_t: 0,
+        };
+        let size = fn64_render::NeutralTileSize {
+            low_s: 0,
+            low_t: 0,
+            high_s: 4,
+            high_t: 4,
+        };
+        let tile_state = |index: u32, tile_index: u8, tmem: u16| {
+            (
+                RdpStateCommand::SetTile {
+                    location: location(index),
+                    raw_words: Box::new([0, 0]),
+                    tile_index,
+                    descriptor: descriptor(tmem),
+                    before: None,
+                    after: fn64_render::RdpStateIdentity::of_tile_descriptor(
+                        tile_index,
+                        descriptor(tmem),
+                    ),
+                },
+                RdpStateCommand::SetTileSize {
+                    location: location(index + 1),
+                    raw_words: Box::new([0, 0]),
+                    tile_index,
+                    size,
+                    before: None,
+                    after: fn64_render::RdpStateIdentity::of_tile_size(tile_index, size),
+                },
+            )
+        };
+        // Tile 0 at TMEM word 0; tile 5 at TMEM word 256.
+        let (tile0, tile0_size) = tile_state(2, 0, 0);
+        let (tile5, tile5_size) = tile_state(4, 5, 256);
+
+        // A triangle whose word 0 names tile 5 (bits 18:16).
+        let mut triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+        let mut words = triangle.raw_words.to_vec();
+        words[0] = 0x0800_0000 | (5 << 16);
+        triangle.raw_words = words.into_boxed_slice();
+
+        for command in [&other_mode, &combine, &tile0, &tile0_size, &tile5, &tile5_size] {
+            collector.command(RawDpcSemanticCommandRef::State(command));
+        }
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector.finish().expect("the triangle is admitted");
+        let draw = draws.into_iter().next().expect("one triangle was staged");
+        assert_eq!(
+            draw.tile_binding.tmem_word_address,
+            256,
+            "a triangle naming tile 5 must bind tile 5's descriptor, not tile 0's"
+        );
+    }
+
     #[test]
     fn an_alpha_compare_wire_two_triangle_is_retrieved_as_no_compare() {
         let mut collector = TriangleDrawStateCollector::default();
