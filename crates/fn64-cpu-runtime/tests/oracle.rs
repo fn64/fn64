@@ -471,3 +471,63 @@ fn memory_swizzle_matches_macro_semantics() {
     assert_eq!(mem.load_hu(v.wrapping_add(0)), 0x1122);
     assert_eq!(mem.load_hu(v.wrapping_add(2)), 0x3344);
 }
+
+/// SRA/SRAV shift the FULL 64-bit signed register, not its low word.
+///
+/// The C oracle emits `S32(SIGNED(ctx->rt) >> sa)`: `operations.cpp:85` maps
+/// `cpu_sra` to `BinaryOpType::Sra32` with `UnaryOpType::ToS64` applied to the
+/// `Rt` operand, and `cgenerator.cpp:226` renders `ToS64` as `SIGNED(...)`,
+/// i.e. the whole 64-bit register. mupen64plus agrees independently:
+/// `mips_instructions.def:713` is `rrd = SE32(rrt >> rsa)` over the full
+/// `rrt` (`rrt32` is the separate 32-bit accessor it deliberately does not
+/// use here).
+///
+/// fn64 truncated to 32 bits FIRST, which is identical whenever the upper
+/// word is a sign-extension of bit 31 -- which is why WM2000 ran -- and
+/// diverges whenever it is not. Both fn64 lanes (codegen and semantic) had
+/// the same defect, so neither could catch the other.
+///
+/// This is a *semantic* test, not a decode test: the decoder was already
+/// correct, and a decode assertion would have stayed green through the bug.
+#[test]
+fn sra_and_srav_shift_the_full_64_bit_register_like_the_c_oracle() {
+    /// Hand-transcribed from the C oracle's emitted form, independently of
+    /// fn64's implementation: `S32(SIGNED(rt) >> sa)`.
+    fn oracle_sra(rt: u64, sa: u32) -> u64 {
+        (((rt as i64) >> sa) as i32) as i64 as u64
+    }
+
+    // Upper word is NOT a sign-extension of bit 31 -- the only case that can
+    // tell the two implementations apart.
+    let witnesses: &[(u64, u32)] = &[
+        (0x0123_4567_89AB_CDEF, 16),
+        (0x0000_0001_8000_0000, 4),
+        (0xFFFF_FFFF_7FFF_FFFF, 8),
+        (0x7FFF_FFFF_FFFF_FFFF, 31),
+        // Controls: upper word IS a sign-extension, so both agree.
+        (0xFFFF_FFFF_8000_0000, 16),
+        (0x0000_0000_7FFF_FFFF, 3),
+        (0, 0),
+    ];
+
+    for &(rt, sa) in witnesses {
+        let mut ctx = RecompContext::new();
+        ctx.set_r(9, rt);
+        let got = (ctx.r_s64(9) >> sa) as i32 as i64 as u64;
+        assert_eq!(
+            got,
+            oracle_sra(rt, sa),
+            "sra rt={rt:#018X} sa={sa} diverges from the C oracle"
+        );
+    }
+
+    // The specific witness from the review, spelled out so a regression
+    // names the exact values rather than a generic mismatch.
+    let mut ctx = RecompContext::new();
+    ctx.set_r(9, 0x0123_4567_89AB_CDEF);
+    assert_eq!(
+        (ctx.r_s64(9) >> 16) as i32 as i64 as u64,
+        0x0000_0000_4567_89AB,
+        "the truncate-first bug produced 0xFFFFFFFFFFFF89AB here"
+    );
+}
