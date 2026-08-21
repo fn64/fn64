@@ -871,8 +871,16 @@ pub(super) fn emit_straight(
         Srl { rd, rt, sa } => {
             line(out, format!("ctx.set_r32({}, (({}) >> {}) as i32);", rd, ru32(rt), sa))
         }
+        // SRA/SRAV shift the FULL 64-bit signed register, then truncate to
+        // 32 (which `set_r32` sign-extends). The C oracle emits
+        // `S32(SIGNED(ctx->rt) >> sa)` -- `operations.cpp:85` applies
+        // `UnaryOpType::ToS64` to Rt before `Sra32` -- and mupen64plus emits
+        // `SE32(rrt >> rsa)` over the full `rrt`. Truncating to 32 FIRST
+        // diverges whenever rt's upper word is not a sign-extension of bit
+        // 31: rt=0x0123456789ABCDEF, sra 16 gives 0x00000000456789AB on
+        // hardware and 0xFFFFFFFFFFFF89AB truncated-first.
         Sra { rd, rt, sa } => {
-            line(out, format!("ctx.set_r32({}, {} >> {});", rd, rs32(rt), sa))
+            line(out, format!("ctx.set_r32({}, ({} >> {}) as i32);", rd, rs64(rt), sa))
         }
         Sllv { rd, rt, rs } => line(
             out,
@@ -882,9 +890,10 @@ pub(super) fn emit_straight(
             out,
             format!("ctx.set_r32({}, (({}) >> ({} & 31)) as i32);", rd, ru32(rt), ru32(rs)),
         ),
+        // Full-64-bit source, as SRA above.
         Srav { rd, rt, rs } => line(
             out,
-            format!("ctx.set_r32({}, {} >> ({} & 31));", rd, rs32(rt), ru32(rs)),
+            format!("ctx.set_r32({}, ({} >> ({} & 31)) as i32);", rd, rs64(rt), ru32(rs)),
         ),
 
         // --- Mult/Div (write HI/LO). MIPS keeps 32x32 -> 64 in {hi,lo}. ---
