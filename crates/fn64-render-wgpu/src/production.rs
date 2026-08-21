@@ -1147,16 +1147,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // the two paths now resolve the SAME tile for the same
                 // draw -- texrect or raw triangle alike -- instead of
                 // disagreeing whenever tile != 0.
-                let bound_tile_index = match source {
-                    TriangleSource::TextureRectangle => raw_words
-                        .get(1)
-                        .map(|word| ((word >> 24) & 0x7) as usize)
-                        .unwrap_or(0),
-                    TriangleSource::RawTriangle => raw_words
-                        .first()
-                        .map(|word| ((word >> 16) & 0x7) as usize)
-                        .unwrap_or(0),
-                };
+                // The shared implementation, not a second copy: this file
+                // and `TriangleDrawStateCollector` must resolve the same
+                // tile for the same draw, and when each carried its own
+                // copy of this arithmetic they drifted.
+                let bound_tile_index =
+                    crate::raw_dpc::bound_tile_index(*source, raw_words);
                 let tile_binding = match self
                     .current_tiles
                     .get(bound_tile_index)
