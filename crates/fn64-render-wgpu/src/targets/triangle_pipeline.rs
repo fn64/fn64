@@ -1188,6 +1188,7 @@ impl UninitializedTrianglePipeline {
                 pipelines,
                 bind_group_layout,
                 framebuffer_color_dummy_buffer,
+                fixture_buffers: Vec::new(),
                 errors,
             },
         )))
@@ -1282,7 +1283,106 @@ pub struct TrianglePipelineRenderer {
     /// buffer reused across every non-reading fixture and every submission,
     /// never a per-fixture or per-submission allocation.
     framebuffer_color_dummy_buffer: wgpu::Buffer,
+    /// Per-fixture buffers, reused across submissions instead of recreated.
+    ///
+    /// `submit_triangles` used to `create_buffer` ten times per fixture, on
+    /// every submission. Measured on WM2000 (rs + wgpu, bounded census,
+    /// warmup 300 / 1200 pumps): **1,361,480 buffer creations in ~35 s**, or
+    /// ~2,813 per slow pump. A `sample` profile of the same run put
+    /// `AGXBuffer initWithDevice:`, `IOGPUResourceCreate`,
+    /// `IOConnectCallMethod` and `mach_msg2_trap` at the top -- each wgpu
+    /// `create_buffer` is a Metal resource creation with a kernel round
+    /// trip. At ~20 us apiece that is ~56 ms of the 64.8 ms slow-pump mean.
+    ///
+    /// Every one of the ten has a FIXED descriptor (nine compile-time size
+    /// constants; the vertex buffer is always `3 * 40` bytes for one
+    /// triangle), so a slot can be reused verbatim: same size, same usage.
+    /// The pool grows to the submission high-water mark and never shrinks,
+    /// so steady state performs zero allocations.
+    ///
+    /// This is the same principle `framebuffer_color_dummy_buffer` above
+    /// already applies, extended from one shared buffer to the per-fixture
+    /// set.
+    fixture_buffers: Vec<FixtureBuffers>,
     errors: Arc<BoundedErrorSink>,
+}
+
+/// One fixture's ten reusable GPU buffers. Created once per pool slot and
+/// rewritten per submission with `queue.write_buffer`, which is a staging
+/// copy rather than a resource creation.
+struct FixtureBuffers {
+    vertex: wgpu::Buffer,
+    raster_params: wgpu::Buffer,
+    combine_params: wgpu::Buffer,
+    tmem_bytes: wgpu::Buffer,
+    tmem_validity: wgpu::Buffer,
+    tile_binding: wgpu::Buffer,
+    alpha_compare_params: wgpu::Buffer,
+    coverage_params: wgpu::Buffer,
+    material_params: wgpu::Buffer,
+    blend_params: wgpu::Buffer,
+}
+
+/// Bytes in one triangle's vertex buffer: three vertices of 40 bytes.
+const VERTEX_BUFFER_BYTES: u64 = 3 * 40;
+
+impl FixtureBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        let uniform = |label: &'static str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let storage = |label: &'static str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            vertex: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-vertices"),
+                size: VERTEX_BUFFER_BYTES,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            raster_params: uniform(
+                "fn64-triangle-pipeline-raster-params",
+                RASTER_PARAMS_BYTES,
+            ),
+            combine_params: uniform(
+                "fn64-triangle-pipeline-combine-params",
+                COMBINE_PARAMS_BYTES,
+            ),
+            tmem_bytes: storage("fn64-triangle-pipeline-tmem-bytes", TMEM_BYTES_BUFFER_SIZE),
+            tmem_validity: storage(
+                "fn64-triangle-pipeline-tmem-validity",
+                TMEM_VALIDITY_BUFFER_SIZE,
+            ),
+            tile_binding: uniform(
+                "fn64-triangle-pipeline-tile-binding",
+                TILE_BINDING_PARAMS_BYTES,
+            ),
+            alpha_compare_params: uniform(
+                "fn64-triangle-pipeline-alpha-compare-params",
+                ALPHA_COMPARE_PARAMS_BYTES,
+            ),
+            coverage_params: uniform(
+                "fn64-triangle-pipeline-coverage-params",
+                COVERAGE_PARAMS_BYTES,
+            ),
+            material_params: uniform(
+                "fn64-triangle-pipeline-material-params",
+                MATERIAL_PARAMS_BYTES,
+            ),
+            blend_params: uniform("fn64-triangle-pipeline-blend-params", BLEND_PARAMS_BYTES),
+        }
+    }
 }
 
 impl TrianglePipelineRenderer {
@@ -1469,75 +1569,53 @@ impl TrianglePipelineRenderer {
             material_params_buffer: wgpu::Buffer,
             blend_params_buffer: wgpu::Buffer,
         }
+        // Grow the pool to this submission's high-water mark. Steady state
+        // reuses every slot, so this allocates only when a frame needs more
+        // fixtures than any frame before it.
+        while self.fixture_buffers.len() < fixtures.len() {
+            self.fixture_buffers.push(FixtureBuffers::new(&self.device));
+        }
+
         let mut draws = Vec::with_capacity(fixtures.len());
-        for fixture in fixtures {
+        for (fixture_index, fixture) in fixtures.iter().enumerate() {
+            let slot = &self.fixture_buffers[fixture_index];
             let mut vertex_bytes = Vec::with_capacity(3 * 40);
             for vertex in fixture.vertices {
                 vertex_bytes.extend_from_slice(&vertex.to_bytes());
             }
-            let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-vertices"),
-                size: vertex_bytes.len() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            debug_assert_eq!(
+                vertex_bytes.len() as u64,
+                VERTEX_BUFFER_BYTES,
+                "the pooled vertex buffer is sized for exactly one triangle"
+            );
+            let vertex_buffer = &slot.vertex;
             self.queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
 
-            let raster_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-raster-params"),
-                size: RASTER_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let raster_params_buffer = &slot.raster_params;
             self.queue.write_buffer(
                 &raster_params_buffer,
                 0,
                 &raster_params_bytes(fixture.raster_params, fixture.is_rect),
             );
-            let combine_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-combine-params"),
-                size: COMBINE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let combine_params_buffer = &slot.combine_params;
             let combine_bytes = fragment_combine_params_bytes(fixture.combine_params);
             self.queue
                 .write_buffer(&combine_params_buffer, 0, &combine_bytes);
 
-            let tmem_bytes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tmem-bytes"),
-                size: TMEM_BYTES_BUFFER_SIZE,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tmem_bytes_buffer = &slot.tmem_bytes;
             self.queue
                 .write_buffer(&tmem_bytes_buffer, 0, &fixture.tmem.byte_words_bytes());
-            let tmem_validity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tmem-validity"),
-                size: TMEM_VALIDITY_BUFFER_SIZE,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tmem_validity_buffer = &slot.tmem_validity;
             self.queue.write_buffer(
                 &tmem_validity_buffer,
                 0,
                 &fixture.tmem.validity_words_bytes(),
             );
-            let tile_binding_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tile-binding"),
-                size: TILE_BINDING_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tile_binding_buffer = &slot.tile_binding;
             self.queue
                 .write_buffer(&tile_binding_buffer, 0, &fixture.tile_binding.to_bytes());
 
-            let alpha_compare_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-alpha-compare-params"),
-                size: ALPHA_COMPARE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let alpha_compare_params_buffer = &slot.alpha_compare_params;
             let alpha_compare_bytes = fragment_alpha_compare_params_bytes(
                 fixture.alpha_compare_mode,
                 fixture.blend_color,
@@ -1545,12 +1623,7 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&alpha_compare_params_buffer, 0, &alpha_compare_bytes);
 
-            let coverage_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-coverage-params"),
-                size: COVERAGE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let coverage_params_buffer = &slot.coverage_params;
             let coverage_bytes = fragment_coverage_params_bytes(
                 fixture.coverage_destination,
                 fixture.image_read_enabled,
@@ -1562,44 +1635,34 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&coverage_params_buffer, 0, &coverage_bytes);
 
-            let material_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-material-params"),
-                size: MATERIAL_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let material_params_buffer = &slot.material_params;
             let material_bytes =
                 fragment_material_params_bytes(fixture.env_color, fixture.prim_color);
             self.queue
                 .write_buffer(&material_params_buffer, 0, &material_bytes);
 
-            let blend_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-blend-params"),
-                size: BLEND_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let blend_params_buffer = &slot.blend_params;
             let blend_params_bytes =
                 fragment_blend_params_bytes(fixture.blend_params, row_stride_words);
             self.queue
                 .write_buffer(&blend_params_buffer, 0, &blend_params_bytes);
 
             draws.push(DrawResources {
-                vertex_buffer,
+                vertex_buffer: vertex_buffer.clone(),
                 depth_pipeline_index: depth_pipeline_index(
                     fixture.depth_compare_enabled,
                     fixture.depth_update_enabled,
                 ),
                 reads_framebuffer_color: fixture.blend_params.reads_framebuffer_color,
-                raster_params_buffer,
-                combine_params_buffer,
-                tmem_bytes_buffer,
-                tmem_validity_buffer,
-                tile_binding_buffer,
-                alpha_compare_params_buffer,
-                coverage_params_buffer,
-                material_params_buffer,
-                blend_params_buffer,
+                raster_params_buffer: raster_params_buffer.clone(),
+                combine_params_buffer: combine_params_buffer.clone(),
+                tmem_bytes_buffer: tmem_bytes_buffer.clone(),
+                tmem_validity_buffer: tmem_validity_buffer.clone(),
+                tile_binding_buffer: tile_binding_buffer.clone(),
+                alpha_compare_params_buffer: alpha_compare_params_buffer.clone(),
+                coverage_params_buffer: coverage_params_buffer.clone(),
+                material_params_buffer: material_params_buffer.clone(),
+                blend_params_buffer: blend_params_buffer.clone(),
             });
         }
 
