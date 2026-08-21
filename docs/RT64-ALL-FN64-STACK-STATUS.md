@@ -49,8 +49,21 @@ It shows a wrestler mid-move with correct skin tones, brown hair, a
 green-and-white patterned costume with legible detail, black trunks, an arm
 tattoo, and correctly shaded 3D geometry. Real imagery, not noise.
 
-**539 frames dumped, 339 distinct by sha256** — the scene animates rather
-than a single buffer being re-presented.
+**7,191 frames dumped, 3,770 distinct by sha256** across 7,193 VI swaps,
+zero panics and zero backend errors — the scene animates rather than a
+single buffer being re-presented.
+
+Rendering holds deep into the run, not just at the start: frame 6,800 draws
+a full arena crowd, ringside barriers, a wrestler carrying a detailed
+championship-belt texture, and green HUD overlays. Geometry, textures and UI
+all survive to the end of the budget.
+
+**One pre-existing defect is visible in that late frame and is NOT new:** the
+scene-specific colour cast recorded in `RT64-WM2000-TEXTURE-STATE.md`, where
+in-match scenes read green/magenta while entrance scenes are correct. It was
+confirmed pixel-identical against a run from before the `PLANE_TO_TEXEL` fix,
+so it belongs to the combiner or environment-colour path rather than to
+anything in this stack's own work.
 
 **Frame-dump trap:** `run-rs-lane.sh` sets `WM2000_NO_TRACE=1`, and dumps are
 gated `dumps_disabled = trace_disabled || NO_DUMP`. The flag is read with
