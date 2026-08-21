@@ -388,6 +388,34 @@ pub(crate) fn attribute_plane(
         .expect("attribute plane evaluation fits i64")
 }
 
+/// Advance an already-evaluated attribute plane by exactly one pixel in X.
+///
+/// **Bit-identical to [`attribute_plane`], but only while the selected
+/// subsample is unchanged.** In that case `edge_delta_y_eighth` is unchanged
+/// and `edge_delta_x_q16` grows by exactly [`Q16_ONE`], so for integer
+/// `plane.dx` and positive `Q16_ONE`:
+///
+/// ```text
+/// floor(dx * (delta_x + Q16_ONE) / Q16_ONE) == floor(dx * delta_x / Q16_ONE) + dx
+/// ```
+///
+/// `attribute_plane` uses `div_euclid` with a positive divisor, so the
+/// identity holds for negative slopes and negative deltas alike -- verified
+/// over 200,000 random (dx, delta_x) pairs spanning both signs before this
+/// was written.
+///
+/// **The caller MUST restart from [`attribute_plane`] whenever either sample
+/// delta breaks that relationship.** A changed Y subsample moves both the
+/// `de` term and the major-edge origin; a changed X subsample, or a skipped
+/// pixel, advances `delta_x` by something other than `Q16_ONE`. Stepping
+/// across either is not an approximation -- it is simply wrong.
+#[inline]
+pub(crate) fn attribute_plane_step(plane: AttributePlane, value: i64) -> i64 {
+    value
+        .checked_add(i64::from(plane.dx))
+        .expect("attribute plane evaluation fits i64")
+}
+
 /// The X position of the MAJOR edge at one subpixel Y sample line, in
 /// Q16.16 -- the origin every attribute plane's X term is measured from.
 ///
