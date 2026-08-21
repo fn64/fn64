@@ -94,7 +94,7 @@ pub unsafe extern "C" fn osDpSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut Reco
         Err(error) => panic!("osDpSetNextBuffer_recomp: {error}"),
     };
     if let Some(submission) = submission {
-        unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+        unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission, Vec::new()) };
     }
     ctx.r2 = 0;
 }
