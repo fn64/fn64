@@ -229,11 +229,18 @@ use super::*;
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
 
         fabric.clear_interrupt(InterruptSource::Ai);
+        // The SECOND (final) completion raises AI too. This previously
+        // asserted no notification and no interrupt, which made the two
+        // completions asymmetric: the first raised because a buffer was
+        // queued behind it, the last did not. Hardware does not distinguish
+        // them -- mupen64plus raises MI_INTR_AI unconditionally after
+        // `fifo_pop` (`ai_controller.c:225-239`), and `fifo_pop`
+        // (`:123-139`) clears BUSY for the final buffer.
         let second_done = fabric.advance_to(Cycles::new(386), &mut rdram).unwrap();
-        assert!(second_done.is_empty());
+        assert_eq!(second_done, vec![DeviceNotification::AiDmaComplete(second)]);
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
         assert_eq!(fabric.ai_length(), 0);
-        assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+        assert!(fabric.interrupt_pending(InterruptSource::Ai));
     }
 
 
@@ -293,7 +300,7 @@ use super::*;
 
 
     #[test]
-    fn ai_disabled_fifo_accepts_two_slots_then_full_edge_interrupts_once() {
+    fn ai_disabled_fifo_accepts_two_slots_and_each_completion_interrupts() {
         let mut fabric = fabric();
         fabric.configure_tv_type(TvType::Ntsc).unwrap();
         let first = AiDmaRequest {
@@ -333,12 +340,17 @@ use super::*;
 
         fabric.clear_interrupt(InterruptSource::Ai);
         let second_deadline = fabric.current_ai.unwrap().deadline;
-        assert!(fabric
-            .advance_to(second_deadline, &mut rdram)
-            .unwrap()
-            .is_empty());
+        // The final buffer's completion raises AI as well -- see the note on
+        // `ai_fifo_drains_on_guest_cycles_and_raises_one_shared_mi_source`.
+        // The test name's "interrupts once" described fn64's FIFO-full gate,
+        // not hardware: mupen raises on EVERY completion
+        // (`ai_controller.c:225-239`).
+        assert_eq!(
+            fabric.advance_to(second_deadline, &mut rdram).unwrap(),
+            vec![DeviceNotification::AiDmaComplete(second)]
+        );
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
-        assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+        assert!(fabric.interrupt_pending(InterruptSource::Ai));
     }
 
 
