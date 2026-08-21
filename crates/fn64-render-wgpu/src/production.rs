@@ -668,6 +668,29 @@ impl WgpuBackend {
             return Ok(());
         }
 
+        // **Everything above this line is VALIDATION and always runs.**
+        //
+        // An earlier version of this gate sat at the CALL SITE and skipped
+        // this whole function on the play path. That was wrong: this is not
+        // a pure output-populating draw, it is a fallible validation
+        // boundary. Skipping it returned `Ok(())` for packets that should
+        // have been refused -- `TriangleDrawBeforeCreate`,
+        // `TmemProjectionCountMismatch`, `MissingTriangleDrawState`,
+        // `BlendRequiresFramebuffer` and the per-fixture checks above all
+        // stopped firing. Found by an independent audit, which also showed
+        // `cfg!(test)` does NOT hold for other crates: `fn64-render-conformance`
+        // depends on this crate and its adapterless runner expects
+        // `ConformanceRefusal::Execute` for raw triangles, so the old gate
+        // made it silently ACCEPT what it is documented to refuse.
+        //
+        // Only the GPU submission below is skipped, and only its *output* is
+        // diagnostic: `triangle_draw_output` is "never an accumulated
+        // history, never a persistent framebuffer" and `present` refuses to
+        // scan it out. Guest pixels come from the CPU rasterizer.
+        if !self.gpu_triangle_draw_enabled {
+            return Ok(());
+        }
+
         let in_flight = pipeline
             .submit_triangles(&fixtures)
             .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
@@ -2353,7 +2376,9 @@ impl RenderBackend for WgpuBackend {
         // Kept, not deleted: the host-GPU suite drives real WGSL on a live
         // adapter through this path. `FN64_GPU_TRIANGLE_DRAW=1` forces it on
         // for a play run that wants to exercise the pipeline.
-        if !triangles.is_empty() && self.gpu_triangle_draw_enabled {
+        if !triangles.is_empty() {
+            // Always called: it validates. Only its GPU submission is gated,
+            // inside the function -- see the note there.
             self.draw_admitted_triangles(triangles, draw_tmem)
                 .map_err(RenderError::from)?;
         }
