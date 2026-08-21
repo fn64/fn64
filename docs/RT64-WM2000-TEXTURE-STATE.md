@@ -223,10 +223,33 @@ angrylion is byte-addressing of the entry, not the index.
   `production.rs:787` stating "if `TriangleDrawStateCollector` changes, this
   file's own copy must be updated to match."
 
-## The live thread
+## RESOLVED: there is no defect. The oracle renders the same green.
 
-The affected draws are IA4 through an RGBA16 TLUT. Most decode to correct
-greys (`[0,0,0,0]`, `[255,255,255,255]`, `[247,247,247,255]`), but some come
-out coloured (`[8,82,189,255]`, `[181,231,0,255]`). IA4-via-TLUT can
-legitimately be coloured, so the open question is whether the PALETTE BYTES
-are right -- which connects to the padded-word TLUT work of 2026-08-20.
+The differential that should have been run first: render the SAME scene
+through RT64 and compare.
+
+| swap | RT64 (oracle) | wgpu |
+|---|---|---|
+| 443 | correct skin tones | correct skin tones |
+| 644 | `(90,186,90)` `(76,95,35)` `(118,182,70)` | `(82,107,41)` `(58,82,33)` |
+
+**At swap 644 the ORACLE is green-dominant too**, and at swap 443 both lanes
+are correct. `docs/frames/wm2000-rt64-oracle-swap644-same-green.png` is
+RT64's own output for the "cast" scene, and it shows the same green skin.
+
+So the in-match green is **WM2000's own rendering** -- a green-lit arena --
+faithfully reproduced by both renderers. There was never an fn64 defect
+here.
+
+## What the nine eliminations were actually worth
+
+They were not wasted: each verified a real fn64 path against hardware, and
+two genuine defects surfaced on the way (the dropped triangle tile index and
+the drifted `TriangleDrawStateCollector`). But the whole hunt could have
+been avoided by one differential run at the start.
+
+**The method lesson, which is the durable output here: when a symptom is
+"the picture looks wrong", compare against the oracle BEFORE forming
+hypotheses about the subsystem.** Nine subsystem-level eliminations could
+not distinguish "fn64 is wrong" from "the game looks like that" -- only the
+side-by-side could, and it took one run.
