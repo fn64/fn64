@@ -865,15 +865,32 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             "queued AI promotion was preflighted before event-state mutation",
                         ));
                     }
-                    // Public rcp.h defines FIFO FULL transitioning 1 -> 0 as
-                    // an AI interrupt edge. Other silicon assertion causes
-                    // and the sub-cycle phase remain unclaimed.
-                    if full_before_completion {
-                        self.raise_interrupt(InterruptSource::Ai);
-                        let notification = DeviceNotification::AiDmaComplete(current.request);
-                        notifications.push(notification);
-                        self.record(DeviceTraceKind::NotificationReady(notification));
-                    }
+                    // **Unconditional.** Every completed AI DMA raises AI,
+                    // whether or not a second buffer was queued behind it.
+                    //
+                    // This used to fire only when the FIFO had been FULL
+                    // (`full_before_completion`), reasoning from rcp.h that a
+                    // FULL 1 -> 0 transition is the interrupt edge. **rcp.h
+                    // does not say that.** It defines AI_STATUS_FIFO_FULL as
+                    // a STATUS BIT (`ultra64/rcp.h:576`) and states nothing
+                    // about interrupt edges; the old rule was inferred from a
+                    // register definition that does not carry it. mupen64plus's
+                    // `ai_end_of_dma_event` calls `fifo_pop(ai)` and then
+                    // `raise_rcp_interrupt(ai->mi, MI_INTR_AI)` with no
+                    // condition at all (`ai_controller.c:224-238`), and
+                    // `fifo_pop` (`:123-139`) handles BOTH cases -- promoting
+                    // a queued buffer when FULL, or clearing BUSY when not.
+                    // The interrupt follows either way.
+                    //
+                    // The gated version silently dropped the completion for a
+                    // lone buffer, so a guest that enqueues exactly one AI DMA
+                    // and blocks on the completion queue never wakes. Found by
+                    // an independent audit against mupen64plus.
+                    let _ = full_before_completion;
+                    self.raise_interrupt(InterruptSource::Ai);
+                    let notification = DeviceNotification::AiDmaComplete(current.request);
+                    notifications.push(notification);
+                    self.record(DeviceTraceKind::NotificationReady(notification));
                 }
                 DeviceEvent::Si { token } => {
                     let Some(pending) = self.pending_si else {
