@@ -797,7 +797,7 @@ pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::D
                 };
             }
         }
-        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => {
+        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => {
             panic!(
                 "AI register write unexpectedly produced DPC transaction token {}",
                 submission.token
@@ -1226,7 +1226,10 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
         | fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(_)) => {
             apply_live_ai_write_effect(rdram, effect);
         }
-        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => {
+        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested {
+            submission,
+            retained_tail,
+        } => {
             assert!(
                 !rdram.is_null(),
                 "raw DPC submission has no registered RDRAM"
@@ -1238,7 +1241,9 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                     submission.end
                 );
             }
-            unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+            unsafe {
+                crate::task_dispatch::dispatch_dpc_submission(rdram, submission, retained_tail)
+            };
         }
         fn64_runtime::DeviceMmioWriteEffect::RspStartRequested { pc } => {
             // A guest kicked the RSP through raw MMIO rather than through the

@@ -582,7 +582,7 @@ use super::*;
         fabric.write_mmio(DPC_START_REG, 0x103).unwrap();
         let before_end = fabric.snapshot();
         let first = match fabric.write_mmio(DPC_END_REG, 0x147).unwrap() {
-            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission: submission, .. } => submission,
             other => panic!("DPC END did not request renderer work: {other:?}"),
         };
         assert_eq!(first.source, DpcSubmissionSource::Rdram);
@@ -610,7 +610,7 @@ use super::*;
         assert_eq!(cancelled.dpc_status, before_end.dpc_status);
 
         let retry = match fabric.write_mmio(DPC_END_REG, 0x140).unwrap() {
-            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission: submission, .. } => submission,
             other => panic!("cancelled DPC END was not retryable: {other:?}"),
         };
         fabric.commit_dpc_submission(retry.token).unwrap();
@@ -623,7 +623,7 @@ use super::*;
             "repeating the committed END pointer must not replay the range"
         );
         let extension = match fabric.write_mmio(DPC_END_REG, 0x180).unwrap() {
-            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission: submission, .. } => submission,
             other => panic!("DPC END extension did not request renderer work: {other:?}"),
         };
         assert_eq!((extension.start, extension.end), (0x140, 0x180));
@@ -646,7 +646,7 @@ use super::*;
         );
 
         let extension = match fabric.write_mmio(DPC_END_REG, 0x108).unwrap() {
-            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission: submission, .. } => submission,
             other => panic!("DPC END extension did not request renderer work: {other:?}"),
         };
         assert_eq!((extension.start, extension.end), (0x100, 0x108));
@@ -679,7 +679,7 @@ use super::*;
         );
 
         let submission = match fabric.write_mmio(DPC_STATUS_REG, 0x04).unwrap() {
-            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission: submission, .. } => submission,
             other => panic!("clearing FREEZE did not release renderer work: {other:?}"),
         };
         assert_eq!(submission.source, DpcSubmissionSource::Dmem);

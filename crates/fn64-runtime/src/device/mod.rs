@@ -268,6 +268,26 @@ pub struct DpcSubmission {
     pub end: u32,
 }
 
+/// A known-width RDP command parked until a later END exposes the remainder.
+///
+/// The DPC accepts END extensions in 8-byte increments, so a multiword command
+/// straddles several END writes; hardware stalls CURRENT at that command's
+/// start rather than decoding a truncated stream. This is the raw CPU MMIO
+/// counterpart of the coalescing `fn64-abi`'s `coalesce_dp_submissions`
+/// already performs for RSP-produced streams.
+///
+/// `retained_words` spans `command_start..exposed_end` and is **captured, not
+/// a range to reread**: XBUS DMEM can change between END writes, so the bytes
+/// admitted with the first END are the bytes that must be decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StalledDpc {
+    pub source: DpcSubmissionSource,
+    pub command_start: u32,
+    pub exposed_end: u32,
+    pub bytes_required: u32,
+    pub retained_words: Vec<u32>,
+}
+
 /// Pointer-free architectural registers produced by one synchronous RSP run.
 ///
 /// DPC command transactions are deliberately absent: renderer ownership is
@@ -300,7 +320,7 @@ pub struct RspExecutionState {
 /// production caller must perform the named host action before allowing the
 /// guest to retire another instruction. In particular, a DPC request remains
 /// pending until its exact token is committed or cancelled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use = "MMIO write effects must be handled before guest execution resumes"]
 pub enum DeviceMmioWriteEffect {
     None,
@@ -308,7 +328,13 @@ pub enum DeviceMmioWriteEffect {
         sample_rate_hz: u32,
     },
     AiDmaStarted(AiDmaRequest),
-    DpcSubmissionRequested(DpcSubmission),
+    DpcSubmissionRequested {
+        submission: DpcSubmission,
+        /// Empty for a new stream; a continuation carries a clone of the
+        /// fabric-owned stalled tail so the ABI can prepend it without
+        /// rereading memory that may have changed.
+        retained_tail: Vec<u32>,
+    },
     /// A raw `SP_STATUS` write cleared HALT while the RSP was halted, which on
     /// hardware starts it executing IMEM from `SP_PC`. Reported as an effect so
     /// a host can run the RSP; the device models registers, not execution.
@@ -575,6 +601,18 @@ pub enum DeviceTraceKind {
 /// Typed failure at the raw/shim device boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceFault {
+    /// An END write arrived while a tail was parked, but it does not continue
+    /// that stream. A mismatched source, a latched START, or a non-advancing
+    /// END are all real stream boundaries -- concatenating across one would
+    /// splice unrelated commands, which is exactly what an XBUS ring wrap
+    /// looks like.
+    InvalidStalledDpcContinuation {
+        expected_source: DpcSubmissionSource,
+        received_source: DpcSubmissionSource,
+        exposed_end: u32,
+        received_end: u32,
+        start_valid: bool,
+    },
     UnalignedMmio {
         addr: MmioAddr,
     },
@@ -668,6 +706,18 @@ pub enum DeviceFault {
 impl fmt::Display for DeviceFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::InvalidStalledDpcContinuation {
+                expected_source,
+                received_source,
+                exposed_end,
+                received_end,
+                start_valid,
+            } => write!(
+                f,
+                "invalid stalled DPC continuation: expected {expected_source:?} bytes after \
+                 {exposed_end:#010X}, got {received_source:?} END {received_end:#010X}, \
+                 START_VALID={start_valid}"
+            ),
             Self::UnalignedMmio { addr } => write!(f, "unaligned MMIO word access at {addr}"),
             Self::UnmodeledMmioRead { addr } => write!(f, "unmodeled MMIO read at {addr}"),
             Self::UnmodeledMmioWrite { addr, value } => {

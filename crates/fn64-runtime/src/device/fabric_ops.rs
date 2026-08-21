@@ -442,17 +442,71 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     return Err(DeviceFault::DpBusy);
                 }
                 if self.dpc.status & DPC_STATUS_START_VALID == 0 {
+                    // START opens a new command stream, so any parked tail
+                    // belongs to the old one and must be abandoned. This is
+                    // also the XBUS ring-wrap boundary: concatenating across
+                    // it was MEASURED wrong (rsp_commit.rs:105-115).
+                    self.stalled_dpc = None;
                     self.dpc.start = value & DPC_ADDR_MASK;
                     self.dpc.status |= DPC_STATUS_START_VALID;
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }
             DPC_END_REG => {
+                // **A parked tail is NOT an in-flight transaction.** Reject
+                // only a real pending dispatch; an END that extends a stalled
+                // command must be accepted, and the retained tail must not be
+                // touched here -- it is the rollback target if dispatch fails.
                 if self.pending_dpc.is_some() {
                     return Err(DeviceFault::DpBusy);
                 }
                 let rollback = self.dpc;
                 let end = value & DPC_ADDR_MASK;
+                let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
+                    DpcSubmissionSource::Dmem
+                } else {
+                    DpcSubmissionSource::Rdram
+                };
+
+                if let Some(stalled) = self.stalled_dpc.as_ref() {
+                    // A continuation must be the SAME source, carry no fresh
+                    // START, and advance. Anything else is a new stream --
+                    // including an XBUS ring wrap, which `rsp_commit.rs`
+                    // records as a real boundary that must never be bridged.
+                    let start_valid = self.dpc.status & DPC_STATUS_START_VALID != 0;
+                    if source != stalled.source || start_valid || end <= stalled.exposed_end {
+                        return Err(DeviceFault::InvalidStalledDpcContinuation {
+                            expected_source: stalled.source,
+                            received_source: source,
+                            exposed_end: stalled.exposed_end,
+                            received_end: end,
+                            start_valid,
+                        });
+                    }
+                    let retained_bytes = u32::try_from(stalled.retained_words.len() * 4)
+                        .expect("stalled DPC tail length exceeds u32");
+                    assert_eq!(
+                        stalled.command_start.checked_add(retained_bytes),
+                        Some(stalled.exposed_end),
+                        "stalled DPC tail does not exactly cover command_start..exposed_end"
+                    );
+                    Self::validate_dpc_range(source, stalled.exposed_end, end)?;
+                    Self::validate_dpc_range(source, stalled.command_start, end)?;
+                    let start = stalled.command_start;
+                    let retained_tail = stalled.retained_words.clone();
+                    self.dpc.end = end;
+                    self.dpc.current = start;
+                    self.dpc.status &= !DPC_STATUS_START_VALID;
+                    if self.dpc.status & DPC_STATUS_FREEZE != 0 {
+                        return Ok(DeviceMmioWriteEffect::None);
+                    }
+                    let submission = self.begin_dpc_submission(source, start, end, rollback)?;
+                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                        submission,
+                        retained_tail,
+                    });
+                }
+
                 let start = if self.dpc.status & DPC_STATUS_START_VALID != 0 {
                     self.dpc.start
                 } else {
@@ -464,11 +518,6 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.dpc.status &= !DPC_STATUS_START_VALID;
                     return Ok(DeviceMmioWriteEffect::None);
                 }
-                let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
-                    DpcSubmissionSource::Dmem
-                } else {
-                    DpcSubmissionSource::Rdram
-                };
                 Self::validate_dpc_range(source, start, end)?;
                 self.dpc.end = end;
                 self.dpc.current = start;
@@ -477,7 +526,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     return Ok(DeviceMmioWriteEffect::None);
                 }
                 let submission = self.begin_dpc_submission(source, start, end, rollback)?;
-                return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
+                return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                    submission,
+                    retained_tail: Vec::new(),
+                });
             }
             DPC_CURRENT_REG => {
                 return Err(DeviceFault::UnmodeledMmioWrite { addr, value });
@@ -504,25 +556,49 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 if value & DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND != 0 {
                     self.dpc.clock = DpcCounter24::ZERO;
                 }
+                // Resume from the PARKED command's start, not from CURRENT
+                // alone: `park_dpc_submission` sets them equal, but the tail
+                // is what makes the resumed range decodable.
+                let resume_start = self
+                    .stalled_dpc
+                    .as_ref()
+                    .map_or(self.dpc.current, |stalled| stalled.command_start);
                 if was_frozen
                     && self.dpc.status & DPC_STATUS_FREEZE == 0
                     && self.pending_dpc.is_none()
-                    && self.dpc.current < self.dpc.end
+                    && resume_start < self.dpc.end
                 {
                     let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
                         DpcSubmissionSource::Dmem
                     } else {
                         DpcSubmissionSource::Rdram
                     };
-                    Self::validate_dpc_range(source, self.dpc.current, self.dpc.end)?;
+                    let retained_tail = match self.stalled_dpc.as_ref() {
+                        Some(stalled) if stalled.source != source => {
+                            return Err(DeviceFault::InvalidStalledDpcContinuation {
+                                expected_source: stalled.source,
+                                received_source: source,
+                                exposed_end: stalled.exposed_end,
+                                received_end: self.dpc.end,
+                                start_valid: self.dpc.status & DPC_STATUS_START_VALID != 0,
+                            });
+                        }
+                        Some(stalled) => stalled.retained_words.clone(),
+                        None => Vec::new(),
+                    };
+                    Self::validate_dpc_range(source, resume_start, self.dpc.end)?;
                     let rollback = self.dpc;
+                    self.dpc.current = resume_start;
                     let submission = self.begin_dpc_submission(
                         source,
-                        self.dpc.current,
+                        resume_start,
                         self.dpc.end,
                         rollback,
                     )?;
-                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
+                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                        submission,
+                        retained_tail,
+                    });
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }
