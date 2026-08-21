@@ -65,6 +65,7 @@
 #[cfg(not(fn64_game_linked))]
 mod demo;
 #[allow(dead_code)]
+mod frame_trip;
 mod framebuffer;
 #[allow(dead_code)]
 mod gamepad;
@@ -285,6 +286,12 @@ mod game {
         screenshotter: crate::screenshot::Screenshotter,
         reported_first_frame: bool,
         last_heartbeat_swap: u64,
+        /// Frame-hash tripwire (`FN64_FRAME_TRIP`), `None` when off.
+        frame_trip: Option<crate::frame_trip::FrameTrip>,
+        /// Settled tripwire verdict, acted on in `about_to_wait`.
+        frame_trip_verdict: Option<crate::frame_trip::Verdict>,
+        /// Exit code to propagate once the event loop has returned.
+        frame_trip_exit_code: Option<i32>,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
@@ -608,6 +615,9 @@ mod game {
                 screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
+                frame_trip: crate::frame_trip::FrameTrip::from_env(),
+                frame_trip_verdict: None,
+                frame_trip_exit_code: None,
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
@@ -803,6 +813,25 @@ mod game {
             // a failed present does not make them fabricated.
             self.rgba_holds_a_frame = true;
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
+
+            // Frame-hash tripwire. Placed on the hash that already exists so
+            // the guard adds no hashing and no clock; off by default, in
+            // which case this is one `Option` test per frame.
+            //
+            // The verdict is RECORDED here and acted on in `about_to_wait`.
+            // Exiting from `present` was tried and panics with "panic in a
+            // function that cannot unwind": present runs inside winit's
+            // extern "C" redraw callback, where `process::exit`'s teardown
+            // cannot unwind. `about_to_wait` is ordinary Rust, and is where
+            // the pump census already terminates bounded runs safely.
+            if let Some(trip) = self.frame_trip.as_mut() {
+                if self.frame_trip_verdict.is_none() {
+                    match trip.observe(rgba_hash) {
+                        crate::frame_trip::Verdict::Pending => {}
+                        settled => self.frame_trip_verdict = Some(settled),
+                    }
+                }
+            }
             pixels.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
             // pixels/window fields immutably alongside `&mut self.config`.
@@ -1221,6 +1250,59 @@ mod game {
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Frame-hash tripwire verdict, settled in `present`. Acted on
+            // here because this is ordinary Rust: see the note at the
+            // recording site for why exiting from `present` cannot work.
+            if let Some(verdict) = self.frame_trip_verdict.take() {
+                use crate::frame_trip::Verdict;
+                let path = self
+                    .frame_trip
+                    .as_ref()
+                    .map(|t| t.path().display().to_string())
+                    .unwrap_or_default();
+                let code = match verdict {
+                    Verdict::Pending => unreachable!("Pending is never stored"),
+                    Verdict::Recorded(n) => {
+                        match self.frame_trip.as_ref().expect("verdict implies trip").write() {
+                            Ok(()) => {
+                                println!(
+                                    "[fn64-shell] frame tripwire: recorded {n} frame hashes to {path}"
+                                );
+                                0
+                            }
+                            Err(e) => {
+                                eprintln!("[fn64-shell] frame tripwire: FAILED to write {path}: {e}");
+                                1
+                            }
+                        }
+                    }
+                    Verdict::Matched(n) => {
+                        println!("[fn64-shell] frame tripwire: PASS -- {n} frames match {path}");
+                        0
+                    }
+                    Verdict::Mismatch { index, expected, actual } => {
+                        eprintln!(
+                            "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
+                             {expected:016x}, got {actual:016x} (baseline {path}). A differing \
+                             hash localises the frame; it does not itself say which picture \
+                             is correct."
+                        );
+                        1
+                    }
+                };
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                // `event_loop.exit()`, not `process::exit`: on macOS BOTH
+                // `present` and `about_to_wait` run inside winit's extern "C"
+                // callbacks, where process teardown aborts with "panic in a
+                // function that cannot unwind" (observed, exit 134, after the
+                // message had already printed). Winit's own exit returns
+                // through the loop, and `run_app` then propagates this code.
+                self.frame_trip_exit_code = Some(code);
+                event_loop.exit();
+                return;
+            }
             // Gamepad events every tick (gilrs state only advances when its
             // queue is drained). Presses are consumed by an armed overlay
             // capture and discarded otherwise, so arming a capture never
@@ -1366,7 +1448,14 @@ mod game {
         // user actually copies is its tail.
         println!("{}", crate::stack::banner(Some(shell.active_renderer)));
         println!("[fn64-shell] exited cleanly.");
+        // Tripwire runs are gates, so their verdict must reach the shell as
+        // an exit status. Taken after `prepare_clean_exit` so the teardown
+        // this path exists to perform still happens on a FAIL.
+        let trip_code = shell.frame_trip_exit_code;
         prepare_clean_exit();
+        if let Some(code) = trip_code {
+            std::process::exit(code);
+        }
     }
 
     /// Seal guest coroutine ownership before normal process teardown.
