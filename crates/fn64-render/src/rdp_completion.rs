@@ -62,6 +62,51 @@ const RDP_TEXRECTFLIP: u8 = 0x25;
 const RDP_SYNC_LOAD: u8 = 0x26;
 const RDP_SYNC_FULL: u8 = 0x29;
 
+/// The outcome of scanning a raw-RDP command range.
+///
+/// A range can end in the middle of a command whose opcode width is known.
+/// On hardware that is not an error: the DPC accepts END extensions in 8-byte
+/// increments, so a 16-byte command straddles two END writes and CURRENT
+/// simply stalls at that command's start until a later END exposes the rest.
+/// `coalesce_dp_submissions` (`fn64-abi`) already documents and handles this
+/// for RSP-produced streams; raw CPU MMIO ingress needs the same distinction,
+/// and it could not have it while a truncated tail returned the same
+/// `RenderError` as a genuinely malformed opcode.
+///
+/// **`Err(RenderError)` remains the third outcome and keeps its meaning.**
+/// Only a KNOWN-width command overrunning the range end becomes
+/// `Incomplete`; an unknown opcode, a misaligned or empty range, and an
+/// address-space overflow all still reject loudly. Turning real garbage into
+/// a silent stall is the one failure this type must not enable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawRdpScan<T, P> {
+    /// Every command in the range was whole.
+    Complete(T),
+    /// The range ends inside a command. `complete_prefix` is the result
+    /// accumulated from the whole commands before it.
+    Incomplete {
+        complete_prefix: T,
+        command_start: P,
+        bytes_required: u32,
+        bytes_available: u32,
+    },
+}
+
+impl<T, P> RawRdpScan<T, P> {
+    /// The `Complete` payload, or `None` when the scan stalled.
+    pub fn complete(self) -> Option<T> {
+        match self {
+            Self::Complete(value) => Some(value),
+            Self::Incomplete { .. } => None,
+        }
+    }
+
+    /// True when the range ends inside a known-width command.
+    pub const fn is_incomplete(&self) -> bool {
+        matches!(self, Self::Incomplete { .. })
+    }
+}
+
 /// Inspect one exact raw DPC range for the command that generates the public
 /// DP completion interrupt.
 ///
@@ -72,7 +117,7 @@ pub fn inspect_raw_rdp_full_sync(
     rdram: &[u8],
     start: u32,
     end: u32,
-) -> Result<DpFullSyncStatus, RenderError> {
+) -> Result<RawRdpScan<DpFullSyncStatus, u32>, RenderError> {
     let reject = |reason: String| RenderError::Backend {
         backend: "rdp-full-sync-inspection",
         reason,
@@ -112,18 +157,27 @@ pub fn inspect_raw_rdp_full_sync(
             ))
         })?;
         if pc > end {
-            return Err(reject(format!(
-                "raw RDP command at {:#010x} is truncated by range end {end:#010x}",
-                pc - width
-            )));
+            // Known-width command overruns the range: STALL, not reject.
+            // The prefix before it is whole and its completion result stands.
+            let command_start = pc - width;
+            return Ok(RawRdpScan::Incomplete {
+                complete_prefix: if reached {
+                    DpFullSyncStatus::Reached
+                } else {
+                    DpFullSyncStatus::NotReached
+                },
+                command_start,
+                bytes_required: width,
+                bytes_available: end - command_start,
+            });
         }
     }
 
-    Ok(if reached {
+    Ok(RawRdpScan::Complete(if reached {
         DpFullSyncStatus::Reached
     } else {
         DpFullSyncStatus::NotReached
-    })
+    }))
 }
 
 /// Count the `SYNC_FULL` sites in one owned raw-DPC command word image.
@@ -142,7 +196,9 @@ pub fn inspect_raw_rdp_full_sync(
 ///
 /// Nonclaim: a count is a count of decoded *sites*. It says nothing about
 /// whether any DP interrupt was raised or observed for them.
-pub fn count_raw_rdp_full_sync_sites(words: &[u32]) -> Result<usize, RenderError> {
+pub fn count_raw_rdp_full_sync_sites(
+    words: &[u32],
+) -> Result<RawRdpScan<usize, usize>, RenderError> {
     let reject = |reason: String| RenderError::Backend {
         backend: "rdp-full-sync-site-count",
         reason,
@@ -164,13 +220,17 @@ pub fn count_raw_rdp_full_sync_sites(words: &[u32]) -> Result<usize, RenderError
         })? as usize;
         offset += width;
         if offset > byte_len {
-            return Err(reject(format!(
-                "raw RDP command at byte offset {:#x} is truncated by image length {byte_len:#x}",
-                offset - width
-            )));
+            // Known-width command overruns the image: STALL, not reject.
+            let command_start = offset - width;
+            return Ok(RawRdpScan::Incomplete {
+                complete_prefix: sites,
+                command_start,
+                bytes_required: width as u32,
+                bytes_available: (byte_len - command_start) as u32,
+            });
         }
     }
-    Ok(sites)
+    Ok(RawRdpScan::Complete(sites))
 }
 
 /// Byte width of one public raw RDP command, or `None` when no public
@@ -239,12 +299,12 @@ mod tests {
         write_word(&mut rdram, 8, 0xe900_0000);
         assert_eq!(
             inspect_raw_rdp_full_sync(&rdram, 0, 32).unwrap(),
-            DpFullSyncStatus::NotReached
+            RawRdpScan::Complete(DpFullSyncStatus::NotReached)
         );
         write_word(&mut rdram, 32, 0xe900_0000);
         assert_eq!(
             inspect_raw_rdp_full_sync(&rdram, 0, 40).unwrap(),
-            DpFullSyncStatus::Reached
+            RawRdpScan::Complete(DpFullSyncStatus::Reached)
         );
     }
 
@@ -382,7 +442,7 @@ mod tests {
             write_word(&mut rdram, 0, u32::from(prefix | RDP_SYNC_FULL) << 24);
             assert_eq!(
                 inspect_raw_rdp_full_sync(&rdram, 0, 8).unwrap(),
-                DpFullSyncStatus::Reached,
+                RawRdpScan::Complete(DpFullSyncStatus::Reached),
                 "Sync Full spelled {:#04x} must be recognized",
                 prefix | RDP_SYNC_FULL
             );
@@ -400,7 +460,7 @@ mod tests {
             write_word(&mut rdram, 8, 0xe900_0000);
             assert_eq!(
                 inspect_raw_rdp_full_sync(&rdram, 0, 16).unwrap(),
-                DpFullSyncStatus::Reached,
+                RawRdpScan::Complete(DpFullSyncStatus::Reached),
                 "No Operation {opcode:#04x} must advance exactly one word"
             );
         }
@@ -414,7 +474,7 @@ mod tests {
             write_word(&mut rdram, 8, 0xe900_0000);
             assert_eq!(
                 inspect_raw_rdp_full_sync(&rdram, 0, 24).unwrap(),
-                DpFullSyncStatus::NotReached
+                RawRdpScan::Complete(DpFullSyncStatus::NotReached)
             );
         }
     }

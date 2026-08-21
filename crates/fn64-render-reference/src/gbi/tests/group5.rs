@@ -373,13 +373,13 @@ fn raw_rdp_full_sync_inspection_distinguishes_absent_and_reached() {
     wr_cmd(&mut rdram, 0, (G_RDPPIPESYNC as u32) << 24, 0);
     assert_eq!(
         raw_rdp_full_sync_status(&rdram, 0, 8).unwrap(),
-        fn64_render::DpFullSyncStatus::NotReached
+        fn64_render::RawRdpScan::Complete(fn64_render::DpFullSyncStatus::NotReached)
     );
 
     wr_cmd(&mut rdram, 8, (G_RDPFULLSYNC as u32) << 24, 0x1234_5678);
     assert_eq!(
         raw_rdp_full_sync_status(&rdram, 0, 16).unwrap(),
-        fn64_render::DpFullSyncStatus::Reached
+        fn64_render::RawRdpScan::Complete(fn64_render::DpFullSyncStatus::Reached)
     );
 }
 
@@ -392,18 +392,37 @@ fn raw_rdp_full_sync_inspection_skips_triangle_payload_words() {
 
     assert_eq!(
         raw_rdp_full_sync_status(&rdram, 0, 32).unwrap(),
-        fn64_render::DpFullSyncStatus::NotReached,
+        fn64_render::RawRdpScan::Complete(fn64_render::DpFullSyncStatus::NotReached),
         "an opcode-shaped triangle coefficient is data, not a command"
     );
 }
 
 
 #[test]
-fn raw_rdp_full_sync_inspection_rejects_truncated_commands() {
+fn raw_rdp_full_sync_inspection_reports_a_truncated_command_as_incomplete() {
+    // A known-width command that overruns the range is NOT an error: the DPC
+    // accepts END extensions in 8-byte increments, so a multiword command
+    // straddles several END writes and hardware stalls CURRENT at its start until
+    // the rest arrives. This test previously demanded an error, which is the
+    // defect -- the caller could not tell "wait for more bytes" from "this is
+    // malformed", and the raw CPU MMIO ingress panicked on a legal sequence.
     let mut rdram = vec![0u8; 8];
     wr_cmd(&mut rdram, 0, 0x0800_0000, 0);
-    let error = raw_rdp_full_sync_status(&rdram, 0, 8).unwrap_err();
-    assert!(error.to_string().contains("truncated"));
+    let scanned = raw_rdp_full_sync_status(&rdram, 0, 8)
+        .expect("a truncated tail is a stall, not a rejection");
+    let fn64_render::RawRdpScan::Incomplete {
+        command_start,
+        bytes_required,
+        bytes_available,
+        ..
+    } = scanned
+    else {
+        panic!("an 8-byte range holding a 32-byte command must scan Incomplete");
+    };
+    assert_eq!(command_start, 0);
+    // opcode 0x08 is a base triangle: 32 bytes.
+    assert_eq!(bytes_required, 32);
+    assert_eq!(bytes_available, 8);
 }
 
 
@@ -423,7 +442,7 @@ fn raw_rdp_low_no_operation_block_is_accepted_and_one_word_wide() {
         assert_eq!(raw_rdp_command_width(opcode), Some(8));
         assert_eq!(
             raw_rdp_full_sync_status(&rdram, 0, 16).unwrap(),
-            fn64_render::DpFullSyncStatus::Reached,
+            fn64_render::RawRdpScan::Complete(fn64_render::DpFullSyncStatus::Reached),
             "No Operation {opcode:#04x} must advance exactly one command word"
         );
     }
@@ -490,7 +509,7 @@ fn raw_rdp_accepts_every_prefix_spelling_of_a_command() {
         validate_raw_rdp_command_range(&rdram, 0, 8).unwrap();
         assert_eq!(
             raw_rdp_full_sync_status(&rdram, 0, 8).unwrap(),
-            fn64_render::DpFullSyncStatus::Reached
+            fn64_render::RawRdpScan::Complete(fn64_render::DpFullSyncStatus::Reached)
         );
     }
     // The triangles keep their bare spelling, since the decoder matches them

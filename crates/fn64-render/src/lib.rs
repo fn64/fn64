@@ -67,7 +67,7 @@ pub use raw_dpc_batch::{
     RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{
-    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width,
+    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width, RawRdpScan,
 };
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
