@@ -150,9 +150,34 @@ impl core::fmt::Debug for CapturedGuestRead {
 }
 
 impl CapturedGuestRead {
+    /// Capture bytes we just read ourselves, hashing them ONCE.
+    ///
+    /// This deliberately does not route through
+    /// [`Self::try_new_with_digest`]. That constructor exists to verify a
+    /// digest claimed by *someone else*, and it does so by recomputing the
+    /// digest from the bytes. Handing it a digest we just computed from the
+    /// same bytes made the comparison vacuous -- it compared a value to
+    /// itself and could never fail -- while hashing every payload twice.
+    ///
+    /// The length check below is the part of `try_new_with_digest` that is
+    /// NOT vacuous here, so it is kept.
     pub fn try_new(read: DeferredGuestRead, bytes: Vec<u8>) -> Result<Self, ValidationError> {
+        let actual = u32::try_from(bytes.len()).map_err(|_| ValidationError::NumericOverflow {
+            field: "captured guest-read byte length",
+        })?;
+        if actual != read.range.len() {
+            return Err(ValidationError::GuestReadByteCountMismatch {
+                index: read.access_index as usize,
+                expected: read.range.len(),
+                actual,
+            });
+        }
         let content = guest_read_content_digest(&bytes);
-        Self::try_new_with_digest(read, bytes, content)
+        Ok(Self {
+            read,
+            bytes: bytes.into(),
+            content,
+        })
     }
 
     pub fn try_new_with_digest(
