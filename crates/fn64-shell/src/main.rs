@@ -1387,6 +1387,17 @@ mod game {
                     // a plausible short log. Everything this census measures
                     // is already flushed above; the guest coroutines a normal
                     // teardown exists to seal are not observed after it.
+                    //
+                    // `prepare_clean_exit` FIRST, though. `process::exit`
+                    // still runs thread-local destructors, and dropping the
+                    // `Executor` force-unwinds the guest coroutines through
+                    // `extern "C"` recomp frames -- which aborts with "panic
+                    // in a function that cannot unwind". Observed: the census
+                    // printed its whole report and then exited 134, turning a
+                    // good measurement into a failed run. `prepare_clean_exit`
+                    // detaches the coroutines so that drop has nothing to
+                    // unwind.
+                    prepare_clean_exit();
                     use std::io::Write as _;
                     let _ = std::io::stdout().flush();
                     let _ = std::io::stderr().flush();
