@@ -71,3 +71,8 @@ fn64-audio = { path = "../../fn64-audio" }
 # evidence about which title is linked. Cargo's dependency rename gives the
 # shell a title-neutral local name without editing the emitted manifest.
 game-recompiled = { path = "recompiled", package = "oot-recompiled" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
