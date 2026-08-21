@@ -214,6 +214,37 @@ pub struct TriangleDrawStateCollector {
     current_scissor: Option<RdpScissorRect>,
 }
 
+/// The tile index a draw names in its OWN wire word.
+///
+/// **One implementation, because there are two collectors.**
+/// `production.rs`'s `PlanCollector` and this file's
+/// `TriangleDrawStateCollector` both walk the same plan and must resolve the
+/// same tile for the same draw; when each carried its own copy of this
+/// arithmetic they drifted, and the copy here stayed frozen at tile 0 long
+/// after the other was fixed. A shared function cannot drift.
+///
+/// A raw triangle names its tile in word 0 bits 18:16 -- the field
+/// `RawTriangle::decode` reads (`triangle.rs:183`). A texture rectangle
+/// names its own in word 1 bits 26:24. RT64 honours the draw's tile the
+/// same way: `drawTris` assigns `drawCall.textureTile = tile`
+/// (`rt64_rdp.cpp:1088-1097`).
+///
+/// Falls back to 0 only when the words are absent, which a decoded command
+/// never is -- the fallback exists so a malformed fixture binds the default
+/// tile rather than panicking mid-walk.
+pub fn bound_tile_index(source: TriangleSource, raw_words: &[u32]) -> usize {
+    match source {
+        TriangleSource::TextureRectangle => raw_words
+            .get(1)
+            .map(|word| ((word >> 24) & 0x7) as usize)
+            .unwrap_or(0),
+        TriangleSource::RawTriangle => raw_words
+            .first()
+            .map(|word| ((word >> 16) & 0x7) as usize)
+            .unwrap_or(0),
+    }
+}
+
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
     fn command(&mut self, command: RawDpcSemanticCommandRef<'_>) {
         match command {
@@ -237,16 +268,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 // Identical to the recovery `production.rs`'s `PlanCollector`
                 // already performs, so the two collectors resolve the SAME
                 // tile for the same draw.
-                let bound_tile_index = match source {
-                    TriangleSource::TextureRectangle => raw_words
-                        .get(1)
-                        .map(|word| ((word >> 24) & 0x7) as usize)
-                        .unwrap_or(0),
-                    TriangleSource::RawTriangle => raw_words
-                        .first()
-                        .map(|word| ((word >> 16) & 0x7) as usize)
-                        .unwrap_or(0),
-                };
+                let bound_tile_index = bound_tile_index(*source, raw_words);
                 let tile_binding = match self
                     .current_tiles
                     .get(bound_tile_index)
