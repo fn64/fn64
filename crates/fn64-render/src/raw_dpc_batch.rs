@@ -419,9 +419,20 @@ impl RawDpcBatch {
             let full_sync =
                 inspect_raw_rdp_full_sync(&staged_commands, group_start as u32, group_end as u32)
                     .map_err(|error| RawDpcBatchPreflightError::InvalidStreamGroup {
-                    group: groups.len(),
-                    error: error.to_string(),
-                })?;
+                        group: groups.len(),
+                        error: error.to_string(),
+                    })?
+                    // A batch is a CLOSED capture, not an extendable hardware
+                    // stream: there is no later END write to expose the rest,
+                    // so an incomplete tail here is a malformed group and must
+                    // stay loud. Only raw CPU MMIO ingress may stall.
+                    .complete()
+                    .ok_or_else(|| RawDpcBatchPreflightError::InvalidStreamGroup {
+                        group: groups.len(),
+                        error: "raw RDP stream group ends inside a command; a batch capture \
+                                cannot be extended by a later END write"
+                            .to_string(),
+                    })?;
             groups.push(RawDpcStreamGroup {
                 first_submission,
                 submission_count: index - first_submission,
@@ -667,22 +678,22 @@ mod tests {
         // No FullSync at all.
         assert_eq!(
             crate::count_raw_rdp_full_sync_sites(&words(0xe6)).unwrap(),
-            0
+            crate::RawRdpScan::Complete(0)
         );
         // One, in its canonical 0x29 spelling.
         assert_eq!(
             crate::count_raw_rdp_full_sync_sites(&words(0x29)).unwrap(),
-            1
+            crate::RawRdpScan::Complete(1)
         );
         // Bits 63:62 are don't-care, so 0xe9 is the same command.
         assert_eq!(
             crate::count_raw_rdp_full_sync_sites(&words(0xe9)).unwrap(),
-            1
+            crate::RawRdpScan::Complete(1)
         );
         // Two sites are counted as two, not collapsed to a boolean.
         let mut two = words(0x29);
         two.extend(words(0x29));
-        assert_eq!(crate::count_raw_rdp_full_sync_sites(&two).unwrap(), 2);
+        assert_eq!(crate::count_raw_rdp_full_sync_sites(&two).unwrap(), crate::RawRdpScan::Complete(2));
 
         // The real claim. A 0x08 triangle is a 32-byte (8-word) command whose
         // seven payload words are coefficients, not opcodes. Plant a
@@ -696,11 +707,11 @@ mod tests {
         let planted = triangle.clone();
         assert_eq!(
             crate::count_raw_rdp_full_sync_sites(&planted).unwrap(),
-            0,
+            crate::RawRdpScan::Complete(0),
             "a triangle coefficient spelling 0x29 is payload, not a FullSync site"
         );
         triangle.extend(words(0x29));
-        assert_eq!(crate::count_raw_rdp_full_sync_sites(&triangle).unwrap(), 1);
+        assert_eq!(crate::count_raw_rdp_full_sync_sites(&triangle).unwrap(), crate::RawRdpScan::Complete(1));
     }
 
     #[test]
@@ -773,7 +784,7 @@ mod tests {
         let image = batch.staged_image(&vec![0; 0x200]).unwrap();
         assert_eq!(
             inspect_raw_rdp_full_sync(&image, batch.staging_start(), batch.staging_end()).unwrap(),
-            DpFullSyncStatus::NotReached
+            crate::RawRdpScan::Complete(DpFullSyncStatus::NotReached)
         );
     }
 
@@ -854,7 +865,7 @@ mod tests {
         assert_eq!(&image[..8], &physical);
         assert_eq!(
             inspect_raw_rdp_full_sync(&image, batch.staging_start(), batch.staging_end()).unwrap(),
-            DpFullSyncStatus::Reached
+            crate::RawRdpScan::Complete(DpFullSyncStatus::Reached)
         );
     }
 

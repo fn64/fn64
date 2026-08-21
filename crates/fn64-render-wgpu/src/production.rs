@@ -5261,7 +5261,12 @@ mod tests {
     fn full_sync_capture(words: Vec<u32>) -> fn64_render::OwnedRawDpcCapture {
         let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let end = COMMAND_START + u32::try_from(words.len() * 4).unwrap();
-        let sites = fn64_render::count_raw_rdp_full_sync_sites(&words).unwrap();
+        // `Complete` specifically: a test fixture that ends inside a command
+        // is a broken fixture, not a stall to tolerate.
+        let sites = fn64_render::count_raw_rdp_full_sync_sites(&words)
+            .unwrap()
+            .complete()
+            .expect("test fixture command words must form whole commands");
         let submission =
             OwnedRawDpcSubmission::from_rdram_words(COMMAND_START, end, words.clone()).unwrap();
         let boundaries = (0..sites as u64)
