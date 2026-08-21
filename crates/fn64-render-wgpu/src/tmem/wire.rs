@@ -645,8 +645,29 @@ fn transfer_shape(
     };
     let (logical_source_bytes, transfer_words, undefined_padding_bytes, words_per_row, row_count) =
         match kind {
-            TmemLoadKind::Block { .. } => {
-                let logical = source.total_bytes();
+            TmemLoadKind::Block {
+                source_s, high_s, ..
+            } => {
+                // **Derived from the COMMAND, not from `source.total_bytes()`.**
+                //
+                // The two are equal today, and the invariant below still
+                // asserts it. But the source plan is about to carry PADDED DMA
+                // bytes rather than logical texel bytes -- hardware copies
+                // whole 64-bit words (`rt64_rdp.cpp`'s `loadWord`: "Copy the
+                // entire word", `for i in 0..8`) -- and a logical length read
+                // back out of the padded plan would be circular. The Tile arm
+                // below already derives its own geometry this way; this makes
+                // Block match, with no behaviour change.
+                //
+                // Same inclusive span the decoder computes for the source
+                // range (`decode_load_block`: `high_s - source_s + 1`).
+                let texels = u32::from(
+                    high_s
+                        .raw()
+                        .checked_sub(source_s.raw())
+                        .ok_or(TmemWireError::new("LoadBlock source span is inverted"))?,
+                ) + 1;
+                let logical = texel_bytes(image.size(), texels)?;
                 let words = logical.div_ceil(8);
                 let written = words.checked_mul(8).ok_or(TmemWireError::new(
                     "LoadBlock transfer byte count overflows",
