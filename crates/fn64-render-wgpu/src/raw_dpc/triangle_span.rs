@@ -284,7 +284,24 @@ pub(crate) fn pixel_coverage(triangle: &RawTriangle, x: i32, y: i32) -> u32 {
 /// `dcdy` is decoded and carried but not evaluated by [`attribute_plane`]:
 /// the RDP's own plane evaluation is `base + de*dy + dx*dxpos`, walking the
 /// major edge with `de` and then stepping across the span with `dx`. `dcdy`
-/// exists for the hardware's own span-walker and is not a third term.
+/// is not a third term of THAT walk.
+///
+/// It is not unused on real hardware, though, and an earlier version of this
+/// comment overstated the case. angrylion applies it as a sub-pixel
+/// correction on PARTIALLY covered pixels only: `rgba_correct`
+/// (`rasterizer.c:125`) takes the `cvg != 8` branch and adds
+/// `offy * spans_drdy` (and the G/B/A equivalents), with `offx`/`offy`
+/// derived from the coverage mask in `coverage.c:209`. Fully covered pixels
+/// take the `cvg == 8` branch, which applies no such term -- which is why
+/// the span walk above is right for the interior and wrong only at edges.
+///
+/// **Deliberately not implemented here.** RT64 is this crate's render parity
+/// target and does not model it either: it is a GPU rasterizer taking
+/// coverage from hardware MSAA rather than from the RDP's coverage LUT, and
+/// has no `offx`/`offy` equivalent. Adding the term would diverge from the
+/// oracle we certify against in order to approach a third implementation.
+/// Revisit only if fn64 ever adopts angrylion-style coverage as authority.
+///
 /// Carried rather than dropped so the decode is complete and a future
 /// consumer does not have to re-read the wire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
