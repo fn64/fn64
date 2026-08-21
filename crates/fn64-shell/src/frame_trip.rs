@@ -104,6 +104,11 @@ impl FrameTrip {
         matches!(self.baseline, Baseline::Pinned(_))
     }
 
+    /// Frames observed so far -- the index the next frame will take.
+    pub fn observed_len(&self) -> usize {
+        self.observed.len()
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
