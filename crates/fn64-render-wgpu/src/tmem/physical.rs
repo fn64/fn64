@@ -2779,8 +2779,11 @@ mod tests {
         assert_eq!(state.bytes[untouched], 0xaa);
     }
 
+    /// An odd-width RGBA32 load still routes bytes through split banks, but its
+    /// padded word is fully valid per RT64 `rt64_rdp.cpp:369-397` (`Copy the
+    /// entire word`), including exact adjacent RDRAM bytes.
     #[test]
-    fn odd_width_rgba32_tail_uses_split_bank_physical_mask() {
+    fn odd_width_rgba32_padded_word_uses_full_split_bank_mask() {
         let words = vec![
             word(SET_TEXTURE_IMAGE, 3 << 19),
             0x200,
@@ -2798,8 +2801,8 @@ mod tests {
         let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
         assert_eq!(transfer.words().len(), 1);
         let word = transfer.words()[0];
-        assert_eq!(word.defined_source_byte_mask(), 0x0f);
-        assert_eq!(physical_defined_lane_mask(word).unwrap(), 0x33);
+        assert_eq!(word.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(word).unwrap(), 0xff);
         assert!(matches!(
             word.physical(),
             TmemTransferPhysicalWord::SplitBanks { .. }
@@ -2810,33 +2813,33 @@ mod tests {
         let mut staged = state
             .stage_transfer(decoded.submitted(), &transfer)
             .unwrap();
-        let logical_prefix = [
+        let partial_old_model = [
             Some(0x10),
             Some(0x11),
+            None,
+            None,
             Some(0x12),
             Some(0x13),
             None,
             None,
-            None,
-            None,
         ];
         assert!(matches!(
-            staged.physical_word_payload(word, logical_prefix),
+            staged.physical_word_payload(word, partial_old_model),
             Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
-                expected: 0x33,
-                actual: 0x0f,
+                expected: 0xff,
+                actual: 0x33,
                 ..
             })
         ));
         let physical = [
             Some(0x10),
             Some(0x11),
-            None,
-            None,
+            Some(0x14),
+            Some(0x15),
             Some(0x12),
             Some(0x13),
-            None,
-            None,
+            Some(0x16),
+            Some(0x17),
         ];
         let payload = staged.physical_word_payload(word, physical).unwrap();
         staged.stage_word(payload).unwrap();
@@ -2863,8 +2866,11 @@ mod tests {
             .all(|effect| effect.byte_count() == 4));
     }
 
+    /// The low-level mask mapper retains its partial-mask behavior for hostile
+    /// inputs, while real Tile words are fully valid under RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`) on both row parities.
     #[test]
-    fn linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange() {
+    fn linear_mask_mapping_and_real_padded_words_follow_row_exchange() {
         let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
         let even_masks = [0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff];
         let odd_masks = [0x10, 0x30, 0x70, 0xf0, 0xf1, 0xf3, 0xf7, 0xff];
@@ -2913,27 +2919,27 @@ mod tests {
             !even_tail.odd_row_exchange(),
             "words 0-1 are tile-relative row 0"
         );
-        assert_eq!(even_tail.defined_source_byte_mask(), 0x03);
-        assert_eq!(physical_defined_lane_mask(even_tail).unwrap(), 0x03);
+        assert_eq!(even_tail.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(even_tail).unwrap(), 0xff);
 
         let odd_tail = transfer.words()[3];
         assert!(
             odd_tail.odd_row_exchange(),
             "words 2-3 are tile-relative row 1"
         );
-        assert_eq!(odd_tail.defined_source_byte_mask(), 0x03);
-        assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0x30);
+        assert_eq!(odd_tail.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0xff);
 
         let state = PhysicalTmemState::try_new().unwrap();
         let staged = state
             .stage_transfer(fixture.decoded.submitted(), &transfer)
             .unwrap();
-        let logical_prefix = [Some(0x10), Some(0x11), None, None, None, None, None, None];
+        let old_partial_payload = [None, None, None, None, Some(0x10), Some(0x11), None, None];
         assert!(matches!(
-            staged.physical_word_payload(odd_tail, logical_prefix),
+            staged.physical_word_payload(odd_tail, old_partial_payload),
             Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
-                expected: 0x30,
-                actual: 0x03,
+                expected: 0xff,
+                actual: 0x30,
                 ..
             })
         ));
@@ -3178,8 +3184,12 @@ mod tests {
         ));
     }
 
+    /// Padded Tile words project every copied lane as valid while invalid backing
+    /// outside the writes remains content-hidden; validity, epoch, and touch still
+    /// participate in the digest. RT64 authority: `rt64_rdp.cpp:369-397`,
+    /// `Copy the entire word`.
     #[test]
-    fn canonical_projection_hides_invalid_backing_and_hashes_validity_epoch_and_touch() {
+    fn canonical_projection_hashes_full_padded_validity_epoch_touch_and_hides_backing() {
         let mut first_state = PhysicalTmemState::try_new().unwrap();
         first_state.bytes.fill(0x11);
         let mut second_state = PhysicalTmemState::try_new().unwrap();
@@ -3211,13 +3221,10 @@ mod tests {
         let baseline = completed_effect(projection).unwrap();
         let byte_count = projection.normalized_bytes.len() as u32;
         assert_eq!(baseline.byte_count(), byte_count);
-        assert!(
-            projection
-                .validity
-                .iter()
-                .filter(|valid| **valid == 1)
-                .count()
-                < baseline.byte_count() as usize
+        assert!(projection.validity.iter().all(|valid| *valid == 1));
+        assert_eq!(
+            projection.normalized_bytes,
+            (0x20_u8..0x30).collect::<Vec<_>>().into_boxed_slice()
         );
         assert_eq!(
             baseline.content(),
@@ -3880,8 +3887,8 @@ mod tests {
         fn direct_tile_masks_are_unchanged_by_the_destination_mask_split() {
             // Block/Tile: source and destination masks coincide, including
             // the odd-row partial tail and the split-bank RGBA32 case
-            // already covered by `linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange`
-            // and `odd_width_rgba32_tail_uses_split_bank_physical_mask`. This
+            // already covered by `linear_mask_mapping_and_real_padded_words_follow_row_exchange`
+            // and `odd_width_rgba32_padded_word_uses_full_split_bank_mask`. This
             // is a targeted regression that word minting itself (via
             // `raw_dpc::transfer_record`) still produces `source ==
             // destination` for a non-TLUT kind, now that both masks are

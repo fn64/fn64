@@ -587,7 +587,8 @@ mod tests {
 
     fn source_ranges(spec: BlockFixtureSpec) -> Vec<(u32, u32)> {
         let start = spec.image_address;
-        vec![(start, start + spec.source_byte_len)]
+        let padded_byte_len = spec.source_byte_len.div_ceil(8) * 8;
+        vec![(start, start + padded_byte_len)]
     }
 
     fn command_access(
@@ -896,10 +897,10 @@ mod tests {
         );
     }
 
-    /// A PARTIAL tail word landing on an odd tile-relative row must move its
-    /// payload into the exchanged high lanes -- matching
-    /// `physical.rs::physical_defined_lane_mask`'s `rotate_left(4)` for mask
-    /// `0x03 -> 0x30`, not the stale unexchanged `0x03 -> lanes 0-1`.
+    /// A padded tail word landing on an odd tile-relative row moves the whole
+    /// adjacent-RDRAM word through the four-byte lane exchange. This matches
+    /// RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`), which copies all
+    /// eight bytes even when the logical texels end partway through the word.
     ///
     /// The odd row is reached with `dxt = 2048` (one row per word), so word 1
     /// is tile-relative row 1. This fixture previously relied on `source_t: 1`
@@ -908,7 +909,7 @@ mod tests {
     /// above for the citation. `source_t: 1` is retained so the row-0/row-1
     /// split below inverts if that term is ever reintroduced.
     #[test]
-    fn linear_odd_row_partial_tail_exchanges_into_the_high_half() {
+    fn linear_odd_row_padded_tail_exchanges_the_entire_word() {
         let spec = BlockFixtureSpec {
             format: 0,
             size: 1,
@@ -926,18 +927,36 @@ mod tests {
         assert_eq!(words.len(), 2);
         assert!(!words[0].0.odd_row_exchange(), "word 0 is tile-relative row 0");
         assert!(words[1].0.odd_row_exchange(), "word 1 is tile-relative row 1");
-        assert_eq!(words[1].0.defined_source_byte_mask(), 0x03);
+        // **All eight lanes, because the DMA copies whole 64-bit words.**
+        // This asserted `0x03` and a half-`None` tail, which is the model the
+        // padded-word fix corrected; the EXCHANGE claim it exists for is
+        // unaffected and is asserted below.
+        assert_eq!(words[1].0.defined_source_byte_mask(), 0xff);
 
         // `source_t = 1` offsets the logical source by one image row
-        // (8 texels * 1 byte = 8 bytes) from `image_address`; word 1's two
-        // defined bytes are the row's bytes 8-9, i.e. absolute source bytes
-        // 16-17 (0x10, 0x11).
-        let expected_tail = [None, None, None, None, Some(16), Some(17), None, None];
-        assert_eq!(words[1].1, expected_tail);
-        assert_ne!(
-            words[1].1,
-            [Some(16), Some(17), None, None, None, None, None, None,],
-            "odd-row partial tail must not land at the unexchanged logical-prefix lanes"
+        // (8 texels * 1 byte = 8 bytes) from `image_address`, so word 1 reads
+        // absolute source bytes 16..24 -- its two logical bytes 16-17 plus the
+        // six adjacent RDRAM bytes the padded word carries.
+        //
+        // **The exchange is what this test is for**: word 1 is tile-relative
+        // row 1, so its bytes land in the HIGH half of the destination word
+        // (`lane ^ 4`) rather than at the unexchanged prefix. With a full
+        // word every lane is defined, and the exchange shows as the byte
+        // ORDER: lanes 4..8 carry the word's first four source bytes.
+        let lanes = words[1].1;
+        assert!(
+            lanes.iter().all(Option::is_some),
+            "a padded word defines every lane: {lanes:?}"
+        );
+        assert_eq!(
+            [lanes[4], lanes[5], lanes[6], lanes[7]],
+            [Some(16), Some(17), Some(18), Some(19)],
+            "odd-row exchange puts the word's leading source bytes in the high half"
+        );
+        assert_eq!(
+            [lanes[0], lanes[1], lanes[2], lanes[3]],
+            [Some(20), Some(21), Some(22), Some(23)],
+            "and its trailing source bytes in the low half"
         );
 
         // The placement must also satisfy M4.2a's own independently-derived
@@ -1038,8 +1057,10 @@ mod tests {
         state
     }
 
+    /// RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`) makes a block's
+    /// padded tail lanes valid and fills them with the adjacent RDRAM bytes.
     #[test]
-    fn undefined_tail_bytes_are_staged_invalid_not_zero_filled_valid() {
+    fn padded_tail_bytes_are_staged_valid_with_adjacent_rdram_values() {
         let spec = spec_for_two_word_transfer();
         let fixture = fixture(spec);
         let transfer = fixture
@@ -1048,7 +1069,7 @@ mod tests {
             .bind_tmem_transfer(load(&fixture.decoded))
             .unwrap();
         assert_eq!(transfer.words().len(), 2);
-        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0x03);
+        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0xff);
         assert_eq!(transfer.words()[0].destination_word(), 511);
         assert_eq!(transfer.words()[1].destination_word(), 0);
 
@@ -1067,17 +1088,9 @@ mod tests {
             pending,
         );
 
-        for address in 0_u16..2 {
-            assert!(
-                state.byte_is_valid(address),
-                "byte {address} should be defined"
-            );
-        }
-        for address in 2_u16..8 {
-            assert!(
-                !state.byte_is_valid(address),
-                "byte {address} is undefined padding and must not be marked valid"
-            );
+        for address in 0_u16..8 {
+            assert!(state.byte_is_valid(address), "byte {address} should be valid");
+            assert_eq!(state.valid_byte(address), Some(8 + address as u8));
         }
     }
 

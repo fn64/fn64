@@ -694,29 +694,39 @@ fn transfer_record(
         let logical_offset = plan
             .logical_source_offset(index)
             .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
-        let mut preceding = 0_u32;
-        let mut source_binding = None;
-        for (source_ordinal, access) in sources.iter().enumerate() {
-            let bytes = access.region().declared_bytes();
-            let end = preceding
-                .checked_add(bytes)
-                .ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
-            if logical_offset < end {
-                let ordinal = u32::try_from(source_ordinal)
-                    .map_err(|_| TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
-                source_binding = Some((
-                    plan.source()
+        // **Bound ROW-LOCALLY, not by walking concatenated lengths.**
+        //
+        // The declared source reads are PADDED to whole 64-bit words (each
+        // row reads `words_per_row * 8` bytes, because hardware copies whole
+        // words), so consecutive accesses are no longer contiguous in logical
+        // texel space. Walking their lengths against a LOGICAL offset -- what
+        // this did -- binds later rows into the wrong access as soon as a row
+        // carries any padding.
+        //
+        // Each transfer word's row and position within it are already known
+        // from the plan's own geometry, so the binding is direct: access
+        // `first + row`, offset `within_row * 8`. A single-access plan
+        // (LoadBlock, LoadTLUT) has `row == 0` and reduces to the previous
+        // behaviour.
+        let words_per_row = u32::from(plan.words_per_row().max(1));
+        let row = u32::from(index) / words_per_row;
+        let within_row = u32::from(index) % words_per_row;
+        let source_ordinal = if sources.len() == 1 { 0 } else { row };
+        let source_access_index = plan
+            .source()
                         .first_access_index()
-                        .checked_add(ordinal)
-                        .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?,
-                    logical_offset - preceding,
-                ));
-                break;
-            }
-            preceding = end;
+            .checked_add(source_ordinal)
+            .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+        let source_access_byte_offset = if sources.len() == 1 {
+            logical_offset
+        } else {
+            within_row
+                .checked_mul(8)
+                .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?
+        };
+        if usize::try_from(source_ordinal).unwrap_or(usize::MAX) >= sources.len() {
+            return Err(TmemLoadSourcePlanError::AccessSliceOutOfBounds);
         }
-        let (source_access_index, source_access_byte_offset) =
-            source_binding.ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
         words.push(TmemTransferWord::new(
             index,
             logical_offset,
@@ -1747,7 +1757,9 @@ fn plan_fill(
     // "color image lies outside installed RDRAM" raised while sizing a
     // zero-pixel read. Preempting it here replaced a specific diagnosis
     // with a misleading one, which is how this arm was found.
-    let covers_target = state.color_target_height().is_some_and(|height| height == 0)
+    let covers_target = state
+        .color_target_height()
+        .is_some_and(|height| height == 0)
         || (rectangle.x0 == 0
             && rectangle.y0 == 0
             && rectangle.x1 + 1 == image.width()
@@ -1763,7 +1775,8 @@ fn plan_fill(
         // with none, and the seed must still be sized. The colour image's
         // own last covered row is the honest bound in that case.
         let height = state.color_target_height().unwrap_or(rectangle.y1 + 1);
-        let pixels = image
+        let pixels =
+            image
             .width()
             .checked_mul(height)
             .ok_or(RawDpcDecodeError::InvalidCommand {
@@ -1786,17 +1799,15 @@ fn plan_fill(
                 location,
                 reason: "color image byte range overflows",
             })?;
-        let range =
-            layout
+        let range = layout
                 .range(start, end)
                 .map_err(|_| RawDpcDecodeError::InvalidCommand {
                     location,
                     reason: "color image lies outside installed RDRAM",
                 })?;
-        let index = u32::try_from(planned.len()).map_err(|_| {
-            RawDpcDecodeError::ResourcePlanOverflow {
+        let index =
+            u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
                 workload: location.workload,
-            }
         })?;
         push_access(
             location.workload,
@@ -2584,8 +2595,7 @@ mod tests {
     /// fails this test.
     #[test]
     fn admitted_texture_bit_counts_route_to_their_own_buckets() {
-        let (textured_before, untextured_before) =
-            raw_triangle_drop_stats::textured_snapshot();
+        let (textured_before, untextured_before) = raw_triangle_drop_stats::textured_snapshot();
 
         raw_triangle_drop_stats::note_textured(true);
         raw_triangle_drop_stats::note_textured(true);
@@ -2782,9 +2792,14 @@ mod tests {
             );
         }
         let first_effect = accesses.len() as u32;
-        accesses.extend(effect_ranges.iter().enumerate().map(|(index, &(start, end))| {
+        accesses.extend(
+            effect_ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
             effect_access(layout, index as u32 + first_effect, start, end)
-        }));
+                }),
+        );
         let journal = ResourceJournal::try_new(
             ResourceJournalLimits::try_new(64, LAYOUT_BYTES).unwrap(),
             accesses,
@@ -3155,7 +3170,8 @@ mod tests {
                 &mut planned,
                 &mut commands,
                 &mut Vec::new(),
-            &mut Vec::new())
+                &mut Vec::new(),
+            )
             .unwrap_err();
             assert!(matches!(
                 error,
@@ -3195,7 +3211,8 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
-            &mut Vec::new())
+            &mut Vec::new(),
+        )
         .unwrap_err();
         let RawDpcDecodeError::UnknownCommandWidth { location } = error else {
             panic!("expected unknown command width");
@@ -3624,7 +3641,8 @@ mod tests {
             fill_color,
             fill_rectangle_command,
         crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
-            None)
+            None,
+        )
         .unwrap();
         // RGBA32, period 1: every pixel is the fill color's RGB + expanded
         // low-5-bit alpha-coverage byte. 0x59 & 0x1f = 0x19; expand_five(0x19)
@@ -4543,15 +4561,18 @@ mod tests {
         assert_eq!(load.source_plan().total_bytes(), 8);
     }
 
+    /// The final logical tail still records six padding bytes, while RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`) makes every copied lane
+    /// defined and keeps destination wrap order independent of the union.
     #[test]
-    fn transfer_words_preserve_wrap_order_and_undefined_tail_separately_from_union() {
+    fn transfer_words_preserve_wrap_order_and_padded_tail_separately_from_union() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 0, 2, 8, 0x200));
         words.extend(set_tile(0, 7, 0, 511));
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 4 << 12]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x210, 0x21a)])),
+            submit(packet_with_tmem_sources(7, words, &[(0x210, 0x220)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -4566,16 +4587,13 @@ mod tests {
         assert_eq!(transfer.words()[0].destination_word(), 511);
         assert_eq!(transfer.words()[1].destination_word(), 0);
         assert_eq!(transfer.words()[0].defined_source_byte_mask(), 0xff);
-        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0x03);
+        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0xff);
         // **Neither word exchanges: both are tile-relative row 0.** This
         // LoadBlock carries `DXT = 0`, so no word advances a row, and the
         // block's own TL does not enter the exchange. This used to assert
         // that ALL words exchanged, which was the writer's removed
         // `source_t` term; see `tmem/read.rs::odd_row_exchange`.
-        assert!(transfer
-            .words()
-            .iter()
-            .all(|word| !word.odd_row_exchange()));
+        assert!(transfer.words().iter().all(|word| !word.odd_row_exchange()));
         assert_eq!(
             transfer
                 .destination_accesses()
@@ -4590,6 +4608,8 @@ mod tests {
         assert_transfer_geometry_matches_destination_union(&decoded, load);
     }
 
+    /// DXT still selects each destination row while every source word is fully
+    /// defined by RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
     fn load_block_starting_tl_and_dxt_carry_select_each_word_row() {
         let mut words = Vec::new();
@@ -4598,7 +4618,7 @@ mod tests {
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 8 << 12 | 0x0400]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x220, 0x232)])),
+            submit(packet_with_tmem_sources(7, words, &[(0x220, 0x238)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -4623,7 +4643,7 @@ mod tests {
             // `tmem/read.rs::odd_row_exchange` for the angrylion citation.
             vec![(0, 10, false), (0, 11, false), (1, 14, true)]
         );
-        assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0x03);
+        assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0xff);
         assert_transfer_geometry_matches_destination_union(&decoded, load);
     }
 
@@ -4850,15 +4870,22 @@ mod tests {
         ));
     }
 
+    /// Tile rows bind independently and every transfer word is fully defined, as
+    /// RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`) requires; row parity
+    /// and logical offsets remain independently asserted.
     #[test]
-    fn load_tile_retains_row_local_defined_masks_and_source_row_parity() {
+    fn load_tile_retains_row_local_padded_words_and_source_row_parity() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 0, 2, 5, 0x200));
         words.extend(set_tile(0, 7, 3, 0));
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_TILE, 4), 7 << 24 | 16 << 12 | 8]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x20a, 0x21e)])),
+            submit(packet_with_tmem_sources(
+                7,
+                words,
+                &[(0x20a, 0x21a), (0x214, 0x224)],
+            )),
             &RdpState::default(),
         )
         .unwrap();
@@ -4884,9 +4911,9 @@ mod tests {
             // `low_t.integer()` term (1 for this fixture's S10.2 `low_t = 4`).
             vec![
                 (0, 0xff, 0, false),
-                (8, 0x03, 1, false),
+                (8, 0xff, 1, false),
                 (10, 0xff, 3, true),
-                (18, 0x03, 4, true)
+                (18, 0xff, 4, true)
             ]
         );
         assert_transfer_geometry_matches_destination_union(&decoded, load);
@@ -4940,7 +4967,7 @@ mod tests {
         unpaired_yuv.extend(load_sync(0));
         unpaired_yuv.extend([word(0, LOAD_BLOCK, 1 << 12), 7 << 24 | 2 << 12]);
         let yuv = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, unpaired_yuv, &[(0x202, 0x206)])),
+            submit(packet_with_tmem_sources(7, unpaired_yuv, &[(0x202, 0x20a)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -4969,7 +4996,7 @@ mod tests {
             submit(packet_with_tmem_sources(
                 7,
                 yuv_tile,
-                &[(0x202, 0x206), (0x20a, 0x20e)],
+                &[(0x202, 0x20a), (0x20a, 0x212)],
             )),
             &RdpState::default(),
         )
@@ -4982,7 +5009,7 @@ mod tests {
             .tmem_load_source_accesses(yuv_tile_load.source_plan())
             .unwrap();
         assert_eq!(yuv_tile_load.source_plan().access_count(), 2);
-        assert_eq!(yuv_tile_load.source_plan().total_bytes(), 8);
+        assert_eq!(yuv_tile_load.source_plan().total_bytes(), 16);
         assert_eq!(
             yuv_tile_sources
                 .iter()
@@ -4993,14 +5020,14 @@ mod tests {
                     resource: RdramResource::Buffer,
                     range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
                         .unwrap()
-                        .range(0x202, 0x206)
+                        .range(0x202, 0x20a)
                         .unwrap(),
                 },
                 ResourceRegion::Rdram {
                     resource: RdramResource::Buffer,
                     range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
                         .unwrap()
-                        .range(0x20a, 0x20e)
+                        .range(0x20a, 0x212)
                         .unwrap(),
                 },
             ]
@@ -5124,8 +5151,10 @@ mod tests {
         );
     }
 
+    /// Every tile row has one padded whole-word access, including full-width rows,
+    /// matching RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn load_tile_plans_exact_fractional_subrows_and_collapses_full_rows() {
+    fn load_tile_plans_one_padded_access_per_row_for_fractional_and_full_rows() {
         let mut subrows = Vec::new();
         subrows.extend(set_texture_image(0, 2, 1, 9, 0x200));
         subrows.extend(set_tile(0, 3, 1, 0));
@@ -5135,7 +5164,7 @@ mod tests {
             submit(packet_with_tmem_sources(
                 7,
                 subrows,
-                &[(0x213, 0x216), (0x21c, 0x21f)],
+                &[(0x213, 0x21b), (0x21c, 0x224)],
             )),
             &RdpState::default(),
         )
@@ -5144,7 +5173,7 @@ mod tests {
             panic!("expected LoadTile");
         };
         assert_eq!(load.source_plan().access_count(), 2);
-        assert_eq!(load.source_plan().total_bytes(), 6);
+        assert_eq!(load.source_plan().total_bytes(), 16);
         let TmemLoadKind::Tile { bounds } = load.kind() else {
             panic!("expected tile bounds");
         };
@@ -5159,15 +5188,19 @@ mod tests {
         full_rows.extend(load_sync(0));
         full_rows.extend([word(0, LOAD_TILE, 0), 2 << 24 | 12 << 12 | 4]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, full_rows, &[(0x300, 0x308)])),
+            submit(packet_with_tmem_sources(
+                7,
+                full_rows,
+                &[(0x300, 0x308), (0x304, 0x30c)],
+            )),
             &RdpState::default(),
         )
         .unwrap();
         let RawDpcCommandKind::LoadTile(load) = decoded.commands()[3].kind() else {
             panic!("expected LoadTile");
         };
-        assert_eq!(load.source_plan().access_count(), 1);
-        assert_eq!(load.source_plan().total_bytes(), 8);
+        assert_eq!(load.source_plan().access_count(), 2);
+        assert_eq!(load.source_plan().total_bytes(), 16);
     }
 
     #[test]
@@ -5696,7 +5729,9 @@ mod tests {
         assert_eq!(
             clip_fill_rows_to_scissor(
                 rect(0, 0, 3, 1),
-                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 16, 4)),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 16, 4
+                )),
             ),
             Some(rect(0, 0, 3, 0)),
             "the high row edge must clip y1 from 1 to 0"
@@ -5707,7 +5742,9 @@ mod tests {
         assert_eq!(
             clip_fill_rows_to_scissor(
                 rect(0, 0, 3, 1),
-                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 8, 16)),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 8, 16
+                )),
             ),
             Some(rect(0, 0, 1, 1)),
             "the high column edge must clip x1 from 3 to 1"
@@ -5716,7 +5753,9 @@ mod tests {
         assert_eq!(
             clip_fill_rows_to_scissor(
                 rect(0, 0, 3, 3),
-                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 4, 8, 16, 16)),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 4, 8, 16, 16
+                )),
             ),
             Some(rect(1, 2, 3, 3)),
             "ulx = 4 -> first column 1; uly = 8 -> first row 2"
@@ -5726,7 +5765,9 @@ mod tests {
         assert_eq!(
             clip_fill_rows_to_scissor(
                 rect(2, 0, 3, 1),
-                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 4, 16)),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 4, 16
+                )),
             ),
             None,
             "an empty intersection declares nothing"
@@ -6168,7 +6209,8 @@ mod tests {
             &mut planned,
             &mut commands,
             &mut Vec::new(),
-            &mut Vec::new())
+            &mut Vec::new(),
+        )
         .unwrap_err();
         assert!(matches!(error, RawDpcDecodeError::TruncatedCommand { .. }));
         // The type system already guarantees `decode_raw_dpc`/`decode_stream`

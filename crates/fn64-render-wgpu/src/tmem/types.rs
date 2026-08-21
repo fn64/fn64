@@ -811,15 +811,22 @@ impl TmemTransferPlan {
             return Ok(0x03);
         }
         let defined = match self.kind {
-            TmemLoadKind::Block { .. } => self
-                .logical_source_bytes
-                .saturating_sub(u32::from(word) * 8)
-                .min(8),
-            TmemLoadKind::Tile { .. } => {
-                let row_bytes = self.logical_source_bytes / u32::from(self.row_count);
-                let within = u32::from(word) % u32::from(self.words_per_row);
-                row_bytes.saturating_sub(within * 8).min(8)
-            }
+            // **Every Block/Tile word supplies all eight source bytes.**
+            //
+            // The DMA copies whole 64-bit words, so a row whose logical texels
+            // stop mid-word still reads that word's remaining bytes from the
+            // adjacent RDRAM -- the source plan declares the padded span, and
+            // the executors receive eight real bytes. Verified in the pinned
+            // RT64 oracle's live loader: `loadWord` is commented "Copy the
+            // entire word" and loops `i < 8` (`rt64_rdp.cpp:369-397`), driven
+            // `wordsPerRow` times per row (`:459-468`).
+            //
+            // **This was a partial count**, `logical_source_bytes` minus the
+            // word's offset, which made a short tail's lanes `None`. Those
+            // lanes then CLEARED destination validity (`physical.rs:656`, the
+            // only such site), so a later overlapping load punched holes in an
+            // already-loaded TLUT and a texrect sampling one aborted the run.
+            TmemLoadKind::Block { .. } | TmemLoadKind::Tile { .. } => 8,
             TmemLoadKind::Tlut { .. } => 0,
         };
         Ok(if defined == 8 {
