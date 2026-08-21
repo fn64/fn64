@@ -1402,6 +1402,10 @@ mod game {
                     // close the window cannot be repeated identically, and
                     // "any timing claim needs repeated runs" is the bar.
                     self.pump_census.report_once(self.active_renderer);
+                    // The DPC copy census reports from an `atexit` hook that
+                    // this bounded-run exit path does not reach, so it armed
+                    // and printed nothing. Ask it directly.
+                    fn64_abi::dpc_copy_census::report_now();
                     // Terminate from HERE rather than by unwinding to
                     // `run_app`'s return. The ordinary exit path was observed
                     // to print "exited cleanly" and then hang with the
