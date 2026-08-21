@@ -397,6 +397,14 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         }
     });
     for row in rows {
+        // **Incremental attribute run state.** Attribute planes are exactly
+        // linear in x while the selected subsample holds, so a run can be
+        // stepped by `plane.dx` instead of re-evaluating the full formula
+        // (an i128 multiply and divide per plane, up to seven planes per
+        // pixel). Reset per row: the first covered pixel of every row must
+        // restart from the exact formula.
+        let mut previous_sample: Option<(i32, i64)> = None;
+        let mut shade_values: Option<[i64; 4]> = None;
         for x in row.x0..row.x1 {
             // **One subsample scan, not two.**
             //
@@ -419,9 +427,31 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             // exactly `pixel_coverage(..) > 0`. Same predicate, same
             // traversal order, same first hit.
             let sample = triangle_span::attribute_sample(triangle, x as i32, row.y as i32);
-            if sample.is_none() {
+            let Some((delta_y_eighth, delta_x)) = sample else {
+                // A hole in a declared row breaks the run: the next covered
+                // pixel must restart from the exact formula.
+                previous_sample = None;
+                shade_values = None;
                 continue;
-            }
+            };
+            // Step only when the SAME subsample advanced exactly one pixel.
+            // Checking the returned deltas (not merely adjacent x) is what
+            // makes this exact: it restarts across an X- or Y-subsample
+            // change and across a zero-coverage hole alike.
+            let continues_run = previous_sample.is_some_and(|(prev_y, prev_x)| {
+                prev_y == delta_y_eighth
+                    && prev_x.checked_add(triangle_span::Q16_ONE) == Some(delta_x)
+            });
+            shade_values = match (shade, shade_values, continues_run) {
+                (Some(planes), Some(values), true) => Some(std::array::from_fn(|c| {
+                    triangle_span::attribute_plane_step(planes[c], values[c])
+                })),
+                (Some(planes), _, _) => Some(std::array::from_fn(|c| {
+                    triangle_span::attribute_plane(planes[c], delta_y_eighth, delta_x)
+                })),
+                (None, _, _) => None,
+            };
+            previous_sample = Some((delta_y_eighth, delta_x));
             // **The shade colour is interpolated per pixel, at the pixel's
             // own covered subsample -- not at its centre.** The RDP
             // evaluates a fragment's attributes at a subsample it actually
@@ -439,18 +469,15 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             // sampling the two at different points would put a pixel's colour
             // and its texel a quarter pixel apart.
             let inputs = match (shade, sample) {
-                (Some(planes), Some((delta_y_eighth, delta_x))) => {
+                (Some(_), Some(_)) => {
+                    let values = shade_values.expect("a shaded triangle carries run values");
                     let shade_color = std::array::from_fn(|component| {
                         // Q16.16 -> [0.0, 1.0]: the plane's integer part is
                         // the 0..=255 channel value, clamped the way the
                         // RDP's own colour combiner input stage clamps it.
-                        let value = triangle_span::attribute_plane(
-                            planes[component],
-                            delta_y_eighth,
-                            delta_x,
-                        )
-                        .div_euclid(triangle_span::Q16_ONE)
-                        .clamp(0, 255);
+                        let value = values[component]
+                            .div_euclid(triangle_span::Q16_ONE)
+                            .clamp(0, 255);
                         value as f32 / 255.0
                     });
                     crate::CombinerInputs {
