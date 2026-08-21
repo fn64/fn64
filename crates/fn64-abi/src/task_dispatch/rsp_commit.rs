@@ -1075,8 +1075,28 @@ fn try_dispatch_raw_dpc_via_session(
     // the nonmutating `preflight_dp_full_sync` BEFORE the backend is entered
     // or any guest byte is read -- which is precisely what that function's
     // own doc says it exists for.
-    let full_sync_sites = fn64_render::count_raw_rdp_full_sync_sites(&observation_words)
-        .unwrap_or_else(|error| panic!("try_dispatch_raw_dpc_via_session: {error}"));
+    // **This path receives CLOSED streams only.** A completed RSP task's
+    // submissions are coalesced by `coalesce_dp_submissions` before they get
+    // here, and a CPU raw-MMIO stream reaches this function only once the
+    // fabric has assembled a whole command run -- an incomplete tail is
+    // parked in the fabric and never dispatched. So `Incomplete` here means
+    // an assembler upstream broke its contract, and it stays a loud panic
+    // rather than silently stranding a completed transaction.
+    let full_sync_sites = match fn64_render::count_raw_rdp_full_sync_sites(&observation_words)
+        .unwrap_or_else(|error| panic!("try_dispatch_raw_dpc_via_session: {error}"))
+    {
+        fn64_render::RawRdpScan::Complete(sites) => sites,
+        fn64_render::RawRdpScan::Incomplete {
+            command_start,
+            bytes_required,
+            bytes_available,
+            ..
+        } => panic!(
+            "try_dispatch_raw_dpc_via_session: a dispatched stream ends inside the command at \
+             byte {command_start:#x} ({bytes_available} of {bytes_required} bytes present); \
+             incomplete tails must be parked by the fabric, never dispatched"
+        ),
+    };
     let capture = if full_sync_sites == 0 {
         fn64_render::OwnedRawDpcCapture::new(source.submission, memory_layout, token, cmd_end)
     } else {
@@ -1687,14 +1707,53 @@ pub(crate) fn complete_committed_dpc(
     }
 }
 
+
+/// A closed capture must not end inside a command.
+///
+/// The legacy/staged dispatch paths hold a stream that is already fully
+/// assembled -- there is no later END write to expose more bytes -- so an
+/// incomplete tail means an upstream assembler broke its contract. Only the
+/// raw CPU MMIO ingress may park a tail, and it does so in the fabric before
+/// ever reaching these paths.
+fn require_complete_raw_dpc_scan(
+    scanned: fn64_render::RawRdpScan<fn64_render::DpFullSyncStatus, u32>,
+    operation: &'static str,
+) -> fn64_render::DpFullSyncStatus {
+    match scanned {
+        fn64_render::RawRdpScan::Complete(status) => status,
+        fn64_render::RawRdpScan::Incomplete {
+            command_start,
+            bytes_required,
+            bytes_available,
+            ..
+        } => panic!(
+            "{operation}: closed capture ends inside the command at {command_start:#010x} \
+             ({bytes_available} of {bytes_required} bytes present); an extendable stream must \
+             be parked by the fabric, never dispatched"
+        ),
+    }
+}
+/// Returns the scan outcome so the CALLER applies its ingress policy.
+///
+/// A truncated tail is not an error: hardware stalls CURRENT at that
+/// command's start until a later END exposes the rest. Callers holding a
+/// CLOSED capture (a coalesced RSP stream, a batch replay) must treat
+/// `Incomplete` as a hard failure; only raw CPU MMIO ingress may park it.
+/// A malformed opcode still panics here, as it always did.
 pub(crate) fn preflight_raw_dpc_completion(
     image: &[u8],
     start: u32,
     end: u32,
     operation: &'static str,
-) -> fn64_render::DpFullSyncStatus {
-    let inspected = fn64_render::inspect_raw_rdp_full_sync(image, start, end)
+) -> fn64_render::RawRdpScan<fn64_render::DpFullSyncStatus, u32> {
+    let scanned = fn64_render::inspect_raw_rdp_full_sync(image, start, end)
         .unwrap_or_else(|error| panic!("{operation}: {error}"));
+    let inspected = match scanned {
+        fn64_render::RawRdpScan::Complete(status) => status,
+        // The prefix's completion result still stands, but no FullSync slot
+        // is reserved for a stream that has not finished arriving.
+        fn64_render::RawRdpScan::Incomplete { .. } => return scanned,
+    };
     if inspected == fn64_render::DpFullSyncStatus::Reached {
         // Interleaving closed here: a prior FullSync may remain pending while
         // the guest submits another DPC range. Device advancement and guest
@@ -1707,7 +1766,7 @@ pub(crate) fn preflight_raw_dpc_completion(
         })
         .unwrap_or_else(|error| panic!("{operation}: DP FullSync completion: {error}"));
     }
-    inspected
+    scanned
 }
 
 pub(crate) fn require_matching_raw_dpc_completion(
@@ -1864,7 +1923,11 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 });
                 let rendered = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
                 let full_sync =
-                    require_matching_raw_dpc_completion(inspected, rendered, "dispatch_raw_rdp");
+                    require_matching_raw_dpc_completion(
+                        require_complete_raw_dpc_scan(inspected, "dispatch_raw_rdp"),
+                        rendered,
+                        "dispatch_raw_rdp",
+                    );
                 transaction.validate_atomic_completion();
                 track_rdp_renderer_mutation(real, |real| real.copy_from_slice(&image));
                 (words, full_sync)
@@ -2067,7 +2130,11 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     });
     let rendered = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
     let full_sync =
-        require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
+        require_matching_raw_dpc_completion(
+            require_complete_raw_dpc_scan(inspected, "dispatch_captured_raw_rdp"),
+            rendered,
+            "dispatch_captured_raw_rdp",
+        );
     transaction.validate_atomic_completion();
     if xbus && xbus_diagnostics.diff_trace {
         let mut offset = 0usize;
