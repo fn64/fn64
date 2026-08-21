@@ -950,18 +950,33 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     // does not say that.** It defines AI_STATUS_FIFO_FULL as
                     // a STATUS BIT (`ultra64/rcp.h:576`) and states nothing
                     // about interrupt edges; the old rule was inferred from a
-                    // register definition that does not carry it. mupen64plus's
-                    // `ai_end_of_dma_event` calls `fifo_pop(ai)` and then
-                    // `raise_rcp_interrupt(ai->mi, MI_INTR_AI)` with no
-                    // condition at all (`ai_controller.c:224-238`), and
-                    // `fifo_pop` (`:123-139`) handles BOTH cases -- promoting
-                    // a queued buffer when FULL, or clearing BUSY when not.
-                    // The interrupt follows either way.
+                    // register definition that does not carry it. What rcp.h
+                    // DOES say about AI and interrupts is the opposite kind of
+                    // statement: `AI_STATUS_REG` is annotated "(W): clear
+                    // audio interrupt" (`ultra64/rcp.h:570`) -- a WRITE clears
+                    // the interrupt. Nothing there makes a FIFO-full
+                    // transition the thing that RAISES it.
                     //
-                    // The gated version silently dropped the completion for a
-                    // lone buffer, so a guest that enqueues exactly one AI DMA
-                    // and blocks on the completion queue never wakes. Found by
-                    // an independent audit against mupen64plus.
+                    // The positive argument comes from the libultra contract
+                    // itself, which is what this ABI must serve. `osAiSetNext-
+                    // Buffer` refuses a submission only when the FIFO is
+                    // already full, returning -1 (its decompiled form reads
+                    // `AI_STATUS_REG` and tests `AI_STATUS_FIFO_FULL`); a
+                    // guest is therefore free to keep exactly ONE buffer in
+                    // flight and submit the next one after the previous
+                    // completes. Under the old FIFO-full gate that guest never
+                    // receives a completion, so `osAiSetNextBuffer`-driven
+                    // audio could not work at all for a single-buffered
+                    // player. A completion the guest cannot observe is not a
+                    // completion.
+                    //
+                    // Concretely: the gated version dropped the completion for
+                    // a lone buffer, so a guest that enqueues one AI DMA and
+                    // blocks on the completion queue never wakes. It also made
+                    // the two completions of a two-buffer sequence asymmetric
+                    // -- the first raised because a buffer was queued behind
+                    // it, the last did not -- which no register documentation
+                    // distinguishes.
                     let _ = full_before_completion;
                     self.raise_interrupt(InterruptSource::Ai);
                     let notification = DeviceNotification::AiDmaComplete(current.request);
