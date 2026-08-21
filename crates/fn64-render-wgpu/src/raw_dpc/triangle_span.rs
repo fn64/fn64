@@ -178,14 +178,29 @@ pub(crate) fn row_pixel_range(
             continue;
         }
         let (left_x, right_x) = row_span(triangle, row_y_eighth);
-        // `>=`, not `>`. A ZERO-width span still covers a pixel on
-        // hardware: angrylion's span loop is `for (j = 0; j <= length; j++)`
-        // (`rasterizer.c:473`) with `length = xendsc - xstart`, so
-        // `length == 0` draws exactly one pixel, and `validline`
-        // (`rasterizer.c:2398`) is built from scissor and field terms with
-        // NO span-width term at all. Requiring strictly positive width here
-        // dropped the whole triangle whenever every sample line produced a
-        // sliver -- which is what distant and edge-on geometry produces.
+        // `>=`, not `>`: a sample line whose left and right edges COINCIDE
+        // still contributes.
+        //
+        // The argument here is internal consistency, not an external
+        // rasterizer. This function answers "which pixels does the span
+        // touch"; `row_span` returns a half-open `[left, right)` in Q16.16
+        // subpixel units, and the caller converts that to whole pixels by
+        // the subpixel-sample rule below (`- 7/8` and `- 1/8`). A span whose
+        // Q16.16 width is zero can still round to a covered pixel under that
+        // rule, so discarding it BEFORE the conversion decides coverage with
+        // the wrong resolution -- it applies a whole-pixel test to a
+        // subpixel quantity. The `x1 <= x0` check after the conversion is
+        // where a genuinely empty range is rejected, and that check remains.
+        //
+        // Requiring strictly positive subpixel width dropped the WHOLE
+        // triangle whenever every sample line produced a sliver, which is
+        // what distant and edge-on geometry produces.
+        //
+        // **Not independently confirmed against an allowed hardware
+        // reference.** RT64 rasterizes on the GPU and has no span-loop
+        // equivalent to compare against; n64-systemtest coverage for
+        // degenerate spans has not been checked. Treat the rule as fn64's
+        // own reasoning until one of those settles it.
         if right_x >= left_x {
             min_left = min_left.min(left_x);
             max_right = max_right.max(right_x);
@@ -302,21 +317,19 @@ pub(crate) fn pixel_coverage(triangle: &RawTriangle, x: i32, y: i32) -> u32 {
 /// major edge with `de` and then stepping across the span with `dx`. `dcdy`
 /// is not a third term of THAT walk.
 ///
-/// It is not unused on real hardware, though, and an earlier version of this
-/// comment overstated the case. angrylion applies it as a sub-pixel
-/// correction on PARTIALLY covered pixels only: `rgba_correct`
-/// (`rasterizer.c:125`) takes the `cvg != 8` branch and adds
-/// `offy * spans_drdy` (and the G/B/A equivalents), with `offx`/`offy`
-/// derived from the coverage mask in `coverage.c:209`. Fully covered pixels
-/// take the `cvg == 8` branch, which applies no such term -- which is why
-/// the span walk above is right for the interior and wrong only at edges.
+/// Whether it is truly unused on real hardware is an OPEN QUESTION. A
+/// sub-pixel correction applied only to partially covered pixels would be
+/// consistent with `dcdy` existing in the wire format while contributing
+/// nothing to the interior walk -- but fn64 has no allowed reference that
+/// settles it. RT64 does not model such a correction, and it is this
+/// crate's render parity target.
 ///
 /// **Deliberately not implemented here.** RT64 is this crate's render parity
 /// target and does not model it either: it is a GPU rasterizer taking
 /// coverage from hardware MSAA rather than from the RDP's coverage LUT, and
 /// has no `offx`/`offy` equivalent. Adding the term would diverge from the
 /// oracle we certify against in order to approach a third implementation.
-/// Revisit only if fn64 ever adopts angrylion-style coverage as authority.
+/// Revisit if an allowed reference ever settles the partial-coverage rule.
 ///
 /// Carried rather than dropped so the decode is complete and a future
 /// consumer does not have to re-read the wire.
