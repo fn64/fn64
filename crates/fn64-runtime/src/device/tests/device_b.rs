@@ -233,9 +233,11 @@ use super::*;
         // asserted no notification and no interrupt, which made the two
         // completions asymmetric: the first raised because a buffer was
         // queued behind it, the last did not. Hardware does not distinguish
-        // them -- mupen64plus raises MI_INTR_AI unconditionally after
-        // `fifo_pop` (`ai_controller.c:225-239`), and `fifo_pop`
-        // (`:123-139`) clears BUSY for the final buffer.
+        // them: rcp.h documents `AI_STATUS_FIFO_FULL` as a read status bit
+        // (`ultra64/rcp.h:576`) and says only that a WRITE to
+        // `AI_STATUS_REG` clears the audio interrupt (`:570`). Nothing makes
+        // a FIFO-full transition the raising edge, and the libultra
+        // single-buffer contract requires the final completion to signal.
         let second_done = fabric.advance_to(Cycles::new(386), &mut rdram).unwrap();
         assert_eq!(second_done, vec![DeviceNotification::AiDmaComplete(second)]);
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
@@ -343,8 +345,7 @@ use super::*;
         // The final buffer's completion raises AI as well -- see the note on
         // `ai_fifo_drains_on_guest_cycles_and_raises_one_shared_mi_source`.
         // The test name's "interrupts once" described fn64's FIFO-full gate,
-        // not hardware: mupen raises on EVERY completion
-        // (`ai_controller.c:225-239`).
+        // not any documented rule.
         assert_eq!(
             fabric.advance_to(second_deadline, &mut rdram).unwrap(),
             vec![DeviceNotification::AiDmaComplete(second)]
