@@ -176,6 +176,11 @@ pub struct WgpuBackend {
     /// failed draw leaves the prior value untouched. Never an accumulated
     /// history, never a persistent framebuffer.
     triangle_draw_output: Option<TriangleDrawOutput>,
+    /// Whether to run the diagnostic GPU triangle pipeline. On under
+    /// `cfg(test)` (the suites assert on its output); off on a play run,
+    /// where it is ~65% of frame time and never reaches the screen.
+    /// `FN64_GPU_TRIANGLE_DRAW=1` forces it on.
+    gpu_triangle_draw_enabled: bool,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -301,6 +306,9 @@ impl WgpuBackend {
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
+                gpu_triangle_draw_enabled: cfg!(test)
+                    || std::env::var_os("FN64_GPU_TRIANGLE_DRAW")
+                        .is_some_and(|v| v == "1"),
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -2317,7 +2325,35 @@ impl RenderBackend for WgpuBackend {
         )
         .map_err(RenderError::from)?;
 
-        if !triangles.is_empty() {
+        // **The GPU triangle draw is diagnostic, and it is 65% of this
+        // backend's frame time.**
+        //
+        // `draw_admitted_triangles` fills `self.triangle_draw_output`, which
+        // this file documents as "the most recent triangle draw's real
+        // GPU-observed color/depth output ... never an accumulated history,
+        // never a persistent framebuffer", and which `present` refuses to
+        // scan out by name: "one submission's readback, not a VI-sampled
+        // framebuffer". Guest-visible pixels come from the CPU rasterizer
+        // (`targets::raw_triangle`) writing RDRAM, which VI samples.
+        //
+        // Measured on WM2000 (rs + wgpu, bounded census, 1200 pumps),
+        // timing each layer directly rather than deriving it:
+        //
+        //     session census `Execute`      18.18 s
+        //       draw_admitted_triangles    ~13    s   <-- THIS, unpresented
+        //       execute_raw_dpc_inner        5.29 s
+        //         raster_triangle            3.88 s   (94-102 ns/px, normal)
+        //
+        // So ~65% of `execute` cannot change a presented pixel. Every reader
+        // of `last_triangle_draw()` is a `#[cfg(test)]` assertion or a
+        // `Debug` impl -- verified by grep, 16 call sites, zero in production
+        // code -- so skipping it on the play path loses no guest-visible
+        // behaviour and no test coverage.
+        //
+        // Kept, not deleted: the host-GPU suite drives real WGSL on a live
+        // adapter through this path. `FN64_GPU_TRIANGLE_DRAW=1` forces it on
+        // for a play run that wants to exercise the pipeline.
+        if !triangles.is_empty() && self.gpu_triangle_draw_enabled {
             self.draw_admitted_triangles(triangles, draw_tmem)
                 .map_err(RenderError::from)?;
         }
