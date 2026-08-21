@@ -576,6 +576,147 @@ use super::*;
     }
 
 
+    /// A 32-byte triangle arriving in two END writes must PARK, not panic.
+    ///
+    /// This is the defect the stall machinery exists for: the DPC accepts END
+    /// extensions in 8-byte increments, so hardware stalls CURRENT at the
+    /// command's start rather than decoding a truncated stream.
+    #[test]
+    fn raw_dpc_incomplete_command_parks_then_resumes_on_the_next_end() {
+        const A: u32 = 0x100;
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, A).unwrap();
+
+        let first = match fabric.write_mmio(DPC_END_REG, A + 8).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested {
+                submission,
+                retained_tail,
+            } => {
+                assert!(retained_tail.is_empty(), "a new stream carries no tail");
+                submission
+            }
+            other => panic!("first END did not request inspection: {other:?}"),
+        };
+
+        // The ABI scanned an 8-byte prefix of opcode 0x08 (a 32-byte base
+        // triangle) and parks it rather than dispatching.
+        fabric
+            .park_dpc_submission(first.token, A, A + 8, 32, vec![0x0800_0000, 0])
+            .unwrap();
+
+        // Parked, not in flight: CURRENT names the stalled command, the DP is
+        // still architecturally busy, and no transaction is pending.
+        assert_eq!(fabric.pending_dpc_submission(), None);
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), A);
+        assert!(fabric.snapshot().dp_busy, "a parked tail is DP-busy");
+        assert!(fabric.stalled_dpc().is_some());
+
+        // The extending END is ACCEPTED (not DpBusy) and carries the tail back.
+        let second = match fabric.write_mmio(DPC_END_REG, A + 32).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested {
+                submission,
+                retained_tail,
+            } => {
+                assert_eq!(
+                    retained_tail,
+                    vec![0x0800_0000, 0],
+                    "the continuation must receive the captured tail, not reread memory"
+                );
+                submission
+            }
+            other => panic!("extending END did not request dispatch: {other:?}"),
+        };
+        assert_eq!(
+            (second.start, second.end),
+            (A, A + 32),
+            "the resumed range starts at the stalled command, not at the new bytes"
+        );
+
+        fabric.commit_dpc_submission(second.token).unwrap();
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), A + 32);
+        assert!(fabric.stalled_dpc().is_none(), "commit consumes the tail");
+        assert!(!fabric.snapshot().dp_busy);
+    }
+
+    /// START opens a new stream, so a parked tail from the old one is dropped.
+    #[test]
+    fn accepted_start_discards_a_stalled_dpc_tail() {
+        const A: u32 = 0x180;
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, A).unwrap();
+        let partial = match fabric.write_mmio(DPC_END_REG, A + 8).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => submission,
+            other => panic!("partial command did not request inspection: {other:?}"),
+        };
+        fabric
+            .park_dpc_submission(partial.token, A, A + 8, 32, vec![0x0800_0000, 0])
+            .unwrap();
+        assert!(fabric.stalled_dpc().is_some());
+
+        fabric.write_mmio(DPC_START_REG, 0x300).unwrap();
+
+        assert!(
+            fabric.stalled_dpc().is_none(),
+            "a new START must not leave bytes that would splice onto the next stream"
+        );
+    }
+
+    /// A non-advancing END is a stream boundary, not a continuation.
+    ///
+    /// This is the XBUS ring-wrap shape: `rsp_commit.rs:105-115` records that
+    /// concatenating across a wrap was MEASURED wrong, so it must be refused
+    /// rather than silently bridged.
+    #[test]
+    fn a_regressing_end_does_not_continue_a_stalled_command() {
+        const A: u32 = 0x200;
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, A).unwrap();
+        let partial = match fabric.write_mmio(DPC_END_REG, A + 8).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => submission,
+            other => panic!("partial command did not request inspection: {other:?}"),
+        };
+        fabric
+            .park_dpc_submission(partial.token, A, A + 8, 32, vec![0x0800_0000, 0])
+            .unwrap();
+
+        assert!(
+            matches!(
+                fabric.write_mmio(DPC_END_REG, 0x20),
+                Err(DeviceFault::InvalidStalledDpcContinuation { .. })
+            ),
+            "an END that moves backwards must be refused, never concatenated"
+        );
+        assert!(
+            fabric.stalled_dpc().is_some(),
+            "a refused continuation leaves the tail intact"
+        );
+    }
+
+    /// Parking consumes the admitted token exactly once, like commit/cancel.
+    #[test]
+    fn parking_consumes_the_token_and_rejects_a_stale_one() {
+        const A: u32 = 0x280;
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, A).unwrap();
+        let partial = match fabric.write_mmio(DPC_END_REG, A + 8).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => submission,
+            other => panic!("partial command did not request inspection: {other:?}"),
+        };
+        fabric
+            .park_dpc_submission(partial.token, A, A + 8, 32, vec![0x0800_0000, 0])
+            .unwrap();
+
+        // The token is spent: a replay finds no pending transaction.
+        assert_eq!(
+            fabric.park_dpc_submission(partial.token, A, A + 8, 32, vec![0x0800_0000, 0]),
+            Err(DeviceFault::NoPendingDpcSubmission)
+        );
+        assert_eq!(
+            fabric.commit_dpc_submission(partial.token),
+            Err(DeviceFault::NoPendingDpcSubmission)
+        );
+    }
+
     #[test]
     fn raw_dpc_end_is_transactional_and_does_not_replay_after_commit() {
         let mut fabric = fabric();
