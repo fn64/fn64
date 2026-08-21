@@ -148,3 +148,85 @@ themselves clearly resolve into imagery.
 SAME swap from both runs. Comparing the new in-match frame against the
 older INTRO frame would have shown a difference that is entirely explained
 by the scene changing, and would have blamed the wrong change.
+
+---
+
+# Hunting the colour cast: six hypotheses eliminated (2026-08-21)
+
+The in-match green/magenta cast. Recorded so none of these is re-walked;
+each died to a measurement, not an argument.
+
+## The symptom, quantified
+
+Sampling one scanline (y=180) of a cast frame:
+
+| x | pixel | |
+|---|---|---|
+| 60 | `(107,165, 66)` | G>R — cast |
+| 80 | `( 58, 66, 16)` | G>R — cast |
+| **100** | **`( 82, 49, 25)`** | **R>G — CORRECT** |
+| 200 | `(  8, 25,  8)` | G>R — cast |
+
+Correct skin elsewhere: `(197,132,107)`, `(181,115,90)` — a clean R>G>B
+ramp, G/R about 0.64-0.67. Cast skin: `(82,107,41)`, `(58,82,33)` — G>R>B,
+with blue's ratio to the dominant channel about 0.5 in BOTH.
+
+**Correct and cast pixels coexist in one frame on one scanline.** That single
+fact kills every global-transform explanation.
+
+## Eliminated
+
+1. **Whole-frame colour averages as the instrument.** Frames 3000-5000 read
+   "green-dominant", suggesting a transition near 2400-2600. Frame 2600 is
+   the WrestleMania 2000 title logo, which is legitimately green on black.
+   The probe was measuring scene content. **Averages cannot see this defect.**
+2. **A global R<->G swap.** The numbers fit at first -- swapping R and G
+   turns cast skin into a plausible ramp with blue untouched -- but a global
+   swap would break every scene, and entrance scenes in the same run are
+   correct.
+3. **BGRA/RGBA confusion.** That is a B<->R swap, the wrong axis.
+4. **The combiner.** The census names one dominant program, 2.38M draws:
+   `0xfc15fea3 0xf00ff23f`, cycle 0 `(Texel0 - Zero) * ShadeAlpha + Zero`,
+   cycle 1 `(Env - Combined) * Prim + Combined`. Instrumenting the draw path
+   showed `env = [255,255,255,255]` and **`prim = [0,0,0,254]`** on every
+   sample: with Prim = 0 the cycle-1 lerp weight is ZERO, so cycle 1 is a
+   passthrough and Env never contributes. Cycle 0 reduces to
+   `Texel0 * ShadeAlpha`, and shade alpha is SCALAR -- it darkens, it cannot
+   shift hue. Two-cycle chaining is real (`two_cycle_first` =
+   `two_cycle_second` = 2,859,904), so `Combined` is a genuine cycle-0 result.
+5. **IA4 routed through a TLUT.** The affected draws sample
+   `fmt=IntensityAlpha size=Bits4 lut=Rgba16`, which looks wrong -- IA4 is
+   direct-colour. It is not: angrylion's
+   `tlutswitch = (size << 2) | ((format + 2) & 3)` (`tex.c:116`) puts IA4
+   (format 3, size 0) at case 1, the same nibble palette path as CI4
+   (`tmem.c:1691`). fn64 matches hardware.
+6. **The tile-0 hardcoding.** fn64 decodes each triangle's tile index
+   (`triangle.rs:183`) and then drops it -- `RdpTriangleCommand` has no tile
+   field -- so `TriangleDrawStateCollector` samples every draw through tile 0,
+   where RT64 preserves it (`rt64_rdp.cpp:1088-1097`). A real divergence, but
+   measured: **1,000,001 raw triangles, every one names tile 0.** Tiles 1-7
+   are never used, so tile 0 IS the correct tile here.
+
+Also checked and matching: the CI4/IA4 palette index. fn64's
+`(palette << 4) | texel4` (`texel.rs:365`) is angrylion's
+`p = (tpal << 4) | p` (`tmem.c:271`, `:953`) exactly. The `<< 2` elsewhere in
+angrylion is byte-addressing of the entry, not the index.
+
+## Two real defects found, neither of them this
+
+- **The triangle tile index is dropped at the IR boundary.** Latent for
+  WM2000, which only names tile 0, but wrong against RT64 and worth a fix
+  plus a guard.
+- **`TriangleDrawStateCollector` has drifted from `production.rs`'s
+  `PlanCollector`.** The live path is `PlanCollector`, which carries the
+  fixed 8-entry tile table; the duplicate still tracks tile 0 alone, despite
+  `production.rs:787` stating "if `TriangleDrawStateCollector` changes, this
+  file's own copy must be updated to match."
+
+## The live thread
+
+The affected draws are IA4 through an RGBA16 TLUT. Most decode to correct
+greys (`[0,0,0,0]`, `[255,255,255,255]`, `[247,247,247,255]`), but some come
+out coloured (`[8,82,189,255]`, `[181,231,0,255]`). IA4-via-TLUT can
+legitimately be coloured, so the open question is whether the PALETTE BYTES
+are right -- which connects to the padded-word TLUT work of 2026-08-20.
