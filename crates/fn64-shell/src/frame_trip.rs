@@ -46,13 +46,27 @@ pub enum Verdict {
         expected: u64,
         actual: u64,
     },
+    /// The baseline cannot support a meaningful comparison. Fails the run:
+    /// a gate that cannot compare must not report success.
+    Unusable(String),
+}
+
+/// Why this run is in the mode it is in. Distinguishing "absent" from
+/// "unreadable" is what stops a gate silently re-recording its own baseline.
+#[derive(Debug)]
+enum Baseline {
+    /// No file: collect hashes and write them.
+    Recording,
+    /// A file that parsed. May be empty -- which is an ERROR, not a pass.
+    Pinned(Vec<u64>),
+    /// A file that exists but could not be read.
+    Unreadable(String),
 }
 
 #[derive(Debug)]
 pub struct FrameTrip {
     path: std::path::PathBuf,
-    /// `None` in record mode, the pinned hashes in check mode.
-    baseline: Option<Vec<u64>>,
+    baseline: Baseline,
     observed: Vec<u64>,
     capacity: usize,
 }
@@ -68,7 +82,16 @@ impl FrameTrip {
     /// Split from `from_env` so tests can build one without touching the
     /// process environment (which is global and racy under a test harness).
     pub fn at(path: std::path::PathBuf, capacity: usize) -> Self {
-        let baseline = std::fs::read_to_string(&path).ok().map(|text| parse(&text));
+        // ONLY a genuine "not found" means record mode. Every other read
+        // error (permissions, a directory, non-UTF-8) is recorded as
+        // `Unreadable` rather than collapsed into record mode by `.ok()`:
+        // silently re-recording over a baseline you meant to CHECK against
+        // turns a gate green by destroying the thing it compares to.
+        let baseline = match std::fs::read_to_string(&path) {
+            Ok(text) => Baseline::Pinned(parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Baseline::Recording,
+            Err(e) => Baseline::Unreadable(e.to_string()),
+        };
         Self {
             path,
             baseline,
@@ -78,7 +101,7 @@ impl FrameTrip {
     }
 
     pub fn is_checking(&self) -> bool {
-        self.baseline.is_some()
+        matches!(self.baseline, Baseline::Pinned(_))
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -94,29 +117,45 @@ impl FrameTrip {
         let index = self.observed.len();
         self.observed.push(hash);
 
-        if let Some(baseline) = &self.baseline {
-            // A baseline shorter than capacity bounds the run: compare what
-            // was pinned, no more. Pinning 10 frames and checking 120 would
-            // otherwise report a spurious mismatch at frame 10.
-            if let Some(&expected) = baseline.get(index) {
-                if expected != hash {
-                    return Verdict::Mismatch {
-                        index,
-                        expected,
-                        actual: hash,
-                    };
+        match &self.baseline {
+            Baseline::Unreadable(why) => Verdict::Unusable(format!(
+                "baseline exists but could not be read: {why}"
+            )),
+            Baseline::Pinned(baseline) if baseline.is_empty() => Verdict::Unusable(
+                "baseline file contains no hashes -- a check against nothing \
+                 always passes, so it is refused"
+                    .to_string(),
+            ),
+            Baseline::Pinned(baseline) => {
+                // Compare BEFORE any completion test: a mismatch on the final
+                // pinned frame must report Mismatch, not Matched.
+                if let Some(&expected) = baseline.get(index) {
+                    if expected != hash {
+                        return Verdict::Mismatch {
+                            index,
+                            expected,
+                            actual: hash,
+                        };
+                    }
                 }
+                // A short baseline is compared in FULL and reported with its
+                // own length, so `PASS -- 4 frames` cannot be misread as
+                // covering the requested capacity.
+                if self.observed.len() >= baseline.len() {
+                    return Verdict::Matched(baseline.len());
+                }
+                Verdict::Pending
             }
-            if self.observed.len() >= baseline.len().min(self.capacity).max(1) {
-                return Verdict::Matched(self.observed.len());
+            Baseline::Recording => {
+                // `>=` not `==`, and capacity 0 is treated as 1: a run that
+                // can never satisfy its own completion test would spin
+                // forever collecting hashes nobody asked for.
+                if self.observed.len() >= self.capacity.max(1) {
+                    return Verdict::Recorded(self.observed.len());
+                }
+                Verdict::Pending
             }
-            return Verdict::Pending;
         }
-
-        if self.observed.len() >= self.capacity {
-            return Verdict::Recorded(self.observed.len())
-        }
-        Verdict::Pending
     }
 
     /// Serialize the collected hashes. One hex hash per line, `#` comments
@@ -165,7 +204,7 @@ mod tests {
     #[test]
     fn a_matching_run_reports_matched_not_mismatch() {
         let mut t = trip(8);
-        t.baseline = Some(vec![0xaa, 0xbb]);
+        t.baseline = Baseline::Pinned(vec![0xaa, 0xbb]);
         assert!(t.is_checking());
         assert_eq!(t.observe(0xaa), Verdict::Pending);
         assert_eq!(t.observe(0xbb), Verdict::Matched(2));
@@ -176,7 +215,7 @@ mod tests {
     #[test]
     fn the_first_differing_frame_is_the_one_reported() {
         let mut t = trip(8);
-        t.baseline = Some(vec![0xaa, 0xbb, 0xcc]);
+        t.baseline = Baseline::Pinned(vec![0xaa, 0xbb, 0xcc]);
         assert_eq!(t.observe(0xaa), Verdict::Pending);
         assert_eq!(
             t.observe(0xff),
@@ -194,7 +233,7 @@ mod tests {
     #[test]
     fn a_short_baseline_bounds_the_run_rather_than_failing() {
         let mut t = trip(100);
-        t.baseline = Some(vec![0xaa]);
+        t.baseline = Baseline::Pinned(vec![0xaa]);
         assert_eq!(t.observe(0xaa), Verdict::Matched(1));
     }
 
@@ -212,5 +251,77 @@ mod tests {
     #[test]
     fn parse_survives_blank_lines_and_junk() {
         assert_eq!(parse("# c\n\n  00ff \n\nnot-hex\n11\n"), vec![0xff, 0x11]);
+    }
+
+    // ---- fail-open regressions. Each of these once returned a PASS. ----
+    // Found by an independent Codex review, not by the tests above: the
+    // original six all used well-formed baselines, so every one of these
+    // paths was green while the gate was incapable of failing.
+
+    /// Measured on the real shell before the fix: a comment-only baseline
+    /// printed "PASS -- 1 frames match" and exited 0.
+    #[test]
+    fn an_empty_baseline_is_refused_rather_than_passing() {
+        let mut t = trip(8);
+        t.baseline = Baseline::Pinned(vec![]);
+        assert!(
+            matches!(t.observe(0xaa), Verdict::Unusable(_)),
+            "a check against zero hashes always passes, so it must be refused"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_baseline_does_not_silently_re_record() {
+        let mut t = trip(8);
+        t.baseline = Baseline::Unreadable("permission denied".into());
+        assert!(matches!(t.observe(0xaa), Verdict::Unusable(_)));
+        assert!(!t.is_checking());
+    }
+
+    /// A directory is readable-as-an-entry but not as a file: the classic
+    /// case that `.ok()` used to collapse into record mode.
+    #[test]
+    fn a_directory_baseline_is_unreadable_not_recording() {
+        let t = FrameTrip::at(std::path::PathBuf::from("/tmp"), 4);
+        assert!(matches!(t.baseline, Baseline::Unreadable(_)));
+    }
+
+    #[test]
+    fn a_genuinely_absent_file_still_records() {
+        let t = FrameTrip::at(
+            std::path::PathBuf::from("/nonexistent/definitely/not/here.pin"),
+            4,
+        );
+        assert!(matches!(t.baseline, Baseline::Recording));
+    }
+
+    /// Capacity 0 must not spin forever collecting hashes nobody asked for.
+    #[test]
+    fn zero_capacity_terminates_instead_of_running_forever() {
+        let mut t = trip(0);
+        assert_eq!(t.observe(0xaa), Verdict::Recorded(1));
+    }
+
+    /// A mismatch on the LAST pinned frame must report Mismatch, not Matched
+    /// -- the completion test must not pre-empt the comparison.
+    #[test]
+    fn a_mismatch_on_the_final_frame_is_not_reported_as_a_pass() {
+        let mut t = trip(8);
+        t.baseline = Baseline::Pinned(vec![0xaa, 0xbb]);
+        assert_eq!(t.observe(0xaa), Verdict::Pending);
+        assert!(
+            matches!(t.observe(0xff), Verdict::Mismatch { index: 1, .. }),
+            "the last frame is still compared"
+        );
+    }
+
+    /// A short baseline reports ITS OWN length, so "PASS -- 4 frames" cannot
+    /// be misread as covering the requested capacity.
+    #[test]
+    fn a_short_baseline_reports_its_own_length_not_capacity() {
+        let mut t = trip(100);
+        t.baseline = Baseline::Pinned(vec![0xaa, 0xbb]);
+        assert_eq!(t.observe(0xaa), Verdict::Pending);
+        assert_eq!(t.observe(0xbb), Verdict::Matched(2));
     }
 }
