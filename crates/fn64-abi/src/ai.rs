@@ -321,14 +321,26 @@ mod tests {
 
         let second_deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(second_deadline);
+        // The FINAL buffer's completion interrupts and delivers too.
+        //
+        // This previously asserted no interrupt and `WouldBlock`, citing a
+        // "documented FULL edge". rcp.h documents no such edge -- it defines
+        // `AI_STATUS_FIFO_FULL` as a status bit (`ultra64/rcp.h:576`) and says
+        // nothing about interrupts. mupen64plus raises MI_INTR_AI
+        // unconditionally after `fifo_pop` (`ai_controller.c:225-239`), and
+        // `fifo_pop` (`:123-139`) clears BUSY for the last buffer.
+        //
+        // The old expectation IS the bug in guest-visible form: a guest that
+        // enqueues one buffer and blocks on OS_EVENT_AI got `WouldBlock`
+        // forever.
         assert!(
-            !crate::pi::cpu_interrupt_pending(),
-            "final BUSY 1 -> 0 does not reproduce the documented FULL edge"
+            crate::pi::cpu_interrupt_pending(),
+            "the final AI buffer's completion must raise MI"
         );
         assert_eq!(crate::pi::live_ai_status(), fn64_runtime::AI_STATUS_ENABLED);
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
-            fn64_runtime::RecvMesgOutcome::WouldBlock
+            fn64_runtime::RecvMesgOutcome::Delivered(0xA1)
         );
     }
 
