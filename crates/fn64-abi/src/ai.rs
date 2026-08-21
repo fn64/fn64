@@ -326,9 +326,11 @@ mod tests {
         // This previously asserted no interrupt and `WouldBlock`, citing a
         // "documented FULL edge". rcp.h documents no such edge -- it defines
         // `AI_STATUS_FIFO_FULL` as a status bit (`ultra64/rcp.h:576`) and says
-        // nothing about interrupts. mupen64plus raises MI_INTR_AI
-        // unconditionally after `fifo_pop` (`ai_controller.c:225-239`), and
-        // `fifo_pop` (`:123-139`) clears BUSY for the last buffer.
+        // nothing about what RAISES the interrupt -- only that a WRITE to
+        // `AI_STATUS_REG` clears it (`ultra64/rcp.h:570`). The libultra
+        // contract supplies the positive rule: `osAiSetNextBuffer` refuses
+        // only on a full FIFO, so a single-buffered guest must still be woken
+        // by its one completion.
         //
         // The old expectation IS the bug in guest-visible form: a guest that
         // enqueues one buffer and blocks on OS_EVENT_AI got `WouldBlock`

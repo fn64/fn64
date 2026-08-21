@@ -414,12 +414,14 @@ use super::*;
             assert_eq!(fabric.ai_status() & AI_STATUS_BUSY, 0, "{tv_type:?}");
             assert_eq!(fabric.ai_length(), 0, "{tv_type:?}");
             // A completed AI DMA raises AI even with nothing queued behind
-            // it. mupen64plus `ai_end_of_dma_event` raises MI_INTR_AI
-            // unconditionally after `fifo_pop`
-            // (`ai_controller.c:225-239`), and `fifo_pop` (`:123-139`)
-            // handles the lone-buffer case by clearing BUSY. This assertion
-            // previously demanded NO interrupt here, freezing fn64's own
-            // FIFO-full gate rather than any hardware rule.
+            // it. `osAiSetNextBuffer` refuses a submission only when the
+            // FIFO is already full, so a guest may keep exactly ONE buffer in
+            // flight and submit the next after this one completes; under a
+            // FIFO-full-only gate that guest never receives a completion.
+            // This assertion previously demanded NO interrupt here, freezing
+            // fn64's own gate rather than any documented rule -- and rcp.h
+            // says only that a WRITE to `AI_STATUS_REG` CLEARS the audio
+            // interrupt (`ultra64/rcp.h:570`), never what raises it.
             assert!(
                 fabric.interrupt_pending(InterruptSource::Ai),
                 "{tv_type:?}: a completed AI DMA raises AI"
