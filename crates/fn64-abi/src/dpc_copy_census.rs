@@ -325,6 +325,32 @@ fn arm_report() {
         }
         unsafe { atexit(at_exit) };
     });
+    REPORT_NOW.call_once(|| {
+        REPORT_FN.store(at_exit as *mut (), Relaxed);
+    });
+}
+
+static REPORT_NOW: std::sync::Once = std::sync::Once::new();
+static REPORT_FN: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Print the census now, rather than waiting for `atexit`.
+///
+/// A bounded benchmark run terminates through `process::exit` or
+/// `event_loop.exit()` while the shell still owns the process, and the
+/// `atexit` hook this module registers did NOT produce a line in that path --
+/// the gate reported `FN64_DPC_COPY_CENSUS=ARMED` and then nothing was
+/// printed, which reads as "no copies happened" when it means "never
+/// reported". Same failure shape as the pump census's own exit path.
+///
+/// Safe to call more than once; the counters are cumulative, so a second call
+/// prints a superset of the first.
+pub fn report_now() {
+    let f = REPORT_FN.load(Relaxed);
+    if !f.is_null() {
+        let f: extern "C" fn() = unsafe { std::mem::transmute(f) };
+        f();
+    }
 }
 
 #[cfg(test)]
