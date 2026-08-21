@@ -662,7 +662,7 @@ mod tests {
             word(LOAD_BLOCK, 1 << 12),
             7 << 24 | 2 << 12,
         ];
-        (words, vec![(image_address + 2, image_address + 6)])
+        (words, vec![(image_address + 2, image_address + 10)])
     }
 
     fn tile_then_yuv_block_words(
@@ -811,7 +811,7 @@ mod tests {
             PixelSize::Bits32 => 3,
             _ => unreachable!("RGBA cell fixture is 16-bit or 32-bit"),
         };
-        let byte_count = if size == PixelSize::Bits16 { 8 } else { 16 };
+        let row_bytes = if size == PixelSize::Bits16 { 4 } else { 8 };
         (
             vec![
                 word(SET_TEXTURE_IMAGE, size_wire << 19 | 1),
@@ -823,7 +823,10 @@ mod tests {
                 word(LOAD_TILE, 0),
                 7 << 24 | 4 << 12 | 4,
             ],
-            vec![(image_address, image_address + byte_count)],
+            vec![
+                (image_address, image_address + 8),
+                (image_address + row_bytes, image_address + row_bytes + 8),
+            ],
         )
     }
 
@@ -833,7 +836,7 @@ mod tests {
         index_tmem: u16,
         tlut_address: u32,
     ) -> (Vec<u32>, Vec<(u32, u32)>) {
-        let index_bytes = index_width * 2;
+        let second_row = index_address + index_width;
         (
             vec![
                 word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | (index_width - 1)),
@@ -854,7 +857,8 @@ mod tests {
                 7 << 24 | 3 << 14,
             ],
             vec![
-                (index_address, index_address + index_bytes),
+                (index_address, index_address + 8),
+                (second_row, second_row + 8),
                 (tlut_address, tlut_address + 8),
             ],
         )
@@ -1337,7 +1341,9 @@ mod tests {
 
     #[test]
     fn committed_texture_cell_gathers_literal_rgba16_and_rgba32_corners() {
-        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let rgba16_source = [
+            0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff, 0xa1, 0xb2, 0xc3, 0xd4,
+        ];
         let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
         let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
         let before = observe_durable(&rgba16);
@@ -1401,7 +1407,9 @@ mod tests {
         // exact addressing (`cell_request` = raw S10.5 16, `reader_size(0, 0,
         // 4, 4)`, zero shift/mask) to produce `sf=16, tf=16`: the formula's
         // `<=` boundary, which the `<=` puts in the lower-left branch.
-        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let rgba16_source = [
+            0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff, 0xa1, 0xb2, 0xc3, 0xd4,
+        ];
         let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
         let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
         let cell = gather_committed_texture_cell(
@@ -1439,7 +1447,7 @@ mod tests {
 
     #[test]
     fn committed_texture_cell_resolves_each_ci_corner_through_its_tlut_entry() {
-        let ci4_indices = [0x12, 0x34];
+        let ci4_indices = [0x12, 0x34, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
         let rgba16_entries = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
         let (words, ranges) = ci_cell_tlut_words(0x200, 1, 8, 0x300);
         let ci4 = publish_sources(
@@ -1471,7 +1479,7 @@ mod tests {
             .all(|texel| texel.snapshot() == cell.texels()[0].snapshot()));
         assert_eq!(observe_durable(&ci4), before);
 
-        let ci8_indices = [0x01, 0x02, 0x03, 0x04];
+        let ci8_indices = [0x01, 0x02, 0x03, 0x04, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9];
         let ia16_entries = [0x10, 0x01, 0x20, 0x40, 0x80, 0xff, 0xff, 0x00];
         let (words, ranges) = ci_cell_tlut_words(0x400, 2, 16, 0x500);
         let ci8 = publish_sources(
@@ -1504,10 +1512,13 @@ mod tests {
         assert_eq!(observe_durable(&ci8), before);
     }
 
+    /// A two-byte logical image still yields a fully valid sampled cell because each
+    /// row copies its padded word of adjacent RDRAM bytes, matching RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn committed_texture_cell_reports_the_first_invalid_semantic_corner() {
+    fn committed_texture_cell_reads_padded_adjacent_bytes_for_every_corner() {
         let image_address = 0x200;
-        let source = [0x11, 0x22];
+        let source = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
         let words = vec![
             word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19),
             image_address,
@@ -1518,21 +1529,23 @@ mod tests {
             word(LOAD_TILE, 0),
             7 << 24 | 4,
         ];
-        let ranges = [(image_address, image_address + 2)];
+        let ranges = [
+            (image_address, image_address + 8),
+            (image_address + 1, image_address + 9),
+        ];
         let state = publish_sources(words, &ranges, &[(image_address, &source)]);
         let before = observe_durable(&state);
-        assert_eq!(
-            gather_committed_texture_cell(
+        let cell = gather_committed_texture_cell(
                 &state,
                 reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
                 reader_size(0, 0, 4, 4),
                 cell_request(TmemFirstRowParity::Even),
                 TextureLutMode::Disabled,
-            ),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::InvalidTexelByte { address: 0x001 },
-            })
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(cell),
+            [[0x11; 4], [0x22; 4], [0x22; 4], [0x33; 4]]
         );
         assert_eq!(observe_durable(&state), before);
     }
@@ -1731,8 +1744,9 @@ mod tests {
         assert_eq!(observe_durable(&unequal), unequal_before);
     }
 
-    /// Renamed from
-    /// `committed_texture_cell_locates_nonfirst_partial_and_unequal_tlut_errors`.
+    /// Renamed from the earlier partial-tail names. The hostile Tile source now
+    /// copies a full padded word per RT64 `rt64_rdp.cpp:369-397` (`Copy the
+    /// entire word`), while TLUT lookup itself remains lane-0 based.
     /// Both hostile TLUT words are now READ, from lane 0, so the cell
     /// resolves instead of locating a corner error. The fixture is
     /// unchanged: the second entry (0x808) is still the hostile one and
@@ -1740,8 +1754,8 @@ mod tests {
     /// silently fell back to entry 0 would still be caught by the
     /// upper-left/upper-right colors disagreeing.
     #[test]
-    fn committed_texture_cell_resolves_nonfirst_partial_and_unequal_tlut_words() {
-        let indices = [0x00, 0x01];
+    fn committed_texture_cell_resolves_nonfirst_padded_and_unequal_tlut_words() {
+        let indices = [0x00, 0x01, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7];
         let canonical = [0xf8, 0x01];
         let request = PointSampleRequest::new(
             PointSampleCoordinates::new(
@@ -1753,7 +1767,7 @@ mod tests {
         let tile = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
         let size = reader_size(0, 0, 4, 0);
 
-        let hostile_partial = [0xaa, 0xbb];
+        let hostile_padded = [0xaa, 0xbb, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7];
         let (words, ranges) = ci_cell_with_hostile_second_tlut_words(2);
         let partial = publish_sources(
             words,
@@ -1761,32 +1775,35 @@ mod tests {
             &[
                 (0x200, &indices),
                 (0x300, &canonical),
-                (0x400, &hostile_partial),
+                (0x400, &hostile_padded),
             ],
         );
         let before = observe_durable(&partial);
+        for (lane, expected) in hostile_padded.into_iter().enumerate() {
+            assert_eq!(partial.valid_byte(0x808 + lane as u16), Some(expected));
+        }
         // Entry 0 at 0x800 is the canonical `[0xf8, 0x01]`: RGBA16 0xf801
         // is r=0b11111 g=0 b=0 a=1, and 5-bit replication (v << 3 | v >> 2)
         // sends 0b11111 to 0xff, so opaque red.
         //
-        // Entry 1 at 0x808 is the hostile partial `[0xaa, 0xbb]`, only two
-        // bytes valid (mask 0x03). Lane 0 is 0xaabb == 1010101010111011:
+        // Entry 1 at 0x808 is the hostile padded word beginning `[0xaa, 0xbb]`;
+        // every byte is valid, and lane 0 is 0xaabb == 1010101010111011:
         // r=0b10101 (21), g=0b01010 (10), b=0b11101 (29), a=1. Replication
         // gives 21 -> 168|5 = 173, 10 -> 80|2 = 82, 29 -> 232|7 = 239.
         // Every number here is derived from the RGBA16 bit layout by hand.
         const RED: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
-        const HOSTILE_PARTIAL: [u8; 4] = [173, 82, 239, 255];
+        const HOSTILE_PADDED: [u8; 4] = [173, 82, 239, 255];
         assert_ne!(
-            RED, HOSTILE_PARTIAL,
+            RED, HOSTILE_PADDED,
             "the two entries must differ, or the cell cannot show that the \
              upper-right corner read its OWN entry"
         );
         let cell =
             gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16)
-                .expect("a partially valid TLUT word resolves from lane 0");
+                .expect("a padded TLUT word resolves from lane 0");
         assert_eq!(
             cell.texels().map(|texel| texel.texel().rgba8888()),
-            [RED, RED, HOSTILE_PARTIAL, HOSTILE_PARTIAL],
+            [RED, RED, HOSTILE_PADDED, HOSTILE_PADDED],
         );
         assert_eq!(observe_durable(&partial), before);
 
