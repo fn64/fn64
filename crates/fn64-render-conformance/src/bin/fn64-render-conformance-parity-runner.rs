@@ -218,6 +218,12 @@ const OTHER_MODES_FILL_NO_AA: (u32, u32) = (0xef30_00f0, 0);
 /// `filter_three_nearest_committed_cell`).
 const OTHER_MODES_ONE_CYCLE_TEXTURED: (u32, u32) = (0xef00_00f0, 0);
 
+/// The perspective-textured twin: only public `G_TP_PERSP` bit 19 differs.
+/// Point sampling, disabled dithering, and disabled coverage modes remain
+/// identical to [`OTHER_MODES_ONE_CYCLE_TEXTURED`].
+const OTHER_MODES_ONE_CYCLE_TEXTURED_PERSPECTIVE: (u32, u32) =
+    (OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 19), 0);
+
 /// `SetOtherModes` for a ONE-CYCLE fill: byte-identical to
 /// [`OTHER_MODES_FILL_NO_AA`] except the cycle-type field.
 ///
@@ -419,6 +425,20 @@ const WIDE_TEXELS: [u16; 16] = [
     0xf841, 0x0641, 0x0079, 0xffbf, 0x8461, 0xc671, 0x4251, 0xfc41,
 ];
 
+// Independent, hand-derived keys. Keep these separate from `WIDE_TEXELS` so
+// mutating an expected entry cannot also mutate the staged texture source.
+const LOAD_BLOCK_LINEAR_EXPECTED: [u16; 8] = [
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01,
+];
+const LOAD_BLOCK_DXT_EXPECTED: [u16; 16] = [
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01, 0xf841, 0x0641, 0x0079, 0xffbf,
+    0x8461, 0xc671, 0x4251, 0xfc41,
+];
+const TEXRECT_FLIP_EXPECTED: [u16; 16] = [
+    0xf801, 0x8421, 0xf841, 0x8461, 0x07c1, 0xc631, 0x0641, 0xc671, 0x003f, 0x4211, 0x0079, 0x4251,
+    0x7fff, 0xfc01, 0xffbf, 0xfc41,
+];
+
 /// A tall RGBA16 strip reproducing WM2000's measured texrect state without
 /// carrying any game content. The 64-texel source row occupies 16 TMEM
 /// words, while the base tile deliberately declares the measured
@@ -561,15 +581,22 @@ const fn set_tile(line_words: u32, tmem_word: u32) -> (u32, u32) {
     (0xf500_0000 | (2 << 19) | (line_words << 9) | tmem_word, 0)
 }
 
+/// Tile 0 with explicit S/T clamp and a two-bit S mask for a four-texel row.
+/// Public `gDPSetTile` places T mode at 19:18, S mode at 9:8 and S mask at
+/// 7:4. `G_TX_CLAMP = 2`; mask 2 preserves columns 0..3 after clamping.
+const fn set_tile_clamped_four_texels(line_words: u32, tmem_word: u32) -> (u32, u32) {
+    (
+        0xf500_0000 | (2 << 19) | (line_words << 9) | tmem_word,
+        (2 << 18) | (2 << 8) | (2 << 4),
+    )
+}
+
 /// `SetTileSize` for tile 0 covering the whole texture.
 ///
 /// All four coordinates are S10.2 and both high edges are INCLUSIVE, so a
 /// `w`-texel wide tile has `high_s = (w - 1) << 2`.
 const fn set_tile_size(width: u32, height: u32) -> (u32, u32) {
-    (
-        0xf200_0000,
-        (((width - 1) * 4) << 12) | ((height - 1) * 4),
-    )
+    (0xf200_0000, (((width - 1) * 4) << 12) | ((height - 1) * 4))
 }
 
 /// `LoadTile` for tile 0 covering the whole texture, in the same S10.2
@@ -619,13 +646,7 @@ const fn load_tile_at(width: u32, height: u32, low_t: u32) -> (u32, u32) {
 /// The same one-texel-per-pixel texrect with its S10.5 T origin aligned to a
 /// nonzero tile origin. Subtracting the tile's S10.2 `low_t` therefore starts
 /// the draw on tile-relative row zero.
-fn texture_rectangle_at_t(
-    ulx: u32,
-    uly: u32,
-    lrx: u32,
-    lry: u32,
-    low_t: u32,
-) -> Vec<(u32, u32)> {
+fn texture_rectangle_at_t(ulx: u32, uly: u32, lrx: u32, lry: u32, low_t: u32) -> Vec<(u32, u32)> {
     let mut words = texture_rectangle(ulx, uly, lrx, lry);
     words[1].0 = low_t << 5;
     words
@@ -689,8 +710,7 @@ const IA8_BYTES: [u8; 8] = [0x1f, 0x2f, 0x3f, 0x4f, 0x5f, 0x6f, 0x7f, 0x8f];
 const IA4_BYTES: [u8; 4] = [0x13, 0x57, 0x9b, 0xd0];
 /// Eight big-endian IA16 texels: one intensity byte then opaque alpha.
 const IA16_BYTES: [u8; 16] = [
-    0x08, 0xff, 0x28, 0xff, 0x48, 0xff, 0x68, 0xff, 0x88, 0xff, 0xa8, 0xff,
-    0xc8, 0xff, 0xe8, 0xff,
+    0x08, 0xff, 0x28, 0xff, 0x48, 0xff, 0x68, 0xff, 0x88, 0xff, 0xa8, 0xff, 0xc8, 0xff, 0xe8, 0xff,
 ];
 /// I4 is four-bit intensity replicated into RGB and alpha.
 const I4_BYTES: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
@@ -713,9 +733,7 @@ const IA8_EXPECTED: [u16; 8] = [
 /// IA4 uses three intensity bits plus one alpha bit. For `0xb`, `i3 = 5`
 /// expands to `0xb6`, `i5 = 0xb6 >> 3 = 22`, and opaque RGBA16 gray is
 /// `(22 << 11)|(22 << 6)|(22 << 1)|1 = 0xb5ad`.
-const IA4_EXPECTED: [u16; 7] = [
-    0x0001, 0x2109, 0x4a53, 0x6b5b, 0x94a5, 0xb5ad, 0xdef7,
-];
+const IA4_EXPECTED: [u16; 7] = [0x0001, 0x2109, 0x4a53, 0x6b5b, 0x94a5, 0xb5ad, 0xdef7];
 /// IA16 is already one intensity byte followed by one alpha byte. These
 /// intensities quantize to five bits 1,5,9,...,29 and alpha stays opaque.
 const IA16_EXPECTED: [u16; 8] = [
@@ -833,8 +851,8 @@ const CI_LOAD_TEXELS: u32 = CI_INDICES.len() as u32 / 4;
 /// palette. So this case really does read the palette through `en_tlut`
 /// rather than sampling the indices as colour.
 const PALETTE: [u16; 16] = [
-    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01, 0x0843,
-    0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843, 0x0843,
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01, 0x0843, 0x0843, 0x0843, 0x0843,
+    0x0843, 0x0843, 0x0843, 0x0843,
 ];
 
 /// The expected pixel for the CI4 case: pixel `x` reads index
@@ -867,7 +885,10 @@ fn one_ci4_rect() -> Vec<(u32, u32)> {
     words.pop();
     words.extend([
         // One-cycle textured, TLUT ENABLED.
-        (OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15), OTHER_MODES_ONE_CYCLE_TEXTURED.1),
+        (
+            OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15),
+            OTHER_MODES_ONE_CYCLE_TEXTURED.1,
+        ),
         SET_COMBINE_TEXEL0,
         set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
@@ -1096,21 +1117,10 @@ fn textured_triangle_pair() -> Vec<(u32, u32)> {
     // side, the upper-right half's is the right side.
     let left_s = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
     let right_s = left_s + PLANE_PER_TEXEL * (TRI_RIGHT - TRI_LEFT) as i32;
-    let mut words = textured_triangle_words(
-        TRI_LEFT,
-        TRI_RIGHT,
-        TRI_TOP,
-        TRI_BOTTOM,
-        TRI_BOTTOM,
-        left_s,
-    );
+    let mut words =
+        textured_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM, left_s);
     words.extend(textured_triangle_words(
-        TRI_RIGHT,
-        TRI_LEFT,
-        TRI_TOP,
-        TRI_BOTTOM,
-        TRI_TOP,
-        right_s,
+        TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP, right_s,
     ));
     words
 }
@@ -1119,6 +1129,72 @@ fn textured_triangle_pair() -> Vec<(u32, u32)> {
 /// triangle, sync. The texture staging is the 4x2 image the texrect cases
 /// use, so a disagreement here against those is a triangle-path difference
 /// and not a different texture.
+/// Two constant-plane perspective triangles covering the standard triangle
+/// box. The texture block is hand-authored as Q16.16 `[S,T,W] =
+/// [65536,0,-262144]`, with all derivatives zero.
+fn negative_w_textured_triangle_pair() -> Vec<(u32, u32)> {
+    let triangle = |x_h: u32, x_l: u32, y_m: u32| {
+        let yl = ((TRI_BOTTOM as i32) << 2) as u16 as u32;
+        let ym = ((y_m as i32) << 2) as u16 as u32;
+        let yh = ((TRI_TOP as i32) << 2) as u16 as u32;
+        let base = [
+            (0x0a00_0000 | (1 << 23) | yl, (ym << 16) | yh),
+            (x_l << 16, 0),
+            (x_h << 16, 0),
+            (x_l << 16, 0),
+        ];
+        let texture = coefficient_block(
+            [1 << 16, 0, -(4 << 16), 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        );
+        let mut words = base.to_vec();
+        for pair in texture.chunks_exact(2) {
+            words.push((pair[0], pair[1]));
+        }
+        words
+    };
+
+    let mut words = triangle(TRI_LEFT, TRI_RIGHT, TRI_BOTTOM);
+    words.extend(triangle(TRI_RIGHT, TRI_LEFT, TRI_TOP));
+    words
+}
+
+/// Signed division gives `(1 / -4) * 1024 = -256` texels. Point sampling
+/// floors that coordinate and the explicit four-texel S clamp selects column
+/// zero, whose independently staged RGBA16 wire word is red (`0xf801`). The
+/// full-target seed is `STALE` (`0xffff`), which this draw cannot produce.
+fn negative_w_triangle_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x >= TRI_LEFT && x < TRI_RIGHT && y >= TRI_TOP && y < TRI_BOTTOM {
+        0xf801
+    } else {
+        STALE
+    }
+}
+
+fn one_negative_w_textured_triangle() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED_PERSPECTIVE,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        set_tile_clamped_four_texels(TEXTURE_LINE_WORDS, 0),
+        set_tile_size(TEXTURE_WIDTH, 1),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, 1),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(negative_w_textured_triangle_pair());
+    words.push((0xe900_0000, 0));
+    words
+}
+
 fn one_textured_triangle() -> Vec<(u32, u32)> {
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
     words.pop();
@@ -1189,6 +1265,170 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     words
 }
 
+// ---------------------------------------------------------------------------
+// Measured-opcode gap cases
+// ---------------------------------------------------------------------------
+
+/// `LoadBlock` transfers `texel_count` consecutive RGBA16 texels beginning at
+/// `(uls, ult)`. Unlike [`load_tile`], its last twelve bits are DXT rather
+/// than a lower-right T coordinate.
+///
+/// Wire, from public libultra `gDPLoadBlock`: ULS/ULT occupy word 0's two
+/// twelve-bit coordinate fields, while word 1 holds tile, inclusive LRS and
+/// DXT. These cases start at `(0, 0)`, so only LRS and DXT are nonzero.
+const fn load_block(texel_count: u32, dxt: u32) -> (u32, u32) {
+    (0xf300_0000, ((texel_count - 1) << 12) | dxt)
+}
+
+/// A LoadBlock case over [`WIDE_TEXELS`]. `load_line_words` is the stride
+/// applied when DXT crosses 0x800; `render_line_words` redescribes the loaded
+/// bytes for sampling, because LoadBlock may leave holes between its logical
+/// rows.
+fn load_block_textured_rect(
+    texel_count: u32,
+    dxt: u32,
+    load_line_words: u32,
+    render_width: u32,
+    render_height: u32,
+    render_line_words: u32,
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(WIDE_WIDTH, WIDE_SOURCE),
+        // Public gDPLoadTextureBlock orders TileSync before the loading tile.
+        (0xe800_0000, 0),
+        set_tile(load_line_words, 0),
+        (0xe600_0000, 0),
+        load_block(texel_count, dxt),
+        // The render descriptor is not installed until the load is complete.
+        (0xe700_0000, 0),
+        set_tile(render_line_words, 0),
+        set_tile_size(render_width, render_height),
+    ]);
+    words.extend(texture_rectangle(0, 0, render_width, render_height));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// DXT zero never crosses the 0x800 row threshold. The first two 64-bit
+/// words therefore land at TMEM words 0 and 1, so the one-row render reads
+/// source texels 0 through 7 in order.
+fn load_block_linear_expected(index: u32) -> u16 {
+    expected_direct_row(index, &LOAD_BLOCK_LINEAR_EXPECTED)
+}
+
+/// DXT 0x400 advances after the second word. With a loading `line = 2`, the
+/// four source words land at TMEM words 0, 1, 4 and 5; redescribing the tile
+/// with render `line = 4` makes rows 0 and 1 read those exact pairs. The odd
+/// row's four-byte exchange is applied by both load and sample, so the visible
+/// texels remain [`WIDE_TEXELS`] in row-major order.
+fn load_block_dxt_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < WIDE_WIDTH && y < WIDE_HEIGHT {
+        LOAD_BLOCK_DXT_EXPECTED[(y * WIDE_WIDTH + x) as usize]
+    } else {
+        STALE
+    }
+}
+
+/// Opcode 0x25 uses the same destination rectangle as opcode 0x24 and swaps
+/// the coordinate axes: pixel `(x, y)` reads source `(s, t) = (y, x)`.
+/// [`WIDE_TEXELS`] is redescribed as a 4x4 image so the transpose is square,
+/// in-bounds, and every transposed position has a distinct value.
+fn texrect_flip_expected(index: u32) -> u16 {
+    const SIDE: u32 = 4;
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < SIDE && y < SIDE {
+        TEXRECT_FLIP_EXPECTED[(y * SIDE + x) as usize]
+    } else {
+        STALE
+    }
+}
+
+fn one_textured_rect_flip() -> Vec<(u32, u32)> {
+    const SIDE: u32 = 4;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(SIDE, WIDE_SOURCE),
+        set_tile(1, 0),
+        set_tile_size(SIDE, SIDE),
+        (0xe600_0000, 0),
+        load_tile(SIDE, SIDE),
+        (0xe700_0000, 0),
+    ]);
+    let mut rectangle = texture_rectangle(0, 0, SIDE, SIDE);
+    rectangle[0].0 = (rectangle[0].0 & 0x00ff_ffff) | 0xe500_0000;
+    words.extend(rectangle);
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// Public libultra `G_CC_PRIMITIVE` in both cycles. Its token `0` maps to the
+/// dedicated zero mux encodings (RGB 31, narrowed to 15 in A/B; alpha 7),
+/// while primitive is D=3. Applying `GCCc0w0`/`GCCc1w0` gives `0x00ff_ffff`;
+/// applying `GCCc0w1`/`GCCc1w1` gives `0xfffd_f6fb`.
+const SET_COMBINE_PRIMITIVE: (u32, u32) = (0xfcff_ffff, 0xfffd_f6fb);
+// RGBA16 bit 0 stores coverage[2], not primitive alpha. Full coverage stores
+// 8 - 1 = 7 under CVG_DST_CLAMP, whose visible MSB is one; RGB5=(4,24,28)
+// therefore packs as 0x2639 (Programming Manual §§15.5.3, 15.5.6, 15.7).
+const FLAT_TRIANGLE_COLOR: u16 = 0x2639;
+
+fn flat_triangle_words(x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32) -> Vec<(u32, u32)> {
+    let yl = ((y_l as i32) << 2) as u16 as u32;
+    let ym = ((y_m as i32) << 2) as u16 as u32;
+    let yh = ((y_h as i32) << 2) as u16 as u32;
+    vec![
+        (0x0800_0000 | (1 << 23) | yl, (ym << 16) | yh),
+        (x_l << 16, 0),
+        (x_h << 16, 0),
+        (x_l << 16, 0),
+    ]
+}
+
+fn one_flat_triangle_pair() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_NO_AA,
+        SET_COMBINE_PRIMITIVE,
+        // Primitive RGBA8888 = (0x20, 0xc0, 0xe0, 0xff). With dither off,
+        // the target keeps RGB5=(4,24,28), A1=1: 0x2000+0x0600+0x0038+1.
+        (0xfa00_0000, 0x20c0_e0ff),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(flat_triangle_words(
+        TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM,
+    ));
+    words.extend(flat_triangle_words(
+        TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+fn flat_triangle_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x >= TRI_LEFT && x < TRI_RIGHT && y >= TRI_TOP && y < TRI_BOTTOM {
+        FLAT_TRIANGLE_COLOR
+    } else {
+        STALE
+    }
+}
+
 fn skew_textured_rect(line_words: u32, low_t: u32) -> Vec<(u32, u32)> {
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
     words.pop();
@@ -1204,13 +1444,7 @@ fn skew_textured_rect(line_words: u32, low_t: u32) -> Vec<(u32, u32)> {
         load_tile_at(SKEW_WIDTH, SKEW_HEIGHT, low_t),
         (0xe600_0000, 0),
     ]);
-    words.extend(texture_rectangle_at_t(
-        0,
-        0,
-        SKEW_WIDTH,
-        SKEW_HEIGHT,
-        low_t,
-    ));
+    words.extend(texture_rectangle_at_t(0, 0, SKEW_WIDTH, SKEW_HEIGHT, low_t));
     words.push((0xe900_0000, 0));
     words
 }
@@ -1524,6 +1758,62 @@ fn cases() -> Vec<Case> {
             authority: Authority::Rt64Authoritative,
             commands: one_direct_texture_rect(I8_SOURCE, 8, 4, 4, 1, 1),
             expected: i8_expected,
+        },
+        Case {
+            name: "textured-rect-loadblock-linear",
+            intent: "the corpus's first LoadBlock. DXT=0 loads two consecutive \
+                     64-bit words into TMEM words 0 and 1, then an 8x1 \
+                     point-sampled rectangle reads all eight distinct RGBA16 \
+                     texels. This isolates opcode 0x33's linear placement \
+                     from LoadTile's per-row addressing.",
+            authority: Authority::Rt64Authoritative,
+            commands: load_block_textured_rect(8, 0, 2, 8, 1, 2),
+            expected: load_block_linear_expected,
+        },
+        Case {
+            name: "textured-rect-loadblock-dxt-row-advance",
+            intent: "LoadBlock with DXT=0x400 crosses the 0x800 accumulator \
+                     after word 1. Loading line=2 therefore maps four source \
+                     words to TMEM 0,1,4,5; render line=4 reads them as two \
+                     rows and exposes both the DXT stride and odd-row \
+                     four-byte exchange.",
+            authority: Authority::Rt64Authoritative,
+            commands: load_block_textured_rect(16, 0x400, 2, 8, 2, 4),
+            expected: load_block_dxt_expected,
+        },
+        Case {
+            name: "textured-rect-flip-point-sampled",
+            intent: "opcode 0x25 keeps a 4x4 rectangle's destination fixed \
+                     while transposing its S/T sample axes. Every source \
+                     texel is distinct, so treating TEXRECTFLIP as ordinary \
+                     TEXRECT produces a different hand-derived 4x4 key.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_textured_rect_flip(),
+            expected: texrect_flip_expected,
+        },
+        Case {
+            name: "flat-triangle-primitive",
+            intent: "the first opcode 0x08 triangle, with no shade, texture \
+                     or depth coefficients. Two explicit edge pairs tile the \
+                     same 4x3 box as the textured control, while a public \
+                     G_CC_PRIMITIVE combiner makes every covered pixel one \
+                     hand-derived RGBA16 value. This isolates base edge-walk \
+                     and coverage from the texture pipeline.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_flat_triangle_pair(),
+            expected: flat_triangle_expected,
+        },
+        Case {
+            name: "perspective-textured-triangle-negative-w",
+            intent: "a perspective raw triangle with constant Q16.16 planes \
+                     [S,T,W] = [65536,0,-262144]. Signed RT64 division gives \
+                     S=-256 texels, which point sampling floors and the \
+                     explicit four-texel clamp maps to the FIRST texel. The \
+                     old |W| divide gives +256 and maps to the LAST texel, so \
+                     this row kills the confirmed sign-loss defect.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_negative_w_textured_triangle(),
+            expected: negative_w_triangle_expected,
         },
         Case {
             name: "textured-triangle-point-sampled",
@@ -2031,9 +2321,9 @@ mod captured {
                 ));
             }
             let parse_hex = |field: &str, name: &str| -> Result<u64, String> {
-                let stripped = field
-                    .strip_prefix("0x")
-                    .ok_or_else(|| format!("line {} {name} is {field:?}, want 0x hex", index + 1))?;
+                let stripped = field.strip_prefix("0x").ok_or_else(|| {
+                    format!("line {} {name} is {field:?}, want 0x hex", index + 1)
+                })?;
                 u64::from_str_radix(stripped, 16)
                     .map_err(|e| format!("line {} {name} is {field:?}: {e}", index + 1))
             };
@@ -2608,7 +2898,8 @@ mod tests {
             // positions (`rdp.c:623-660`).
             assert!(
                 *other_modes == OTHER_MODES_FILL_NO_AA
-                    || *other_modes == OTHER_MODES_ONE_CYCLE_TEXTURED,
+                    || *other_modes == OTHER_MODES_ONE_CYCLE_TEXTURED
+                    || *other_modes == OTHER_MODES_ONE_CYCLE_TEXTURED_PERSPECTIVE,
                 "RT64-authoritative case {} uses an unvetted other-modes word \
                  {other_modes:#010x?}; add it here with its own hand-derived \
                  field table before using it",
@@ -2735,12 +3026,13 @@ mod tests {
         let view = fn64_runtime::RdramView::from_storage(&rdram);
         assert_eq!(view.read_u16(RdramAddr::from_offset(FRAMEBUFFER)), STALE);
         assert_eq!(
-            view.read_u16(RdramAddr::from_offset(
-                FRAMEBUFFER + FRAMEBUFFER_BYTES - 2
-            )),
+            view.read_u16(RdramAddr::from_offset(FRAMEBUFFER + FRAMEBUFFER_BYTES - 2)),
             STALE
         );
-        assert_eq!(view.read_u16(RdramAddr::from_offset(FRAMEBUFFER - 2)), GUARD);
+        assert_eq!(
+            view.read_u16(RdramAddr::from_offset(FRAMEBUFFER - 2)),
+            GUARD
+        );
         assert_eq!(
             view.read_u16(RdramAddr::from_offset(FRAMEBUFFER + FRAMEBUFFER_BYTES)),
             GUARD
@@ -2853,7 +3145,7 @@ mod tests {
         // exactly that one 64-bit command.
         let line_changes = changed(&base, &line_16);
         assert_eq!(line_changes.len(), 1);
-        assert_eq!(line_changes[0].1.0 >> 24, 0xf5);
+        assert_eq!(line_changes[0].1 .0 >> 24, 0xf5);
     }
 
     #[test]
@@ -2950,7 +3242,10 @@ mod tests {
         assert_eq!(captured::target_extent(&walked), Some((480, 237)));
         assert_eq!(captured::color_image_addr(&walked), Some(0x0038_f800));
         // A stream with no color image cannot have an extent invented for it.
-        assert_eq!(captured::target_extent(&captured::walk(&[0xe900_0000, 0])), None);
+        assert_eq!(
+            captured::target_extent(&captured::walk(&[0xe900_0000, 0])),
+            None
+        );
     }
 
     /// With the variable unset the report must say the captured corpus is
@@ -2963,7 +3258,10 @@ mod tests {
         }
         let row = captured_row();
         assert_eq!(row["available"], serde_json::json!(false));
-        assert!(row["reason"].as_str().unwrap().contains(captured::PACKET_ENV));
+        assert!(row["reason"]
+            .as_str()
+            .unwrap()
+            .contains(captured::PACKET_ENV));
     }
 
     /// The key must be materialised through the same `^3` guest byte-lane

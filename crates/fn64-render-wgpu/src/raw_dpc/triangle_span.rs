@@ -581,37 +581,34 @@ fn coefficient_components(
 ///    SAMPLER's, not this function's, so the total is `2^21`. See
 ///    [`PLANE_TO_TEXEL`] for the measurement that corrected this.
 ///
-/// # `w <= 0` must not fault
+/// # Perspective division preserves W's sign
 ///
-/// Also earned from real content rather than reasoned. A perspective
-/// triangle crossing the near plane legitimately presents non-positive W at
-/// edge pixels of the interpolated plane. Real RDP hardware's tcdiv derives
-/// 1/w from the operand's top bits with NO sign trap: the pixel samples
-/// garbage texels and the chip keeps rasterizing. So the divide is by
-/// `w.unsigned_abs().max(1)` -- the magnitude, floored at one ULP so it
-/// stays finite. The reference records that a loud assert here was correct
-/// until real WM2000 content (gfx task ~#27, a pixel-level near-plane
-/// crossing) hit it, and that the hardware-faithful behaviour is "keep
-/// rasterizing", not "abort the machine".
+/// Pinned RT64 reconstructs each W plane value as a signed Q16.16 float and
+/// divides the corresponding S/T vertex values by that signed `w1`/`w2`/`w3`
+/// (`src/gbi/rt64_gbi_rdp.cpp:512,523-525`). It never takes W's magnitude.
+/// A negative W therefore flips both texture-coordinate signs; replacing it
+/// with `abs(W)` selects the opposite clamped edge of a tile. A zero W still
+/// does not fault in this float path: IEEE division produces an infinity or
+/// NaN which the narrowing policy below handles deterministically.
 ///
-/// # The result is SATURATED into S10.5's own `i16`, never wrapped
+/// # The result is currently saturated into S10.5's `i16`
 ///
 /// `TextureCoordinateS10_5` is an `i16` -- ten integer bits and five
 /// fractional ones -- which is the format the texrect path's
 /// `TexrectDraw::s_at` also produces, so both primitives reach
 /// [`crate::sample_point`] through one coordinate type.
 ///
-/// A perspective divide by a near-zero W legitimately produces a coordinate
-/// far outside that range, and `w <= 0` above guarantees the divide never
-/// faults, so this conversion MUST have a defined answer for one. Saturating
-/// clamps it to the extreme the tile's own address mode then folds; wrapping
-/// (`as i16`) would send a coordinate that ran off the right edge back to
-/// the LEFT one, which is a visible tear rather than a stretched edge.
+/// A perspective divide by a near-zero W can produce a coordinate far outside
+/// that range. Saturating gives the existing integer sampler a deterministic
+/// input instead of wrapping across the tile, but it is not full RT64 parity:
+/// RT64 retains floating texture coordinates, so exactly `S/W = 1` remains
+/// 1024.0 texels while this representation clamps raw 32768 to 32767. Fixing
+/// that boundary requires widening or separating the triangle-coordinate
+/// representation from the shared texrect S10.5 input.
 pub(crate) fn texture_coordinates_s10_5(stw: [i64; 3], perspective: bool) -> (i16, i16) {
     let (s, t) = if perspective {
-        // The magnitude, never the signed value: see this function's own doc
-        // on why a non-positive W is defined garbage rather than a fault.
-        let denominator = stw[2].unsigned_abs().max(1) as f32;
+        // RT64 divides by signed w1/w2/w3; negative W must flip S and T.
+        let denominator = stw[2] as f32;
         (
             stw[0] as f32 / denominator * PERSPECTIVE_TEXEL_SCALE,
             stw[1] as f32 / denominator * PERSPECTIVE_TEXEL_SCALE,
@@ -624,23 +621,15 @@ pub(crate) fn texture_coordinates_s10_5(stw: [i64; 3], perspective: bool) -> (i1
     };
     // `as i16` on a float is NOT available; and `f32 as i32` saturates while
     // a subsequent `as i16` would WRAP. So the clamp is explicit, in float,
-    // before any narrowing -- and NaN (which `0/0` cannot produce here, since
-    // the denominator is floored at 1, but which a future caller could) maps
-    // to zero through `clamp`'s own total order rather than to an arbitrary
-    // bit pattern.
+    // before any narrowing. Zero W can produce NaN for a zero numerator, so
+    // map it to zero rather than letting a cast choose the result implicitly.
     (saturate_s10_5(s), saturate_s10_5(t))
 }
 
 /// One float S10.5 coordinate clamped into `i16` before narrowing.
 ///
-/// **The NaN arm is unreachable from this crate and correspondingly
-/// untested**, recorded rather than removed. `texture_coordinates_s10_5`
-/// floors its denominator at 1, so neither `0/0` nor `inf/inf` can arise
-/// there, and mutating `return 0` to `return 1` leaves the whole suite
-/// green -- verified, not assumed. It is kept because `clamp` on a NaN
-/// would otherwise propagate an arbitrary bit pattern through `as i16`,
-/// and a future caller without the flooring guarantee would get that
-/// silently. If a caller ever can supply NaN, this arm needs a fixture.
+/// Zero W with a zero numerator reaches the NaN arm; it maps to zero rather
+/// than relying on a float-to-integer cast's implicit NaN policy.
 fn saturate_s10_5(value: f32) -> i16 {
     if value.is_nan() {
         return 0;

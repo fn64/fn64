@@ -739,18 +739,29 @@ mod tests {
     }
 
     #[test]
-    fn raw_busy_bitrate_write_traps_without_mutating_device_evidence() {
+    fn os_ai_set_frequency_applies_while_ai_fifo_is_busy() {
         configure_ntsc();
+        let mut initial = ctx_with(32_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut initial) };
         let mut submit = ctx_with(0xFFFF_FFFF_8000_2000, 0x80, 0);
         unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut submit) };
         assert_eq!(submit.r2, 0);
         let before = crate::device_evidence_snapshot();
+        assert_ne!(before.guest.ai_status & fn64_runtime::AI_STATUS_BUSY, 0);
 
-        let fault = std::panic::catch_unwind(|| {
-            crate::pi::write_raw_mmio_word(0xA450_0014, 7);
-        });
-        assert!(fault.is_err());
-        assert_eq!(crate::device_evidence_snapshot(), before);
+        let mut changed = ctx_with(96_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut changed) };
+        let after = crate::device_evidence_snapshot();
+
+        assert_eq!(changed.r2, 96_019);
+        assert_eq!(after.guest.ai_dacrate, 506);
+        assert_eq!(after.guest.ai_bitrate, 6);
+        assert_ne!(after.guest.ai_status & fn64_runtime::AI_STATUS_BUSY, 0);
+        assert_eq!(after.guest.ai_length, before.guest.ai_length);
+        assert!(
+            after.current_ai.unwrap().deadline < before.current_ai.unwrap().deadline,
+            "the higher live DAC rate must retime the occupied FIFO slot"
+        );
     }
 
     #[test]
