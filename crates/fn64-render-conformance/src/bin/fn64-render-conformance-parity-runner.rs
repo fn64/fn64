@@ -218,6 +218,11 @@ const OTHER_MODES_FILL_NO_AA: (u32, u32) = (0xef30_00f0, 0);
 /// `filter_three_nearest_committed_cell`).
 const OTHER_MODES_ONE_CYCLE_TEXTURED: (u32, u32) = (0xef00_00f0, 0);
 
+/// The two-cycle textured twin: only public `G_CYC_2CYCLE` bit 20 differs.
+/// Point sampling, disabled dithering, and disabled coverage modes remain
+/// identical to [`OTHER_MODES_ONE_CYCLE_TEXTURED`].
+const OTHER_MODES_TWO_CYCLE_TEXTURED: (u32, u32) = (0xef10_00f0, 0);
+
 /// The perspective-textured twin: only public `G_TP_PERSP` bit 19 differs.
 /// Point sampling, disabled dithering, and disabled coverage modes remain
 /// identical to [`OTHER_MODES_ONE_CYCLE_TEXTURED`].
@@ -244,6 +249,16 @@ const OTHER_MODES_ONE_CYCLE_NO_AA: (u32, u32) = (0xef00_00f0, 0);
 /// overflow classification true.
 const OTHER_MODES_ONE_CYCLE_BLEND_OVERFLOW: (u32, u32) =
     (0xef00_00f0, (2 << 18) | (1 << 14));
+
+/// One-cycle forced blending that selects BlendColor for P, input alpha for
+/// A, combiner output for M, and zero for B. With opaque combiner alpha and
+/// B=zero the M term vanishes, so the blender outputs BlendColor directly.
+/// M=clr_in (0) avoids clr_mem (1) which would require IM_RD.
+const OTHER_MODES_ONE_CYCLE_BLEND_COLOR: (u32, u32) = (0xef00_00f0, 0x800c_4000);
+
+/// The FogColor twin of [`OTHER_MODES_ONE_CYCLE_BLEND_COLOR`], selecting
+/// FogColor for P while retaining the same opaque-alpha and zero-B terms.
+const OTHER_MODES_ONE_CYCLE_FOG_COLOR: (u32, u32) = (0xef00_00f0, 0xc00c_4000);
 
 /// The colour the one-cycle band is asked to paint, and the seed it must
 /// replace. Deliberately not `STALE`, so "the band did nothing" and "the
@@ -1443,6 +1458,75 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     words
 }
 
+/// The one-cycle point-sampled fixture with only its draw cycle changed to
+/// two-cycle mode. [`SET_COMBINE_TEXEL0`] programs Texel0 passthrough in both
+/// cycles, so its hand-derived key remains [`textured_expected`].
+fn two_cycle_textured_rect() -> Vec<(u32, u32)> {
+    let mut words = one_textured_rect();
+    let draw_modes = words
+        .iter_mut()
+        .find(|word| **word == OTHER_MODES_ONE_CYCLE_TEXTURED)
+        .expect("one_textured_rect must set one-cycle textured draw modes");
+    *draw_modes = OTHER_MODES_TWO_CYCLE_TEXTURED;
+    words
+}
+
+/// A texrect whose primitive combiner supplies opaque alpha while the
+/// blender's P selector reads either BlendColor or FogColor. The seeded blue
+/// target and red primitive colour are both distinct from the state colour,
+/// so a dropped state command or combiner passthrough cannot satisfy the key.
+fn state_color_blender_rect(
+    set_state_color: (u32, u32),
+    other_modes: (u32, u32),
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(BLUE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        set_state_color,
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, 0xff00_00ff),
+        other_modes,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        set_tile(TEXTURE_LINE_WORDS, 0),
+        set_tile_size(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(texture_rectangle(
+        TEXRECT_ULX,
+        TEXRECT_ULY,
+        TEXRECT_LRX,
+        TEXRECT_LRY,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+fn blend_color_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < TEXRECT_LRX && y < TEXRECT_LRY {
+        // RGBA8888 (0x40, 0x80, 0xc0, 0xff) -> RGBA5551 (8, 16, 24, 1).
+        0x4431
+    } else {
+        BLUE
+    }
+}
+
+fn fog_color_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < TEXRECT_LRX && y < TEXRECT_LRY {
+        // RGBA8888 (0x20, 0x60, 0xa0, 0xff) -> RGBA5551 (4, 12, 20, 1).
+        0x2329
+    } else {
+        BLUE
+    }
+}
+
 /// A texrect whose combiner emits opaque white and whose blender evaluates
 /// `(white * 1 + white * 1) / (1 + 1)` through RT64's overflow path.
 ///
@@ -2269,6 +2353,46 @@ fn cases() -> Vec<Case> {
             commands: blend_numerator_overflow_rect(),
             expected: blend_numerator_overflow_expected,
         },
+        Case {
+            name: "blend-color-blender-passthrough",
+            intent: "SetBlendColor supplies the forced blender's P input while \
+                     an opaque red primitive supplies only the alpha factor. \
+                     The covered 4x2 texrect must therefore resolve to the \
+                     distinct blue-purple blend colour, proving opcode 0xf9 \
+                     reaches the blender rather than the combiner.",
+            authority: Authority::Rt64Authoritative,
+            commands: state_color_blender_rect(
+                (0xf900_0000, 0x4080_c0ff),
+                OTHER_MODES_ONE_CYCLE_BLEND_COLOR,
+            ),
+            expected: blend_color_expected,
+        },
+        Case {
+            name: "fog-color-blender",
+            intent: "SetFogColor supplies the forced blender's P input while \
+                     the same opaque primitive and zero memory factor isolate \
+                     that selector. The covered 4x2 texrect must resolve to \
+                     the distinct fog colour, proving opcode 0xf8 reaches \
+                     the blender without relying on an impossible combiner \
+                     FogColor input.",
+            authority: Authority::Rt64Authoritative,
+            commands: state_color_blender_rect(
+                (0xf800_0000, 0x2060_a0ff),
+                OTHER_MODES_ONE_CYCLE_FOG_COLOR,
+            ),
+            expected: fog_color_expected,
+        },
+        Case {
+            name: "two-cycle-textured",
+            intent: "the point-sampled 4x2 RGBA16 control with only cycle type \
+                     changed to G_CYC_2CYCLE. Both combiner cycles select \
+                     Texel0 passthrough, so every covered pixel must remain \
+                     identical to textured-rect-point-sampled while exercising \
+                     the previously absent two-cycle texture path.",
+            authority: Authority::Rt64Authoritative,
+            commands: two_cycle_textured_rect(),
+            expected: textured_expected,
+        },
         // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
         // does not model, so RT64's answer is NOT evidence about wgpu.
@@ -2436,6 +2560,24 @@ fn reference_bytes(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
         Ok(fn64_render::FrameStatus::Complete) => Ok(observation_bytes(&rdram)),
         Ok(status) => Err(format!("nonterminal status {status:?}")),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Preserve the RT64/wgpu differential when the diagnostic-only reference
+/// lane loudly rejects a state combination. Reference output never enters a
+/// verdict, so converting its trap to a reported refusal changes no authority
+/// claim and keeps the remaining corpus rows observable.
+fn reference_outcome(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
+    match std::panic::catch_unwind(|| reference_bytes(commands)) {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            Err(format!("reference trapped: {message}"))
+        }
     }
 }
 
@@ -2869,7 +3011,7 @@ fn run() -> Value {
         let key = pixels(&key_bytes(&case));
         let rt64 = rt64_bytes(&case.commands);
         let wgpu = wgpu_outcome(&case.commands);
-        let reference = reference_bytes(&case.commands);
+        let reference = reference_outcome(&case.commands);
 
         let verdict = Verdict::of(&rt64, &wgpu);
         match case.authority {
