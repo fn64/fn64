@@ -408,31 +408,71 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             }
             AI_DACRATE_REG => {
                 let dacrate = value & AI_DACRATE_MASK;
-                if self.current_ai.is_some() || self.queued_ai.is_some() {
-                    if dacrate == self.ai_dacrate {
-                        return Ok(DeviceMmioWriteEffect::None);
-                    }
-                    return Err(DeviceFault::AiDacrateWhileBusy {
-                        current: self.ai_dacrate,
-                        requested: dacrate,
-                    });
+                if dacrate == self.ai_dacrate {
+                    return Ok(DeviceMmioWriteEffect::None);
                 }
                 let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+                let retimed = self
+                    .current_ai
+                    .filter(|current| current.deadline != current.started_at)
+                    .map(|current| {
+                        let remaining_len = self.ai_length();
+                        let deadline = self.ai_dma_deadline(remaining_len, self.now, dacrate)?;
+                        let event = self.events.get(&(current.deadline, current.token));
+                        assert_eq!(
+                            event,
+                            Some(&DeviceEvent::Ai {
+                                token: current.token
+                            }),
+                            "active AI DMA must own its scheduled completion"
+                        );
+                        Ok::<_, DeviceFault>((current, deadline))
+                    })
+                    .transpose()?;
+
+                // libultra writes DACRATE/BITRATE without consulting AI_STATUS
+                // (`refs/oot-decomp/src/libultra/io/aisetfreq.c:31-32`). ares'
+                // hardware model applies that write to the live sample period,
+                // including an occupied FIFO (ares fc834543, ai/io.cpp:57-66;
+                // ai/ai.cpp:27-46). Retiming only the undrained bytes makes the
+                // same immediate transition without replaying consumed audio.
                 self.ai_dacrate = dacrate;
+                let sample_rate_hz = tv_type.vi_clock_hz() / (dacrate + 1);
+                if let Some(dormant) = self
+                    .current_ai
+                    .filter(|current| current.deadline == current.started_at)
+                {
+                    self.current_ai = Some(PendingAi {
+                        request: AiDmaRequest {
+                            sample_rate_hz,
+                            ..dormant.request
+                        },
+                        ..dormant
+                    });
+                }
+                if let Some(queued) = &mut self.queued_ai {
+                    queued.sample_rate_hz = sample_rate_hz;
+                }
+                if let Some((mut current, deadline)) = retimed {
+                    self.events.remove(&(current.deadline, current.token));
+                    current.started_at = self.now;
+                    current.deadline = deadline;
+                    self.events.insert(
+                        (current.deadline, current.token),
+                        DeviceEvent::Ai {
+                            token: current.token,
+                        },
+                    );
+                    self.current_ai = Some(current);
+                }
                 return Ok(DeviceMmioWriteEffect::AiFrequencyChanged {
-                    sample_rate_hz: tv_type.vi_clock_hz() / (dacrate + 1),
+                    sample_rate_hz,
                 });
             }
             AI_BITRATE_REG => {
                 let bitrate = value & AI_BITRATE_MASK;
-                if self.current_ai.is_some() || self.queued_ai.is_some() {
-                    if bitrate == self.ai_bitrate {
-                        return Ok(DeviceMmioWriteEffect::None);
-                    }
-                    return Err(DeviceFault::AiBitrateWhileBusy {
-                        current: self.ai_bitrate,
-                        requested: bitrate,
-                    });
+                if bitrate == self.ai_bitrate {
+                    return Ok(DeviceMmioWriteEffect::None);
                 }
                 self.ai_bitrate = bitrate;
                 return Ok(DeviceMmioWriteEffect::None);

@@ -717,8 +717,10 @@ const PERSPECTIVE_W: i32 = 1 << 20;
 
 /// The S plane value that samples S10.5 coordinate `s10_5` at [`PERSPECTIVE_W`].
 ///
-/// Inverts the CITED perspective rule -- `s10_5 = (S / |W|) * 2^15` -- rather
-/// than reading anything back from the implementation.
+/// Inverts the cited perspective rule -- `s10_5 = (S / W) * 2^15` -- rather
+/// than reading anything back from the implementation. These positive-W
+/// fixtures isolate scale; the negative-W fixture below independently pins
+/// the denominator's sign.
 ///
 /// **The scale here was `1024` and that made this fixture circular.** It was
 /// derived by inverting fn64's own constant, so it asserted the
@@ -729,9 +731,10 @@ const PERSPECTIVE_W: i32 = 1 << 20;
 /// `docs/RT64-WM2000-COMBINER-CENSUS.md` and
 /// `the_perspective_scale_matches_rt64s_texel_scale`.
 ///
-/// Everything these fixtures actually CLAIM -- that the divide happens, that
-/// the two paths differ, that W's magnitude is used -- is unchanged and
-/// still asserted; only the constant the expectation is built from moved.
+/// Everything these fixtures actually claim -- that the divide happens and
+/// that the two paths differ -- is unchanged and still asserted; only the
+/// constant the expectation is built from moved. Signed-W behavior is pinned
+/// by the separate negative-W fixture below.
 const fn perspective_s_for(s10_5: i32) -> i32 {
     s10_5 * (PERSPECTIVE_W / 32768)
 }
@@ -845,24 +848,31 @@ fn the_perspective_and_non_perspective_paths_sample_different_texels() {
     );
 }
 
-/// **The `w <= 0` divide uses W's MAGNITUDE, not its signed value.**
+/// **A negative W flips the perspective texture coordinate's sign.**
 ///
-/// The killing case for the difference between `w.unsigned_abs().max(1)` and
-/// a bare `w.max(1)`: a NEGATIVE W of the same magnitude as a positive one
-/// must sample the SAME texels, because the sign is discarded before the
-/// divide. A `max(1)` would floor the negative denominator at 1, multiplying
-/// every coordinate by 2^20 and sending all four columns off the tile.
+/// Pinned RT64 divides each vertex's S/T by signed `w1`/`w2`/`w3`
+/// (`src/gbi/rt64_gbi_rdp.cpp:512,523-525`). Negating the constant W in the
+/// positive fixture therefore makes every S coordinate negative; the
+/// four-texel clamped tile selects its FIRST texel rather than the distinct
+/// positive-W texels.
 ///
-/// This is a mutation-driven test, and it is stated as an equality against
-/// the positive-W fixture's own already-pinned texels rather than against a
-/// literal, so it cannot drift away from the claim it exists to make.
-///
-/// Found because the non-fault test below SURVIVED that mutant: asserting a
-/// packet completes says nothing about which texel it read. That is this
-/// area's recorded failure mode -- a fixture reading the arm at a point where
-/// correct and incorrect answers coincide -- and it recurred here.
+/// This test formerly pinned the defect by requiring the negative-W result to
+/// equal the positive magnitude. Keeping the same fixture and reversing that
+/// expectation makes it a regression test for the signed divide.
 #[test]
-fn a_negative_w_samples_the_same_texels_its_positive_magnitude_does() {
+fn a_negative_w_flips_the_raw_s10_5_coordinate() {
+    assert_eq!(
+        crate::raw_dpc::triangle_span::texture_coordinates_s10_5(
+            [65_536, 0, -262_144],
+            true,
+        ),
+        (-8_192, 0),
+        "[S, T, W] = [65536, 0, -262144] must preserve W's sign and yield raw S10.5 S = -8192"
+    );
+}
+
+#[test]
+fn a_negative_w_flips_coordinates_and_clamps_to_the_first_texel() {
     let (mut value, dx, de, dy) = perspective_texture_planes();
     value[2] = -PERSPECTIVE_W;
     let frame = Rdp::new(16, 8)
@@ -879,30 +889,26 @@ fn a_negative_w_samples_the_same_texels_its_positive_magnitude_does() {
         )
         .run();
 
-    for (index, expected) in TEXELS.iter().enumerate() {
+    for index in 0..TEXELS.len() {
         assert_eq!(
             frame.pixel(2 + index as u32, 0),
-            *expected,
-            "column {} under W = -2^20 must read the same texel it reads under W = +2^20; \
-             the divide takes |W|",
+            TEXELS[0],
+            "column {} under W = -2^20 must clamp its negative S coordinate to texel 0",
             2 + index
         );
     }
 }
 
-/// **`w <= 0` must not fault** -- the rule earned from real WM2000 content
-/// (gfx task ~#27), not a hypothetical.
+/// **`w <= 0` must not fault.**
 ///
-/// A perspective triangle crossing the near plane legitimately presents a
-/// non-positive W. Real hardware's tcdiv derives 1/w from the operand's top
-/// bits with no sign trap: the pixel samples garbage texels and the chip
-/// keeps rasterizing. So this triangle must COMPLETE -- writing whatever the
-/// magnitude divide produces -- rather than panicking, refusing, or aborting
-/// the packet.
+/// Pinned RT64's signed floating divide accepts negative W and lets zero W
+/// produce IEEE infinity or NaN (`src/gbi/rt64_gbi_rdp.cpp:512,523-525`). A
+/// near-plane crossing must therefore keep rasterizing rather than panic,
+/// refuse, or abort the packet.
 ///
-/// Asserted as "the packet completed and wrote its declared rows", not as a
-/// specific texel: the sampled texel IS defined garbage, and pinning it would
-/// pin an accident rather than the rule.
+/// This test pins completion across zero and extreme denominators. The exact
+/// negative-W texel selection is pinned separately above and by the parity
+/// corpus, where it has a hand-derived answer.
 #[test]
 fn a_non_positive_w_samples_garbage_without_faulting() {
     for w in [0i32, -1, -PERSPECTIVE_W, i32::MIN] {

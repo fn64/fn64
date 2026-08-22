@@ -441,8 +441,14 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
         let duration = current.deadline.get() - current.started_at.get();
         let remaining_cycles = current.deadline.get().saturating_sub(self.now.get());
-        let remaining = (u128::from(current.request.len) * u128::from(remaining_cycles))
-            .div_ceil(u128::from(duration));
+        let tv_type = self
+            .tv_type
+            .expect("an active AI DMA has an IPL-selected television clock");
+        let interval_frames = (u128::from(duration) * u128::from(tv_type.vi_clock_hz()))
+            / (u128::from(CPU_CLOCK_HZ) * u128::from(self.ai_dacrate + 1));
+        let interval_len = interval_frames * 4;
+        let remaining =
+            (interval_len * u128::from(remaining_cycles)).div_ceil(u128::from(duration));
         let remaining = remaining.div_ceil(8) * 8;
         u32::try_from(remaining).expect("AI remaining length exceeds u32")
     }
@@ -1009,15 +1015,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         request: AiDmaRequest,
         started_at: Cycles,
     ) -> Result<PendingAi, DeviceFault> {
-        const BYTES_PER_STEREO_FRAME: u128 = 4;
-        let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
-        let frames = u128::from(request.len) / BYTES_PER_STEREO_FRAME;
-        let duration = (frames * u128::from(CPU_CLOCK_HZ) * u128::from(self.ai_dacrate + 1))
-            .div_ceil(u128::from(tv_type.vi_clock_hz()));
-        let duration = u64::try_from(duration.max(1)).map_err(|_| DeviceFault::DeadlineOverflow)?;
-        let deadline = started_at
-            .checked_add(Cycles::new(duration))
-            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let deadline = self.ai_dma_deadline(request.len, started_at, self.ai_dacrate)?;
         let token = self.next_event_sequence;
         self.next_event_sequence
             .checked_add(1)
@@ -1028,6 +1026,23 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             started_at,
             deadline,
         })
+    }
+
+    pub(crate) fn ai_dma_deadline(
+        &self,
+        len: u32,
+        started_at: Cycles,
+        dacrate: u32,
+    ) -> Result<Cycles, DeviceFault> {
+        const BYTES_PER_STEREO_FRAME: u128 = 4;
+        let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+        let frames = u128::from(len) / BYTES_PER_STEREO_FRAME;
+        let duration = (frames * u128::from(CPU_CLOCK_HZ) * u128::from(dacrate + 1))
+            .div_ceil(u128::from(tv_type.vi_clock_hz()));
+        let duration = u64::try_from(duration.max(1)).map_err(|_| DeviceFault::DeadlineOverflow)?;
+        started_at
+            .checked_add(Cycles::new(duration))
+            .ok_or(DeviceFault::DeadlineOverflow)
     }
 
     pub(crate) fn commit_ai_dma(&mut self, pending: PendingAi) {
