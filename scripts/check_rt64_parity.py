@@ -15,7 +15,7 @@ cov = p["rt64_not_authoritative_coverage"]
 
 exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "1"))
 exp_refused = int(os.environ.get("EXPECTED_ONE_REFUSED", "1"))
-min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "15"))
+min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "18"))
 
 # Known, measured divergences. Each is explained in the runner's `intent`.
 KNOWN_DIVERGENCES = {"scissor-narrower-than-rect"}
