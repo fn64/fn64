@@ -700,24 +700,19 @@ fn linear_byte_address(tile: TileDescriptor, addressed: AddressedTmemTexel) -> u
 /// The odd-row XOR4 bank exchange: the TILE-RELATIVE row's parity, and
 /// nothing else.
 ///
-/// angrylion takes this bit on both sides of TMEM from a row that is already
-/// tile-relative, and neither side carries a T-origin term:
+/// Pinned RT64 states the same rule, and takes the parity from a
+/// TILE-RELATIVE coordinate with no T-origin term:
 ///
-/// - **Read.** `fetch_texel` (`src/core/n64video/rdp/tmem.c:63-129`) does
-///   `taddr ^= ((t & 1) ? WORD_XOR_DWORD_SWAP : WORD_ADDR_XOR)`. It never
-///   reads `tile->tl` -- the field does not appear in the function.
-/// - **Write.** `loading_pipeline` takes `dswap = sst & 1`
-///   (`tex.c:583`) after `tc_pipeline_load` has applied
-///   `TRELATIVE(sst1, tile->tl)` (`tcoord.c:998-999`), and the span was
-///   seeded with exactly `tl << 3` in the first place
-///   (`rdp_load_block`'s `lewdata[5]`, `tex.c:929`). The origin cancels.
+/// - **The exchange.** `implLoadTMEM` (`shaders/TextureDecoder.hlsli:17-25`)
+///   computes `wordIndex = (relativeAddress - rowStart) / 4`, then on
+///   `oddRow` addresses `swapWordIndex = wordIndex ^ 1` while preserving
+///   `relativeAddress & 0x3`. Swapping the 32-bit word index within a row
+///   and keeping the byte offset is exactly a 4-byte address XOR -- fn64
+///   spells the same operation `addr ^ 4`.
+/// - **The parity.** `sampleTMEM` (`:149-150`) derives it as
+///   `oddRow = (texelInt.y & 1)`, from the tile-relative texel coordinate.
+///   No tile origin (`tl`/`low_t`) participates.
 ///
-/// The true-hardware macro values are `WORD_ADDR_XOR = 0`,
-/// `WORD_XOR_DWORD_SWAP = 2` and `BYTE_ADDR_XOR = 0`,
-/// `BYTE_XOR_DWORD_SWAP = 4` (`src/core/common.h:10-20`) -- a 4-byte swap in
-/// both the byte and the 16-bit-word domain. The `LSB_FIRST` arm of those
-/// macros is host byte-order compensation for angrylion's own swapped TMEM
-/// array and is NOT hardware semantics.
 ///
 /// **This used to XOR in a `first_row_parity` derived from the tile's
 /// `low_t`.** That term is not on hardware. It was self-cancelling for
@@ -1003,7 +998,7 @@ mod tests {
     // the load never wrote.
     //
     // Both sides now use the tile-relative row alone, which is what
-    // angrylion does (see `odd_row_exchange`), so the origin cannot perturb
+    // pinned RT64 does (see `odd_row_exchange`), so the origin cannot perturb
     // the pairing at all. These tests are retained as the regression guard
     // for that, on real measured content.
 
@@ -1044,7 +1039,7 @@ mod tests {
             let destination_word = row * WM2000_LINE_WORDS + within;
             // The writer's own parity, not the reader's -- and the writer's
             // rule is the TILE-RELATIVE row alone, with no T-origin term.
-            // See `odd_row_exchange` above for the angrylion citation. This
+            // See `odd_row_exchange` above for the RT64 citation. This
             // line used to read `(low_t_integer + row) & 1`, mirroring a
             // writer term that has since been removed from
             // `tmem/types.rs` as not being on hardware.
