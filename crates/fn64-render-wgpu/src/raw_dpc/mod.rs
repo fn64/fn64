@@ -227,9 +227,10 @@ pub enum RawDpcCommandKind {
     /// "no draw, clip, or bounds computation in this crate reads a scissor
     /// rect today". That was accurate when written, and is precisely why a
     /// texrect overhanging the framebuffer was refused outright instead of
-    /// clipped. `execute_texture_rectangle` now clips against this rect the
-    /// way the RDP does (angrylion `rasterizer.c:2349-2363` for X,
-    /// `:2284-2305` for Y), so the value has to survive into durable state:
+    /// clipped. `execute_texture_rectangle` now clips against this rect;
+    /// pinned RT64 likewise intersects its current scissor with the draw
+    /// rectangle (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so the
+    /// value has to survive into durable state:
     /// a display list commonly sets the scissor once per frame and then
     /// submits several packets under it.
     SetScissor(crate::rt64_gbi_rdp_decode::SetScissorDecoded),
@@ -1297,15 +1298,17 @@ fn decode_stream(
                 // tracked-only, on the reasoning that nothing in this crate
                 // read a scissor rect -- true when written, and no longer
                 // true: `execute_texture_rectangle` clips against it (see
-                // `targets::clip_texrect_extent` and angrylion
-                // `rasterizer.c:2349-2363`), so keeping it out of `RdpState`
+                // `targets::clip_texrect_extent`); pinned RT64 also
+                // intersects its scissor and draw rectangles
+                // (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so
+                // keeping it out of `RdpState`
                 // would silently unscissor every packet that inherits the
                 // rect from an earlier one.
                 //
-                // Latched in the decoder's own quarter-pixel wire units,
-                // matching `rdp_set_scissor` (angrylion
-                // `rasterizer.c:2779-2784`), which stores the four
-                // twelve-bit fields with no rescale.
+                // Latched in the decoder's own quarter-pixel wire units.
+                // Public libultra `include/ultra64/gbi.h:4794-4837` encodes
+                // the four coordinates as twelve-bit fields scaled by four,
+                // or accepts the fractional wire values directly.
                 let decoded = crate::rt64_gbi_rdp_decode::decode_set_scissor(w0, w1);
                 // `p0`/`p1` mask to twelve bits and never sign-extend, so
                 // every coordinate is in `0..=4095` and fits a `u16`. The
@@ -1667,10 +1670,9 @@ fn plan_fill(
     // **The scissor narrows what this command WRITES, so it must narrow what
     // the journal DECLARES.**
     //
-    // angrylion clips every span against the `clip` rect latched by
-    // `rdp_set_scissor` (`rasterizer.c:2779-2784`) inside the edgewalker --
-    // X at `:2349-2363`, Y at `:2284-2305` -- so a scissored fill never
-    // touches the pixels outside the clip, and the executor
+    // Pinned RT64 intersects its current scissor with the draw rectangle
+    // (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so a scissored
+    // fill never touches pixels outside that intersection, and the executor
     // (`targets::execute_fill_rectangle`, via `clip_fill_rectangle`) now
     // does the same.
     //
@@ -1868,8 +1870,9 @@ impl FillSeedRead {
 /// Uses [`crate::targets::RdpScissorRect`]'s own pixel accessors rather than
 /// re-deriving the quarter-pixel rounding, so the decoder and the executor
 /// round the scissor identically by construction instead of by two
-/// agreeing-looking copies of `div_ceil`. That rounding is angrylion's, and
-/// `RdpScissorRect::quarter_to_pixel_ceil` carries its derivation.
+/// agreeing-looking copies of `div_ceil`. The `ceil(q / 4)` rule is fn64's
+/// own reading and is not independently confirmed against an allowed
+/// hardware reference.
 ///
 /// The target-extent bound is deliberately NOT applied here: `plan_fill`
 /// has already rejected `x1 >= image.width()` loudly, and the row planner
@@ -4641,7 +4644,9 @@ mod tests {
             // words 0-1 are row 0, word 2 is row 1. This used to read
             // `true, true, false`, folding in the writer's removed
             // `source_t` term (TL is 1 here). See
-            // `tmem/read.rs::odd_row_exchange` for the angrylion citation.
+            // pinned RT64's `TextureDecoder.hlsli:17-25,149-150`, where the
+            // tile-relative row parity selects a four-byte address exchange
+            // with no T-origin term (commit `f0728a2`).
             vec![(0, 10, false), (0, 11, false), (1, 14, true)]
         );
         assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0xff);
@@ -5720,8 +5725,9 @@ mod tests {
     ///
     /// Every expectation is hand-derived from the wire. The scissor latches
     /// quarter-pixels and each edge becomes `ceil(q / 4)`
-    /// (`RdpScissorRect::quarter_to_pixel_ceil`, derived from angrylion
-    /// `rasterizer.c:2349-2363` for X and `:2284-2305` for Y).
+    /// (`RdpScissorRect::quarter_to_pixel_ceil`). This `ceil(q / 4)` rule is
+    /// fn64's own reading and is not independently confirmed against an
+    /// allowed hardware reference.
     #[test]
     fn a_scissored_fill_declares_only_the_rows_that_survive_the_clip() {
         let rect = |x0, y0, x1, y1| RenderTargetRectangle { x0, y0, x1, y1 };
@@ -5807,10 +5813,13 @@ mod tests {
     ///
     /// The tracked-only shape is exactly what made a texrect overhanging
     /// the framebuffer a refusal rather than a clip: with no latched rect,
-    /// `execute_texture_rectangle` had nothing to clip against. angrylion
-    /// latches the four fields into `wstate->clip` in `rdp_set_scissor`
-    /// (`rasterizer.c:2779-2784`) and the edgewalker clips every span
-    /// against them (`:2349-2363` for X, `:2284-2305` for Y).
+    /// `execute_texture_rectangle` had nothing to clip against. Public
+    /// libultra encodes all four scissor coordinates as twelve-bit
+    /// quarter-pixel fields (`include/ultra64/gbi.h:4794-4837`), and pinned
+    /// RT64 intersects its current scissor with the draw rectangle
+    /// (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`). Persisting the
+    /// rect as staged state is fn64's own reading; its exact lifetime is not
+    /// independently confirmed against an allowed hardware reference.
     ///
     /// Asserts the staged rect field by field, in the quarter-pixel wire
     /// units the command carries, using four DISTINCT values so a staging
