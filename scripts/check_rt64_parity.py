@@ -65,6 +65,20 @@ EXPECTED_OUTCOMES = {
         rt64_matches_key=False,
         differing_pixels=12,
     ),
+    "two-cycle-textured": ExpectedOutcome(
+        Kind.FN64_CAPABILITY_GAP,
+        "differs",
+        "fn64-render-conformance-parity-runner.rs:1462-1471 (two_cycle_textured_rect)",
+        "flipping only the cycle-type bits from 1-cycle to 2-cycle is not an "
+        "equivalent draw: wgpu collapses all 8 covered texels to 0x0001, RT64 "
+        "to a uniform 0xf801, and neither matches the 1-cycle key. wgpu "
+        "diverges from the RT64 oracle in the 2-cycle textured path -- a real "
+        "capability gap to fix in Phase 3, not the same-as-1-cycle key error "
+        "the fixture assumed",
+        wgpu_matches_key=False,
+        rt64_matches_key=False,
+        differing_pixels=8,
+    ),
 }
 
 
