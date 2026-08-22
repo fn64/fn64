@@ -21,13 +21,11 @@ if [[ ! -d "$FN64_RT64_DIR" ]]; then
   exit 1
 fi
 
-# Expected divergences, each one MEASURED and explained in the runner's own
-# `intent` text. Any NEW divergence fails the gate; any of these DISAPPEARING
-# also fails it, because a vanished known-difference means the corpus stopped
-# exercising the case.
-export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-3}
-export EXPECTED_ONE_REFUSED=${EXPECTED_ONE_REFUSED:-1}
-export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-32}
+# Authoritative divergences and refusals are exact per-case assertions in the
+# checker. Aggregate knobs would duplicate those assertions and could drift
+# independently, so only the separate coverage-partition expectation remains.
+export EXPECTED_COVERAGE_ONE_REFUSED=${EXPECTED_COVERAGE_ONE_REFUSED:-1}
+export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-33}
 
 echo "[gate-rt64-parity] building parity runner (RT64 C++ + wgpu)"
 cargo build -p fn64-render-conformance --features parity-runner \

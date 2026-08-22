@@ -218,27 +218,27 @@ fn expected_one_cycle(
         return composite(p_val, alpha, memory);
     }
 
-    // blend_fragment evaluates blend_color(cycle.p, ...) and
-    // blend_color(cycle.m, ...) unconditionally, before branching on
-    // whether either selector is Framebuffer -- so a Framebuffer selector
-    // on *either* P or M requires a memory sample even though only one of
-    // the two resolved values is actually used by the taken branch. This
-    // mirrors the reference's own `blend.rs:191-192` unconditional
-    // evaluation exactly (not a simplification this port introduced).
-    let p_val = color_of(p);
-    let m_val = color_of(m);
+    let passthrough = a_sel == BlendAlphaInput::Zero
+        || b_sel == BlendBInput::Zero
+        || (p == m && b_sel == BlendBInput::OneMinusA);
+    let framebuffer_color = p == BlendColorInput::Framebuffer
+        || m == BlendColorInput::Framebuffer;
+    if passthrough {
+        if framebuffer_color {
+            return composite(src_rgb, 0.0, memory);
+        }
+        let selected = if a_sel == BlendAlphaInput::Zero { m } else { p };
+        return composite(color_of(selected)?, 1.0, memory);
+    }
+
     if p == BlendColorInput::Framebuffer {
-        let m_val = m_val?;
-        p_val?;
-        return composite(m_val, 1.0 - a, memory);
+        return composite(color_of(m)?, 1.0 - a, memory);
     }
     if m == BlendColorInput::Framebuffer {
-        let p_val = p_val?;
-        m_val?;
-        return composite(p_val, a, memory);
+        return composite(color_of(p)?, a, memory);
     }
-    let p_val = p_val?;
-    let m_val = m_val?;
+    let p_val = color_of(p)?;
+    let m_val = color_of(m)?;
     let b = match b_sel {
         BlendBInput::OneMinusA => 1.0 - a,
         BlendBInput::FramebufferAlpha => memory
@@ -247,18 +247,21 @@ fn expected_one_cycle(
         BlendBInput::One => 1.0,
         BlendBInput::Zero => 0.0,
     };
-    let blended = if a == 0.0 {
-        m_val
-    } else if b == 0.0 {
-        p_val
-    } else {
-        let divisor = a + b;
-        let mut out = [0.0f32; 3];
-        for c in 0..3 {
-            out[c] = ((p_val[c] * a + m_val[c] * b) / divisor).clamp(0.0, 255.0);
-        }
-        out
-    };
+    let divisor = (a + b).max(1.0 / 255.0);
+    // RT64 `rt64_blender.h:385-388,401-436`: passthrough returned above;
+    // among the remaining selectors, only B != OneMinusA is classified as
+    // numeratorOverflow and receives the normalized-RGB modulo wrap.
+    let numerator_overflow = !passthrough && b_sel != BlendBInput::OneMinusA;
+    let mut blended = [0.0f32; 3];
+    for c in 0..3 {
+        let raw_numerator = (p_val[c] / 255.0) * a + (m_val[c] / 255.0) * b;
+        let numerator = if numerator_overflow {
+            raw_numerator % (1.0 + 8.0 / 255.0)
+        } else {
+            raw_numerator
+        };
+        blended[c] = (numerator / divisor) * 255.0;
+    }
     composite(blended, 1.0, memory)
 }
 
@@ -464,7 +467,7 @@ fn mid_range_a_and_b_use_the_general_divide() {
 }
 
 #[test]
-fn a_at_max_255_and_b_at_max_still_use_general_divide_not_a_shortcut() {
+fn a_and_b_at_max_wrap_numerator_before_general_divide() {
     let state = one_cycle_mode_state(
         selector_wire(BlendColorInput::Combined),
         alpha_wire(BlendAlphaInput::Combined),
@@ -477,16 +480,11 @@ fn a_at_max_255_and_b_at_max_still_use_general_divide_not_a_shortcut() {
     );
     let src = [255, 255, 255, 255];
     let result = blend_fragment(src, None, 0, state, true).unwrap();
-    // a=1.0, b=1.0, divisor=2.0: (255*1 + val*1)/2.
-    assert_eq!(
-        result.rgba,
-        [
-            ((255.0f32 * 1.0 + 50.0) / 2.0).round() as u8,
-            ((255.0f32 * 1.0 + 60.0) / 2.0).round() as u8,
-            ((255.0f32 * 1.0 + 70.0) / 2.0).round() as u8,
-            255
-        ]
-    );
+    // RT64 `rt64_blender.h:385-388,429-436`: this is non-passthrough and
+    // B != OneMinusA, so normalized RGB wraps modulo 1+8/255 before the
+    // general divide. In byte-domain arithmetic the modulus is 263:
+    // (255 + [50, 60, 70] - 263) / 2 = [21, 26, 31]. Alpha is separate.
+    assert_eq!(result.rgba, [21, 26, 31, 255]);
 }
 
 // --- Sequential cycle handoff / two-cycle curated interactions -----------

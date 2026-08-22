@@ -90,29 +90,19 @@ pub(crate) enum ViScanoutRefusal {
     ///    estimated background: a confidently wrong pixel, not a slightly
     ///    wrong one. Dither restoration is admitted precisely because it
     ///    reads coverage only as the boolean `== 8`.
-    /// 2. **A sidecar alone would not be sufficient, because this lane
-    ///    never produces coverage to put in one.** The reference's sidecar
-    ///    is populated by its own rasterizer: `write_rgba5551_framebuffer`
-    ///    splits `Coverage::stored()` into the visible LSB (bit 2) and the
-    ///    two hidden bits (`backend/framebuffer_io.rs:143-190`).
-    ///    `fn64-render-wgpu` writes that bit from **alpha**, not coverage --
-    ///    `pack_device_pixels` (`targets/oracle.rs:128-131`) and both
-    ///    private `write_pixel`s (`targets/fill.rs:418-421`,
-    ///    `targets/texrect.rs`) all emit `alpha >> 7`. `Coverage::stored()`
-    ///    (`coverage.rs`) has zero production callers. So this lane's
-    ///    committed RDRAM carries no coverage information at all, in the
-    ///    visible bit or anywhere else, and adding the two hidden bits
-    ///    beside it would only widen a field nothing writes.
+    /// 2. **The visible encoding is fixed, but geometric coverage remains a
+    ///    separate frontier.** Target packers now store destination
+    ///    `Coverage::stored()[2]`; this lands the one visible bit. The two
+    ///    hidden bits still need a sidecar, and `docs/RT64-GUARD-AUDIT.md`
+    ///    records that RT64 does not model a true sample-mask count. Texrects
+    ///    deliberately supply `Coverage::FULL`, so this change proves encoding
+    ///    and full-pixel propagation, not geometric edge coverage.
     ///
-    /// The real shape is therefore two pieces, in order: a coverage stage
-    /// that computes and *retains* a per-pixel count through the draw
-    /// path (the executors currently discard it -- see
-    /// `targets/texrect.rs`'s `coverage_for`, which derives the count and
-    /// then documents that it "cannot reach an observable"), and then a
-    /// sidecar for the two bits RGBA16 has no room for. The 195 lines are
-    /// the second piece. Refusing until both exist is the correct call;
-    /// building only the sidecar would produce a filter weighted by a
-    /// count that is still always 8 or 1.
+    /// The remaining work is therefore two independent pieces: retain all
+    /// three destination-coverage bits through RDRAM publication, and supply
+    /// authoritative geometric counts for primitives that can partially cover
+    /// a pixel. Until both exist, silhouette AA cannot consume a trustworthy
+    /// magnitude and continues to refuse by name.
     SilhouetteAntialias,
     /// VI STATUS bit 16 **with a coverage-bearing pixel that this backend
     /// cannot classify**: dither restoration is implemented (see
@@ -493,13 +483,11 @@ impl SourceGeometry {
     /// [`SourcePlane::coverage`] for the deviation this backend is choosing
     /// by having no sidecar to hit.
     ///
-    /// **Reproducing that branch exactly is not the same as reproducing the
-    /// reference's answer.** The branch is the same arithmetic on the same
-    /// bit; on a field this lane rendered, the bit holds `alpha >> 7`
-    /// rather than a coverage MSB. The arithmetic is faithful and its input
-    /// is not, which is why the value below is safe for restoration's
-    /// `== 8` predicate and unsafe as a blend weight. Again see
-    /// [`ViScanoutRefusal::SilhouetteAntialias`].
+    /// The bit is now produced from stored destination coverage, so this
+    /// sidecar-miss reconstruction is exact for the full-versus-partial
+    /// predicate used by restoration. It remains unsafe as a silhouette-AA
+    /// blend weight because intermediate counts 2..=7 still require the two
+    /// hidden bits; see [`ViScanoutRefusal::SilhouetteAntialias`].
     ///
     /// RGBA32 carries coverage in the top three bits of its fourth byte,
     /// which the reference reads the same way.
@@ -556,7 +544,7 @@ impl SourceGeometry {
                     expand_five_bit(((pixel >> 11) & 0x1f) as u8),
                     expand_five_bit(((pixel >> 6) & 0x1f) as u8),
                     expand_five_bit(((pixel >> 1) & 0x1f) as u8),
-                    // RGBA16's low bit is the coverage/alpha bit. This
+                    // RGBA16's low bit is stored coverage bit 2. This
                     // scanout emits an opaque field, matching the reference
                     // backend's `load_vi_source`, which also writes 255 and
                     // routes the low bit into coverage instead.
@@ -805,24 +793,11 @@ struct SourcePlane {
     /// reference has a tracked partial-coverage entry this backend reads
     /// full coverage instead.
     ///
-    /// **And the bit itself does not mean the same thing on the two
-    /// lanes.** The reference's `write_rgba5551_framebuffer` puts
-    /// `Coverage::stored() >> 2` there -- genuinely the coverage MSB. Every
-    /// RGBA16 packer in *this* crate puts `alpha >> 7` there
-    /// (`targets::pack_device_pixels`, and the private `write_pixel`s in
-    /// `targets/fill.rs` and `targets/texrect.rs`), and
-    /// `crate::coverage::Coverage::stored()` has no production caller. So
-    /// on a field this lane rendered, the value read above is a thresholded
-    /// alpha rather than a truncated coverage count. Pinned by
-    /// `this_lanes_rgba16_low_bit_is_alpha_not_a_coverage_msb`; see
-    /// [`ViScanoutRefusal::SilhouetteAntialias`] for what it costs.
-    ///
-    /// That difference is inert for the *restoration*
-    /// filter's own output — restoration recomputes each component from
-    /// five-bit neighbors and never reads the coverage value — but it does
-    /// change *which* pixels restoration is applied to, and it is why
-    /// `SilhouetteAntialias`, which consumes the coverage magnitude
-    /// directly, still refuses by name.
+    /// The target packers now put `Coverage::stored() >> 2` in the visible
+    /// bit, matching the reference and RT64 encoding. Dither restoration's
+    /// `coverage == 8` gate is therefore sound for full coverage. Silhouette
+    /// AA still refuses because it consumes the complete magnitude and this
+    /// lane still cannot retain the two hidden bits needed for counts 2..=7.
     coverage: Vec<u8>,
 }
 
