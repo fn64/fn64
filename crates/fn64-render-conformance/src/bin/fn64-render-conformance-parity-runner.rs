@@ -312,6 +312,38 @@ const WIDE_TEXELS: [u16; 16] = [
     0xf841, 0x0641, 0x0079, 0xffbf, 0x8461, 0xc671, 0x4251, 0xfc41,
 ];
 
+/// A tall RGBA16 strip reproducing WM2000's measured texrect state without
+/// carrying any game content. The 64-texel source row occupies 16 TMEM
+/// words, while the base tile deliberately declares the measured
+/// `line = 17`, leaving one word of padding between rows. Fourteen rows make
+/// a two-pixel-per-row displacement impossible to mistake for a boundary
+/// tie-break.
+const SKEW_SOURCE: u32 = 0x5000;
+const SKEW_WIDTH: u32 = 64;
+const SKEW_HEIGHT: u32 = 14;
+const SKEW_LOW_T_ODD: u32 = 95;
+const SKEW_LINE_WORDS: u32 = 17;
+const SKEW_BAR_LEFT: u32 = 8;
+const SKEW_BAR_RIGHT: u32 = 56;
+
+const fn skew_texel(x: u32) -> u16 {
+    if x >= SKEW_BAR_LEFT && x < SKEW_BAR_RIGHT {
+        RED
+    } else {
+        BLUE
+    }
+}
+
+fn skew_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < SKEW_WIDTH && y < SKEW_HEIGHT {
+        skew_texel(x)
+    } else {
+        STALE
+    }
+}
+
 /// The expected pixel for the wide case, by linear target index.
 ///
 /// Half-open on both axes, the texrect rule. Inside, pixel `(x, y)` reads
@@ -458,6 +490,38 @@ fn texture_rectangle(ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> 
         ),
         (0, (1 << 26) | (1 << 10)),
     ]
+}
+
+/// `SetTileSize`/`LoadTile` bounds with a nonzero T origin. Coordinates are
+/// S10.2 and the high edge remains inclusive.
+const fn tile_bounds_at(opcode: u32, width: u32, height: u32, low_t: u32) -> (u32, u32) {
+    (
+        opcode | (low_t * 4),
+        (((width - 1) * 4) << 12) | ((low_t + height - 1) * 4),
+    )
+}
+
+const fn set_tile_size_at(width: u32, height: u32, low_t: u32) -> (u32, u32) {
+    tile_bounds_at(0xf200_0000, width, height, low_t)
+}
+
+const fn load_tile_at(width: u32, height: u32, low_t: u32) -> (u32, u32) {
+    tile_bounds_at(0xf400_0000, width, height, low_t)
+}
+
+/// The same one-texel-per-pixel texrect with its S10.5 T origin aligned to a
+/// nonzero tile origin. Subtracting the tile's S10.2 `low_t` therefore starts
+/// the draw on tile-relative row zero.
+fn texture_rectangle_at_t(
+    ulx: u32,
+    uly: u32,
+    lrx: u32,
+    lry: u32,
+    low_t: u32,
+) -> Vec<(u32, u32)> {
+    let mut words = texture_rectangle(ulx, uly, lrx, lry);
+    words[1].0 = low_t << 5;
+    words
 }
 
 /// `SetCombine` selecting `(Zero - Zero) * Zero + Texel0` in BOTH the colour
@@ -890,6 +954,32 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     words
 }
 
+fn skew_textured_rect(line_words: u32, low_t: u32) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(SKEW_WIDTH, SKEW_SOURCE),
+        set_tile(line_words, 0),
+        set_tile_size_at(SKEW_WIDTH, SKEW_HEIGHT, low_t),
+        (0xe600_0000, 0),
+        load_tile_at(SKEW_WIDTH, SKEW_HEIGHT, low_t),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(texture_rectangle_at_t(
+        0,
+        0,
+        SKEW_WIDTH,
+        SKEW_HEIGHT,
+        low_t,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
 /// The corpus.
 ///
 /// Every key is stated as arithmetic over the case's own display list under
@@ -1177,6 +1267,40 @@ fn cases() -> Vec<Case> {
             commands: wide_textured_rect(),
             expected: wide_expected,
         },
+        Case {
+            name: "textured-rect-line17-low-t95",
+            intent: "the measured WM2000 texrect state reduced to a synthetic \
+                     64x14 RGBA16 bar: LoadTile, tmem 0, line 17 and odd \
+                     low_t 95. Every source row has identical red extents, \
+                     so a two-texel XOR4 displacement appears directly as a \
+                     shifted red edge and fourteen rows expose any cumulative \
+                     two-pixel-per-row skew.",
+            authority: Authority::Rt64Authoritative,
+            commands: skew_textured_rect(SKEW_LINE_WORDS, SKEW_LOW_T_ODD),
+            expected: skew_expected,
+        },
+        Case {
+            name: "textured-rect-line17-low-t94",
+            intent: "one-variable control for textured-rect-line17-low-t95. \
+                     Only the SetTileSize, LoadTile and texrect T origins \
+                     change from odd low_t 95 to even low_t 94; line 17, \
+                     LoadTile, RGBA16, tmem 0, source pixels and 64x14 draw \
+                     geometry stay fixed.",
+            authority: Authority::Rt64Authoritative,
+            commands: skew_textured_rect(SKEW_LINE_WORDS, SKEW_LOW_T_ODD - 1),
+            expected: skew_expected,
+        },
+        Case {
+            name: "textured-rect-line16-low-t95",
+            intent: "one-variable control for textured-rect-line17-low-t95. \
+                     Only SetTile's line field changes from the measured 17 \
+                     words to the tightly packed 16 words occupied by each \
+                     64-texel RGBA16 source row; odd low_t 95, LoadTile, \
+                     tmem 0, source pixels and 64x14 draw geometry stay fixed.",
+            authority: Authority::Rt64Authoritative,
+            commands: skew_textured_rect(SKEW_LINE_WORDS - 1, SKEW_LOW_T_ODD),
+            expected: skew_expected,
+        },
         // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
         // does not model, so RT64's answer is NOT evidence about wgpu.
@@ -1263,6 +1387,18 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
                 RdramAddr::from_offset(WIDE_SOURCE + index as u32 * 2),
                 *texel,
             );
+        }
+        // Stage the same synthetic bar on every source row used by the odd
+        // base and even-low-T control. Keeping these bytes fixed means the
+        // control changes only the command's tile/load origin.
+        for source_y in (SKEW_LOW_T_ODD - 1)..(SKEW_LOW_T_ODD + SKEW_HEIGHT) {
+            for x in 0..SKEW_WIDTH {
+                let source_index = source_y * SKEW_WIDTH + x;
+                view.write_u16(
+                    RdramAddr::from_offset(SKEW_SOURCE + source_index * 2),
+                    skew_texel(x),
+                );
+            }
         }
         // The CI4 palette, RGBA16 like every other texel image.
         for (index, entry) in PALETTE.iter().enumerate() {
@@ -2368,6 +2504,54 @@ mod tests {
             for x in 0..TEXTURE_WIDTH {
                 assert_eq!(at(x, y), TEXTURE_TEXELS[(y * TEXTURE_WIDTH + x) as usize]);
             }
+        }
+    }
+
+    #[test]
+    fn skew_sweep_changes_only_the_named_ingredient() {
+        let base = skew_textured_rect(SKEW_LINE_WORDS, SKEW_LOW_T_ODD);
+        let even_low_t = skew_textured_rect(SKEW_LINE_WORDS, SKEW_LOW_T_ODD - 1);
+        let line_16 = skew_textured_rect(SKEW_LINE_WORDS - 1, SKEW_LOW_T_ODD);
+
+        let changed = |left: &[(u32, u32)], right: &[(u32, u32)]| {
+            left.iter()
+                .zip(right)
+                .enumerate()
+                .filter_map(|(index, (left, right))| {
+                    (left != right).then_some((index, *left, *right))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A different T origin necessarily changes the three commands that
+        // carry that one semantic ingredient: tile bounds, load bounds and
+        // the texrect's sample origin. Every other command is byte-identical.
+        let low_t_changes = changed(&base, &even_low_t);
+        assert_eq!(low_t_changes.len(), 3);
+        assert_eq!(
+            low_t_changes
+                .iter()
+                .map(|(_, base, _)| base.0 >> 24)
+                .collect::<Vec<_>>(),
+            vec![0xf2, 0xf4, 0]
+        );
+
+        // `line` lives in SetTile alone, so the line control must differ by
+        // exactly that one 64-bit command.
+        let line_changes = changed(&base, &line_16);
+        assert_eq!(line_changes.len(), 1);
+        assert_eq!(line_changes[0].1.0 >> 24, 0xf5);
+    }
+
+    #[test]
+    fn skew_key_has_fourteen_stationary_red_extents() {
+        for y in 0..SKEW_HEIGHT {
+            let red: Vec<u32> = (0..SKEW_WIDTH)
+                .filter(|&x| skew_expected(y * WIDTH + x) == RED)
+                .collect();
+            assert_eq!(red.first(), Some(&SKEW_BAR_LEFT));
+            assert_eq!(red.last(), Some(&(SKEW_BAR_RIGHT - 1)));
+            assert_eq!(red.len() as u32, SKEW_BAR_RIGHT - SKEW_BAR_LEFT);
         }
     }
 
