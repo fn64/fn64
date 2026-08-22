@@ -2114,4 +2114,3 @@ mod tests {
         println!("expected: {:02x?}", digest(&fixture.expected_bytes));
     }
 }
-

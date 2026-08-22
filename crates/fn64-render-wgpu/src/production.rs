@@ -57,14 +57,14 @@ use crate::targets::{
 };
 use crate::tmem::{project_committed_tmem, TileBindingParams, TmemGpuProjection};
 use crate::{
-    execute_fill_rectangle, AlphaCompare, BlendColorInput, BlendModeState, Color4, ColorImage,
-    ColorTargetExtent, ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CombineParams,
-    FillColor, FillExecutionError, FillRectangle, HeadlessBackend, InitializedCandidateColorTarget,
-    MissingTriangleDrawState, OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemState, PrimColor, RawDpcDecodeError, RdpState, ResolvedBlendCycle,
-    RetrievedTriangleDraw, TargetError, TmemLoadSourceIdentity, TmemTransferWord,
-    TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
-    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    execute_combined_fill_rectangle, execute_fill_rectangle, AlphaCompare, BlendColorInput,
+    BlendModeState, Color4, ColorImage, ColorTargetExtent, ColorTargetFormat, ColorTargetKey,
+    ColorTargetRegistry, CombineParams, CycleType, FillColor, FillExecutionError, FillRectangle,
+    HeadlessBackend, InitializedCandidateColorTarget, MissingTriangleDrawState, OtherMode,
+    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemState, PrimColor,
+    RawDpcDecodeError, RdpState, ResolvedBlendCycle, RetrievedTriangleDraw, TargetError,
+    TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput, TrianglePipelineDeviceOutcome,
+    TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
@@ -307,8 +307,7 @@ impl WgpuBackend {
                 triangle_target_extent: None,
                 triangle_draw_output: None,
                 gpu_triangle_draw_enabled: cfg!(test)
-                    || std::env::var_os("FN64_GPU_TRIANGLE_DRAW")
-                        .is_some_and(|v| v == "1"),
+                    || std::env::var_os("FN64_GPU_TRIANGLE_DRAW").is_some_and(|v| v == "1"),
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -888,15 +887,11 @@ struct PlanCollector {
     /// silent default, matching `TriangleDrawStateCollector`'s own
     /// documented absence handling.
     triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
-    /// One entry per admitted `FillRectangle` command, in plan order,
-    /// paired with its own decode-order command index. Unlike `triangles`,
-    /// no draw-state snapshot is taken here: a fill carries its own
-    /// `color_image`/`fill_color` on the command itself (see
-    /// `RdpFillRectangleCommand`), so nothing needs to be tracked across
-    /// the walk for it.
     /// One entry per admitted `FillRectangle`, in plan order: its
-    /// decode-order command index, the command, and the `OtherMode`
-    /// current at **its own** stream position.
+    /// decode-order command index, command, and render state current at
+    /// **its own** stream position. Fill cycle consumes the command's fill
+    /// color; one-/two-cycle consumes the snapshotted combiner and color
+    /// registers through the existing texture-rectangle pixel stages.
     ///
     /// The `OtherMode` snapshot is not redundant with
     /// `current_other_mode`. That field is the walk's running value, which
@@ -924,6 +919,11 @@ struct PlanCollector {
         fn64_render::RdpFillRectangleCommand,
         Option<OtherMode>,
         Option<crate::targets::RdpScissorRect>,
+        Option<CombineParams>,
+        Color4,
+        PrimColor,
+        Color4,
+        Color4,
     )>,
     /// One entry per admitted `FullSync` site, in plan order, paired with
     /// its own decode-order command index.
@@ -1186,8 +1186,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // and `TriangleDrawStateCollector` must resolve the same
                 // tile for the same draw, and when each carried its own
                 // copy of this arithmetic they drifted.
-                let bound_tile_index =
-                    crate::raw_dpc::bound_tile_index(*source, raw_words);
+                let bound_tile_index = crate::raw_dpc::bound_tile_index(*source, raw_words);
                 let tile_binding = match self
                     .current_tiles
                     .get(bound_tile_index)
@@ -1349,6 +1348,11 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     fill.clone(),
                     self.current_other_mode,
                     self.current_scissor,
+                    self.current_combine,
+                    self.current_env_color,
+                    self.current_prim_color,
+                    self.current_blend_color,
+                    self.current_fog_color,
                 ));
             }
             // Mandatory alongside `push_full_sync_site`'s admission, for the
@@ -1630,9 +1634,9 @@ pub enum WgpuRawDpcExecutionError {
     NoColorTargetHeight,
     /// The registry, candidate, or executor rejected an admitted fill.
     Target(TargetError),
-    /// The fill executor itself rejected the rectangle -- non-Fill cycle, a
-    /// Z/framebuffer-consumer bypass hazard, a fractional edge, or missing
-    /// resident bytes.
+    /// The fill executor itself rejected the rectangle -- unsupported cycle,
+    /// missing combined state, an unsafe pixel-pipeline mode, a fractional
+    /// edge, or missing resident/seed bytes.
     FillExecution(FillExecutionError),
     /// A recorded fill access span could not be bound back to the plan's own
     /// ordered access list.
@@ -3755,7 +3759,7 @@ fn stage_color_commands(
         .fills
         .iter()
         .enumerate()
-        .map(|(index, (command_index, _, _, _))| (*command_index, ColorCommandKind::Fill(index)))
+        .map(|(index, (command_index, ..))| (*command_index, ColorCommandKind::Fill(index)))
         .chain(collector.plan.texrect_commands.iter().enumerate().map(
             |(index, (_, _, _, command_index))| (*command_index, ColorCommandKind::Texrect(index)),
         ))
@@ -4025,7 +4029,7 @@ fn color_target_key(
         .plan
         .current_color_image
         .ok_or(WgpuRawDpcExecutionError::NoStagedColorImage)?;
-    if let Some((command_index, fill, _, _)) = collector.plan.fills.first() {
+    if let Some((command_index, fill, ..)) = collector.plan.fills.first() {
         let declared = ColorImage::from_wire(
             image_format(fill.color_image.format),
             pixel_size(fill.color_image.size),
@@ -4103,7 +4107,17 @@ fn execute_scheduled_fill(
     index: usize,
     accumulated: Option<&[u8]>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
-    let (_, fill, fill_other_mode, fill_scissor) = &collector.plan.fills[index];
+    let (
+        _,
+        fill,
+        fill_other_mode,
+        fill_scissor,
+        fill_combine,
+        fill_env_color,
+        fill_prim_color,
+        fill_blend_color,
+        fill_fog_color,
+    ) = &collector.plan.fills[index];
     let fill_seed_access = &fill.seed_access_index;
 
     // This fill's OWN `OtherMode`, snapshotted at its stream position --
@@ -4160,19 +4174,49 @@ fn execute_scheduled_fill(
         (None, None) => None,
     };
 
-    let completed = execute_fill_rectangle(
-        candidate,
-        other_mode,
-        FillColor::from_wire(fill.fill_color.value),
-        FillRectangle::from_wire_fields(
-            fill.upper_left_x,
-            fill.upper_left_y,
-            fill.lower_right_x,
-            fill.lower_right_y,
-        ),
-        scissor,
-        seed,
-    )?;
+    let rectangle = FillRectangle::from_wire_fields(
+        fill.upper_left_x,
+        fill.upper_left_y,
+        fill.lower_right_x,
+        fill.lower_right_y,
+    );
+    let completed = match other_mode.cycle_type() {
+        CycleType::Fill => execute_fill_rectangle(
+            candidate,
+            other_mode,
+            FillColor::from_wire(
+                fill.fill_color
+                    .ok_or(FillExecutionError::MissingCombinedState {
+                        register: "SetFillColor",
+                    })?
+                    .value,
+            ),
+            rectangle,
+            scissor,
+            seed,
+        )?,
+        CycleType::OneCycle | CycleType::TwoCycle => execute_combined_fill_rectangle(
+            candidate,
+            other_mode,
+            (*fill_combine).ok_or(FillExecutionError::MissingCombinedState {
+                register: "SetCombine",
+            })?,
+            *fill_env_color,
+            *fill_prim_color,
+            *fill_blend_color,
+            *fill_fog_color,
+            rectangle,
+            scissor,
+            seed,
+        )?,
+        CycleType::Copy => {
+            return Err(WgpuRawDpcExecutionError::FillExecution(
+                FillExecutionError::UnsupportedCombinedCycle {
+                    cycle_type: CycleType::Copy,
+                },
+            ))
+        }
+    };
     let accesses = fill_accesses(&collector.plan.accesses, fill)?.to_vec();
     Ok((completed, accesses))
 }
@@ -8814,8 +8858,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("fixture plans cleanly");
-        let bound = finalize_and_submit_pair(session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend
             .execute_raw_dpc(bound)
@@ -8885,8 +8928,7 @@ mod tests {
         Result<BackendPreparedRawDpc, RenderError>,
     ) {
         let planned = plan_with_no_reads(backend, session, words);
-        let bound = finalize_and_submit_pair(session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(session, planned).unwrap();
         let submission = bound.submission();
         (submission, backend.execute_raw_dpc(bound))
     }
@@ -8934,8 +8976,7 @@ mod tests {
              UnadmittedRawDpcCommand",
         );
 
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend
             .execute_raw_dpc(bound)
@@ -9001,8 +9042,7 @@ mod tests {
         let request = session.plan_request(capture(full_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
 
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
 
@@ -9193,8 +9233,7 @@ mod tests {
 
         let request = session.plan_request(capture(partial_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
         let staged = backend.staged_guest_render_target_writes(submission);
@@ -9240,36 +9279,10 @@ mod tests {
         );
     }
 
-    /// **Supersedes T-14** (`plan_raw_dpc_rejects_a_copy_cycle_fill_rectangle`),
-    /// which asserted a Copy-cycle `FillRectangle` is rejected at plan
-    /// time. That pinned scaffolding, not hardware.
-    ///
-    /// The RDP defines `G_FILLRECT` in every cycle type; cycle type selects
-    /// how the rectangle's content is produced, not whether the command is
-    /// legal. `plan_fill`'s own doc carries the three authorities
-    /// (fn64's reference lane `raster/draw.rs:113-128`, RT64
-    /// `rt64_rdp.cpp:1033-1050`, and the WM2000 packet measured at VI swap
-    /// 2522 in `docs/WM2000-FILLRECT-EVIDENCE.txt`).
-    ///
-    /// What "admitted" means here is precise and narrow, and both halves
-    /// are asserted:
-    ///
-    /// 1. The plan SUCCEEDS -- one unexecutable command no longer refuses
-    ///    the whole packet.
-    /// 2. It declares NO `RenderTarget` write. That is what keeps this from
-    ///    being "admit all fills": `targets/fill.rs`'s
-    ///    `execute_fill_rectangle` implements the fill-cycle branch alone,
-    ///    so a declared write here would name bytes nothing fills and
-    ///    publish a digest of stale RDRAM.
-    ///
-    /// The Fill-cycle control arm below is what makes the fixture
-    /// non-degenerate: a planner that declared nothing for every cycle type
-    /// would satisfy assertion 2 alone.
-    ///
-    /// FAILS BEFORE this change (`plan_raw_dpc` returned `Err`), PASSES
-    /// AFTER.
+    /// Fill and combined cycles plan; Copy is refused by the public-result
+    /// contract rather than silently admitted as a zero-write command.
     #[test]
-    fn plan_raw_dpc_admits_a_copy_cycle_fill_rectangle_without_declaring_a_write() {
+    fn plan_raw_dpc_admits_combined_fill_rectangles_and_refuses_copy_cycle() {
         let plans = |cycle_bits: u32| {
             let (mut backend, session) = WgpuBackend::try_new().unwrap();
             let mut words = Vec::new();
@@ -9286,32 +9299,15 @@ mod tests {
         // so a change that broke planning outright cannot pass this test by
         // making every arm behave identically.
         assert!(plans(3), "a Fill-cycle FillRectangle must still plan");
-        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1), ("Copy", 2)] {
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1)] {
             assert!(
                 plans(cycle_bits),
-                "{name}: one command this backend has no executor for must no longer \
-                 refuse the whole packet"
+                "{name}: combined FillRectangle must plan"
             );
         }
-    }
-
-    /// The other half of the contract the card above states, asserted where
-    /// the access list is actually reachable: a non-Fill cycle
-    /// `FillRectangle` declares no `RenderTarget` write, so nothing slices
-    /// stale bytes for it. `PlannedRawDpcSubmission` exposes no journal
-    /// accessor, so the zero-write assertion lives on the decoder's own
-    /// plan in
-    /// `raw_dpc::tests::a_non_fill_cycle_fill_rectangle_declares_no_write_but_a_fill_cycle_one_does`.
-    /// Named here so a reader of this card finds it rather than assuming
-    /// the property is unpinned.
-    #[test]
-    fn the_zero_write_half_of_the_non_fill_cycle_contract_is_pinned_elsewhere() {
-        let source = include_str!("raw_dpc/mod.rs");
         assert!(
-            source.contains(
-                "fn a_non_fill_cycle_fill_rectangle_declares_no_write_but_a_fill_cycle_one_does"
-            ),
-            "the zero-declared-write assertion this card defers to must exist"
+            !plans(2),
+            "Copy-cycle G_FILLRECT has no guaranteed public result and must be refused"
         );
     }
 
@@ -9416,8 +9412,7 @@ mod tests {
         words.extend(flat_triangle_in_target_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, words);
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = match backend.execute_raw_dpc(bound) {
             Ok(prepared) => prepared,
@@ -9535,8 +9530,7 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
 
         let planned = plan_with_no_reads(&mut backend, &session, triangle_only_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         match backend.execute_raw_dpc(bound) {
             // A host that DOES have an adapter AND has had create() called
@@ -9608,8 +9602,7 @@ mod tests {
             planned.guest_read_plan().reads().is_empty(),
             "a sync-only plan declares no TmemLoadSource reads"
         );
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let initial_identity = backend.physical_tmem().identity();
 
@@ -9694,8 +9687,7 @@ mod tests {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
 
         let planned = plan_with_no_reads(&mut backend, &session, state_only_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         match backend.execute_raw_dpc(bound) {
             Err(RenderError::Backend { reason, .. }) => assert_eq!(
@@ -9762,8 +9754,7 @@ mod tests {
         configure_fill_target_height(&mut backend);
 
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         let (_prepared, _triangles, pending, _draw_tmem) = execute_raw_dpc_inner(
             &mut backend.coordinator,
@@ -9921,8 +9912,7 @@ mod tests {
 
         let request = session.plan_request(capture(partial_width_fill_words()));
         let planned = backend.plan_raw_dpc(request).unwrap();
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend.execute_raw_dpc(bound).unwrap();
 
@@ -9935,8 +9925,7 @@ mod tests {
         // same session.
         let other_request = session.plan_request(capture(full_width_fill_words()));
         let other_planned = backend.plan_raw_dpc(other_request).unwrap();
-        let other_bound = finalize_and_submit_pair(&mut session, other_planned)
-            .unwrap();
+        let other_bound = finalize_and_submit_pair(&mut session, other_planned).unwrap();
         let other_submission = other_bound.submission();
         assert_ne!(other_submission, submission);
         assert!(
@@ -10182,8 +10171,7 @@ mod tests {
         );
 
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let error = backend
             .execute_raw_dpc(bound)
             .expect_err("a fill against a zero-height target must not execute");
@@ -10233,8 +10221,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("fixture plans cleanly");
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let prepared = backend
             .execute_raw_dpc(bound)
@@ -10976,7 +10963,8 @@ mod tests {
 
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
-        let (submission, result) = plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
+        let (submission, result) =
+            plan_and_execute_fill(&mut backend, &mut session, fill_and_triangle);
         match result {
             Ok(_) => {
                 assert_eq!(
@@ -11681,8 +11669,7 @@ mod tests {
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let result = backend.execute_raw_dpc(bound);
         let prepared = match result {
@@ -11794,8 +11781,7 @@ mod tests {
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
 
         let planned = plan_with_no_reads(&mut backend, &session, flat_triangle_packet_words());
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let submission = bound.submission();
         let Ok(prepared) = backend.execute_raw_dpc(bound) else {
             return;
@@ -13260,7 +13246,7 @@ mod tests {
         let mut schedule: Vec<(u32, &str)> = plan
             .fills
             .iter()
-            .map(|(command_index, _, _, _)| (*command_index, "fill"))
+            .map(|(command_index, ..)| (*command_index, "fill"))
             .chain(
                 plan.texrect_commands
                     .iter()
@@ -13322,8 +13308,7 @@ mod tests {
         let planned = backend
             .plan_raw_dpc(request)
             .expect("a reserved sync-only capture must plan cleanly");
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         let mut plan_visitor = PlanCollector::seeded(
             None,
@@ -15434,8 +15419,7 @@ mod tests {
             5 << 24 | 0x0abc << 12 | 0x0789,
         ];
         let planned = plan_with_no_reads(&mut backend, &session, words);
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
         let _ = backend.execute_raw_dpc(bound);
 
         let tiles = durable_neutral_tiles(&backend.rdp_state);
@@ -15624,8 +15608,7 @@ mod tests {
              could read the live registers and still look correct"
         );
 
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         // Seeded from `WgpuBackend`'s OWN choice of table -- the same
         // expression `execute_raw_dpc` uses -- so a mutant that leaves the
@@ -15855,8 +15838,7 @@ mod tests {
              read the live registers and still look correct"
         );
 
-        let bound = finalize_and_submit_pair(&mut session, planned)
-            .unwrap();
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
         // **Driven through `execute_raw_dpc_inner`, the function
         // `execute_raw_dpc` delegates to**, with every seed taken from

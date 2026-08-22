@@ -889,8 +889,14 @@ mod tests {
         assert_eq!(
             words[1].1,
             [
-                Some(0x12), Some(0x13), Some(0x14), Some(0x15),
-                Some(0x16), Some(0x17), Some(0x18), Some(0x19),
+                Some(0x12),
+                Some(0x13),
+                Some(0x14),
+                Some(0x15),
+                Some(0x16),
+                Some(0x17),
+                Some(0x18),
+                Some(0x19),
             ]
         );
         // Word 2 is row 1: a full word, so the exchange swaps its two 4-byte
@@ -913,8 +919,14 @@ mod tests {
         assert_eq!(
             words[3].1,
             [
-                Some(0x20), Some(0x21), Some(0x22), Some(0x23),
-                Some(0x1c), Some(0x1d), Some(0x1e), Some(0x1f),
+                Some(0x20),
+                Some(0x21),
+                Some(0x22),
+                Some(0x23),
+                Some(0x1c),
+                Some(0x1d),
+                Some(0x1e),
+                Some(0x1f),
             ]
         );
     }
@@ -1060,7 +1072,9 @@ mod tests {
             assert_eq!(state.last_touched_generation(lane), Some(1));
         }
         assert_eq!(
-            (0_u16..8).map(|lane| state.valid_byte(lane).unwrap()).collect::<Vec<_>>(),
+            (0_u16..8)
+                .map(|lane| state.valid_byte(lane).unwrap())
+                .collect::<Vec<_>>(),
             vec![0x06, 0x07, 0x08, 0x09, 0x02, 0x03, 0x04, 0x05]
         );
     }
