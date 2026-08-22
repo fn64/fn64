@@ -1,5 +1,15 @@
 # WM2000 flat-shading: the combiner census
 
+
+> **PROVENANCE WARNING.** This document's stated authority is
+> angrylion-rdp-plus, which `AGENTS.md:26-45` EXCLUDES from fn64's clean-room
+> protocol (`docs/DISCOVER-PLAN.md:2260` records the exclusion). Its
+> observations about WM2000 and about fn64's own behaviour remain valid --
+> measured facts about a ROM are explicitly allowed -- but **any claim here
+> about what HARDWARE does, sourced only to angrylion, is not admissible as
+> fn64 authority.** Re-ground such a claim on pinned RT64 (MIT), the public
+> libultra headers, or a fresh measurement before acting on it.
+
 Card: distinguish "the sampled texel is wrong" (candidate 1) from "the
 combiner never selects Texel0" (candidate 2), given the prior lane's
 CONFIRMED result that 255,654 of 255,654 admitted triangles are textured and
