@@ -551,11 +551,11 @@ fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
     );
 }
 
-/// The perspective texture-coordinate scale, pinned against angrylion's
+/// The perspective texture-coordinate scale, pinned against RT64's
 /// `tcdiv_persp` rather than against fn64's own constant.
 ///
 /// **Expectations derived by hand from the cycle-accurate oracle, and NOT
-/// from the code under test.** angrylion's chain, traced through three
+/// from the code under test.** The reference chain, traced through three
 /// files:
 ///
 /// 1. `tcdiv_persp` (`src/core/n64video/rdp/tcoord.c:1027-1101`) is fed
@@ -599,7 +599,7 @@ fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
 /// half-magnitude S keeps the expected value inside `i16` while still
 /// depending on the full scale.
 #[test]
-fn the_perspective_scale_matches_angrylions_tcdiv_persp() {
+fn the_perspective_scale_matches_rt64s_texel_scale() {
     // Q16.16 planes. S/W = 0.25, so the expected RAW S10.5 value is
     // 0.25 * 32768 = 8192, comfortably inside i16 and 32x away from the
     // 256 the old 1024 scale would produce.
@@ -609,13 +609,13 @@ fn the_perspective_scale_matches_angrylions_tcdiv_persp() {
 
     assert_eq!(
         out_s, 8192,
-        "S/W = 0.25 must give 0.25 * 2^15 raw S10.5 units, per angrylion's \
+        "S/W = 0.25 must give 0.25 * 2^15 raw S10.5 units, matching RT64's \
          tcdiv_persp scale of 2^15"
     );
     assert_eq!(out_t, 8192, "T takes the identical path");
 
     // The texel coordinate that raw value denotes: 8192 / 2^5 = 256 texels,
-    // which is 0.25 * 2^10 -- angrylion's own "(S/W) * 2^10 texels".
+    // which is 0.25 * 2^10 -- RT64's own `* 1024.0f` texel scale.
     assert_eq!(out_s >> 5, 256);
 }
 
