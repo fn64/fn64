@@ -554,7 +554,7 @@ const TEXELS: [u16; 4] = [0xF801, 0x07C1, 0x003F, 0xFFFF];
 
 /// **One texel of S, in the non-perspective plane's own units.**
 ///
-/// Derived from angrylion, not from fn64's code: `G_TP_NONE` converts an
+/// Derived from the s15.16 wire scale, not from fn64's code: `G_TP_NONE` converts an
 /// s15.16 plane value to S10.5 with `ss = s >> 16` (`rasterizer.c:479`) --
 /// `tcdiv_nopersp` itself applies no scale -- and one whole texel is 32 in
 /// S10.5 (`*S = locs >> 5`, `tcoord.c:143`). So one texel is
@@ -723,12 +723,11 @@ const PERSPECTIVE_W: i32 = 1 << 20;
 /// **The scale here was `1024` and that made this fixture circular.** It was
 /// derived by inverting fn64's own constant, so it asserted the
 /// implementation against itself and passed under a scale that is 32x short
-/// of the hardware's. The value is now angrylion's: `tcdiv_persp`
-/// (`src/core/n64video/rdp/tcoord.c:1027`) returns `(ss/sw) * 2^15` into a
-/// field whose five fractional bits `texture_pipeline_cycle` reads as
-/// `sfrac = sss1 & 0x1f` (`tex.c:182`). See
+/// of the hardware's. The value now matches pinned RT64's
+/// `(texcoord / w) * 1024.0f` (`gbi/rt64_gbi_rdp.cpp:523-530`): S10.5
+/// carries five fractional bits, so 1024 texels is `2^15` in raw units. See
 /// `docs/RT64-WM2000-COMBINER-CENSUS.md` and
-/// `the_perspective_scale_matches_angrylions_tcdiv_persp`.
+/// `the_perspective_scale_matches_rt64s_texel_scale`.
 ///
 /// Everything these fixtures actually CLAIM -- that the divide happens, that
 /// the two paths differ, that W's magnitude is used -- is unchanged and
