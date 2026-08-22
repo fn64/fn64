@@ -171,7 +171,9 @@ mod game {
     use crate::gamepad::Gamepads;
     use crate::input_map::{InputConfig, PadState};
     use crate::overlay::{Capture, Overlay};
-    use crate::timing::{DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow};
+    use crate::timing::{
+        subfield_device_deadline, DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow,
+    };
     use std::sync::Arc;
 
     #[cfg(fn64_cpu_runtime)]
@@ -644,22 +646,42 @@ mod game {
             let start_swaps = fn64_abi::vi_swap_count();
             let mut drain = RetraceDrain::new(start_swaps);
 
-            // Advance the guest clock by exactly one live retrace interval FIRST,
+            // Advance the guest clock to the exact armed retrace FIRST,
             // unconditionally, because the caller only enters here when the
             // 16.67 ms wall deadline is due (`about_to_wait`'s FRAME). One
-            // pump == one field == one retrace, whatever happens below. The
-            // interval may change when a pending OSViMode latches.
+            // pump == one field == one retrace, whatever happens below.
             //
             // Doing it at the TOP is load-bearing: retrace must not depend on
             // whether the game happens to finish a frame during this pump.
-            let interval = fn64_abi::vi_field_interval()
+            // Use the fabric's exact edge rather than `sim_time + interval`:
+            // this pump may have serviced sub-field device deadlines since the
+            // preceding edge, and adding a field to that later time would drift
+            // the independent VI schedule.
+            let tick = fn64_abi::next_vi_deadline()
                 .expect("typed television standard must keep VI armed");
-            let tick = fn64_abi::sim_time() + interval;
             fn64_abi::advance_virtual_time(tick);
 
             loop {
                 let next_priority = fn64_abi::next_runnable_priority();
                 if drain.before_step(next_priority) == DrainDecision::Quiescent {
+                    // The guest can block after scheduling an event only one
+                    // cycle away (raw FullSync -> DP is the live WM2000 case).
+                    // Ending the pump here rounds that event up to the next VI
+                    // edge and inserts an entire field of latency. Service
+                    // every exact non-VI deadline first, then resume whatever
+                    // it wakes; the following VI edge still belongs to the
+                    // next wall-paced pump.
+                    let current = fn64_abi::sim_time();
+                    let next_vi = fn64_abi::next_vi_deadline()
+                        .expect("typed television standard must keep VI armed");
+                    if let Some(deadline) = subfield_device_deadline(
+                        current,
+                        fn64_abi::next_device_deadline(),
+                        next_vi,
+                    ) {
+                        fn64_abi::advance_virtual_time(deadline);
+                        continue;
+                    }
                     // Exact closed loop: after retrace work blocks, OoT's
                     // priority-0 idle thread calls pause_self, which makes it
                     // runnable again. The old driver treated every such yield
