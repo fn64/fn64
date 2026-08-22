@@ -68,6 +68,47 @@ use crate::{
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
+/// Every durable RDP register the execution walk may read before this
+/// submission issues its first state command. One value represents one stream
+/// instant; its fields cannot drift across the packet boundary independently.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RawDpcCarryIn {
+    other_mode: Option<OtherMode>,
+    combine: Option<CombineParams>,
+    blend_color: Color4,
+    env_color: Color4,
+    prim_color: PrimColor,
+    fog_color: Color4,
+    scissor: Option<crate::targets::RdpScissorRect>,
+    color_image: Option<ColorImage>,
+    tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
+}
+
+impl RawDpcCarryIn {
+    fn capture(state: &RdpState) -> Self {
+        Self {
+            other_mode: state.other_mode(),
+            combine: state.combine(),
+            blend_color: state.blend_color(),
+            env_color: state.env_color(),
+            prim_color: state.prim_color(),
+            fog_color: state.fog_color(),
+            scissor: state.scissor(),
+            color_image: state.color_image(),
+            tiles: durable_neutral_tiles(state),
+        }
+    }
+}
+
+impl Default for RawDpcCarryIn {
+    fn default() -> Self {
+        Self::capture(&RdpState::default())
+    }
+}
+
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
 /// outright -- there is exactly one route to one, at construction, per
 /// `RawDpcBackendAuthority::into_coordinator`'s own doc comment.
@@ -85,83 +126,11 @@ pub struct WgpuBackend {
     /// prior submission set (e.g. a `SetTile` from submission N read by a
     /// `LoadBlock` in submission N+1).
     rdp_state: RdpState,
-    /// **The tile registers as they stood BEFORE this submission's own
-    /// `SetTile`/`SetTileSize` commands were applied.**
-    ///
-    /// `plan_raw_dpc` and `execute_raw_dpc` are two separate trait calls
-    /// for one submission, and `plan_raw_dpc` folds the whole packet's
-    /// `RdpStateDelta` into `rdp_state` before `execute_raw_dpc` ever runs.
-    /// Seeding the executor's `PlanCollector` from `rdp_state` at that
-    /// point therefore starts the in-order walk from the packet's **final**
-    /// tile table, not its carry-in: every triangle standing before the
-    /// packet's first `SetTile` is then bound to a tile the guest set
-    /// later in the same packet.
-    ///
-    /// Measured on the real ROM: WM2000 draws each sprite strip as
-    /// `SetTile(tile7) -> LoadTile -> SetTile(tile0) -> 2 triangles`, and a
-    /// packet boundary fell between one strip's two triangles. The orphaned
-    /// second triangle sat at command index 0, before its packet's first
-    /// `SetTile`, so it should have carried the previous packet's tile
-    /// (`line_words = 5`). It was bound to `line_words = 4` -- the value
-    /// the packet's own later `SetTile` installed -- and read its rows at a
-    /// 32-byte stride through an image the load had written at a 40-byte
-    /// stride, landing in the undefined row-tail padding and aborting with
-    /// `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
-    ///
-    /// Snapshotted in `plan_raw_dpc` before `RdpState::apply`, consumed by
-    /// the matching `execute_raw_dpc`. `None` until the first successful
-    /// plan, which is also the only state in which no `execute_raw_dpc`
-    /// can legitimately arrive; the executor falls back to `rdp_state`'s
-    /// live tiles in that case, exactly as it did before this field
-    /// existed.
-    ///
-    /// `combine`, the constant colors and `color_image` are also folded
-    /// early and the same reasoning applies to them, but no measurement
-    /// implicates them yet, so they are deliberately still seeded live.
-    /// `other_mode` WAS measured and has its own snapshot below.
-    tiles_before_last_plan: Option<
-        [(
-            Option<fn64_render::NeutralTileDescriptor>,
-            Option<fn64_render::NeutralTileSize>,
-        ); 8],
-    >,
-    /// **`OtherMode` as it stood BEFORE this submission's own
-    /// `SetOtherMode` commands were applied** -- the sibling of
-    /// `tiles_before_last_plan`, for the same reason and by the same
-    /// mechanism.
-    ///
-    /// `f2c52822` repaired the plan/execute fold's time travel for the
-    /// tile registers only, and said in this struct's own doc that
-    /// widening to `other_mode` would be "a change with no evidence behind
-    /// it". This field is that evidence, measured on the real WM2000 ROM
-    /// on the all-Rust stack:
-    ///
-    /// A packet folded `other_mode.high` from `0x00000cef` to `0x0008acef`.
-    /// `G_MDSFT_TEXTLUT` is bits 15:14, so the carried-in word selects
-    /// `G_TT_NONE` (TLUT off) and the packet-final word selects
-    /// `G_TT_RGBA16` (TLUT on). The packet's FIRST texrect, at command
-    /// index 6, stood before that `SetOtherMode` and so should have run
-    /// TLUT-off -- but was seeded with the folded word.
-    ///
-    /// Under an enabled TLUT the RDP indexes *any* format through the
-    /// palette and confines the index read to half of TMEM (RT64
-    /// `TextureDecoder.hlsli:162-163`, `or(isRgba32, usesTlut)` selecting
-    /// `RDP_TMEM_MASK16`; fn64 implements this in `AddressScope::of` and in
-    /// `tmem_sample.wgsl`). So the texrect's `Rgba`/`Bits16` tile, whose
-    /// row 16 column 2 texel is at linear byte `0x884`, was masked to
-    /// `0x084` and XOR4'd to `0x080` instead of being masked to `0x884` and
-    /// XOR4'd to `0x880`. `0x880` was loaded; `0x080` never was, and the
-    /// `InvalidTexelByte` guard correctly aborted the run at 280 VI swaps.
-    ///
-    /// The guard, the low-half mask and both samplers were right
-    /// throughout. The defect was which stream position the mode came
-    /// from.
-    ///
-    /// Snapshotted and consumed exactly like `tiles_before_last_plan`:
-    /// taken in `plan_raw_dpc` before `RdpState::apply`, on the success
-    /// path only, and falling back to the live register when no plan has
-    /// run yet.
-    other_mode_before_last_plan: Option<Option<OtherMode>>,
+    /// The matching successful plan's complete pre-delta register state.
+    /// Captured immediately before `RdpState::apply`; execution consumes this
+    /// value as a unit, so no register can be seeded from the packet's final
+    /// state while a sibling is seeded from its carry-in state.
+    raw_dpc_carry_in_before_last_plan: Option<RawDpcCarryIn>,
     /// `Some` only after a successful `RenderBackend::create`; `try_new`
     /// never populates it. Always `Some` together with
     /// `triangle_target_extent`, never one without the other.
@@ -301,8 +270,7 @@ impl WgpuBackend {
             Self {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
-                tiles_before_last_plan: None,
-                other_mode_before_last_plan: None,
+                raw_dpc_carry_in_before_last_plan: None,
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
@@ -1032,7 +1000,32 @@ impl PlanCollector {
     /// the same `rdp_state`, via `decode_raw_dpc`'s existing
     /// `durable_state` parameter -- see this card's own design notes for
     /// why neither half needed a signature change to close this gap.
-    fn seeded(
+    fn seeded(carry_in: RawDpcCarryIn) -> Self {
+        Self {
+            loads: Vec::new(),
+            accesses: Vec::new(),
+            next_command_index: 0,
+            current_other_mode: carry_in.other_mode,
+            current_combine: carry_in.combine,
+            current_tiles: carry_in.tiles,
+            current_blend_color: carry_in.blend_color,
+            current_env_color: carry_in.env_color,
+            current_prim_color: carry_in.prim_color,
+            current_fog_color: carry_in.fog_color,
+            current_scissor: carry_in.scissor,
+            current_color_image: carry_in.color_image,
+            triangles: Vec::new(),
+            fills: Vec::new(),
+            full_sync_sites: Vec::new(),
+            triangle_neutral_tiles: Vec::new(),
+            triangle_commands: Vec::new(),
+            texrect_commands: Vec::new(),
+            raw_triangle_commands: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn seeded_from_parts(
         other_mode: Option<OtherMode>,
         combine: Option<CombineParams>,
         blend_color: Color4,
@@ -1046,27 +1039,17 @@ impl PlanCollector {
             Option<fn64_render::NeutralTileSize>,
         ); 8],
     ) -> Self {
-        Self {
-            loads: Vec::new(),
-            accesses: Vec::new(),
-            next_command_index: 0,
-            current_other_mode: other_mode,
-            current_combine: combine,
-            current_tiles: tiles,
-            current_blend_color: blend_color,
-            current_env_color: env_color,
-            current_prim_color: prim_color,
-            current_fog_color: fog_color,
-            current_scissor: scissor,
-            current_color_image: color_image,
-            triangles: Vec::new(),
-            fills: Vec::new(),
-            full_sync_sites: Vec::new(),
-            triangle_neutral_tiles: Vec::new(),
-            triangle_commands: Vec::new(),
-            texrect_commands: Vec::new(),
-            raw_triangle_commands: Vec::new(),
-        }
+        Self::seeded(RawDpcCarryIn {
+            other_mode,
+            combine,
+            blend_color,
+            env_color,
+            prim_color,
+            fog_color,
+            scissor,
+            color_image,
+            tiles,
+        })
     }
 }
 
@@ -1528,17 +1511,7 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
         // its exact seed values are irrelevant.
         self.plan = core::mem::replace(
             plan_visitor,
-            PlanCollector::seeded(
-                None,
-                None,
-                Color4::default(),
-                Color4::default(),
-                PrimColor::default(),
-                Color4::default(),
-                None,
-                None,
-                [(None, None); 8],
-            ),
+            PlanCollector::seeded(RawDpcCarryIn::default()),
         );
     }
 
@@ -2323,15 +2296,9 @@ impl RenderBackend for WgpuBackend {
                 backend: "render-wgpu/raw-dpc-plan",
                 reason,
             })?;
-        // BEFORE the fold, not after: see `tiles_before_last_plan`'s doc.
-        // Taken only on the success path, so a rejected plan leaves the
-        // previous submission's snapshot in place rather than replacing it
-        // with one for a packet that never executes.
-        self.tiles_before_last_plan = Some(durable_neutral_tiles(&self.rdp_state));
-        // Same rule, same instant, same success-path-only guard as the
-        // tile snapshot above: see `other_mode_before_last_plan`'s doc for
-        // the measurement that made this register non-hypothetical.
-        self.other_mode_before_last_plan = Some(self.rdp_state.other_mode());
+        // This single capture is intentionally adjacent to and before the
+        // fold: splitting it by register recreates mixed-time carry-in.
+        self.raw_dpc_carry_in_before_last_plan = Some(RawDpcCarryIn::capture(&self.rdp_state));
         self.rdp_state.apply(&delta);
         Ok(planned)
     }
@@ -2343,17 +2310,8 @@ impl RenderBackend for WgpuBackend {
         let (prepared, triangles, pending, draw_tmem) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
-            self.other_mode_before_last_plan
-                .unwrap_or_else(|| self.rdp_state.other_mode()),
-            self.rdp_state.combine(),
-            self.rdp_state.blend_color(),
-            self.rdp_state.env_color(),
-            self.rdp_state.prim_color(),
-            self.rdp_state.fog_color(),
-            self.rdp_state.scissor(),
-            self.rdp_state.color_image(),
-            self.tiles_before_last_plan
-                .unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state)),
+            self.raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&self.rdp_state)),
             &mut self.color_targets,
             self.configured_target_extent,
         )
@@ -2813,37 +2771,13 @@ fn transaction_sequence(packet: &WorkloadPacket) -> u64 {
 /// `into_physical_successor` (T3 Phase A) result to
 /// `RawDpcCoordinator::complete_execution`.
 ///
-/// `durable_other_mode`/`durable_combine`/`durable_blend_color`/
-/// `durable_env_color`/`durable_prim_color`/`durable_fog_color` are
-/// `WgpuBackend.rdp_state`'s own current values, passed in by the trait
-/// method (which has `self`) since this is a free function taking only
-/// `coordinator` -- they seed `PlanCollector`'s walk (`PlanCollector::seeded`)
-/// so a triangle in this submission with no `SetOtherMode`/`SetCombine`/
-/// `SetBlendColor`/`SetEnvColor`/`SetPrimColor`/`SetFogColor` of its own
-/// still resolves its draw state from durable cross-submission carry-in, not
-/// `None`. `durable_color_image` is the same carry-in for `SetColorImage`,
-/// and is what `color_target_key` derives this packet's destination from --
-/// the register the decoder's own write-access planner already reads.
-#[allow(clippy::too_many_arguments)]
+/// `carry_in` is the complete pre-delta state captured for this plan. The walk
+/// advances its fields in command order; it never consults the already-folded
+/// durable state while retrieving this packet's draws.
 fn execute_raw_dpc_inner(
     coordinator: &mut RawDpcCoordinator<PhysicalTmemState>,
     bound: BoundSubmittedRawDpc,
-    durable_other_mode: Option<OtherMode>,
-    durable_combine: Option<CombineParams>,
-    durable_blend_color: Color4,
-    durable_env_color: Color4,
-    durable_prim_color: PrimColor,
-    durable_fog_color: Color4,
-    // `durable_scissor`: the rect latched by an EARLIER packet, or `None`
-    // if none has ever been issued. Passed for the same reason as the color
-    // registers above -- `SetScissor` is durable RDP state, so a packet
-    // that issues none must still be clipped by whatever the last one set.
-    durable_scissor: Option<crate::targets::RdpScissorRect>,
-    durable_color_image: Option<ColorImage>,
-    durable_tiles: [(
-        Option<fn64_render::NeutralTileDescriptor>,
-        Option<fn64_render::NeutralTileSize>,
-    ); 8],
+    carry_in: RawDpcCarryIn,
     color_targets: &mut Option<ColorTargetRegistry>,
     configured_target_extent: Option<TriangleTargetExtent>,
 ) -> Result<
@@ -2855,33 +2789,13 @@ fn execute_raw_dpc_inner(
     ),
     WgpuRawDpcExecutionError,
 > {
-    let mut plan_visitor = PlanCollector::seeded(
-        durable_other_mode,
-        durable_combine,
-        durable_blend_color,
-        durable_env_color,
-        durable_prim_color,
-        durable_fog_color,
-        durable_scissor,
-        durable_color_image,
-        durable_tiles,
-    );
+    let mut plan_visitor = PlanCollector::seeded(carry_in);
     let mut view = ExecutionCollector {
         physical: coordinator.physical(),
         queue: bound.queue(),
         ordinal: bound.ordinal(),
         submission: bound.submission(),
-        plan: PlanCollector::seeded(
-            durable_other_mode,
-            durable_combine,
-            durable_blend_color,
-            durable_env_color,
-            durable_prim_color,
-            durable_fog_color,
-            durable_scissor,
-            durable_color_image,
-            durable_tiles,
-        ),
+        plan: PlanCollector::seeded(carry_in),
         reads: Vec::new(),
         outcome: None,
         color_targets,
@@ -7899,7 +7813,7 @@ mod tests {
     fn plan_collector_snapshots_distinct_fog_colors_through_a_and_b_triangles() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8010,7 +7924,7 @@ mod tests {
     fn plan_collector_snapshots_scissor_per_triangle() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8080,7 +7994,7 @@ mod tests {
     #[test]
     fn plan_collector_carries_a_seeded_scissor_into_a_packet_that_sets_none() {
         let seeded = crate::targets::RdpScissorRect::from_wire_quarter_pixels(2, 40, 44, 48, 52);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
             Color4::from_wire(0),
@@ -8195,7 +8109,7 @@ mod tests {
         let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
         tiles[5] = (Some(descriptor_five), Some(size_five));
 
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
             Color4::from_wire(0),
@@ -8247,7 +8161,7 @@ mod tests {
         let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
         tiles[5] = (Some(descriptor_five), Some(size_five));
 
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
             Color4::from_wire(0),
@@ -8413,7 +8327,7 @@ mod tests {
     fn plan_collector_snapshots_distinct_env_and_prim_colors_through_a_and_b_triangles() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8475,7 +8389,7 @@ mod tests {
         let seed_combine = CombineParams::from_wire(0, 0);
         let seed_env_color = Color4::from_wire(0x5555_5555);
         let seed_prim_color = PrimColor::from_wire(15 | (7 << 8), 0x6666_6666);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8498,12 +8412,12 @@ mod tests {
 
     /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
     /// neither seeded nor in-plan -- must be a loud, named rejection, not
-    /// a silent default. Proves `PlanCollector::seeded(None, None)`
+    /// a silent default. Proves `PlanCollector::seeded_from_parts(None, None)`
     /// (unseeded) genuinely leaves `current_other_mode`/`current_combine`
     /// at `None` rather than defaulting them.
     #[test]
     fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -8538,7 +8452,7 @@ mod tests {
     fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8571,7 +8485,7 @@ mod tests {
     fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
         let seed_combine = CombineParams::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(seed_combine),
             Color4::from_wire(0),
@@ -8617,7 +8531,7 @@ mod tests {
     #[test]
     fn plan_collector_lets_an_in_plan_set_other_mode_override_the_seed() {
         let seed_other_mode = OtherMode::from_wire(0, 0);
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(seed_other_mode),
             Some(CombineParams::from_wire(0, 0)),
             Color4::from_wire(0),
@@ -8649,7 +8563,7 @@ mod tests {
     /// `Triangle` as `unreachable!()`.
     #[test]
     fn plan_collector_walks_a_triangle_only_plan_without_panicking() {
-        let mut collector = PlanCollector::seeded(
+        let mut collector = PlanCollector::seeded_from_parts(
             Some(OtherMode::from_wire(0, 0)),
             Some(CombineParams::from_wire(0, 0)),
             Color4::from_wire(0),
@@ -9759,15 +9673,9 @@ mod tests {
         let (_prepared, _triangles, pending, _draw_tmem) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
-            backend.rdp_state.other_mode(),
-            backend.rdp_state.combine(),
-            backend.rdp_state.blend_color(),
-            backend.rdp_state.env_color(),
-            backend.rdp_state.prim_color(),
-            backend.rdp_state.fog_color(),
-            backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
-            durable_neutral_tiles(&backend.rdp_state),
+            backend
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
         )
@@ -11153,7 +11061,7 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(
+        let mut plan_visitor = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -11168,7 +11076,7 @@ mod tests {
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(
+            plan: PlanCollector::seeded_from_parts(
                 None,
                 None,
                 Color4::from_wire(0),
@@ -11482,7 +11390,7 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(
+        let mut plan_visitor = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -11497,7 +11405,7 @@ mod tests {
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(
+            plan: PlanCollector::seeded_from_parts(
                 None,
                 None,
                 Color4::from_wire(0),
@@ -12530,15 +12438,9 @@ mod tests {
         let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
-            backend.rdp_state.other_mode(),
-            backend.rdp_state.combine(),
-            backend.rdp_state.blend_color(),
-            backend.rdp_state.env_color(),
-            backend.rdp_state.prim_color(),
-            backend.rdp_state.fog_color(),
-            backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
-            durable_neutral_tiles(&backend.rdp_state),
+            backend
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
         )
@@ -12653,7 +12555,7 @@ mod tests {
             plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
-        let mut plan_visitor = PlanCollector::seeded(
+        let mut plan_visitor = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -12672,7 +12574,7 @@ mod tests {
             queue: bound.queue(),
             ordinal: bound.ordinal(),
             submission: bound.submission(),
-            plan: PlanCollector::seeded(
+            plan: PlanCollector::seeded_from_parts(
                 None,
                 None,
                 Color4::from_wire(0),
@@ -12857,15 +12759,9 @@ mod tests {
         let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
-            backend.rdp_state.other_mode(),
-            backend.rdp_state.combine(),
-            backend.rdp_state.blend_color(),
-            backend.rdp_state.env_color(),
-            backend.rdp_state.prim_color(),
-            backend.rdp_state.fog_color(),
-            backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
-            durable_neutral_tiles(&backend.rdp_state),
+            backend
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
         )
@@ -13310,7 +13206,7 @@ mod tests {
             .expect("a reserved sync-only capture must plan cleanly");
         let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(
+        let mut plan_visitor = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -13325,7 +13221,7 @@ mod tests {
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(
+            plan: PlanCollector::seeded_from_parts(
                 None,
                 None,
                 Color4::from_wire(0),
@@ -13358,7 +13254,7 @@ mod tests {
         let read_capture = guest_read_capture(&planned, &source_bytes);
         let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-        let mut plan_visitor = PlanCollector::seeded(
+        let mut plan_visitor = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -13373,7 +13269,7 @@ mod tests {
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
         let mut view = ExecutionCollector {
-            plan: PlanCollector::seeded(
+            plan: PlanCollector::seeded_from_parts(
                 None,
                 None,
                 Color4::from_wire(0),
@@ -15351,6 +15247,121 @@ mod tests {
         );
     }
 
+    /// Packet A establishes `(Zero - Zero) * Zero + Primitive` with a white
+    /// primitive. Packet B draws a CI4 texrect, changes to black primitive and
+    /// Texel0 passthrough, then draws again. State must not travel backwards.
+    ///
+    /// For texel `[32, 64, 128, 255]`, expected channels come directly from
+    /// `(A-B)*C+D`: first `(0-0)*0+1`, then `(0-0)*0+Texel0`. No fn64 output
+    /// is captured as the oracle.
+    #[test]
+    fn a_raw_dpc_packet_does_not_apply_later_combiner_state_retroactively() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let flat_primitive = one_cycle_combine_words(FLAT_PRIM_COLOR, FLAT_PRIM_ALPHA);
+        let texel0_passthrough = one_cycle_combine_words([8, 8, 16, 1], [7, 7, 7, 1]);
+
+        let mut first = Vec::new();
+        first.extend(set_other_mode(0, 0));
+        // SetTile: format=CI (2), size=4-bit (0), line=1, tile=7.
+        first.extend([word(SET_TILE, 2 << 21 | 1 << 9), 7 << 24]);
+        first.extend(set_tile_size_words(7, 7 << 2, 7 << 2));
+        first.extend(flat_primitive);
+        first.extend(set_prim_color(0, 0, 0xffff_ffff));
+        backend
+            .plan_raw_dpc(session.plan_request(capture(first)))
+            .expect("packet A establishes the carry-in state");
+
+        let mut second = Vec::new();
+        second.extend(texrect_words_at(7, 0, 0, 3, 1));
+        second.extend(set_prim_color(0, 0, 0x0000_00ff));
+        second.extend(texel0_passthrough);
+        second.extend(texrect_words_at(7, 4, 0, 7, 1));
+        let planned = backend
+            .plan_raw_dpc(session.plan_request(capture(second)))
+            .expect("packet B plans cleanly");
+        let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
+
+        // The production execute_raw_dpc seeding shape: one complete
+        // pre-delta snapshot, never per-register reads from mixed times.
+        let mut plan_visitor = PlanCollector::seeded(
+            backend
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+        );
+        let mut color_targets = None;
+        let mut view = ExecutionCollector {
+            plan: PlanCollector::seeded_from_parts(
+                None,
+                None,
+                Color4::default(),
+                Color4::default(),
+                PrimColor::default(),
+                Color4::default(),
+                None,
+                None,
+                [(None, None); 8],
+            ),
+            reads: Vec::new(),
+            outcome: None,
+            queue: bound.queue(),
+            ordinal: bound.ordinal(),
+            submission: bound.submission(),
+            physical: backend.coordinator.physical(),
+            color_targets: &mut color_targets,
+            configured_target_extent: backend.configured_target_extent,
+            draw_tmem: None,
+        };
+        backend
+            .coordinator
+            .execution_view(&bound, &mut plan_visitor, &mut view);
+
+        assert_eq!(
+            view.plan.triangles.len(),
+            4,
+            "two texrects produce two triangles each"
+        );
+        let draws: Vec<_> = view
+            .plan
+            .triangles
+            .iter()
+            .map(|draw| draw.as_ref().expect("each texrect retrieves draw state"))
+            .collect();
+        let texel = [32.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+        for (index, draw) in draws.iter().enumerate() {
+            let inputs = crate::combiner::combiner_inputs_from_fragment_registers(
+                crate::combiner::CombinerInputs {
+                    tex_val0: texel,
+                    tex_val1: [0.0; 4],
+                    prim_color: [0.0; 4],
+                    shade_color: [0.0; 4],
+                    env_color: [0.0; 4],
+                    key_center: [0.0; 3],
+                    key_scale: [0.0; 3],
+                    lod_fraction: 0.0,
+                    prim_lod_frac: 0.0,
+                    noise: 0.0,
+                    k4: 0.0,
+                    k5: 0.0,
+                },
+                draw.env_color,
+                draw.prim_color,
+            );
+            let (actual, _) = crate::combiner::run_one_cycle(draw.combine_params, inputs);
+            let expected = if index < 2 { [1.0; 4] } else { texel };
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() < 1.0e-6,
+                    "draw {index} channel {channel}: expected {expected:?}, got {actual:?}"
+                );
+            }
+            assert_eq!(
+                draw.combine_params.references_texels_in_first_cycle(),
+                index >= 2,
+                "only the second rectangle may read Texel0"
+            );
+        }
+    }
+
     /// `a_second_packet_composes_into_the_color_image_the_first_one_declared`'s
     /// second packet, as its own function so the positive control measures
     /// the identical word stream the test executes rather than a retyped
@@ -15380,7 +15391,7 @@ mod tests {
     /// with a zeroed default would fail the second assertion.
     #[test]
     fn a_plan_collector_starts_from_the_durable_tile_registers() {
-        let unseeded = PlanCollector::seeded(
+        let unseeded = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -15494,7 +15505,7 @@ mod tests {
         assert_eq!(neutral_size.low_t, 0x0cba, "low_t is w0 bits 11:0");
         assert_eq!(neutral_size.high_s, 0x0abc, "high_s is w1 bits 23:12");
         assert_eq!(neutral_size.high_t, 0x0789, "high_t is w1 bits 11:0");
-        let seeded = PlanCollector::seeded(
+        let seeded = PlanCollector::seeded_from_parts(
             None,
             None,
             Color4::from_wire(0),
@@ -15537,7 +15548,7 @@ mod tests {
     ///
     /// **Asserted on the binding the walk actually produced, never on the
     /// snapshot field itself.** An earlier draft read
-    /// `backend.tiles_before_last_plan` directly; a mutant that recorded
+    /// `backend.raw_dpc_carry_in_before_last_plan` directly; a mutant that recorded
     /// the snapshot correctly and then had the executor ignore it (reading
     /// the live, already-folded `rdp_state` instead -- exactly the
     /// pre-repair behaviour) SURVIVED that draft. Seeding the collector
@@ -15614,19 +15625,9 @@ mod tests {
         // expression `execute_raw_dpc` uses -- so a mutant that leaves the
         // snapshot correct but has the executor ignore it is still caught.
         let seed = backend
-            .tiles_before_last_plan
-            .unwrap_or_else(|| durable_neutral_tiles(&backend.rdp_state));
-        let mut plan_visitor = PlanCollector::seeded(
-            backend.rdp_state.other_mode(),
-            backend.rdp_state.combine(),
-            backend.rdp_state.blend_color(),
-            backend.rdp_state.env_color(),
-            backend.rdp_state.prim_color(),
-            backend.rdp_state.fog_color(),
-            backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
-            seed,
-        );
+            .raw_dpc_carry_in_before_last_plan
+            .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state));
+        let mut plan_visitor = PlanCollector::seeded(seed);
         let mut color_targets = None;
         let configured_target_extent = backend.configured_target_extent;
         let coordinator = &backend.coordinator;
@@ -15635,17 +15636,7 @@ mod tests {
             queue: bound.queue(),
             ordinal: bound.ordinal(),
             submission: bound.submission(),
-            plan: PlanCollector::seeded(
-                backend.rdp_state.other_mode(),
-                backend.rdp_state.combine(),
-                backend.rdp_state.blend_color(),
-                backend.rdp_state.env_color(),
-                backend.rdp_state.prim_color(),
-                backend.rdp_state.fog_color(),
-                backend.rdp_state.scissor(),
-                backend.rdp_state.color_image(),
-                seed,
-            ),
+            plan: PlanCollector::seeded(seed),
             reads: Vec::new(),
             outcome: None,
             color_targets: &mut color_targets,
@@ -15678,7 +15669,7 @@ mod tests {
 
     /// **A REJECTED plan must not replace the snapshot.**
     ///
-    /// `tiles_before_last_plan` is recorded on `plan_raw_dpc`'s success
+    /// `raw_dpc_carry_in_before_last_plan` is recorded on `plan_raw_dpc`'s success
     /// path only, after `plan_raw_dpc_inner` returns `Ok`. Moving it above
     /// that call would record a snapshot for a packet that never executes,
     /// so the next `execute_raw_dpc` -- which belongs to whichever
@@ -15709,10 +15700,10 @@ mod tests {
             .expect("the tile-establishing submission plans cleanly");
 
         let after_success = backend
-            .tiles_before_last_plan
+            .raw_dpc_carry_in_before_last_plan
             .expect("a successful plan records a snapshot");
         assert!(
-            after_success[0].0.is_none(),
+            after_success.tiles[0].0.is_none(),
             "positive control: this FIRST plan's own snapshot is the state before it ran, \
              which bound no tile -- if it already carried one, the comparison below could \
              not tell a preserved snapshot from a re-taken one"
@@ -15736,7 +15727,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .tiles_before_last_plan
+                .raw_dpc_carry_in_before_last_plan
                 .expect("the snapshot must still be present after a rejected plan"),
             after_success,
             "a rejected plan must leave the last SUCCESSFUL submission's snapshot untouched. \
@@ -15848,7 +15839,7 @@ mod tests {
         // `self.rdp_state.other_mode()` at the call site changes THIS
         // value and is caught.
         //
-        // Reading `backend.other_mode_before_last_plan` in the test instead
+        // Reading `backend.raw_dpc_carry_in_before_last_plan` in the test instead
         // and handing it to a locally-built `PlanCollector` does NOT catch
         // that mutant -- measured: the first draft did exactly that and the
         // consumer-side mutant passed. This is the trap the tile-side
@@ -15859,18 +15850,8 @@ mod tests {
             &mut backend.coordinator,
             bound,
             backend
-                .other_mode_before_last_plan
-                .unwrap_or_else(|| backend.rdp_state.other_mode()),
-            backend.rdp_state.combine(),
-            backend.rdp_state.blend_color(),
-            backend.rdp_state.env_color(),
-            backend.rdp_state.prim_color(),
-            backend.rdp_state.fog_color(),
-            backend.rdp_state.scissor(),
-            backend.rdp_state.color_image(),
-            backend
-                .tiles_before_last_plan
-                .unwrap_or_else(|| durable_neutral_tiles(&backend.rdp_state)),
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut color_targets,
             backend.configured_target_extent,
         )
@@ -15935,25 +15916,18 @@ mod tests {
             .unwrap_or(source.len());
         let body = &source[body_start..next_fn];
         assert!(
-            body.contains("self.other_mode_before_last_plan"),
+            body.contains("self.raw_dpc_carry_in_before_last_plan"),
             "execute_raw_dpc must seed `other_mode` from the pre-delta snapshot \
-             `other_mode_before_last_plan`. Reading `rdp_state` directly reads the packet's \
+             `raw_dpc_carry_in_before_last_plan`. Reading `rdp_state` directly reads the packet's \
              own already-folded SetOtherModes, which ran WM2000's first texrect under a \
              G_TT_RGBA16 the guest had not set yet and sent it down the enabled-TLUT \
              half-TMEM address path"
         );
         assert_eq!(
-            body.matches("self.rdp_state.other_mode()").count(),
+            body.matches("RawDpcCarryIn::capture(&self.rdp_state)")
+                .count(),
             1,
-            "the only `self.rdp_state.other_mode()` in execute_raw_dpc must be the \
-             `unwrap_or_else` fallback for the no-plan-yet case -- a second, unconditional \
-             one would reintroduce the live-register read the snapshot exists to replace"
-        );
-        assert!(
-            body.contains(".unwrap_or_else(|| self.rdp_state.other_mode())"),
-            "that one call must be the fallback arm specifically, so a backend that has \
-             executed before it ever planned still resolves a mode rather than panicking \
-             on an empty Option"
+            "the only live-state read in execute_raw_dpc must build the complete typed fallback",
         );
     }
 
@@ -15961,7 +15935,7 @@ mod tests {
     ///
     /// The arm the repair KEEPS, pinned for the same reason the tile
     /// sibling `a_rejected_plan_leaves_the_previous_submissions_tile_snapshot_in_place`
-    /// pins its own: `other_mode_before_last_plan` is assigned after
+    /// pins its own: `raw_dpc_carry_in_before_last_plan` is assigned after
     /// `plan_raw_dpc_inner` returns `Ok`, and hoisting it above that
     /// fallible call would stamp a boundary for a packet that never
     /// executes.
@@ -15982,7 +15956,7 @@ mod tests {
             .plan_raw_dpc(session.plan_request(capture(first)))
             .expect("the mode-establishing submission plans cleanly");
         let after_success = backend
-            .other_mode_before_last_plan
+            .raw_dpc_carry_in_before_last_plan
             .expect("a successful plan records the pre-delta other-mode snapshot");
 
         // A submission that is rejected at plan time -- `FullSync`
@@ -16003,7 +15977,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .other_mode_before_last_plan
+                .raw_dpc_carry_in_before_last_plan
                 .expect("the snapshot must still be present after a rejected plan"),
             after_success,
             "a rejected plan must leave the last SUCCESSFUL submission's other-mode \
@@ -16047,25 +16021,17 @@ mod tests {
             .unwrap_or(source.len());
         let body = &source[body_start..next_fn];
         assert!(
-            body.contains("self.tiles_before_last_plan"),
+            body.contains("self.raw_dpc_carry_in_before_last_plan"),
             "execute_raw_dpc must seed its tile walk from the pre-delta snapshot \
-             `tiles_before_last_plan`. Reading `rdp_state` directly reads the packet's own \
+             `raw_dpc_carry_in_before_last_plan`. Reading `rdp_state` directly reads the packet's own \
              already-folded SetTiles, which binds every draw standing before the packet's \
              first SetTile to a register the guest had not set yet"
         );
         assert_eq!(
-            body.matches("durable_neutral_tiles(&self").count(),
+            body.matches("RawDpcCarryIn::capture(&self.rdp_state)")
+                .count(),
             1,
-            "the only `durable_neutral_tiles(&self.rdp_state)` in execute_raw_dpc must be \
-             the `unwrap_or_else` fallback for the no-plan-yet case -- a second, \
-             unconditional one would reintroduce the live-register read the snapshot exists \
-             to replace"
-        );
-        assert!(
-            body.contains(".unwrap_or_else(|| durable_neutral_tiles(&self.rdp_state))"),
-            "that one call must be the fallback arm specifically, so a backend that has \
-             executed before it ever planned still resolves a tile table rather than \
-             panicking on an empty Option"
+            "the only live-state read in execute_raw_dpc must build the complete typed fallback",
         );
     }
 

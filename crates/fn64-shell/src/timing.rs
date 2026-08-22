@@ -11,6 +11,24 @@ pub enum DrainDecision {
     Quiescent,
 }
 
+/// Select an exact device deadline that a quiescent retrace pump must service
+/// before returning, without consuming the following VI edge.
+///
+/// `fn64_abi::next_device_deadline` exists for this boundary: raw FullSync and
+/// other mid-slice devices can schedule completion one cycle after the guest
+/// blocks, while the next VI edge is still a full field away. The shell must
+/// advance to that sub-field event and resume the newly-runnable guest in the
+/// same pump. A deadline at the VI edge belongs to the next pump.
+pub fn subfield_device_deadline(
+    current: u64,
+    next_device: Option<u64>,
+    next_vi: u64,
+) -> Option<u64> {
+    next_device
+        .filter(|deadline| *deadline < next_vi)
+        .map(|deadline| deadline.max(current))
+}
+
 /// State for exactly one host-driven VI retrace. A framebuffer swap is
 /// recorded in the outcome but cannot end the drain; only an empty run queue
 /// or a second consecutive turn for the idle thread is quiescence.
@@ -229,6 +247,28 @@ mod tests {
                 swapped: true,
                 steps: 3,
             }
+        );
+    }
+
+    /// The live raw-DPC path schedules FullSync completion one cycle after
+    /// synchronous renderer publication. Rounding that deadline up to the next
+    /// VI pump inserts an entire field between DP completion and the scheduler
+    /// wake, turning WM2000's two-field frame into the measured three-pump
+    /// 3.5/4.4/33 ms rhythm.
+    #[test]
+    fn a_quiescent_pump_services_full_sync_before_the_next_vi_edge() {
+        let current = 10_000;
+        let next_vi = 20_000;
+
+        assert_eq!(
+            subfield_device_deadline(current, Some(current + 1), next_vi),
+            Some(current + 1),
+            "the one-cycle DP completion must remain in this retrace pump"
+        );
+        assert_eq!(
+            subfield_device_deadline(current, Some(next_vi), next_vi),
+            None,
+            "the following VI edge starts the next retrace pump"
         );
     }
 }
