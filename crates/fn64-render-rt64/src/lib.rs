@@ -1618,7 +1618,17 @@ impl RenderBackend for Rt64Backend {
                 });
             }
             debug_assert!(start_usize < end_usize);
-            let full_sync = fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)?;
+            // The scan is tri-state since the DPC stall fix. An INCOMPLETE
+            // stream reserves no FullSync slot -- the same rule the shipping
+            // lane applies in `rsp_commit.rs`'s `scan_raw_dpc_full_sync`, so
+            // the oracle and the backend under test agree about what a
+            // partially-arrived command range means.
+            let full_sync = match fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)? {
+                fn64_render::RawRdpScan::Complete(status) => status,
+                fn64_render::RawRdpScan::Incomplete {
+                    complete_prefix, ..
+                } => complete_prefix,
+            };
             let mut context = NativeContextLease::take(&mut self.context)
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
             // No RDRAM rollback here, deliberately: on the only path that
