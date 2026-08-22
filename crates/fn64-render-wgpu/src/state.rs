@@ -64,7 +64,7 @@
 //! independent bits, this module follows the silicon: the texture-LUT field
 //! (high 15:14) and the alpha-compare field (low 1:0) each decode two
 //! independent bits, so their nominally-reserved encodings mean "feature off"
-//! and are not distinct variants (angrylion `src/core/n64video/rdp.c:630-631`
+//! and are not distinct variants (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`
 //! and `:659-660`; `docs/RT64-GUARD-AUDIT.md` findings A2 and A3). Encodings
 //! that are genuinely unverified are still preserved as distinct variants
 //! (`TextureFilter::Reserved`). No claim is made about byte layout,
@@ -87,7 +87,7 @@ use crate::tmem::TmemState;
 /// Texture lookup-table interpretation selected by `SetOtherModes` high bits
 /// 15:14 (`G_MDSFT_TEXTLUT`).
 ///
-/// **There is no two-bit TLUT enum on hardware.** angrylion-rdp-plus decodes
+/// **There is no two-bit TLUT enum on hardware.** Pinned RT64 decodes
 /// bits 15 and 14 as two *independent* one-bit fields
 /// (`src/core/n64video/rdp.c:630-631`):
 ///
@@ -229,7 +229,7 @@ impl OtherMode {
 
     /// Decodes other-mode high bits 15:14 as the two independent hardware
     /// bits they are: bit 15 is `en_tlut`, bit 14 is `tlut_type`
-    /// (angrylion `src/core/n64video/rdp.c:630-631`). With `en_tlut` clear
+    /// (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`). With `en_tlut` clear
     /// the type bit is dead, so both encodings 0 and 1 are `Disabled`.
     pub const fn texture_lut_mode(self) -> TextureLutMode {
         let enabled = self.high & (1 << 15) != 0;
@@ -310,7 +310,7 @@ impl OtherMode {
     }
 
     /// Other-mode low bits 0:1 (`G_MDSFT_ALPHACOMPARE`). **Not a two-bit
-    /// enum on hardware:** angrylion decodes two independent bits
+    /// enum on hardware:** pinned RT64 decodes two independent bits
     /// (`src/core/n64video/rdp.c:659-660`):
     ///
     /// ```c
@@ -743,7 +743,10 @@ pub struct RdpState {
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
     /// `G_SETSCISSOR`'s latched clip rect, in the quarter-pixel wire units
-    /// angrylion's `rdp_set_scissor` latches (`rasterizer.c:2779-2784`).
+    /// the scissor command latches. The public libultra macro
+    /// `gDPSetScissor` (`ultra64/gbi.h:4794-4837`) shows the wire
+    /// encoding: each bound is stored as `(int)(coord * 4.0f)`, i.e.
+    /// quarter-pixel units in two 12-bit fields.
     ///
     /// **Durable across packets, like every other `Set*` register here.**
     /// A display list that sets the scissor once at the top of a frame and
@@ -1158,8 +1161,8 @@ mod tests {
 
     #[test]
     /// Hand-derived from the bit layout, not from the code under test:
-    /// bit 15 is `en_tlut`, bit 14 is `tlut_type` (angrylion
-    /// `src/core/n64video/rdp.c:630-631`). With `en_tlut` clear the type bit
+    /// bit 15 is `en_tlut`, bit 14 is `tlut_type` (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`
+    /// ). With `en_tlut` clear the type bit
     /// is dead, so encodings 0 and 1 both mean the TLUT is off; with it set,
     /// `tlut_type` picks IA16 over RGBA16 (`rdp/rasterizer.c:76`).
     ///
@@ -1199,7 +1202,7 @@ mod tests {
     /// Encoding 1 is no longer an error at all; it is the TLUT being off, and
     /// it must be *observably distinct* from the enabled encodings, so that a
     /// decoder that collapsed everything to one answer cannot pass.
-    /// angrylion `src/core/n64video/rdp.c:630-631`.
+    /// pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`.
     fn tlut_type_bit_alone_does_not_enable_the_table() {
         let type_bit_only = OtherMode::from_wire(1 << 14, 0);
         assert_eq!(type_bit_only.texture_lut_mode(), TextureLutMode::Disabled);
@@ -1345,7 +1348,7 @@ mod tests {
 
     #[test]
     /// Hand-derived from the bit layout, not from the code under test: bit 0
-    /// is `alpha_compare_en`, bit 1 is `dither_alpha_en` (angrylion
+    /// is `alpha_compare_en`, bit 1 is `dither_alpha_en` (pinned RT64
     /// `src/core/n64video/rdp.c:659-660`), and `rdp/blender.c`'s
     /// `alpha_compare` returns 1 unconditionally when bit 0 is clear. So
     /// encoding 2 (`dither_alpha_en` set, `alpha_compare_en` clear) is
@@ -1666,7 +1669,7 @@ mod tests {
         let compares = [
             AlphaCompare::None,
             AlphaCompare::Threshold,
-            // Encoding 2 clears `alpha_compare_en` (angrylion rdp.c:660), so
+            // Encoding 2 clears `alpha_compare_en` (pinned RT64 `shaders/RasterPS.hlsl:203-213`), so
             // it is `None`, not a fourth distinct mode.
             AlphaCompare::None,
             AlphaCompare::Dither,
