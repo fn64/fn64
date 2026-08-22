@@ -1351,10 +1351,7 @@ impl FixtureBuffers {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            raster_params: uniform(
-                "fn64-triangle-pipeline-raster-params",
-                RASTER_PARAMS_BYTES,
-            ),
+            raster_params: uniform("fn64-triangle-pipeline-raster-params", RASTER_PARAMS_BYTES),
             combine_params: uniform(
                 "fn64-triangle-pipeline-combine-params",
                 COMBINE_PARAMS_BYTES,

@@ -875,8 +875,14 @@ mod tests {
         let words = prepared_lanes(spec);
         assert_eq!(words.len(), 2);
         // Row 0: no exchange. Row 1: exchange.
-        assert!(!words[0].0.odd_row_exchange(), "word 0 is tile-relative row 0");
-        assert!(words[1].0.odd_row_exchange(), "word 1 is tile-relative row 1");
+        assert!(
+            !words[0].0.odd_row_exchange(),
+            "word 0 is tile-relative row 0"
+        );
+        assert!(
+            words[1].0.odd_row_exchange(),
+            "word 1 is tile-relative row 1"
+        );
         assert_eq!(words[1].0.defined_source_byte_mask(), 0xff);
         // `source_t = 1` offsets the logical source by one image row
         // (8 texels * 2 bytes = 16 bytes), so the captured bytes start at
@@ -925,8 +931,14 @@ mod tests {
         };
         let words = prepared_lanes(spec);
         assert_eq!(words.len(), 2);
-        assert!(!words[0].0.odd_row_exchange(), "word 0 is tile-relative row 0");
-        assert!(words[1].0.odd_row_exchange(), "word 1 is tile-relative row 1");
+        assert!(
+            !words[0].0.odd_row_exchange(),
+            "word 0 is tile-relative row 0"
+        );
+        assert!(
+            words[1].0.odd_row_exchange(),
+            "word 1 is tile-relative row 1"
+        );
         // **All eight lanes, because the DMA copies whole 64-bit words.**
         // This asserted `0x03` and a half-`None` tail, which is the model the
         // padded-word fix corrected; the EXCHANGE claim it exists for is
@@ -1089,7 +1101,10 @@ mod tests {
         );
 
         for address in 0_u16..8 {
-            assert!(state.byte_is_valid(address), "byte {address} should be valid");
+            assert!(
+                state.byte_is_valid(address),
+                "byte {address} should be valid"
+            );
             assert_eq!(state.valid_byte(address), Some(8 + address as u8));
         }
     }

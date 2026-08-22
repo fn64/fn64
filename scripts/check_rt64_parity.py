@@ -13,18 +13,12 @@ p = d["parity"]
 auth = p["rt64_authoritative"]
 cov = p["rt64_not_authoritative_coverage"]
 
-exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "2"))
+exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "1"))
 exp_refused = int(os.environ.get("EXPECTED_ONE_REFUSED", "1"))
 min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "19"))
 
 # Known, measured divergences. Each is explained in the runner's `intent`.
-# Known, measured divergences. Each is explained in the runner's `intent`.
-# `one-cycle-fill-band` is an OPEN DEFECT, not an accepted difference: wgpu
-# drops one-cycle G_FILLRECT entirely. It is listed so the gate stays green
-# on the rest of the corpus while the fix lands; REMOVE it from this set once
-# the combined-fill executor exists, at which point the case must go
-# identical and the gate will demand it.
-KNOWN_DIVERGENCES = {"scissor-narrower-than-rect", "one-cycle-fill-band"}
+KNOWN_DIVERGENCES = {"scissor-narrower-than-rect"}
 
 failures = []
 
@@ -79,6 +73,5 @@ print(
 )
 print(
     f"  {exp_differs} known divergences: scissor-narrower-than-rect (RT64 paints "
-    "outside the scissor, wgpu is right) and one-cycle-fill-band (OPEN DEFECT: "
-    "wgpu drops one-cycle G_FILLRECT, RT64 draws)"
+    "outside the scissor, wgpu is right)"
 )

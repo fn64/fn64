@@ -1137,8 +1137,8 @@ pub fn push_decoded_raw_dpc(
             RawDpcCommandKind::NoOp { .. } => {}
             RawDpcCommandKind::FillRectangle(rectangle) => {
                 // Narrow admission. `plan_fill` has already refused every
-                // fill this backend cannot execute -- non-Fill cycle,
-                // missing `SetColorImage`/`SetFillColor`, a non-RGBA16/32
+                // fill this backend cannot execute -- Copy cycle, missing
+                // `SetColorImage` (or `SetFillColor` in Fill cycle), a non-RGBA16/32
                 // color image, fractional or reversed edges, a rectangle
                 // wider than the staged image, or a write outside installed
                 // RDRAM -- as a `RawDpcDecodeError::InvalidCommand` before
@@ -1152,35 +1152,12 @@ pub fn push_decoded_raw_dpc(
                 // one, and a second independent derivation of the same
                 // geometry would turn that sealed guarantee into a runtime
                 // coin flip.
-                // **A fill that declared no write is admitted and
-                // collected nothing**, mirroring the `TextureRectangle` arm
-                // above, which treats an empty access slice as `None`
-                // rather than a zero-count span.
-                //
-                // `plan_fill` now returns `Ok(())` without pushing a span
-                // for a non-Fill cycle type (see its own doc for the three
-                // authorities and the measured WM2000 packet). Calling
-                // `bind_fill_rectangle` for such a command would raise
-                // `FillNotDeclared` -- turning a deliberate "declares no
-                // write" into a hard rejection at a different layer, which
-                // is exactly the whole-packet refusal the planner change
-                // exists to remove.
-                //
-                // The `?` below is retained for every OTHER
-                // `FillAccessSpanError`: a span that IS declared but whose
-                // access run is out of bounds or is not a run of
-                // RenderTarget colour-framebuffer writes remains a loud
-                // rejection. Only the "nothing was declared" case is
-                // absorbed, and only into the same silence the planner
-                // chose.
-                let bound = match resource_plan.bind_fill_rectangle(command_index) {
-                    Ok(bound) => Some(bound),
-                    Err(FillAccessSpanError::FillNotDeclared { .. }) => None,
-                    Err(error) => return Err(PushDecodedRawDpcError::FillAccessSpan(error).into()),
-                };
-                let Some((span, accesses)) = bound else {
-                    continue;
-                };
+                // Every admitted fill has a declared span. A missing or
+                // malformed span is therefore a decoder/resource-plan
+                // disagreement and remains a loud rejection here.
+                let (span, accesses) = resource_plan
+                    .bind_fill_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
                 let Some(color_image) = current_color_image else {
                     return Err(UnadmittedRawDpcCommand {
                         command_index,
@@ -1189,16 +1166,19 @@ pub fn push_decoded_raw_dpc(
                     }
                     .into());
                 };
-                let Some(fill_color) = current_fill_color else {
+                let neutral_image = neutral_color_image(color_image, layout);
+                let neutral_fill = current_fill_color.map(neutral_fill_color);
+                if current_other_mode
+                    .is_some_and(|mode| mode.cycle_type() == crate::CycleType::Fill)
+                    && neutral_fill.is_none()
+                {
                     return Err(UnadmittedRawDpcCommand {
                         command_index,
                         location: old_location,
                         opcode_name: opcode_name(&command.kind()),
                     }
                     .into());
-                };
-                let neutral_image = neutral_color_image(color_image, layout);
-                let neutral_fill = neutral_fill_color(fill_color);
+                }
                 let after = RdpStateIdentity::of_color_image(neutral_image);
                 // **The colour-image seed read, mirrored into the writer at
                 // the same position the decoder pushed it.**
@@ -1393,59 +1373,18 @@ fn push_tmem_load(
 
 #[cfg(test)]
 mod tests {
-    /// Pins the **narrowness** of the `FillRectangle` arm's
-    /// `bind_fill_rectangle` error absorption.
-    ///
-    /// Only `FillAccessSpanError::FillNotDeclared` may be absorbed into
-    /// `None`. That variant means `plan_fill` deliberately declared no
-    /// write (a staged non-Fill cycle type -- see its own doc and the
-    /// measured packet in `docs/WM2000-FILLRECT-EVIDENCE.txt`), so the
-    /// adapter must match the planner's silence.
-    ///
-    /// The other two variants mean something entirely different: a span
-    /// that IS declared but whose access run is out of bounds
-    /// (`AccessSliceOutOfBounds`) or is not a run of RenderTarget
-    /// colour-framebuffer writes (`AccessDescriptorsDiffer`). Both are the
-    /// decoder and the resource plan *disagreeing* about what an admitted
-    /// fill writes -- which `FillAccessSpanError`'s own doc calls "a loud
-    /// rejection, never a silently substituted access slice". Absorbing
-    /// those into `None` would execute a fill whose declared bytes nobody
-    /// validated.
-    ///
-    /// Asserted on the source text rather than by constructing a corrupt
-    /// plan, because `RawDpcResourcePlan`'s fields are private to the
-    /// decoder and no public API can build one whose fill span is
-    /// declared-but-invalid. This is the same technique
-    /// `production.rs`'s
-    /// `plan_raw_dpc_inner_decodes_both_passes_against_durable_state_not_default`
-    /// uses for the same reason.
-    ///
-    /// MUTATION EVIDENCE: replacing the two `Err` arms with a single
-    /// `Err(_) => None` survived every other test in this crate. This card
-    /// is the one that kills it.
+    /// An admitted fill must bind its declared span directly. In particular,
+    /// `FillNotDeclared` must not be absorbed into a zero-write command.
     #[test]
-    fn only_fill_not_declared_is_absorbed_by_the_fill_rectangle_arm() {
+    fn fill_not_declared_is_not_absorbed_by_the_fill_rectangle_arm() {
         let source = include_str!("production_adapter.rs");
-        let arm_start = source
-            .find("let bound = match resource_plan.bind_fill_rectangle(command_index) {")
-            .expect("the FillRectangle arm's bind_fill_rectangle match must exist");
-        let arm_end = arm_start
-            + source[arm_start..]
-                .find("};")
-                .expect("the match must be closed");
-        let arm = &source[arm_start..arm_end];
-        assert!(
-            arm.contains("Err(FillAccessSpanError::FillNotDeclared { .. }) => None"),
-            "only the FillNotDeclared variant may be absorbed into None"
-        );
-        assert!(
-            arm.contains("Err(error) => return Err(PushDecodedRawDpcError::FillAccessSpan(error)"),
-            "every other FillAccessSpanError must still propagate as a loud rejection;              a catch-all `Err(_) => None` would silently execute a fill whose declared              access run the decoder and the resource plan disagree about"
-        );
-        assert!(
-            !arm.contains("Err(_) => None"),
-            "a catch-all absorption arm is exactly the mutation this card exists to kill"
-        );
+        let arm = source
+            .split("RawDpcCommandKind::FillRectangle(rectangle) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("RawDpcCommandKind::FullSync").next())
+            .expect("FillRectangle adapter arm");
+        assert!(arm.contains(".bind_fill_rectangle(command_index)"));
+        assert!(!arm.contains("FillNotDeclared"));
     }
 
     use fn64_render::{

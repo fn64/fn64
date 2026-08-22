@@ -319,11 +319,11 @@ mod blend;
 // Public only under `conformance-runner`: the adapterless entry point the
 // renderer-conformance harness's wgpu runner drives. Off by default, so the
 // default build's public surface is unchanged.
-#[cfg(feature = "conformance-runner")]
-pub mod conformance;
 mod color_converter;
 mod color_hlsli;
 mod combiner;
+#[cfg(feature = "conformance-runner")]
+pub mod conformance;
 mod coverage;
 mod depth_encode;
 mod depth_mode;
@@ -540,17 +540,17 @@ pub use state::{
     RdpState, RdpStateDelta, RgbDither, StagedRdpState, TextureFilter, TextureLutMode,
 };
 pub use targets::{
-    decode_fill_cycle_pixel, execute_fill_rectangle, execute_texture_rectangle,
-    fixed_fixture_other_mode, pack_device_pixels, resolve_fill_pixel_rectangle,
-    unpack_device_pixels, CandidateColorTarget, ColorTargetExtent, ColorTargetFormat,
-    ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame, CompletedColorTargetWrite,
-    DeviceColorBytes, ExactRowPlan, FillCoordinateError, FillCycleBypassHazards,
-    FillExecutionError, FillPixelRectangle, InFlightNativeRasterFill, InFlightTriangleDraw,
-    InitializedCandidateColorTarget, InitializedRegionProof, NativeRasterDeviceOutcome,
-    NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, RasterVertex,
-    ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle, TargetRowRange,
-    TargetRows, TexrectAxis, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
-    TexrectShading, TexrectTileBinding, TriangleDrawOutput, TriangleFixture,
+    decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
+    execute_texture_rectangle, fixed_fixture_other_mode, pack_device_pixels,
+    resolve_fill_pixel_rectangle, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
+    ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame,
+    CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, FillCoordinateError,
+    FillCycleBypassHazards, FillExecutionError, FillPixelRectangle, InFlightNativeRasterFill,
+    InFlightTriangleDraw, InitializedCandidateColorTarget, InitializedRegionProof,
+    NativeRasterDeviceOutcome, NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit,
+    RasterVertex, ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle,
+    TargetRowRange, TargetRows, TexrectAxis, TexrectConstantRegister, TexrectDraw,
+    TexrectExecutionError, TexrectShading, TexrectTileBinding, TriangleDrawOutput, TriangleFixture,
     TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
     TriangleRasterParams, TriangleTargetExtent, UninitializedNativeRaster,
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_INVALID_BYTE,

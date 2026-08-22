@@ -1536,11 +1536,11 @@ mod tests {
         let state = publish_sources(words, &ranges, &[(image_address, &source)]);
         let before = observe_durable(&state);
         let cell = gather_committed_texture_cell(
-                &state,
-                reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
-                reader_size(0, 0, 4, 4),
-                cell_request(TmemFirstRowParity::Even),
-                TextureLutMode::Disabled,
+            &state,
+            reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
         )
         .unwrap();
         assert_eq!(
