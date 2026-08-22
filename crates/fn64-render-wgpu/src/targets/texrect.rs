@@ -360,35 +360,22 @@ fn step_axis(start: i16, end: i16, index: u32, span: u32) -> i16 {
 ///
 /// ## Why quarter-pixels and not pixels
 ///
-/// `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`) latches the four
-/// twelve-bit fields verbatim into `wstate->clip`:
-///
-/// ```c
-/// wstate->clip.xh = (args[0] >> 12) & 0xfff;
-/// wstate->clip.yh = (args[0] >>  0) & 0xfff;
-/// wstate->clip.xl = (args[1] >> 12) & 0xfff;
-/// wstate->clip.yl = (args[1] >>  0) & 0xfff;
-/// ```
-///
-/// and `rdp_tex_rect` (`:2637-2640`) reads the rectangle's own corners from
-/// the identical bit positions at the identical scale. The two are therefore
-/// directly comparable in quarter-pixels, which is exactly how the edgewalker
-/// compares them: Y with no rescale at all (`yhlimit = (yh >= wstate->clip.yh)`
-/// at `:2303-2305`, `yllimit = (yl & 0xfff) < wstate->clip.yl` at `:2286-2290`),
-/// and X after shifting BOTH sides into the edgewalker's own 1/8-pixel domain
-/// (`clipxlshift = wstate->clip.xl << 1`, `:2308-2309`).
+/// Public libultra's `gDPSetScissor` macro encodes each coordinate multiplied
+/// by four into one of four twelve-bit fields
+/// (`/Users/jer/Code/aki-recomp/refs/oot-decomp/include/ultra64/gbi.h:4794-4804`),
+/// while `gDPSetScissorFrac` places already-fractional values in those same
+/// fields (`:4807-4817`). The command therefore carries all four bounds in
+/// quarter-pixel units.
 ///
 /// Storing pixels here instead would have to round at latch time, before the
 /// comparison hardware performs, and a sub-pixel scissor edge would then clip
 /// the wrong column.
 ///
-/// `mode` is the two-bit field angrylion splits into `scfield`/`sckeepodd`
-/// (`:2786-2787`) -- interlaced field selection. It is carried so the value
-/// survives the round trip, and is **not** consulted by the texrect clip:
-/// this executor renders progressive full-frame targets, where every scanline
-/// is drawn, and honouring `sckeepodd` would drop every other row of content
-/// the progressive path is expected to write. Marked here rather than
-/// silently ignored.
+/// `mode` is carried so the two-bit value survives the round trip, and is
+/// **not** consulted by the texrect clip: this executor renders progressive
+/// full-frame targets, where every scanline is drawn. This is fn64's own
+/// reading of the mode's role in this path and is not independently confirmed
+/// against an allowed hardware reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RdpScissorRect {
     upper_left_x: u16,
@@ -524,10 +511,12 @@ impl ClippedTexrectExtent {
 ///
 /// ## Precedence: the scissor is the authority, the target is a second bound
 ///
-/// Both are applied, and neither substitutes for the other. angrylion clamps
-/// the span to `clip` unconditionally (`rasterizer.c:2349-2363` for X,
-/// `:2284-2305` for Y) -- a scissor TIGHTER than the framebuffer really does
-/// suppress pixels the framebuffer could hold. Separately, no span may name
+/// Both are applied, and neither substitutes for the other. Pinned RT64
+/// intersects its scissor rectangle with the draw rectangle before recording
+/// the surviving colour/depth extent
+/// (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/hle/rt64_rdp.cpp:1214-1223`),
+/// so a tighter scissor suppresses pixels the draw rectangle otherwise covers.
+/// Separately, no span may name
 /// memory outside the target, which is this executor's own invariant and not
 /// a hardware one: the RDP would happily scribble past the end of a
 /// colour image, but fn64's target is a sized buffer and a write past it is
@@ -716,11 +705,11 @@ pub enum TexrectExecutionError {
     /// this variant used to fire whenever any part of the rectangle
     /// overhung the target, on the reasoning that "a clamped rectangle
     /// would write pixels the RDP never covers." That reasoning was
-    /// backwards: clamping is precisely what the RDP's scissor does.
-    /// angrylion drives every span endpoint to the clip rect rather than
-    /// rejecting the primitive (`rasterizer.c:2349-2363` for X,
-    /// `:2284-2305` for Y, with `clip` latched by `rdp_set_scissor` at
-    /// `:2779-2784`), and fn64's own reference renderer clamps the same way
+    /// backwards: clipping is precisely what the scissor does. Pinned RT64
+    /// intersects the scissor and draw rectangles and keeps a non-empty
+    /// intersection rather than rejecting an overhanging primitive
+    /// (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/hle/rt64_rdp.cpp:1214-1223`),
+    /// and fn64's own reference renderer clamps the same way
     /// at `fn64-render-reference/src/raster/draw.rs:197-203`. The texrect
     /// path now clips through [`clip_texrect_extent`] and refuses only the
     /// genuinely empty result, as [`Self::ScissoredAway`].
@@ -1609,39 +1598,16 @@ impl TexrectShading {
     /// before any `SetEnvColor` therefore combines against the register's
     /// actual power-on value rather than aborting.
     ///
-    /// # `shade_color` is a hardware value, not a placeholder
+    /// # `shade_color` is fn64's zero, not a placeholder
     ///
-    /// A texture rectangle's shade is **zero by construction**, and this is
-    /// a property of the command the RDP executes rather than a convention
-    /// this crate adopts. The rasterizer synthesizes a full edge-walker
-    /// primitive for a rectangle and explicitly clears the shade block
-    /// while doing so:
+    /// A `G_TEXRECT` command carries no shade coefficient words. fn64 reads
+    /// that wire layout as requiring a zero shade for the synthesized
+    /// rectangle primitive, rather than retaining a previous triangle's
+    /// shade, so `Shade` and `ShadeAlpha` are admitted and read zero here.
     ///
-    /// - `rdp_tex_rect` builds `ewdata[0..44]` and then runs
-    ///   `memset(&ewdata[8], 0, 16 * sizeof(uint32_t))`
-    ///   (angrylion-rdp-plus, `src/core/n64video/rdp/rasterizer.c:2665`;
-    ///   `rdp_tex_rect_flip` does the same at `:2721`).
-    /// - Words 8..=23 are exactly the shade block: `edgewalker_for_prims`
-    ///   reads the shade bases from `ewdata[8]`/`[9]`/`[12]`/`[13]` and
-    ///   their `DrDx`/`DrDe`/`DrDy` derivatives from `[10]`, `[11]`,
-    ///   `[14]`..`[23]` (`rasterizer.c:2088-2105`). A texture rectangle
-    ///   command carries no shade words on the wire, so every one of them
-    ///   is zeroed rather than left holding the previous triangle's.
-    /// - With base and all derivatives zero, the per-pixel shade
-    ///   reconstruction at `rasterizer.c:130-154` evaluates to zero for
-    ///   every pixel of the rectangle, and that is what
-    ///   `wstate->shade_color` holds when the combiner's `SHADE` (index 4)
-    ///   and `SHADE_ALPHA` (color slot C index 11) selectors dereference it
-    ///   (`src/core/n64video/rdp/combiner.c:14,33,52,59,80,95,110`).
-    ///
-    /// So the zero here is not "a value we do not have"; it is the value
-    /// the hardware produces, and admitting `Shade`/`ShadeAlpha` for a
-    /// rectangle evaluates the guest's program against the same number real
-    /// silicon would. RT64 reaches the identical conclusion independently
-    /// and unconditionally: `RDP::drawRect` inserts a six-vertex
-    /// `rectColorFloats` of all zeros as the rectangle's vertex color
-    /// (`rt64/src/hle/rt64_rdp.cpp:1255-1265`, pinned `5473732a`), which
-    /// `RasterPS.hlsl` feeds straight to `ccInputs.shadeColor`.
+    /// **Not independently confirmed against an allowed hardware reference.**
+    /// Treat the zero-shade rule as fn64's own reading until an allowed source
+    /// or differential experiment settles it.
     ///
     /// This is why the refusal that used to stand here was a wiring gap
     /// rather than a guard: the executor already held the right number and
@@ -1778,10 +1744,11 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     let format = key.format();
     let extent = key.extent();
     let rectangle = TargetRectangle::try_new(draw.left(), draw.top(), draw.width(), draw.height())?;
-    // **Clipped, not refused.** The RDP's scissor drives every span
-    // endpoint to the clip rect rather than rejecting the primitive --
-    // angrylion `rasterizer.c:2349-2363` (X) and `:2284-2305` (Y), against
-    // the rect `rdp_set_scissor` latches at `:2779-2784`. A rectangle that
+    // **Clipped, not refused.** Pinned RT64 intersects the scissor and draw
+    // rectangles and keeps a non-empty intersection rather than rejecting
+    // an overhanging primitive
+    // (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/hle/rt64_rdp.cpp:1214-1223`).
+    // A rectangle that
     // overhangs the framebuffer is routine content, and the previous
     // `OutsideTarget` refusal here dropped all of it. See
     // [`clip_texrect_extent`] for the precedence between the scissor and
@@ -2269,11 +2236,10 @@ impl TexrectFragmentStages {
     ) -> Result<Self, TexrectExecutionError> {
         let alpha_compare = other_mode.alpha_compare();
         match alpha_compare {
-            // Wire encoding 2 is not a reserved mode: other-mode low bits
-            // 1:0 are two independent hardware bits, and `alpha_compare_en`
-            // (bit 0) clear means no compare at all (angrylion
-            // `src/core/n64video/rdp.c:659-660`, `rdp/blender.c`'s
-            // `alpha_compare`; copy path likewise `rdp/rasterizer.c:1971`).
+            // Pinned RT64 implements alpha compare only for `G_AC_DITHER`
+            // and `G_AC_THRESHOLD`; encoding 2 falls through without a
+            // compare
+            // (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/RasterPS.hlsl:203-213`).
             // It therefore arrives here already decoded as `None`.
             // See `docs/RT64-GUARD-AUDIT.md` finding A3.
             AlphaCompare::None | AlphaCompare::Threshold => {}
@@ -3429,15 +3395,14 @@ mod one_cycle_tests {
         );
     }
 
-    /// **A texrect's `Shade`/`ShadeAlpha` is admitted and evaluates to the
-    /// hardware's zero**, rather than being refused by name.
+    /// **A texrect's `Shade`/`ShadeAlpha` is admitted and evaluates to
+    /// fn64's zero**, rather than being refused by name.
     ///
-    /// Derived by hand from the wire layout, not from the code under test:
-    /// a `G_TEXRECT` command carries no shade coefficient words, and the
-    /// rasterizer zeroes the whole 16-word shade block when it synthesizes
-    /// the edge-walker primitive (angrylion `rasterizer.c:2665`, block
-    /// decoded at `:2088-2105`), so `shade_color` is `[0, 0, 0, 0]` for
-    /// every pixel of every rectangle. See [`TexrectShading::base_inputs`].
+    /// A `G_TEXRECT` command carries no shade coefficient words; fn64 reads
+    /// that wire layout as making `shade_color` `[0, 0, 0, 0]` for every
+    /// pixel of every rectangle. This rule is not independently confirmed
+    /// against an allowed hardware reference. See
+    /// [`TexrectShading::base_inputs`].
     #[test]
     fn a_texrect_shade_reading_program_is_admitted_and_reads_zero() {
         // Color A index 4 is SHADE in the shared common table.
@@ -3489,9 +3454,10 @@ mod one_cycle_tests {
     /// environment colour, or one, a program that merely *succeeds* would
     /// not notice. So both constant registers are staged to distinctive
     /// NON-ZERO values and the program is `(SHADE - ZERO) * ONE + ZERO`,
-    /// whose output is the shade itself. Expected `[0, 0, 0, 0]` is derived
-    /// from the wire layout (no shade words in a `G_TEXRECT`, block zeroed
-    /// at angrylion `rasterizer.c:2665`), never from this crate.
+    /// whose output is the shade itself. Expected `[0, 0, 0, 0]` follows
+    /// fn64's reading of the `G_TEXRECT` wire layout, which has no shade
+    /// coefficient words. The zero-shade rule is not independently confirmed
+    /// against an allowed hardware reference.
     #[test]
     fn a_texrects_shade_evaluates_to_the_hardwares_zero_not_a_neighbouring_register() {
         // Distinctive non-zero registers: any executor that substituted one
@@ -3837,11 +3803,11 @@ mod one_cycle_tests {
         //
         // `Shade`/`ShadeAlpha` is deliberately NOT in this list any more,
         // and the distinction is the whole point of the list. Its zero is
-        // not "a field we left at zero": a texture rectangle carries no
-        // shade words and the rasterizer clears the entire shade block when
-        // it synthesizes the primitive (angrylion `rasterizer.c:2665`,
-        // block decoded at `:2088-2105`), so zero is the value real
-        // hardware feeds the combiner. See
+        // not an accidental unset field: a texture rectangle carries no
+        // shade words, and fn64 reads that wire layout as requiring zero for
+        // the synthesized primitive. This zero-shade rule is fn64's own
+        // reading and is not independently confirmed against an allowed
+        // hardware reference. See
         // [`a_texrects_shade_evaluates_to_the_hardwares_zero_not_a_neighbouring_register`]
         // and [`TexrectShading::base_inputs`]. The unshaded-*triangle*
         // refusal, where the hardware really does interpolate a value this
@@ -5662,10 +5628,11 @@ mod fragment_stage_tests {
     /// from every other refusal.
     #[test]
     fn every_unevaluatable_stage_mode_is_refused_by_name() {
-        // G_AC wire encoding 2 is NOT refused: `alpha_compare_en` (low bit
-        // 0) is clear, so hardware performs no compare at all -- angrylion
-        // `src/core/n64video/rdp.c:659-660` plus `rdp/blender.c`'s
-        // `alpha_compare` early return. Retargeted from the assertion that
+        // G_AC wire encoding 2 is NOT refused: pinned RT64 branches only for
+        // `G_AC_DITHER` and `G_AC_THRESHOLD`, so encoding 2 performs no
+        // compare
+        // (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/RasterPS.hlsl:203-213`).
+        // Retargeted from the assertion that
         // this encoding raised `ReservedAlphaCompare`; see
         // `docs/RT64-GUARD-AUDIT.md` finding A3.
         let dither_bit_without_enable = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
@@ -6268,10 +6235,10 @@ mod scissor_clip_tests {
     /// A scissor genuinely TIGHTER than the colour target on every edge.
     ///
     /// Hand-derived from the wire layout, not from the code under test.
-    /// `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`) latches four
-    /// twelve-bit fields at the same 10.2 quarter-pixel scale
-    /// `rdp_tex_rect` reads its own corners at (`:2637-2640`), so a pixel
-    /// bound is the quarter value divided by four:
+    /// Public libultra's `gDPSetScissor` encodes each coordinate multiplied
+    /// by four into one of four twelve-bit fields
+    /// (`/Users/jer/Code/aki-recomp/refs/oot-decomp/include/ultra64/gbi.h:4794-4804`),
+    /// so a pixel bound is the quarter value divided by four:
     ///
     /// - `ulx = 40` quarter-pixels -> first column `40 / 4 = 10`
     /// - `lrx = 240` quarter-pixels -> column limit `240 / 4 = 60`
@@ -6304,12 +6271,10 @@ mod scissor_clip_tests {
     /// assertion.** A full-target rectangle under a tighter scissor is
     /// CLIPPED to the scissor, not refused and not clipped to the target.
     ///
-    /// angrylion drives each span endpoint to the clip rect rather than
-    /// rejecting the primitive: X at `rasterizer.c:2349-2363`
-    /// (`xrsc = curunder ? clipxhshift : ...` then
-    /// `xrsc = curover ? clipxlshift : xrsc`), Y at `:2284-2305`
-    /// (`yllimit = yllimit ? yl : wstate->clip.yl`). fn64's own reference
-    /// renderer clamps identically at
+    /// Pinned RT64 intersects the scissor and draw rectangles and retains a
+    /// non-empty intersection rather than rejecting the primitive
+    /// (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/hle/rt64_rdp.cpp:1214-1223`).
+    /// fn64's own reference renderer clamps identically at
     /// `fn64-render-reference/src/raster/draw.rs:197-203`.
     #[test]
     fn a_rectangle_under_a_tighter_scissor_is_clipped_to_the_scissor_not_the_target() {
@@ -6458,12 +6423,10 @@ mod scissor_clip_tests {
 
     /// **The texture ramp must NOT slide when the rectangle is clipped.**
     ///
-    /// `rdp_tex_rect` loads the S/T origin into `ewdata[24]` and the steps
-    /// into `ewdata[26..39]` from the unclipped command
-    /// (angrylion `rasterizer.c:2657-2677`), and the edgewalker's clip
-    /// writes only `majorx`/`minorx` (`:2349-2363`) -- it never touches
-    /// them. A clipped rectangle therefore samples the same texel at a
-    /// given screen pixel that an unclipped one would.
+    /// fn64 evaluates S/T from offsets relative to the unclipped rectangle,
+    /// so clipping changes only the surviving screen extent and does not
+    /// rebase the texture ramp. This is fn64's own reading of the rule and
+    /// is not independently confirmed against an allowed hardware reference.
     ///
     /// This is why the clip returns OFFSETS into the rectangle rather than
     /// a narrowed `TexrectDraw`: rebasing the ramp onto the clipped left
@@ -6489,8 +6452,8 @@ mod scissor_clip_tests {
     /// The mode field survives the latch and is not consulted by the clip.
     /// Carried so a reader can see it was decoded rather than dropped; the
     /// progressive full-frame path this executor serves draws every
-    /// scanline, and honouring `sckeepodd` (angrylion `:2786-2787`) would
-    /// drop every other row of content it is expected to write.
+    /// scanline. Ignoring the mode during clipping is fn64's own policy and
+    /// is not independently confirmed against an allowed hardware reference.
     #[test]
     fn the_scissor_mode_field_round_trips_and_does_not_change_the_clip() {
         let rect = draw(0, 0, 64, 64, 64, 64);
@@ -6708,10 +6671,10 @@ mod scissor_execution_tests {
     /// A full-target rectangle under a scissor covering pixels 4..12 on
     /// both axes leaves everything outside that box untouched. Derived by
     /// hand from the wire layout: `ulx = uly = 16` quarter-pixels is pixel
-    /// 4, `lrx = lry = 48` quarter-pixels is pixel 12 exclusive
-    /// (angrylion `rdp_set_scissor`, `rasterizer.c:2779-2784`, latching the
-    /// same 10.2 fields `rdp_tex_rect` reads its corners from at
-    /// `:2637-2640`).
+    /// 4, `lrx = lry = 48` quarter-pixels is pixel 12 exclusive. Public
+    /// libultra's `gDPSetScissor` encodes all four coordinates multiplied by
+    /// four into twelve-bit fields
+    /// (`/Users/jer/Code/aki-recomp/refs/oot-decomp/include/ultra64/gbi.h:4794-4804`).
     ///
     /// The scissor is strictly inside the 16x16 target on all four edges,
     /// so a clip that consulted the target extent instead would write the
@@ -6760,9 +6723,11 @@ mod scissor_execution_tests {
     ///
     /// This is the case the old `TexrectExecutionError::OutsideTarget`
     /// refusal rejected outright, on the reasoning that "a clamped
-    /// rectangle would write pixels the RDP never covers." angrylion
-    /// clamps instead of rejecting (`rasterizer.c:2349-2363` for X,
-    /// `:2284-2305` for Y), and fn64's own reference renderer does the
+    /// rectangle would write pixels the RDP never covers." Pinned RT64
+    /// intersects the scissor and draw rectangles and keeps a non-empty
+    /// intersection instead of rejecting it
+    /// (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/hle/rt64_rdp.cpp:1214-1223`),
+    /// and fn64's own reference renderer does the
     /// same at `fn64-render-reference/src/raster/draw.rs:197-203`.
     ///
     /// FAILS BEFORE this change with `OutsideTarget`; passes after, with
