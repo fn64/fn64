@@ -13,12 +13,34 @@ p = d["parity"]
 auth = p["rt64_authoritative"]
 cov = p["rt64_not_authoritative_coverage"]
 
-exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "1"))
+exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "2"))
 exp_refused = int(os.environ.get("EXPECTED_ONE_REFUSED", "1"))
-min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "24"))
+min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "29"))
 
 # Known, measured divergences. Each is explained in the runner's `intent`.
-KNOWN_DIVERGENCES = {"scissor-narrower-than-rect"}
+KNOWN_DIVERGENCES = {
+    "scissor-narrower-than-rect",
+    # TEXRECTFLIP (0x25) is UNIMPLEMENTED in the wgpu raw-DPC slice and
+    # refuses LOUDLY rather than dropping silently: `plan_texture_rectangle`
+    # returns early for `flip()` because "declaring a write no executor fills
+    # would promise content that never arrives" (`raw_dpc/mod.rs:1938`). RT64
+    # renders it. A known FEATURE GAP, not an accepted behavioural
+    # difference -- delete this entry when the flip executor lands.
+    "textured-rect-flip-point-sampled",
+    # INEFFECTIVE AS WRITTEN, kept visible rather than deleted or forced
+    # green. This case was added to pin the signed-W perspective fix, but
+    # RT64 never reaches its sampler for this geometry, so the 12 differing
+    # pixels are NOT evidence about the fix -- the hand-derived key does not
+    # describe what RT64 computes here. The fix itself IS pinned, by
+    # `a_negative_w_flips_the_raw_s10_5_coordinate`
+    # (`rdp_harness/tests.rs`), which asserts the raw S10.5 coordinate
+    # directly and is mutation-proven: reverting the denominator to
+    # `unsigned_abs()` fails it with `left: (8192, 0)` vs `right: (-8192, 0)`.
+    # Replace this case with geometry RT64 actually samples, then delete this
+    # entry. Changing its expected pixels to match would leave a green
+    # fixture that pins nothing.
+    "perspective-textured-triangle-negative-w",
+}
 
 failures = []
 

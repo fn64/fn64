@@ -25,9 +25,9 @@ fi
 # `intent` text. Any NEW divergence fails the gate; any of these DISAPPEARING
 # also fails it, because a vanished known-difference means the corpus stopped
 # exercising the case.
-export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-1}
+export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-2}
 export EXPECTED_ONE_REFUSED=${EXPECTED_ONE_REFUSED:-1}
-export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-24}
+export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-29}
 
 echo "[gate-rt64-parity] building parity runner (RT64 C++ + wgpu)"
 cargo build -p fn64-render-conformance --features parity-runner \
