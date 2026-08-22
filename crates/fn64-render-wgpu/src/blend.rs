@@ -6,9 +6,10 @@
 //! (`crates/fn64-render-reference/src/raster/blend.rs:157-292`), per
 //! `/private/tmp/rt64-blender-depth-port-card.md` §1 ("Blender"). Covers:
 //! P/M/A/B selector semantics for both blender cycles, sequential cycle
-//! handoff (cycle 1's `Combined` result feeds cycle 2), the no-`FORCE_BL`
-//! last-cycle bypass, the zero-factor (`a==0`/`b==0`) divisor collapse, the
-//! `Framebuffer`-selecting dual-source composite path, and the exact
+//! handoff (including RT64's selector passthrough forwarding), the
+//! no-`FORCE_BL` last-cycle bypass, selector-classified passthrough, the
+//! wrapped general numerator, the `Framebuffer`-selecting dual-source
+//! composite path, and the exact
 //! `IM_RD`-disabled loud rejection.
 //!
 //! `fn64-render-wgpu` has no crate dependency on `fn64-render-reference` (see
@@ -389,18 +390,16 @@ fn round_clamp_u8(value: f32) -> u8 {
 ///   directly (bypass) and the memory-composite alpha becomes `0.0` if
 ///   `P == Framebuffer` else `1.0`; earlier cycles (and the last cycle when
 ///   `blend_enabled` is true) evaluate the full selector set.
-/// - When `P` or `M` selects [`BlendColorInput::Framebuffer`], the cycle
-///   routes through the dual-source composite (see
-///   [`DualSourceBlendOutput`]) instead of the general A/B divide. **Both**
-///   `P` and `M` are resolved via [`blend_color`] *before* this dispatch
-///   runs (matching the reference's own unconditional
-///   `blend.rs:191-192` evaluation order exactly), so a `Framebuffer`
-///   selector on either input requires a memory sample even on the branch
-///   whose resolved value is then discarded -- e.g. `P == Framebuffer`
-///   still requires `memory` to resolve `P`'s (unused) color, not only
-///   `M`'s (used) one.
-/// - Otherwise: `a == 0.0` collapses to `M`; `b == 0.0` (with `a != 0.0`)
-///   collapses to `P`; else the general `(P*A + M*B) / (A+B)` divide runs.
+/// - RT64 classifies passthrough from selectors, before resolving values:
+///   `A == Zero`, `B == Zero`, or `P == M && B == OneMinusA`. An earlier
+///   passthrough cycle forwards its selected P/M selector into the next
+///   cycle's `Combined` slot (`rt64_blender.h:385-413`).
+/// - A non-passthrough cycle selecting framebuffer color uses the dual-source
+///   path. Otherwise RT64 classifies numerator overflow only when
+///   `B != OneMinusA`, wraps the normalized RGB numerator modulo
+///   `1 + 8/255`, then divides. RT64 applies `fmod` to the `float3` only and
+///   sets `finalAlpha` separately, so alpha is not wrapped
+///   (`rt64_blender.h:180-220,385-438`, pinned RT64 `f0728a2520d5`).
 /// - The final composite blends the last cycle's `blender_rgb`/`final_alpha`
 ///   against the memory sample (or nothing, when `final_alpha == 1.0`) --
 ///   asserting (as a loud [`BlendImageReadError`]) that an `IM_RD`-disabled
@@ -425,11 +424,14 @@ pub fn blend_fragment(
     let src_rgb = [src[0] as f32, src[1] as f32, src[2] as f32];
     let mut blender_rgb = src_rgb;
     let mut final_alpha = 1.0_f32;
+    let mut passthrough_enabled = false;
+    let mut passthrough_input = BlendColorInput::Combined;
 
     for cycle_index in 0..cycle_count {
         let cycle = state.cycle(cycle_index);
         let is_last = cycle_index + 1 == cycle_count;
         let is_first = cycle_index == 0;
+        let replace_combined_with_blender = !is_first && !passthrough_enabled;
 
         if is_last && !blend_enabled {
             blender_rgb = blend_color(
@@ -438,7 +440,7 @@ pub fn blend_fragment(
                 memory,
                 state.blend_color_register,
                 state.fog_color,
-                is_first,
+                !replace_combined_with_blender,
                 blender_rgb,
             )?;
             final_alpha = if cycle.p == BlendColorInput::Framebuffer {
@@ -449,44 +451,105 @@ pub fn blend_fragment(
             continue;
         }
 
-        let a = blend_a(cycle.a, src[3], shade_alpha, state.fog_color[3]);
-        let p = blend_color(
-            cycle.p,
-            src_rgb,
-            memory,
-            state.blend_color_register,
-            state.fog_color,
-            is_first,
-            blender_rgb,
-        )?;
-        let m = blend_color(
-            cycle.m,
-            src_rgb,
-            memory,
-            state.blend_color_register,
-            state.fog_color,
-            is_first,
-            blender_rgb,
-        )?;
+        let passthrough = cycle.a == BlendAlphaInput::Zero
+            || cycle.b == BlendBInput::Zero
+            || (cycle.p == cycle.m && cycle.b == BlendBInput::OneMinusA);
+        let numerator_overflow = !passthrough && cycle.b != BlendBInput::OneMinusA;
+        let mut p_input = cycle.p;
+        let mut m_input = cycle.m;
+        let mut framebuffer_color = p_input == BlendColorInput::Framebuffer
+            || m_input == BlendColorInput::Framebuffer;
+        if passthrough_enabled {
+            if p_input == BlendColorInput::Combined {
+                p_input = passthrough_input;
+                framebuffer_color |= passthrough_input == BlendColorInput::Framebuffer;
+            } else if m_input == BlendColorInput::Combined {
+                m_input = passthrough_input;
+                framebuffer_color |= passthrough_input == BlendColorInput::Framebuffer;
+            }
+        }
 
-        if cycle.p == BlendColorInput::Framebuffer {
-            blender_rgb = m;
-            final_alpha = 1.0 - a;
-        } else if cycle.m == BlendColorInput::Framebuffer {
-            blender_rgb = p;
-            final_alpha = a;
-        } else {
-            let b = blend_b(cycle.b, a, memory)?;
-            if a == 0.0 {
-                blender_rgb = m;
-            } else if b == 0.0 {
-                blender_rgb = p;
+        if passthrough {
+            let selected = if cycle.a == BlendAlphaInput::Zero {
+                m_input
             } else {
-                let divisor = a + b;
-                for channel in 0..3 {
-                    blender_rgb[channel] =
-                        ((p[channel] * a + m[channel] * b) / divisor).clamp(0.0, 255.0);
-                }
+                p_input
+            };
+            if !is_last {
+                passthrough_input = selected;
+                passthrough_enabled = true;
+            } else if framebuffer_color {
+                final_alpha = 0.0;
+            } else {
+                blender_rgb = blend_color(
+                    selected,
+                    src_rgb,
+                    memory,
+                    state.blend_color_register,
+                    state.fog_color,
+                    !replace_combined_with_blender,
+                    blender_rgb,
+                )?;
+                final_alpha = 1.0;
+            }
+        } else if framebuffer_color {
+            let a = blend_a(cycle.a, src[3], shade_alpha, state.fog_color[3]);
+            if p_input == BlendColorInput::Framebuffer {
+                blender_rgb = blend_color(
+                    m_input,
+                    src_rgb,
+                    memory,
+                    state.blend_color_register,
+                    state.fog_color,
+                    !replace_combined_with_blender,
+                    blender_rgb,
+                )?;
+                final_alpha = 1.0 - a;
+            } else if m_input == BlendColorInput::Framebuffer {
+                blender_rgb = blend_color(
+                    p_input,
+                    src_rgb,
+                    memory,
+                    state.blend_color_register,
+                    state.fog_color,
+                    !replace_combined_with_blender,
+                    blender_rgb,
+                )?;
+                final_alpha = a;
+            }
+        } else {
+            let a = blend_a(cycle.a, src[3], shade_alpha, state.fog_color[3]);
+            let b = blend_b(cycle.b, a, memory)?;
+            let p = blend_color(
+                p_input,
+                src_rgb,
+                memory,
+                state.blend_color_register,
+                state.fog_color,
+                !replace_combined_with_blender,
+                blender_rgb,
+            )?;
+            let m = blend_color(
+                m_input,
+                src_rgb,
+                memory,
+                state.blend_color_register,
+                state.fog_color,
+                !replace_combined_with_blender,
+                blender_rgb,
+            )?;
+            const COLOR_SCALE: f32 = 255.0;
+            const OVERFLOW: f32 = 1.0 + 8.0 / COLOR_SCALE;
+            let divisor = (a + b).max(1.0 / 255.0);
+            for channel in 0..3 {
+                let raw_numerator = (p[channel] / COLOR_SCALE) * a
+                    + (m[channel] / COLOR_SCALE) * b;
+                let numerator = if numerator_overflow {
+                    raw_numerator % OVERFLOW
+                } else {
+                    raw_numerator
+                };
+                blender_rgb[channel] = (numerator / divisor) * COLOR_SCALE;
             }
             final_alpha = 1.0;
         }
@@ -648,6 +711,24 @@ pub const BLEND_ENTRY_POINT: &str = "blend_fragment_cycle";
 /// `coverage.rs`'s own `*_FRAGMENT_FN_WGSL` constants. See
 /// `shaders/blend_fragment_fn.wgsl`'s own header for scope.
 pub const BLEND_FRAGMENT_FN_WGSL: &str = include_str!("shaders/blend_fragment_fn.wgsl");
+
+#[cfg(test)]
+mod overflow_wrap_tests {
+    use super::*;
+
+    /// Hand-derived from RT64's byte-domain equivalent:
+    /// `(255 + 255) % 263 / 2 = 123.5`, rounded to 124.
+    #[test]
+    fn opaque_white_p_and_m_wrap_each_rgb_numerator_before_division() {
+        let state = BlendModeState {
+            other_mode: OtherMode::from_wire(0, (2 << 18) | (1 << 14)),
+            blend_color_register: [0; 4],
+            fog_color: [0; 4],
+        };
+        let result = blend_fragment([255; 4], None, 0, state, true).unwrap();
+        assert_eq!(result.rgba, [124, 124, 124, 255]);
+    }
+}
 
 #[cfg(test)]
 mod tests;

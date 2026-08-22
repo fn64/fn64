@@ -98,8 +98,12 @@ fn exact_fixture_packs_to_m3_3a_device_domain() {
     assert_eq!(m3_3a.device_bytes(), [0xf8, 0x01].repeat(8));
 }
 
+/// The generic pixel oracle has no render-mode or sample-mask input, so it
+/// explicitly supplies full coverage. RGBA16 bit 0 must therefore remain one
+/// across the alpha 0x7f/0x80 boundary: it is stored coverage bit 2, not
+/// primitive alpha (Programming Manual §§15.5.3, 15.5.6, 15.7).
 #[test]
-fn rgba16_oracle_has_exact_quantization_and_alpha_semantics() {
+fn rgba16_oracle_has_exact_quantization_and_full_coverage_semantics() {
     let pixels = [
         Rgba8::new(0, 0, 0, 0),
         Rgba8::new(255, 255, 255, 255),
@@ -111,10 +115,14 @@ fn rgba16_oracle_has_exact_quantization_and_alpha_semantics() {
         .begin_candidate(key_at(FIXTURE_START, 4, 1, ColorTargetFormat::Rgba16))
         .unwrap();
     let packed = pack_device_pixels(&candidate, &pixels).unwrap();
+    assert_eq!(
+        packed.device_bytes(),
+        [0x00, 0x01, 0xff, 0xff, 0xaa, 0xc9, 0xaa, 0xc9]
+    );
     let unpacked = unpack_device_pixels(ColorTargetFormat::Rgba16, packed.device_bytes()).unwrap();
-    assert_eq!(unpacked[0], Rgba8::new(0, 0, 0, 0));
+    assert_eq!(unpacked[0], Rgba8::new(0, 0, 0, 255));
     assert_eq!(unpacked[1], Rgba8::new(255, 255, 255, 255));
-    assert_eq!(unpacked[2], Rgba8::new(173, 90, 33, 0));
+    assert_eq!(unpacked[2], Rgba8::new(173, 90, 33, 255));
     assert_eq!(unpacked[3], Rgba8::new(173, 90, 33, 255));
 }
 

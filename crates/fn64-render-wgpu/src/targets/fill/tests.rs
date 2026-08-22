@@ -290,13 +290,12 @@ fn full_extent_new_target_writes_exact_bytes() {
     let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let candidate = registry.begin_candidate(key).unwrap();
-    // Fill color halfword 0xF801: R=31 G=0 B=0 A=1 -> device bytes stay
-    // packed (no expand/repack round trip -- write_pixel repacks from the
-    // *expanded* 8-bit color, so verify the repack is lossless for this
-    // input): expand(0x1f)=0xFF, pack(0xFF>>3=0x1f)<<11 = 0xF800, alpha
-    // bit = 0xFF>>7=1 -> 0xF801. Matches the original wire halfword exactly
-    // for full-intensity components, proving expand+repack round-trips.
-    let fill_color = FillColor::from_wire(0xF801_F801);
+    // Fill cycle bypasses the pixel pipeline: the memory interface expands
+    // each 16-bit fill-register halfword to an 18-bit framebuffer pixel by
+    // replicating its LSB into the hidden coverage bits (Programming Manual
+    // §12.8.2). Bit 0 clear therefore remains clear in visible RGBA16, so
+    // this deliberately differs from the one-/two-cycle coverage packers.
+    let fill_color = FillColor::from_wire(0xF800_F800);
     let completed = execute_fill_rectangle(
         &candidate,
         fill_cycle_other_mode(),
@@ -309,7 +308,7 @@ fn full_extent_new_target_writes_exact_bytes() {
     assert_eq!(completed.rectangle().width(), 4);
     assert_eq!(completed.rectangle().height(), 2);
     let bytes = completed.device_bytes().device_bytes();
-    assert_eq!(bytes, [0xF8, 0x01].repeat(8));
+    assert_eq!(bytes, [0xF8, 0x00].repeat(8));
 
     let initialized = candidate.admit_completed_initialization(completed).unwrap();
     assert_eq!(initialized.initialized_region().rows(), 2);
@@ -568,8 +567,8 @@ fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectan
     // Expectation derived by hand from the wire, not from the executor.
     // Target is 4x2 RGBA16. `rect(0, 4, 12, 4)` is quarter-pixel
     // (ulx=0, uly=4, lrx=12, lry=4) -> x 0..=3, y 1..=1: the whole of row 1
-    // and none of row 0. Fill colour halfword 0xF801 round-trips exactly
-    // (expand(0x1f)=0xFF; 0xFF>>3=0x1f; alpha bit 0xFF>>7=1).
+    // and none of row 0. Fill colour halfword 0xF801 is the memory-interface
+    // source itself, so its RGB5 and visible coverage bit round-trip together.
     //
     // The seed is 0x1234 everywhere -- deliberately NOT the fill colour and
     // deliberately not zero, so "kept the seed", "painted the fill" and

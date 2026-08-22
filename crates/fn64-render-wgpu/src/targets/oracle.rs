@@ -100,6 +100,11 @@ impl DeviceColorBytes {
     }
 }
 
+/// Packs the oracle's color-only pixels with full destination coverage.
+/// RGBA16 bit 0 is stored coverage bit 2 (Programming Manual §§15.5.3,
+/// 15.5.6, 15.7), so primitive alpha never selects it. This generic oracle
+/// has no render-mode or sample-mask input and therefore makes only the
+/// explicit full-coverage fixture claim, not a geometric-coverage claim.
 pub fn pack_device_pixels(
     candidate: &CandidateColorTarget,
     pixels: &[Rgba8],
@@ -128,7 +133,7 @@ pub fn pack_device_pixels(
                 let packed = (u16::from(pixel.red >> 3) << 11)
                     | (u16::from(pixel.green >> 3) << 6)
                     | (u16::from(pixel.blue >> 3) << 1)
-                    | u16::from(pixel.alpha >> 7);
+                    | 1;
                 bytes.extend_from_slice(&packed.to_be_bytes());
             }
         }
