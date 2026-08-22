@@ -455,7 +455,7 @@ use super::*;
 
 
     #[test]
-    fn ai_review_contract_rejects_metadata_and_busy_rate_writes_without_mutation() {
+    fn ai_review_contract_rejects_metadata_and_applies_busy_rate_writes() {
         let mut fabric = fabric();
         fabric.configure_tv_type(TvType::Ntsc).unwrap();
         fabric.write_mmio(AI_DACRATE_REG, 1_520).unwrap();
@@ -494,22 +494,27 @@ use super::*;
             "an idempotent BITRATE rewrite is not a live-FIFO transition"
         );
         assert_eq!(fabric.evidence_snapshot(), before);
+        fabric
+            .advance_to(Cycles::new(10_000), &mut Rdram::new(0))
+            .unwrap();
+        let old_deadline = fabric.current_ai.unwrap().deadline;
+        let old_length = fabric.ai_length();
+        assert!(old_length < request.len, "the active DMA must be partly drained");
+        let pal_rate_on_ntsc_clock = TvType::Ntsc.vi_clock_hz() / 1_552;
         assert_eq!(
-            fabric.write_mmio(AI_DACRATE_REG, 1_551),
-            Err(DeviceFault::AiDacrateWhileBusy {
-                current: 1_520,
-                requested: 1_551,
-            })
+            fabric.write_mmio(AI_DACRATE_REG, 1_551).unwrap(),
+            DeviceMmioWriteEffect::AiFrequencyChanged {
+                sample_rate_hz: pal_rate_on_ntsc_clock,
+            }
         );
-        assert_eq!(fabric.evidence_snapshot(), before);
+        assert_eq!(fabric.ai_length(), old_length);
+        assert!(fabric.current_ai.unwrap().deadline > old_deadline);
+        assert_eq!(fabric.ai_dacrate(), 1_551);
         assert_eq!(
-            fabric.write_mmio(AI_BITRATE_REG, 7),
-            Err(DeviceFault::AiBitrateWhileBusy {
-                current: 15,
-                requested: 7,
-            })
+            fabric.write_mmio(AI_BITRATE_REG, 7).unwrap(),
+            DeviceMmioWriteEffect::None
         );
-        assert_eq!(fabric.evidence_snapshot(), before);
+        assert_eq!(fabric.ai_bitrate(), 7);
     }
 
 
