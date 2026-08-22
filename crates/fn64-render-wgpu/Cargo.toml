@@ -9,12 +9,25 @@ description = "Pure-Rust wgpu renderer backend for fn64."
 [features]
 default = []
 host-gpu-tests = []
+# Exposes `crate::conformance`, the adapterless public entry point
+# `fn64-render-conformance`'s wgpu runner drives. Additive and inert when
+# off: it gates one module and adds no dependency.
+conformance-runner = []
 
 [dependencies]
 fn64-render = { path = "../fn64-render" }
 fn64-render-ir = { path = "../fn64-render-ir" }
 fn64-runtime = { path = "../fn64-runtime" }
-wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl"] }
+# `vulkan-portability` is what makes the `vulkan` feature reach an Apple
+# target at all: wgpu-core routes plain `vulkan` to
+# `wgpu-core-deps-windows-linux-android` (wgpu-core/Cargo.toml:96) and only
+# `vulkan-portability` (:97) reaches `wgpu-core-deps-apple`. Measured on this
+# host: with `vulkan` alone, zero Vulkan adapters enumerate even though
+# `vulkaninfo` lists Mesa Lavapipe; with `vulkan-portability` added, the same
+# host enumerates `Vulkan | llvmpipe (LLVM 22.1.8, 128 bits) | Cpu`. It adds a
+# backend that is otherwise unreachable here; it removes none, so the default
+# Metal path is unchanged. See `src/device/adapter_selection.rs`.
+wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "vulkan-portability", "wgsl"] }
 # Already locked transitively at this exact version (pulled in by
 # fn64-shell's `pixels` dependency's own wgpu 0.19.4 tree) -- promoting it
 # to a direct dependency here makes an already-resolved version explicit,
@@ -22,5 +35,11 @@ wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "met
 pollster = "0.3.0"
 
 [dev-dependencies]
+# Test-only, and deliberately so: `fn64-render-reference` is the established
+# comparison oracle for VI scanout, and `vi_scanout::tests`'s differential
+# runs both backends over one RDRAM image and one register word. It depends
+# only on `fn64-render` and `fn64-runtime`, which this crate already has, so
+# it introduces no cycle and does not enter the production graph.
+fn64-render-reference = { path = "../fn64-render-reference" }
 naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
 sha2 = "0.10"

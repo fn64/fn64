@@ -229,6 +229,7 @@ fn non_fill_cycle_is_rejected_before_touching_the_target() {
         one_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap_err();
@@ -245,6 +246,7 @@ fn z_cmp_bypass_hazard_is_rejected_before_touching_the_target() {
         other_mode_with_hazard(0x0010),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap_err();
@@ -270,6 +272,7 @@ fn z_upd_and_im_rd_bypass_hazards_are_each_rejected() {
             other_mode_with_hazard(bit),
             FillColor::from_wire(0xF801_F801),
             rect(0, 0, 12, 4),
+            crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
             None,
         )
         .unwrap_err();
@@ -299,6 +302,7 @@ fn full_extent_new_target_writes_exact_bytes() {
         fill_cycle_other_mode(),
         fill_color,
         rect(0, 0, 12, 4), // (12>>2)=3 -> x1=3, width 4; (4>>2)=1 -> y1=1, height 2
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -323,6 +327,7 @@ fn resident_sub_rectangle_write_patches_only_the_claimed_rows_exact_bytes() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -346,7 +351,8 @@ fn resident_sub_rectangle_write_patches_only_the_claimed_rows_exact_bytes() {
         &candidate2,
         fill_cycle_other_mode(),
         FillColor::from_wire(0x07C1_07C1),
-        rect(0, 4, 12, 4), // uly raw 4 -> y0=1; lry raw 4 -> y1=1 (single row)
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff), // uly raw 4 -> y0=1; lry raw 4 -> y1=1 (single row)
         Some(&resident_bytes_before),
     )
     .unwrap();
@@ -386,6 +392,7 @@ fn resident_candidate_without_resident_bytes_is_rejected_not_zero_filled() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -403,6 +410,7 @@ fn resident_candidate_without_resident_bytes_is_rejected_not_zero_filled() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0x07C1_07C1),
         rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap_err();
@@ -431,6 +439,7 @@ fn out_of_bounds_rectangle_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -452,6 +461,7 @@ fn out_of_bounds_rectangle_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0x0000_0000),
         rect(0, 0, 20, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         Some(&before),
     )
     .unwrap_err();
@@ -481,6 +491,7 @@ fn resident_byte_length_mismatch_is_rejected_without_touching_the_target() {
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         Some(&wrong_length_bytes),
     )
     .unwrap_err();
@@ -505,6 +516,7 @@ fn rgba32_target_format_stride_is_four_bytes_per_pixel() {
         fill_cycle_other_mode(),
         fill_color,
         rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
         None,
     )
     .unwrap();
@@ -515,29 +527,249 @@ fn rgba32_target_format_stride_is_four_bytes_per_pixel() {
 }
 
 #[test]
-fn admission_still_rejects_partial_write_to_a_brand_new_target() {
-    // Preserves the invariant a brand-new (predecessor: None) target must be
-    // fully initialized before it can become resident -- this slice only
-    // lifts the restriction for resident targets, per the task's explicit
-    // "smallest type-safe mechanism" instruction, not for new ones.
+fn a_partial_fill_of_a_brand_new_target_refuses_without_seed_bytes() {
+    // **Retargeted, not deleted.** This used to assert
+    // `PartialNewTargetInitialization`: that a brand-new target could not
+    // become resident from a partial rectangle at all. That refusal was
+    // wrong -- hardware's untouched pixels are simply the RDRAM bytes that
+    // were already there, and refusing swallowed every partial-rect fill,
+    // which is ordinary content.
+    //
+    // What was RIGHT about it, and what this now pins, is the narrower
+    // fact: the untouched pixels must not be fabricated. A partial fill
+    // with no seed still refuses, by name, and still publishes nothing.
     let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let candidate = registry.begin_candidate(key).unwrap();
     assert_eq!(candidate.predecessor(), None);
+    let error = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff), // partial: only row 1
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, FillExecutionError::MissingSeedBytes { .. }),
+        "expected MissingSeedBytes, got {error:?}"
+    );
+    assert!(registry.residents().is_empty());
+}
+
+#[test]
+fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectangle() {
+    // The positive half of the test above, and the one that would have
+    // caught the fabricated zeros: the SAME partial rectangle, now given a
+    // seed, must become resident with the seed's own bytes everywhere it
+    // did not paint.
+    //
+    // Expectation derived by hand from the wire, not from the executor.
+    // Target is 4x2 RGBA16. `rect(0, 4, 12, 4)` is quarter-pixel
+    // (ulx=0, uly=4, lrx=12, lry=4) -> x 0..=3, y 1..=1: the whole of row 1
+    // and none of row 0. Fill colour halfword 0xF801 round-trips exactly
+    // (expand(0x1f)=0xFF; 0xFF>>3=0x1f; alpha bit 0xFF>>7=1).
+    //
+    // The seed is 0x1234 everywhere -- deliberately NOT the fill colour and
+    // deliberately not zero, so "kept the seed", "painted the fill" and
+    // "fabricated a zero" are three distinguishable outcomes. A seed equal
+    // to the fill colour would have passed under the very bug this pins.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    assert_eq!(candidate.predecessor(), None);
+    let seed = [0x12u8, 0x34].repeat(8);
     let completed = execute_fill_rectangle(
         &candidate,
         fill_cycle_other_mode(),
         FillColor::from_wire(0xF801_F801),
-        rect(0, 4, 12, 4), // partial: only row 1
-        None,
+        rect(0, 4, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        Some(&seed),
     )
     .unwrap();
-    let error = candidate
-        .admit_completed_initialization(completed)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        TargetError::PartialNewTargetInitialization { .. }
-    ));
-    assert!(registry.residents().is_empty());
+    assert_eq!(
+        completed.rectangle(),
+        TargetRectangle::try_new(0, 1, 4, 1).unwrap()
+    );
+    let bytes = completed.device_bytes().device_bytes();
+    // Row 0: untouched, so still the seed.
+    assert_eq!(
+        &bytes[0..8],
+        &[0x12, 0x34].repeat(4)[..],
+        "row 0 must keep the seed"
+    );
+    // Row 1: painted with the fill colour.
+    assert_eq!(
+        &bytes[8..16],
+        &[0xF8, 0x01].repeat(4)[..],
+        "row 1 must carry the fill"
+    );
+    // And it publishes, which the old refusal prevented.
+    let initialized = candidate.admit_completed_initialization(completed).unwrap();
+    assert_eq!(
+        initialized.initialized_region().covered(),
+        TargetRectangle::try_new(0, 1, 4, 1).unwrap(),
+        "the proof must name the rectangle actually covered, not the whole target"
+    );
+}
+
+/// **The scissor must clip on BOTH axes, and each axis is pinned alone.**
+///
+/// A parallel three-way differential (wgpu vs RT64 vs reference) measured
+/// this backend honouring the scissor horizontally and IGNORING it
+/// vertically before the fill clip landed: its `scissor-top-rows-only` case
+/// differed by exactly 320x120 pixels -- precisely the scissored-out region
+/// -- with RT64, the reference backend and an independent hand-derived key
+/// all agreeing against wgpu, while the X-axis counterpart case was
+/// byte-identical.
+///
+/// That asymmetry is the reason these are two tests over one helper rather
+/// than one test with a scissor narrowed on both axes. A rectangle clipped
+/// correctly in X and not at all in Y still LOOKS clipped, so a fixture that
+/// narrows both would pass while Y silently regressed -- the coincidence
+/// trap `docs/RT64-WM2000-HARNESS-TRAPS.md` names.
+///
+/// Each expectation is derived from the wire, not the executor: the scissor
+/// is latched in quarter-pixels and fn64 resolves its pixel bounds as
+/// `ceil(q / 4)` on every edge
+/// (`RdpScissorRect::quarter_to_pixel_ceil`). That rounding rule is fn64's
+/// own reading and is not independently confirmed against an allowed
+/// hardware reference.
+fn fill_clipped_by(scissor: RdpScissorRect) -> (TargetRectangle, Vec<u8>) {
+    // A 4x4 RGBA16 target, seeded 0x1234 everywhere -- neither the fill
+    // colour nor zero, so "kept the seed", "painted the fill" and
+    // "fabricated a zero" stay three distinguishable outcomes.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 4, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    let seed = [0x12u8, 0x34].repeat(16);
+    let completed = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        // The whole 4x4 target, in quarter-pixels: 0..=12 on both axes.
+        rect(0, 0, 12, 12),
+        scissor,
+        Some(&seed),
+    )
+    .unwrap();
+    let bytes = completed.device_bytes().device_bytes().to_vec();
+    (completed.rectangle(), bytes)
+}
+
+#[test]
+fn the_scissor_clips_columns_leaving_every_row_present() {
+    // Scissor admits columns 0..2 (lrx = 8 quarter-pixels -> ceil(8/4) = 2)
+    // and every row. The fill asks for all four columns.
+    let (rectangle, bytes) =
+        fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 8, 16));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(0, 0, 2, 4).unwrap(),
+        "two columns, all four rows"
+    );
+    for row in 0..4 {
+        let base = row * 8;
+        assert_eq!(
+            &bytes[base..base + 4],
+            &[0xF8, 0x01].repeat(2)[..],
+            "row {row} columns 0..2 must be painted"
+        );
+        assert_eq!(
+            &bytes[base + 4..base + 8],
+            &[0x12, 0x34].repeat(2)[..],
+            "row {row} columns 2..4 are outside the scissor and must keep the seed"
+        );
+    }
+}
+
+#[test]
+fn the_scissor_clips_rows_leaving_every_column_present() {
+    // The Y counterpart, and the axis the differential measured as broken.
+    // Scissor admits rows 0..2 (lry = 8 -> ceil(8/4) = 2) and every column.
+    //
+    // A backend that clipped X and ignored Y would return a 4x4 rectangle
+    // here and paint rows 2 and 3, which the seed assertion below catches.
+    let (rectangle, bytes) =
+        fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 16, 8));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(0, 0, 4, 2).unwrap(),
+        "all four columns, two rows"
+    );
+    assert_eq!(
+        &bytes[0..16],
+        &[0xF8, 0x01].repeat(8)[..],
+        "rows 0..2 must be painted across their full width"
+    );
+    assert_eq!(
+        &bytes[16..32],
+        &[0x12, 0x34].repeat(8)[..],
+        "rows 2..4 are outside the scissor and must keep the seed"
+    );
+}
+
+#[test]
+fn the_scissor_clips_the_low_edge_on_both_axes() {
+    // The high edges alone would pass a backend that clamped only `lrx`/
+    // `lry`. This narrows `ulx`/`uly` instead: columns 1..4 and rows 1..4
+    // (ceil(4/4) = 1 on each low edge).
+    let (rectangle, bytes) =
+        fill_clipped_by(RdpScissorRect::from_wire_quarter_pixels(0, 4, 4, 16, 16));
+    assert_eq!(
+        rectangle,
+        TargetRectangle::try_new(1, 1, 3, 3).unwrap(),
+        "origin moves to (1, 1) and the extent shrinks to 3x3"
+    );
+    assert_eq!(
+        &bytes[0..8],
+        &[0x12, 0x34].repeat(4)[..],
+        "row 0 is above the scissor and must keep the seed"
+    );
+    assert_eq!(
+        &bytes[8..10],
+        &[0x12, 0x34],
+        "row 1 column 0 is left of the scissor and must keep the seed"
+    );
+    assert_eq!(
+        &bytes[10..16],
+        &[0xF8, 0x01].repeat(3)[..],
+        "row 1 columns 1..4 must be painted"
+    );
+}
+
+#[test]
+fn a_rectangle_entirely_outside_the_scissor_refuses_rather_than_drawing_nothing() {
+    // **Mutation-driven.** Replacing the `ScissoredAway` return with
+    // `Ok(rectangle)` -- a silent no-op -- survived every other test in this
+    // file and the whole differential sweep, because no fixture placed a
+    // rectangle wholly outside its scissor.
+    //
+    // The distinction is not cosmetic. A silent `Ok` here returns the
+    // UNCLIPPED rectangle, so the executor would then paint the full span
+    // the scissor was supposed to suppress, and `plan_rows` would declare
+    // writes for it. The refusal is what stops that.
+    //
+    // Scissor admits columns 0..1 only (lrx = 4 quarter-pixels -> 1); the
+    // rectangle starts at column 2, so nothing survives.
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 4, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    let seed = [0x12u8, 0x34].repeat(16);
+    let error = execute_fill_rectangle(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        rect(8, 0, 12, 12), // columns 2..=3
+        RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 4, 16),
+        Some(&seed),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, FillExecutionError::ScissoredAway { .. }),
+        "expected ScissoredAway, got {error:?}"
+    );
+    assert!(registry.residents().is_empty(), "nothing may be published");
 }

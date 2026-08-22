@@ -885,7 +885,9 @@ version = "0.0.0"
 dependencies = [
  "fn64-render",
  "fn64-render-ir",
+ "fn64-render-reference",
  "fn64-render-rt64",
+ "fn64-render-wgpu",
  "fn64-runtime",
  "libc",
  "serde",
@@ -918,6 +920,7 @@ dependencies = [
  "fn64-boot-harness",
  "fn64-render",
  "fn64-render-reference",
+ "fn64-render-wgpu",
  "fn64-runtime",
  "serde",
  "serde_json",
@@ -930,6 +933,7 @@ version = "0.0.0"
 dependencies = [
  "fn64-render",
  "fn64-render-ir",
+ "fn64-render-reference",
  "fn64-runtime",
  "naga 30.0.0",
  "pollster",
@@ -961,6 +965,7 @@ dependencies = [
  "fn64-render",
  "fn64-render-reference",
  "fn64-render-rt64",
+ "fn64-render-wgpu",
  "fn64-runtime",
  "gilrs",
  "pixels",

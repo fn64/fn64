@@ -40,13 +40,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RECOMP_H_DIR");
     println!("cargo:rerun-if-env-changed=ROM");
     println!("cargo:rerun-if-env-changed=FN64_RECOMP");
+    println!("cargo:rerun-if-env-changed=RECOMP_RS_HOST_LOOKUP");
     // Declared so a clean `#[cfg(fn64_game_linked)]` doesn't warn as an
     // unexpected cfg under `-Wunexpected_cfgs` (Rust 1.80+ lint).
     println!("cargo:rustc-check-cfg=cfg(fn64_game_linked)");
     println!("cargo:rustc-check-cfg=cfg(fn64_cpu_runtime)");
 
-    // FN64_RECOMP=rs (same contract as oot-boot/build.rs): the game comes
-    // from the linked `oot-recompiled` typed-Rust crate (the rs manifest at
+    // FN64_RECOMP=rs (same contract as the harnesses' own build.rs): the game
+    // comes from the linked emitted typed-Rust crate (the rs manifest at
     // crates/fn64-shell/rs/), so there is no C to compile -- ROM is still
     // required at runtime. Only the rs manifest carries the rs deps, so
     // this branch is unreachable from the plain workspace build.
@@ -56,8 +57,88 @@ fn main() {
             "Point it at the decomp's OWN decompressed build-output z64 -- NOT the retail \
              compressed cartridge image.",
         );
+        // The rs lane resolves host functions BY ADDRESS, so its vram ->
+        // adapter table is per-title game-profile data that lives beside the
+        // title's own harness. This used to be a hardcoded `#[path]` include
+        // of `examples/oot-boot/src/host_lookup.rs` in src/main.rs, which
+        // pinned the shell to OoT AND named a file that no longer exists in
+        // this repo -- so `FN64_RECOMP=rs` could not compile here for ANY
+        // title. Take the path from the environment instead and hand it to
+        // main.rs as FN64_HOST_LOOKUP_PATH.
+        //
+        // No default is baked in on purpose. Defaulting to some title's table
+        // would silently bind another game's addresses: the rs lane would run,
+        // resolve a wrong-but-plausible set of host functions, and produce
+        // wrong behaviour with no error -- exactly the silent-mismapping class
+        // AGENTS.md's "loud traps, no silent shrugs" forbids.
+        let host_lookup = required_env(
+            "RECOMP_RS_HOST_LOOKUP",
+            "Point it at the linked title's own host_lookup.rs (its vram -> fn64-abi adapter \
+             table), e.g. recomps/wm2000/packages/wm2000-boot/src/host_lookup.rs. There is \
+             deliberately no default: the rs lane binds host functions by ADDRESS, so another \
+             title's table would resolve silently and produce wrong behaviour.",
+        );
+        let host_lookup = PathBuf::from(&host_lookup);
+        let host_lookup = host_lookup.canonicalize().unwrap_or_else(|error| {
+            panic!(
+                "fn64-shell build.rs: RECOMP_RS_HOST_LOOKUP={} cannot be resolved: {error}",
+                host_lookup.display()
+            )
+        });
+        if !host_lookup.is_file() {
+            panic!(
+                "fn64-shell build.rs: RECOMP_RS_HOST_LOOKUP={} is not a file -- expected the \
+                 linked title's host_lookup.rs.",
+                host_lookup.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", host_lookup.display());
+        // Copy it to a FIXED path under OUT_DIR. `#[path]` needs a literal and
+        // cannot expand `env!` to the source location, and `include!` would
+        // splice the table's leading `//!` inner doc comments into the middle
+        // of a module, which does not parse. `concat!(env!("OUT_DIR"), ..)` in
+        // a `#[path]` is a literal, so the copy is what makes this work.
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+        let staged = out_dir.join("host_lookup.rs");
+        let table = std::fs::read_to_string(&host_lookup).unwrap_or_else(|error| {
+            panic!(
+                "fn64-shell build.rs: read host lookup {}: {error}",
+                host_lookup.display()
+            )
+        });
+        // Drop the table's leading `//!` inner-doc block. Those are only valid
+        // at the top of a file module, and `include!` splices this text into
+        // the middle of one -- so they would fail to parse here. Only the
+        // contiguous leading block is removed; `//!` cannot legally appear
+        // later in the file anyway.
+        let body: String = table
+            .lines()
+            .skip_while(|line| {
+                let t = line.trim_start();
+                t.starts_with("//!") || t.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("fn exact_host_lookup"),
+            "fn64-shell build.rs: {} does not define exact_host_lookup -- expected a title's \
+             rs-lane vram -> adapter table",
+            host_lookup.display()
+        );
+        std::fs::write(&staged, body).unwrap_or_else(|error| {
+            panic!(
+                "fn64-shell build.rs: stage host lookup into {}: {error}",
+                staged.display()
+            )
+        });
         println!("cargo:rustc-cfg=fn64_cpu_runtime");
         println!("cargo:rustc-cfg=fn64_game_linked");
+        // Build-time provenance for the startup stack banner (src/stack.rs).
+        // A run's lane comes from the cfg above, but "which game" is only
+        // knowable HERE: nothing in the linked binary records what was fed to
+        // this script. Baking it in costs one env var and lets a symptom
+        // report carry its own cell.
+        emit_stack_provenance(&host_lookup.display().to_string());
         return;
     }
 
@@ -156,6 +237,7 @@ fn main() {
 
     // The game symbols are now linkable: turn on the boot/window path.
     println!("cargo:rustc-cfg=fn64_game_linked");
+    emit_stack_provenance(&recompiled_dir.display().to_string());
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
@@ -165,6 +247,21 @@ fn main() {
         bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
+}
+
+/// Bake the build's game provenance into the binary for `src/stack.rs`'s
+/// startup banner: WHERE the linked bodies came from, and WHICH ROM this build
+/// validated. Both are build-time facts that no runtime read can recover --
+/// `RECOMPILED_DIR` may be unset, changed, or point somewhere else by the time
+/// the binary runs, while the bodies compiled into it do not change.
+///
+/// `option_env!` on the reader side means a content-free build simply has
+/// neither, which is the honest answer there.
+fn emit_stack_provenance(game_source: &str) {
+    println!("cargo:rustc-env=FN64_SHELL_GAME_SOURCE={game_source}");
+    if let Ok(rom) = env::var("ROM") {
+        println!("cargo:rustc-env=FN64_SHELL_BUILD_ROM={rom}");
+    }
 }
 
 fn required_env(name: &str, hint: &str) -> PathBuf {

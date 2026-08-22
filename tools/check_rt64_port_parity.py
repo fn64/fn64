@@ -55,7 +55,7 @@ RUST_STATES = {"RUST_PENDING", "RUST_PASS", "RUST_BOUNDED_QUALIFICATION"}
 AUTHORITIES = {"hardware_reference", "admitted_full_rom", "base_renderer_matrix", "pinned_rt64"}
 AVAILABILITY = {"qualified", "unexercised", "build_not_enabled", "platform_unavailable"}
 CONTRACT_DIGEST = "7556031949f3093d616f75724e5be091beda5152140c489127213917ef382da0"
-STATE_DIGEST = "65f6438686713767b135ae74def03001679a93ae27c5f245dc2049be987ef9d5"
+STATE_DIGEST = "8763281ca7929b5cffab7a46288eff77dfd938e6315fa525eeb34e21976aab64"
 
 
 class ParityError(Exception):
@@ -247,6 +247,27 @@ REGISTERED_RUNNERS: dict[str, RunnerPolicy] = {
             "fn64-render-rt64/rt64",
         ),
         cooldown_milliseconds=1_000,
+    ),
+    # The second engine adapter, and the first non-RT64 one. `fn64-render-
+    # reference` is a pure-Rust CPU rasterizer: no GPU, no FFI, no platform
+    # gate, so this entry pins no RT64 source and its runner reports
+    # `delegate_identity: None` (required of every non-RT64 delegate below).
+    # Its verifier-private authority is derived arithmetically from the
+    # replay's display list rather than captured from a backend run; see the
+    # runner source's module documentation.
+    "reference-native-rdram-sync-v1": RunnerPolicy(
+        delegate_kind="rust_port",
+        runner_path="evidence/rt64-port/artifacts/native-renderer-rdram-sync/bin/runner",
+        runner_sha256="64b075f66e17c0af1abb659c9b3d01fd00702d12953a32663500fea0bc9fc796",
+        build_receipt_path="evidence/rt64-port/artifacts/native-renderer-rdram-sync/build-receipt.json",
+        build_receipt_sha256="6d2d12dce0d9b3fcd9c5259d87c2a77883e475531e314dabef76e2d9443c0270",
+        verifier_path="evidence/rt64-port/artifacts/native-renderer-rdram-sync/bin/verifier",
+        verifier_sha256="0ae646571803484983ff9ac12049a37f33c12f0821db70275c8b9400c8b6833f",
+        authority_path="evidence/rt64-port/artifacts/native-renderer-rdram-sync/private-authority.json",
+        authority_sha256="21880b77486b246d64fc76021c19b2f21527ad38dd7630b07ebf27f187ab270e",
+        runner_args=("run",),
+        enabled_features=("fn64-render-conformance/reference-runner",),
+        cooldown_milliseconds=0,
     ),
 }
 
@@ -783,7 +804,13 @@ def render_doc(rows: list[dict], metadata: dict[tuple[str, str], dict]) -> str:
         "The ordinary checker keeps a structurally sound development backlog green. The",
         "separate `--progress` gate remains red until every required row has both a",
         "qualified RT64 observation/classification and a qualified Rust result.", "",
-        "The first concrete backend runner is registered only for deferred frame history.",
+        "Two concrete runners are registered: the RT64 deferred-frame-history runner, and the",
+        "pure-Rust reference delegate qualifying `feature::native-renderer-rdram-sync`. That",
+        "single `RUST_PASS` records that fn64's *reference* CPU rasterizer reproduces an",
+        "independently derived RDRAM answer on one fixture at one observable layer. It is not",
+        "RT64 parity: `rt64_evidence.availability` on that row is still `unexercised`, so RT64",
+        "has never been run against it and no RT64-to-Rust comparison exists. It also says",
+        "nothing about the wgpu renderer, which this row does not exercise.",
         "Closed evidence remains fail-closed: the checker launches every fresh process and owns each random",
         "challenge. A public replay artifact contains only the Rust-decoded record, exact raw",
         "payload streams, and capture control; a separately registered verifier-private authority",

@@ -44,6 +44,7 @@ use fn64_render::{
 };
 
 use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor};
+use crate::targets::RdpScissorRect;
 use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
 
@@ -68,20 +69,8 @@ pub const fn neutral_vertex_to_raster_vertex(vertex: NeutralTriangleVertex) -> R
 /// that is a hard error here, not a silent default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingTriangleDrawState {
-    NoOtherMode {
-        triangle_index: usize,
-    },
-    NoCombine {
-        triangle_index: usize,
-    },
-    /// A triangle whose `OtherMode::alpha_compare()` decodes `Threshold` was
-    /// visited before this plan's own first `SetBlendColor` (seeded or
-    /// in-plan) -- `Threshold` needs a real `G_SETBLENDCOLOR.a` to compare
-    /// against (`alpha_compare.rs:96-98`); a `None`-mode or `Dither`-rejected
-    /// triangle never reaches this check (module doc, card §4a).
-    NoBlendColor {
-        triangle_index: usize,
-    },
+    NoOtherMode { triangle_index: usize },
+    NoCombine { triangle_index: usize },
 }
 
 impl core::fmt::Display for MissingTriangleDrawState {
@@ -89,7 +78,6 @@ impl core::fmt::Display for MissingTriangleDrawState {
         let (missing, triangle_index) = match self {
             Self::NoOtherMode { triangle_index } => ("SetOtherMode", *triangle_index),
             Self::NoCombine { triangle_index } => ("SetCombine", *triangle_index),
-            Self::NoBlendColor { triangle_index } => ("SetBlendColor", *triangle_index),
         };
         write!(
             formatter,
@@ -135,20 +123,34 @@ pub struct RetrievedTriangleDraw {
     /// retrieval time; blend-cycle's `BlendColorInput::Blend`/
     /// `BlendAlphaInput`-independent gate at draw-submission time) rather
     /// than this struct duplicating one register behind two fields.
-    pub blend_color: Option<Color4>,
+    pub blend_color: Color4,
     /// `G_SETENVCOLOR` current at this triangle's own stream position --
     /// mirrors `blend_color`'s same command-time-snapshot pattern,
     /// unconditionally tracked.
-    pub env_color: Option<Color4>,
+    pub env_color: Color4,
     /// `G_SETPRIMCOLOR` current at this triangle's own stream position --
     /// mirrors `env_color` exactly.
-    pub prim_color: Option<PrimColor>,
+    pub prim_color: PrimColor,
     /// `G_SETFOGCOLOR` current at this triangle's own stream position --
     /// mirrors `blend_color`/`env_color`/`prim_color` exactly. Needed by
     /// the production blend-cycle wiring whenever a resolved cycle's `P`/
     /// `M` selects [`crate::blend::BlendColorInput::Fog`] or its `A`
     /// selects [`crate::blend::BlendAlphaInput::Fog`].
-    pub fog_color: Option<Color4>,
+    pub fog_color: Color4,
+    /// `G_SETSCISSOR` current at this triangle's own stream position, as
+    /// the quarter-pixel rect the wire carries -- the same
+    /// command-time-snapshot pattern as `blend_color`/`env_color`/
+    /// `prim_color`/`fog_color`, and for the same reason: one packet can
+    /// carry several rectangles under different scissors, so the walk's
+    /// running final value would clip the earlier ones with the later
+    /// one's rect.
+    ///
+    /// `None` means this plan issued no `SetScissor` before this triangle.
+    /// It is deliberately NOT defaulted to the full framebuffer here: the
+    /// consumer, not this collector, owns the fallback, because only the
+    /// consumer knows the target extent that fallback has to be. See
+    /// `production.rs`'s texrect submission for where it is supplied.
+    pub scissor: Option<RdpScissorRect>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -162,11 +164,10 @@ pub struct TriangleDrawStateCollector {
     draws: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
     current_other_mode: Option<OtherMode>,
     current_combine: Option<CombineParams>,
-    /// Tile 0's binding current at the walk's current stream position --
-    /// tile 0 is the RDP's default bound texture tile for a standard
-    /// triangle draw (`RdpTriangleCommand` carries no tile index of its
-    /// own). `None` until this plan's own first `SetTile{tile_index: 0,
-    /// ..}`/`SetTileSize{tile_index: 0, ..}` pair is both present;
+    /// Every tile's binding current at the walk's current stream position.
+    ///
+    /// An entry is `(None, None)` until this plan's own
+    /// `SetTile`/`SetTileSize` pair for that index is both present;
     /// [`TileBindingParams::unbound`] is used at snapshot time when either
     /// half is still missing (card §6: a named, non-fatal condition here --
     /// unlike `OtherMode`/`CombineParams`, a missing tile binding does not
@@ -174,22 +175,74 @@ pub struct TriangleDrawStateCollector {
     /// `TMEM_SAMPLE_STATUS_NO_TILE_BINDING` surfaces it per-fragment
     /// instead, since a flat-colored/non-textured triangle legitimately has
     /// no tile bound at all).
-    current_tile0_descriptor: Option<fn64_render::NeutralTileDescriptor>,
-    current_tile0_size: Option<fn64_render::NeutralTileSize>,
+    ///
+    /// **This was tile 0 alone, on the claim that "`RdpTriangleCommand`
+    /// carries no tile index of its own". That claim was false** -- the
+    /// decoder reads the index at `triangle.rs:183` and the command retains
+    /// the wire words it came from.
+    ///
+    /// **The whole 8-entry tile table**, not tile 0 alone.
+    ///
+    /// EVERY admitted draw names its own tile in its own wire word -- a
+    /// raw triangle in word 0 bits 18:16, a texture rectangle in word 1
+    /// bits 26:24 -- so tracking only tile 0 silently bound tile 0's
+    /// descriptor for any draw naming another. `production.rs`'s
+    /// `PlanCollector` already carries the whole table for exactly this
+    /// reason; this is the same fix on the copy its doc requires to match.
+    current_tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
     /// `G_SETBLENDCOLOR` current at the walk's current stream position --
     /// mirrors `current_other_mode`/`current_combine` exactly, a fourth
     /// instance of the same command-time-snapshot pattern (card §4a).
-    current_blend_color: Option<Color4>,
+    current_blend_color: Color4,
     /// `G_SETENVCOLOR` current at the walk's current stream position --
     /// mirrors `current_blend_color`, unconditionally tracked (no
     /// `AlphaCompare` gate).
-    current_env_color: Option<Color4>,
+    current_env_color: Color4,
     /// `G_SETPRIMCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color` exactly.
-    current_prim_color: Option<PrimColor>,
+    current_prim_color: PrimColor,
     /// `G_SETFOGCOLOR` current at the walk's current stream position --
     /// mirrors `current_env_color`/`current_prim_color` exactly.
-    current_fog_color: Option<Color4>,
+    current_fog_color: Color4,
+    /// `G_SETSCISSOR` current at the walk's current stream position --
+    /// mirrors `current_fog_color`'s pattern, except that it stays `None`
+    /// until this plan issues one (see [`RetrievedTriangleDraw::scissor`]
+    /// for why the fallback is the consumer's and not this collector's).
+    current_scissor: Option<RdpScissorRect>,
+}
+
+/// The tile index a draw names in its OWN wire word.
+///
+/// **One implementation, because there are two collectors.**
+/// `production.rs`'s `PlanCollector` and this file's
+/// `TriangleDrawStateCollector` both walk the same plan and must resolve the
+/// same tile for the same draw; when each carried its own copy of this
+/// arithmetic they drifted, and the copy here stayed frozen at tile 0 long
+/// after the other was fixed. A shared function cannot drift.
+///
+/// A raw triangle names its tile in word 0 bits 18:16 -- the field
+/// `RawTriangle::decode` reads (`triangle.rs:183`). A texture rectangle
+/// names its own in word 1 bits 26:24. RT64 honours the draw's tile the
+/// same way: `drawTris` assigns `drawCall.textureTile = tile`
+/// (`rt64_rdp.cpp:1088-1097`).
+///
+/// Falls back to 0 only when the words are absent, which a decoded command
+/// never is -- the fallback exists so a malformed fixture binds the default
+/// tile rather than panicking mid-walk.
+pub fn bound_tile_index(source: TriangleSource, raw_words: &[u32]) -> usize {
+    match source {
+        TriangleSource::TextureRectangle => raw_words
+            .get(1)
+            .map(|word| ((word >> 24) & 0x7) as usize)
+            .unwrap_or(0),
+        TriangleSource::RawTriangle => raw_words
+            .first()
+            .map(|word| ((word >> 16) & 0x7) as usize)
+            .unwrap_or(0),
+    }
 }
 
 impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
@@ -199,10 +252,29 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 vertices,
                 source,
                 viewport,
+                raw_words,
                 ..
             }) => {
                 let triangle_index = self.draws.len();
-                let tile_binding = match (self.current_tile0_descriptor, self.current_tile0_size) {
+                // **The draw's OWN tile, read from its retained wire words.**
+                //
+                // This arm previously froze the index to 0. A raw triangle
+                // names its tile in word 0 bits 18:16 -- the same field
+                // `RawTriangle::decode` reads as `tile` -- and a texture
+                // rectangle names its own in word 1 bits 26:24. RT64 does
+                // the same: `drawTris` takes the draw's tile and assigns
+                // `drawCall.textureTile = tile` (`rt64_rdp.cpp:1088-1097`).
+                //
+                // Identical to the recovery `production.rs`'s `PlanCollector`
+                // already performs, so the two collectors resolve the SAME
+                // tile for the same draw.
+                let bound_tile_index = bound_tile_index(*source, raw_words);
+                let tile_binding = match self
+                    .current_tiles
+                    .get(bound_tile_index)
+                    .copied()
+                    .unwrap_or((None, None))
+                {
                     (Some(descriptor), Some(size)) => {
                         TileBindingParams::from_neutral(descriptor, size)
                     }
@@ -215,28 +287,29 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     let combine_params = self
                         .current_combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
-                    // Retrieval-time admission gate (card §4a): the natural
-                    // `require_supported_alpha_compare` call site this
-                    // module was always documented to need. `Reserved`/
-                    // `Dither` never reach `submit_admitted_triangle` --
-                    // loud, named panics here, not a silent None/Threshold
-                    // coercion (AGENTS.md "loud traps, no silent shrugs").
+                    // Retrieval-time admission gate (card §4a): `Dither`
+                    // never reaches `submit_admitted_triangle` -- a loud,
+                    // named panic here, not a silent None/Threshold coercion
+                    // (AGENTS.md "loud traps, no silent shrugs"). There is no
+                    // reserved encoding to gate: pinned RT64's shader
+                    // branches only for `G_AC_DITHER` and `G_AC_THRESHOLD`,
+                    // so wire 2 falls through to no compare
+                    // (`src/shaders/RasterPS.hlsl:203-213`, commit
+                    // `f0728a2`; `docs/RT64-GUARD-AUDIT.md` A3).
                     match other_mode.alpha_compare() {
-                        AlphaCompare::Reserved => panic!(
-                            "triangle #{triangle_index} (plan order) selected reserved G_AC \
-                             alpha-compare mode 2"
-                        ),
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
                              alpha-compare, which has no fragment-callable RT64 PRNG binding in \
                              this pipeline (no frame-count uniform exists to seed it honestly; \
                              see fn64-alpha-compare-production-card.md \u{a7}2)"
                         ),
-                        AlphaCompare::Threshold => {
-                            self.current_blend_color
-                                .ok_or(MissingTriangleDrawState::NoBlendColor { triangle_index })?;
-                        }
-                        AlphaCompare::None => {}
+                        // `Threshold` compares fragment alpha against
+                        // `G_SETBLENDCOLOR.a`, a register that always holds
+                        // a value (zero until written), so there is nothing
+                        // to refuse -- see the twin gate in
+                        // `production.rs` and `RdpState`'s constant-color
+                        // field doc for the citations.
+                        AlphaCompare::Threshold | AlphaCompare::None => {}
                     };
                     Ok(RetrievedTriangleDraw {
                         vertices: *vertices,
@@ -249,6 +322,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         env_color: self.current_env_color,
                         prim_color: self.current_prim_color,
                         fog_color: self.current_fog_color,
+                        scissor: self.current_scissor,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -263,31 +337,51 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         Some(CombineParams::from_wire(combine.low, combine.high));
                 }
                 RdpStateCommand::SetBlendColor { color, .. } => {
-                    self.current_blend_color = Some(Color4::from_wire(color.value));
+                    self.current_blend_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetEnvColor { color, .. } => {
-                    self.current_env_color = Some(Color4::from_wire(color.value));
+                    self.current_env_color = Color4::from_wire(color.value);
                 }
                 RdpStateCommand::SetPrimColor { color, .. } => {
-                    self.current_prim_color = Some(PrimColor::from_wire(
+                    self.current_prim_color = PrimColor::from_wire(
                         u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
                         color.color,
-                    ));
+                    );
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
-                    self.current_fog_color = Some(Color4::from_wire(color.value));
+                    self.current_fog_color = Color4::from_wire(color.value);
+                }
+                // Latched verbatim in wire quarter-pixels. Public libultra
+                // `include/ultra64/gbi.h:4794-4837` encodes the four
+                // coordinates as twelve-bit fields scaled by four, or
+                // accepts the fractional wire values directly. Retaining a
+                // reversed or empty rect until clip time is fn64's own
+                // reading and is not independently confirmed against an
+                // allowed hardware reference.
+                RdpStateCommand::SetScissor { scissor, .. } => {
+                    self.current_scissor = Some(RdpScissorRect::from_wire_quarter_pixels(
+                        scissor.mode,
+                        scissor.upper_left_x,
+                        scissor.upper_left_y,
+                        scissor.lower_right_x,
+                        scissor.lower_right_y,
+                    ));
                 }
                 RdpStateCommand::SetTile {
                     tile_index,
                     descriptor,
                     ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_descriptor = Some(*descriptor);
+                } => {
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.0 = Some(*descriptor);
+                    }
                 }
                 RdpStateCommand::SetTileSize {
                     tile_index, size, ..
-                } if *tile_index == 0 => {
-                    self.current_tile0_size = Some(*size);
+                } => {
+                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
+                        slot.1 = Some(*size);
+                    }
                 }
                 _ => {}
             },
@@ -400,6 +494,7 @@ mod tests {
             vertices,
             source: TriangleSource::RawTriangle,
             viewport: None,
+            texrect_accesses: None,
         }
     }
 
@@ -478,12 +573,6 @@ mod tests {
              command; a triangle draw cannot retrieve real state that was never admitted at \
              its own stream position"
         );
-        assert_eq!(
-            MissingTriangleDrawState::NoBlendColor { triangle_index: 3 }.to_string(),
-            "triangle #3 (plan order) was visited before this plan's own first SetBlendColor \
-             command; a triangle draw cannot retrieve real state that was never admitted at \
-             its own stream position"
-        );
     }
 
     fn blend_color_command(index: u32, value: u32) -> RdpStateCommand {
@@ -520,7 +609,7 @@ mod tests {
         let draws = collector
             .finish()
             .expect("threshold triangle has blend_color");
-        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x1122_3344)));
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x1122_3344));
     }
 
     #[test]
@@ -537,11 +626,22 @@ mod tests {
         let draws = collector
             .finish()
             .expect("None-mode triangle needs no blend_color at all");
-        assert_eq!(draws[0].blend_color, None);
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0));
     }
 
+    /// **Wall 6.** A `Threshold` triangle with no `SetBlendColor` anywhere
+    /// in the plan is admitted, carrying the blend register's power-on
+    /// zero.
+    ///
+    /// This replaces a test that asserted the opposite. `Threshold`
+    /// compares the fragment alpha against `G_SETBLENDCOLOR.a`, and that
+    /// register always holds a value -- zero until the guest writes one.
+    /// `fn64-render-reference` models it as a zero-initialized `[u8; 4]`
+    /// (`gbi/state.rs:227`, `:387`) and RT64's C++ zero-initializes
+    /// `blendColor` at `src/hle/rt64_state.cpp:131`. The refusal invented an
+    /// "unset" state the RDP cannot be in, and it aborted WM2000's plan.
     #[test]
-    fn a_threshold_triangle_before_any_blend_color_is_a_loud_named_error() {
+    fn a_threshold_triangle_before_any_blend_color_reads_the_power_on_zero() {
         let mut collector = TriangleDrawStateCollector::default();
         let other_mode = threshold_other_mode_command(0);
         let combine = combine_command(1, 1, 2);
@@ -551,10 +651,39 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::State(&combine));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let error = collector.finish().unwrap_err();
-        assert_eq!(
-            error,
-            MissingTriangleDrawState::NoBlendColor { triangle_index: 0 }
+        let draws = collector
+            .finish()
+            .expect("a Threshold triangle with no SetBlendColor is admissible");
+        // Derived by hand: an RDP color register powers up holding four
+        // zero bytes, so the packed wire word is 0x0000_0000.
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0));
+    }
+
+    /// The companion to the test above: an in-plan `SetBlendColor` must
+    /// still reach the snapshot. Without this, the power-on assertion could
+    /// hold against a field hardcoded to zero that ignores every write.
+    #[test]
+    fn a_threshold_triangle_after_a_blend_color_carries_that_written_value() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = threshold_other_mode_command(0);
+        let combine = combine_command(1, 1, 2);
+        let written = blend_color_command(2, 0x1122_3344);
+        let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+
+        collector.command(RawDpcSemanticCommandRef::State(&other_mode));
+        collector.command(RawDpcSemanticCommandRef::State(&combine));
+        collector.command(RawDpcSemanticCommandRef::State(&written));
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("written blend color is admissible");
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x1122_3344));
+        assert_ne!(
+            draws[0].blend_color,
+            Color4::from_wire(0),
+            "the written value must differ from the power-on zero, or neither test can \
+             distinguish real tracking from a hardcoded constant"
         );
     }
 
@@ -581,8 +710,8 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
 
         let draws = collector.finish().expect("both triangles have blend_color");
-        assert_eq!(draws[0].blend_color, Some(Color4::from_wire(0x0000_00AA)));
-        assert_eq!(draws[1].blend_color, Some(Color4::from_wire(0x0000_00BB)));
+        assert_eq!(draws[0].blend_color, Color4::from_wire(0x0000_00AA));
+        assert_eq!(draws[1].blend_color, Color4::from_wire(0x0000_00BB));
         assert_ne!(
             draws[0].blend_color, draws[1].blend_color,
             "triangle A must NOT be retroactively affected by a SetBlendColor that comes after \
@@ -590,17 +719,135 @@ mod tests {
         );
     }
 
+    /// **A raw triangle binds ITS OWN tile, not tile 0.**
+    ///
+    /// A triangle names its tile in wire word 0 bits 18:16 -- the field
+    /// `RawTriangle::decode` reads at `triangle.rs:183` -- and RT64 honours
+    /// it: `drawTris` takes the draw's tile and assigns
+    /// `drawCall.textureTile = tile` (`rt64_rdp.cpp:1088-1097`).
+    ///
+    /// This collector previously froze the index to 0 on the claim that
+    /// "`RdpTriangleCommand` carries no tile index of its own", which is
+    /// false, and tracked only `SetTile{tile_index: 0}` so tiles 1-7 were
+    /// discarded outright. The consequence was silent: a triangle naming
+    /// another tile sampled tile 0's descriptor -- wrong TMEM base, format,
+    /// size and palette.
+    ///
+    /// WM2000 cannot catch this: measured, all 1,000,001 of its raw
+    /// triangles name tile 0. So the regression guard has to be a fixture
+    /// that names a NON-zero tile, and it must distinguish the two tiles by
+    /// a field the binding actually carries.
     #[test]
-    #[should_panic(expected = "selected reserved G_AC alpha-compare mode 2")]
-    fn a_reserved_alpha_compare_triangle_panics_loudly_at_retrieval_time() {
+    fn a_raw_triangle_binds_the_tile_its_own_wire_word_names() {
         let mut collector = TriangleDrawStateCollector::default();
-        let other_mode = other_mode_command(0, 0, 2); // Reserved
+        let other_mode = other_mode_command(0, 0, 2);
+        let combine = combine_command(1, 1, 2);
+
+        // Two tiles that differ in a field the binding carries through.
+        let descriptor = |tmem_word_address: u16| fn64_render::NeutralTileDescriptor {
+            format: fn64_render::NeutralImageFormat::Rgba,
+            size: fn64_render::NeutralPixelSize::Bits16,
+            line_words: 1,
+            tmem_word_address,
+            palette: 0,
+            s_mode: fn64_render::NeutralTileAddressMode {
+                mirror: false,
+                clamp: true,
+            },
+            mask_s: 0,
+            shift_s: 0,
+            t_mode: fn64_render::NeutralTileAddressMode {
+                mirror: false,
+                clamp: true,
+            },
+            mask_t: 0,
+            shift_t: 0,
+        };
+        let size = fn64_render::NeutralTileSize {
+            low_s: 0,
+            low_t: 0,
+            high_s: 4,
+            high_t: 4,
+        };
+        let tile_state = |index: u32, tile_index: u8, tmem: u16| {
+            (
+                RdpStateCommand::SetTile {
+                    location: location(index),
+                    raw_words: Box::new([0, 0]),
+                    tile_index,
+                    descriptor: descriptor(tmem),
+                    before: None,
+                    after: fn64_render::RdpStateIdentity::of_tile_descriptor(
+                        tile_index,
+                        descriptor(tmem),
+                    ),
+                },
+                RdpStateCommand::SetTileSize {
+                    location: location(index + 1),
+                    raw_words: Box::new([0, 0]),
+                    tile_index,
+                    size,
+                    before: None,
+                    after: fn64_render::RdpStateIdentity::of_tile_size(tile_index, size),
+                },
+            )
+        };
+        // Tile 0 at TMEM word 0; tile 5 at TMEM word 256.
+        let (tile0, tile0_size) = tile_state(2, 0, 0);
+        let (tile5, tile5_size) = tile_state(4, 5, 256);
+
+        // A triangle whose word 0 names tile 5 (bits 18:16).
+        let mut triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
+        let mut words = triangle.raw_words.to_vec();
+        words[0] = 0x0800_0000 | (5 << 16);
+        triangle.raw_words = words.into_boxed_slice();
+
+        for command in [
+            &other_mode,
+            &combine,
+            &tile0,
+            &tile0_size,
+            &tile5,
+            &tile5_size,
+        ] {
+            collector.command(RawDpcSemanticCommandRef::State(command));
+        }
+        collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector.finish().expect("the triangle is admitted");
+        let draw = draws.into_iter().next().expect("one triangle was staged");
+        assert_eq!(
+            draw.tile_binding.tmem_word_address, 256,
+            "a triangle naming tile 5 must bind tile 5's descriptor, not tile 0's"
+        );
+    }
+
+    /// Retargeted from `a_reserved_alpha_compare_triangle_panics_loudly_at_
+    /// retrieval_time`. Pinned RT64's shader branches only for
+    /// `G_AC_DITHER` and `G_AC_THRESHOLD`, so wire 2 falls through and the
+    /// triangle is ordinary no-compare content, not a refusal
+    /// (`src/shaders/RasterPS.hlsl:203-213`, commit `f0728a2`).
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    #[test]
+    fn an_alpha_compare_wire_two_triangle_is_retrieved_as_no_compare() {
+        let mut collector = TriangleDrawStateCollector::default();
+        let other_mode = other_mode_command(0, 0, 2);
         let combine = combine_command(1, 1, 2);
         let triangle = triangle_command([vertex(1.0), vertex(2.0), vertex(3.0)]);
 
         collector.command(RawDpcSemanticCommandRef::State(&other_mode));
         collector.command(RawDpcSemanticCommandRef::State(&combine));
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
+
+        let draws = collector
+            .finish()
+            .expect("wire encoding 2 is admitted, not refused");
+        let draw = draws.into_iter().next().expect("one triangle was staged");
+        assert_eq!(draw.other_mode.alpha_compare(), AlphaCompare::None);
+        // Distinguishing check: wire 3 still panics, so the retrieval above
+        // cannot be produced by a collector that stopped gating entirely.
+        // (`a_dither_alpha_compare_triangle_panics_loudly_naming_the_frame_
+        // count_gap` below is that assertion.)
     }
 
     #[test]
@@ -671,15 +918,15 @@ mod tests {
 
         let draws = collector.finish().expect("both triangles have state");
         assert_eq!(draws.len(), 2);
-        assert_eq!(draws[0].env_color, Some(Color4::from_wire(0x1111_1111)));
+        assert_eq!(draws[0].env_color, Color4::from_wire(0x1111_1111));
         assert_eq!(
             draws[0].prim_color,
-            Some(PrimColor::from_wire(10 | (5 << 8), 0x2222_2222))
+            PrimColor::from_wire(10 | (5 << 8), 0x2222_2222)
         );
-        assert_eq!(draws[1].env_color, Some(Color4::from_wire(0x3333_3333)));
+        assert_eq!(draws[1].env_color, Color4::from_wire(0x3333_3333));
         assert_eq!(
             draws[1].prim_color,
-            Some(PrimColor::from_wire(20 | (10 << 8), 0x4444_4444))
+            PrimColor::from_wire(20 | (10 << 8), 0x4444_4444)
         );
         assert_ne!(
             draws[0].env_color, draws[1].env_color,
@@ -710,7 +957,7 @@ mod tests {
         let draws = collector
             .finish()
             .expect("no env/prim color needed to resolve");
-        assert_eq!(draws[0].env_color, None);
-        assert_eq!(draws[0].prim_color, None);
+        assert_eq!(draws[0].env_color, Color4::from_wire(0));
+        assert_eq!(draws[0].prim_color, PrimColor::from_wire(0, 0));
     }
 }

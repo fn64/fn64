@@ -664,7 +664,14 @@ pub(super) fn emit_lld(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg
     }
 }
 
-pub(super) fn emit_sc(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16, double: bool) {
+pub(super) fn emit_sc(
+    out: &mut String,
+    mem_fault: MemFault,
+    rt: Reg,
+    base: Reg,
+    off: i16,
+    double: bool,
+) {
     let addr = format!("Rdram::eff_addr({}, {})", r(base), off);
     let (value, width, store, checked_store) = if double {
         (ru64(rt), 8, "store_d", "try_store_d_translated")
@@ -752,7 +759,12 @@ pub(super) fn emit_bank_fpu_trap(
 }
 
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
-pub(super) fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &MemFault) {
+pub(super) fn emit_straight(
+    out: &mut String,
+    instr: Instruction,
+    _vram: u32,
+    mem_fault: &MemFault,
+) {
     use Instruction::*;
     let line = |out: &mut String, s: String| {
         let _ = writeln!(out, "            {}", s);
@@ -859,8 +871,19 @@ pub(super) fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, me
         Srl { rd, rt, sa } => {
             line(out, format!("ctx.set_r32({}, (({}) >> {}) as i32);", rd, ru32(rt), sa))
         }
+        // SRA/SRAV shift the FULL 64-bit signed register, then truncate to
+        // 32 (which `set_r32` sign-extends). The C oracle emits
+        // `S32(SIGNED(ctx->rt) >> sa)` -- `operations.cpp:85` applies
+        // `UnaryOpType::ToS64` to Rt before `Sra32`, and `cgenerator.cpp:226`
+        // renders `ToS64` as `SIGNED(...)` -- the whole 64-bit register.
+        //
+        // Truncating to 32 bits FIRST diverges whenever rt's upper word is
+        // not a sign-extension of bit 31: rt=0x0123456789ABCDEF, sra 16
+        // gives 0x00000000456789AB under the oracle and 0xFFFFFFFFFFFF89AB
+        // truncated-first. Well-formed MIPS keeps that invariant, which is
+        // why WM2000 ran either way and no existing test caught it.
         Sra { rd, rt, sa } => {
-            line(out, format!("ctx.set_r32({}, {} >> {});", rd, rs32(rt), sa))
+            line(out, format!("ctx.set_r32({}, ({} >> {}) as i32);", rd, rs64(rt), sa))
         }
         Sllv { rd, rt, rs } => line(
             out,
@@ -870,9 +893,10 @@ pub(super) fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, me
             out,
             format!("ctx.set_r32({}, (({}) >> ({} & 31)) as i32);", rd, ru32(rt), ru32(rs)),
         ),
+        // Full-64-bit source, as SRA above.
         Srav { rd, rt, rs } => line(
             out,
-            format!("ctx.set_r32({}, {} >> ({} & 31));", rd, rs32(rt), ru32(rs)),
+            format!("ctx.set_r32({}, ({} >> ({} & 31)) as i32);", rd, rs64(rt), ru32(rs)),
         ),
 
         // --- Mult/Div (write HI/LO). MIPS keeps 32x32 -> 64 in {hi,lo}. ---

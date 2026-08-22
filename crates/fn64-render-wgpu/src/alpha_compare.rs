@@ -6,10 +6,12 @@
 //! per `/private/tmp/rt64-blender-depth-port-card.md` §3 ("Alpha compare").
 //! Covers: `None`/`Threshold`/`Dither` general compare, the copy-cycle
 //! RGBA16-alpha-bit special case with ordinary fallback for every other
-//! format, loud typed rejection of the reserved encoding, and the four
+//! format, and the four
 //! alpha-dither modes (`Pattern`/`InversePattern`/`Noise`/`Disabled`) with
 //! their exact 4x4 ordered-matrix substitution rule and 5-bit
-//! quantize/expand rounding.
+//! quantize/expand rounding. The reference's `require_supported_alpha_compare`
+//! rejection of "encoding 2" is deliberately *not* ported: hardware has no
+//! such encoding (see below).
 //!
 //! `fn64-render-wgpu` has no crate dependency on `fn64-render-reference`
 //! (see `depth_strict_less.rs`), so this is a self-contained literal
@@ -47,8 +49,11 @@
 //! `production.rs`'s `PlanCollector` (this module still does not own that
 //! state itself). `Dither` remains a loud, named, unimplemented trap
 //! (no fragment-callable RT64 PRNG binding and no frame-count concept in
-//! this pipeline); `Reserved` is rejected at retrieval time via
-//! `require_supported_alpha_compare`'s first real call site.
+//! this pipeline). There is no `Reserved` mode: wire encoding 2 clears
+//! `alpha_compare_en` and is decoded as `None` (pinned RT64
+//! `shaders/RasterPS.hlsl:203-213` compares only `G_AC_DITHER` and
+//! `G_AC_THRESHOLD`, so encoding 2 falls through to no compare;
+//! `docs/RT64-GUARD-AUDIT.md` A3).
 
 use crate::state::{
     AlphaCompare as AlphaCompareMode, AlphaDither as AlphaDitherMode, RgbDither as RgbDitherMode,
@@ -88,21 +93,6 @@ impl CopyCycleSourceFormat {
     pub const OTHER: Self = Self { is_rgba16: false };
 }
 
-/// Loud typed rejection of the reserved alpha-compare encoding. Literal port
-/// of `require_supported_alpha_compare`
-/// (`crates/fn64-render-reference/src/raster/blend.rs:4-11`): a
-/// GBI-decode-time validation seam, not a runtime fragment-shader branch.
-/// Panics naming the offending primitive rather than silently coercing
-/// encoding 2 into `None` or `Threshold`.
-pub fn require_supported_alpha_compare(mode: AlphaCompareMode, primitive: &str) {
-    match mode {
-        AlphaCompareMode::None | AlphaCompareMode::Threshold | AlphaCompareMode::Dither => {}
-        AlphaCompareMode::Reserved => {
-            panic!("{primitive} selected reserved G_AC alpha-compare mode 2")
-        }
-    }
-}
-
 /// General (triangle/line/rect) alpha-compare gate. Literal port of
 /// `alpha_compare_value` (`blend.rs:105-123`).
 ///
@@ -114,10 +104,10 @@ pub fn require_supported_alpha_compare(mode: AlphaCompareMode, primitive: &str) 
 ///   always rejects and `alpha=255` always passes -- Programming Manual
 ///   §15.5.4's "alpha greater than a random value in [0,1)".
 ///
-/// # Panics
-/// If `mode` is `Reserved` -- callers must reject that encoding at
-/// GBI-decode time via [`require_supported_alpha_compare`] before ever
-/// reaching a fragment with this mode set.
+/// There is no fourth mode: other-mode low bits 1:0 are two independent
+/// hardware bits, and wire encoding 2 decodes to `None` (pinned RT64
+/// `shaders/RasterPS.hlsl:203-213` branches only on `G_AC_DITHER` and
+/// `G_AC_THRESHOLD`; see `docs/RT64-GUARD-AUDIT.md` finding A3).
 pub const fn alpha_compare_value(
     mode: AlphaCompareMode,
     alpha: u8,
@@ -128,9 +118,6 @@ pub const fn alpha_compare_value(
         AlphaCompareMode::None => true,
         AlphaCompareMode::Threshold => alpha >= threshold_alpha,
         AlphaCompareMode::Dither => alpha as u32 * 256 > noise.byte() as u32 * 255,
-        AlphaCompareMode::Reserved => {
-            panic!("reserved alpha compare is rejected before rasterization")
-        }
     }
 }
 
@@ -141,8 +128,10 @@ pub const fn alpha_compare_value(
 /// Every other source format falls through to the ordinary
 /// threshold/dither arithmetic in [`alpha_compare_value`].
 ///
-/// # Panics
-/// If `mode` is `Reserved`.
+/// Hardware likewise gates this whole block on `alpha_compare_en` (bit 0)
+/// alone, so wire encoding 2 is "no compare" here too. Copy cycle keeps its
+/// own compare path rather than sharing the fragment one; that split is
+/// fn64's own structure and is exercised by this module's tests.
 pub const fn copy_alpha_compare_value(
     mode: AlphaCompareMode,
     source: CopyCycleSourceFormat,
@@ -155,34 +144,78 @@ pub const fn copy_alpha_compare_value(
         AlphaCompareMode::Threshold | AlphaCompareMode::Dither if source.is_rgba16 => alpha != 0,
         AlphaCompareMode::Threshold => alpha >= threshold_alpha,
         AlphaCompareMode::Dither => alpha as u32 * 256 > noise.byte() as u32 * 255,
-        AlphaCompareMode::Reserved => {
-            panic!("reserved alpha compare is rejected before copy rasterization")
-        }
     }
 }
 
 /// Screen-registered three-bit thresholds for the two ordered RGB dither
-/// tiles, shared by the alpha-dither `Pattern`/`InversePattern`
-/// substitution rule below. Literal port of `ordered_rgb_dither_threshold`
-/// (`blend.rs:28-38`).
+/// tiles, consumed by the alpha-dither `Pattern`/`InversePattern`
+/// substitution rule below.
+///
+/// **Reads [`crate::rgb_dither`]'s tables; does not carry its own.** This
+/// function used to duplicate the tables as local `MAGIC_SQUARE`/`BAYER`
+/// constants ported from `ordered_rgb_dither_threshold` (`blend.rs:28-38`),
+/// while [`crate::rgb_dither`] carried RT64's `DitherPatternBayer`
+/// (`Formats.hlsli:9-14`). The two Bayer tiles disagree at rows 1 and 2,
+/// so this crate carried **two different Bayer tables for one hardware
+/// quantity**, and whichever is right, at most one of the two sites could
+/// have been.
+///
+/// The split is a defect independent of which tile matches silicon, because
+/// libultra defines the alpha-dither `G_AD_PATTERN` threshold as *the
+/// currently selected RGB dither matrix* (`gbi.h:674-678`; the substitution
+/// rule is restated at [`apply_alpha_dither`]). The two paths are therefore
+/// required to read the **same** tile by definition, whatever it contains.
+///
+/// [`crate::rgb_dither`] is the site kept, and the reason is that same
+/// definition rather than a judgement about the tables: it *is* this
+/// crate's RGB dither module, so "the currently selected RGB dither matrix"
+/// is the thing it owns, and alpha dither is downstream of it. Deleting the
+/// duplicate here removes the possibility of the two drifting again;
+/// keeping this side instead would have inverted the dependency libultra
+/// states.
+///
+/// **This resolves no hardware question and claims none.** Which Bayer
+/// arrangement the RDP actually uses is the open frontier
+/// [`crate::rgb_dither`]'s module header records and
+/// `docs/RT64-LANE-DIVERGENCES.md` D19 scores UNKNOWN -- `gbi.h` publishes
+/// the `G_CD_BAYER` selector bit and no table, and RT64 is one of the two
+/// disputants, not an adjudicator. If that question is ever settled against
+/// RT64's arrangement, exactly one table changes and both paths follow it,
+/// which is the whole point of removing the copy.
 ///
 /// # Panics
 /// If `mode` is `Noise` or `Disabled` -- both lack an ordered tile and must
 /// be resolved to `MagicSquare`/`Bayer` by the caller (see
 /// [`apply_alpha_dither`]'s substitution rule) before reaching this
-/// function.
+/// function. [`crate::rgb_dither::dither_pattern_value`] answers those two
+/// modes rather than panicking, so this narrowing is enforced here and the
+/// noise byte it would otherwise need is deliberately not threaded in.
 const fn ordered_dither_threshold(mode: RgbDitherMode, x: i32, y: i32) -> u8 {
-    const MAGIC_SQUARE: [[u8; 4]; 4] = [[0, 6, 1, 7], [4, 2, 5, 3], [3, 5, 2, 4], [7, 1, 6, 0]];
-    const BAYER: [[u8; 4]; 4] = [[0, 4, 1, 5], [6, 2, 7, 3], [1, 5, 0, 4], [7, 3, 6, 2]];
-    let row = y.rem_euclid(4) as usize;
-    let column = x.rem_euclid(4) as usize;
     match mode {
-        RgbDitherMode::MagicSquare => MAGIC_SQUARE[row][column],
-        RgbDitherMode::Bayer => BAYER[row][column],
+        RgbDitherMode::MagicSquare | RgbDitherMode::Bayer => {
+            crate::rgb_dither::ordered_tile_value(mode, x, y)
+        }
         RgbDitherMode::Noise | RgbDitherMode::Disabled => {
             panic!("ordered dither threshold requested for a non-ordered RgbDitherMode")
         }
     }
+}
+
+/// [`ordered_dither_threshold`], reachable from `rgb_dither`'s
+/// cross-module agreement test.
+///
+/// A `#[cfg(test)]` accessor rather than making the function itself
+/// `pub(crate)`: the production surface of this module is
+/// [`apply_alpha_dither`], and widening the private helper's visibility to
+/// serve a test would invite a caller that bypasses the substitution rule.
+/// The test needs the tile lookup specifically, so that is what is exposed.
+#[cfg(test)]
+pub(crate) const fn alpha_dither_pattern_threshold_for_tests(
+    mode: RgbDitherMode,
+    x: i32,
+    y: i32,
+) -> u8 {
+    ordered_dither_threshold(mode, x, y)
 }
 
 /// Pre-blend alpha dither: reduce post-combiner pixel alpha to the
@@ -382,35 +415,56 @@ mod tests {
         }
     }
 
+    /// Retargeted from the three `reserved_*_panics_loudly` /
+    /// `require_supported_alpha_compare_*` tests, which pinned wire encoding 2
+    /// as a refusal. There is no reserved encoding: other-mode low bits 1:0
+    /// are two independent hardware bits (pinned RT64
+    /// `shaders/RasterPS.hlsl:203-213`) and `rdp/blender.c`'s
+    /// `alpha_compare` returns 1 whenever bit 0 (`alpha_compare_en`) is clear,
+    /// so wire 2 decodes to `None` and always passes. The copy path gates on
+    /// the same bit alone (`rdp/rasterizer.c:1971`).
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     #[test]
-    #[should_panic(expected = "reserved alpha compare is rejected before rasterization")]
-    fn reserved_mode_panics_loudly_in_general_path() {
-        alpha_compare_value(AlphaCompareMode::Reserved, 255, 0, noise(0));
-    }
+    fn wire_encoding_two_decodes_to_none_and_always_passes() {
+        use crate::state::OtherMode;
 
-    #[test]
-    #[should_panic(expected = "reserved alpha compare is rejected before copy rasterization")]
-    fn reserved_mode_panics_loudly_in_copy_path() {
-        copy_alpha_compare_value(
-            AlphaCompareMode::Reserved,
-            CopyCycleSourceFormat::OTHER,
-            255,
-            0,
-            noise(0),
+        assert_eq!(
+            OtherMode::from_wire(0, 2).alpha_compare(),
+            AlphaCompareMode::None
         );
-    }
 
-    #[test]
-    #[should_panic(expected = "selected reserved G_AC alpha-compare mode 2")]
-    fn require_supported_alpha_compare_panics_naming_primitive() {
-        require_supported_alpha_compare(AlphaCompareMode::Reserved, "gSPTriangle");
-    }
+        // Values chosen so "off" and "refused" are observably different:
+        // alpha 0 against threshold 255 REJECTS under Threshold and under
+        // Dither, and PASSES under None. A decoder that mapped 2 to
+        // Threshold/Dither, or a gate that rejected it, would fail here.
+        let mode = OtherMode::from_wire(0, 2).alpha_compare();
+        assert!(alpha_compare_value(mode, 0, 255, noise(255)));
+        assert!(!alpha_compare_value(
+            AlphaCompareMode::Threshold,
+            0,
+            255,
+            noise(255)
+        ));
+        assert!(!alpha_compare_value(
+            AlphaCompareMode::Dither,
+            0,
+            255,
+            noise(255)
+        ));
 
-    #[test]
-    fn require_supported_alpha_compare_accepts_every_non_reserved_mode() {
-        require_supported_alpha_compare(AlphaCompareMode::None, "p");
-        require_supported_alpha_compare(AlphaCompareMode::Threshold, "p");
-        require_supported_alpha_compare(AlphaCompareMode::Dither, "p");
+        // Copy path, same distinguishing pair. RGBA16 source would collapse
+        // Threshold/Dither onto `alpha != 0`, which also rejects alpha 0, so
+        // this stays distinguishing under both source formats.
+        for source in [CopyCycleSourceFormat::OTHER, CopyCycleSourceFormat::RGBA16] {
+            assert!(copy_alpha_compare_value(mode, source, 0, 255, noise(255)));
+            assert!(!copy_alpha_compare_value(
+                AlphaCompareMode::Threshold,
+                source,
+                0,
+                255,
+                noise(255)
+            ));
+        }
     }
 
     #[test]
@@ -903,8 +957,9 @@ mod tests {
     }
 
     /// One frozen fixture case for the CPU-vs-WGSL differential (port card
-    /// §4): mode as the raw wire encoding (`0=None,1=Threshold,2=Reserved,
-    /// 3=Dither`, matching `alpha_compare.wgsl`'s own convention),
+    /// §4): mode as the raw wire encoding (`0=None,1=Threshold,2=None (the
+    /// dither bit without the enable bit), 3=Dither`, matching
+    /// `alpha_compare.wgsl`'s own convention),
     /// `copy_cycle_rgba16` as `0u`/`1u`, and the hand-derived `expected`
     /// boolean stated in the port card, not re-derived here.
     struct AlphaCompareFixture {
@@ -917,14 +972,23 @@ mod tests {
         expected: bool,
     }
 
+    /// Wire encoding for a decoded mode. `None` has two wire spellings --
+    /// 0 (`alpha_compare_en` and `dither_alpha_en` both clear) and 2
+    /// (`dither_alpha_en` set but `alpha_compare_en` clear, so still no
+    /// compare; pinned RT64 `shaders/RasterPS.hlsl:203-213`). This helper
+    /// returns the canonical 0; `WIRE_MODE_DITHER_BIT_WITHOUT_ENABLE` below
+    /// names the other one for the fixtures that exercise it.
     const fn wire_mode(mode: AlphaCompareMode) -> u32 {
         match mode {
             AlphaCompareMode::None => 0,
             AlphaCompareMode::Threshold => 1,
-            AlphaCompareMode::Reserved => 2,
             AlphaCompareMode::Dither => 3,
         }
     }
+
+    /// Wire encoding 2: `dither_alpha_en` set with `alpha_compare_en` clear.
+    /// Behaviourally `G_AC_NONE`.
+    const WIRE_MODE_DITHER_BIT_WITHOUT_ENABLE: u32 = 2;
 
     /// Frozen fixture partition, port card §4, literal values verified
     /// against `alpha_compare_value`/`copy_alpha_compare_value`'s own
@@ -969,6 +1033,35 @@ mod tests {
                 threshold_alpha: 255,
                 noise_byte: 0,
                 copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            // Wire encoding 2 -- `dither_alpha_en` set, `alpha_compare_en`
+            // clear (pinned RT64 `shaders/RasterPS.hlsl:203-213`). Hardware
+            // never compares (`rdp/blender.c`'s `alpha_compare` returns 1 on
+            // a clear bit 0), so this PASSES. Hand-derived, not read off the
+            // code under test. Deliberately uses alpha 0 with threshold 255
+            // and noise 255: every other mode rejects that triple, so a
+            // decoder that treated 2 as Threshold/Dither -- or a shader that
+            // fell through to `return false` -- is caught here.
+            AlphaCompareFixture {
+                name: "dither_bit_without_enable_bit_always_passes",
+                mode: WIRE_MODE_DITHER_BIT_WITHOUT_ENABLE,
+                alpha: 0,
+                threshold_alpha: 255,
+                noise_byte: 255,
+                copy_cycle_rgba16: 0,
+                expected: true,
+            },
+            // Same encoding on the copy path: `rasterizer.c:1971` gates the
+            // whole inline copy-mode compare on bit 0 alone, so the RGBA16
+            // hard-alpha-bit special case does not apply either.
+            AlphaCompareFixture {
+                name: "dither_bit_without_enable_bit_passes_in_copy_rgba16",
+                mode: WIRE_MODE_DITHER_BIT_WITHOUT_ENABLE,
+                alpha: 0,
+                threshold_alpha: 255,
+                noise_byte: 255,
+                copy_cycle_rgba16: 1,
                 expected: true,
             },
             // Dither mode, the exact cross-multiply tie boundary.
@@ -1050,12 +1143,9 @@ mod tests {
     #[test]
     fn frozen_fixtures_match_rust_oracle() {
         for fixture in frozen_fixtures() {
-            let mode = match fixture.mode {
-                0 => AlphaCompareMode::None,
-                1 => AlphaCompareMode::Threshold,
-                3 => AlphaCompareMode::Dither,
-                other => panic!("fixture {}: unexpected wire mode {other}", fixture.name),
-            };
+            // Decoded via the real wire decoder, so wire 2 exercises the
+            // `alpha_compare_en`-clear path rather than a test-local table.
+            let mode = crate::state::OtherMode::from_wire(0, fixture.mode).alpha_compare();
             let alpha = fixture.alpha as u8;
             let threshold_alpha = fixture.threshold_alpha as u8;
             let noise_byte = noise(fixture.noise_byte as u8);
@@ -1173,6 +1263,32 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
         /// required-host-GPU convention rather than silently skipping.
         #[test]
         fn required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures() {
+            dispatch_and_check(
+                "fragment-fn",
+                shim_source(),
+                "alpha_compare_fragment_fn_shim",
+            );
+        }
+
+        /// Same required-host-GPU three-way check for the *characterization*
+        /// compute shader `alpha_compare.wgsl`, which has its own
+        /// `@compute` entry point and until now had no behavioural coverage
+        /// at all -- only string-contains and naga-parse assertions. That
+        /// gap let a mutant that re-added a `mode == 2u -> return false`
+        /// rejection survive. Wire encoding 2 must PASS here for the same
+        /// reason it does in the fragment-callable twin (pinned RT64
+        /// `shaders/RasterPS.hlsl:203-213`; `docs/RT64-GUARD-AUDIT.md` A3).
+        #[test]
+        fn required_host_characterization_shader_matches_cpu_oracle_across_frozen_fixtures() {
+            dispatch_and_check(
+                "characterization",
+                ALPHA_COMPARE_WGSL.to_string(),
+                ALPHA_COMPARE_ENTRY_POINT,
+            );
+        }
+
+        fn dispatch_and_check(label: &str, source: String, entry: &str) {
+            let _ = label;
             let fixtures = frozen_fixtures();
             let cases: Vec<RawCase> = fixtures
                 .iter()
@@ -1186,7 +1302,9 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 .collect();
 
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+                backends: crate::device::adapter_selection::backends_for_request(
+                    wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+                ),
                 flags: wgpu::InstanceFlags::VALIDATION,
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
@@ -1202,6 +1320,7 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 }
                 Err(error) => panic!("adapter request failed: {error}"),
             };
+            crate::device::adapter_selection::assert_expected_adapter(&adapter);
             eprintln!(
                 "fn64-alpha-compare-fragment-fn: adapter={:?}",
                 adapter.get_info().name
@@ -1218,13 +1337,13 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fn64-alpha-compare-fragment-fn-shim"),
-                source: wgpu::ShaderSource::Wgsl(shim_source().into()),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("fn64-alpha-compare-fragment-fn-shim"),
                 layout: None,
                 module: &shader,
-                entry_point: Some("alpha_compare_fragment_fn_shim"),
+                entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -1290,6 +1409,11 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
+                // The fragment-fn shim is `@workgroup_size(1)`; the
+                // characterization entry point is `@workgroup_size(64)`.
+                // One workgroup per case is correct for the former and
+                // safely over-dispatches for the latter, which bounds-checks
+                // `index >= arrayLength(&cases)` itself.
                 pass.dispatch_workgroups(cases.len() as u32, 1, 1);
             }
             encoder.copy_buffer_to_buffer(&result_buffer, 0, &readback_buffer, 0, result_bytes);
@@ -1328,12 +1452,11 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 // three-way (WGSL, Rust oracle, hand-derived) agreement is
                 // checked in the same assertion pass, not just WGSL-vs-
                 // hand-derived.
-                let mode = match fixture.mode {
-                    0 => AlphaCompareMode::None,
-                    1 => AlphaCompareMode::Threshold,
-                    3 => AlphaCompareMode::Dither,
-                    other => panic!("fixture {}: unexpected wire mode {other}", fixture.name),
-                };
+                // Decoded via the real wire decoder, so wire 2 exercises
+                // the `alpha_compare_en`-clear path (pinned RT64
+                // `shaders/RasterPS.hlsl:203-213`) rather than a
+                // test-local table.
+                let mode = crate::state::OtherMode::from_wire(0, fixture.mode).alpha_compare();
                 let alpha = fixture.alpha as u8;
                 let threshold_alpha = fixture.threshold_alpha as u8;
                 let noise_byte = noise(fixture.noise_byte as u8);

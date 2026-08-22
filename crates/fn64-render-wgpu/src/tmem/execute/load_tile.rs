@@ -561,16 +561,12 @@ mod tests {
         let high_t = u32::from(spec.high_t >> 2);
         let width = high_s - low_s + 1;
         let row_bytes = width * bytes_per_pixel;
-        if low_s == 0 && width == u32::from(spec.image_width) {
-            let start = spec.image_address
-                + (low_t * u32::from(spec.image_width) + low_s) * bytes_per_pixel;
-            return vec![(start, start + (high_t - low_t + 1) * row_bytes)];
-        }
+        let padded_row_bytes = row_bytes.div_ceil(8) * 8;
         (low_t..=high_t)
             .map(|row| {
                 let start = spec.image_address
                     + (row * u32::from(spec.image_width) + low_s) * bytes_per_pixel;
-                (start, start + row_bytes)
+                (start, start + padded_row_bytes)
             })
             .collect()
     }
@@ -785,31 +781,71 @@ mod tests {
             ]
         );
 
-        let odd = TileFixtureSpec {
+        // **A load's FIRST row is tile-relative row 0 and never exchanges,
+        // whatever the tile's T origin is.** This fixture used to set
+        // `low_t: 4` (S10.2, so `.integer()` is 1) and assert that its single
+        // word exchanged, which asserted the writer's removed
+        // `low_t.integer()` term rather than anything hardware does --
+        // the reference takes its write parity on a row made tile-relative by
+        // `TRELATIVE`, so the first row's parity is 0 (`tex.c:583`,
+        // `tcoord.c:998-999`).
+        //
+        // The origin is kept nonzero so the assertion FAILS if that term is
+        // reintroduced, and a genuinely odd row is reached by spanning two
+        // rows instead: `high_t` one row past `low_t` makes word 1
+        // tile-relative row 1.
+        let two_rows = TileFixtureSpec {
             low_t: 4,
-            high_t: 4,
+            high_t: 8,
             ..even
         };
-        let odd_words = prepared_lanes(odd);
-        assert_eq!(source_ranges(odd), vec![(0x208, 0x210)]);
-        assert!(odd_words[0].0.odd_row_exchange());
+        let odd_words = prepared_lanes(two_rows);
+        assert_eq!(
+            source_ranges(two_rows),
+            vec![(0x208, 0x210), (0x210, 0x218)]
+        );
+        assert_eq!(odd_words.len(), 2);
+        assert!(
+            !odd_words[0].0.odd_row_exchange(),
+            "the load's first row is tile-relative row 0"
+        );
         assert_eq!(
             odd_words[0].1,
             [
-                Some(0x0c),
-                Some(0x0d),
-                Some(0x0e),
-                Some(0x0f),
                 Some(0x08),
                 Some(0x09),
                 Some(0x0a),
                 Some(0x0b),
+                Some(0x0c),
+                Some(0x0d),
+                Some(0x0e),
+                Some(0x0f),
+            ]
+        );
+        assert!(
+            odd_words[1].0.odd_row_exchange(),
+            "the load's second row is tile-relative row 1"
+        );
+        assert_eq!(
+            odd_words[1].1,
+            [
+                Some(0x14),
+                Some(0x15),
+                Some(0x16),
+                Some(0x17),
+                Some(0x10),
+                Some(0x11),
+                Some(0x12),
+                Some(0x13),
             ]
         );
     }
 
+    /// Each row reads its own padded whole words, including exact adjacent
+    /// RDRAM bytes, and retains tile-relative row parity. This follows RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn rgba16_row_tails_never_spill_and_keep_row_parity() {
+    fn rgba16_padded_row_words_carry_adjacent_bytes_and_keep_row_parity() {
         let spec = TileFixtureSpec {
             format: 0,
             size: 2,
@@ -822,7 +858,7 @@ mod tests {
             high_s: 16,
             high_t: 8,
         };
-        assert_eq!(source_ranges(spec), vec![(0x20a, 0x21e)]);
+        assert_eq!(source_ranges(spec), vec![(0x20a, 0x21a), (0x214, 0x224)]);
         let words = prepared_lanes(spec);
         assert_eq!(
             words
@@ -834,33 +870,64 @@ mod tests {
                     word.odd_row_exchange(),
                 ))
                 .collect::<Vec<_>>(),
+            // The exchange column is the TILE-RELATIVE row's parity and
+            // nothing else: words 0-1 are row 0, words 2-3 are row 1. This
+            // used to read `true, true, false, false` -- the exact inverse --
+            // because the writer folded in `low_t.integer()`, which is 1 for
+            // this fixture's `low_t = 4` (S10.2). That term is not on
+            // hardware; see `tmem/read.rs::odd_row_exchange` for the
+            // RT64 citation.
             vec![
-                (0, 0xff, 0, true),
-                (8, 0x03, 1, true),
-                (10, 0xff, 3, false),
-                (18, 0x03, 4, false),
+                (0, 0xff, 0, false),
+                (8, 0xff, 1, false),
+                (10, 0xff, 3, true),
+                (18, 0xff, 4, true),
             ]
         );
+        // Word 1 is row 0: unexchanged, so its two defined bytes stay in the
+        // logical-prefix lanes 0-1.
         assert_eq!(
             words[1].1,
-            [None, None, None, None, Some(0x12), Some(0x13), None, None]
-        );
-        assert_eq!(
-            words[2].1,
             [
+                Some(0x12),
+                Some(0x13),
                 Some(0x14),
                 Some(0x15),
                 Some(0x16),
                 Some(0x17),
                 Some(0x18),
                 Some(0x19),
-                Some(0x1a),
-                Some(0x1b),
             ]
         );
+        // Word 2 is row 1: a full word, so the exchange swaps its two 4-byte
+        // halves.
+        assert_eq!(
+            words[2].1,
+            [
+                Some(0x18),
+                Some(0x19),
+                Some(0x1a),
+                Some(0x1b),
+                Some(0x14),
+                Some(0x15),
+                Some(0x16),
+                Some(0x17),
+            ]
+        );
+        // Word 3 is row 1 with a two-byte tail: the exchange moves it into
+        // the high lanes 4-5.
         assert_eq!(
             words[3].1,
-            [Some(0x1c), Some(0x1d), None, None, None, None, None, None]
+            [
+                Some(0x20),
+                Some(0x21),
+                Some(0x22),
+                Some(0x23),
+                Some(0x1c),
+                Some(0x1d),
+                Some(0x1e),
+                Some(0x1f),
+            ]
         );
     }
 
@@ -934,29 +1001,37 @@ mod tests {
                     word.physical(),
                 ))
                 .collect::<Vec<_>>(),
+            // Row 0 does not exchange and row 1 does -- the tile-relative
+            // row's parity alone. This used to read `true` then `false`,
+            // folding in the writer's removed `low_t.integer()` term (1 for
+            // this fixture's S10.2 `low_t = 4`); the bank ranges move with the
+            // exchange, so both columns invert together. See
+            // `tmem/read.rs::odd_row_exchange`.
             vec![
                 (
                     255,
-                    true,
+                    false,
                     TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap(),
                     },
                 ),
                 (
                     0,
-                    false,
+                    true,
                     TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(0, 4).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(2048, 2052).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(4, 8).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap(),
                     },
                 ),
             ]
         );
     }
 
+    /// Overlapping destination rows publish the later row's complete padded
+    /// word, following RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn overlapping_rows_publish_only_the_last_rows_defined_lanes() {
+    fn overlapping_rows_publish_the_last_rows_entire_padded_word() {
         let spec = TileFixtureSpec {
             format: 0,
             size: 2,
@@ -993,12 +1068,15 @@ mod tests {
 
         assert_eq!(state.generation(), 1);
         for lane in 0..8_u16 {
-            let expected_valid = lane == 4 || lane == 5;
-            assert_eq!(state.byte_is_valid(lane), expected_valid);
+            assert!(state.byte_is_valid(lane));
             assert_eq!(state.last_touched_generation(lane), Some(1));
         }
-        assert_eq!(state.valid_byte(4), Some(0x02));
-        assert_eq!(state.valid_byte(5), Some(0x03));
+        assert_eq!(
+            (0_u16..8)
+                .map(|lane| state.valid_byte(lane).unwrap())
+                .collect::<Vec<_>>(),
+            vec![0x06, 0x07, 0x08, 0x09, 0x02, 0x03, 0x04, 0x05]
+        );
     }
 
     #[test]

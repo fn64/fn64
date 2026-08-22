@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T11:18:56Z",
+    "updated_utc": "2026-08-17T00:00:00Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -113,13 +113,14 @@
         "docs/rt64-render-measurement-schema.json"
       ],
       "dependencies": [],
-      "state": "RUNNING",
+      "state": "BLOCKED",
       "findings": [
         "fn64-abi exposes an owned raw frame-census measurement snapshot; fn64-certification builds typed control and explicit-partial development reports.",
         "The headless route runs Shell::pump_one_frame outside the winit/pixels compositor; five counterbalanced control/instrumented pairs launch as fresh processes.",
         "A control run can become comparison_ready only after the post-create verifier completes and both horizon endpoint observations are available and unchanged.",
         "No real matched baseline has been recorded; the private linked-build and native-identity gates remain open.",
-        "This is an open evidence gap, not a stall: the C-program receipt and native device query have no linked private-game validation, so no real matched baseline exists yet. It blocks the performance/parity claim, not independent implementation, so the ticket remains RUNNING rather than BLOCKED."
+        "Reclassified from RUNNING to BLOCKED on 2026-08-17 under the port plan's loop rule (any RUNNING ticket with a dead worker becomes BLOCKED with blocker text). The earlier finding argued this should stay RUNNING because the gap blocks the parity claim rather than implementation; that argument does not survive the worker being gone for a day.",
+        "Not promoted: verification_runs records cargo nextest -p fn64-abi --no-default-features at 1 of 10 required clean runs, so the declared reliability bar is unmet and no promotion is available even if a worker returned."
       ],
       "verification_runs": [
         {
@@ -135,10 +136,10 @@
           "kind": "deterministic"
         }
       ],
-      "blocker": null,
-      "next_action": "Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.",
+      "blocker": "Worker gone: this card has been RUNNING since 2026-08-15 with no update since 2026-08-16 and no live integration-lead worker on 2026-08-17. Its own findings already record the substantive gap -- no real matched baseline exists because the C-RecompiledFuncs receipt and native device-identity query have no clean private linked-build validation to run against.",
+      "next_action": "Reassign a worker. Then exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, finish the outstanding 9 clean fn64-abi runs, and run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.",
       "started_utc": "2026-08-15T00:00:00Z",
-      "updated_utc": "2026-08-16T00:00:00Z"
+      "updated_utc": "2026-08-17T00:00:00Z"
     },
     {
       "id": "A0.1",
@@ -329,7 +330,9 @@
         "docs/rt64-port-parity.json",
         "docs/RT64-PORT-PARITY.md"
       ],
-      "dependencies": ["A0.1"],
+      "dependencies": [
+        "A0.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.",
@@ -390,7 +393,9 @@
         "docs/COMPLETENESS.md",
         "docs/DESIGN.md"
       ],
-      "dependencies": ["M1.1"],
+      "dependencies": [
+        "M1.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "An ephemeral packet or digest may exist as backend input before success; the prohibited state is a retained receipt, trace record, guest mutation, or architectural observation for rejected or uncommitted work.",
@@ -448,7 +453,9 @@
       "writable_paths": [
         "probes/m2-wgpu-metal-headless"
       ],
-      "dependencies": ["M2.1"],
+      "dependencies": [
+        "M2.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.",
@@ -501,7 +508,9 @@
       "writable_paths": [
         "probes/m2-wgpu-metal-headless"
       ],
-      "dependencies": ["M2.2"],
+      "dependencies": [
+        "M2.2"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Current public wgpu exposes one physical queue; this ticket proves exact serialized completion and keeps semantic queue identities separate from native multi-queue claims.",
@@ -561,7 +570,9 @@
         "probes/m2-dxc-artifacts",
         "scripts/lint-docs.py"
       ],
-      "dependencies": ["M2.1"],
+      "dependencies": [
+        "M2.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Official DXC supports HLSL-to-SPIR-V with explicit entry point, target, defines, include paths, optimization, target environment, validation, and output controls; official stable v1.9.2607 at 0d3ee6b is the frozen source-build pin.",
@@ -676,7 +687,9 @@
         "docs/rt64-reference-shader-artifact-schema.json",
         "docs/RT64-REFERENCE-SHADER-ARTIFACTS.md"
       ],
-      "dependencies": ["M2.5"],
+      "dependencies": [
+        "M2.5"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.",
@@ -723,15 +736,20 @@
         "docs/rt64-wgpu-shader-assessment-schema.json",
         "docs/RT64-WGPU-SHADER-ASSESSMENT.md"
       ],
-      "dependencies": ["M2.5.1"],
+      "dependencies": [
+        "M2.5.1"
+      ],
       "state": "READY",
       "findings": [
+        "Harness landed, assessment not yet run -- this card is not a port card and does not fit the shipped-module shape. tools/rt64_wgpu_shader_assessment.py, docs/rt64-wgpu-shader-assessment-schema.json and docs/RT64-WGPU-SHADER-ASSESSMENT.md all exist, with the typed ingestible/blocked-known taxonomy and a separate fail-closed runtime-ready gate built as the objective required.",
         "The first row is already a known typed blocker: Naga 30's strict SPIR-V frontend rejects ShaderNonUniform while the source requires NonUniformResourceIndex semantics.",
-        "A complete assessment may close with blocked-known rows; its distinct runtime-ready command must remain red while any required row is not ingestible."
+        "A complete assessment may close with blocked-known rows; its distinct runtime-ready command must remain red while any required row is not ingestible.",
+        "What is genuinely NOT done is the measurement itself. The assess/verify/runtime-ready commands take an accepted reference-corpus directory and a pinned wgpu-validator build directory as absolute paths; neither is in-repo, and no assessment receipt exists under evidence/. So no shader has actually been graded through the boundary.",
+        "The old next_action was nonetheless false: it said to dispatch after M2.5.1 freezes the corpus, and M2.5.1 is now INTEGRATED with its 56-row corpus frozen and externally retained. The stated precondition is met, so the card is dispatchable now rather than waiting."
       ],
       "verification_runs": [],
       "blocker": null,
-      "next_action": "Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.",
+      "next_action": "Run the assessment, do not write it -- the harness is built and M2.5.1's corpus is frozen. Stage the accepted 56-row reference corpus and the pinned wgpu 30/Naga 30 validator build, run selftest, then assess and verify all 56 rows and record the receipt identity.",
       "started_utc": "2026-08-16T09:54:30Z",
       "updated_utc": "2026-08-16T09:54:30Z"
     },
@@ -750,7 +768,10 @@
         "crates/fn64-render-wgpu/src/shader_manifest.rs",
         "docs/RT64-RUNTIME-SHADER-CORPUS.md"
       ],
-      "dependencies": ["M2.5.1", "M2.5.2"],
+      "dependencies": [
+        "M2.5.1",
+        "M2.5.2"
+      ],
       "state": "BLOCKED",
       "findings": [
         "Owned WGSL binding arrays are the portable checked path for nonuniform resource selection; unsafe backend passthrough remains outside the baseline authority.",
@@ -781,7 +802,10 @@
         "README.md",
         "docs/DESIGN.md"
       ],
-      "dependencies": ["M1.2", "M2.3"],
+      "dependencies": [
+        "M1.2",
+        "M2.3"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "This ticket owns only the bounded headless device, pipeline-prewarm, exact-submission, readback, and backend-effect lifecycle. ABI dispatch, shell policy, surface presentation, VI, and broad RDP decoding remain outside its boundary.",
@@ -836,7 +860,9 @@
         "crates/fn64-render-wgpu/src/state.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M3.1"],
+      "dependencies": [
+        "M3.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "The next slice is headless decode/state, not production ABI dispatch or VI/surface: exact framebuffer and TMEM semantics must exist before either boundary can be crossed honestly.",
@@ -871,7 +897,7 @@
     {
       "id": "M3.3.1",
       "milestone": "M3",
-      "objective": "M3.3a — Freeze rollback-safe ownership and byte-domain contracts for one exact synthetic 4x2 RGBA16 native fill before target, raster, or VI implementation.",
+      "objective": "M3.3a \u2014 Freeze rollback-safe ownership and byte-domain contracts for one exact synthetic 4x2 RGBA16 native fill before target, raster, or VI implementation.",
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
@@ -884,7 +910,9 @@
         "crates/fn64-render-wgpu/src/lib.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M3.2"],
+      "dependencies": [
+        "M3.2"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Commit 06eb68db freezes the exact 4x2 RGBA16 fill and separates logical/device bytes from N64Recomp backing-storage bytes.",
@@ -908,7 +936,7 @@
     {
       "id": "M3.3.2",
       "milestone": "M3",
-      "objective": "M3.3b — Add typed native color-target keys, exact row plans, device-byte domains, and rollback-safe resident generations without claiming GPU allocation or raster completion.",
+      "objective": "M3.3b \u2014 Add typed native color-target keys, exact row plans, device-byte domains, and rollback-safe resident generations without claiming GPU allocation or raster completion.",
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
@@ -920,7 +948,9 @@
         "crates/fn64-render-wgpu/src/lib.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M3.3.1"],
+      "dependencies": [
+        "M3.3.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Commit b5ffe53e binds target layout, physical range, extent, RGBA16/32 format, generation, full initialization range, device-byte domain, and exact byte count.",
@@ -950,7 +980,7 @@
     {
       "id": "M3.3.3",
       "milestone": "M3",
-      "objective": "M3.3c — Execute the exact synthetic native fill through a bounded real wgpu raster path and produce the typed completion required by M3.3b.",
+      "objective": "M3.3c \u2014 Execute the exact synthetic native fill through a bounded real wgpu raster path and produce the typed completion required by M3.3b.",
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
@@ -964,7 +994,10 @@
         "crates/fn64-render-wgpu/src/lib.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M3.3.1", "M3.3.2"],
+      "dependencies": [
+        "M3.3.1",
+        "M3.3.2"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Commit 35116c76 executes the exact bounded raster fill, routes its typed RGBA16 output through M3.3d's fixed VI mechanism, validates bounded readback, commits the adjacent-byte-converted result to guest memory, and only then publishes the completed target through an infallible move-only capability.",
@@ -1000,7 +1033,7 @@
     {
       "id": "M3.3.4",
       "milestone": "M3",
-      "objective": "M3.3d — Add one exact progressive/replicate VI CPU oracle, separate VI/capture plans, padded BGRA8 extraction, and a validated repository WGSL mechanism.",
+      "objective": "M3.3d \u2014 Add one exact progressive/replicate VI CPU oracle, separate VI/capture plans, padded BGRA8 extraction, and a validated repository WGSL mechanism.",
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
@@ -1012,7 +1045,9 @@
         "crates/fn64-render-wgpu/src/lib.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M3.3.1"],
+      "dependencies": [
+        "M3.3.1"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Commit bed6c241 admits the exact 4x2 RGBA16 origin, stride, extent, pixel type, U2.10 scale, replicate filters, progressive field, and presentation/capture identity.",
@@ -1069,7 +1104,9 @@
         "docs/DESIGN.md",
         "docs/RENDER-WGPU-PORT-PLAN.md"
       ],
-      "dependencies": ["M3.3.3"],
+      "dependencies": [
+        "M3.3.3"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "Commit d8c0d4b1 adds a real callable ABI capture API plus renderer-neutral plan, owned capture, packet finalization, and v3 record/replay types.",
@@ -1132,7 +1169,9 @@
         "crates/fn64-render-wgpu/src/lib.rs",
         "crates/fn64-render-wgpu/README.md"
       ],
-      "dependencies": ["M4.0"],
+      "dependencies": [
+        "M4.0"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "This slice owns command/state/read-plan semantics only; TMEM byte movement, texture decode, GPU upload, framebuffer hazards, parity, and performance remain later gates.",
@@ -1177,15 +1216,18 @@
         "crates/fn64-render-wgpu/src/native_contract.rs",
         "crates/fn64-render-wgpu/src/lib.rs"
       ],
-      "dependencies": ["M4.1"],
-      "state": "RUNNING",
+      "dependencies": [
+        "M4.1"
+      ],
+      "state": "BLOCKED",
       "findings": [
         "M4.2.0 must first freeze ordered TmemLoadSource accesses plus canonical physical TmemLoadDestination fragments; source-only journal plans are insufficient for effect receipts.",
         "Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.",
         "TextureImage supplies source format, size, width, and address. RT64's tile-size substitution, zero starting-row XOR, silent invalid-coordinate returns, and host-layout correction remain divergence candidates rather than fn64 authority.",
         "The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit.",
-        "Commit 75e9025f integrates M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.",
-        "The accepted M4.2.0 source passed 101 unit tests plus nine compile-fail doctests in 10/10 consecutive guarded processes; it is a plan contract and makes no TMEM-mutation or execution claim."
+        "Commit 75e9025f integrated M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.",
+        "The objective's work has since landed on main through sub-cards rather than this card's branch: f8f3aca7 added tmem/physical.rs (transactional physical TMEM, 24 tests), d618a1c8 the LoadTile executor, 39c82523 the LoadBlock executor, and ea695da1 (M4.2d) the ordered packet executor. crates/fn64-render-wgpu/src/tmem carries 176 unit tests in total.",
+        "Reclassified from RUNNING to BLOCKED on 2026-08-17 under the port plan's loop rule for a dead worker. Not promoted to INTEGRATED: the recorded guarded run is the sub-cards' evidence, and no reliability run is recorded against this card's own merged result, so promoting it here would be a false-completion shape."
       ],
       "verification_runs": [
         {
@@ -1195,10 +1237,10 @@
           "kind": "deterministic"
         }
       ],
-      "blocker": null,
-      "next_action": "Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.",
+      "blocker": "Worker gone: owner /root/m4_2a_physical_state_impl is not alive on 2026-08-17 and its branch port/m4-2a-physical-state (5badcbd5) was never merged. The objective's work nevertheless reached main through separately reviewed sub-cards, so this card is a bookkeeping remnant: it needs an owner to confirm the sub-cards discharge it and close it, not more porting.",
+      "next_action": "Assign an owner to reconcile this card against what actually shipped: confirm sub-cards M4.2a/2b/2c and M4.2d fully discharge the LoadTile/LoadBlock physical-state objective, record a reliability run for the merged tmem surface, then either close this card as superseded or promote it on that evidence. Do not restart the port.",
       "started_utc": "2026-08-16T10:37:19Z",
-      "updated_utc": "2026-08-16T12:37:27Z"
+      "updated_utc": "2026-08-17T00:00:00Z"
     },
     {
       "id": "M4.3",
@@ -1217,19 +1259,366 @@
         "crates/fn64-render-wgpu/src/shaders/tmem_decode.wgsl",
         "crates/fn64-render-reference/src/tmem_decode.rs"
       ],
-      "dependencies": ["M4.2"],
+      "dependencies": [],
       "state": "BLOCKED",
       "findings": [
         "LoadTLUT uses a 16-bit source and high-half destination and quadricates each 16-bit entry into one 64-bit TMEM word; raw sub-16-entry loads remain bounded evidence rather than universal support.",
         "CI4 combines the tile palette high nibble with the texel nibble; CI8 ignores tile palette. TLUT mode selects RGBA16 or IA16 interpretation.",
         "Decode identity contains committed TMEM snapshot, render format/size, base/line, TLUT mode, normalized palette, window, and row parity. Source-image and sampler/filter state do not belong in that cache key.",
-        "YUV remains a separate SetConvert/filter/combiner prerequisite. RT64's black result and eager RGB approximation are not acceptable authority."
+        "YUV remains a separate SetConvert/filter/combiner prerequisite. RT64's black result and eager RGB approximation are not acceptable authority.",
+        "Much of this objective has already landed on main through sub-cards, not through this card's branch: aec0ae1b (M4.3.2) the LoadTLUT executor, M4.3.3's tmem/texel.rs direct and indexed decode (44 tests), b07fc375 the committed point sampler, and 9b74f9d7 TMEM sampling in triangle fragments. This card's declared writable_paths are stale -- none of that landed under them.",
+        "The M4.2 dependency was dropped because it is discharged in substance: M4.1 is INTEGRATED and the physical-state and executor work M4.2 named is merged. M4.2 itself remains open only as a bookkeeping remnant of a dead worker, which is not a real prerequisite for this card.",
+        "Not promoted: this card has no verification_runs, so no promotion beyond BLOCKED is available without recording a reliability run against the landed decode/TLUT surface."
       ],
       "verification_runs": [],
-      "blocker": "M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.",
-      "next_action": "After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.",
+      "blocker": "Stale blocker corrected on 2026-08-17. The dependency half is false: M4.1 is INTEGRATED and M4.2's physical state plus LoadTile/LoadBlock executors are on main. What still blocks is narrower and card-internal -- the frozen decode contract, first-row parity, and noncanonical TLUT-bank behavior still lack explicit authority fixtures, and sample.rs states first-row parity is caller-owned.",
+      "next_action": "Re-scope this card against what shipped. Point writable_paths at the real landed surface (crates/fn64-render-wgpu/src/tmem), settle first-row parity and noncanonical TLUT-bank behavior with explicit authority fixtures, then record a reliability run and take the remainder -- the owned-WGSL differential and bounded cache ownership -- in separately reviewed cards.",
       "started_utc": "2026-08-16T10:46:00Z",
-      "updated_utc": "2026-08-16T10:46:00Z"
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.4",
+      "milestone": "M4",
+      "objective": "Port rt64_blender.h's CPU-side shader-SELECTION analysis: combineCycleCount, blendCycleCount, usesInput/usesCombinerAlpha, usesAlphaBlendCycle/usesAlphaBlend, usesStandardFogCycle, usesVisualizeCoverageCycle. Unwired CPU predicates; no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "blender-analysis writer",
+      "branch": "port/m4-blender-analysis",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_blender_analysis.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_blender_analysis.rs (declared at lib.rs:338) ports all eight named predicates -- combine_cycle_count, blend_cycle_count, uses_input, uses_combiner_alpha, uses_alpha_blend_cycle, uses_alpha_blend, uses_standard_fog_cycle, uses_visualize_coverage_cycle -- with 51 tests, split across the module file and its rt64_blender_analysis/ test directory.",
+        "Source: src/shared/rt64_blender.h, 510 lines; take its sha256 from docs/rt64-port-inventory.json when writing the module doc.",
+        "NOT a duplicate of the landed blend.rs. That module ports the runtime EVALUATION path (blend_fragment/blend_a/blend_b/dual_source). This card ports the disjoint CPU ANALYSIS half RT64 uses to pick a pipeline before any fragment runs.",
+        "Symbol gate: blend_cycle_count, combine_cycle_count, uses_alpha_blend, uses_standard_fog_cycle and visualize_coverage have ZERO hits under crates/.",
+        "Reuse crate::state::OtherMode's landed cycle_type/force_blend/blender_cycle_1/blender_cycle_2 accessors. Do NOT edit state.rs -- ticket M4.2 holds it RUNNING and an edit there is an exclusivity violation.",
+        "Decode the P/M/A/B selectors from the raw 16-bit blenderInputs word per the header's own shifts (P: 14/12, M: 6/4, A: 10/8, B: 2/0). Second-cycle uses the LOW shift of each pair; first-cycle the high. Do not swap them.",
+        "usesVisualizeCoverageCycle is the direct prerequisite for FramebufferPair::earlyPresentCandidate, so this unblocks later framebuffer-pair work.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the whole predicate cluster is ported with 51 tests over hand-built blenderInputs words and the cycle-count boundaries. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.5",
+      "milestone": "M4",
+      "objective": "Port rt64_blender.h's checkEmulationRequirements: per-cycle passthrough/numeratorOverflow/framebufferColor classification, the simpleEmulation decision tree, and the two named Approximation patterns. Unwired CPU classifier; no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "blender-emulation-requirements writer",
+      "branch": "port/m4-blender-emulation-reqs",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_blender_emulation.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_blender_emulation.rs (declared at lib.rs:339) ports EmulationRequirements, check_emulation_requirements and the Approximation enum with 51 tests, split across the module file and its rt64_blender_emulation/ test directory.",
+        "Source: src/shared/rt64_blender.h's HLSL_CPU-only EmulationRequirements block; take the file sha256 from docs/rt64-port-inventory.json.",
+        "Symbol gate: EmulationRequirements, emulation_requirements and BlenderApproximation have ZERO hits under crates/.",
+        "Depends on M4.4 for decodeInputP/M/A/B and blendCycleCount; do not redefine those selectors or the cycle-count rule.",
+        "The decision tree is order-sensitive and each branch is separately reachable: cycle-0 numeratorOverflow+framebufferColor short-circuits BEFORE the two-cycle checks, so a table-driven test must cover both orderings, not just the outcome.",
+        "The two Approximation patterns are exact 8-selector equality patterns. AnyFramebuffer1MA_MultiplyMix deliberately does NOT constrain A0/A1 while CombinerFramebuffer1MA_SquareMix pins them to A_CC_ALPHA -- port the asymmetry literally rather than normalizing it.",
+        "Approximation::None is assigned only inside the two-cycle branch; a one-cycle non-simple case leaves the field at its zero-initialized default. Preserve that, do not 'fix' it.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the classifier and both Approximation patterns are ported with 51 tests over the order-sensitive decision tree. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.6",
+      "milestone": "M4",
+      "objective": "Close rgb_dither.rs's named HDR frontier: port Float4ToRGBA16's full (float4, dither, usesHDR) signature, then FbCommon.hlsli's deferred Float4ToUINT16 and Float4ToUINT. Unwired CPU quantizers; no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "rgba16-hdr-quantizer writer",
+      "branch": "port/m4-float4-rgba16-hdr",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_float4_quantize.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_float4_quantize.rs (899 lines, declared at lib.rs:344) ports float4_to_rgba16 with the explicit usesHDR parameter plus float4_to_uint16 and float4_to_uint, with 42 tests. Its own header carries a 'Partial coverage disclosure' section bounding what the two closed deferrals do and do not cover.",
+        "This closes TWO named deferrals, it is not a re-port. fbcommon.rs's Nonclaims says it 'does not port Float4ToUINT16's or Float4ToUINT's RGBA branch'; rgb_dither.rs's Frontier says 'A future HDR-target slice must port the usesHDR == true branch separately'.",
+        "Symbol gate: float4_to_rgba16, float4_to_uint16 and float4_to_uint have ZERO implementations under crates/ -- every hit is inside those two deferral notes.",
+        "Sources: src/shaders/FbCommon.hlsli (Float4ToUINT16/Float4ToUINT) and Formats.hlsli's Float4ToRGBA16; cite the FbCommon.hlsli sha256 from docs/rt64-port-inventory.json.",
+        "cvgRange is usesHDR ? 65535.0 : 255.0 and is applied ONLY to the alpha channel. r/g/b keep the 255.0 clamp in both branches -- do not scale them by cvgRange.",
+        "The alpha result is a single bit: cvgModulo = round(a*cvgRange) % 8, then a = (cvgModulo & 0x4) ? 1 : 0. Dither is added to r/g/b via min(x + dither, 255) >> 3 AFTER the clamp, never to alpha.",
+        "Reuse rgb_dither::quantize_post_float_rgba16_non_hdr for the non-HDR integer tail rather than re-deriving it; this module owns only the float front half plus the HDR branch. Extend that module's Frontier note to record what is now covered.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both named deferrals are closed with 42 tests covering the HDR and non-HDR cvgRange branches separately. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.7",
+      "milestone": "M4",
+      "objective": "Port FbReinterpretCS.hlsl's four framebuffer format-reinterpretation kernels (RGBA16toCI8, ANY8toUINT8/toI8/toIA8, RGBA16toIA16) plus the format-dispatch predicate chain. Unwired CPU kernels; no GPU dispatch, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "fb-reinterpret kernel writer",
+      "branch": "port/m4-fb-reinterpret",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_fb_reinterpret.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_fb_reinterpret.rs (1433 lines, declared at lib.rs:343) ports all four kernels -- rgba16_to_ci8, any8_to_uint8/any8_to_i8/any8_to_ia8, rgba16_to_ia16 -- plus the format-dispatch chain, with 53 tests. Its header records a 'Visibility gap: loadTLUT' rather than silently re-porting the helper.",
+        "Source: src/shaders/FbReinterpretCS.hlsl, 99 lines; take its sha256 from docs/rt64-port-inventory.json.",
+        "Symbol gate: rgba16_to_ci8, any8_to_i8, rgba16_to_ia16 and fb_reinterpret have ZERO hits under crates/.",
+        "Depends on M4.6 for Float4ToRGBA16 (RGBA16toCI8 calls it with the dither value and usesHDR). Do not re-port that quantizer here.",
+        "Reuse the landed random::RandomState (initRand/nextRand) and rgb_dither's DitherPatternValue rather than re-porting the PRNG; report a gap instead of copying if a needed helper is private.",
+        "RGBA16toIA16 is NOT a real format conversion: it encodes into a fake R10G10B10A2 (InputScale 1023.0) and decodes as a fake I16A16 (OutputScale 65535.0). Port the two DIFFERENT scale constants literally; conflating them silently changes every output.",
+        "RGBA16toCI8's pixelMisalignment is `1 - (outputCoord.x % 2)` -- note the inversion. ANY8toUINT8 instead picks green on an ODD column. The two parity rules point opposite ways; do not unify them.",
+        "The TLUT palette word is assembled big-endian across two TMEM bytes: loadTLUT(addr+1) | (loadTLUT(addr) << 8). decodedFormat is tlutFormat - 1, not tlutFormat.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the four kernels and the dispatch chain are ported with 53 tests covering both column-parity rules and both RGBA16toIA16 scale constants. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.8",
+      "milestone": "M4",
+      "objective": "Port rt64_framebuffer.cpp's pure geometry and RDRAM word-swap cluster: imageRowBytes, contains/overlaps, discardLastWrite, isLastWriteDifferent, clearChanged, addDitherPatterns, bestDitherPattern, FramebufferTile::valid, NativeTarget::getNativeSize, and both byte-swap loops. Unwired CPU helper; no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "framebuffer-geometry writer",
+      "branch": "port/m4-framebuffer-geometry",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs (1098 lines, declared at lib.rs:346) ports all ten named cluster items and both copyNativeToRAM byte-swap branches, with 67 unit tests. Its own doc header states \"Complete for its stated scope\" and \"not waiting on any other card\".",
+        "Sources: src/hle/rt64_framebuffer.cpp (202 lines) and src/hle/rt64_framebuffer.h (96 lines), plus NativeTarget::getNativeSize from src/render/rt64_native_target.cpp; each sha256 is recorded in the module header and matches docs/rt64-port-inventory.json.",
+        "FramebufferTile::hash stays excluded -- it is XXH3_64bits over the raw struct bytes and XXH3 is a triage reject. The module's Nonclaims records that exclusion, as the card required.",
+        "Also excluded, by design rather than deferral: the RenderWorker/RHI methods (copyRenderTargetToNative, readChangeFrom*, nativeTarget.copyFrom/ToRAM). Only the pure arithmetic around them was in scope and all of it is ported.",
+        "The sub-word tail of copyNativeToRAM was the trap and is ported literally: below 4 remaining bytes RT64 writes dstFirstWordU8[i ^ 3] = dstBytes[i] into a saved copy of the ORIGINAL first word rather than byte-swapping. Both that tail and the >= 4-byte loop are tested.",
+        "imageRowBytes is ported as `rowWidth << siz >> 1` with the shift order preserved (not rewritten as a division) and tested across all four siz values; bestDitherPattern returns the INDEX of the max element with first-max-wins ties, per std::max_element.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the whole named cluster is ported with 67 tests, including the XOR-3 sub-word tail at 1/2/3 residual bytes and imageRowBytes across all four siz values. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.9",
+      "milestone": "M4",
+      "objective": "Port FramebufferStorage: the append-only RDRAM arena with its 3/2 growth policy, plus the last-matching-handle-wins get() lookup bounded by maxFbPairIndex. Unwired CPU allocator; no parity claim.",
+      "profile": "M",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "framebuffer-storage writer",
+      "branch": "port/m4-framebuffer-storage",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_framebuffer_storage.rs (1002 lines, declared at lib.rs:347) ports both source files whole -- every FramebufferStorage member (constructor, reset, store, get, getRDRAM) plus the Handle record -- with 49 unit tests. Its doc header states \"Complete for its stated scope\" and \"not waiting on any other card\".",
+        "Sources: src/hle/rt64_framebuffer_storage.cpp (61 lines) and .h (35 lines); both sha256 values are recorded in the module header and match docs/rt64-port-inventory.json.",
+        "Fully self-contained as scoped: no RHI, no hashing, no threads, no filesystem.",
+        "The growth policy is ported exactly: `newSize = (rdramUsed * 3) / 2` computed AFTER rdramUsed was already advanced by size, with resize never shrinking. The tests assert the capacity sequence, not merely that a vec grows.",
+        "get() is ported as last-qualifying-handle-wins: it scans the whole handle vector and keeps the LAST entry whose fbPairIndex <= maxFbPairIndex and whose address matches exactly. A test asserts that against several handles sharing one address.",
+        "reset() clears the handle vector and zeroes rdramUsed while deliberately RETAINING the allocated rdramData buffer; that retention is preserved and covered.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the arena and handle table are ported with 49 tests covering the exact capacity growth sequence and last-handle-wins lookup. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.10",
+      "milestone": "M4",
+      "objective": "Port FramebufferManager::makeFramebufferTile: the RDRAM-address-range to framebuffer-tile geometry solver, including every named rejection path. Unwired CPU geometry; no parity claim.",
+      "profile": "F",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "framebuffer-tile geometry writer",
+      "branch": "port/m4-make-framebuffer-tile",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_framebuffer_tile.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_framebuffer_tile.rs (1553 lines, declared at lib.rs:348) ports make_framebuffer_tile including every named rejection path, with 45 tests.",
+        "Source: src/hle/rt64_framebuffer_manager.cpp's makeFramebufferTile (about 95 lines of the 1093-line file); take the file sha256 from docs/rt64-port-inventory.json.",
+        "Symbol gate: make_framebuffer_tile and framebuffer_tile have ZERO hits under crates/.",
+        "Depends on M4.8 for imageRowBytes and bestDitherPattern; take the framebuffer extent as an owned input struct rather than reaching into a manager.",
+        "The function has SIX distinct false returns (address walked past fb end, end <= start, offset not pixel-aligned, misaligned multi-row load-block, degenerate bottom<=top, degenerate right<=left). Each needs its own fixture; collapsing them into one error loses the contract.",
+        "lineWidth == 0 and tileHeight == 0 are SENTINELS meaning 'derive from the framebuffer', not literal zeros -- load-block passes 0 for both. The tileHeight == 0 case additionally arms the misaligned-multi-row rejection.",
+        "pixelSize is `1 << siz >> 1`, which is 0 for siz == 0 (4-bit); the `offset % pixelSize` guard therefore divides by zero for 4-bit in C++. Report this as a frontier in the module doc rather than inventing a guard RT64 does not have.",
+        "pixelShift is 1 only for G_IM_SIZ_4b and scales the left/right coordinates but NOT the row math. Do not apply it to top/bottom.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the solver is ported with 45 tests covering the six rejection paths and both sentinel-derived branches. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.11",
+      "milestone": "M4",
+      "objective": "Port FramebufferManager's TMEM region interval tracker: insertRegionsTMEM's wraparound word splitting, discardRegionsTMEM's four-way interval subtraction with recursion, and synchronizeRegionsTMEM. Unwired CPU interval list; no parity claim.",
+      "profile": "F",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "tmem-region tracker writer",
+      "branch": "port/m4-tmem-regions",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_tmem_regions.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_tmem_regions.rs (1353 lines, declared at lib.rs:385) ports insert_regions_tmem, discard_regions_tmem and synchronize_regions_tmem over an owned RegionTmem list, with 46 tests.",
+        "Source: src/hle/rt64_framebuffer_manager.cpp's insertRegionsTMEM/discardRegionsTMEM/synchronizeRegionsTMEM (about 110 lines); take the file sha256 from docs/rt64-port-inventory.json.",
+        "Symbol gate: RegionTMEM, region_tmem, insert_regions_tmem and discard_regions_tmem have ZERO hits under crates/. This is disjoint from ticket M4.2's physical-TMEM work, which owns byte contents, not address-range bookkeeping.",
+        "Do NOT write into crates/fn64-render-wgpu/src/tmem -- that directory is claimed by M4.2 (RUNNING) and M4.3 (BLOCKED). This card owns a new sibling module only.",
+        "insertRegionsTMEM pushes to the FRONT of the list and can emit multiple regions for one call as the wraparound cursor unwinds; RGBA32 runs the whole insertion twice, the second time offset by RDP_TMEM_WORDS >> 1. Preserve both the ordering and the double pass.",
+        "discardRegionsTMEM recurses when the range crosses the mask limit, and the second recursive call clamps its width with min(tmemStart, rightWords) -- an easy detail to drop, and dropping it silently over-discards.",
+        "The four-way subtraction has an asymmetry: the fully-contained case sets tmemEnd = tmemStart WITHOUT clearing fbTile, while all three partial cases clear fbTile first. Port that asymmetry literally.",
+        "The split case appends the right-hand remainder to the BACK of the list while insertion pushes to the front; the resulting order is observable and must be preserved.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the interval tracker is ported with 46 tests covering wraparound insertion, the mask-crossing recursion and all four subtraction cases. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.12",
+      "milestone": "M4",
+      "objective": "Port TextureMap's slot allocator and LRU eviction policy: the LIFO free-slot reuse, the access-list move-to-front on use, and the age-clamped evict() rule. Unwired CPU cache policy; no parity claim.",
+      "profile": "F",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "texture-map LRU writer",
+      "branch": "port/m4-texture-map-lru",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs (1367 lines, declared at lib.rs:382) ports the TextureMap slot allocator, access list and clamped-maxAge eviction sweep over opaque u64 handles, with 43 tests.",
+        "Source: src/render/rt64_texture_cache.cpp's TextureMap add/use/evict/clearReplacements/replace (about 190 lines of the 1791-line file); take the file sha256 from docs/rt64-port-inventory.json.",
+        "Symbol gate: TextureMap, texture_map, access_list and free_spaces have ZERO hits under crates/.",
+        "The REST of rt64_texture_cache.cpp is a triage reject (XXH3, stb_image, ddspp, zip filesystem, threads, mutexes). This card deliberately carves out the one dependency-free algorithm; state that boundary in Nonclaims. Texture handles are opaque u64/index values here, never real GPU textures.",
+        "The eviction rule is the substance: maxAge = clamp(lastUsedFrame - creationFrame, WORKLOAD_QUEUE_SIZE * 2, WORKLOAD_QUEUE_SIZE * 32). Note it clamps the entry's OWN lifetime, not its age -- a long-lived texture earns a longer grace period.",
+        "The reverse scan breaks early only when age == 0, not on the first non-evictable entry, so a fresh entry ahead of stale ones does not stop the sweep. Test that ordering explicitly.",
+        "Free slots are reused LIFO (back of the vector), and a reused slot's version counter increments rather than resetting. globalVersion increments on add/replace/clearReplacements but NOT on use.",
+        "Take WORKLOAD_QUEUE_SIZE as a named constant parameter and record its RT64 value in the doc rather than hard-coding an unexplained multiplier.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the allocator and eviction policy are ported with 43 tests covering LIFO slot reuse, move-to-front on use, and the clamped-maxAge boundary. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.13",
+      "milestone": "M4",
+      "objective": "Port RenderTarget's resolution geometry: computeScaledSize, computeFixedResolutionScale, the pillarbox viewport/scissor derivation, and viewportScissorIntersection. Unwired CPU geometry; no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "render-target geometry writer",
+      "branch": "port/m4-render-target-geometry",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs (819 lines, declared at lib.rs:372) ports all four named functions with 39 unit tests. Its doc header states \"Complete for its stated scope\" and \"not waiting on any other card\".",
+        "Sources: src/render/rt64_render_target.cpp lines 487-506 plus the 289-314 pillarbox block, and src/render/rt64_framebuffer_renderer.cpp lines 128-135 for viewportScissorIntersection; both sha256 values are recorded in the module header and match docs/rt64-port-inventory.json.",
+        "The rest of both files is RHI plumbing (descriptor sets, barriers, command lists, raytracing) and is declined by design, not deferred; the module's Nonclaims says so.",
+        "The x/y trap is ported correctly: computeScaledSize uses resolutionScale.y for the NATIVE width and the height but resolutionScale.x for the EXPANDED width, so the misalignment output depends on the difference between the two widths.",
+        "lround's round-half-away-from-zero is ported via f32::round rather than an `as i64` truncation, clamped to MaxDimension 0x4000 with a floor of 1.",
+        "computeFixedResolutionScale forces an EVEN width via `w += w & 1` and returns a modified scale rather than a size; the pillarbox branch (selected by resolutionScale.x > resolutionScale.y) floors the scissor origin and ceils the extent literally. Both branches are tested separately.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: all four functions are ported as pure math with 39 tests, covering the pillarbox and letterbox branches separately and the misalignment result at non-integer resolution scales. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M4.14",
+      "milestone": "M4",
+      "objective": "Close TextureSampler.hlsli's deferred sampling cluster: clampWrapMirrorSample's texel address arithmetic and sampleTextureLevel's filter blends, including the three-sample bilinear. Unwired CPU address/blend math; no parity claim.",
+      "profile": "F",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "texture-sampler address writer",
+      "branch": "port/m4-texture-sampler-address",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_texture_sampler.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: the work is in crates/fn64-render-wgpu/src/rt64_texture_sampler.rs (1309 lines, declared at lib.rs:383), NOT the rt64_texture_sampler_address.rs this card declared -- writable_paths corrected to the real path. It ports clamp_wrap_mirror_address and sample_texture_level_blend with 53 tests, under a 'Scope split (per the task card)' header section.",
+        "This closes a real named deferral. texture_lod.rs ports only computeLOD (46 of TextureSampler.hlsli's 359 lines) yet the inventory marks the whole file ported -- treat that row as coarse, exactly like rt64_math.cpp's.",
+        "Symbol gate: clamp_wrap_mirror, sample_texture_level and three_sample / tri0 / tri1 have ZERO hits under crates/.",
+        "Sources: src/shaders/TextureSampler.hlsli's clampWrapMirrorSample and sampleTextureLevel; take the file sha256 from docs/rt64-port-inventory.json.",
+        "Scope split: port the ADDRESS arithmetic and the BLEND arithmetic only. The actual fetch (sampleTMEM, gTextures.Load, the nine native-sampler SampleLevel arms) is a resource binding this crate does not have -- take the four texel samples as caller-supplied values.",
+        "HLSL lerp(x,y,s) is x + s*(y-x). Spell that form out; do not reach for a mix-shaped e1*(1-s)+e2*s expression, which is a different float computation.",
+        "The three-sample path is the substance: tri0 = lerp(s00,s10,fx) + (s01-s00)*fy; tri1 = lerp(s11,s01,1-fx) + (s10-s11)*(1-fy); result = lerp(tri0,tri1,step(1,fx+fy)). Note the reversed argument order in tri1 -- it is not a mirror of tri0.",
+        "The mirror rule needs both the masks>0 guard and the modulo(t, masks*2) >= masks test; when masks is 0 the else branch still calls modulo(t, 0). Report that divide-by-zero as a frontier rather than inventing a guard.",
+        "filterAverage only takes effect when both filterAverage AND all(abs(frac - 0.5) <= 1/128) hold; the doubled filterAverage test in RT64's source is redundant but harmless -- port the effective condition and note the redundancy.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the address arithmetic and the three filter blends are ported with 53 tests, including the three-sample path on both sides of fx+fy == 1. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
     },
     {
       "id": "A0.4",
@@ -1250,7 +1639,9 @@
         "docs/RT64-PORT-PARITY.md",
         "docs/rt64-port-status.json"
       ],
-      "dependencies": ["A0.3"],
+      "dependencies": [
+        "A0.3"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "RT64's FullSync handler advances and enqueues an RT64-owned Workload with its own workload ID; the existing shim snapshots that completed Workload under the queue mutex before worker consumption.",
@@ -1321,7 +1712,9 @@
         "docs/RT64-PORT-DASHBOARD.md",
         "docs/rt64-port-dashboard.html"
       ],
-      "dependencies": ["A0.2"],
+      "dependencies": [
+        "A0.2"
+      ],
       "state": "INTEGRATED",
       "findings": [
         "The prior dashboard rendered ticket detail before the operational frontier and exposed recorded timestamps and elapsed duration, which are not a durable workflow-state signal.",
@@ -1368,6 +1761,876 @@
         "prevention": "Frontier tests now slice before detail and assert queue facts in that bounded region.",
         "estimated_minutes_saved": 10
       }
+    },
+    {
+      "id": "M8.1",
+      "milestone": "M8",
+      "objective": "Port RT64's rt64_extended_gbi.h opcode/word-packing ABI (PARAM, G_EX_* opcodes and enums, gEX* command encoders) as an unwired CPU encoder module. No interpreter wiring and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "extended-GBI encoder writer",
+      "branch": "port/m8-extended-gbi-encode",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_extended_gbi.rs (2334 lines, declared at lib.rs:341) ports the PARAM packing macro, the full G_EX_* opcode/enum constant set and the gEX* encoders, with 117 tests.",
+        "Source: include/rt64_extended_gbi.h, 582 lines. Cite its sha256 in the module doc from docs/rt64-port-inventory.json (sources.port.sha256); digests are not restated here to keep them test-gated at the code.",
+        "Manifest gate: no existing ticket claims rt64_extended_gbi.rs.",
+        "Provenance gate: that file's port digest appears nowhere under crates/; inventory port_state is not-started.",
+        "Symbol gate: G_EX_ has zero hits in crates/. ExtendedAlignment hits only README/texture_rectangle.rs prose that explicitly names it as an unimplemented nonclaim, so no landed encoder is duplicated.",
+        "Computation is real: PARAM(value,bits,shift) masks to `bits` then shifts, and each gEX* macro composes fixed bit fields into word0/word1 pairs -- exactly characterizable by table-driven unit tests.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the packing ABI is ported with 117 tests pinning each encoder against the header's literal bit layout. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.2",
+      "milestone": "M8",
+      "objective": "Port the rt64_gbi_extended.cpp bit-field DECODERS as pure word-pair -> parameter-struct functions and round-trip them against M8.1's encoders. Decode helpers only; no State/rdp/rsp dispatch.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "extended-GBI decoder writer",
+      "branch": "port/m8-extended-gbi-decode",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs (2282 lines, declared at lib.rs:351) ports the p0/p1 extraction half of every GBI_EXTENDED handler, with 152 tests -- the largest test count in this milestone.",
+        "Source: src/gbi/rt64_gbi_extended.cpp, 445 lines; take its sha256 from the inventory when writing the module doc.",
+        "Scope split is deliberate: each handler in this file is (a) a pure sequence of DisplayList p0/p1 bit extractions followed by (b) a call into state->rdp/state->rsp. Only (a) is portable.",
+        "Part (b) needs the whole HLE State machine and belongs to M5, not here. Port only the extraction half into parameter structs.",
+        "Depends on M8.1 for the shared G_EX_* opcode constants and the ExtendedAlignment field layout; do not redefine them.",
+        "Round-trip test is the point: encode with M8.1, decode here, assert the parameter struct is recovered exactly.",
+        "Symbol gate: no decoder for these opcodes exists under crates/.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the decode half is ported with 152 tests including the encoder/decoder round-trip against M8.1. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.3",
+      "milestone": "M8",
+      "objective": "Close rt64_math's deferred matrix cluster: extract3x3, rotationFrom3x3, matrixDifference, lerpMatrix/lerpMatrix3x3/lerpMatrixComponents, and matrixScale/Translation/RotationX/Y/Z. Unwired CPU math, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "rt64-math decomposition writer",
+      "branch": "port/m8-rt64-math-matrix-cluster",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_math_matrix.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed, but NARROWER than this card's objective: crates/fn64-render-wgpu/src/rt64_math_matrix.rs (892 lines, lib.rs:365) ports six of the eleven named symbols -- extract_3x3, rotation_from_3x3, matrix_difference, lerp_matrix, lerp_matrix_3x3, lerp_matrix_components -- with 41 tests.",
+        "This is NOT a duplicate of the landed rt64_math.rs. That module's own Nonclaims section explicitly defers exactly these symbols: 'Does not port matrixScale, matrixTranslation, matrixRotationX/Y/Z, extract3x3, rotationFrom3x3, matrixDifference, lerpMatrix/lerpMatrix3x3/lerpMatrixComponents ...'.",
+        "Symbol gate: every hit for these names under crates/ is inside that deferral sentence -- prose, not an implementation.",
+        "Inventory says src/common/rt64_math.cpp/.h are port_state=ported, which is true only for the bounded scalar/predicate cluster that landed. Treat the inventory row as coarse, not as proof of coverage.",
+        "Deliberately EXCLUDES decomposeMatrix/recomposeMatrix/DecomposedTransform/lerpTransforms -- those need quaternion and matrix-inverse infrastructure and are M8.4's scope.",
+        "matrixDifference is the direct prerequisite for rt64_game_frame's isSceneCompatible tolerance check, so this unblocks later HFR work.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "Scope gap, recorded rather than papered over: matrixScale, matrixTranslation and matrixRotationX/Y/Z are named in this card's objective but are NOT ported. The module's Nonclaims states they 'remain out of scope exactly as rt64_math.rs already stated'. matrixDecomposeViewProj, also named there, landed separately in rt64_rsp_matrix_stack.rs under M5.2.",
+        "So this card is a partial delivery, not a complete one. Review should decide explicitly whether to accept the narrowed scope and re-scope the five unported constructors onto a follow-up card, or to hold the card open until they land."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has partly landed: six of eleven named symbols are ported with 41 tests. Before any reliability run, resolve the scope gap -- either accept the narrowing and re-scope matrixScale/Translation/RotationX/Y/Z to a follow-up card, or reopen this one to land them.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.4",
+      "milestone": "M8",
+      "objective": "Port rt64_math's quaternion decomposition core: DecomposedTransform, decomposeMatrix, recomposeMatrix, lerpTransforms, matrixDecomposeViewProj. Unwired CPU math helper, no parity claim.",
+      "profile": "F",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "rt64-math quaternion writer",
+      "branch": "port/m8-rt64-math-decompose",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_math_decompose.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_math_decompose.rs (2073 lines, declared at lib.rs:364) ports DecomposedTransform, decompose_matrix, recompose_matrix and lerp_transforms -- supplying the quaternion and 4x4-inverse infra the deferral named as blocking -- with 63 tests.",
+        "Same deferral evidence as M8.3: rt64_math.rs names 'decomposeMatrix/recomposeMatrix, DecomposedTransform/lerpTransforms (deferred -- needs new matrix-inverse/quaternion infra)'. That sentence is the only hit under crates/; nothing is implemented.",
+        "This card is what supplies the missing infra: a quaternion type plus a 4x4 inverse, both of which the deferral sentence names as the blocking reason.",
+        "Depends on M8.3 for extract3x3/rotationFrom3x3, which decomposeMatrix calls; do not re-port them.",
+        "Numerically sensitive: decompose/recompose round-trip must be tested with an explicit epsilon, and shear/negative-scale cases must be covered or explicitly declared out of scope in the module doc.",
+        "This is the sole blocker for a faithful RigidBody port (M8.5).",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "One named symbol went elsewhere by design: matrixDecomposeViewProj is not in this module. It landed in rt64_rsp_matrix_stack.rs (M5.2), whose own findings argued it belongs with matrixCommon, its only caller. This module's Nonclaims records it as out of scope, so the split is deliberate and consistent, not a gap."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the decomposition core is ported with 63 tests proving the decompose/recompose round-trip within a stated epsilon. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.5",
+      "milestone": "M8",
+      "objective": "Port RT64's RigidBody interpolation heuristics (updateLinear, updateAngular, updatePerspective, updateDecomposition, lerp) as an unwired CPU helper. No frame-graph wiring, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "rigid-body interpolation writer",
+      "branch": "port/m8-rigid-body",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rigid_body.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rigid_body.rs (1486 lines, declared at lib.rs:375) ports the constructor plus update_linear, update_angular, update_perspective, update_decomposition and lerp, with 48 tests.",
+        "Sources: src/hle/rt64_rigid_body.cpp (138 lines) and .h (42 lines); take both sha256 values from the inventory.",
+        "Symbol gate: RigidBody has ZERO hits under crates/. DecomposedTransform's one hit is rt64_math.rs's deferral prose.",
+        "Real computation: velocity/acceleration epsilon heuristics, a dot-product auto-interpolation decision, and an acos-of-trace rotation-angle test -- all deterministically testable.",
+        "Hard dependency on M8.4: lerp() delegates its core to lerpTransforms and recomposeMatrix. Porting this before M8.4 yields a module that cannot express lerp() faithfully.",
+        "G_EX_COMPONENT_* constants come from M8.1's ported constant set rather than being redefined locally.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: all five RigidBody methods are ported with 48 tests pinning the skip/interpolate heuristics at their epsilon boundaries. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.6",
+      "milestone": "M8",
+      "objective": "Repair provenance for the ALREADY-LANDED color_converter.rs: add the missing SHA-256 citations for rt64_color_converter.h/.cpp so the inventory stops reporting a ported file as not-started. Citation only.",
+      "profile": "M",
+      "model": "Claude Sonnet 5",
+      "effort": "low",
+      "owner": "port-provenance repair writer",
+      "branch": "port/m8-color-converter-provenance",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/color_converter.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Done, and provably so: color_converter.rs now carries both SHA-256 citations, and docs/rt64-port-inventory.json reports src/hle/rt64_color_converter.cpp and .h as port_state=ported with ported_as pointing at crates/fn64-render-wgpu/src/color_converter.rs. That inventory flip is this card's own declared exit condition, met.",
+        "NOT A PORT CARD. crates/fn64-render-wgpu/src/color_converter.rs already exists (579 lines) and is a complete literal port of ColorConverter::RGBA16/RGBA32/D16, and lib.rs line 319 declares `mod color_converter;` -- so it is landed AND wired.",
+        "Root cause of the false negative: the module cites the commit and the file paths but contains NO sha256 at all, and tools/rt64_port_inventory.py derives port_state by digest matching.",
+        "The two files are byte-identical across the oracle and port commits (inventory port_delta=unchanged), so citing the port-source digests asserts nothing new about behavior.",
+        "Take the two digests to cite from docs/rt64-port-inventory.json rows src/hle/rt64_color_converter.cpp and .h (sources.port.sha256). They belong in the module doc, where the inventory scan gates them -- not restated in this ticket.",
+        "Do NOT rewrite the port or restate its behavior claims; only add the digest citations, then re-run the inventory to confirm port_state flips to ported for both rows.",
+        "This card's remaining work is therefore genuinely zero, unlike the port cards around it: the module carries 29 tests it did not add, and the citation-only change it did make is already confirmed by the inventory scan."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Work has landed and its exit condition is confirmed by the inventory scan itself. Remaining is process only -- record a reliability run and obtain review, then this card can promote on stronger evidence than most in this milestone.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.7",
+      "milestone": "M8",
+      "objective": "Port ReplacementDatabase's pure string/hash algorithms: checkWildcard, stringToHash, hashToString, toLower, endsWith, removeKnownExtension, resolveOperation, resolveShift. Unwired CPU helper, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "replacement-path resolution writer",
+      "branch": "port/m8-replacement-resolve",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed, but NARROWER than this card's objective: crates/fn64-render-wgpu/src/rt64_replacement_resolve.rs (807 lines, lib.rs:373) ports check_wildcard, string_to_hash and hash_to_string (as hash_to_string_u32/u64), with 67 tests.",
+        "Source: src/common/rt64_replacement_database.cpp (410 lines); port ONLY the free/static functions at lines 19, 112, 130, 257, 261-267, 284, 293, 298 -- roughly 120 lines of real algorithm.",
+        "Explicitly EXCLUDED: every nlohmann-JSON to_json/from_json block (a dependency this card must not pull in) and resolvePaths, which takes a FileSystem* and does directory probing.",
+        "checkWildcard is a hand-written glob matcher -- the single best unit-test target in the whole M8 common cluster.",
+        "Symbol gate: ReplacementDatabase's 5 hits under crates/ are in the fn64-render-rt64 C++ FFI shim and docs, not a Rust port. Confirm at implementation time that no Rust glob matcher already covers this.",
+        "resolveOperation/resolveShift walk an ordered filter list and first-match wins; test ordering precedence explicitly.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "Scope gap, recorded rather than papered over: toLower, endsWith, removeKnownExtension, resolveOperation and resolveShift are named in this card's objective but are NOT ported. The module's own header excludes them by reasoned argument -- resolveOperation/resolveShift read JSON-populated ReplacementDatabase instance state, and the extension helpers are scoped to the excluded path handling.",
+        "So this card is a partial delivery. The exclusion is argued in the module rather than silent, but it contradicts the card as written; review should either accept the narrowing on that argument or re-scope the five functions onto a follow-up card."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has partly landed: three of eight named functions are ported with 67 tests, check_wildcard heavily table-tested. Before any reliability run, resolve the scope gap -- accept the module's stated exclusion argument and re-scope the other five, or reopen this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.8",
+      "milestone": "M8",
+      "objective": "Port UserConfiguration's validation logic: clampEnum, validate() range clamping, and msaaSampleCount(). Unwired CPU helper; excludes JSON and platform graphics-API policy. No parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "user-configuration validation writer",
+      "branch": "port/m8-user-config-validate",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_user_configuration.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_user_configuration.rs (1249 lines, declared at lib.rs:387) ports clamp_enum, validate and msaa_sample_count over the config enum set, with 92 tests.",
+        "Sources: src/common/rt64_user_configuration.cpp (180) and .h (177).",
+        "Port ONLY clampEnum<T>, UserConfiguration::validate(), and msaaSampleCount(). These are genuine bounds/dispatch logic over the config enums and are deterministically testable.",
+        "Explicitly EXCLUDED: all NLOHMANN_JSON_SERIALIZE_ENUM macro blocks and ConfigurationJSON::read/write (JSON + iostream dependency), and isGraphicsAPISupported/resolveGraphicsAPI, which are #ifdef platform policy plus Sommelier Wine detection, not portable computation.",
+        "Symbol gate: UserConfiguration's 3 hits under crates/ are in the fn64-render-rt64 C++ FFI shim, not a Rust port.",
+        "Test the clamps at both bounds and one step outside each, and assert every enum value maps to the documented MSAA sample count.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the three functions are ported with 92 tests clamping at both bounds and covering every enum value for msaaSampleCount. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.9",
+      "milestone": "M8",
+      "objective": "Port DrawCallKey/DrawCallMask comparison and PresetDrawCall::matches() as an unwired CPU helper, excluding the ImGui inspector half and the XXH3 hash(). No parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "draw-call preset matching writer",
+      "branch": "port/m8-preset-draw-call-match",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_preset_draw_call_match.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_preset_draw_call_match.rs (1188 lines, declared at lib.rs:367) ports DrawCallKey with its equality, DrawCallMask field masking, and PresetDrawCall::matches, with 47 tests. fromDrawCall landed as from_raw_sample over a minimal local RawDrawCallSample struct, exactly as this card directed.",
+        "Source: src/preset/rt64_preset_draw_call.cpp (486 lines) and .h (78). Roughly the first 239 lines are data logic; lines ~241-485 are PresetDrawCallLibraryInspector, wall-to-wall ImGui.",
+        "Port ONLY DrawCallKey::fromDrawCall, DrawCallKey::operator==, the DrawCallMask field masking, and PresetDrawCall::matches(). That is real masked-comparison logic worth characterizing.",
+        "Explicitly EXCLUDED: DrawCallKey::hash(), which calls XXH3_64bits. Pulling xxhash is a dependency decision that must not ride along in a mechanical port card -- see the M8 triage note on XXH3.",
+        "Also excluded: the whole inspector class and every JSON block.",
+        "fromDrawCall reads a live DrawCall; port it against a minimal local struct holding only the fields the key actually samples, and say so in the module doc.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the key/mask types and matches() are ported with 47 tests proving masked-out fields are ignored and unmasked mismatches reject. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.10",
+      "milestone": "M8",
+      "objective": "Port LightManager::estimatedSunLight and estimatedAmbientLight as pure functions over already-accumulated light state. Unwired CPU helper, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "light estimation writer",
+      "branch": "port/m8-light-estimation",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_light_estimation.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_light_estimation.rs (671 lines, declared at lib.rs:360) ports estimated_sun_light and estimated_ambient_light over a plain accumulator input type, with 29 tests.",
+        "Source: src/hle/rt64_light_manager.cpp (166 lines) and .h (34 lines).",
+        "Port ONLY estimatedSunLight and estimatedAmbientLight. Both are pure functions of the already-accumulated directionalLights / ambientColSum / ambientSum fields -- weighted-average selection and normalization.",
+        "Explicitly EXCLUDED: processDirLight/processAmbientLight/processLight, which read live state->rsp->lights register state and cannot be characterized without faking the whole RSP light-register format.",
+        "Also excluded: processPointLight, which sits inside #if ENABLE_AUTOMATIC_POINT_LIGHTS with the macro defined to 0 immediately above -- it is dead code that never compiles.",
+        "Symbol gate: LightManager and light_manager both have zero hits under crates/.",
+        "Port the accumulator struct as a plain input type so the two estimators are directly unit-testable.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both estimators are ported with 29 tests covering zero-light, single-light and weighted multi-light cases. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.11",
+      "milestone": "M8",
+      "objective": "Port ShaderDescription::toShader() deterministic shader-source serialization from rt64_shader_common, excluding the XXH3 hash(). Unwired CPU helper, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "shader-description serialization writer",
+      "branch": "port/m8-shader-description",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_shader_description.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_shader_description.rs (402 lines, declared at lib.rs:381) ports the packed ShaderDescription and its to_shader serialization, with 25 tests. The smallest module in this milestone, matching the card's small declared scope.",
+        "Sources: src/render/rt64_shader_common.cpp (34) and .h (29).",
+        "toShader() builds shader source text deterministically from the packed ColorCombiner/OtherMode/RenderFlags bitfields -- pure string formatting, fully testable with no RHI or device.",
+        "Explicitly EXCLUDED: ShaderDescription::hash(), which calls XXH3_64bits. Do not add an xxhash dependency in this card.",
+        "Also excluded: maskUnusedParameters(), which is an empty TODO stub in the source -- porting an empty body would be a false coverage claim.",
+        "The interop bitfield structs it reads (rt64_color_combiner.h, rt64_other_mode.h, rt64_render_params.h) are plain POD bit layouts; check whether combiner.rs already models any of them before redefining, and reuse if so.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the description struct and toShader() are ported with 25 golden tests over representative combiner/othermode inputs. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.12",
+      "milestone": "M8",
+      "objective": "Port GameFrame::areFramebufferPairsCompatible and isSceneCompatible as pure predicates over minimal local descriptor structs. Unwired CPU helper, no frame-graph wiring, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "frame-compatibility predicate writer",
+      "branch": "port/m8-frame-compatibility",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Source: src/hle/rt64_game_frame.cpp (1042 lines) -- ported ONLY the two predicates at lines 15-73. The file has zero ImGui; the remaining ~970 lines (set/match/matchScene/matchTransform/buildCallHashMap) were deliberately declined, not deferred: they are RHI/thread plumbing over WorkloadQueue, RenderWorker, and BufferUploader that this card's scope excludes by design.",
+        "Landed: crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs (896 lines, declared in lib.rs) ports both predicates over local descriptor structs (FramebufferPairIndex, ColorImageFields, DepthImageFields, FbPairFields) and covers them with 40 unit tests, including the 1e-6 tolerance at/just-inside/just-outside and one rejecting-field case per compared field.",
+        "The M8.3 dependency is discharged. It was recorded because isSceneCompatible calls matrixDifference, but the landed port takes the two matrix differences as caller-supplied f32 inputs, so it never calls that symbol. M8.3's matrix_difference has since landed in rt64_math_matrix.rs regardless.",
+        "The predicates only compare depth/color image address, fmt, siz, width, and two matrix differences against a 1e-6 tolerance -- ported against minimal local descriptor structs rather than dragging in the workload graph.",
+        "The union of what this card needs from RT64's HLE object graph is four scalar color-image fields, one depth address, two depth bools, and a two-u32 index pair. The wider Workload/WorkloadQueue graph exists to accumulate frames for motion interpolation, a feature fn64 does not implement, so it is out of scope by design rather than a pending prerequisite.",
+        "rt64_math.rs's Nonclaims sentence 'rt64_game_frame.cpp itself remains unported' was left as-is: narrowing it falls outside this card's exclusive-paths scope.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both predicates are ported over local descriptor structs, with the tolerance boundary and each rejecting field tested. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.13",
+      "milestone": "M8",
+      "objective": "Port the LookAtProcessor lerp formula and adjustProjectionMatrix as two small pure helpers, excluding all BufferUploader/RHI plumbing. Unwired CPU helper, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "low",
+      "owner": "lookat/projection helper writer",
+      "branch": "port/m8-lookat-projection-helpers",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs (462 lines, declared at lib.rs:359) ports both fragments -- look_at_lerp_component/look_at_lerp_vec3 and adjust_projection_matrix -- with 25 tests.",
+        "Sources: src/render/rt64_look_at_processor.cpp (66) and src/render/rt64_projection_processor.cpp (163).",
+        "Deliberately a SMALL card. Both files are majority RHI upload plumbing over WorkloadQueue/GameFrame/BufferUploader; only two fragments are portable computation.",
+        "From look_at_processor: the RSPLookAt x/y lerp `cur - delta * (1 - weight)` at lines ~40-41.",
+        "From projection_processor: adjustProjectionMatrix, the aspect-ratio column scale helper.",
+        "Grouped together precisely BECAUSE each alone is too small to justify a module; neither warrants its own card.",
+        "Symbol gate: LookAtProcessor and ProjectionProcessor both have zero hits under crates/.",
+        "Everything else in both files (setup/process/processScene/upload) is out of scope and must be named as such in the module doc.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both fragments are ported with 25 tests covering the lerp at weight 0, 1 and midpoint plus the aspect scale against hand-computed matrices. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M8.14",
+      "milestone": "M8",
+      "objective": "Port the two self-contained RT64 shaders FullScreenVS.hlsl and Constants.hlsli into the owned WGSL/constant corpus with a CPU oracle. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "low",
+      "owner": "fullscreen-triangle shader writer",
+      "branch": "port/m8-fullscreen-vs",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_fullscreen_vs.rs",
+        "crates/fn64-render-wgpu/src/shaders/fullscreen_vs.wgsl"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_fullscreen_vs.rs (declared at lib.rs:349) plus the owned shaders/fullscreen_vs.wgsl, with 30 tests split across the module file and its rt64_fullscreen_vs/ test directory.",
+        "Sources: src/shaders/FullScreenVS.hlsl (9 lines) and src/shaders/Constants.hlsli (12 lines); cite both sha256 values from the inventory in the module doc.",
+        "FullScreenVS is the standard oversized-triangle trick: uv.x = (id==2)?2:0, uv.y = (id==1)?2:0, pos = uv*(2,-2)+(-1,1). Fully determined by SV_VertexID, so a 3-vertex CPU oracle characterizes it exhaustively -- no GPU needed.",
+        "Constants.hlsli is 5 #defines (APPLY_LIGHTS_MINIMUM_ALPHA, APPLY_LIGHTS_DITHER_ALPHA, and three ray-query masks). Carried as named constants only; the ray-query masks are inert until M12.",
+        "These two are the ONLY M8 shaders portable in isolation. DebugPS, ComposePS, Im3DPS and Im3DVS all bind FbRendererRT ray-tracing resources (gShadingPosition, gDirectLightAccum, RtParams) that do not exist in this renderer yet -- see the triage list.",
+        "Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "Constants.hlsli is cited but deliberately carries no ported symbol, on an upstream fact rather than a deferral: the module header records that FullScreenVS.hlsl does not #include it and VSMain references none of its five defines, so carrying them as constants would assert a dependency the source does not have. Both files' sha256 are cited."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the vertex formula is ported as a CPU oracle plus owned Naga-validated WGSL, with 30 tests asserting the three vertex outputs exactly. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.1",
+      "milestone": "M5",
+      "objective": "Port RT64's RSP segmented-address translation (fromSegmented, fromSegmentedMasked/PD, maskPhysicalAddress, setSegment) plus the rt64_f3d_defines.h constant set as an unwired CPU module. No interpreter wiring and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "RSP segment-translation writer",
+      "branch": "port/m5-rsp-segment-address",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_segment.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rsp_segment.rs (749 lines, declared at lib.rs:378) ports the four address functions over a plain segment table plus an extend_rdram bool, and the rt64_f3d_defines.h constant set, with 36 tests.",
+        "Sources: rt64_rsp.cpp's segmented-address cluster (26 lines) and rt64_f3d_defines.h (169 lines). Cite both sha256 values in the module doc from docs/rt64-port-inventory.json (sources.port.sha256); digests stay out of this ticket so they remain test-gated at the code.",
+        "Manifest gate: no existing ticket claims rt64_rsp_segment.rs, and no ticket names rt64_rsp.cpp or rt64_f3d_defines.h at all.",
+        "Symbol gate: from_segmented, mask_physical_address and SegmentTable have zero hits under crates/. `fromSegmented` appears only inside rt64_gbi_f3d.rs's Nonclaims sentence naming it as deferred dispatch.",
+        "Computation is real and exhaustively testable: index is (addr>>24)&0x0F, base is segments[index] + (addr & 0x00FFFFFF), and the two DMA masks differ (0x00FFFFF8 vs 0x00FFFFFC). The extended-RDRAM early-out returns addr - 0x80000000 when bit 31 is set, bypassing the mask entirely.",
+        "Pass extend_rdram in as a plain bool parameter rather than reaching for State; that is the only thing standing between this cluster and purity.",
+        "rt64_f3d_defines.h is pure #define constants -- no function-like macros. Port the G_MDSFT_* shift positions paired with their shifted values so later other-mode cards can address fields symbolically. Watch the G_MW_FOG / G_MW_GENSTAT collision (both 0x08): use consts, not an enum.",
+        "fn64-render-reference carries its own independent G_MDSFT_/G_CLIPPING constants. Per rt64_gbi_f3dex.rs's stated precedent that crate is a separate, independently-maintained implementation, not a shared dependency of this port -- so this is not a duplicate.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the translation cluster and the defines are ported with 36 tests covering both DMA masks, the bit-31 early-out and each segment index. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.2",
+      "milestone": "M5",
+      "objective": "Port RT64's RSP matrix-stack algebra: matrixCommon's projection/model branches, the projection push/pop stacks, computeModelViewProj, and the deferred matrixDecomposeViewProj. Unwired CPU math, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "RSP matrix-stack writer",
+      "branch": "port/m5-rsp-matrix-stack",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rsp_matrix_stack.rs (1598 lines, declared at lib.rs:376) ports matrixCommon's two branches, the projection/model stacks, computeModelViewProj and matrix_decompose_view_proj, with 50 tests.",
+        "Source: rt64_rsp.cpp's matrixCommon plus the projection stack helpers (about 119 lines including matrixDecomposeViewProj from rt64_math.cpp). Cite the sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_rsp_matrix_stack.rs. M8.3 and M8.4 own rt64_math's matrix helpers and its decompose/recompose cluster respectively; neither covers matrixCommon or the RSP stacks.",
+        "Symbol gate: matrix_common and matrixCommon have zero hits under crates/.",
+        "Prerequisites ALREADY LANDED -- reuse, do not reimplement: rt64_math.rs provides is_matrix_view_proj, is_matrix_affine, is_matrix_identity, sqr and matrix_is_nan; fn64-render-ir provides Mat4.",
+        "matrixDecomposeViewProj IS legitimately in scope: rt64_math.rs's own Nonclaims list defers it by name, and M8.4's scope is decomposeMatrix/ recomposeMatrix/DecomposedTransform/lerpTransforms -- a different cluster. It is 32 lines, pure, and only matrixCommon needs it, so it belongs here.",
+        "The branch structure is the whole behavior: projection-load decomposes into view/proj only when isMatrixViewProj holds; projection-mul routes to view when isMatrixAffine and not isMatrixIdentity, else to proj. Model push copies stack[n-1] into stack[n] only while n < 32.",
+        "matrixDecomposeViewProj's NaN fallback (identity view, proj = vp) is a real branch, not an error path -- unit-test it with a singular vp.",
+        "Inject the segment-translated address rather than calling into State; M5.1 owns that translation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "This module is where matrixDecomposeViewProj actually landed -- M8.3's and M8.4's Nonclaims both name it as out of their scope, and this card's own findings argued it belongs beside matrixCommon, its only caller. The three cards agree, so the symbol is ported exactly once and no gap exists between them."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both matrixCommon branches, the stacks with their exact depth limits, and the decomposition helper are ported with 50 tests including the NaN fallback. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.3",
+      "milestone": "M5",
+      "objective": "Port RT64's fixed-point matrix patching (insertMatrix's region decode) and the G_MODIFYVTX vertex-attribute patch decode from rt64_rsp.cpp. Unwired CPU math, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "RSP matrix-patch writer",
+      "branch": "port/m5-rsp-insert-matrix",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_patch.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rsp_patch.rs (1151 lines, declared at lib.rs:377) ports insert_matrix's region/index decode over the landed FixedMatrix helpers and the G_MODIFYVTX attribute switch, with 53 tests.",
+        "Source: rt64_rsp.cpp's insertMatrix (63 lines) and modifyVertex's attribute switch (44 lines). Cite the file's sha256 in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_rsp_patch.rs.",
+        "Symbol gate: insert_matrix has zero hits under crates/; `insertMatrix` appears only as prose in fn64-render's geometry_task_inspection.",
+        "Prerequisite ALREADY LANDED -- reuse, do not reimplement: rt64_common.rs's FixedMatrix already ports fixed_to_float, to_float's j^1 column swap, modify_matrix4x4_integer and modify_matrix4x4_fraction. This card is only the region/index decode that drives them.",
+        "insertMatrix's decode is pure and exact: dst = (address + 0x80) & 0xFFFF; regions Model 0x00, ViewProj 0x40, ModelViewProj 0x80, each 0x40 bytes with the fraction half at +0x20; modify_fractional = rel >= 0x20 (then rel -= 0x20); index = rel/2, row = index/4, column = index%4; two consecutive components are written from the halfwords of value.",
+        "Port the out-of-range arm as a returned None/error rather than the upstream assert(false), matching the DECODE-only precedent that rt64_gbi_f3d.rs's decode_move_mem already set for a debug-only guard.",
+        "modifyVertex's switch is separate pure bit math with four distinct divisors -- POINT_ST /32.0, POINT_XYSCREEN /4.0, POINT_ZSCREEN /65536.0, POINT_RGBA plain byte extraction -- plus the (globalIndex<<1)|is_z tag encoding. Port only the switch; modifyVertex's 15-vector clone half is object-graph plumbing and is out of scope.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the region decode and the patch switch are ported with 53 tests covering every region boundary, the fraction split at +0x20 and each divisor. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.4",
+      "milestone": "M5",
+      "objective": "Port RT64's F3DEX2 display-list command-word bitfield DECODE (rt64_gbi_f3dex2.cpp plus its opcode constants) as pure (w0, w1) -> struct functions. Decode only, no state->rsp-> dispatch, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "high",
+      "owner": "F3DEX2 decode writer",
+      "branch": "port/m5-gbi-f3dex2-decode",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_f3dex2.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_gbi_f3dex2.rs (1718 lines, declared at lib.rs:355) ports each F3DEX2 opcode as a pure decode function with its own struct plus the opcode constants, with 108 tests.",
+        "Sources: rt64_gbi_f3dex2.cpp (212 lines) and rt64_gbi_f3dex2.h (87 lines of opcode/offset defines), 299 RT64 lines total. Cite both sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_gbi_f3dex2.rs.",
+        "Provenance gate: the inventory reports rt64_gbi_f3dex2.cpp as not-started. The three landed GBI decoders cover f3d, f3dex and s2dex2 only; F3DEX2 is a distinct translation unit with a distinct bit layout.",
+        "Symbol gate: F3DEX2_G_ hits only rt64_gbi_s2dex2.rs, where it names GBI_F3DEX2::moveWord as the unported `Delegate` default arm -- prose marking an absence, not an implementation. This card closes that named deferral for the delegate target itself.",
+        "Follow the three landed decoders exactly: free p0/p1 functions over a (w0, w1) pair, one decode_* function per opcode, and a Nonclaims section listing every omitted state->rsp-> call.",
+        "Real computation to characterize: setOtherModeH/L's size = p0(0,8)+1 with off = max(0, 32 - p0(8,8) - size) (a signed clamp that differs from F3D's layout); moveMem's light index = (p0(8,8)*8)/24 with the >= 2 split between setLight and setLookAt; moveWord's /24 divisions; matrix's p0(0,8) ^ pushMask; popMatrix's w1 >> 6.",
+        "Port dmaIO and line3D as explicit absences -- upstream dmaIO is a documented no-op and line3D is a bare TODO. Do not invent operand layouts.",
+        "fn64-render-reference has its own F3DEX2 decode; rt64_gbi_f3dex.rs's module doc already records that it uses a different bit layout for several opcodes and is not a shared dependency of this port.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the F3DEX2 decoders are ported with 108 tests pinning the bit layouts against source literals, with every omitted dispatch call recorded in Nonclaims. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.5",
+      "milestone": "M5",
+      "objective": "Close rt64_gbi_rdp.cpp's remaining decode gaps: setConvert, setKeyR, setKeyGB, setScissor, setDepthImage and the HLE cursor-walking texrect/texrectFlip. Decode only, no dispatch, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "RDP decode-gap writer",
+      "branch": "port/m5-gbi-rdp-decode-gaps",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_rdp_decode.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed, but NARROWER than this card's objective: crates/fn64-render-wgpu/src/rt64_gbi_rdp_decode.rs (855 lines, lib.rs:356) ports four of the six named items -- decode_set_scissor, decode_set_convert, decode_set_key_r, decode_set_key_gb -- with 58 tests.",
+        "This is NOT a card to port rt64_gbi_rdp.cpp. Most of that file is already landed: getTrianglePointers and decodeTriangles are ported across raw_dpc/triangle.rs and raw_dpc/triangle_vertices.rs, and texrectLLE/texrectFlipLLE are ported in raw_dpc/texture_rectangle.rs -- all three wired through raw_dpc/production_adapter.rs.",
+        "Manifest gate: no existing ticket claims rt64_gbi_rdp_decode.rs.",
+        "Coverage gate: raw_dpc's RawDpcCommand enum already carries SetOtherMode, SetColorImage, SetFillColor, SetEnvColor, SetPrimColor, SetBlendColor, SetFogColor, SetPrimDepth, SetCombine, FillRectangle, SetTextureImage, SetTile, SetTileSize, LoadBlock, LoadTile and LoadTlut. Porting any of those again would duplicate landed work.",
+        "Symbol gate: SetConvert, SetKeyR and SetKeyGB have ZERO hits anywhere under crates/. Those three are genuinely unported.",
+        "setConvert is the computation worth the card: k2 = (p0(0,4) << 5) | p1(27,5) is a split field spanning both command words, and k0/k1/k3/k4/k5 are 9-bit fields that the RDP treats as signed. Unit-test the split reassembly against literals.",
+        "setScissor's mode = p1(24,2) plus four 12-bit corners has no raw_dpc equivalent; scissor appears in the wgpu crate only as production and texture_rectangle prose, never as a decoder.",
+        "The HLE texrect/texrectFlip differ from the already-ported LLE forms by advancing the DisplayList cursor twice (*dl = *dl + 1). Port the field extraction as a three-word decode and record the cursor advance as a documented fact, exactly as rt64_gbi_f3d.rs handles moveMem's extra_words_consumed.",
+        "Port setDepthImage's single-field decode for completeness; fullSync, the three sync no-ops and setup are dispatch/wiring and stay out.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "Scope gap, recorded rather than papered over: setDepthImage and the HLE cursor-walking texrect/texrectFlip are named in this card's objective but are NOT ported here. The module's Nonclaims is explicit -- 'This module's contribution is exactly, and only, the four named functions' bitfield decode' -- and lists both among the surface landed elsewhere or still unported.",
+        "So this card is a partial delivery. Review should confirm whether the HLE texrect cursor form is genuinely covered by raw_dpc/texture_rectangle.rs's texrectLLE (the module claims only the LLE form landed there, which is a different decode) and re-scope whatever is left onto a follow-up card."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has partly landed: four of six named items are ported with 58 tests including setConvert's split k2 field. Before any reliability run, resolve the scope gap -- confirm the HLE texrect cursor form and setDepthImage are covered elsewhere, or re-scope them onto a follow-up card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.6",
+      "milestone": "M5",
+      "objective": "Port the four F3D variant microcodes' command-word DECODE (F3DWAVE, F3DGOLDEN's triX, F3DPD, F3DZEX2's branchW) plus their opcode constants. Decode only, no dispatch, no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "F3D variant decode writer",
+      "branch": "port/m5-gbi-f3d-variants",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_gbi_f3d_variants.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_gbi_f3d_variants.rs (1217 lines, declared at lib.rs:353) ports all four variant microcodes' decode across the eight source files, with 50 tests.",
+        "Sources: rt64_gbi_f3dwave.cpp/.h, rt64_gbi_f3dgolden.cpp/.h, rt64_gbi_f3dpd.cpp/.h and rt64_gbi_f3dzex2.cpp/.h -- 202 RT64 lines across eight small files. Cite each sha256 in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_gbi_f3d_variants.rs.",
+        "Symbol gate: F3DWAVE, F3DGOLDEN, triX and branchW all have zero hits under crates/.",
+        "These four belong on ONE card because each is a thin delta over base F3D (every setup() calls GBI_F3D::setup first) and none is large enough to carry a module alone; the shared p0/p1 decode shape is identical.",
+        "F3DGOLDEN's triX is the real computation: a loop that pops 4-bit vertex indices, taking v0 and v1 from w1 and v2 from w0, shifting both words right by 4 each iteration, and terminating when w1 reaches zero. It emits a variable-length triangle list -- unit-test the iteration count and index order against literal word pairs.",
+        "F3DWAVE's whole delta is the /5 vertex-index divisor (base F3D uses /10) across vertex/tri1/tri2/quad -- a divisor difference that is exactly the kind of thing a table-driven test pins down.",
+        "F3DZEX2 contributes only branchW's p0(1,7) plus w1; its microcode.half1 read and the DisplayList rewrite are dispatch and stay out.",
+        "DELIBERATELY EXCLUDES rt64_gbi_l3dex2.cpp/.h: its only function, line3D, is a bare assert(false) with no bitfield read. Porting it would mean inventing behavior upstream does not have. See the triage list.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: triX's nibble loop, F3DWAVE's /5 divisors, F3DPD's vertex forms and branchW are ported with 50 tests pinning each divisor and triX's termination. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.7",
+      "milestone": "M5",
+      "objective": "Port RSPModifyCS and RSPWorldCS as CPU oracles plus owned WGSL: fixed-point vertex patching and world-space position/normal/velocity transform. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "RSP world/modify shader writer",
+      "branch": "port/m5-rsp-world-modify",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_world_modify.rs",
+        "crates/fn64-render-wgpu/src/shaders/rsp_world.wgsl",
+        "crates/fn64-render-wgpu/src/shaders/rsp_modify.wgsl"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rsp_world_modify.rs (declared at lib.rs:380) plus the owned shaders/rsp_world.wgsl and rsp_modify.wgsl, with 54 tests split across the module file and its rt64_rsp_world_modify/ test directory.",
+        "Sources: RSPModifyCS.hlsl (36 lines) and RSPWorldCS.hlsl (45 lines). Cite both sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims either module or either WGSL file.",
+        "Symbol gate: rsp_world, smooth_normal and modify_pos have zero hits under crates/.",
+        "These two are grouped because both are pure per-element arithmetic with no sampler, no groupshared, no atomics and no wave intrinsics -- the only two RSP compute shaders whose whole body ports as a plain function over slices.",
+        "RSPModifyCS is exact bit math: bit 0 selects Z-vs-XY and the rest is the vertex index (value >> 1); Z is value / 65536.0; XY sign-extends each 16-bit half with the (int << 16) >> 16 idiom then divides by 4.0. Include negative literals in the test set -- that idiom is where a Rust oracle and WGSL most easily diverge.",
+        "RSPWorldCS is three mat4-by-vec4 products plus a normalize: world position from pos - vel * (1 - curFrameWeight), previous position from the same with prevFrameWeight, velocity as their difference, and the inverse-transpose normal transform. The all(norm == 0) guard returning (0,0,0,1) is a real branch and needs its own test.",
+        "DELIBERATELY EXCLUDES RSPProcessCS and RSPVertexTestZCS -- see the triage list. RSPProcessCS's leaf math is already landed (rsp_math.rs's light trio, texture_gen.rs's computeTextureGen), and RSPVertexTestZCS is a depth-buffer Load predicate with an MSAA variant and a second descriptor space, binding resources that do not exist in this renderer yet.",
+        "Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both shader bodies are ported as CPU oracles plus Naga-validated WGSL, with 54 tests covering the sign-extension idiom and the zero-normal guard. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.8",
+      "milestone": "M5",
+      "objective": "Port RSPSmoothNormalCS's welded-vertex normal computation as a CPU oracle plus owned WGSL. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "RSP smooth-normal writer",
+      "branch": "port/m5-rsp-smooth-normal",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_rsp_smooth_normal.rs",
+        "crates/fn64-render-wgpu/src/shaders/rsp_smooth_normal.wgsl"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_rsp_smooth_normal.rs (declared at lib.rs:379) plus the owned shaders/rsp_smooth_normal.wgsl, with 52 tests split across the module file and its rt64_rsp_smooth_normal/ test directory.",
+        "Source: RSPSmoothNormalCS.hlsl (64 lines). Cite its sha256 in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_rsp_smooth_normal.rs or rsp_smooth_normal.wgsl.",
+        "Symbol gate: smooth_normal has zero hits under crates/.",
+        "It is self-contained despite being the largest RSP shader: three plain input buffers (positions, packed colors, face indices), one output, no sampler, no textures, no constant-buffer struct beyond an index range.",
+        "The weld predicate is the behavior: a candidate triangle contributes when dot(posDelta, posDelta) <= 1.0 AND the packed color compares exactly equal. Exact color equality on a packed integer is deliberate -- port it as an integer compare, not a float tolerance.",
+        "Each contribution is normalize(cross(triB - triA, triC - triA)) and the accumulated sum is normalized at the end; a zero-length accumulated sum is the degenerate case worth its own test.",
+        "The shader's AllMemoryBarrierWithGroupSync before its three writes means all normals must be computed before any is written -- a CPU port must not write in place while still reading, and the WGSL must keep the barrier.",
+        "It is O(n^2) by construction (every vertex rescans the whole range); port that faithfully rather than adding a spatial index, which would be an invented optimization and a behavior claim.",
+        "Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the weld-and-accumulate kernel is ported as a CPU oracle plus Naga-validated WGSL, with 52 tests covering the distance and exact-color predicates. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M5.9",
+      "milestone": "M5",
+      "objective": "Repair provenance for the ALREADY-LANDED fn64-render-ir rsp_math.rs: add the missing SHA-256 citations for the five RT64 shared RSP headers so the inventory stops reporting ported files as not-started. Citation only.",
+      "profile": "M",
+      "model": "Claude Sonnet 5",
+      "effort": "low",
+      "owner": "port-provenance repair writer",
+      "branch": "port/m5-rsp-math-provenance",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-ir/src/rsp_math.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Done, and provably so: crates/fn64-render-ir/src/rsp_math.rs (606 lines, declared at that crate's lib.rs:20) now carries the SHA-256 citations, and docs/rt64-port-inventory.json reports all five src/shared/rt64_rsp_*.h rows as port_state=ported with ported_as pointing at that module. That inventory flip is this card's declared exit condition, met.",
+        "NOT A PORT CARD. crates/fn64-render-ir/src/rsp_math.rs already exists (591 lines) and already ports all five RT64 shared RSP headers: rt64_rsp_viewport.h, rt64_rsp_fog.h, rt64_rsp_light.h, rt64_rsp_lookat.h and rt64_rsp_vertex_test_z.h -- 173 RT64 lines the inventory still reports as not-started.",
+        "It carries the landed compute_attenuation, compute_n_dot_l, compute_length, compute_pos_light and compute_dir_light, plus the RspViewport/RspFog/RspLight/RspLookAt/RspVertexTestZCb layouts.",
+        "Root cause of the false negative is identical to M8.6's: the module cites the commit and all five file paths but contains NO sha256 at all, and tools/rt64_port_inventory.py derives port_state by digest matching.",
+        "Provenance gate: the work landed on the merged branch worktree-rt64-rsp-shared-math (its diff against main is empty), so this is merged work with a missing citation, not an abandoned artifact.",
+        "Take the five digests to cite from docs/rt64-port-inventory.json (sources.port.sha256) for the five src/shared/rt64_rsp_*.h rows. They belong in the module doc, where the inventory scan gates them -- not restated in this ticket.",
+        "Do NOT rewrite the port or widen its claims. Its Nonclaims already defer RSPViewport::rect's FixedRect/clip-ratio conversion; leave that deferred and record it as still-open rather than quietly closing it here.",
+        "Do not touch crates/fn64-render-wgpu/src/lib.rs -- unlike every other card here this one edits an existing wired module in a different crate.",
+        "This is the one card here outside fn64-render-wgpu, so its 23 tests are not part of that crate's count. Like M8.6 its remaining work is genuinely zero -- the citation change it made is confirmed by the inventory scan rather than merely asserted."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Work has landed and its exit condition is confirmed by the inventory scan itself. Remaining is process only -- record a reliability run for fn64-render-ir and obtain review before promotion.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M11.1",
+      "milestone": "M11",
+      "objective": "Port RT64's resampling kernels BoxFilterCS and BicubicScalingCS as CPU oracles plus owned WGSL. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "resampling kernel writer",
+      "branch": "port/m11-box-bicubic",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_resample.rs",
+        "crates/fn64-render-wgpu/src/shaders/box_filter.wgsl",
+        "crates/fn64-render-wgpu/src/shaders/bicubic_scaling.wgsl"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_resample.rs (declared at lib.rs:374) plus the owned shaders/box_filter.wgsl and bicubic_scaling.wgsl, with 51 tests split across the module file and its rt64_resample/ test directory. Its header carries an explicit 'Ported vs. skipped' section.",
+        "Sources: BoxFilterCS.hlsl (29 lines) and BicubicScalingCS.hlsl (58 lines). Cite both sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_resample.rs or either WGSL file. M11 currently has zero tickets.",
+        "Symbol gate: box_filter, BoxFilter and cubic_weights have zero hits under crates/; bicubic and gaussian have zero hits anywhere in the repo.",
+        "BoxFilterCS is the cleanest target in M11: no sampler at all (Load only), integer-exact address math, no groupshared. clampedCoord = clamp(coord * scale + (x,y) + misalignment, 0, resolution - 1), summed then divided by the scale product.",
+        "Port BoxFilterCS's edge behavior faithfully: the divisor is the scale product, NOT the number of distinct unclamped taps, so clamped edge pixels are weighted more than once. That is deliberate upstream behavior and needs its own literal edge test.",
+        "BicubicScalingCS's cubic() is four B-spline polynomials over 6 and ports directly. Two upstream quirks must be preserved deliberately and pinned by tests, not silently corrected: the fractional offsets fx and fy are hardcoded to -0.5 so the coordinate's fractional part is never used, and InputResolution is declared in the constant buffer but never read.",
+        "Structure the bicubic oracle to take the four already-sampled values plus sx and sy so the three-lerp combine is testable without modelling hardware bilinear filtering; keep the tap-offset derivation as its own pure function.",
+        "Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: both kernels are ported as CPU oracles plus Naga-validated WGSL, with 51 tests including the box filter's clamped-edge double weighting. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M11.2",
+      "milestone": "M11",
+      "objective": "Port RT64's auto-exposure arithmetic: LuminanceHistogramCS's binning function and HistogramAverageCS's weighted-average and temporal-adaptation tail, as unwired CPU helpers. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "auto-exposure arithmetic writer",
+      "branch": "port/m11-luminance-histogram",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_luminance_histogram.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_luminance_histogram.rs (786 lines, declared at lib.rs:362) ports the binning function and the weighted-average/adaptation tail as pure functions taking the reduced sum and dt as arguments, with 48 tests.",
+        "Sources: LuminanceHistogramCS.hlsl (55 lines) and HistogramAverageCS.hlsl (53 lines). Cite both sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_luminance_histogram.rs.",
+        "Symbol gate: hdr_to_histogram_bin has zero hits under crates/; the histogram hits elsewhere in the repo are fn64-cpu-runtime and fn64-render-reference diagnostics, unrelated to luminance.",
+        "SCOPE IS THE ARITHMETIC, NOT THE DISPATCH. The binning function is pure float3 -> uint and the averaging tail is pure given the reduced sum as a scalar; both are exactly testable. The two-level InterlockedAdd scatter and the six-step groupshared barrier tree carry no testable semantics on the CPU and are explicitly out of scope -- say so in Nonclaims.",
+        "HDRToHistogramBin: luminance below 1e-6 returns bin 0, otherwise bin = (uint)(saturate((lum - minLuminance) * oneOverRange) * 62.0 + 1.0). Test the bin-0 path, both saturate clamps, and the truncating cast at saturation where the result must land in bin 63.",
+        "LUMINANCE COEFFICIENT TRAP: this shader defines its own local GetLuminance with BT.709 (0.2127, 0.7152, 0.0722) even though it includes Color.hlsli, whose already-landed rgb_to_luminance in color_hlsli.rs uses BT.601 under STRONG_GREEN_LUMINANCE. Do NOT reuse the landed helper here -- port the local BT.709 coefficients and document why the two coexist.",
+        "The averaging tail's denominator is max(pixelCount - bin0Count, 1.0), i.e. the black-pixel bin is excluded; the /62.0 is the exact inverse of the binning multiply; the isinf/isnan guard resets the previous luminance to 1.0; adaptation is last + (target - last) * (1 - exp(-dt * tau)).",
+        "The adaptation term is time-dependent but NOT timer-dependent: dt arrives as a plain parameter, so tests stay deterministic. Test dt = 0 (no change) and a large dt (full snap).",
+        "Record as a documented upstream fact, without porting it, that the caller sets pixelCount to a thread-group count rather than a pixel count.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the binning and adaptation arithmetic are ported with 48 tests covering the bin boundaries, the excluded black bin and both adaptation extremes. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M11.3",
+      "milestone": "M11",
+      "objective": "Port PostProcessPS's tonemap arithmetic and Upscaler::getQualityAuto's resolution ladder as unwired CPU helpers. No GPU execution, no vendor upscaler, and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "post-process tonemap writer",
+      "branch": "port/m11-postprocess-tonemap",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_postprocess.rs"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: the work is in crates/fn64-render-wgpu/src/rt64_postprocess.rs (declared at lib.rs:366), NOT the rt64_post_process.rs this card declared -- writable_paths corrected to the real path. It ports the tonemap arithmetic and get_quality_auto's ladder with 59 tests, split across the module file and its rt64_postprocess/ test directory.",
+        "Sources: PostProcessPS.hlsl (61 lines) and rt64_upscaler.cpp (36 lines). Cite both sha256 values in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_post_process.rs.",
+        "Symbol gate: white_black_point, WhiteBlackPoint, get_quality_auto and QualityMode all have zero hits under crates/; upscaler has zero hits anywhere in the repo.",
+        "SCOPE IS THE ARITHMETIC. WhiteBlackPoint is (color - black) / (white - black); exposure is tonemapExposure / avgLuma with avgLuma taken as a plain argument, which cleanly breaks the dependency on the 1x1 GPU luminance texture M11.2's shaders write.",
+        "The motion-blur sample-offset sequence is a pure function of uv, flow, strength and sample index and is portable; the texture fetches are not. Port the offset sequence and leave the sampling to a future wiring card.",
+        "Record as documented upstream facts, without inventing behavior: the per-sample weight is hardcoded to 1.0 so the weighted sum is a plain box mean, and the flowLength <= EPSILON path falls through to a single tap with alpha forced to 1.",
+        "DELIBERATELY EXCLUDES rt64_upscaler.h (56 lines): it is a pure-virtual interface plus a POD parameter bag of nine RenderTexture pointers, with no computation, and the FSR/DLSS/XeSS backends it abstracts are absent from the pinned checkout entirely. See the triage list.",
+        "getQualityAuto IS in scope and is real: a pure (width, height) -> quality ladder over the 720p/1080p/1440p/4K pixel thresholds. Test each boundary exactly. Note upstream multiplies in int before widening to uint64_t.",
+        "The Halton jitter this file's callers use is ALREADY LANDED as halton_sequence and halton_jitter in rt64_common.rs -- do not reimplement it; reference it if the module needs it.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: WhiteBlackPoint, the exposure multiply, the blur offset sequence and getQualityAuto are ported with 59 tests pinning every resolution boundary. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
+    },
+    {
+      "id": "M11.4",
+      "milestone": "M11",
+      "objective": "Port GaussianFilterRGB3x3CS's region weight table, tap offsets and channel combine as a CPU oracle plus owned WGSL. No GPU execution and no parity claim.",
+      "profile": "I",
+      "model": "Claude Sonnet 5",
+      "effort": "medium",
+      "owner": "gaussian filter writer",
+      "branch": "port/m11-gaussian-filter",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/src/rt64_gaussian_filter.rs",
+        "crates/fn64-render-wgpu/src/shaders/gaussian_filter_rgb3x3.wgsl"
+      ],
+      "dependencies": [],
+      "state": "READY",
+      "findings": [
+        "Landed: crates/fn64-render-wgpu/src/rt64_gaussian_filter.rs (declared at lib.rs:350) plus the owned WGSL, with 55 tests split across the module file and its rt64_gaussian_filter/ test directory.",
+        "Source: GaussianFilterRGB3x3CS.hlsl (82 lines). Cite its sha256 in the module doc from docs/rt64-port-inventory.json.",
+        "Manifest gate: no existing ticket claims rt64_gaussian_filter.rs or the WGSL file. Symbol gate: gaussian has zero hits anywhere in the repo.",
+        "It reconstructs a 9-tap 3x3 Gaussian from only 4 fetches -- three bilinear samples at fractional offsets plus one direct load -- with a distinct renormalized weight vector per region (interior, four corners, four borders).",
+        "Split the port so the sampler is not in the way: weights_for_pixel(coord, size) -> [f32; 4] and the three fractional offsets are pure functions testable as constants, and the combine is dot(samples_per_channel, weights) over four already-sampled values passed as plain arguments.",
+        "State plainly in Nonclaims that end-to-end equivalence depends on a bilinear-clamp sampler doing the sub-taps; the CPU oracle characterizes the weights, offsets and combine, and claims nothing about the filtered image.",
+        "The renormalization divisors are load-bearing (corner 0.519827, border 0.720991) and each region's weights must sum to 1 -- assert that property for all nine regions as a test, alongside the literal weight values.",
+        "Kept separate from M11.1's resampling card because this one needs a sampler model the other two deliberately avoid; merging them would blur that boundary.",
+        "Follow the existing repository WGSL mechanism used by vi/ and raster_vs, including Naga validation.",
+        "Contends with other cards on crates/fn64-render-wgpu/src/lib.rs (one `mod` line only); the module path is the real exclusive claim.",
+        "writable_paths corrected: the shader landed as shaders/gaussian_filter_rgb3x3.wgsl, not the gaussian_filter_rgb_3x3.wgsl this card declared. The module references the real name via include_str!, so the declared path never existed."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Code has landed: the weight table, offsets and combine are ported as pure functions plus Naga-validated WGSL, with 55 tests asserting each of the nine regions' weights sum to 1. Remaining is process, not porting -- record a reliability run for the module's tests, then independent review, before the integration lead may promote this card.",
+      "started_utc": "2026-08-17T00:00:00Z",
+      "updated_utc": "2026-08-17T00:00:00Z"
     }
   ]
 }

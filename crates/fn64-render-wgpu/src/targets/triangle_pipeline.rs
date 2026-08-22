@@ -76,9 +76,38 @@
 //!
 //! Nonclaims (port card §7, extended by the production depth-slice task
 //! card's nonclaims): no RT64 parity claim, no performance claim, no
-//! production/`decode_stream` wiring (fixture data only), no texture
-//! sampling/alpha-compare/blend/coverage-write/decal/backface-cull/MSAA/
-//! upscaling/`SetCombine` decode, no rasterization-algorithm claim of any
+//! `decode_stream` wiring -- draws arrive either from this module's own
+//! fixture or from `production.rs` via `submit_admitted_triangle`, never
+//! from the raw-DPC decode path itself.
+//!
+//! **Five stages this block previously declared absent are wired below and
+//! are no longer nonclaims** (`docs/RT64-COVERAGE-AUDIT.md`; each verified
+//! against the code in this file, not against the audit's summary): the
+//! `SetCombine` decode (`fragment_combine_params_bytes`, `:231`), texture
+//! sampling (the TMEM bytes/validity/tile-binding bindings and
+//! `tmem_sample.wgsl`'s `TMEM_SAMPLE_STATUS_*` readback channel, `:165`),
+//! alpha compare (`fragment_alpha_compare_params_bytes`, `:254`), coverage
+//! (`fragment_coverage_params_bytes`, `:345`), and blend
+//! (`fragment_blend_params_bytes`, `:541`, including the
+//! framebuffer-color-reading composite path). The restriction set quoted
+//! at the top of this header describes the original one-triangle fixture
+//! slice and is retained as that slice's history, not as the module's
+//! current surface. Stating them as absent would clear an auditor on five
+//! stages that do run -- the inverse of the defect that cost 99.38% of
+//! pixels, where a true nonclaim went unchecked against the ROM.
+//!
+//! What is genuinely still absent in those five areas: no **memory**
+//! coverage read (node 2) and no sub-pixel `CoverageMask` geometry
+//! (node 3) -- `fragment_coverage_params_bytes` panics by name on `Save`
+//! and on the `image_read_enabled` combinations where the unsupplied
+//! `memory` value could reach an output, and admits the rest only under
+//! the proven `!alpha_coverage_select && force_blend` predicate; and no
+//! `AlphaCompare::Dither` mode, likewise a named panic.
+//!
+//! Still absent and still nonclaimed: no decal, no backface culling
+//! (`cull_mode: None`, `:1109`), no MSAA
+//! (`wgpu::MultisampleState::default()`), no upscaling, and no
+//! rasterization-algorithm claim of any
 //! kind -- coverage determination routes entirely through wgpu's own
 //! `TriangleList` primitive state and the host GPU's rasterizer. The
 //! `Z_CMP`/`Z_UPD` pipeline-variant slice additionally makes no `DepthMode`
@@ -138,6 +167,24 @@ pub const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1;
 pub const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2;
 pub const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3;
 pub const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4;
+/// RETIRED, and reserved so no future status reuses the code.
+///
+/// This was the enabled-TLUT low-half REFUSAL, mirroring the CPU reader's
+/// `PhysicalTexelReadError::EnabledCiSourceOutsideLowHalf`. The low-half
+/// rule itself is real and is still enforced -- RT64's
+/// `src/shaders/TextureDecoder.hlsli:162-163` (pinned port source
+/// `5473732a`) confines an enabled-TLUT index source to `RDP_TMEM_MASK16`
+/// (`0x7FF`) exactly as it confines RGBA32. But RT64 confines it by
+/// MASKING inside `implLoadTMEM` (`:17-25`), never by refusing, so both
+/// lanes now wrap: `tmem/read.rs`'s `AddressScope::LowHalf` and
+/// `tmem_sample.wgsl`'s `tmem_indexed_byte_address`. Wrapping preserves
+/// what the refusal protected -- an index read can still never reach the
+/// palette's own half -- without refusing a frame the RDP would draw.
+///
+/// No shader path emits this value any more. It is kept, unused, so the
+/// numbering of codes 0..4 is undisturbed and a stale readback carrying a
+/// 5 is still nameable.
+pub const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5;
 
 /// One `RasterVS`-shaped vertex: RDP screen-pixel position, UV (unused by
 /// this slice's textureless fragment shader, but present in the layout to
@@ -224,17 +271,17 @@ fn fragment_combine_params_bytes(
 /// existing pad-to-16-byte-multiple convention).
 fn fragment_alpha_compare_params_bytes(
     mode: AlphaCompare,
-    blend_color: Option<Color4>,
+    blend_color: Color4,
 ) -> [u8; ALPHA_COMPARE_PARAMS_BYTES as usize] {
     let mode_wire: u32 = match mode {
         AlphaCompare::None => 0,
         AlphaCompare::Threshold => 1,
-        AlphaCompare::Reserved | AlphaCompare::Dither => unreachable!(
+        AlphaCompare::Dither => unreachable!(
             "submit_admitted_triangle received an alpha-compare mode ({mode:?}) that must have \
              been rejected at retrieval time before reaching the pipeline"
         ),
     };
-    let threshold_alpha = u32::from(blend_color.map_or(0, |color| color.rgba8()[3]));
+    let threshold_alpha = u32::from(blend_color.rgba8()[3]);
     let mut bytes = [0u8; ALPHA_COMPARE_PARAMS_BYTES as usize];
     bytes[0..4].copy_from_slice(&mode_wire.to_le_bytes());
     bytes[4..8].copy_from_slice(&threshold_alpha.to_le_bytes());
@@ -268,6 +315,51 @@ fn fragment_alpha_compare_params_bytes(
 /// here at the pipeline's own submission boundary since no upstream
 /// retrieval-time collector exists for coverage yet (this card's scope is
 /// this crate's pipeline/shader files only, not `raw_dpc`/`production.rs`).
+///
+/// ## The `memory`-independent `Clamp`/`Wrap` admission
+///
+/// `Clamp`/`Wrap` with `image_read_enabled` are admitted **only** when the
+/// unknown `memory` value provably cannot reach any shader output. That is
+/// not a substituted coverage value: `memory_count` stays the `0u` literal
+/// `fs_main` already passes, and the admission is conditioned on the
+/// accumulation's result being unobservable rather than on it being correct.
+///
+/// `coverage_fragment_fn`'s result reaches `FragmentOutput` by exactly two
+/// routes, both read off `shaders/triangle_pipeline_fragment.wgsl`:
+///
+/// 1. `output.color.a = coverage.adjusted_alpha`, guarded by
+///    `alpha_coverage_select != 0u` (`:283-285`). `adjusted_alpha` is the
+///    only consumer of `destination`/`adjusted_coverage`, and both
+///    `destination` and `adjusted_coverage` are `memory`-dependent under
+///    `Clamp`/`Wrap` + image read. With `alpha_coverage_select` clear this
+///    route is dead, so `destination` is computed and discarded.
+/// 2. `coverage.blend_enabled`, passed to `blend_fragment_cycle_fn` /
+///    `blend_fragment_memory_composite_fn` (`:326`, `:344`).
+///    `blend_enabled == force_blend || (antialias_enabled && !wraps)`
+///    (`coverage.rs:149`), and `wraps` is the `memory`-dependent term. With
+///    `force_blend` set the disjunction short-circuits to `true` for every
+///    `memory` in `0..=8`, so this route is `memory`-independent too.
+///
+/// `wraps` itself is otherwise unexported: the shader writes it to no output
+/// and this pipeline has no `clear_on_coverage` discard (the CPU reference's
+/// `set_blended` consumer, `raster/draw.rs:598`, has no counterpart here).
+///
+/// So the admitted predicate is `!alpha_coverage_select && force_blend`, and
+/// under it the draw's every observable output is a function of the supplied
+/// `pixel` alone. Anything outside it -- `alpha_coverage_select` set, or
+/// `force_blend` clear (where `antialias_enabled && !wraps` makes
+/// `blend_enabled` genuinely read `memory`) -- still panics, and `Save`
+/// still panics unconditionally since `destination = memory` has no
+/// `memory`-independent case at all.
+///
+/// **This is a narrowing of the refusal, not an implementation of the read.**
+/// No framebuffer coverage is read, and none is invented. A draw whose
+/// coverage arithmetic would actually matter is refused exactly as before.
+/// Measured, not assumed: all 60 of WM2000's frame-0 texrects latch low word
+/// `0x005041c8` -- `cvg_dst=Wrap`, `IM_RD`, `AA_EN`, `CLR_ON_CVG`,
+/// `FORCE_BL`, with `CVG_X_ALPHA` and `ALPHA_CVG_SEL` both clear -- which
+/// satisfies this predicate (`docs/RT64-WM2000-REPLAY.md` §2's capture,
+/// decoded per `state.rs`'s own bit accessors).
 fn fragment_coverage_params_bytes(
     coverage_destination: CoverageDestination,
     image_read_enabled: bool,
@@ -277,12 +369,18 @@ fn fragment_coverage_params_bytes(
     alpha_coverage_select: bool,
 ) -> [u8; COVERAGE_PARAMS_BYTES as usize] {
     let coverage_destination_wire: u32 = match coverage_destination {
-        CoverageDestination::Clamp | CoverageDestination::Wrap if image_read_enabled => panic!(
-            "submit_admitted_triangle received coverage_destination={coverage_destination:?} \
-             with image_read_enabled=true: this pipeline has no framebuffer-read mechanism to \
-             supply a real memory coverage value (node 2, out of scope) -- must be rejected \
-             before GPU submission, not silently substituted"
-        ),
+        CoverageDestination::Clamp | CoverageDestination::Wrap
+            if image_read_enabled && (alpha_coverage_select || !force_blend) =>
+        {
+            panic!(
+                "submit_admitted_triangle received coverage_destination={coverage_destination:?} \
+                 with image_read_enabled=true and alpha_coverage_select={alpha_coverage_select} \
+                 force_blend={force_blend}: this pipeline has no framebuffer-read mechanism to \
+                 supply a real memory coverage value (node 2, out of scope), and this mode \
+                 combination lets that value reach a shader output -- must be rejected before \
+                 GPU submission, not silently substituted"
+            )
+        }
         CoverageDestination::Save => panic!(
             "submit_admitted_triangle received coverage_destination=Save: this pipeline has no \
              framebuffer-read mechanism to supply a real memory coverage value (node 2, out of \
@@ -313,13 +411,14 @@ fn fragment_coverage_params_bytes(
 /// `SetPrimColor` before this triangle) serializes as all-zero, matching
 /// `CombinerInputs`'s pre-Slice-B hardcoded default exactly.
 fn fragment_material_params_bytes(
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
+    env_color: Color4,
+    prim_color: PrimColor,
 ) -> [u8; MATERIAL_PARAMS_BYTES as usize] {
-    let env = env_color.map_or([0.0f32; 4], Color4::normalized);
-    let (prim_rgba, prim_lod_frac) = prim_color.map_or(([0.0f32; 4], 0.0f32), |pc| {
-        (pc.color().normalized(), pc.lod().lod_frac_normalized())
-    });
+    let env = env_color.normalized();
+    let (prim_rgba, prim_lod_frac) = (
+        prim_color.color().normalized(),
+        prim_color.lod().lod_frac_normalized(),
+    );
     let mut bytes = [0u8; MATERIAL_PARAMS_BYTES as usize];
     bytes[0..16].copy_from_slice(&bytemuck_f32x4(env));
     bytes[16..32].copy_from_slice(&bytemuck_f32x4(prim_rgba));
@@ -387,13 +486,16 @@ pub struct ResolvedFragmentBlendParams {
     pub cycle0: crate::blend::ResolvedBlendCycle,
     /// Cycle 1's four selectors, meaningful only when `cycle_count == 2`.
     pub cycle1: crate::blend::ResolvedBlendCycle,
-    /// `G_SETBLENDCOLOR`, needed whenever an active cycle's `P`/`M` selects
-    /// [`crate::blend::BlendColorInput::Blend`].
-    pub blend_color: Option<Color4>,
-    /// `G_SETFOGCOLOR`, needed whenever an active cycle's `P`/`M` selects
+    /// `G_SETBLENDCOLOR`, read whenever an active cycle's `P`/`M` selects
+    /// [`crate::blend::BlendColorInput::Blend`]. Not an `Option`: the RDP
+    /// register always holds a value, zero until the guest writes one (see
+    /// `crate::state::RdpState`'s constant-color field doc).
+    pub blend_color: Color4,
+    /// `G_SETFOGCOLOR`, read whenever an active cycle's `P`/`M` selects
     /// [`crate::blend::BlendColorInput::Fog`] or `A` selects
-    /// [`crate::blend::BlendAlphaInput::Fog`].
-    pub fog_color: Option<Color4>,
+    /// [`crate::blend::BlendAlphaInput::Fog`]. Same power-on-register
+    /// reasoning as `blend_color`.
+    pub fog_color: Color4,
     /// Framebuffer-blend Slice B: `true` when this fixture's active cycle(s)
     /// select [`crate::blend::BlendColorInput::Framebuffer`] on `P` or `M`
     /// -- computed once in `production.rs`'s `draw_admitted_triangles` from
@@ -427,8 +529,8 @@ impl ResolvedFragmentBlendParams {
             m: crate::blend::BlendColorInput::Combined,
             b: crate::blend::BlendBInput::Zero,
         },
-        blend_color: None,
-        fog_color: None,
+        blend_color: Color4::from_wire(0),
+        fog_color: Color4::from_wire(0),
         reads_framebuffer_color: false,
     };
 }
@@ -475,8 +577,8 @@ fn fragment_blend_params_bytes(
     bytes[36..40].copy_from_slice(&u32::from(params.reads_framebuffer_color).to_le_bytes());
     bytes[40..44].copy_from_slice(&row_stride_words.to_le_bytes());
     // bytes[44..48] left zero: _reserved_2.
-    let blend_color = params.blend_color.map_or([0.0f32; 4], Color4::normalized);
-    let fog_color = params.fog_color.map_or([0.0f32; 4], Color4::normalized);
+    let blend_color = params.blend_color.normalized();
+    let fog_color = params.fog_color.normalized();
     bytes[48..64].copy_from_slice(&bytemuck_f32x4(blend_color));
     bytes[64..80].copy_from_slice(&bytemuck_f32x4(fog_color));
     bytes
@@ -572,9 +674,9 @@ pub struct TriangleFixture {
     pub tmem: TmemGpuProjection,
     pub tile_binding: TileBindingParams,
     pub alpha_compare_mode: AlphaCompare,
-    pub blend_color: Option<Color4>,
-    pub env_color: Option<Color4>,
-    pub prim_color: Option<PrimColor>,
+    pub blend_color: Color4,
+    pub env_color: Color4,
+    pub prim_color: PrimColor,
     /// Production blend wiring slice 1: the admitted-subset resolved
     /// blend-cycle parameters this triangle's real `OtherMode` decoded to.
     /// Always present (never `Option`) -- a `cycle_count == 0` value (built
@@ -616,15 +718,15 @@ pub(crate) fn admitted_triangle_fixture(
     extent: TriangleTargetExtent,
     tmem: TmemGpuProjection,
     tile_binding: TileBindingParams,
-    blend_color: Option<Color4>,
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
+    blend_color: Color4,
+    env_color: Color4,
+    prim_color: PrimColor,
     blend_params: ResolvedFragmentBlendParams,
     is_rect: bool,
 ) -> TriangleFixture {
     let alpha_compare_mode = match other_mode.alpha_compare() {
         mode @ (AlphaCompare::None | AlphaCompare::Threshold) => mode,
-        unsupported @ (AlphaCompare::Reserved | AlphaCompare::Dither) => unreachable!(
+        unsupported @ AlphaCompare::Dither => unreachable!(
             "admitted_triangle_fixture received alpha-compare mode {unsupported:?}, which must \
              have been rejected at retrieval time before reaching the pipeline"
         ),
@@ -728,6 +830,7 @@ impl UninitializedTrianglePipeline {
             }
             Err(error) => return Err(TrianglePipelineError::RequestAdapter(error.to_string())),
         };
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fn64-triangle-pipeline"),
@@ -1085,6 +1188,7 @@ impl UninitializedTrianglePipeline {
                 pipelines,
                 bind_group_layout,
                 framebuffer_color_dummy_buffer,
+                fixture_buffers: Vec::new(),
                 errors,
             },
         )))
@@ -1179,7 +1283,103 @@ pub struct TrianglePipelineRenderer {
     /// buffer reused across every non-reading fixture and every submission,
     /// never a per-fixture or per-submission allocation.
     framebuffer_color_dummy_buffer: wgpu::Buffer,
+    /// Per-fixture buffers, reused across submissions instead of recreated.
+    ///
+    /// `submit_triangles` used to `create_buffer` ten times per fixture, on
+    /// every submission. Measured on WM2000 (rs + wgpu, bounded census,
+    /// warmup 300 / 1200 pumps): **1,361,480 buffer creations in ~35 s**, or
+    /// ~2,813 per slow pump. A `sample` profile of the same run put
+    /// `AGXBuffer initWithDevice:`, `IOGPUResourceCreate`,
+    /// `IOConnectCallMethod` and `mach_msg2_trap` at the top -- each wgpu
+    /// `create_buffer` is a Metal resource creation with a kernel round
+    /// trip. At ~20 us apiece that is ~56 ms of the 64.8 ms slow-pump mean.
+    ///
+    /// Every one of the ten has a FIXED descriptor (nine compile-time size
+    /// constants; the vertex buffer is always `3 * 40` bytes for one
+    /// triangle), so a slot can be reused verbatim: same size, same usage.
+    /// The pool grows to the submission high-water mark and never shrinks,
+    /// so steady state performs zero allocations.
+    ///
+    /// This is the same principle `framebuffer_color_dummy_buffer` above
+    /// already applies, extended from one shared buffer to the per-fixture
+    /// set.
+    fixture_buffers: Vec<FixtureBuffers>,
     errors: Arc<BoundedErrorSink>,
+}
+
+/// One fixture's ten reusable GPU buffers. Created once per pool slot and
+/// rewritten per submission with `queue.write_buffer`, which is a staging
+/// copy rather than a resource creation.
+struct FixtureBuffers {
+    vertex: wgpu::Buffer,
+    raster_params: wgpu::Buffer,
+    combine_params: wgpu::Buffer,
+    tmem_bytes: wgpu::Buffer,
+    tmem_validity: wgpu::Buffer,
+    tile_binding: wgpu::Buffer,
+    alpha_compare_params: wgpu::Buffer,
+    coverage_params: wgpu::Buffer,
+    material_params: wgpu::Buffer,
+    blend_params: wgpu::Buffer,
+}
+
+/// Bytes in one triangle's vertex buffer: three vertices of 40 bytes.
+const VERTEX_BUFFER_BYTES: u64 = 3 * 40;
+
+impl FixtureBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        let uniform = |label: &'static str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let storage = |label: &'static str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            vertex: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-triangle-pipeline-vertices"),
+                size: VERTEX_BUFFER_BYTES,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            raster_params: uniform("fn64-triangle-pipeline-raster-params", RASTER_PARAMS_BYTES),
+            combine_params: uniform(
+                "fn64-triangle-pipeline-combine-params",
+                COMBINE_PARAMS_BYTES,
+            ),
+            tmem_bytes: storage("fn64-triangle-pipeline-tmem-bytes", TMEM_BYTES_BUFFER_SIZE),
+            tmem_validity: storage(
+                "fn64-triangle-pipeline-tmem-validity",
+                TMEM_VALIDITY_BUFFER_SIZE,
+            ),
+            tile_binding: uniform(
+                "fn64-triangle-pipeline-tile-binding",
+                TILE_BINDING_PARAMS_BYTES,
+            ),
+            alpha_compare_params: uniform(
+                "fn64-triangle-pipeline-alpha-compare-params",
+                ALPHA_COMPARE_PARAMS_BYTES,
+            ),
+            coverage_params: uniform(
+                "fn64-triangle-pipeline-coverage-params",
+                COVERAGE_PARAMS_BYTES,
+            ),
+            material_params: uniform(
+                "fn64-triangle-pipeline-material-params",
+                MATERIAL_PARAMS_BYTES,
+            ),
+            blend_params: uniform("fn64-triangle-pipeline-blend-params", BLEND_PARAMS_BYTES),
+        }
+    }
 }
 
 impl TrianglePipelineRenderer {
@@ -1258,9 +1458,9 @@ impl TrianglePipelineRenderer {
         extent: TriangleTargetExtent,
         tmem: TmemGpuProjection,
         tile_binding: TileBindingParams,
-        blend_color: Option<Color4>,
-        env_color: Option<Color4>,
-        prim_color: Option<PrimColor>,
+        blend_color: Color4,
+        env_color: Color4,
+        prim_color: PrimColor,
         blend_params: ResolvedFragmentBlendParams,
         is_rect: bool,
     ) -> Result<InFlightTriangleDraw<'_>, TrianglePipelineError> {
@@ -1366,75 +1566,53 @@ impl TrianglePipelineRenderer {
             material_params_buffer: wgpu::Buffer,
             blend_params_buffer: wgpu::Buffer,
         }
+        // Grow the pool to this submission's high-water mark. Steady state
+        // reuses every slot, so this allocates only when a frame needs more
+        // fixtures than any frame before it.
+        while self.fixture_buffers.len() < fixtures.len() {
+            self.fixture_buffers.push(FixtureBuffers::new(&self.device));
+        }
+
         let mut draws = Vec::with_capacity(fixtures.len());
-        for fixture in fixtures {
+        for (fixture_index, fixture) in fixtures.iter().enumerate() {
+            let slot = &self.fixture_buffers[fixture_index];
             let mut vertex_bytes = Vec::with_capacity(3 * 40);
             for vertex in fixture.vertices {
                 vertex_bytes.extend_from_slice(&vertex.to_bytes());
             }
-            let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-vertices"),
-                size: vertex_bytes.len() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            debug_assert_eq!(
+                vertex_bytes.len() as u64,
+                VERTEX_BUFFER_BYTES,
+                "the pooled vertex buffer is sized for exactly one triangle"
+            );
+            let vertex_buffer = &slot.vertex;
             self.queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
 
-            let raster_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-raster-params"),
-                size: RASTER_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let raster_params_buffer = &slot.raster_params;
             self.queue.write_buffer(
                 &raster_params_buffer,
                 0,
                 &raster_params_bytes(fixture.raster_params, fixture.is_rect),
             );
-            let combine_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-combine-params"),
-                size: COMBINE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let combine_params_buffer = &slot.combine_params;
             let combine_bytes = fragment_combine_params_bytes(fixture.combine_params);
             self.queue
                 .write_buffer(&combine_params_buffer, 0, &combine_bytes);
 
-            let tmem_bytes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tmem-bytes"),
-                size: TMEM_BYTES_BUFFER_SIZE,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tmem_bytes_buffer = &slot.tmem_bytes;
             self.queue
                 .write_buffer(&tmem_bytes_buffer, 0, &fixture.tmem.byte_words_bytes());
-            let tmem_validity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tmem-validity"),
-                size: TMEM_VALIDITY_BUFFER_SIZE,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tmem_validity_buffer = &slot.tmem_validity;
             self.queue.write_buffer(
                 &tmem_validity_buffer,
                 0,
                 &fixture.tmem.validity_words_bytes(),
             );
-            let tile_binding_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-tile-binding"),
-                size: TILE_BINDING_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let tile_binding_buffer = &slot.tile_binding;
             self.queue
                 .write_buffer(&tile_binding_buffer, 0, &fixture.tile_binding.to_bytes());
 
-            let alpha_compare_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-alpha-compare-params"),
-                size: ALPHA_COMPARE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let alpha_compare_params_buffer = &slot.alpha_compare_params;
             let alpha_compare_bytes = fragment_alpha_compare_params_bytes(
                 fixture.alpha_compare_mode,
                 fixture.blend_color,
@@ -1442,12 +1620,7 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&alpha_compare_params_buffer, 0, &alpha_compare_bytes);
 
-            let coverage_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-coverage-params"),
-                size: COVERAGE_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let coverage_params_buffer = &slot.coverage_params;
             let coverage_bytes = fragment_coverage_params_bytes(
                 fixture.coverage_destination,
                 fixture.image_read_enabled,
@@ -1459,44 +1632,34 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&coverage_params_buffer, 0, &coverage_bytes);
 
-            let material_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-material-params"),
-                size: MATERIAL_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let material_params_buffer = &slot.material_params;
             let material_bytes =
                 fragment_material_params_bytes(fixture.env_color, fixture.prim_color);
             self.queue
                 .write_buffer(&material_params_buffer, 0, &material_bytes);
 
-            let blend_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fn64-triangle-pipeline-blend-params"),
-                size: BLEND_PARAMS_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let blend_params_buffer = &slot.blend_params;
             let blend_params_bytes =
                 fragment_blend_params_bytes(fixture.blend_params, row_stride_words);
             self.queue
                 .write_buffer(&blend_params_buffer, 0, &blend_params_bytes);
 
             draws.push(DrawResources {
-                vertex_buffer,
+                vertex_buffer: vertex_buffer.clone(),
                 depth_pipeline_index: depth_pipeline_index(
                     fixture.depth_compare_enabled,
                     fixture.depth_update_enabled,
                 ),
                 reads_framebuffer_color: fixture.blend_params.reads_framebuffer_color,
-                raster_params_buffer,
-                combine_params_buffer,
-                tmem_bytes_buffer,
-                tmem_validity_buffer,
-                tile_binding_buffer,
-                alpha_compare_params_buffer,
-                coverage_params_buffer,
-                material_params_buffer,
-                blend_params_buffer,
+                raster_params_buffer: raster_params_buffer.clone(),
+                combine_params_buffer: combine_params_buffer.clone(),
+                tmem_bytes_buffer: tmem_bytes_buffer.clone(),
+                tmem_validity_buffer: tmem_validity_buffer.clone(),
+                tile_binding_buffer: tile_binding_buffer.clone(),
+                alpha_compare_params_buffer: alpha_compare_params_buffer.clone(),
+                coverage_params_buffer: coverage_params_buffer.clone(),
+                material_params_buffer: material_params_buffer.clone(),
+                blend_params_buffer: blend_params_buffer.clone(),
             });
         }
 

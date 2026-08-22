@@ -1,7 +1,7 @@
 # The rs-lane configuration of fn64-shell: the SAME src/main.rs and build.rs,
-# but the game arrives as the emitted `oot-recompiled` typed-Rust crate
+# but the game arrives as the emitted `game-recompiled` typed-Rust crate
 # instead of compiled RecompiledFuncs C. A standalone workspace (like
-# examples/oot-boot/rs) because `oot-recompiled` is out-of-tree game-derived
+# a title's own rs manifest) because `game-recompiled` is out-of-tree game-derived
 # material that must never enter the main workspace graph.
 #
 # Build (the recompiled symlink is refreshed from RECOMP_RS_DIR first, same
@@ -47,7 +47,32 @@ fn64-cpu-runtime = { path = "../../fn64-cpu-runtime" }
 fn64-render = { path = "../../fn64-render" }
 fn64-render-reference = { path = "../../fn64-render-reference" }
 fn64-render-rt64 = { path = "../../fn64-render-rt64" }
+# The all-Rust renderer half of the target stack (`fn64-cpu-runtime` +
+# `fn64-render-wgpu`), and the ONLY renderer this manifest can reach without a
+# native C++ adapter. It is not optional: `src/main.rs` names
+# `fn64_render_wgpu::WgpuBackend::try_new()` UNCONDITIONALLY in its
+# `FN64_RENDER` dispatch, so omitting it here is not "wgpu is unavailable on
+# the rs lane" -- it is a hard `E0433: unresolved module` that made
+# `FN64_RECOMP=rs` fail to compile at all, for every title and every renderer.
+# The sibling harness manifest (recomps/wm2000/packages/wm2000-boot/rs) has
+# carried this dependency all along, which is why the headless rs lane built
+# while this one did not.
+#
+# Unlike `fn64-render-rt64` it needs no Cargo feature and no C++ toolchain:
+# `WgpuBackend::try_new` is available unconditionally, so `FN64_RENDER=wgpu`
+# works on a plain `cargo build` with no `--features`.
+fn64-render-wgpu = { path = "../../fn64-render-wgpu" }
 fn64-audio = { path = "../../fn64-audio" }
 # Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo
 # `path` cannot interpolate env vars) -- same bridge as oot-boot/rs.
-oot-recompiled = { path = "recompiled" }
+# `package = "oot-recompiled"` because recompile_rom hardcodes that crate name
+# in every manifest it emits (crates/fn64-cpu-runtime-codegen/src/bin/
+# recompile_rom.rs), regardless of which ROM it consumed -- the name is NOT
+# evidence about which title is linked. Cargo's dependency rename gives the
+# shell a title-neutral local name without editing the emitted manifest.
+game-recompiled = { path = "recompiled", package = "oot-recompiled" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

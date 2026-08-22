@@ -9,7 +9,9 @@ description = "Backend-neutral bounded renderer fixtures and proof-bearing confo
 [dependencies]
 fn64-render-ir = { path = "../fn64-render-ir" }
 fn64-render = { path = "../fn64-render", optional = true }
+fn64-render-reference = { path = "../fn64-render-reference", optional = true }
 fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false, optional = true }
+fn64-render-wgpu = { path = "../fn64-render-wgpu", optional = true }
 fn64-runtime = { path = "../fn64-runtime", optional = true }
 libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +19,39 @@ serde_json = "1"
 
 [features]
 conformance-test-runner = []
+reference-runner = [
+    "dep:fn64-render",
+    "dep:fn64-render-reference",
+    "dep:fn64-runtime",
+]
+# The wgpu runner: the first adapter for the backend fn64 actually ships.
+# Adapterless -- it drives `fn64-render-wgpu`'s CPU-side raw-DPC seam and reads
+# `ColorTargetRegistry`'s `device_bytes`, a CPU `Vec<u8>`. No GPU required.
+# `fn64-render` and `fn64-render-reference` are here for the `sweep`
+# subcommand only: the differential drives BOTH backends over one family of
+# fixtures in one process, which is the whole point of a comparison harness.
+# The `run` path -- the one the orchestrator drives -- touches neither.
+wgpu-runner = [
+    "dep:fn64-render",
+    "dep:fn64-render-reference",
+    "dep:fn64-render-wgpu",
+    "dep:fn64-runtime",
+    "fn64-render-wgpu/conformance-runner",
+]
+# The three-way parity differential: wgpu against RT64 (the oracle), with
+# the reference backend as an independent third reading. Needs both the
+# shipping wgpu backend and the RT64 C++ build, so it is macOS-only and
+# gated behind its own feature.
+parity-runner = [
+    "dep:fn64-render",
+    "dep:libc",
+    "dep:fn64-render-reference",
+    "dep:fn64-render-rt64",
+    "dep:fn64-render-wgpu",
+    "dep:fn64-runtime",
+    "fn64-render-rt64/rt64",
+    "fn64-render-wgpu/conformance-runner",
+]
 rt64-deferred-history-runner = [
     "dep:fn64-render",
     "dep:fn64-render-rt64",
@@ -31,6 +66,21 @@ path = "src/bin/fn64-render-conformance-test-runner.rs"
 required-features = ["conformance-test-runner"]
 
 [[bin]]
+name = "fn64-render-conformance-reference-runner"
+path = "src/bin/fn64-render-conformance-reference-runner.rs"
+required-features = ["reference-runner"]
+
+[[bin]]
+name = "fn64-render-conformance-wgpu-runner"
+path = "src/bin/fn64-render-conformance-wgpu-runner.rs"
+required-features = ["wgpu-runner"]
+
+[[bin]]
 name = "fn64-render-conformance-rt64-deferred-history-runner"
 path = "src/bin/fn64-render-conformance-rt64-deferred-history-runner.rs"
 required-features = ["rt64-deferred-history-runner"]
+
+[[bin]]
+name = "fn64-render-conformance-parity-runner"
+path = "src/bin/fn64-render-conformance-parity-runner.rs"
+required-features = ["parity-runner"]

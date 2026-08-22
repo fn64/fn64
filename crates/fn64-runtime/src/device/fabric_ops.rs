@@ -408,31 +408,71 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             }
             AI_DACRATE_REG => {
                 let dacrate = value & AI_DACRATE_MASK;
-                if self.current_ai.is_some() || self.queued_ai.is_some() {
-                    if dacrate == self.ai_dacrate {
-                        return Ok(DeviceMmioWriteEffect::None);
-                    }
-                    return Err(DeviceFault::AiDacrateWhileBusy {
-                        current: self.ai_dacrate,
-                        requested: dacrate,
-                    });
+                if dacrate == self.ai_dacrate {
+                    return Ok(DeviceMmioWriteEffect::None);
                 }
                 let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+                let retimed = self
+                    .current_ai
+                    .filter(|current| current.deadline != current.started_at)
+                    .map(|current| {
+                        let remaining_len = self.ai_length();
+                        let deadline = self.ai_dma_deadline(remaining_len, self.now, dacrate)?;
+                        let event = self.events.get(&(current.deadline, current.token));
+                        assert_eq!(
+                            event,
+                            Some(&DeviceEvent::Ai {
+                                token: current.token
+                            }),
+                            "active AI DMA must own its scheduled completion"
+                        );
+                        Ok::<_, DeviceFault>((current, deadline))
+                    })
+                    .transpose()?;
+
+                // libultra writes DACRATE/BITRATE without consulting AI_STATUS
+                // (`refs/oot-decomp/src/libultra/io/aisetfreq.c:31-32`). ares'
+                // hardware model applies that write to the live sample period,
+                // including an occupied FIFO (ares fc834543, ai/io.cpp:57-66;
+                // ai/ai.cpp:27-46). Retiming only the undrained bytes makes the
+                // same immediate transition without replaying consumed audio.
                 self.ai_dacrate = dacrate;
+                let sample_rate_hz = tv_type.vi_clock_hz() / (dacrate + 1);
+                if let Some(dormant) = self
+                    .current_ai
+                    .filter(|current| current.deadline == current.started_at)
+                {
+                    self.current_ai = Some(PendingAi {
+                        request: AiDmaRequest {
+                            sample_rate_hz,
+                            ..dormant.request
+                        },
+                        ..dormant
+                    });
+                }
+                if let Some(queued) = &mut self.queued_ai {
+                    queued.sample_rate_hz = sample_rate_hz;
+                }
+                if let Some((mut current, deadline)) = retimed {
+                    self.events.remove(&(current.deadline, current.token));
+                    current.started_at = self.now;
+                    current.deadline = deadline;
+                    self.events.insert(
+                        (current.deadline, current.token),
+                        DeviceEvent::Ai {
+                            token: current.token,
+                        },
+                    );
+                    self.current_ai = Some(current);
+                }
                 return Ok(DeviceMmioWriteEffect::AiFrequencyChanged {
-                    sample_rate_hz: tv_type.vi_clock_hz() / (dacrate + 1),
+                    sample_rate_hz,
                 });
             }
             AI_BITRATE_REG => {
                 let bitrate = value & AI_BITRATE_MASK;
-                if self.current_ai.is_some() || self.queued_ai.is_some() {
-                    if bitrate == self.ai_bitrate {
-                        return Ok(DeviceMmioWriteEffect::None);
-                    }
-                    return Err(DeviceFault::AiBitrateWhileBusy {
-                        current: self.ai_bitrate,
-                        requested: bitrate,
-                    });
+                if bitrate == self.ai_bitrate {
+                    return Ok(DeviceMmioWriteEffect::None);
                 }
                 self.ai_bitrate = bitrate;
                 return Ok(DeviceMmioWriteEffect::None);
@@ -442,17 +482,71 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     return Err(DeviceFault::DpBusy);
                 }
                 if self.dpc.status & DPC_STATUS_START_VALID == 0 {
+                    // START opens a new command stream, so any parked tail
+                    // belongs to the old one and must be abandoned. This is
+                    // also the XBUS ring-wrap boundary: concatenating across
+                    // it was MEASURED wrong (rsp_commit.rs:105-115).
+                    self.stalled_dpc = None;
                     self.dpc.start = value & DPC_ADDR_MASK;
                     self.dpc.status |= DPC_STATUS_START_VALID;
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }
             DPC_END_REG => {
+                // **A parked tail is NOT an in-flight transaction.** Reject
+                // only a real pending dispatch; an END that extends a stalled
+                // command must be accepted, and the retained tail must not be
+                // touched here -- it is the rollback target if dispatch fails.
                 if self.pending_dpc.is_some() {
                     return Err(DeviceFault::DpBusy);
                 }
                 let rollback = self.dpc;
                 let end = value & DPC_ADDR_MASK;
+                let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
+                    DpcSubmissionSource::Dmem
+                } else {
+                    DpcSubmissionSource::Rdram
+                };
+
+                if let Some(stalled) = self.stalled_dpc.as_ref() {
+                    // A continuation must be the SAME source, carry no fresh
+                    // START, and advance. Anything else is a new stream --
+                    // including an XBUS ring wrap, which `rsp_commit.rs`
+                    // records as a real boundary that must never be bridged.
+                    let start_valid = self.dpc.status & DPC_STATUS_START_VALID != 0;
+                    if source != stalled.source || start_valid || end <= stalled.exposed_end {
+                        return Err(DeviceFault::InvalidStalledDpcContinuation {
+                            expected_source: stalled.source,
+                            received_source: source,
+                            exposed_end: stalled.exposed_end,
+                            received_end: end,
+                            start_valid,
+                        });
+                    }
+                    let retained_bytes = u32::try_from(stalled.retained_words.len() * 4)
+                        .expect("stalled DPC tail length exceeds u32");
+                    assert_eq!(
+                        stalled.command_start.checked_add(retained_bytes),
+                        Some(stalled.exposed_end),
+                        "stalled DPC tail does not exactly cover command_start..exposed_end"
+                    );
+                    Self::validate_dpc_range(source, stalled.exposed_end, end)?;
+                    Self::validate_dpc_range(source, stalled.command_start, end)?;
+                    let start = stalled.command_start;
+                    let retained_tail = stalled.retained_words.clone();
+                    self.dpc.end = end;
+                    self.dpc.current = start;
+                    self.dpc.status &= !DPC_STATUS_START_VALID;
+                    if self.dpc.status & DPC_STATUS_FREEZE != 0 {
+                        return Ok(DeviceMmioWriteEffect::None);
+                    }
+                    let submission = self.begin_dpc_submission(source, start, end, rollback)?;
+                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                        submission,
+                        retained_tail,
+                    });
+                }
+
                 let start = if self.dpc.status & DPC_STATUS_START_VALID != 0 {
                     self.dpc.start
                 } else {
@@ -464,11 +558,6 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.dpc.status &= !DPC_STATUS_START_VALID;
                     return Ok(DeviceMmioWriteEffect::None);
                 }
-                let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
-                    DpcSubmissionSource::Dmem
-                } else {
-                    DpcSubmissionSource::Rdram
-                };
                 Self::validate_dpc_range(source, start, end)?;
                 self.dpc.end = end;
                 self.dpc.current = start;
@@ -477,7 +566,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     return Ok(DeviceMmioWriteEffect::None);
                 }
                 let submission = self.begin_dpc_submission(source, start, end, rollback)?;
-                return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
+                return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                    submission,
+                    retained_tail: Vec::new(),
+                });
             }
             DPC_CURRENT_REG => {
                 return Err(DeviceFault::UnmodeledMmioWrite { addr, value });
@@ -504,25 +596,49 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 if value & DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND != 0 {
                     self.dpc.clock = DpcCounter24::ZERO;
                 }
+                // Resume from the PARKED command's start, not from CURRENT
+                // alone: `park_dpc_submission` sets them equal, but the tail
+                // is what makes the resumed range decodable.
+                let resume_start = self
+                    .stalled_dpc
+                    .as_ref()
+                    .map_or(self.dpc.current, |stalled| stalled.command_start);
                 if was_frozen
                     && self.dpc.status & DPC_STATUS_FREEZE == 0
                     && self.pending_dpc.is_none()
-                    && self.dpc.current < self.dpc.end
+                    && resume_start < self.dpc.end
                 {
                     let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
                         DpcSubmissionSource::Dmem
                     } else {
                         DpcSubmissionSource::Rdram
                     };
-                    Self::validate_dpc_range(source, self.dpc.current, self.dpc.end)?;
+                    let retained_tail = match self.stalled_dpc.as_ref() {
+                        Some(stalled) if stalled.source != source => {
+                            return Err(DeviceFault::InvalidStalledDpcContinuation {
+                                expected_source: stalled.source,
+                                received_source: source,
+                                exposed_end: stalled.exposed_end,
+                                received_end: self.dpc.end,
+                                start_valid: self.dpc.status & DPC_STATUS_START_VALID != 0,
+                            });
+                        }
+                        Some(stalled) => stalled.retained_words.clone(),
+                        None => Vec::new(),
+                    };
+                    Self::validate_dpc_range(source, resume_start, self.dpc.end)?;
                     let rollback = self.dpc;
+                    self.dpc.current = resume_start;
                     let submission = self.begin_dpc_submission(
                         source,
-                        self.dpc.current,
+                        resume_start,
                         self.dpc.end,
                         rollback,
                     )?;
-                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
+                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
+                        submission,
+                        retained_tail,
+                    });
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }
@@ -865,15 +981,47 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             "queued AI promotion was preflighted before event-state mutation",
                         ));
                     }
-                    // Public rcp.h defines FIFO FULL transitioning 1 -> 0 as
-                    // an AI interrupt edge. Other silicon assertion causes
-                    // and the sub-cycle phase remain unclaimed.
-                    if full_before_completion {
-                        self.raise_interrupt(InterruptSource::Ai);
-                        let notification = DeviceNotification::AiDmaComplete(current.request);
-                        notifications.push(notification);
-                        self.record(DeviceTraceKind::NotificationReady(notification));
-                    }
+                    // **Unconditional.** Every completed AI DMA raises AI,
+                    // whether or not a second buffer was queued behind it.
+                    //
+                    // This used to fire only when the FIFO had been FULL
+                    // (`full_before_completion`), reasoning from rcp.h that a
+                    // FULL 1 -> 0 transition is the interrupt edge. **rcp.h
+                    // does not say that.** It defines AI_STATUS_FIFO_FULL as
+                    // a STATUS BIT (`ultra64/rcp.h:576`) and states nothing
+                    // about interrupt edges; the old rule was inferred from a
+                    // register definition that does not carry it. What rcp.h
+                    // DOES say about AI and interrupts is the opposite kind of
+                    // statement: `AI_STATUS_REG` is annotated "(W): clear
+                    // audio interrupt" (`ultra64/rcp.h:570`) -- a WRITE clears
+                    // the interrupt. Nothing there makes a FIFO-full
+                    // transition the thing that RAISES it.
+                    //
+                    // The positive argument comes from the libultra contract
+                    // itself, which is what this ABI must serve. `osAiSetNext-
+                    // Buffer` refuses a submission only when the FIFO is
+                    // already full, returning -1 (its decompiled form reads
+                    // `AI_STATUS_REG` and tests `AI_STATUS_FIFO_FULL`); a
+                    // guest is therefore free to keep exactly ONE buffer in
+                    // flight and submit the next one after the previous
+                    // completes. Under the old FIFO-full gate that guest never
+                    // receives a completion, so `osAiSetNextBuffer`-driven
+                    // audio could not work at all for a single-buffered
+                    // player. A completion the guest cannot observe is not a
+                    // completion.
+                    //
+                    // Concretely: the gated version dropped the completion for
+                    // a lone buffer, so a guest that enqueues one AI DMA and
+                    // blocks on the completion queue never wakes. It also made
+                    // the two completions of a two-buffer sequence asymmetric
+                    // -- the first raised because a buffer was queued behind
+                    // it, the last did not -- which no register documentation
+                    // distinguishes.
+                    let _ = full_before_completion;
+                    self.raise_interrupt(InterruptSource::Ai);
+                    let notification = DeviceNotification::AiDmaComplete(current.request);
+                    notifications.push(notification);
+                    self.record(DeviceTraceKind::NotificationReady(notification));
                 }
                 DeviceEvent::Si { token } => {
                     let Some(pending) = self.pending_si else {

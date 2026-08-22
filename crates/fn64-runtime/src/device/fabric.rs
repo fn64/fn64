@@ -20,6 +20,10 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) queued_ai: Option<AiDmaRequest>,
     pub(crate) dpc: DpcRegisters,
     pub(crate) pending_dpc: Option<PendingDpc>,
+    /// A known-width command parked mid-arrival, awaiting a later END.
+    /// Distinct from `pending_dpc`: nothing is in flight, but the DP is
+    /// architecturally busy and CURRENT names the stalled command.
+    pub(crate) stalled_dpc: Option<StalledDpc>,
     pub(crate) si_dram_addr: RdramAddr,
     pub(crate) si_dma_error: bool,
     pub(crate) pending_si: Option<PendingSi>,
@@ -82,6 +86,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 tmem_busy: DpcCounter24::ZERO,
             },
             pending_dpc: None,
+            stalled_dpc: None,
             si_dram_addr: RdramAddr::from_offset(0),
             si_dma_error: false,
             pending_si: None,
@@ -169,7 +174,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             sp_mem_addr: self.sp_mem_addr,
             sp_dram_addr: self.sp_dram_addr,
             sp_imem_generation: self.rsp_memory.imem_generation(),
-            dp_busy: self.pending_dp.is_some() || self.pending_dpc.is_some(),
+            // A parked tail is architecturally busy: hardware reads DP busy
+            // mid-command, and reporting idle would let software issue a
+            // conflicting START/END believing the pipe is free.
+            dp_busy: self.pending_dp.is_some()
+                || self.pending_dpc.is_some()
+                || self.stalled_dpc.is_some(),
             dpc_start: self.dpc.start,
             dpc_end: self.dpc.end,
             dpc_current: self.dpc.current,
@@ -431,10 +441,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
         let duration = current.deadline.get() - current.started_at.get();
         let remaining_cycles = current.deadline.get().saturating_sub(self.now.get());
-        let remaining = (u128::from(current.request.len) * u128::from(remaining_cycles))
-            .div_ceil(u128::from(duration));
+        let tv_type = self
+            .tv_type
+            .expect("an active AI DMA has an IPL-selected television clock");
+        let interval_frames = (u128::from(duration) * u128::from(tv_type.vi_clock_hz()))
+            / (u128::from(CPU_CLOCK_HZ) * u128::from(self.ai_dacrate + 1));
+        let interval_len = interval_frames * 4;
+        let remaining =
+            (interval_len * u128::from(remaining_cycles)).div_ceil(u128::from(duration));
         let remaining = remaining.div_ceil(8) * 8;
         u32::try_from(remaining).expect("AI remaining length exceeds u32")
+    }
+
+    pub fn stalled_dpc(&self) -> Option<&StalledDpc> {
+        self.stalled_dpc.as_ref()
     }
 
     pub const fn pending_dpc_submission(&self) -> Option<DpcSubmission> {
@@ -521,6 +541,61 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     /// Commit renderer acceptance. CURRENT advances only here, after the
     /// selected backend has consumed the submitted bytes.
+    /// Consume an admitted token by PARKING its incomplete tail.
+    ///
+    /// Every fallible check precedes mutation, so a rejected park leaves the
+    /// transaction exactly as it was. On success the token is consumed once,
+    /// CURRENT identifies the stalled command, and the DP stays busy without
+    /// a live renderer transaction.
+    pub fn park_dpc_submission(
+        &mut self,
+        token: u64,
+        command_start: u32,
+        exposed_end: u32,
+        bytes_required: u32,
+        retained_words: Vec<u32>,
+    ) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_dpc
+            .ok_or(DeviceFault::NoPendingDpcSubmission)?;
+        if pending.submission.token != token {
+            return Err(DeviceFault::StaleDpcSubmission {
+                pending_token: pending.submission.token,
+                received_token: token,
+            });
+        }
+        assert_eq!(
+            pending.submission.end, exposed_end,
+            "parked DPC END disagrees with the admitted transaction"
+        );
+        assert!(
+            command_start >= pending.submission.start && command_start < exposed_end,
+            "parked command start lies outside the admitted DPC range"
+        );
+        let retained_bytes = u32::try_from(retained_words.len() * size_of::<u32>())
+            .expect("parked DPC tail exceeds u32");
+        assert_eq!(
+            command_start.checked_add(retained_bytes),
+            Some(exposed_end),
+            "parked words do not exactly cover command_start..exposed_end"
+        );
+        assert!(
+            retained_bytes < bytes_required,
+            "parked DPC command is not incomplete"
+        );
+        self.dpc.current = command_start;
+        self.dpc.end = exposed_end;
+        self.stalled_dpc = Some(StalledDpc {
+            source: pending.submission.source,
+            command_start,
+            exposed_end,
+            bytes_required,
+            retained_words,
+        });
+        self.pending_dpc = None;
+        Ok(())
+    }
+
     pub fn commit_dpc_submission(&mut self, token: u64) -> Result<(), DeviceFault> {
         let pending = self
             .pending_dpc
@@ -533,6 +608,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
         self.dpc.current = pending.submission.end;
         self.dpc.status &= !(DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY);
+        // A completed dispatch consumed any tail it was resuming.
+        self.stalled_dpc = None;
         self.pending_dpc = None;
         Ok(())
     }
@@ -635,6 +712,29 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn vi_width(&self) -> Option<u32> {
         let width = self.vi_registers[2] & 0x0fff;
         (width != 0).then_some(width)
+    }
+
+    /// The guest-programmed active digital output height in lines, decoded
+    /// from VI_V_START (`vi_registers[10]`) exactly as
+    /// `fn64_render::ViActiveWindow` decodes it: the half-line interval
+    /// `(end - start) / 2`. `None` until both the H and V intervals have been
+    /// programmed, since register initialization is not atomic.
+    ///
+    /// A presenter must size its surface from this rather than from a fixed
+    /// 240: the guest's own output rectangle is the only authority for how
+    /// many scanned-out lines exist, and rows past it are memory the game
+    /// never rendered into. Measured on WM2000, V_START is `0x002501ff` --
+    /// half-lines 37..511, i.e. **237** output lines, not 240.
+    pub fn vi_output_height(&self) -> Option<u32> {
+        let horizontal = self.vi_registers[9];
+        let vertical = self.vi_registers[10];
+        let used = 0x03ff | (0x03ff << 16);
+        if horizontal & used == 0 || vertical & used == 0 {
+            return None;
+        }
+        let start = (vertical >> 16) & 0x03ff;
+        let end = vertical & 0x03ff;
+        (end > start).then(|| (end - start) / 2)
     }
 
     /// The physical RDRAM address the video interface is currently scanning
@@ -915,15 +1015,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         request: AiDmaRequest,
         started_at: Cycles,
     ) -> Result<PendingAi, DeviceFault> {
-        const BYTES_PER_STEREO_FRAME: u128 = 4;
-        let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
-        let frames = u128::from(request.len) / BYTES_PER_STEREO_FRAME;
-        let duration = (frames * u128::from(CPU_CLOCK_HZ) * u128::from(self.ai_dacrate + 1))
-            .div_ceil(u128::from(tv_type.vi_clock_hz()));
-        let duration = u64::try_from(duration.max(1)).map_err(|_| DeviceFault::DeadlineOverflow)?;
-        let deadline = started_at
-            .checked_add(Cycles::new(duration))
-            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let deadline = self.ai_dma_deadline(request.len, started_at, self.ai_dacrate)?;
         let token = self.next_event_sequence;
         self.next_event_sequence
             .checked_add(1)
@@ -934,6 +1026,23 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             started_at,
             deadline,
         })
+    }
+
+    pub(crate) fn ai_dma_deadline(
+        &self,
+        len: u32,
+        started_at: Cycles,
+        dacrate: u32,
+    ) -> Result<Cycles, DeviceFault> {
+        const BYTES_PER_STEREO_FRAME: u128 = 4;
+        let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+        let frames = u128::from(len) / BYTES_PER_STEREO_FRAME;
+        let duration = (frames * u128::from(CPU_CLOCK_HZ) * u128::from(dacrate + 1))
+            .div_ceil(u128::from(tv_type.vi_clock_hz()));
+        let duration = u64::try_from(duration.max(1)).map_err(|_| DeviceFault::DeadlineOverflow)?;
+        started_at
+            .checked_add(Cycles::new(duration))
+            .ok_or(DeviceFault::DeadlineOverflow)
     }
 
     pub(crate) fn commit_ai_dma(&mut self, pending: PendingAi) {

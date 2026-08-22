@@ -16,7 +16,11 @@
 //!    every function in every section of the config. A vram claimed by more
 //!    than one distinct name is *ambiguous* and deliberately left unresolved
 //!    (emitted indirect), exactly like N64Recomp's multi-match `Ambiguous`
-//!    case — we never silently pick one.
+//!    case — we never silently pick one. Its claimants are retained with
+//!    their section indices so the emitted dispatcher can still reach them
+//!    (see `BANKED_LOOKUP_TABLE` in [`emit_lookup_dispatcher`]): overlay banks
+//!    genuinely share a VRAM window, and dropping those bodies entirely would
+//!    make them undispatchable rather than merely un-direct-callable.
 //! 2. As a [`CallResolver`], it turns a `JAL`/`J` target vram into either a
 //!    [`CallTarget::Direct`] (unique symbol) or [`CallTarget::Indirect`]
 //!    (unknown or ambiguous), which the emitter renders as a direct
@@ -49,6 +53,17 @@ pub struct SymbolTable {
     /// Vrams seen more than once with conflicting names; kept so a direct call
     /// is never emitted for them (they fall through to indirect lookup).
     ambiguous: std::collections::HashSet<u32>,
+    /// Every claimant of an ambiguous vram, keyed by vram: `(section, name)`
+    /// for each distinct body that links at that address.
+    ///
+    /// Bank-switched overlays genuinely share a VRAM window (WM2000's
+    /// `bank1_text` and `bank4_text` both link at `0x800E1B90`), so dropping
+    /// the collided vrams from `by_vram` is right for *direct* calls but
+    /// would make the bodies undispatchable if the information were also
+    /// discarded here. Retaining the claimants is what lets
+    /// [`emit_lookup_dispatcher`] resolve them at runtime against the bank
+    /// the guest actually has resident.
+    claimants: HashMap<u32, Vec<(usize, String)>>,
 }
 
 impl SymbolTable {
@@ -62,10 +77,44 @@ impl SymbolTable {
         I: IntoIterator<Item = (S, u32)>,
         S: Into<String>,
     {
+        // Section 0 for every entry: a caller with no section information
+        // cannot describe a bank collision, so every claimant is attributed to
+        // one nominal section and bank-aware dispatch is unavailable. Callers
+        // that know their sections use `from_section_entries`.
+        SymbolTable::from_section_entries(
+            entries
+                .into_iter()
+                .map(|(name, vram)| (0usize, name.into(), vram)),
+        )
+    }
+
+    /// Build a symbol table from `(section_index, name, vram)` entries.
+    ///
+    /// Identical to [`SymbolTable::from_entries`] for the unique and
+    /// same-name-twice cases. The difference is what happens on a genuine
+    /// collision: the vram still leaves `by_vram` (no direct call is ever
+    /// emitted for it), but every distinct claimant is retained with the
+    /// section that owns it, so the runtime dispatcher can resolve the
+    /// address against the bank the guest currently has PI-swapped in.
+    ///
+    /// `section_index` must be the section's registration index -- the same
+    /// numbering `RECOMPILED_SECTION_GEOMETRY` is emitted in and that the
+    /// host's `SectionRegistry` assigns -- because that index is the only
+    /// thing tying an emitted claimant back to a residency bit.
+    pub fn from_section_entries<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, S, u32)>,
+        S: Into<String>,
+    {
         let mut by_vram: HashMap<u32, String> = HashMap::new();
         let mut ambiguous = std::collections::HashSet::new();
-        for (name, vram) in entries {
+        let mut claimants: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
+        for (section, name, vram) in entries {
             let name = name.into();
+            let seen = claimants.entry(vram).or_default();
+            if !seen.iter().any(|(s, n)| *s == section && *n == name) {
+                seen.push((section, name.clone()));
+            }
             match by_vram.get(&vram) {
                 Some(existing) if *existing == name => {}
                 Some(_) => {
@@ -79,18 +128,58 @@ impl SymbolTable {
                 }
             }
         }
-        SymbolTable { by_vram, ambiguous }
+        // Only collisions need claimant records; uniquely-owned vrams resolve
+        // through the flat table and would only bloat the emitted source.
+        claimants.retain(|vram, _| ambiguous.contains(vram));
+        for entries in claimants.values_mut() {
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
+        SymbolTable {
+            by_vram,
+            ambiguous,
+            claimants,
+        }
+    }
+
+    /// Every `(vram, claimants)` pair for a vram claimed by more than one
+    /// differently-named body, in ascending vram order, each claimant list in
+    /// ascending section order.
+    ///
+    /// These are exactly the bodies a flat `vram -> fn` table cannot express.
+    /// Reported by the gap report and emitted as the banked dispatch table.
+    pub fn ambiguous_claimants(&self) -> Vec<(u32, Vec<(usize, &str)>)> {
+        let mut rows = self
+            .claimants
+            .iter()
+            .map(|(&vram, entries)| {
+                (
+                    vram,
+                    entries
+                        .iter()
+                        .map(|(section, name)| (*section, name.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|(vram, _)| *vram);
+        rows
+    }
+
+    /// Number of distinct bodies that are only reachable through bank-aware
+    /// dispatch (the sum of every ambiguous vram's claimant count).
+    pub fn banked_body_count(&self) -> usize {
+        self.claimants.values().map(Vec::len).sum()
     }
 
     /// Build from a [`fn64_recomp::RecompConfig`]: every function in every
     /// section contributes its `(name, vram)` pair.
     pub fn from_config(cfg: &fn64_recomp::RecompConfig) -> Self {
-        let entries = cfg
-            .sections
-            .iter()
-            .flat_map(|s| s.functions.iter())
-            .map(|f| (f.name.clone(), f.vram));
-        SymbolTable::from_entries(entries)
+        let entries = cfg.sections.iter().enumerate().flat_map(|(index, s)| {
+            s.functions
+                .iter()
+                .map(move |f| (index, f.name.clone(), f.vram))
+        });
+        SymbolTable::from_section_entries(entries)
     }
 
     /// The name owning `vram`, if it is a unique function entry.
@@ -156,6 +245,13 @@ pub struct ModuleFunc<'a> {
 /// those vrams from `symbols`, which makes both direct `JAL`s and computed
 /// `JALR`s converge on the same host seam instead of a recompiled panic body.
 ///
+/// A vram claimed by two or more overlay banks cannot live in the flat table,
+/// so it is emitted into a second sorted table, `BANKED_LOOKUP_TABLE`, that
+/// keeps every claimant with the section index owning it.
+/// `fn64_cpu_runtime::resolve_banked_function` resolves it against the bank
+/// the guest actually has resident; zero or multiple resident claimants are
+/// both named traps, never a first-claimant default.
+///
 /// Unknown vrams trap with the exact address. There is no default function,
 /// pointer cast, `transmute`, or `unsafe` block.
 pub fn emit_lookup_dispatcher(symbols: &SymbolTable) -> String {
@@ -166,13 +262,38 @@ pub fn emit_lookup_dispatcher(symbols: &SymbolTable) -> String {
         out.push_str(&format!("    ({vram:#010X}, {name} as RecompFunc),\n"));
     }
     out.push_str("];\n\n");
+
+    // Bank-switched overlays share a VRAM window, so these vrams cannot live
+    // in the flat table: two differently-named bodies claim one address and
+    // only the resident bank's is correct. Each row carries every claimant
+    // with the section index that owns it; `resolve_banked_function` picks the
+    // resident one and traps when residency does not name exactly one.
+    let banked = symbols.ambiguous_claimants();
+    out.push_str(
+        "// Vrams claimed by more than one overlay bank: resolved against guest residency.\n",
+    );
+    out.push_str(
+        "static BANKED_LOOKUP_TABLE: &[(u32, &[(usize, &'static str, RecompFunc)])] = &[\n",
+    );
+    for (vram, claimants) in &banked {
+        out.push_str(&format!("    ({vram:#010X}, &["));
+        for (section, name) in claimants {
+            out.push_str(&format!("({section}, \"{name}\", {name} as RecompFunc), "));
+        }
+        out.push_str("]),\n");
+    }
+    out.push_str("];\n\n");
+
     out.push_str("pub fn lookup(vram: u32) -> RecompFunc {\n");
     out.push_str("    if let Some(func) = resolve_host_function(vram) {\n");
     out.push_str("        return func;\n");
     out.push_str("    }\n");
     out.push_str("    match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {\n");
     out.push_str("        Ok(index) => LOOKUP_TABLE[index].1,\n");
-    out.push_str("        Err(_) => fn64_cpu_runtime::trap_unsupported(format!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\")),\n");
+    out.push_str("        Err(_) => match BANKED_LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {\n");
+    out.push_str("            Ok(index) => fn64_cpu_runtime::resolve_banked_function(vram, BANKED_LOOKUP_TABLE[index].1),\n");
+    out.push_str("            Err(_) => fn64_cpu_runtime::trap_unsupported(format!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\")),\n");
+    out.push_str("        },\n");
     out.push_str("    }\n");
     out.push_str("}\n");
     out
@@ -210,9 +331,493 @@ pub fn emit_module(funcs: &[ModuleFunc], symbols: &SymbolTable) -> String {
     out
 }
 
+
+/// One statically-known call target that the emitted module can never
+/// dispatch: a `JAL`/`J` immediate whose vram carries no function symbol, yet
+/// falls strictly **inside** the span of a function that IS emitted.
+///
+/// Such a target is emitted as `lookup(addr)`, but `addr` reaches neither
+/// `LOOKUP_TABLE` nor `BANKED_LOOKUP_TABLE` (both hold function ENTRY vrams
+/// only), so the call traps at run time via `trap_unsupported` -- arbitrarily
+/// far into the run, whenever the guest first takes that path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndispatchableCallTarget {
+    /// The unreachable target vram (the `lookup()` argument that will trap).
+    pub target: u32,
+    /// Name of the emitted function whose declared span contains `target`.
+    pub containing_function: String,
+    /// Entry vram of that containing function.
+    pub containing_vram: u32,
+    /// Every emitted function that contains a static call to `target`.
+    pub callers: Vec<String>,
+}
+
+/// Audit a module's functions for statically-known call targets that resolve
+/// indirect and are undispatchable (see [`UndispatchableCallTarget`]).
+///
+/// This is a **whole-module** property: neither the per-function emitter nor
+/// the dispatcher emitter can see it, because each half is individually
+/// correct. The emitter is right that an unknown vram must become `lookup()`;
+/// the dispatcher is right that only entry points belong in its tables. What
+/// is wrong is the *symbol table*, which failed to declare a function entry
+/// that the machine code plainly calls -- typically because the upstream
+/// symbol source mislabeled it, so the predecessor's declared size swallowed
+/// it.
+///
+/// Detecting it here converts a nondeterministic mid-run abort into a
+/// deterministic, named build-time finding that points at the exact missing
+/// symbol boundary.
+///
+/// Returns the findings ordered by target vram. An empty vector means every
+/// static call target in `funcs` is dispatchable.
+pub fn audit_undispatchable_call_targets(
+    funcs: &[ModuleFunc],
+    symbols: &SymbolTable,
+) -> Vec<UndispatchableCallTarget> {
+    use fn64_cpu_runtime::decode;
+
+    // Spans of every emitted function, from its declared word count.
+    let spans: Vec<(u32, u32, &str)> = funcs
+        .iter()
+        .map(|f| (f.vram, f.vram + (f.words.len() as u32) * 4, f.name))
+        .collect();
+
+    // target -> (containing function, callers)
+    let mut found: HashMap<u32, (String, u32, Vec<String>)> = HashMap::new();
+
+    for f in funcs {
+        for (i, &w) in f.words.iter().enumerate() {
+            let vram = f.vram + (i as u32) * 4;
+            let instr = decode(w);
+            // Only absolute JAL/J immediates carry a statically-known target.
+            //
+            // A `J` whose target lands inside the SAME function is a local
+            // branch: the emitter lowers it to `pc = <target>; continue 'run`
+            // and never calls `lookup()`. Only a `J` that leaves the function
+            // is a tail call, while every `JAL` is a call. Counting local
+            // jumps here would report thousands of ordinary intra-function
+            // branches as defects.
+            let func_end = f.vram + (f.words.len() as u32) * 4;
+            let target = match instr {
+                fn64_cpu_runtime::Instruction::J { target } => {
+                    let t = (vram.wrapping_add(4) & 0xF000_0000) | (target << 2);
+                    if t >= f.vram && t < func_end {
+                        continue;
+                    }
+                    t
+                }
+                fn64_cpu_runtime::Instruction::Jal { target } => {
+                    (vram.wrapping_add(4) & 0xF000_0000) | (target << 2)
+                }
+                _ => continue,
+            };
+            // A target the symbol table resolves is emitted as a direct call.
+            if symbols.resolve(target) != CallTarget::Indirect {
+                continue;
+            }
+            // An ambiguous vram is a real entry reachable via the banked
+            // table; that is dispatchable, not a gap.
+            if symbols.is_ambiguous(target) {
+                continue;
+            }
+            // A target inside a function's span -- but not its entry -- can
+            // never be reached by an entry-keyed table.
+            let Some(&(cv, _, cname)) = spans
+                .iter()
+                .find(|&&(start, end, _)| target > start && target < end)
+            else {
+                continue;
+            };
+            let row = found
+                .entry(target)
+                .or_insert_with(|| (cname.to_string(), cv, Vec::new()));
+            if !row.2.iter().any(|c| c == f.name) {
+                row.2.push(f.name.to_string());
+            }
+        }
+    }
+
+    let mut out: Vec<UndispatchableCallTarget> = found
+        .into_iter()
+        .map(|(target, (containing_function, containing_vram, mut callers))| {
+            callers.sort();
+            UndispatchableCallTarget {
+                target,
+                containing_function,
+                containing_vram,
+                callers,
+            }
+        })
+        .collect();
+    out.sort_unstable_by_key(|f| f.target);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode `JAL <target>` (opcode 3) exactly as the ROM does.
+    fn jal(target: u32) -> u32 {
+        (3u32 << 26) | ((target & 0x0FFF_FFFF) >> 2)
+    }
+
+    /// The WM2000 swap-1901 abort, reduced to its exact shape: a caller makes
+    /// a static `JAL` to an address that is a real function entry in the ROM
+    /// but carries no symbol, so the predecessor's declared size swallows it.
+    /// The emitted call becomes `lookup(target)`, and no table holds a
+    /// non-entry vram, so it traps at run time.
+    #[test]
+    fn interior_static_call_target_is_reported_as_undispatchable() {
+        // The real `func_8012079C_bank3_text` is declared 75 words long, so
+        // its span runs 0x8012079C..0x801208C8 and swallows 0x80120854.
+        let swallower_words = [0u32; 75];
+        // The caller does `JAL 0x80120854` -- inside `swallower`, not its entry.
+        let caller_words = [jal(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "func_8012079C",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "func_801206D0",
+                vram: 0x8012_06D0,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("func_8012079C", 0x8012_079Cu32),
+            ("func_801206D0", 0x8012_06D0u32),
+        ]);
+
+        // The emitter really does render this as an undispatchable lookup.
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            module.contains("lookup(0x80120854)"),
+            "expected the swallowed target to be emitted as a lookup"
+        );
+        assert!(
+            !module.contains("(0x80120854, func_"),
+            "the swallowed target must NOT be in the dispatch table"
+        );
+
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(
+            findings,
+            vec![UndispatchableCallTarget {
+                target: 0x8012_0854,
+                containing_function: "func_8012079C".to_string(),
+                containing_vram: 0x8012_079C,
+                callers: vec!["func_801206D0".to_string()],
+            }]
+        );
+    }
+
+    /// Encode `J <target>` (opcode 2).
+    fn j(target: u32) -> u32 {
+        (2u32 << 26) | ((target & 0x0FFF_FFFF) >> 2)
+    }
+
+    /// A `J` backwards or forwards INSIDE its own function is an ordinary
+    /// local branch: the emitter lowers it to `pc = <target>; continue 'run`
+    /// and never calls `lookup()`, so it can never trap. Counting it would
+    /// bury the real findings -- on WM2000 it turned 12 genuine targets into
+    /// 3961 rows, almost all of them ordinary loop branches.
+    #[test]
+    fn local_jump_inside_own_function_is_not_reported() {
+        // A 6-word function whose 5th word jumps back to its own 2nd word.
+        let mut words = [0u32; 6];
+        words[4] = j(0x8012_0904);
+        let funcs = [ModuleFunc {
+            name: "loops_to_itself",
+            vram: 0x8012_0900,
+            words: &words,
+        }];
+        let symbols = SymbolTable::from_entries([("loops_to_itself", 0x8012_0900u32)]);
+
+        // The emitter really does keep this local (no lookup at all).
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            !module.contains("lookup(0x80120904)"),
+            "a local J must not be emitted as a lookup"
+        );
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// The counterpart: a `J` that LEAVES the function is a tail call, and if
+    /// its target is swallowed by another function's span it is exactly as
+    /// undispatchable as a `JAL` would be. The local-jump exclusion must be
+    /// scoped to the jumping function, not applied to every `J`.
+    #[test]
+    fn tail_call_j_to_swallowed_target_is_reported() {
+        let swallower_words = [0u32; 75];
+        // Jumps out of its own body, into the middle of `swallower`.
+        let caller_words = [j(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "tail_caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("swallower", 0x8012_079Cu32),
+            ("tail_caller", 0x8012_0A00u32),
+        ]);
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1, "a J tail call to a swallowed target is a trap");
+        assert_eq!(findings[0].target, 0x8012_0854);
+        assert_eq!(findings[0].callers, vec!["tail_caller".to_string()]);
+    }
+
+    /// The audit must not fire on the ordinary cases. A call to a declared
+    /// entry is direct; a call to an address outside every emitted span is a
+    /// host shim or a genuinely absent function, not a swallowed entry; and a
+    /// call to a function's own entry is dispatchable by definition.
+    #[test]
+    fn dispatchable_static_call_targets_are_not_reported() {
+        let callee_words = [0u32, 0];
+        // Calls: a declared entry, an address beyond every span, and an entry.
+        let caller_words = [jal(0x8012_0900), jal(0x8000_2000), jal(0x8012_0900)];
+        let funcs = [
+            ModuleFunc {
+                name: "callee",
+                vram: 0x8012_0900,
+                words: &callee_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols =
+            SymbolTable::from_entries([("callee", 0x8012_0900u32), ("caller", 0x8012_0A00u32)]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// Both span bounds are exclusive, and both edges are real cases.
+    ///
+    /// The LOW edge is a function's own entry: it is in the dispatch table by
+    /// definition, so an `>= start` test would report every ordinary
+    /// self-recursive call as undispatchable. The HIGH edge is the first word
+    /// of the NEXT function: it belongs to that function's entry, so a
+    /// `<= end` test would blame the wrong function for a perfectly
+    /// dispatchable call.
+    #[test]
+    fn span_bounds_are_exclusive_at_both_edges() {
+        let a_words = [0u32; 4]; // 0x80120800..0x80120810
+        let b_words = [0u32; 4]; // 0x80120810..0x80120820
+        // `caller` recurses to `a`'s entry (low edge) and calls `b`'s entry,
+        // which is exactly one past `a`'s end (high edge). Both dispatchable.
+        let caller_words = [jal(0x8012_0800), jal(0x8012_0810)];
+        let funcs = [
+            ModuleFunc {
+                name: "a",
+                vram: 0x8012_0800,
+                words: &a_words,
+            },
+            ModuleFunc {
+                name: "b",
+                vram: 0x8012_0810,
+                words: &b_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0900,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("a", 0x8012_0800u32),
+            ("b", 0x8012_0810u32),
+            ("caller", 0x8012_0900u32),
+        ]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+
+        // Now drop `a`'s and `b`'s symbols so BOTH calls resolve indirect and
+        // actually reach the span test. `a`'s entry is its own span's low
+        // edge, and `b`'s entry is `a`'s exclusive high edge; a body is
+        // emitted at each, so both are dispatchable through their own
+        // entries and neither may be reported as swallowed by `a`.
+        let partial = SymbolTable::from_entries([("caller", 0x8012_0900u32)]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &partial), vec![]);
+    }
+
+    /// The local-jump exclusion applies to `J` ONLY. A `JAL` is always a
+    /// call -- the emitter emits `lookup()` for it even when the target lies
+    /// inside the calling function itself -- so a `JAL` into one's own body
+    /// at an undeclared address is a real trap, not a local branch.
+    #[test]
+    fn jal_into_own_body_is_still_reported() {
+        // A 75-word function that JALs to an undeclared address inside
+        // itself: dispatch has to go through `lookup()`, which cannot name it.
+        let mut words = [0u32; 75];
+        words[0] = jal(0x8012_0854);
+        let funcs = [ModuleFunc {
+            name: "self_caller",
+            vram: 0x8012_079C,
+            words: &words,
+        }];
+        let symbols = SymbolTable::from_entries([("self_caller", 0x8012_079Cu32)]);
+
+        // The emitter really does route a self-JAL through lookup().
+        let module = emit_module(&funcs, &symbols);
+        assert!(
+            module.contains("lookup(0x80120854)"),
+            "a JAL is a call even when its target is inside the caller"
+        );
+
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].target, 0x8012_0854);
+        assert_eq!(findings[0].containing_function, "self_caller");
+        assert_eq!(findings[0].callers, vec!["self_caller".to_string()]);
+    }
+
+    /// Findings are ordered by target vram, independent of the `HashMap`
+    /// iteration order they are collected in. The gap report is a build
+    /// artifact that gets diffed across runs, so an unstable order would show
+    /// spurious churn and hide real movement.
+    #[test]
+    fn findings_are_sorted_by_target_vram() {
+        let swallower_words = [0u32; 75];
+        // Call the high target first, so insertion order is NOT sorted order.
+        let caller_words = [jal(0x8012_0884), 0, jal(0x8012_0854)];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols =
+            SymbolTable::from_entries([("swallower", 0x8012_079Cu32), ("caller", 0x8012_0A00u32)]);
+        let targets: Vec<u32> = audit_undispatchable_call_targets(&funcs, &symbols)
+            .into_iter()
+            .map(|f| f.target)
+            .collect();
+        assert_eq!(targets, vec![0x8012_0854, 0x8012_0884]);
+    }
+
+    /// A call the symbol table resolves is emitted as a DIRECT Rust call and
+    /// never goes through `lookup()`, so it cannot trap however its address
+    /// relates to another function's declared span. Overlapping declared
+    /// spans do occur (overlay banks), and reporting a direct call inside one
+    /// would be a pure false positive.
+    #[test]
+    fn direct_call_inside_another_declared_span_is_not_reported() {
+        let outer_words = [0u32; 75];
+        // 0x801207C0 is INSIDE `outer`'s span and is also its own declared
+        // entry, so the call to it is direct.
+        let inner_words = [0u32; 4];
+        let caller_words = [jal(0x8012_07C0), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "outer",
+                vram: 0x8012_079C,
+                words: &outer_words,
+            },
+            ModuleFunc {
+                name: "inner",
+                vram: 0x8012_07C0,
+                words: &inner_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x8012_0A00,
+                words: &caller_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("outer", 0x8012_079Cu32),
+            ("inner", 0x8012_07C0u32),
+            ("caller", 0x8012_0A00u32),
+        ]);
+        // The emitter renders it direct, which is what makes it safe.
+        let module = emit_module(&funcs, &symbols);
+        assert!(module.contains("call_host_or_recompiled(0x801207C0, inner"));
+        assert!(!module.contains("lookup(0x801207C0)"));
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// A vram claimed by two overlay banks IS dispatchable -- through
+    /// `BANKED_LOOKUP_TABLE` -- so the audit must not confuse a bank
+    /// collision (correctly handled) with a swallowed entry (the defect).
+    #[test]
+    fn bank_ambiguous_interior_target_is_not_reported() {
+        let host_words = [0u32; 8];
+        let caller_words = [jal(0x800E_1B90), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "spanning",
+                vram: 0x800E_1B88,
+                words: &host_words,
+            },
+            ModuleFunc {
+                name: "caller",
+                vram: 0x800E_2000,
+                words: &caller_words,
+            },
+        ];
+        // 0x800E1B90 is a real entry claimed by two banks, and it sits inside
+        // `spanning`'s declared span -- the audit must still let it pass.
+        let symbols = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90_bank4_text", 0x800E_1B90u32),
+            (1usize, "spanning", 0x800E_1B88u32),
+            (1usize, "caller", 0x800E_2000u32),
+        ]);
+        assert_eq!(audit_undispatchable_call_targets(&funcs, &symbols), vec![]);
+    }
+
+    /// Every caller of one swallowed target is reported, de-duplicated and
+    /// sorted, so the finding names the whole repair surface at once.
+    #[test]
+    fn all_callers_of_one_swallowed_target_are_collected() {
+        let swallower_words = [0u32; 75];
+        let a_words = [jal(0x8012_0854), 0, jal(0x8012_0854)];
+        let b_words = [jal(0x8012_0854), 0];
+        let funcs = [
+            ModuleFunc {
+                name: "swallower",
+                vram: 0x8012_079C,
+                words: &swallower_words,
+            },
+            ModuleFunc {
+                name: "zeta_caller",
+                vram: 0x8012_0900,
+                words: &a_words,
+            },
+            ModuleFunc {
+                name: "alpha_caller",
+                vram: 0x8012_0A00,
+                words: &b_words,
+            },
+        ];
+        let symbols = SymbolTable::from_entries([
+            ("swallower", 0x8012_079Cu32),
+            ("zeta_caller", 0x8012_0900u32),
+            ("alpha_caller", 0x8012_0A00u32),
+        ]);
+        let findings = audit_undispatchable_call_targets(&funcs, &symbols);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].callers,
+            vec!["alpha_caller".to_string(), "zeta_caller".to_string()]
+        );
+    }
 
     #[test]
     fn ambiguous_vram_is_left_indirect() {
@@ -222,6 +827,66 @@ mod tests {
         assert_eq!(t.name_of(0x8000_0100), None);
         assert_eq!(t.resolve(0x8000_0100), CallTarget::Indirect);
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn collided_vram_keeps_every_claimant_with_its_section() {
+        // Two banks at one vram (WM2000's 0x800E1B90 shape), plus an
+        // uncontested address to prove only collisions are retained.
+        let t = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90_bank4_text", 0x800E_1B90u32),
+            (1usize, "resident_only", 0x8000_0450u32),
+        ]);
+        assert!(t.is_ambiguous(0x800E_1B90));
+        assert_eq!(t.name_of(0x800E_1B90), None);
+        assert_eq!(
+            t.ambiguous_claimants(),
+            vec![(
+                0x800E_1B90,
+                vec![(2, "func_800E1B90"), (5, "func_800E1B90_bank4_text"),]
+            )]
+        );
+        assert_eq!(t.banked_body_count(), 2);
+        // Uncontested vrams stay in the flat table and out of the claimants.
+        assert_eq!(t.name_of(0x8000_0450), Some("resident_only"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn same_name_in_two_sections_is_not_a_collision() {
+        // A name reported twice for one vram is idempotent regardless of the
+        // section it came from: that is one body, not two banks.
+        let t = SymbolTable::from_section_entries([
+            (2usize, "func_800E1B90", 0x800E_1B90u32),
+            (5usize, "func_800E1B90", 0x800E_1B90u32),
+        ]);
+        assert!(!t.is_ambiguous(0x800E_1B90));
+        assert_eq!(t.name_of(0x800E_1B90), Some("func_800E1B90"));
+        assert!(t.ambiguous_claimants().is_empty());
+        assert_eq!(t.banked_body_count(), 0);
+    }
+
+    #[test]
+    fn banked_table_is_sorted_and_binary_searchable() {
+        // The emitted dispatcher binary-searches BANKED_LOOKUP_TABLE, so its
+        // rows must be vram-ascending and its claimants section-ascending —
+        // both independent of the HashMap iteration order they came from.
+        let t = SymbolTable::from_section_entries([
+            (5usize, "high_b", 0x8011_C900u32),
+            (3usize, "high_a", 0x8011_C900u32),
+            (5usize, "low_b", 0x800E_1B90u32),
+            (2usize, "low_a", 0x800E_1B90u32),
+        ]);
+        let rows = t.ambiguous_claimants();
+        assert_eq!(
+            rows,
+            vec![
+                (0x800E_1B90, vec![(2, "low_a"), (5, "low_b")]),
+                (0x8011_C900, vec![(3, "high_a"), (5, "high_b")]),
+            ]
+        );
+        assert_eq!(t.banked_body_count(), 4);
     }
 
     #[test]

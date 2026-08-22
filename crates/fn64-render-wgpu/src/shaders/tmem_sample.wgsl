@@ -12,13 +12,67 @@
 // Rust build seam (mirroring `color_combiner.wgsl`'s own established
 // pattern) so `fs_main` can call it directly.
 //
-// Scope: RGBA16 direct-format texels only (`ImageFormat::Rgba`,
-// `PixelSize::Bits16`) -- the only format this slice's frozen fixture (card
-// §4) exercises. CI4/CI8/TLUT, RGBA32, IA4/IA8/IA16, I4/I8, and YUV are not
-// ported here; a footprint that would require any of them is out of scope
-// for this slice and is not requested by its own fixed fragment-shader call
-// site. `TmemFirstRowParity::Even` is frozen for every sample this slice
-// issues (card §6) -- see `TMEM_FIRST_ROW_PARITY_EVEN` below.
+// Scope: two arms, selected by `tlut_en` BEFORE any format dispatch,
+// matching the hardware order.
+//
+//  * **TLUT enabled** (`tmem_tile_binding.lut_mode != TMEM_TLUT_MODE_DISABLED`):
+//    the tile format is IGNORED and every 4/8/16-bit texel indexes the
+//    palette. n64brew `Reality_Display_Processor/Pipeline` (CC BY-SA 4.0):
+//    "If tlut_en is set in othermodes the final texel will be sourced from a
+//    palette and the tile format is ignored, for tiles that indicate a
+//    4-bit texel size the TMEM address for the palette is indicated in the
+//    tile's palette field, the tile size is otherwise ignored." RT64's
+//    `sampleTMEM` (pinned `5473732a`, `src/shaders/TextureDecoder.hlsli`
+//    :149-208) branches on `usesTlut` before any format dispatch and never
+//    reads `fmt` inside that arm. This module mirrors
+//    `tmem/read.rs`'s `read_texel` + `tmem/texel.rs`'s
+//    `resolve_indexed_texel`/`decode_tlut_entry` for that arm, byte-for-byte
+//    with the CPU reader as fixed at `4c412a96`. 32-bit under an enabled
+//    TLUT stays REFUSED, matching that same CPU fix, which deliberately did
+//    not widen there (the index byte would have to be re-derived against the
+//    RGBA32 low/high bank split, and no title in this corpus reaches it).
+//    `validate_address_scope`'s canonical low-half requirement is mirrored
+//    here too (`TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF`); it was
+//    missing until a CPU-vs-GPU sweep found it, and its absence made the
+//    shader silently sample palette bytes as indexes where the CPU reader
+//    aborted by name.
+//
+//    **That mirroring makes the two lanes AGREE; it does not settle whether
+//    the rule itself is right.** `docs/RT64-LANE-DIVERGENCES.md` D14 scores
+//    this same refusal against `fn64-render-reference`, which imposes a
+//    low-half constraint only on the genuine split-bank formats (RGBA32,
+//    YUV) and addresses 4/8/16-bit CI across all 4 KiB. D14's verdict is
+//    "REFERENCE on the divergence; UNKNOWN on hardware" -- this crate's own
+//    justification is a self-citation to M4.3.3b, not a measurement. So if
+//    D14 is resolved in the reference's favour, the correct repair is to
+//    drop the rule from BOTH lanes together, not to re-open the gap between
+//    them. Until then the two lanes at least fail the same way instead of
+//    one aborting while the other paints palette bytes as a picture.
+//
+//    Two known differences from the CPU reader remain on this arm, both
+//    pinned by tests in `targets/triangle_pipeline/tests.rs` rather than
+//    resolved here:
+//
+//      * At 16 bits the CPU reads BOTH bytes of the big-endian texel and
+//        then discards the low one, so it refuses when the low byte is
+//        invalid; this shader reads only the high byte. Public documentation
+//        does not say whether a partially-loaded 16-bit texel's palette index
+//        is well-defined, so neither behaviour is corrected on the other's
+//        authority. See
+//        `a_sixteen_bit_tlut_texel_with_an_invalid_low_byte_splits_the_two_lanes`.
+//      * The CPU refuses a palette selector wider than four bits
+//        (`Ci4Palette::try_new`); this shader masks with `& 0x0f`. Latent --
+//        the reference `SetTile` decode narrows the field -- but
+//        `TileDescriptor::from_neutral_parts` is public and does not. See
+//        `an_out_of_range_palette_is_refused_by_the_cpu_and_masked_by_the_shader`.
+//  * **TLUT disabled**: RGBA16 direct-format texels only (`ImageFormat::Rgba`,
+//    `PixelSize::Bits16`). RGBA32, IA4/IA8/IA16, I4/I8, and YUV direct
+//    decodes are still not ported here; a disabled-TLUT footprint requiring
+//    any of them reports `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT`.
+//
+// The odd-row XOR4 bank exchange follows the TILE-RELATIVE row alone -- see
+// the block above `TEXEL_FRACTION_BITS` below, and the CPU oracle's
+// `tmem/read.rs::odd_row_exchange`, which carries the angrylion citation.
 //
 // GPU-side validity-sentinel encoding (card §6, matching
 // `tmem/gpu_projection.rs`'s own doc verbatim): a parallel bitmap, one bit
@@ -45,11 +99,35 @@
 const TMEM_BYTES: u32 = 4096u;
 const TMEM_VALIDITY_WORDS: u32 = 128u;
 const TMEM_ADDRESS_MASK: u32 = 0x0fffu;
+// RT64's `RDP_TMEM_MASK16` (`src/shaders/TextureDecoder.hlsli:15`, pinned
+// port source `5473732a`): the mask a read scoped to one 2 KiB half uses.
+// `TextureDecoder.hlsli:162-163` selects it for RGBA32 *or* an enabled
+// TLUT -- "When using RGBA32 or TLUT, each sample only addresses half of
+// TMEM" -- and `implLoadTMEM` (`:17-25`) applies it as a mask, never as a
+// refusal. Mirrors `tmem/read.rs`'s `AddressScope::LowHalf`.
+const TMEM_LOW_HALF_MASK: u32 = 0x07ffu;
 
-// Card §6: `TmemFirstRowParity::Even` is frozen for every sample this slice
-// issues. `false` here means "first row is even" (no XOR4 exchange bias),
-// matching `tmem/read.rs`'s `TmemFirstRowParity::Even` variant exactly.
-const TMEM_FIRST_ROW_PARITY_ODD: bool = false;
+// **The odd-row XOR4 exchange is the TILE-RELATIVE row's parity, and nothing
+// else** -- the same rule, and the same one-line expression, as the CPU
+// oracle's `tmem/read.rs::odd_row_exchange`, which carries the full
+// angrylion citation. In short: `fetch_texel` (`tmem.c:63-129`) XORs on
+// `(t & 1)` and never reads `tile->tl`, and `loading_pipeline`'s write-side
+// `dswap = sst & 1` (`tex.c:583`) is taken after `TRELATIVE` has made the
+// row tile-relative (`tcoord.c:998-999`), so the T origin cancels out of
+// both sides.
+//
+// This module used to derive a `first_row_parity` from the bound tile's
+// `low_t` and XOR it in, mirroring a CPU reader that did the same. That term
+// is not on hardware. It was self-cancelling for LoadTile, whose writer
+// carried the identical term, but the LoadBlock writer derived its own
+// parity from `source_t.raw()` -- a different field in a different unit --
+// so the two disagreed and every texel on a disagreeing row was fetched from
+// the wrong 4-byte half of its 64-bit word. See
+// `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
+//
+// The `low_t` the tile binding uploads is still used for the tile-relative
+// coordinate itself (the origin subtraction in `relative_axis_coordinate`);
+// it simply no longer participates in the bank exchange.
 
 const TEXEL_FRACTION_BITS: i32 = 5;
 const TEXEL_FRACTION_SCALE: i32 = 32; // 1 << TEXEL_FRACTION_BITS
@@ -65,7 +143,26 @@ const TILE_TO_TEXEL_FRACTION_SCALE: i32 = 8; // TEXEL_FRACTION_SCALE / 4
 // rejection: "loudly reject non-RGBA/Bits16", never silently sample as if
 // it were RGBA16).
 const TMEM_IMAGE_FORMAT_RGBA: u32 = 0u;
+const TMEM_PIXEL_SIZE_BITS4: u32 = 0u;
+const TMEM_PIXEL_SIZE_BITS8: u32 = 1u;
 const TMEM_PIXEL_SIZE_BITS16: u32 = 2u;
+const TMEM_PIXEL_SIZE_BITS32: u32 = 3u;
+
+// `TextureLutMode` wire codes, mirroring `tmem/gpu_projection.rs`'s
+// `TLUT_MODE_*`. The reserved encoding never reaches this shader --
+// `OtherMode::texture_lut_mode()` refuses it by name host-side.
+const TMEM_TLUT_MODE_DISABLED: u32 = 0u;
+const TMEM_TLUT_MODE_RGBA16: u32 = 2u;
+const TMEM_TLUT_MODE_IA16: u32 = 3u;
+
+// Physical byte address of TLUT entry 0. `tmem/texel.rs`'s
+// `resolve_indexed_texel` computes `0x0800 + index * 8` -- each entry is
+// quadricated into four identical big-endian 16-bit lanes across eight
+// bytes, and this module requires all four (see
+// `tmem_read_canonical_tlut_entry`), exactly as
+// `tmem/read.rs`'s `read_canonical_tlut_entry` does.
+const TMEM_TLUT_BASE: u32 = 0x0800u;
+const TMEM_TLUT_ENTRY_STRIDE: u32 = 8u;
 
 struct TileBindingParams {
     // `SetTile` fields (`TileDescriptor`, `tmem/types.rs`), each already
@@ -90,13 +187,21 @@ struct TileBindingParams {
     // silent default); 1 = a real binding is present.
     bound: u32,
     // `TileDescriptor::format()`/`::size()` wire codes (see the
-    // `TMEM_IMAGE_FORMAT_*`/`TMEM_PIXEL_SIZE_*` constants above). Checked by
-    // `sample_committed_rgba16_three_nearest` before any addressing math
-    // runs -- this slice ports RGBA16 only (module doc), so any other
-    // format/size pair is a named rejection, not a silent fallback to
-    // treating the bytes as RGBA16.
+    // `TMEM_IMAGE_FORMAT_*`/`TMEM_PIXEL_SIZE_*` constants above). `format`
+    // is read ONLY on the TLUT-disabled arm, where the direct decode this
+    // module ports is RGBA16 alone and any other pair is a named rejection
+    // rather than a silent fallback to treating the bytes as RGBA16. Under
+    // an enabled TLUT `format` is not read at all -- see the module header.
     format: u32,
     pixel_size: u32,
+    // `SetTile`'s four-bit palette selector. Read only on the 4-bit
+    // enabled-TLUT path, where it supplies the palette's own TMEM address
+    // (n64brew, quoted in this file's header).
+    palette: u32,
+    // `OtherMode::texture_lut_mode()`'s wire code (`TMEM_TLUT_MODE_*`).
+    // Consulted BEFORE `format`, because `tlut_en` is a pipeline mode and
+    // the tile format is ignored while it is set.
+    lut_mode: u32,
     reserved_zero: u32,
 }
 
@@ -114,6 +219,16 @@ const TMEM_SAMPLE_STATUS_NO_TILE_BINDING: u32 = 1u;
 const TMEM_SAMPLE_STATUS_INVALID_BYTE: u32 = 2u;
 const TMEM_SAMPLE_STATUS_REVERSED_EXTENT: u32 = 3u;
 const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4u;
+// The enabled-TLUT canonical-source refusal, mirroring `tmem/read.rs`'s
+// `validate_address_scope` -> `PhysicalTexelReadError::
+// EnabledCiSourceOutsideLowHalf`. Under `tlut_en` the palette occupies the
+// high 2 KiB of TMEM from `TMEM_TLUT_BASE`, so a tile whose index source
+// lands at or above that address would be reading the palette as image
+// data. Deliberately NOT folded into `INVALID_BYTE`: the bytes at `0x0800`
+// are usually perfectly valid TLUT bytes, so a validity failure would never
+// fire and the wrong color would be painted silently -- which is exactly
+// what this shader did before this status existed.
+const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5u;
 
 struct TmemSampleResult {
     status: u32,
@@ -208,12 +323,24 @@ fn tmem_rgba16_linear_base(
 // Masks and, if this row's parity triggers the odd-row exchange, XORs ONE
 // already-offset linear address -- called independently per byte (see
 // `tmem_rgba16_linear_base`'s doc above).
-fn tmem_rgba16_byte_address(linear: u32, row: u32) -> u32 {
+// The enabled-TLUT index source's own address: identical to
+// `tmem_rgba16_byte_address` except that it wraps within the low 2 KiB
+// (RT64 `TextureDecoder.hlsli:162-163`), so an index read can never reach
+// the palette's own half. XOR4 only touches bit 2, so masking before or
+// after the exchange is the same address; the CPU oracle
+// (`tmem/read.rs`'s `first_physical_byte` under `AddressScope::LowHalf`)
+// masks first, and this matches it.
+fn tmem_indexed_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
+    let address = linear & TMEM_LOW_HALF_MASK;
+    if (row & 1u) != 0u {
+        return address ^ 4u;
+    }
+    return address;
+}
+
+fn tmem_rgba16_byte_address(tile: TileBindingParams, linear: u32, row: u32) -> u32 {
     let address = linear & TMEM_ADDRESS_MASK;
-    let first_is_odd = TMEM_FIRST_ROW_PARITY_ODD;
-    let row_is_odd = (row & 1u) != 0u;
-    let exchange = first_is_odd != row_is_odd;
-    if exchange {
+    if (row & 1u) != 0u {
         return address ^ 4u;
     }
     return address;
@@ -226,8 +353,8 @@ fn tmem_sample_rgba16_texel(
     out_ok: ptr<function, bool>,
 ) -> vec4<f32> {
     let linear = tmem_rgba16_linear_base(tile, column, row);
-    let hi_address = tmem_rgba16_byte_address(linear, row);
-    let lo_address = tmem_rgba16_byte_address(linear + 1u, row);
+    let hi_address = tmem_rgba16_byte_address(tile, linear, row);
+    let lo_address = tmem_rgba16_byte_address(tile, linear + 1u, row);
     var ok_hi = false;
     var ok_lo = false;
     let hi = tmem_read_byte(hi_address, &ok_hi);
@@ -239,6 +366,157 @@ fn tmem_sample_rgba16_texel(
     *out_ok = true;
     let raw_be = (hi << 8u) | lo;
     return decode_rgba16(raw_be);
+}
+
+// `decode_ia16`, `tmem/texel.rs` (`IA16ToFloat4`, Formats.hlsli:108-112).
+// High byte is intensity, low byte is alpha; both already 8 bits,
+// big-endian packed. The second of the two TLUT entry formats.
+fn decode_ia16(raw_be: u32) -> vec4<f32> {
+    let i = (raw_be >> 8u) & 0xffu;
+    let a = raw_be & 0xffu;
+    return vec4<f32>(f32(i), f32(i), f32(i), f32(a)) / 255.0;
+}
+
+// `linear_byte_address` (`tmem/read.rs`) generalized over pixel size, in
+// the same three cases the CPU reader spells out: a 4-bit texel advances
+// half a byte per column (`column / 2`), an 8-bit texel one byte, and a
+// 16-bit texel two. Returns the UNMASKED, UNEXCHANGED linear address of the
+// texel's first byte, for the same reason `tmem_rgba16_linear_base` does --
+// the mask and the XOR4 exchange are applied per byte by
+// `tmem_rgba16_byte_address`, never once on a shared base.
+//
+// 32-bit is absent deliberately: it needs the RGBA32 low/high bank split
+// (`rgba32_low_address`), and both arms of this module refuse 32-bit before
+// any addressing runs.
+fn tmem_indexed_linear_base(
+    tile: TileBindingParams,
+    column: u32,
+    row: u32,
+) -> u32 {
+    var column_offset: u32;
+    if tile.pixel_size == TMEM_PIXEL_SIZE_BITS4 {
+        column_offset = column / 2u;
+    } else if tile.pixel_size == TMEM_PIXEL_SIZE_BITS8 {
+        column_offset = column;
+    } else {
+        column_offset = column * 2u;
+    }
+    return tile.tmem_word_address * 8u
+        + row * tile.line_words * 8u
+        + column_offset;
+}
+
+// `read_tlut_entry` (`tmem/read.rs`): the FIRST quadricated lane at
+// `0x800 + index * 8`, and only that lane.
+//
+// RT64 `src/shaders/TextureDecoder.hlsli:179` is the whole palette read:
+// `loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8)` over
+// `#define loadTLUT(a) TMEM.Load(uint2((a) & RDP_TMEM_MASK8, 0))` (`:28`).
+// Lanes 1..3 are never addressed, so neither their contents nor their
+// validity can gate the read. `fn64-render-reference`'s `read_tlut`
+// (`src/gbi/state.rs:853-869`) reads the same two bytes.
+//
+// Lane 0's own two bytes are still required to be valid: `out_ok = false`
+// here still means an unwritten palette byte, which the RDP's TMEM would
+// never have and which this shader must not invent -- the same rule
+// `tmem_read_byte` enforces everywhere else.
+fn tmem_read_tlut_entry(index: u32, out_ok: ptr<function, bool>) -> u32 {
+    let base = TMEM_TLUT_BASE + index * TMEM_TLUT_ENTRY_STRIDE;
+    var ok_hi = false;
+    var ok_lo = false;
+    let hi = tmem_read_byte(base, &ok_hi);
+    let lo = tmem_read_byte(base + 1u, &ok_lo);
+    if !ok_hi || !ok_lo {
+        *out_ok = false;
+        return 0u;
+    }
+    *out_ok = true;
+    return (hi << 8u) | lo;
+}
+
+// The enabled-TLUT texel path, mirroring `tmem/read.rs`'s `read_texel`
+// `ReadKind::Indexed` arm plus `tmem/texel.rs`'s `resolve_indexed_texel`
+// (as fixed at `4c412a96`) and `decode_tlut_entry`, in that order:
+//
+//  1. read the raw index from TMEM at this texel's own physical address,
+//     narrowing by size -- 4-bit unpacks the nibble selected by the
+//     column's parity (`unpack_ci4_texel`: even column is bits 7:4, odd is
+//     3:0) and prefixes the tile's palette field (`(palette << 4) | nibble`),
+//     8-bit takes the byte, 16-bit takes the HIGH (big-endian first) byte;
+//  2. look up the quadricated entry at `0x800 + index * 8`;
+//  3. decode that entry as RGBA16 or IA16 per the TLUT mode -- NOT per the
+//     tile format, which is ignored on this arm.
+//
+// The tile's declared `format` is never read here. That is the whole point
+// of the arm.
+fn tmem_sample_tlut_texel(
+    tile: TileBindingParams,
+    column: u32,
+    row: u32,
+    out_ok: ptr<function, bool>,
+) -> vec4<f32> {
+    let linear = tmem_indexed_linear_base(tile, column, row);
+
+    var index: u32;
+    if tile.pixel_size == TMEM_PIXEL_SIZE_BITS16 {
+        // The high byte of the big-endian 16-bit texel: the first byte at
+        // this texel's address, not the second.
+        var ok_hi = false;
+        let hi = tmem_read_byte(tmem_indexed_byte_address(tile, linear, row), &ok_hi);
+        if !ok_hi {
+            *out_ok = false;
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+        index = hi;
+    } else {
+        var ok_byte = false;
+        let byte = tmem_read_byte(tmem_indexed_byte_address(tile, linear, row), &ok_byte);
+        if !ok_byte {
+            *out_ok = false;
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+        if tile.pixel_size == TMEM_PIXEL_SIZE_BITS4 {
+            var nibble: u32;
+            if (column & 1u) == 0u {
+                nibble = (byte >> 4u) & 0x0fu;
+            } else {
+                nibble = byte & 0x0fu;
+            }
+            index = ((tile.palette & 0x0fu) << 4u) | nibble;
+        } else {
+            index = byte;
+        }
+    }
+
+    var entry_ok = false;
+    let entry = tmem_read_tlut_entry(index, &entry_ok);
+    if !entry_ok {
+        *out_ok = false;
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    *out_ok = true;
+    if tile.lut_mode == TMEM_TLUT_MODE_IA16 {
+        return decode_ia16(entry);
+    }
+    return decode_rgba16(entry);
+}
+
+// Dispatches one already-addressed texel to whichever of the two arms this
+// tile's `lut_mode` selects. Both arms' unsupported cases are refused
+// before this function is ever called (see
+// `sample_committed_rgba16_three_nearest`), so `out_ok = false` here means
+// an invalid TMEM byte or a non-canonical TLUT entry, never a format
+// refusal.
+fn tmem_sample_texel(
+    tile: TileBindingParams,
+    column: u32,
+    row: u32,
+    out_ok: ptr<function, bool>,
+) -> vec4<f32> {
+    if tile.lut_mode != TMEM_TLUT_MODE_DISABLED {
+        return tmem_sample_tlut_texel(tile, column, row, out_ok);
+    }
+    return tmem_sample_rgba16_texel(tile, column, row, out_ok);
 }
 
 // `relative_axis_coordinate` (`tmem/sample.rs`): shifts the S10.5 raw
@@ -431,7 +709,19 @@ fn sample_committed_rgba16_three_nearest(
         return result;
     }
 
-    if tile.format != TMEM_IMAGE_FORMAT_RGBA || tile.pixel_size != TMEM_PIXEL_SIZE_BITS16 {
+    // **`lut_mode` first, `format` only as the disabled arm's tiebreak.**
+    // Under `tlut_en` the RDP sources the final texel from a palette and
+    // the tile format is ignored (module header: n64brew + RT64
+    // `sampleTMEM`), so consulting `format` here would refuse WM2000's
+    // measured IA4-under-`G_TT_RGBA16` tile for a property the hardware
+    // does not read. 32-bit stays refused on BOTH arms, mirroring the CPU
+    // fix at `4c412a96`, which deliberately did not widen there.
+    if tile.lut_mode == TMEM_TLUT_MODE_DISABLED {
+        if tile.format != TMEM_IMAGE_FORMAT_RGBA || tile.pixel_size != TMEM_PIXEL_SIZE_BITS16 {
+            result.status = TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT;
+            return result;
+        }
+    } else if tile.pixel_size == TMEM_PIXEL_SIZE_BITS32 {
         result.status = TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT;
         return result;
     }
@@ -447,10 +737,10 @@ fn sample_committed_rgba16_three_nearest(
     var ok_ll = false;
     var ok_ur = false;
     var ok_lr = false;
-    let c_ul = tmem_sample_rgba16_texel(tile, cell.s0, cell.t0, &ok_ul);
-    let c_ll = tmem_sample_rgba16_texel(tile, cell.s0, cell.t1, &ok_ll);
-    let c_ur = tmem_sample_rgba16_texel(tile, cell.s1, cell.t0, &ok_ur);
-    let c_lr = tmem_sample_rgba16_texel(tile, cell.s1, cell.t1, &ok_lr);
+    let c_ul = tmem_sample_texel(tile, cell.s0, cell.t0, &ok_ul);
+    let c_ll = tmem_sample_texel(tile, cell.s0, cell.t1, &ok_ll);
+    let c_ur = tmem_sample_texel(tile, cell.s1, cell.t0, &ok_ur);
+    let c_lr = tmem_sample_texel(tile, cell.s1, cell.t1, &ok_lr);
     if !ok_ul || !ok_ll || !ok_ur || !ok_lr {
         result.status = TMEM_SAMPLE_STATUS_INVALID_BYTE;
         return result;

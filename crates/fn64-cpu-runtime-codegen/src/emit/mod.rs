@@ -327,7 +327,10 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         base,
         words.len()
     );
-    let _ = writeln!(out, "// Emitted by fn64-cpu-runtime (typed Rust, no unsafe).");
+    let _ = writeln!(
+        out,
+        "// Emitted by fn64-cpu-runtime (typed Rust, no unsafe)."
+    );
     // A leaf function may not touch memory (or, degenerately, registers); the
     // fixed ABI signature keeps both params, so allow the unused-var lint per
     // function rather than second-guessing which params a body references.
@@ -398,14 +401,39 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
             let _ = writeln!(out, "            pc = {:#010X};", next_vram);
             let _ = writeln!(out, "        }}");
         } else if next_vram >= func_end {
-            // This straight-line instruction is the LAST word of the function
-            // (e.g. a padding `nop` sitting after a `jr $ra` return, which is
-            // common alignment tail). Its arm was opened but has no successor
-            // to fall through to, so close it explicitly — otherwise the block
-            // dangles into the `_ =>` catch-all and the emitted Rust has an
-            // unbalanced brace. Assign `pc` past the function so the loop's
-            // `_ =>` arm is the (unreachable) terminator.
-            let _ = writeln!(out, "            pc = {:#010X};", next_vram);
+            // This straight-line instruction is the LAST word of the function.
+            // Usually that is padding after a `jr $ra` and the arm is genuinely
+            // unreachable — but not always: a function can END mid-flow and run
+            // straight on into its successor, which is what a fallthrough split
+            // in the symbol map looks like. WM2000's `func_80120B28` (size
+            // 0x5C) ends on a plain `sw` and continues into `func_80120B84`.
+            //
+            // Assigning `pc = next_vram` sends both cases into the `_ =>`
+            // catch-all, which aborts the reachable one with "jumped to
+            // unmapped vram". Emit the resolved successor as a tail call
+            // instead; an unknown successor still goes to `lookup`, which traps
+            // with the exact vram rather than guessing.
+            match resolver.resolve(next_vram) {
+                CallTarget::Direct(name) => {
+                    let _ = writeln!(
+                        out,
+                        "            call_host_or_recompiled({next_vram:#010X}, {name}, ctx, mem); return;"
+                    );
+                }
+                CallTarget::Indirect => {
+                    // Unknown OR bank-ambiguous. `lookup` is the right seam for
+                    // both: it consults residency for a banked vram and traps
+                    // by name for a genuinely unknown one. WM2000's
+                    // `func_80120B84` is claimed by two overlay banks, so it is
+                    // absent from the flat table and only `lookup` can pick the
+                    // resident body. Falling back to `pc =` here would abort in
+                    // the `_ =>` arm even though the successor exists.
+                    let _ = writeln!(
+                        out,
+                        "            lookup({next_vram:#010X})(ctx, mem); return;"
+                    );
+                }
+            }
             let _ = writeln!(out, "        }}");
         }
         i += 1;
@@ -1379,6 +1407,66 @@ fn emit_control_transfer(
     // the resolver decides how to emit).
     let in_func = |t: u32| t >= base && t < func_end;
 
+    // A conditional branch whose target leaves this function is a *tail call*,
+    // exactly like the inter-function `J` arm below: the target's own `jr $ra`
+    // returns to OUR caller. Assigning such a target to the local `pc`
+    // dispatcher instead would land in the `match`'s `_ =>` catch-all, because
+    // the leader set (see `emit_function_resolved`) deliberately only admits
+    // in-function targets.
+    //
+    // WM2000 makes this reachable: `func_80038480`'s true body ends at
+    // `0x800385F0` (`disasm/symbol_addrs.txt`: `func_800385F0 ... size:0x60`),
+    // and `beqz $v1, 0x800385F0` at `0x800384D8` branches to it.
+    //
+    // Returns the emitted taken-arm source, or `None` when the target is local.
+    let escaping_taken_arm = |t: u32| -> Option<String> {
+        if in_func(t) {
+            return None;
+        }
+        Some(match resolver.resolve(t) {
+            CallTarget::Direct(name) => {
+                format!("call_host_or_recompiled({t:#010X}, {name}, ctx, mem); return;")
+            }
+            CallTarget::Indirect => format!("lookup({t:#010X})(ctx, mem); return;"),
+        })
+    };
+
+    // A function whose LAST instruction is a call (`JAL`/`JALR`) or a
+    // conditional branch has a *fallthrough* address one past its end. Writing
+    // `pc = <func_end>` sends the local dispatcher into its `_ =>` catch-all
+    // and aborts with "jumped to unmapped vram", even though the guest is
+    // simply running on into the next function.
+    //
+    // WM2000's `func_8011F67C` (size 0x7FC) ends with `jal func_800E7B64` at
+    // 0x8011FE70 plus its delay slot; 0x8011FE78 is the next real function.
+    // Four functions ROM-wide have this shape.
+    //
+    // Emitting the fallthrough as a resolved tail call is the same treatment
+    // the inter-function `J` arm already gives an escaping jump, and it keeps
+    // the "never guess a target" rule: an unresolved fallthrough goes to
+    // `lookup`, which traps with the exact vram.
+    let fallthrough_tail = |t: u32| -> Option<String> {
+        if in_func(t) {
+            return None;
+        }
+        Some(match resolver.resolve(t) {
+            CallTarget::Direct(name) => {
+                format!("call_host_or_recompiled({t:#010X}, {name}, ctx, mem); return;")
+            }
+            CallTarget::Indirect => format!("lookup({t:#010X})(ctx, mem); return;"),
+        })
+    };
+    // Emits the post-call fallthrough: a local `pc =` when it stays inside the
+    // body, a resolved tail call when the function ends here.
+    let emit_fallthrough = |out: &mut String| match fallthrough_tail(fallthrough) {
+        Some(tail) => {
+            let _ = writeln!(out, "            {tail}");
+        }
+        None => {
+            let _ = writeln!(out, "            pc = {fallthrough:#010X}; continue 'run;");
+        }
+    };
+
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
             let _ = writeln!(out, "            // delay: {:#010X}: {:?}", delay_vram, d);
@@ -1469,11 +1557,7 @@ fn emit_control_transfer(
                     let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
                 }
             }
-            let _ = writeln!(
-                out,
-                "            pc = {:#010X}; continue 'run;",
-                fallthrough
-            );
+            emit_fallthrough(out);
         }
         Jalr { rd, rs } => {
             // JALR reads the target before writing the link; this matters when
@@ -1486,11 +1570,7 @@ fn emit_control_transfer(
             );
             emit_delay(out);
             let _ = writeln!(out, "            lookup(_target)(ctx, mem);");
-            let _ = writeln!(
-                out,
-                "            pc = {:#010X}; continue 'run;",
-                fallthrough
-            );
+            emit_fallthrough(out);
         }
         Bltzal { .. } | Bgezal { .. } => {
             // Conditional branch-and-link.
@@ -1532,10 +1612,23 @@ fn emit_control_transfer(
             let t = target.unwrap();
             let _ = writeln!(out, "            if {} {{", c);
             emit_delay(out);
-            let _ = writeln!(out, "                pc = {:#010X};", t);
-            let _ = writeln!(out, "            }} else {{");
-            let _ = writeln!(out, "                pc = {:#010X};", fallthrough);
-            let _ = writeln!(out, "            }} continue 'run;");
+            match escaping_taken_arm(t) {
+                Some(tail) => {
+                    let _ = writeln!(out, "                {tail}");
+                    let _ = writeln!(out, "            }}");
+                    let _ = writeln!(
+                        out,
+                        "            pc = {:#010X}; continue 'run;",
+                        fallthrough
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "                pc = {:#010X};", t);
+                    let _ = writeln!(out, "            }} else {{");
+                    let _ = writeln!(out, "                pc = {:#010X};", fallthrough);
+                    let _ = writeln!(out, "            }} continue 'run;");
+                }
+            }
         }
         _ => {
             // Normal conditional branch: delay slot runs unconditionally.
@@ -1543,11 +1636,259 @@ fn emit_control_transfer(
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
             emit_delay(out);
-            let _ = writeln!(
-                out,
-                "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
-                t, fallthrough
-            );
+            match escaping_taken_arm(t) {
+                Some(tail) => {
+                    let _ = writeln!(out, "            if _take {{ {tail} }}");
+                    emit_fallthrough(out);
+                }
+                None => match fallthrough_tail(fallthrough) {
+                    // Taken target is local but the function ENDS here, so the
+                    // not-taken path runs on into the next function.
+                    Some(tail) => {
+                        let _ = writeln!(
+                            out,
+                            "            if _take {{ pc = {t:#010X}; continue 'run; }}"
+                        );
+                        let _ = writeln!(out, "            {tail}");
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
+                            t, fallthrough
+                        );
+                    }
+                },
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod escaping_branch_tests {
+    use super::*;
+    use crate::module::SymbolTable;
+
+    /// WM2000 `func_80038480` at its true size `0x170` ends with
+    /// `beqz $v1, 0x800385F0` at `0x800384D8` — a *conditional* branch whose
+    /// target is the NEXT function. Until the conditional arm learned to route
+    /// an escaping target through the resolver, it emitted a bare
+    /// `pc = 0x800385F0; continue 'run;` into a `match` that has no such arm,
+    /// which the `_ =>` catch-all turns into `unreachable!`.
+    #[test]
+    fn conditional_branch_out_of_the_function_is_a_resolved_tail_call() {
+        // beqz $v1, +0x114 (0x800384D8 -> 0x800385F0), nop, jr $ra, nop
+        let words = [0x1060_0045u32, 0x0000_0000, 0x03E0_0008, 0x0000_0000];
+        let symbols = SymbolTable::from_entries([("func_800385F0", 0x8003_85F0u32)]);
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_84D8,
+                words: &words,
+            },
+            &symbols,
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x800385F0, func_800385F0, ctx, mem); return;"),
+            "escaping conditional branch must tail-call the resolved target:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x800385F0"),
+            "must never assign an out-of-function pc into the local dispatcher:\n{src}"
+        );
+        // The not-taken path must still fall through locally, not tail-call.
+        assert!(
+            src.contains("pc = 0x800384E0; continue 'run;"),
+            "the not-taken arm must fall through to the next local block:\n{src}"
+        );
+    }
+
+    /// Positive control for the mechanism above: an IN-function conditional
+    /// branch must keep the plain two-way `pc =` form. Without this the test
+    /// above would also pass if every conditional branch became a tail call.
+    #[test]
+    fn conditional_branch_inside_the_function_stays_a_local_pc_assignment() {
+        // beqz $v1, +2 (0x80038480 -> 0x8003848C), nop, nop, jr $ra, nop
+        let words = [
+            0x1060_0002u32,
+            0x0000_0000,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_8480,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("elsewhere", 0x8003_848Cu32)]),
+        );
+        assert!(
+            src.contains("pc = if _take { 0x8003848C } else { 0x80038488 }; continue 'run;"),
+            "an in-function branch must not be rerouted through the resolver:\n{src}"
+        );
+        assert!(
+            !src.contains("call_host_or_recompiled(0x8003848C"),
+            "a symbol that merely shares an in-function vram must not hijack \
+             a local branch:\n{src}"
+        );
+    }
+
+    /// An escaping conditional branch to an UNKNOWN vram must go through
+    /// `lookup`, which traps by name — never a silent fall-through and never
+    /// a nearest-match.
+    #[test]
+    fn escaping_conditional_branch_to_an_unknown_target_is_a_named_lookup() {
+        let words = [0x1060_0045u32, 0x0000_0000, 0x03E0_0008, 0x0000_0000];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80038480",
+                vram: 0x8003_84D8,
+                words: &words,
+            },
+            &SymbolTable::from_entries([] as [(&str, u32); 0]),
+        );
+        assert!(
+            src.contains("lookup(0x800385F0)(ctx, mem); return;"),
+            "an unknown escaping target must reach the trapping dispatcher:\n{src}"
+        );
+    }
+
+    /// WM2000 `func_8011F67C` (size 0x7FC) ends with `jal func_800E7B64` at
+    /// `0x8011FE70` plus its delay slot, so its fallthrough `0x8011FE78` is
+    /// the NEXT function. Writing `pc = 0x8011FE78` aborts the local
+    /// dispatcher with "jumped to unmapped vram". Four functions ROM-wide have
+    /// this shape.
+    #[test]
+    fn a_call_in_the_last_slot_falls_through_to_the_next_function() {
+        // jal func_800E7B64 ; addiu $a0, $sp, 0x28   (the whole function)
+        let words = [0x0C03_9ED9u32, 0x27A4_0028];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_8011F67C",
+                vram: 0x8011_FE70,
+                words: &words,
+            },
+            &SymbolTable::from_entries([
+                ("func_800E7B64", 0x800E_7B64u32),
+                ("func_8011FE78", 0x8011_FE78u32),
+            ]),
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x800E7B64, func_800E7B64, ctx, mem);"),
+            "the call itself must still be emitted:\n{src}"
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x8011FE78, func_8011FE78, ctx, mem); return;"),
+            "the escaping fallthrough must tail-call the next function:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x8011FE78"),
+            "must never assign an out-of-function fallthrough to pc:\n{src}"
+        );
+    }
+
+    /// Positive control: a call that is NOT in the last slot keeps its plain
+    /// local `pc =` fallthrough.
+    #[test]
+    fn a_call_mid_function_keeps_a_local_fallthrough() {
+        // jal ; delay ; nop ; jr $ra ; nop
+        let words = [
+            0x0C03_9ED9u32,
+            0x27A4_0028,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "mid",
+                vram: 0x8011_FE70,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("func_800E7B64", 0x800E_7B64u32)]),
+        );
+        assert!(
+            src.contains("pc = 0x8011FE78; continue 'run;"),
+            "an in-function fallthrough must stay a local pc assignment:\n{src}"
+        );
+    }
+
+    /// WM2000 `func_80120B28` (size 0x5C) ends on a plain `sw` — no control
+    /// transfer at all — and runs straight on into `func_80120B84`. The
+    /// last-word arm assumed that position was always unreachable padding.
+    #[test]
+    fn a_function_ending_mid_flow_tail_calls_its_successor() {
+        // sw $v0, 0x40($sp)   (the whole "function")
+        let words = [0xAFA2_0040u32];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80120B28",
+                vram: 0x8012_0B80,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("func_80120B84", 0x8012_0B84u32)]),
+        );
+        assert!(
+            src.contains("call_host_or_recompiled(0x80120B84, func_80120B84, ctx, mem); return;"),
+            "a function ending mid-flow must tail-call its successor:\n{src}"
+        );
+    }
+
+    /// The real `func_80120B84` is claimed by two overlay banks, so the symbol
+    /// table leaves it `Indirect` and it lives only in `BANKED_LOOKUP_TABLE`.
+    /// The mid-flow successor must still reach `lookup`, which resolves it
+    /// against residency, rather than falling back to a `pc =` that aborts.
+    #[test]
+    fn a_bank_ambiguous_successor_still_reaches_the_residency_dispatcher() {
+        let words = [0xAFA2_0040u32];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "func_80120B28",
+                vram: 0x8012_0B80,
+                words: &words,
+            },
+            // Two claimants at one vram: `SymbolTable` reports Indirect.
+            &SymbolTable::from_section_entries([
+                (3usize, "func_80120B84", 0x8012_0B84u32),
+                (4usize, "func_80120B84_bank3_text", 0x8012_0B84u32),
+            ]),
+        );
+        assert!(
+            src.contains("lookup(0x80120B84)(ctx, mem); return;"),
+            "a bank-ambiguous successor must go through lookup:\n{src}"
+        );
+        assert!(
+            !src.contains("pc = 0x80120B84;\n"),
+            "must not fall back to a pc assignment the dispatcher cannot serve:\n{src}"
+        );
+    }
+
+    /// Positive control: a function ending in `jr $ra` plus alignment padding
+    /// must NOT gain a tail call, even when a symbol happens to sit at the
+    /// next address. That padding really is unreachable.
+    #[test]
+    fn padding_after_a_return_does_not_become_a_tail_call() {
+        // jr $ra ; nop ; nop   -- the trailing nop is unreachable padding
+        let words = [0x03E0_0008u32, 0x0000_0000, 0x0000_0000];
+        let src = emit_function_resolved(
+            &FuncInput {
+                name: "padded",
+                vram: 0x8012_0B78,
+                words: &words,
+            },
+            &SymbolTable::from_entries([("successor", 0x8012_0B84u32)]),
+        );
+        assert!(
+            src.contains("return;"),
+            "the `jr $ra` must still return:\n{src}"
+        );
+        // The padding arm may name the successor, but control must never reach
+        // it: the only executable path out of this body is the `return`.
+        assert!(
+            !src.contains("pc = if"),
+            "no conditional dispatch belongs in a straight return body:\n{src}"
+        );
     }
 }

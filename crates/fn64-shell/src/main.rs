@@ -17,6 +17,29 @@
 //!    reaches a live cpal output stream. The linked game/harness separately
 //!    registers the recompiled ucode that produces those samples.
 //!
+//! ## Shell hotkeys
+//!
+//! Handled before the keyboard reaches the game, so they stay reachable
+//! whatever `input.toml` binds:
+//!
+//! | Key | Effect |
+//! |---|---|
+//! | F1 | Settings overlay (`overlay.rs`) |
+//! | F2 | Screenshot the game frame to a PNG (`screenshot.rs`) |
+//! | F3 | Stack + framerate HUD (`stack.rs`); `FN64_HUD=1` starts it open |
+//! | F11 | Toggle borderless fullscreen |
+//! | Esc | Close the overlay, or exit when it is closed |
+//!
+//! ## What this build is running on
+//!
+//! The recompiler lane and the renderer are chosen in two places a player
+//! never sees, and both default to the opposite of the intended target stack.
+//! `stack.rs` prints a greppable `[fn64-stack]` block naming both -- plus
+//! whether a game is linked and which -- unconditionally at startup and again
+//! at exit, and F3 puts the same identity on screen with a live framerate.
+//! Paste that block into any symptom report; without it the report has no
+//! cell.
+//!
 //! ## Game intake (same contract as oot-boot)
 //!
 //! The recompiled game is linked at BUILD time from `RECOMPILED_DIR`/
@@ -42,6 +65,7 @@
 #[cfg(not(fn64_game_linked))]
 mod demo;
 #[allow(dead_code)]
+mod frame_trip;
 mod framebuffer;
 #[allow(dead_code)]
 mod gamepad;
@@ -49,6 +73,17 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+/// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
+/// inside a slow pump that is not inside a fast one -- the decomposition the
+/// heartbeat's distribution cannot supply.
+#[allow(dead_code)]
+mod pump_census;
+#[allow(dead_code)]
+mod screenshot;
+/// What this build is running on: the recompiler lane, the renderer, and
+/// whether a game is linked. Printed unconditionally at startup and exit.
+#[allow(dead_code)]
+mod stack;
 #[allow(dead_code)]
 mod timing;
 
@@ -60,6 +95,9 @@ fn main() {
     // UI stack stays verifiable in a checkout with no game content; without
     // it, report the intake contract honestly rather than opening a window
     // with nothing to boot.
+    // Unconditional, and FIRST: a content-free build is itself a stack fact
+    // worth naming, and the demo path opens a window with no game behind it.
+    println!("{}", stack::banner(None));
     if std::env::args().any(|a| a == "--demo") {
         demo::run();
         return;
@@ -85,15 +123,43 @@ fn main() {
 
 #[cfg(fn64_game_linked)]
 fn main() {
+    // Before the ROM loads and before any backend is constructed: the two
+    // facts that are already fixed (lane, linked game) are printed here so
+    // even a run that dies during boot leaves its cell in the log.
+    println!("{}", stack::banner(None));
     game::run();
 }
 
-/// OoT's host-first rs-lane lookup table, shared verbatim with the headless
-/// harness (game-profile data beside the OoT harness, not duplicated here —
-/// see that file's module doc).
+/// The linked title's host-first rs-lane lookup table.
+///
+/// The rs lane resolves host functions **by address**, so this table is
+/// game-profile data and lives beside its own harness, never in this
+/// game-agnostic crate. `build.rs` locates it from the `RECOMP_RS_HOST_LOOKUP`
+/// environment variable and copies it into `OUT_DIR/host_lookup.rs`, which the
+/// `#[path]` below names. Pointing that variable at a different harness's
+/// `host_lookup.rs` links a different title.
+///
+/// This replaced a hardcoded `#[path]` include of
+/// `../../../examples/oot-boot/src/host_lookup.rs`, which (a) pinned the shell
+/// to OoT and (b) named a file that no longer exists in this repo, so
+/// `FN64_RECOMP=rs` could not compile here for any title at all.
+///
+/// The staging step is what makes this work: `#[path]` accepts only a plain
+/// literal (no `env!`, no `concat!`), and the table file opens with `//!` inner
+/// doc comments that are legal only at the top of a *file* module. So build.rs
+/// strips that leading block and writes the rest to a fixed `OUT_DIR` path,
+/// which `include!` can name through `env!`.
+/// Crate-root alias for the linked emitted crate. The shared per-title
+/// `host_lookup.rs` refers to `crate::recompiled` so it does not have to
+/// hardcode a harness-specific dependency name (`wm2000-boot` calls it
+/// `wm2000_recompiled`; this shell calls it `game-recompiled`).
 #[cfg(fn64_cpu_runtime)]
-#[path = "../../../examples/oot-boot/src/host_lookup.rs"]
-mod host_lookup;
+pub(crate) use game_recompiled as recompiled;
+
+#[cfg(fn64_cpu_runtime)]
+mod host_lookup {
+    include!(concat!(env!("OUT_DIR"), "/host_lookup.rs"));
+}
 
 /// Everything that requires the linked game symbols lives here, gated on the
 /// `fn64_game_linked` cfg `build.rs` sets only when it compiled the
@@ -105,11 +171,13 @@ mod game {
     use crate::gamepad::Gamepads;
     use crate::input_map::{InputConfig, PadState};
     use crate::overlay::{Capture, Overlay};
-    use crate::timing::{DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow};
+    use crate::timing::{
+        subfield_device_deadline, DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow,
+    };
     use std::sync::Arc;
 
     #[cfg(fn64_cpu_runtime)]
-    use oot_recompiled as recompiled;
+    use crate::recompiled;
 
     use pixels::{Pixels, SurfaceTexture};
     use winit::application::ApplicationHandler;
@@ -198,18 +266,44 @@ mod game {
         /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
         /// latched, so the full framebuffer line is presented (not cropped).
         fb_width: usize,
+        /// Current pixels-surface / scratch height in lines. Starts at
+        /// FB_HEIGHT and is resized to the game's own VI active output height
+        /// once V_START is latched, so the window shows exactly the
+        /// scanned-out rectangle and never rows the game did not render.
+        fb_height: usize,
         /// `Arc<Window>` (not a bare `Window`) so the `SurfaceTexture`
         /// pixels holds can own a `'static` window handle, letting `pixels`
         /// be `Pixels<'static>` -- otherwise pixels 0.15 borrows the window
         /// and the self-referential lifetime can't live in one struct.
         window: Option<Arc<Window>>,
         pixels: Option<Pixels<'static>>,
+        /// True once `present()` has unpacked a VI framebuffer into `rgba`.
+        /// Distinct from `reported_first_frame` (a logging latch): a capture
+        /// needs to know the buffer holds a real frame, because a freshly
+        /// allocated `rgba` is all-zero and would encode as a plausible but
+        /// fabricated black PNG.
+        rgba_holds_a_frame: bool,
+        /// Hands out the never-reused suffix that keeps two captures in the
+        /// same millisecond from overwriting each other.
+        screenshotter: crate::screenshot::Screenshotter,
         reported_first_frame: bool,
         last_heartbeat_swap: u64,
+        /// Frame-hash tripwire (`FN64_FRAME_TRIP`), `None` when off.
+        frame_trip: Option<crate::frame_trip::FrameTrip>,
+        /// Settled tripwire verdict, acted on in `about_to_wait`.
+        frame_trip_verdict: Option<crate::frame_trip::Verdict>,
+        /// Exit code to propagate once the event loop has returned.
+        frame_trip_exit_code: Option<i32>,
+        /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
+        frame_dump_dir: Option<std::path::PathBuf>,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
+        /// Pumps in the current heartbeat window whose interval exceeded one
+        /// 60 Hz field. Counted rather than derived: the percentile summary
+        /// cannot report *how many* frames breached, only where the ranks fell.
+        pumps_over_budget: usize,
         pump_times: TimingWindow,
         present_times: TimingWindow,
         pump_steps_total: u64,
@@ -217,6 +311,20 @@ mod game {
         pump_step_samples: u64,
         last_audio_underrun_sample_slots: u64,
         last_audio_late_callbacks: u64,
+        /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
+        /// unarmed it is one `bool` load per pump and nothing else.
+        pump_census: crate::pump_census::PumpCensus,
+        /// The backend `boot()` actually registered, carried so the census
+        /// can name it on its first line. A graphics figure without its
+        /// renderer beside it is not a result, and reading it back from
+        /// `FN64_RENDER` would report the REQUEST rather than the fallback
+        /// that may have replaced it.
+        active_renderer: &'static str,
+        /// The F3 HUD's own rolling timing window. Separate from the
+        /// heartbeat's `TimingWindow`s on purpose: `take_stats()` DRAINS
+        /// those, so sharing would make the two instruments steal each
+        /// other's samples.
+        hud_timing: crate::stack::HudTiming,
     }
 
     /// How many executor steps to run per window pump before yielding back to
@@ -351,10 +459,50 @@ mod game {
             let requested_renderer = std::env::var("FN64_RENDER")
                 .unwrap_or_else(|_| "reference".to_string())
                 .to_ascii_lowercase();
+            // `wgpu` additionally yields the ABI-side half of `WgpuBackend`'s
+            // role split. `set_raw_dpc_session`'s own doc names "a shell or
+            // test harness, never `fn64-abi` itself" as the caller that must
+            // register it: without it `try_dispatch_raw_dpc_via_session`
+            // (`rsp_commit.rs`) early-returns `None` and the raw-DPC seam this
+            // backend implements is never reached. Order against
+            // `set_render_backend` is immaterial -- `set_render_backend_with_policy`
+            // never touches `RAW_DPC_SESSION` -- so the doc's "first or in the
+            // same setup step" is a pairing-provenance rule, honored here by
+            // taking both halves from one `try_new`.
+            let mut raw_dpc_session: Option<fn64_render::RawDpcAbiSession> = None;
             let (render_backend, active_renderer): (
                 Box<dyn fn64_render::RenderBackend>,
                 &'static str,
-            ) = if requested_renderer == "rt64" {
+            ) = if requested_renderer == "wgpu" {
+                match fn64_render_wgpu::WgpuBackend::try_new() {
+                    Ok((mut backend, session)) => {
+                        match backend.create(&fn64_render::RenderConfig::for_tv(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                            tv_type,
+                        )) {
+                            Ok(()) => {
+                                raw_dpc_session = Some(session);
+                                (Box::new(backend), "wgpu")
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[fn64-shell] WARNING: WgpuBackend create failed ({error}); \
+                                     falling back to the ReferenceBackend oracle"
+                                );
+                                (create_reference(), "reference-fallback")
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
+                             falling back to the ReferenceBackend oracle"
+                        );
+                        (create_reference(), "reference-fallback")
+                    }
+                }
+            } else if requested_renderer == "rt64" {
                 let mut backend = fn64_render_rt64::Rt64Backend::new();
                 match backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
@@ -380,7 +528,17 @@ mod game {
                 (create_reference(), "reference")
             };
             fn64_abi::set_render_backend(render_backend, rdram.len());
+            if let Some(session) = raw_dpc_session {
+                fn64_abi::set_raw_dpc_session(session);
+                println!(
+                    "[fn64-shell] raw-DPC session registered (wgpu plan/execute/publish seam)"
+                );
+            }
             println!("[fn64-shell] render backend registered ({active_renderer}, 320x240)");
+            // The banner again, now that the renderer is a RESOLVED fact
+            // rather than a request -- this is the copy that answers "what am
+            // I actually running", including a silent fallback.
+            println!("{}", crate::stack::banner(Some(active_renderer)));
 
             // Audio OUTPUT path: a live cpal output stream. This is the
             // shell's audio deliverable -- samples produced by M_AUDTASK and
@@ -398,8 +556,14 @@ mod game {
                 fn64_cpu_runtime::set_host_lookup(Some(
                     crate::host_lookup::recompiled_or_host_lookup,
                 ));
+                // Overlay banks share a VRAM window, so the emitted
+                // dispatcher cannot resolve a collided vram from its table
+                // alone. This is the seam it asks; the registry behind it is
+                // already maintained from the guest's own PI DMA
+                // (`fn64_abi::note_dma_overlay_load`).
+                fn64_cpu_runtime::set_host_section_resident(Some(fn64_abi::is_section_loaded));
                 println!(
-                    "[fn64-shell] FN64_RECOMP=rs: linked oot-recompiled crate + host-first \
+                    "[fn64-shell] FN64_RECOMP=rs: linked game-recompiled crate + host-first \
                      recompiled adapters active"
                 );
                 // SAFETY: `rdram` is owned by the returned Shell, which lives
@@ -410,7 +574,13 @@ mod game {
                         rdram_ptr,
                         rdram.len(),
                         recompiled::lookup,
-                        recompiled::entrypoint,
+                        // recompile_rom emits no `entrypoint` symbol (the
+                        // previous reference here was stale and could not
+                        // compile). Section 0 of the emitted geometry table is
+                        // the entry section, so its ram_addr IS the configured
+                        // entrypoint, title-neutrally. `lookup` traps by name
+                        // if that vram carries no body.
+                        recompiled::lookup(recompiled::RECOMPILED_SECTION_GEOMETRY[0].1),
                         0,
                         10,
                     );
@@ -432,17 +602,31 @@ mod game {
                 pad: PadState::new(),
                 config: InputConfig::load(),
                 gamepads: Gamepads::new(),
-                overlay: Overlay::new(),
+                overlay: {
+                    let mut overlay = Overlay::new();
+                    // FN64_HUD=1 brings the HUD up with the window, so a scripted
+                    // or headless run does not have to synthesize an F3.
+                    overlay.hud = crate::stack::hud_starts_open();
+                    overlay
+                },
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
                 fb_width: FB_WIDTH,
+                fb_height: FB_HEIGHT,
                 window: None,
                 pixels: None,
+                rgba_holds_a_frame: false,
+                screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
+                frame_trip: crate::frame_trip::FrameTrip::from_env(),
+                frame_trip_verdict: None,
+                frame_trip_exit_code: None,
+                frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
+                pumps_over_budget: 0,
                 pump_times: TimingWindow::default(),
                 present_times: TimingWindow::default(),
                 pump_steps_total: 0,
@@ -450,6 +634,9 @@ mod game {
                 pump_step_samples: 0,
                 last_audio_underrun_sample_slots: 0,
                 last_audio_late_callbacks: 0,
+                pump_census: crate::pump_census::PumpCensus::new(),
+                active_renderer,
+                hud_timing: crate::stack::HudTiming::default(),
             }
         }
 
@@ -459,22 +646,42 @@ mod game {
             let start_swaps = fn64_abi::vi_swap_count();
             let mut drain = RetraceDrain::new(start_swaps);
 
-            // Advance the guest clock by exactly one live retrace interval FIRST,
+            // Advance the guest clock to the exact armed retrace FIRST,
             // unconditionally, because the caller only enters here when the
             // 16.67 ms wall deadline is due (`about_to_wait`'s FRAME). One
-            // pump == one field == one retrace, whatever happens below. The
-            // interval may change when a pending OSViMode latches.
+            // pump == one field == one retrace, whatever happens below.
             //
             // Doing it at the TOP is load-bearing: retrace must not depend on
             // whether the game happens to finish a frame during this pump.
-            let interval = fn64_abi::vi_field_interval()
+            // Use the fabric's exact edge rather than `sim_time + interval`:
+            // this pump may have serviced sub-field device deadlines since the
+            // preceding edge, and adding a field to that later time would drift
+            // the independent VI schedule.
+            let tick = fn64_abi::next_vi_deadline()
                 .expect("typed television standard must keep VI armed");
-            let tick = fn64_abi::sim_time() + interval;
             fn64_abi::advance_virtual_time(tick);
 
             loop {
                 let next_priority = fn64_abi::next_runnable_priority();
                 if drain.before_step(next_priority) == DrainDecision::Quiescent {
+                    // The guest can block after scheduling an event only one
+                    // cycle away (raw FullSync -> DP is the live WM2000 case).
+                    // Ending the pump here rounds that event up to the next VI
+                    // edge and inserts an entire field of latency. Service
+                    // every exact non-VI deadline first, then resume whatever
+                    // it wakes; the following VI edge still belongs to the
+                    // next wall-paced pump.
+                    let current = fn64_abi::sim_time();
+                    let next_vi = fn64_abi::next_vi_deadline()
+                        .expect("typed television standard must keep VI armed");
+                    if let Some(deadline) = subfield_device_deadline(
+                        current,
+                        fn64_abi::next_device_deadline(),
+                        next_vi,
+                    ) {
+                        fn64_abi::advance_virtual_time(deadline);
+                        continue;
+                    }
                     // Exact closed loop: after retrace work blocks, OoT's
                     // priority-0 idle thread calls pause_self, which makes it
                     // runnable again. The old driver treated every such yield
@@ -551,7 +758,21 @@ mod game {
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
-            let fb_offset = match fn64_abi::current_vi_framebuffer() {
+            // VI_ORIGIN, not the `osViSwapBuffer` bookkeeping pointer.
+            // `scanout_vi_framebuffer`'s own doc names this distinction: the
+            // two agree for a game that swaps through libultra, but only
+            // VI_ORIGIN is defined for a game that programs the register
+            // directly. Measured on WM2000 they differ by exactly one
+            // 480-pixel row (`0x38f800` vs `0x38fbc0`, and `0x3c7c00` vs
+            // `0x3c7fc0`; the two G_SETCIMG bases are 480*240*2 apart, so
+            // they are the real buffer bases and VI_ORIGIN is one row into
+            // each). Reading the bookkeeping pointer therefore shifts the
+            // whole image up one line and pulls a row of never-rendered
+            // memory in at the bottom. Fall back to the swap pointer only
+            // when VI_ORIGIN has not been programmed at all.
+            let fb_offset = match fn64_abi::scanout_vi_framebuffer()
+                .or_else(fn64_abi::current_vi_framebuffer)
+            {
                 Some(o) => o as usize,
                 None => return,
             };
@@ -565,6 +786,11 @@ mod game {
                 );
                 return;
             }
+            // The guest's own active output rectangle, from V_START. Rows
+            // past it were never rendered into, so presenting a fixed 240
+            // shows stale RDRAM along the bottom -- WM2000 programs 237.
+            let target_height = fn64_abi::vi_output_height()
+                .map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
@@ -584,16 +810,18 @@ mod game {
             // Resize only on change -- pixels' buffer resize reallocates GPU
             // storage. wgpu caps texture dimensions; clamp defensively.
             let target_width = src_stride.clamp(1, 4096);
-            if target_width != self.fb_width {
+            if target_width != self.fb_width || target_height != self.fb_height {
                 if pixels
-                    .resize_buffer(target_width as u32, FB_HEIGHT as u32)
+                    .resize_buffer(target_width as u32, target_height as u32)
                     .is_ok()
                 {
                     self.fb_width = target_width;
-                    self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
+                    self.fb_height = target_height;
+                    self.rgba = vec![0u8; target_width * target_height * 4];
                     println!(
-                        "[fn64-shell] resized present surface to {target_width}x{FB_HEIGHT} \
-                         (game VI_WIDTH); window shows the full framebuffer line."
+                        "[fn64-shell] resized present surface to {target_width}x{target_height} \
+                         (game VI_WIDTH x VI active output lines); window shows exactly the \
+                         scanned-out rectangle."
                     );
                 }
             }
@@ -602,21 +830,81 @@ mod game {
                 fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
                 src_stride,
                 self.fb_width,
+                self.fb_height,
                 &mut self.rgba,
             );
+            // `rgba` now holds a real frame, so F2 may encode it. Set here and
+            // not after `render()`: the bytes are what a screenshot wants, and
+            // a failed present does not make them fabricated.
+            self.rgba_holds_a_frame = true;
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
+
+            // Frame-hash tripwire. Placed on the hash that already exists so
+            // the guard adds no hashing and no clock; off by default, in
+            // which case this is one `Option` test per frame.
+            //
+            // The verdict is RECORDED here and acted on in `about_to_wait`.
+            // Exiting from `present` was tried and panics with "panic in a
+            // function that cannot unwind": present runs inside winit's
+            // extern "C" redraw callback, where `process::exit`'s teardown
+            // cannot unwind. `about_to_wait` is ordinary Rust, and is where
+            // the pump census already terminates bounded runs safely.
+            // `FN64_FRAME_DUMP=<dir>` writes every tripwire frame as a PNG.
+            // Diagnostic sibling of the tripwire: the tripwire says WHICH
+            // frame changed, this says what it looks like. Same recording
+            // point, so the two always agree about frame numbering.
+            if let Some(dir) = self.frame_dump_dir.as_ref() {
+                let index = self
+                    .frame_trip
+                    .as_ref()
+                    .map_or(0, |t| t.observed_len());
+                let file = format!("frame-{index:04}-{rgba_hash:016x}.png");
+                if let Err(e) = crate::screenshot::capture(
+                    dir,
+                    &file,
+                    self.fb_width,
+                    self.fb_height,
+                    &self.rgba,
+                    self.rgba_holds_a_frame,
+                ) {
+                    eprintln!("[fn64-shell] frame dump failed: {e}");
+                }
+            }
+            if let Some(trip) = self.frame_trip.as_mut() {
+                if self.frame_trip_verdict.is_none() {
+                    match trip.observe(rgba_hash) {
+                        crate::frame_trip::Verdict::Pending => {}
+                        settled => self.frame_trip_verdict = Some(settled),
+                    }
+                }
+            }
             pixels.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
             // pixels/window fields immutably alongside `&mut self.config`.
-            let render_result = if self.overlay.open {
+            let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
+                // Built only when the HUD is actually up: with F3 off this
+                // whole branch is one `bool` test, so the readout cannot
+                // perturb the timings it exists to report.
+                let hud = self.overlay.hud.then(|| {
+                    let live = self
+                        .hud_timing
+                        .sample(std::time::Instant::now())
+                        .map(|sample| sample.line());
+                    crate::overlay::HudReadout {
+                        identity: crate::stack::hud_identity(self.active_renderer),
+                        live,
+                        alarm: self.active_renderer == "reference-fallback",
+                    }
+                });
                 self.overlay.render_over(
                     self.pixels.as_ref().expect("checked above"),
                     (size.width.max(1), size.height.max(1)),
                     window.scale_factor() as f32,
                     &mut self.config,
                     &self.gamepads,
+                    hud.as_ref(),
                 )
             } else {
                 self.pixels.as_ref().expect("checked above").render()
@@ -681,6 +969,23 @@ mod game {
                         .take_stats()
                         .expect("heartbeat must follow at least one present");
                     let window_hz = 1000.0 / interval.median_ms;
+                    // Choppy and slow are different failures and the median
+                    // cannot tell them apart. `over_budget` is the fraction
+                    // of pumps whose OWN COST breached the deadline -- not the
+                    // fraction of frame intervals, which was the original
+                    // shape and was an artifact: the interval median sits
+                    // exactly on FRAME, so it fired as a coin flip on
+                    // microsecond scheduler jitter (measured 50.4% against a
+                    // real pump-cost breach rate of 0.1%, and it read 50.4 vs
+                    // 56.3 on two lanes whose pump costs differed 3x). p99/max
+                    // are computed by `TimingStats` and were being discarded.
+                    let over_budget = self.pumps_over_budget;
+                    let over_budget_pct = if interval.samples > 0 {
+                        100.0 * over_budget as f64 / interval.samples as f64
+                    } else {
+                        0.0
+                    };
+                    self.pumps_over_budget = 0;
                     let average_steps =
                         self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
                     let audio_health = fn64_abi::audio_stream_health();
@@ -715,8 +1020,10 @@ mod game {
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                          retrace_hz={cadence} cumulative, window_hz={window_hz:.1}; \
-                         timing_ms median/p95: interval={:.2}/{:.2} pump={:.2}/{:.2} \
-                         present={:.2}/{:.2} (n={}); pump_steps avg/max={average_steps:.1}/{}; audio: \
+                         timing_ms median/p95/p99/max: interval={:.2}/{:.2}/{:.2}/{:.2} \
+                         pump={:.2}/{:.2}/{:.2}/{:.2} present={:.2}/{:.2}/{:.2}/{:.2} (n={}); \
+                         over_budget={over_budget}/{} ({over_budget_pct:.1}% of pumps > 16.67ms); \
+                         pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
                          callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
                          (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
@@ -726,10 +1033,17 @@ mod game {
                          guest/stream_hz={audio_rates:?}",
                         interval.median_ms,
                         interval.p95_ms,
+                        interval.p99_ms,
+                        interval.max_ms,
                         pump.median_ms,
                         pump.p95_ms,
+                        pump.p99_ms,
+                        pump.max_ms,
                         present.median_ms,
                         present.p95_ms,
+                        present.p99_ms,
+                        present.max_ms,
+                        interval.samples,
                         interval.samples,
                         self.pump_steps_max,
                         audio.ai_buffers,
@@ -744,6 +1058,54 @@ mod game {
                     self.pump_step_samples = 0;
                     self.last_audio_underrun_sample_slots = audio_underrun_sample_slots;
                     self.last_audio_late_callbacks = audio_late_callbacks;
+                }
+            }
+        }
+
+        /// F2: write the frame currently in `rgba` to a PNG.
+        ///
+        /// Every outcome is reported -- the written path on success, the
+        /// concrete reason on failure -- because a screenshot key that
+        /// sometimes does nothing visible is the silent no-op `AGENTS.md`
+        /// forbids. Nothing here can end the session: the fallible work is
+        /// behind `screenshot::capture`'s `Result`, which is logged and
+        /// dropped, so a full disk or a read-only directory costs the player
+        /// a screenshot and not their progress.
+        fn save_screenshot(&mut self) {
+            let dir = crate::screenshot::resolve_dir(
+                std::env::var(crate::screenshot::DIR_ENV).ok().as_deref(),
+            );
+            let file = crate::screenshot::file_name(
+                crate::screenshot::now_unix_millis(),
+                self.screenshotter.next_seq(),
+            );
+            match crate::screenshot::capture(
+                &dir,
+                &file,
+                self.fb_width,
+                self.fb_height,
+                &self.rgba,
+                self.rgba_holds_a_frame,
+            ) {
+                Ok(path) => {
+                    // Absolute where we can get it: a player who launched from
+                    // a shortcut has no idea what the working directory is.
+                    let shown = std::fs::canonicalize(&path).unwrap_or(path);
+                    println!(
+                        "[fn64-shell] screenshot saved: {} ({}x{}, game frame only -- \
+                         the settings overlay is not captured)",
+                        shown.display(),
+                        self.fb_width,
+                        self.fb_height
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[fn64-shell] screenshot FAILED: {e} (target directory {}; override it \
+                         with {}=<dir>)",
+                        dir.display(),
+                        crate::screenshot::DIR_ENV
+                    );
                 }
             }
         }
@@ -803,6 +1165,18 @@ mod game {
             }
             match event {
                 WindowEvent::CloseRequested => {
+                    // Same rule as Esc below: while the census is armed the
+                    // run ends at its pump budget and nowhere else. A
+                    // benchmark window sitting under whatever else is on the
+                    // desktop must not have its sample size decided by a
+                    // stray click or a window manager.
+                    if self.pump_census.armed() {
+                        println!(
+                            "[fn64-shell] close request IGNORED: FN64_PUMP_CENSUS is armed and \
+                             this run ends at its pump budget"
+                        );
+                        return;
+                    }
                     println!("[fn64-shell] window close requested -- exiting");
                     event_loop.exit();
                 }
@@ -824,7 +1198,25 @@ mod game {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = event.state == ElementState::Pressed;
                         // Shell chords, never game input: F1 settings,
-                        // F11 fullscreen.
+                        // F2 screenshot, F11 fullscreen. Checked ahead of
+                        // `pad.apply` like the others, so a chord stays a
+                        // chord even if a user's input.toml binds the same
+                        // key to a controller button.
+                        if code == KeyCode::F2 && pressed {
+                            self.save_screenshot();
+                            return;
+                        }
+                        if code == KeyCode::F3 && pressed {
+                            self.overlay.toggle_hud();
+                            // Named in the log too: a player who hits F3 by
+                            // accident should learn what it is, and a log
+                            // reader gets the stack line either way.
+                            println!(
+                                "[fn64-shell] stack/fps HUD {} (F3)",
+                                if self.overlay.hud { "on" } else { "off" }
+                            );
+                            return;
+                        }
                         if code == KeyCode::F1 && pressed {
                             self.overlay.toggle();
                             if self.overlay.open {
@@ -861,6 +1253,23 @@ mod game {
                             return;
                         }
                         if code == KeyCode::Escape && pressed {
+                            // A bounded census run must end at its pump
+                            // budget and nowhere else. These runs open a real
+                            // window that takes focus, so a keystroke typed at
+                            // a terminal lands in the game -- which truncated
+                            // four runs of a measurement matrix into short
+                            // logs that still parsed, still exited 0, and
+                            // still printed a plausible report. Ignoring Esc
+                            // while the census is armed makes the run's length
+                            // a property of the experiment rather than of what
+                            // was typed nearby.
+                            if self.pump_census.armed() {
+                                println!(
+                                    "[fn64-shell] Esc IGNORED: FN64_PUMP_CENSUS is armed and \
+                                     this run ends at its pump budget"
+                                );
+                                return;
+                            }
                             println!("[fn64-shell] Esc pressed -- exiting");
                             event_loop.exit();
                             return;
@@ -887,6 +1296,68 @@ mod game {
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Frame-hash tripwire verdict, settled in `present`. Acted on
+            // here because this is ordinary Rust: see the note at the
+            // recording site for why exiting from `present` cannot work.
+            if let Some(verdict) = self.frame_trip_verdict.take() {
+                use crate::frame_trip::Verdict;
+                let path = self
+                    .frame_trip
+                    .as_ref()
+                    .map(|t| t.path().display().to_string())
+                    .unwrap_or_default();
+                let code = match verdict {
+                    Verdict::Pending => unreachable!("Pending is never stored"),
+                    Verdict::Recorded(n) => {
+                        match self.frame_trip.as_ref().expect("verdict implies trip").write() {
+                            Ok(()) => {
+                                println!(
+                                    "[fn64-shell] frame tripwire: recorded {n} frame hashes to {path}"
+                                );
+                                0
+                            }
+                            Err(e) => {
+                                eprintln!("[fn64-shell] frame tripwire: FAILED to write {path}: {e}");
+                                1
+                            }
+                        }
+                    }
+                    Verdict::Matched(n) => {
+                        println!("[fn64-shell] frame tripwire: PASS -- {n} frames match {path}");
+                        0
+                    }
+                    Verdict::Unusable(why) => {
+                        // Fails the run. A gate that cannot compare must not
+                        // report success: a comment-only baseline was
+                        // measured reporting "PASS -- 1 frames match".
+                        eprintln!(
+                            "[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})"
+                        );
+                        1
+                    }
+                    Verdict::Mismatch { index, expected, actual } => {
+                        eprintln!(
+                            "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
+                             {expected:016x}, got {actual:016x} (baseline {path}). A differing \
+                             hash localises the frame; it does not itself say which picture \
+                             is correct."
+                        );
+                        1
+                    }
+                };
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                // `event_loop.exit()`, not `process::exit`: on macOS BOTH
+                // `present` and `about_to_wait` run inside winit's extern "C"
+                // callbacks, where process teardown aborts with "panic in a
+                // function that cannot unwind" (observed, exit 134, after the
+                // message had already printed). Winit's own exit returns
+                // through the loop, and `run_app` then propagates this code.
+                self.frame_trip_exit_code = Some(code);
+                event_loop.exit();
+                return;
+            }
             // Gamepad events every tick (gilrs state only advances when its
             // queue is drained). Presses are consumed by an armed overlay
             // capture and discarded otherwise, so arming a capture never
@@ -910,11 +1381,78 @@ mod game {
 
             let now_t = std::time::Instant::now();
             if now_t >= self.next_frame_deadline {
+                // Held rather than recorded here: the HUD pairs each pump's
+                // COST with the interval that preceded it, and the cost is
+                // only known below. Keeping the pair together is what lets
+                // the HUD report the two as separate quantities instead of
+                // conflating them -- the exact conflation that produced the
+                // 57.3%-over-budget artifact.
+                let mut hud_interval = None;
                 if let Some(previous) = self.last_pump_started.replace(now_t) {
-                    self.frame_intervals.record(now_t.duration_since(previous));
+                    let elapsed = now_t.duration_since(previous);
+                    self.frame_intervals.record(elapsed);
+                    hud_interval = Some(elapsed);
                 }
+                // Bracket the pump, not its internals: the phase counters
+                // `pump_census` reads are running totals `run_one_step`
+                // already maintains, so differencing them across the pump
+                // adds no clock to the hot loop (perf-method rule 17 -- a
+                // predicted instrumentation cost was once wrong by 56x, so
+                // the instrument that adds no timer is the one to prefer).
+                self.pump_census.before_pump();
                 let outcome = self.pump_one_frame();
-                self.pump_times.record(now_t.elapsed());
+                let pump_wall = now_t.elapsed();
+                // **Pump cost, not frame interval.** The interval median sits
+                // exactly on FRAME, so counting interval breaches is a coin
+                // flip on microsecond scheduler jitter -- measured at 50.4%
+                // on a lane whose real pump-cost breach rate was 0.1%
+                // (9 of 6000), and it could not tell two lanes apart whose
+                // pump costs differed 3x. Pump cost is the work the shell
+                // actually did, so a breach here is a real missed deadline.
+                if pump_wall > FRAME {
+                    self.pumps_over_budget += 1;
+                }
+                self.pump_times.record(pump_wall);
+                if let Some(interval) = hud_interval {
+                    self.hud_timing.record(interval, pump_wall);
+                }
+                if self
+                    .pump_census
+                    .after_pump(pump_wall, outcome.steps, outcome.swapped)
+                {
+                    // Bounded run: a windowed benchmark that needs a human to
+                    // close the window cannot be repeated identically, and
+                    // "any timing claim needs repeated runs" is the bar.
+                    self.pump_census.report_once(self.active_renderer);
+                    // The DPC copy census reports from an `atexit` hook that
+                    // this bounded-run exit path does not reach, so it armed
+                    // and printed nothing. Ask it directly.
+                    fn64_abi::dpc_copy_census::report_now();
+                    // Terminate from HERE rather than by unwinding to
+                    // `run_app`'s return. The ordinary exit path was observed
+                    // to print "exited cleanly" and then hang with the
+                    // process alive and its CPU time frozen -- a benchmark
+                    // driver that waits on such a process waits forever, and
+                    // killing it mid-matrix is how a run gets truncated into
+                    // a plausible short log. Everything this census measures
+                    // is already flushed above; the guest coroutines a normal
+                    // teardown exists to seal are not observed after it.
+                    //
+                    // `prepare_clean_exit` FIRST, though. `process::exit`
+                    // still runs thread-local destructors, and dropping the
+                    // `Executor` force-unwinds the guest coroutines through
+                    // `extern "C"` recomp frames -- which aborts with "panic
+                    // in a function that cannot unwind". Observed: the census
+                    // printed its whole report and then exited 134, turning a
+                    // good measurement into a failed run. `prepare_clean_exit`
+                    // detaches the coroutines so that drop has nothing to
+                    // unwind.
+                    prepare_clean_exit();
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(0);
+                }
                 self.pump_steps_total = self.pump_steps_total.saturating_add(outcome.steps);
                 self.pump_steps_max = self.pump_steps_max.max(outcome.steps);
                 self.pump_step_samples += 1;
@@ -952,6 +1490,19 @@ mod game {
             return;
         }
 
+        // The only place the chords are announced to a player who never opens
+        // a source file. The overlay's own hint line is shared with `--demo`
+        // (which has no screenshot handler), so F2 is advertised here rather
+        // than there -- a hint that lies in one of two modes is worse than no
+        // hint.
+        println!(
+            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into ./{}/, override with \
+             {}=<dir>) · F3 stack/fps HUD (FN64_HUD=1 starts it open) · F11 fullscreen · \
+             Esc exit",
+            crate::screenshot::resolve_dir(None).display(),
+            crate::screenshot::DIR_ENV
+        );
+
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
         // Poll (not Wait): the game runs continuously, we're not idle-waiting
         // on OS events.
@@ -959,8 +1510,22 @@ mod game {
         if let Err(e) = event_loop.run_app(&mut shell) {
             eprintln!("[fn64-shell] event loop error: {e}");
         }
+        // Idempotent: the bounded-run path already printed if it fired, and a
+        // report printed twice reads as two runs.
+        shell.pump_census.report_once(shell.active_renderer);
+        // Reprinted on exit: after twenty minutes of heartbeat lines the
+        // startup banner is far off the top of the scrollback, and the log a
+        // user actually copies is its tail.
+        println!("{}", crate::stack::banner(Some(shell.active_renderer)));
         println!("[fn64-shell] exited cleanly.");
+        // Tripwire runs are gates, so their verdict must reach the shell as
+        // an exit status. Taken after `prepare_clean_exit` so the teardown
+        // this path exists to perform still happens on a FAIL.
+        let trip_code = shell.frame_trip_exit_code;
         prepare_clean_exit();
+        if let Some(code) = trip_code {
+            std::process::exit(code);
+        }
     }
 
     /// Seal guest coroutine ownership before normal process teardown.

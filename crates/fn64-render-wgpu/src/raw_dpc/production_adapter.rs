@@ -14,21 +14,35 @@
 //! reusing the same triangle draw path -- see `push_decoded_raw_dpc`'s
 //! `TextureRectangle` arm). `NoOp` is admitted and discarded: it carries no
 //! resource identity or state delta, so it is pushed nowhere and simply
-//! skipped. Every other decoded command kind (`FillRectangle`, `FullSync`)
-//! remains outside the admitted zero-guest-write subset and is rejected
-//! loudly -- never silently dropped -- the instant one is encountered.
+//! skipped.
+//!
+//! `FillRectangle` is admitted too, as the one command here that declares
+//! guest-visible `RenderTarget` write accesses -- N of them, one per row for
+//! a partial-width fill (see `RdpFillRectangleCommand`). Its access slice
+//! comes from the decoder's own recorded span, never re-derived here.
+//!
+//! `FullSync` is admitted as a *site*: the opcode is walked, bound to the
+//! capture's own `FullSyncBoundary`, and pushed as an `RdpFullSyncSite` that
+//! declares zero resource accesses. Admitting the site claims the opcode was
+//! reached and the sole DP completion slot was proved free -- it claims
+//! nothing about a DP interrupt being raised or observed. A capture that
+//! carries no boundary for the site is still rejected loudly, never silently
+//! dropped.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralColor4, NeutralColorImage, NeutralCombineParams,
     NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize, NeutralPrimColor,
-    NeutralPrimDepth, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
-    NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    NeutralTriangleVertex, RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpStateCommand,
-    RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch, TmemLoadKind as NeutralTmemLoadKind,
-    TmemLoadSemantics, TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
+    NeutralPrimDepth, NeutralScissor, NeutralTextureImage, NeutralTileAddressMode,
+    NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+    NeutralTmemTransferWord, NeutralTriangleVertex,
+    RawDpcCommandLocation as NeutralRawDpcCommandLocation, RdpFillRectangleCommand,
+    RdpStateCommand, RdpStateIdentity, RdpTriangleCommand, TmemLoadEpoch,
+    TmemLoadKind as NeutralTmemLoadKind, TmemLoadSemantics,
+    TmemTransferLayout as NeutralTmemTransferLayout, TriangleSource,
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
+use crate::raw_dpc::FillAccessSpanError;
 use crate::raw_dpc::{decode_triangle_vertices, texture_rectangle_vertices};
 use crate::state::OtherMode;
 use crate::{
@@ -42,12 +56,19 @@ use crate::{
 /// `SetTile`/`SetTileSize`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut`, the
 /// nine pure-RDP-state commands (`SetOtherMode`/`SetColorImage`/
 /// `SetFillColor`/`SetEnvColor`/`SetPrimColor`/`SetBlendColor`/
-/// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`, and
-/// `TextureRectangle` is rejected here, loudly, at the exact command
-/// index/location it was decoded at -- never silently dropped or aliased to
-/// a no-op push. Remaining rejected kinds: `FillRectangle`, `FullSync`.
-/// `NoOp` is not rejected: it is admitted and discarded (see
-/// `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
+/// `SetFogColor`/`SetPrimDepth`/`SetCombine`), `RawTriangle`,
+/// `TextureRectangle`, `FillRectangle`, and `FullSync` is rejected here,
+/// loudly, at the exact command index/location it was decoded at -- never
+/// silently dropped or aliased to a no-op push. No command kind is blanket-
+/// rejected any more. `NoOp` is not rejected: it is admitted and discarded
+/// (see `push_decoded_raw_dpc`'s `NoOp` arm), never producing this error.
+///
+/// Two admitted kinds can still reach this error through their own narrowed
+/// rejections: a `FillRectangle` whose staged `SetColorImage`/`SetFillColor`
+/// this walk never observed is reported here rather than executed against
+/// invented state, and a `FullSync` whose capture carries no boundary record
+/// is reported here rather than admitted as a site the producer never
+/// reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnadmittedRawDpcCommand {
     pub command_index: u32,
@@ -165,6 +186,10 @@ pub enum PushDecodedRawDpcError {
     TriangleBeforeAnyOtherMode(TriangleBeforeAnyOtherMode),
     TextureRectangleBeforeAnyOtherMode(TextureRectangleBeforeAnyOtherMode),
     DegenerateTextureRectangle(DegenerateTextureRectangle),
+    /// An admitted `FillRectangle`'s recorded access span could not be
+    /// bound back to the plan's own ordered access list -- the decoder and
+    /// the resource plan disagree about what this fill writes.
+    FillAccessSpan(crate::raw_dpc::FillAccessSpanError),
 }
 
 impl core::fmt::Display for PushDecodedRawDpcError {
@@ -176,6 +201,7 @@ impl core::fmt::Display for PushDecodedRawDpcError {
                 core::fmt::Display::fmt(error, formatter)
             }
             Self::DegenerateTextureRectangle(error) => core::fmt::Display::fmt(error, formatter),
+            Self::FillAccessSpan(error) => core::fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -209,10 +235,23 @@ impl From<DegenerateTextureRectangle> for PushDecodedRawDpcError {
 fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
     match kind {
         RawDpcCommandKind::NoOp { .. } => "NoOp",
+        // Still named, deliberately, even though `FillRectangle` is now
+        // admitted rather than blanket-rejected: this arm remains reachable
+        // from the narrowed fill rejections in `push_decoded_raw_dpc`'s own
+        // `FillRectangle` arm (a fill whose staged `SetColorImage`/
+        // `SetFillColor` the walk never saw). Deleting it would make those
+        // rejections hit the `unreachable!` below and panic instead of
+        // naming the opcode. `NoOp` above is already in the same defensive
+        // state -- it is admitted and discarded, so its arm is likewise
+        // unreachable in practice.
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
+        // Likewise still named after FullSync became a site admission: the
+        // `FullSync` arm's own narrowed rejection (a capture carrying no
+        // boundary record for the site) routes through here.
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
         RawDpcCommandKind::SetOtherMode(_)
+        | RawDpcCommandKind::SetScissor(_)
         | RawDpcCommandKind::SetColorImage(_)
         | RawDpcCommandKind::SetFillColor(_)
         | RawDpcCommandKind::SetEnvColor(_)
@@ -231,6 +270,34 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         | RawDpcCommandKind::TextureRectangle(_) => {
             unreachable!("admitted kinds are pushed, never rejected")
         }
+    }
+}
+
+/// Widen one `SetScissor` decode into its neutral mirror.
+///
+/// [`crate::rt64_gbi_rdp_decode::decode_set_scissor`] types its four
+/// coordinates `i32` to mirror RT64's `int32_t` locals, but every one is a
+/// zero-extended 12-bit extraction (`p0`/`p1` mask to `bits` width and never
+/// sign-extend), so the true domain is `0..=4095` -- comfortably inside
+/// `u16`. The `expect`s below are loud traps on that invariant rather than
+/// silent `as` truncations: if the decoder is ever changed to sign-extend,
+/// this panics naming the field instead of quietly wrapping a negative
+/// coordinate into a huge positive one.
+fn neutral_scissor(value: crate::rt64_gbi_rdp_decode::SetScissorDecoded) -> NeutralScissor {
+    fn coordinate(field: &str, raw: i32) -> u16 {
+        u16::try_from(raw).unwrap_or_else(|_| {
+            panic!(
+                "SetScissor {field} decoded to {raw}, outside the zero-extended 12-bit \
+                 domain 0..=4095 that decode_set_scissor is proven to produce"
+            )
+        })
+    }
+    NeutralScissor {
+        mode: value.mode,
+        upper_left_x: coordinate("ulx", value.ulx),
+        upper_left_y: coordinate("uly", value.uly),
+        lower_right_x: coordinate("lrx", value.lrx),
+        lower_right_y: coordinate("lry", value.lry),
     }
 }
 
@@ -562,10 +629,34 @@ struct StateIdentityTracker {
     fog_color: Option<RdpStateIdentity>,
     prim_depth: Option<RdpStateIdentity>,
     combine: Option<RdpStateIdentity>,
+    /// Tracked-only, exactly like the applied slots above -- `SetScissor`
+    /// still owns one global slot whose `before`/`after` chain threads
+    /// through this plan, even though no consumer reads the value.
+    scissor: Option<RdpStateIdentity>,
 }
 
 fn tile_slot(index: TileIndex) -> usize {
     usize::from(index.get())
+}
+
+/// Whether the capture backing `writer` carries a boundary record for the
+/// FullSync site at `ordinal`.
+///
+/// This is the seam's proof that the producer took the reserve half. A
+/// boundary can only enter a capture through
+/// `OwnedRawDpcCapture::with_full_sync_boundaries`, whose contract requires
+/// `DeviceFabric::preflight_dp_full_sync` to have proved the sole DP
+/// completion slot free first; `OwnedRawDpcCapture::new` installs an empty
+/// list and no other constructor exists.
+///
+/// In practice this always returns `true` for a decoded site, because IR
+/// stream derivation already refuses to build a stream whose `SYNC_FULL`
+/// count exceeds its boundary count (`MissingFullSyncObservation`). It is
+/// checked anyway rather than asserted: the alternative is admitting a site
+/// on an assumption about a sibling crate's invariant, and a loud rejection
+/// costs nothing on a path that is not hot.
+fn full_sync_reserved_by_capture(writer: &ExactRawDpcPlanWriter, ordinal: u32) -> bool {
+    writer.capture().full_sync_boundaries().len() > ordinal as usize
 }
 
 /// Push every command in one already-decoded raw-DPC stream into `writer`,
@@ -573,9 +664,15 @@ fn tile_slot(index: TileIndex) -> usize {
 /// flat word image of the submission `decoded` was decoded from
 /// (`writer.capture().submission().command_words()`); `layout` is that same
 /// capture's memory layout. Returns the first unadmitted command
-/// encountered, if any -- v11's frozen scope is TMEM-only,
-/// no-FullSync, no-guest-write, so any other decoded command kind is a loud
-/// rejection, not a silent omission. The writer retains every command
+/// encountered, if any -- the admitted scope is the exact list
+/// [`UnadmittedRawDpcCommand`]'s own doc enumerates (the TMEM
+/// staging/load commands, the nine pure-RDP-state commands, `RawTriangle`,
+/// `TextureRectangle`, `FillRectangle`, and `FullSync`; `NoOp` is admitted
+/// and discarded), so any other decoded command kind is a loud rejection,
+/// not a silent omission. That type's doc is authoritative; do not restate
+/// the list here, where it would drift out of date -- an earlier
+/// "TMEM-only, no-FullSync, no-guest-write" wording survived several scope
+/// widenings and misdirected a live diagnosis. The writer retains every command
 /// pushed before the rejection; the caller must not call `finish` on a
 /// writer this function rejected against, since the resulting plan would
 /// silently omit the unadmitted command's semantics.
@@ -624,6 +721,21 @@ pub fn push_decoded_raw_dpc(
     // never this plan's final value.
     let mut current_other_mode: Option<OtherMode> = decoded.base_state.other_mode();
 
+    // The staged `SetColorImage`/`SetFillColor` *values* (not merely their
+    // `RdpStateIdentity`s, which `tracker` already carries) current at the
+    // walk's position. An admitted `FillRectangle` copies both onto its own
+    // neutral command so the execution-time color-target identity is derived
+    // from the same values plan time used, rather than re-tracked
+    // independently at the far end.
+    //
+    // Seeded from `decoded.base_state` for the same reason
+    // `current_other_mode` is: a `FillRectangle` may legitimately depend on
+    // a `SetColorImage` issued by an earlier submission. `plan_fill`'s own
+    // admission gate reads the identical durable state, so a fill this loop
+    // sees is one `plan_fill` already proved has both staged.
+    let mut current_color_image: Option<crate::ColorImage> = decoded.base_state.color_image();
+    let mut current_fill_color: Option<crate::FillColor> = decoded.base_state.fill_color();
+
     // The journal's ordered access list opens with one `CommandDecode` read
     // access per source stream (`decode_from_state` pushes these before it
     // ever walks a command), *before* any TMEM source/destination pair. T1's
@@ -650,8 +762,9 @@ pub fn push_decoded_raw_dpc(
         // fixed-2-word slicer, or a texture rectangle's payload would be
         // silently truncated from 4 words to 2. `NoOp` and the two rejected
         // kinds below (`FillRectangle`/`FullSync`) never reach a
-        // `push_state`/`push_triangle` call, so slicing them with the
-        // fixed-2-word reader (their own wire shape) is harmless -- their
+        // `push_state`/`push_triangle` call, and `FullSync` is itself a
+        // fixed 2-word command, so slicing all three with the fixed-2-word
+        // reader (their own wire shape) is exact. `NoOp`'s
         // `raw_words`/`location` values are computed but discarded.
         let raw_words = if matches!(
             command.kind(),
@@ -751,6 +864,7 @@ pub fn push_decoded_raw_dpc(
                 let after = RdpStateIdentity::of_color_image(neutral);
                 let before = tracker.color_image;
                 tracker.color_image = Some(after);
+                current_color_image = Some(image);
                 writer.push_state(RdpStateCommand::SetColorImage {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -764,6 +878,7 @@ pub fn push_decoded_raw_dpc(
                 let after = RdpStateIdentity::of_fill_color(neutral);
                 let before = tracker.fill_color;
                 tracker.fill_color = Some(after);
+                current_fill_color = Some(value);
                 writer.push_state(RdpStateCommand::SetFillColor {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -824,6 +939,19 @@ pub fn push_decoded_raw_dpc(
                     after,
                 });
             }
+            RawDpcCommandKind::SetScissor(value) => {
+                let neutral = neutral_scissor(value);
+                let after = RdpStateIdentity::of_scissor(neutral);
+                let before = tracker.scissor;
+                tracker.scissor = Some(after);
+                writer.push_state(RdpStateCommand::SetScissor {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    scissor: neutral,
+                    before,
+                    after,
+                });
+            }
             RawDpcCommandKind::SetPrimDepth(value) => {
                 let neutral = neutral_prim_depth(value);
                 let after = RdpStateIdentity::of_prim_depth(neutral);
@@ -861,12 +989,47 @@ pub fn push_decoded_raw_dpc(
                 let decoded = decode_triangle_vertices(&triangle, other_mode.texture_perspective());
                 let vertices =
                     core::array::from_fn(|index| neutral_triangle_vertex(decoded.vertex(index)));
+                // **An executable raw triangle now declares a per-scanline write
+                // run, and this is where the decoder's own access slice is
+                // pushed into the writer.**
+                //
+                // Same contract as the `TEXTURE_RECTANGLE` arm below and
+                // `push_fill_rectangle` above: the slice is the DECODER's,
+                // read back out of the resource plan by
+                // `bind_texture_rectangle` (which is keyed on the command
+                // index and is kind-agnostic), never re-derived from the
+                // triangle's geometry here. A second independent derivation
+                // is exactly the drift `ExactRawDpcPlanWriter::finish`'s
+                // access-for-access check exists to catch.
+                //
+                // An empty slice means this triangle declared no destination
+                // write -- outside `plan_raw_triangle`'s executable subset,
+                // no staged `SetColorImage`, Fill cycle, or a covered row
+                // outside installed RDRAM. That is `None`, not a zero-count
+                // span: "declared nothing" and "declared zero accesses" must
+                // not be the same value.
+                let triangle_accesses = resource_plan
+                    .bind_texture_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                // Read off the writer's own access list BEFORE this
+                // command's accesses are appended: `first_access_index` is
+                // where they are about to land.
+                let triangle_span = if triangle_accesses.is_empty() {
+                    None
+                } else {
+                    Some(fn64_render::TriangleAccessSpan {
+                        first_access_index: writer.access_count(),
+                        access_count: triangle_accesses.len() as u32,
+                    })
+                };
+                writer.push_texture_rectangle_accesses(triangle_accesses);
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
                     vertices,
                     source: TriangleSource::RawTriangle,
                     viewport: None,
+                    texrect_accesses: triangle_span,
                 });
             }
             RawDpcCommandKind::TextureRectangle(rectangle) => {
@@ -916,12 +1079,51 @@ pub fn push_decoded_raw_dpc(
                 // plain `Box<[u32]>` field shape -- a rectangle's wire words
                 // are a handful of `u32`s, so this is not a hot-path
                 // allocation concern.
+                // The rectangle's destination writes come first, so
+                // `writer.accesses` stays in the decoder's own order: the
+                // decoder pushed these at the point it decoded this command,
+                // and `ExactRawDpcPlanWriter::finish` compares the two lists
+                // position by position. The slice is the decoder's own,
+                // never re-derived here -- the same contract
+                // `push_fill_rectangle`'s doc states.
+                let texrect_accesses = resource_plan
+                    .bind_texture_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                // The span is read off the writer's own access list
+                // *before* this command's accesses are appended, exactly as
+                // `push_fill_rectangle`'s caller does: `first_access_index`
+                // is where they are about to land, and `access_count` is
+                // how many the decoder's slice carries. Both are taken from
+                // the one slice `bind_texture_rectangle` returned -- never
+                // re-derived from the rectangle's geometry, which would be
+                // the second independent derivation `finish`'s
+                // access-for-access check exists to catch.
+                //
+                // An empty slice means this texrect declared no destination
+                // write (no staged `SetColorImage`, unsupported format,
+                // fractional/reversed rectangle, or flip -- see
+                // `plan_texture_rectangle`). That is `None`, not a
+                // zero-count span: "declared nothing" and "declared zero
+                // accesses" must not be the same value.
+                let texrect_span = if texrect_accesses.is_empty() {
+                    None
+                } else {
+                    Some(fn64_render::TriangleAccessSpan {
+                        first_access_index: writer.access_count(),
+                        access_count: texrect_accesses.len() as u32,
+                    })
+                };
+                writer.push_texture_rectangle_accesses(texrect_accesses);
+                // Both halves carry the identical span: it describes the
+                // originating wire command, not either half's share. A
+                // consumer must attribute it once per command.
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.clone().into_boxed_slice(),
                     vertices: first,
                     source: TriangleSource::TextureRectangle,
                     viewport: Some(vertices.viewport),
+                    texrect_accesses: texrect_span,
                 });
                 writer.push_triangle(RdpTriangleCommand {
                     location,
@@ -929,16 +1131,151 @@ pub fn push_decoded_raw_dpc(
                     vertices: second,
                     source: TriangleSource::TextureRectangle,
                     viewport: Some(vertices.viewport),
+                    texrect_accesses: texrect_span,
                 });
             }
             RawDpcCommandKind::NoOp { .. } => {}
-            other @ (RawDpcCommandKind::FillRectangle(_) | RawDpcCommandKind::FullSync(_)) => {
-                return Err(UnadmittedRawDpcCommand {
-                    command_index,
-                    location: old_location,
-                    opcode_name: opcode_name(&other),
+            RawDpcCommandKind::FillRectangle(rectangle) => {
+                // Narrow admission. `plan_fill` has already refused every
+                // fill this backend cannot execute -- Copy cycle, missing
+                // `SetColorImage` (or `SetFillColor` in Fill cycle), a non-RGBA16/32
+                // color image, fractional or reversed edges, a rectangle
+                // wider than the staged image, or a write outside installed
+                // RDRAM -- as a `RawDpcDecodeError::InvalidCommand` before
+                // this loop ever runs. Reaching this arm therefore means the
+                // decoder already proved the fill admissible; nothing is
+                // silently downgraded to a zero-write no-op here.
+                //
+                // The access slice comes from the decoder's own recorded
+                // span, never re-derived: `ExactRawDpcPlanWriter::finish`
+                // proves the pushed accesses equal the journal's one for
+                // one, and a second independent derivation of the same
+                // geometry would turn that sealed guarantee into a runtime
+                // coin flip.
+                // Every admitted fill has a declared span. A missing or
+                // malformed span is therefore a decoder/resource-plan
+                // disagreement and remains a loud rejection here.
+                let (span, accesses) = resource_plan
+                    .bind_fill_rectangle(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                let Some(color_image) = current_color_image else {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
+                };
+                let neutral_image = neutral_color_image(color_image, layout);
+                let neutral_fill = current_fill_color.map(neutral_fill_color);
+                if current_other_mode
+                    .is_some_and(|mode| mode.cycle_type() == crate::CycleType::Fill)
+                    && neutral_fill.is_none()
+                {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
                 }
-                .into());
+                let after = RdpStateIdentity::of_color_image(neutral_image);
+                // **The colour-image seed read, mirrored into the writer at
+                // the same position the decoder pushed it.**
+                //
+                // `finish`'s check is access-for-access against the real
+                // journal, so an access the decoder declared and the writer
+                // omitted is a hard count mismatch -- which is exactly what
+                // this arm produced before the mirror was added ("accumulated
+                // access count is 5; exact journal requires 6").
+                //
+                // Pushed BEFORE `push_fill_rectangle`, because `plan_fill`
+                // pushes the seed before `plan_render_target_rows` pushes the
+                // write span, and the two orders have to agree.
+                let seed_access_index = resource_plan
+                    .bind_fill_seed(command_index)
+                    .map_err(PushDecodedRawDpcError::FillAccessSpan)?;
+                if let Some(seed_index) = seed_access_index {
+                    let access = resource_plan
+                        .accesses()
+                        .get(seed_index as usize)
+                        .copied()
+                        .ok_or(PushDecodedRawDpcError::FillAccessSpan(
+                            FillAccessSpanError::AccessSliceOutOfBounds { command_index },
+                        ))?;
+                    writer.push_command_decode_access(access);
+                }
+                writer.push_fill_rectangle(
+                    RdpFillRectangleCommand {
+                        location,
+                        raw_words: raw_words.into_boxed_slice(),
+                        upper_left_x: rectangle.upper_left_x(),
+                        upper_left_y: rectangle.upper_left_y(),
+                        lower_right_x: rectangle.lower_right_x(),
+                        lower_right_y: rectangle.lower_right_y(),
+                        color_image: neutral_image,
+                        fill_color: neutral_fill,
+                        first_access_index: span.first_access_index(),
+                        access_count: span.count(),
+                        // A fill that declared a span always declared a seed
+                        // record too -- `plan_fill` pushes both or neither --
+                        // so a missing record is a decoder bug and stays a
+                        // loud rejection rather than being absorbed into
+                        // `None`, which would silently mean "full extent,
+                        // needs no seed".
+                        seed_access_index,
+                        before: tracker.color_image,
+                        after,
+                    },
+                    accesses,
+                );
+            }
+            RawDpcCommandKind::FullSync(occurrence) => {
+                // Site-only admission. Reaching this arm means the decoder
+                // already found a capture-time `FullSyncBoundary` at exactly
+                // this stream offset and proved its chunk/source identity
+                // matches (`raw_dpc::mod`'s `FULL_SYNC` arm rejects both
+                // failures as `InvalidCommand` before this loop runs), so the
+                // boundary carried below is the decoder's own, not one
+                // re-derived here.
+                //
+                // A capture can only carry a boundary through
+                // `OwnedRawDpcCapture::with_full_sync_boundaries`, whose
+                // contract requires the producer to have reserved the sole DP
+                // completion slot via the nonmutating
+                // `DeviceFabric::preflight_dp_full_sync` before building it.
+                // `OwnedRawDpcCapture::new` installs an empty list, so a
+                // producer that never reserved cannot reach this arm at all:
+                // its stream derivation fails with
+                // `MissingFullSyncObservation` before decode.
+                //
+                // NONCLAIM. Admitting the site claims the opcode was walked
+                // and the slot was free. It claims nothing about a DP
+                // interrupt being raised or observed. The only observation
+                // claim in the whole path is
+                // `occurrence.interrupt_after == Asserted`, carried verbatim
+                // below and never synthesized here -- see `RdpFullSyncSite`.
+                let dp_slot_reserved = full_sync_reserved_by_capture(writer, occurrence.ordinal);
+                if !dp_slot_reserved {
+                    return Err(UnadmittedRawDpcCommand {
+                        command_index,
+                        location: old_location,
+                        opcode_name: opcode_name(&command.kind()),
+                    }
+                    .into());
+                }
+                writer.push_full_sync_site(fn64_render::RdpFullSyncSite {
+                    location,
+                    raw_words: raw_words.into_boxed_slice(),
+                    ordinal: occurrence.ordinal,
+                    boundary: fn64_render_ir::FullSyncBoundary::new(
+                        occurrence.sequence,
+                        occurrence.interrupt_sequence,
+                        occurrence.interrupt_before,
+                        occurrence.interrupt_after,
+                    ),
+                    dp_slot_reserved,
+                });
             }
         }
     }
@@ -961,16 +1298,24 @@ fn push_tmem_load(
 
     let source_accesses = bound.source_accesses();
     let destination_accesses = bound.destination_accesses();
-    assert_eq!(
-        source_accesses.len(),
-        1,
-        "v11's admitted TMEM source plan is exactly one journal access wide"
+    // The source union spans one access per source *row* for every
+    // partial-width `LoadTile` -- `tmem::wire::decode_load_tile`'s
+    // `(low_t..=high_t)` arm emits one `TmemLoadSource` read per row, and
+    // only a load whose columns cover the full texture-image width takes
+    // the collapsed single-range arm above it. WM2000's first textured
+    // load is a 49-row sub-rectangle, so 49 accesses is the mainstream
+    // case, not an exotic one. `TmemLoadSemantics::sources` carries the
+    // whole run and `push_tmem_load` pushes all of it, in the decoder's
+    // exact journal order, before the destination -- see that method's own
+    // doc for why the ordering is load-bearing.
+    assert!(
+        !source_accesses.is_empty(),
+        "a TMEM load always reads at least one source access"
     );
     assert!(
         !destination_accesses.is_empty(),
         "a TMEM load always writes at least one destination access"
     );
-    let source = source_accesses[0];
     // The destination union can span more than one journal access (the
     // canonical sorted/disjoint fragment set `destination_ranges` computes,
     // e.g. the low/high split-bank halves an odd-row exchange produces).
@@ -1009,7 +1354,7 @@ fn push_tmem_load(
         load.tile().get(),
         neutral_texture_image(load.source_image(), location.source_address.layout()),
         neutral_tile_descriptor(load.tile_descriptor()),
-        source,
+        source_accesses.to_vec(),
         source_access_index,
         destination,
         destination_access_index,
@@ -1028,6 +1373,20 @@ fn push_tmem_load(
 
 #[cfg(test)]
 mod tests {
+    /// An admitted fill must bind its declared span directly. In particular,
+    /// `FillNotDeclared` must not be absorbed into a zero-write command.
+    #[test]
+    fn fill_not_declared_is_not_absorbed_by_the_fill_rectangle_arm() {
+        let source = include_str!("production_adapter.rs");
+        let arm = source
+            .split("RawDpcCommandKind::FillRectangle(rectangle) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("RawDpcCommandKind::FullSync").next())
+            .expect("FillRectangle adapter arm");
+        assert!(arm.contains(".bind_fill_rectangle(command_index)"));
+        assert!(!arm.contains("FillNotDeclared"));
+    }
+
     use fn64_render::{
         new_raw_dpc_roles, ExactRawDpcPlanVisitor, OwnedRawDpcCapture, OwnedRawDpcSubmission,
         RawDpcSemanticCommandRef, TmemLoadShape,
@@ -1049,9 +1408,7 @@ mod tests {
     const LOAD_TILE: u8 = 0x34;
     const LOAD_TLUT: u8 = 0x30;
 
-    fn word(opcode: u8, payload: u32) -> u32 {
-        u32::from(opcode) << 24 | payload
-    }
+    use crate::wire_words::word;
 
     fn set_texture_image(format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
         [
@@ -1081,6 +1438,11 @@ mod tests {
     const SET_FOG_COLOR: u8 = 0x38;
     const SET_PRIM_DEPTH: u8 = 0x2e;
     const SET_COMBINE: u8 = 0x3c;
+    /// Spelled independently of the decoder's own `SET_SCISSOR`, exactly
+    /// like every sibling above -- so a typo in either one is caught by
+    /// `set_scissor_is_admitted_and_matches_the_decoded_command` rather
+    /// than cancelling out.
+    const SET_SCISSOR: u8 = 0x2d;
 
     fn set_other_mode(cycle_type: u32, low: u32) -> [u32; 2] {
         [word(SET_OTHER_MODE, cycle_type << 20), low]
@@ -1117,6 +1479,15 @@ mod tests {
         [word(SET_PRIM_DEPTH, 0), z << 16 | dz]
     }
 
+    /// `SetScissor` wire words: `w0` payload packs `ulx << 12 | uly`, `w1`
+    /// packs `mode << 24 | lrx << 12 | lry`.
+    fn set_scissor(mode: u32, ulx: u32, uly: u32, lrx: u32, lry: u32) -> [u32; 2] {
+        [
+            word(SET_SCISSOR, ulx << 12 | uly),
+            mode << 24 | lrx << 12 | lry,
+        ]
+    }
+
     /// `CombineParams::from_wire(w0, w1)` stores `w0` unmasked -- the opcode
     /// byte `word()` bakes into the top 8 bits stays part of `low`, matching
     /// RT64's `combineL = combine & 0xFFFFFFFF` (`combiner.rs` module doc).
@@ -1135,11 +1506,18 @@ mod tests {
     /// the legacy multi-stream `WorkloadPacket` constructor those tests use.
     const FULL_SYNC: u8 = 0x29;
 
-    /// Every full-sync boundary this fixture's `words` observes, derived the
+    /// Every full-sync boundary this fixture's `words` requires, derived the
     /// same way `raw_dpc::mod::tests`'s own `packet()` helper does: scan
     /// each 2-word command slot for the `FULL_SYNC` opcode byte and record
     /// its exact stream/source position. `preflight_raw_dpc_capture` has no
     /// auto-derivation of its own -- a caller must supply this list.
+    ///
+    /// `interrupt_after` is `Clear`, matching what the real ABI producer
+    /// (`rsp_commit.rs`'s `try_dispatch_raw_dpc_via_session`) supplies: it
+    /// reserves the DP completion slot but cannot observe the interrupt,
+    /// which the device fabric raises only on a later `advance_to`. A
+    /// fixture claiming `Asserted` would be testing an observation the
+    /// production path does not make.
     fn full_sync_boundaries(words: &[u32]) -> Vec<fn64_render_ir::FullSyncBoundary> {
         words
             .chunks_exact(2)
@@ -1150,7 +1528,7 @@ mod tests {
                     2 + ordinal as u64 * 2,
                     3 + ordinal as u64 * 2,
                     fn64_render_ir::DpInterruptState::Clear,
-                    fn64_render_ir::DpInterruptState::Asserted,
+                    fn64_render_ir::DpInterruptState::Clear,
                 )
             })
             .collect()
@@ -1179,11 +1557,18 @@ mod tests {
         let full_syncs = full_sync_boundaries(&words);
         let submission =
             OwnedRawDpcSubmission::from_rdram_words(COMMAND_START, end, words.clone()).unwrap();
-        let capture = OwnedRawDpcCapture::new(
+        // Carry the boundaries on the capture itself, not only into
+        // `finalize_ticket`. `push_decoded_raw_dpc` reads
+        // `writer.capture().full_sync_boundaries()` to prove the producer
+        // took the reserve half, so a fixture that supplied them to the
+        // ticket alone would exercise the narrowed rejection instead of the
+        // site admission it means to test.
+        let capture = OwnedRawDpcCapture::with_full_sync_boundaries(
             submission,
             layout,
             7,
             TemporalBoundary::new(1, fn64_render_ir::DpInterruptState::Clear),
+            full_syncs.clone(),
         );
 
         // The real journal (which includes every TMEM destination access
@@ -1306,6 +1691,7 @@ mod tests {
         loads: Vec<TmemLoadSemantics>,
         states: Vec<RdpStateCommand>,
         triangles: Vec<fn64_render::RdpTriangleCommand>,
+        full_sync_sites: Vec<fn64_render::RdpFullSyncSite>,
         accesses: Vec<fn64_render_ir::ResourceAccess>,
     }
 
@@ -1316,6 +1702,9 @@ mod tests {
                 RawDpcSemanticCommandRef::State(state) => self.states.push(state.clone()),
                 RawDpcSemanticCommandRef::Triangle(triangle) => {
                     self.triangles.push(triangle.clone());
+                }
+                RawDpcSemanticCommandRef::FullSyncSite(site) => {
+                    self.full_sync_sites.push(site.clone());
                 }
                 other => unreachable!(
                     "RawDpcSemanticCommandRef gained a variant this test doesn't know about: \
@@ -1503,6 +1892,252 @@ mod tests {
             plan_destination_accesses,
             expected_destination_accesses.as_slice(),
             "every split-bank destination fragment must be pushed, in order, not just the first"
+        );
+    }
+
+    /// Hand-derived multi-row `LoadTile` fixture matching the shape
+    /// WM2000's first textured load takes: a **partial-width**
+    /// sub-rectangle of a wider texture image, which
+    /// `tmem::wire::decode_load_tile` splits into **one `TmemLoadSource`
+    /// read per row**.
+    ///
+    /// Geometry, derived from the wire fields rather than captured from a
+    /// run: the texture image is RGBA/16-bit (2 bytes per texel) and 64
+    /// texels wide; the tile bounds are S in `[0, 31]` and T in `[0, 48]`.
+    /// The S span is 32 texels, which is *not* the image's full 64-texel
+    /// width, so the collapsed single-range arm does not apply. The T span
+    /// is `48 - 0 + 1 = `**`49`** rows, so the decoder emits 49 source
+    /// accesses of `32 * 2 = 64` bytes each: 3,136 source bytes total.
+    /// Row `t` starts at texel `t * 64`, i.e. byte `0x200 + t * 128`, so
+    /// the rows are disjoint and non-contiguous -- exactly why they cannot
+    /// collapse into one range.
+    const MULTI_ROW_IMAGE_WIDTH: u32 = 64;
+    const MULTI_ROW_HIGH_S: u32 = 31;
+    const MULTI_ROW_HIGH_T: u32 = 48;
+    const MULTI_ROW_EXPECTED_SOURCES: usize = (MULTI_ROW_HIGH_T + 1) as usize;
+    const MULTI_ROW_BYTES_PER_ROW: u32 = (MULTI_ROW_HIGH_S + 1) * 2;
+
+    /// Builds the fixture described above. Returns the decoded capture plus
+    /// the journal the decoder itself asked for.
+    fn multi_row_load_tile_fixture() -> (DecodedRawDpc, OwnedRawDpcCapture, ResourceJournal) {
+        let mut words = Vec::new();
+        // RGBA (format 0), 16-bit (size 2), 64 texels wide, base 0x200.
+        words.extend(set_texture_image(0, 2, MULTI_ROW_IMAGE_WIDTH, 0x200));
+        // `line` is in 64-bit TMEM words per row: 64 source bytes = 8 words.
+        words.extend(set_tile(7, 8, 0));
+        // Wire coordinate fields are 10.2 fixed point; `integer()` is
+        // `raw >> 2`, so the integer bounds shift left by two.
+        words.extend(set_tile_size(
+            7,
+            MULTI_ROW_HIGH_S << 2,
+            MULTI_ROW_HIGH_T << 2,
+        ));
+        words.extend(load_sync());
+        words.extend([
+            word(LOAD_TILE, 0),
+            7 << 24 | (MULTI_ROW_HIGH_S << 2) << 12 | (MULTI_ROW_HIGH_T << 2),
+        ]);
+        // The probe source range only has to be in bounds; the harness
+        // rediscovers the decoder's real 49-access journal via
+        // `JournalMismatch::expected`.
+        decode_admitted_capture(words, (0x200, 0x1a40))
+    }
+
+    /// Positive control for every multi-source test below: prove the
+    /// fixture really is a 49-row load whose source rows are disjoint and
+    /// non-adjacent, so none of those tests can pass vacuously against a
+    /// load that collapsed to a single access.
+    #[test]
+    fn multi_row_load_tile_fixture_really_declares_forty_nine_disjoint_source_rows() {
+        let (decoded, _, _) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let bound = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap();
+        let sources = bound.source_accesses();
+
+        assert_eq!(
+            sources.len(),
+            MULTI_ROW_EXPECTED_SOURCES,
+            "hand-derived row count: high_t - low_t + 1 = 48 - 0 + 1"
+        );
+        assert_eq!(
+            source_load.transfer_plan().unwrap().row_count() as usize,
+            MULTI_ROW_EXPECTED_SOURCES,
+            "the transfer plan's own row count must agree with the source access count"
+        );
+        for access in sources {
+            assert_eq!(
+                access.region().declared_bytes(),
+                MULTI_ROW_BYTES_PER_ROW,
+                "each row reads (high_s - low_s + 1) * 2 bytes"
+            );
+            assert_eq!(access.mode(), fn64_render_ir::AccessMode::Read);
+            assert_eq!(
+                access.purpose(),
+                fn64_render_ir::AccessPurpose::TmemLoadSource
+            );
+        }
+        // Disjoint AND non-adjacent: consecutive row starts differ by the
+        // full image stride (128 bytes), not by the 64 bytes each row
+        // reads. A gap between every pair is precisely what makes a
+        // single collapsed range wrong.
+        let starts: Vec<u32> = sources
+            .iter()
+            .map(|access| match access.region() {
+                fn64_render_ir::ResourceRegion::Rdram { range, .. } => range.start().get(),
+                other => panic!("TMEM source must be an RDRAM read, got {other:?}"),
+            })
+            .collect();
+        for pair in starts.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                MULTI_ROW_IMAGE_WIDTH * 2,
+                "rows advance by the image stride, leaving a gap a collapsed range would swallow"
+            );
+        }
+        assert!(
+            MULTI_ROW_IMAGE_WIDTH * 2 > MULTI_ROW_BYTES_PER_ROW,
+            "the fixture is only a positive control if the stride really exceeds the row"
+        );
+    }
+
+    /// The defect this card fixes: `push_tmem_load` used to assert the
+    /// source plan was exactly one journal access wide, aborting on any
+    /// partial-width `LoadTile`. Every source access must now reach the
+    /// plan, and `TmemLoadSemantics::sources` must carry all of them.
+    #[test]
+    fn multi_row_load_tile_admits_every_source_access() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let expected_sources = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap()
+            .source_accesses()
+            .to_vec();
+
+        let plan = push_and_visit(&decoded, capture, journal);
+
+        assert_eq!(plan.loads.len(), 1);
+        let load = &plan.loads[0];
+        assert_eq!(
+            load.sources(),
+            expected_sources.as_slice(),
+            "the neutral load must carry the decoder's whole ordered source run"
+        );
+        assert_eq!(load.sources().len(), MULTI_ROW_EXPECTED_SOURCES);
+        assert_eq!(
+            load.source(),
+            expected_sources[0],
+            "`source()` still names the first fragment"
+        );
+    }
+
+    /// **Journal ordering.** `fn64_render_ir::validate_effects` compares a
+    /// backend's writes against the journal position by position under an
+    /// equal-length precondition, so the order the writer pushes accesses
+    /// in is load-bearing, not cosmetic. This pins the exact positional
+    /// layout: `[CommandDecode, source_0 .. source_48, destination_0 ..]`.
+    ///
+    /// Two different orders give observably different results here: the
+    /// per-position comparison against `expected_sources` below fails if
+    /// the sources are pushed after the destination, if they are reversed,
+    /// or if only the first is pushed -- see the mutation tests in
+    /// `render_ir.rs` that perturb exactly those.
+    #[test]
+    fn multi_row_load_tile_pushes_sources_before_destinations_in_journal_order() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let RawDpcCommandKind::LoadTile(source_load) = decoded.commands()[4].kind() else {
+            panic!("expected LoadTile");
+        };
+        let bound = decoded
+            .resource_plan()
+            .bind_tmem_transfer(source_load)
+            .unwrap();
+        let expected_sources = bound.source_accesses().to_vec();
+        let expected_destinations = bound.destination_accesses().to_vec();
+
+        let plan = push_and_visit(&decoded, capture, journal.clone());
+        let load = &plan.loads[0];
+
+        // Position 0 is the command-decode read; the source run starts at 1.
+        assert_eq!(load.source_access_index(), 1);
+        assert_eq!(
+            &plan.accesses[1..1 + expected_sources.len()],
+            expected_sources.as_slice(),
+            "sources occupy one contiguous run, in decoder order, before any destination"
+        );
+        // Destinations follow immediately -- never interleaved, never first.
+        let destination_start = 1 + expected_sources.len();
+        assert_eq!(load.destination_access_index() as usize, destination_start);
+        assert_eq!(
+            &plan.accesses[destination_start..],
+            expected_destinations.as_slice(),
+            "every destination fragment follows the whole source run, in order"
+        );
+
+        // The whole access list must equal the journal the decoder itself
+        // asked for, position for position. `finish` already enforces this
+        // (it is why the old assert aborted rather than mis-committing),
+        // but pinning it here names the property the ordering protects.
+        assert_eq!(
+            plan.accesses.as_slice(),
+            journal.accesses(),
+            "the plan's access list is the journal, position for position"
+        );
+
+        // Each source access's operation id is consecutive, which is the
+        // fact `destination_access_run`-style contiguity scans rely on.
+        for (offset, access) in expected_sources.iter().enumerate() {
+            assert_eq!(
+                access.operation().get(),
+                expected_sources[0].operation().get() + offset as u32
+            );
+        }
+    }
+
+    /// Every transfer word must bind to a real source access in the run,
+    /// with an offset that lies inside *that row's* bytes -- not inside a
+    /// flattened concatenation of all 49. This is the fact
+    /// `production::word_source_bytes` depends on to slice the right row.
+    #[test]
+    fn multi_row_load_tile_transfer_words_bind_within_their_own_source_row() {
+        let (decoded, capture, journal) = multi_row_load_tile_fixture();
+        let plan = push_and_visit(&decoded, capture, journal);
+        let load = &plan.loads[0];
+
+        let first = load.source_access_index();
+        let mut seen = vec![false; load.sources().len()];
+        for word in load.transfer_words() {
+            let relative = word
+                .source_access_index
+                .checked_sub(first)
+                .expect("a transfer word never names an access before the load's own run");
+            let index = relative as usize;
+            assert!(
+                index < load.sources().len(),
+                "word {} names source access {relative} beyond the {}-access run",
+                word.index,
+                load.sources().len()
+            );
+            seen[index] = true;
+            let row_bytes = load.sources()[index].region().declared_bytes();
+            let defined = word.defined_source_byte_mask.count_ones();
+            assert!(
+                word.source_access_byte_offset + defined <= row_bytes,
+                "word {} reads past the end of its own {row_bytes}-byte source row",
+                word.index
+            );
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "every one of the 49 source rows must be read by at least one transfer word"
         );
     }
 
@@ -2019,6 +2654,357 @@ mod tests {
         assert!(before.is_none());
     }
 
+    // -- SetScissor (tracked state only) --------------------------------
+
+    #[test]
+    fn set_scissor_is_admitted_and_matches_the_decoded_command() {
+        // ulx = 0x0A0 (160), uly = 0x0B0 (176), lrx = 0x0C0 (192),
+        // lry = 0x0D0 (208), mode = 1 -- hand-derived, each inside its own
+        // 12-bit (coordinate) or 2-bit (mode) field.
+        let words = set_scissor(1, 0x0A0, 0x0B0, 0x0C0, 0x0D0).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words.clone(), (0x214, 0x224));
+        let RawDpcCommandKind::SetScissor(source) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(
+            plan.states.len(),
+            1,
+            "SetScissor must reach the plan as a state command, exactly as SetFogColor does"
+        );
+        let RdpStateCommand::SetScissor {
+            raw_words,
+            scissor,
+            before,
+            after,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(raw_words.as_ref(), words.as_slice());
+        assert_eq!(*scissor, neutral_scissor(source));
+        assert!(
+            before.is_none(),
+            "first SetScissor in the plan has no prior"
+        );
+        assert_eq!(*after, RdpStateIdentity::of_scissor(*scissor));
+
+        // Hand-derived field values, independent of the decoder.
+        assert_eq!(scissor.mode, 1);
+        assert_eq!(scissor.upper_left_x, 0x0A0);
+        assert_eq!(scissor.upper_left_y, 0x0B0);
+        assert_eq!(scissor.lower_right_x, 0x0C0);
+        assert_eq!(scissor.lower_right_y, 0x0D0);
+    }
+
+    #[test]
+    fn set_scissor_pushes_zero_resource_accesses() {
+        // A pure state command, like SetFogColor: it plans no reads and no
+        // writes of its own, so it can neither touch RDRAM nor reorder
+        // anything that does. Both fixtures are one two-word command, so
+        // even the command-decode read spans match byte for byte.
+        let words = set_scissor(0, 0, 0, 320 * 4, 240 * 4).to_vec();
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        let fog_words = set_fog_color(0x11223344).to_vec();
+        let (fog_decoded, fog_capture, fog_journal) =
+            decode_admitted_capture(fog_words, (0x214, 0x224));
+        let fog_plan = push_and_visit(&fog_decoded, fog_capture, fog_journal);
+        assert_eq!(
+            plan.accesses, fog_plan.accesses,
+            "SetScissor must declare exactly the accesses a SetFogColor does -- none of its own"
+        );
+    }
+
+    #[test]
+    fn set_scissor_threads_before_after_identity_across_two_occurrences() {
+        let mut words = Vec::new();
+        words.extend(set_scissor(0, 0, 0, 320 * 4, 240 * 4));
+        words.extend(set_scissor(1, 16, 16, 300 * 4, 220 * 4));
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.states.len(), 2);
+
+        let RdpStateCommand::SetScissor {
+            before: b0,
+            after: a0,
+            scissor: v0,
+            ..
+        } = &plan.states[0]
+        else {
+            panic!("expected SetScissor first");
+        };
+        let RdpStateCommand::SetScissor {
+            before: b1,
+            after: a1,
+            scissor: v1,
+            ..
+        } = &plan.states[1]
+        else {
+            panic!("expected SetScissor second");
+        };
+        assert_ne!(v0, v1, "the fixture's two rects must differ");
+        assert!(b0.is_none());
+        assert_eq!(*b1, Some(*a0), "the second's before is the first's after");
+        assert_ne!(a0, a1, "distinct rects must hash to distinct identities");
+    }
+
+    #[test]
+    fn set_scissor_identity_is_disjoint_from_every_other_state_slot() {
+        // The all-zero rect must not collide with any other slot's all-zero
+        // value: each identity carries its own domain tag.
+        let zero = NeutralScissor {
+            mode: 0,
+            upper_left_x: 0,
+            upper_left_y: 0,
+            lower_right_x: 0,
+            lower_right_y: 0,
+        };
+        let scissor = RdpStateIdentity::of_scissor(zero);
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_fog_color(NeutralColor4 { value: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_fill_color(NeutralFillColor { value: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_combine(NeutralCombineParams { low: 0, high: 0 })
+        );
+        assert_ne!(
+            scissor,
+            RdpStateIdentity::of_prim_depth(NeutralPrimDepth { z: 0, dz: 0 })
+        );
+    }
+
+    /// **The card's core evidence.** Adding `SetScissor` commands to a
+    /// stream must leave the produced plan's rendered effect bit-identical:
+    /// every non-scissor state command, every triangle, every resource
+    /// access, and every full-sync site must be exactly what the
+    /// scissor-free stream produced, in exactly the same order.
+    ///
+    /// Because `SetScissor` is tracked state only -- it stages nothing into
+    /// `RdpState` and pushes no `ResourceAccess` -- the only differences
+    /// between the two plans may be the tracked `RdpStateCommand::SetScissor`
+    /// entries themselves and the length of the command-decode read that
+    /// covers the longer display list.
+    #[test]
+    fn admitting_set_scissor_changes_no_rendered_output() {
+        fn stream(with_scissor: bool) -> Vec<u32> {
+            let mut words = Vec::new();
+            if with_scissor {
+                words.extend(set_scissor(0, 0, 0, 320 * 4, 240 * 4));
+            }
+            words.extend(set_other_mode(3, 0)); // Fill
+            if with_scissor {
+                words.extend(set_scissor(1, 16, 16, 300 * 4, 220 * 4));
+            }
+            words.extend(set_color_image(0, 2, 8, 0x200));
+            words.extend(set_fill_color(0xf801_f801));
+            if with_scissor {
+                words.extend(set_scissor(2, 0, 0, 0xFFF, 0xFFF));
+            }
+            words.extend(set_env_color(0x11223344));
+            words.extend(set_prim_color(10, 5, 0x11223344));
+            words.extend(set_blend_color(0x55667788));
+            words.extend(set_fog_color(0x11223344));
+            words.extend(set_prim_depth(100, 200));
+            words.extend(set_combine(0x0034_5678, 0x9abc_def0));
+            if with_scissor {
+                words.extend(set_scissor(3, 4095, 4095, 4095, 4095));
+            }
+            words
+        }
+
+        fn plan_of(words: Vec<u32>) -> RecordingVisitor {
+            let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+            push_and_visit(&decoded, capture, journal)
+        }
+
+        let without = plan_of(stream(false));
+        let with = plan_of(stream(true));
+
+        // The scissor commands really are there -- otherwise every equality
+        // below is vacuous.
+        let scissor_count = with
+            .states
+            .iter()
+            .filter(|state| matches!(state, RdpStateCommand::SetScissor { .. }))
+            .count();
+        assert_eq!(scissor_count, 4, "all four SetScissor commands admitted");
+        assert!(!without
+            .states
+            .iter()
+            .any(|state| matches!(state, RdpStateCommand::SetScissor { .. })));
+
+        // Everything that can reach a pixel is identical. The only
+        // difference permitted is the tracked SetScissor entries.
+        let with_non_scissor: Vec<_> = with
+            .states
+            .iter()
+            .filter(|state| !matches!(state, RdpStateCommand::SetScissor { .. }))
+            .collect();
+        let without_states: Vec<_> = without.states.iter().collect();
+        assert_eq!(
+            with_non_scissor.len(),
+            without_states.len(),
+            "no state command may be added or dropped"
+        );
+        for (index, (left, right)) in with_non_scissor
+            .iter()
+            .zip(without_states.iter())
+            .enumerate()
+        {
+            // `location`/`raw_words` legitimately shift (the scissor words
+            // move later commands' byte offsets), so compare the variant
+            // and the staged value, which are what a consumer reads.
+            assert_eq!(
+                std::mem::discriminant(*left),
+                std::mem::discriminant(*right),
+                "state command {index} changed variant"
+            );
+            assert_eq!(
+                state_command_value_debug(left),
+                state_command_value_debug(right),
+                "state command {index} changed its staged value"
+            );
+            // The `before`/`after` identity chain must be untouched too:
+            // a SetScissor that wrote into some *other* slot's tracker
+            // entry would leave every staged value intact while silently
+            // corrupting that slot's differential history, which T3 uses
+            // to reconstruct state without rereading command bytes.
+            assert_eq!(
+                state_command_identities(left),
+                state_command_identities(right),
+                "state command {index} changed its before/after identity chain"
+            );
+        }
+
+        assert_eq!(
+            with.triangles.len(),
+            without.triangles.len(),
+            "no triangle may appear or vanish"
+        );
+
+        // Accesses: the only entry either plan declares is the
+        // `CommandDecode` read of the display list itself, and the
+        // scissored stream's is longer by exactly the four SetScissor
+        // commands' own eight bytes each -- reading more command words is
+        // not a rendered effect. Every *other* access must match exactly,
+        // which here means neither plan gained one.
+        fn command_decode_span(accesses: &[fn64_render_ir::ResourceAccess]) -> u64 {
+            let mut spans = accesses.iter().filter_map(|access| {
+                matches!(
+                    access.purpose(),
+                    fn64_render_ir::AccessPurpose::CommandDecode
+                )
+                .then(|| match access.region() {
+                    fn64_render_ir::ResourceRegion::Rdram { range, .. } => {
+                        u64::from(range.end()) - u64::from(range.start().get())
+                    }
+                    other => panic!("CommandDecode read an unexpected region: {other:?}"),
+                })
+            });
+            let span = spans
+                .next()
+                .expect("every plan reads its own command words");
+            assert!(spans.next().is_none(), "exactly one CommandDecode access");
+            span
+        }
+
+        let non_decode = |accesses: &[fn64_render_ir::ResourceAccess]| {
+            accesses
+                .iter()
+                .filter(|access| {
+                    !matches!(
+                        access.purpose(),
+                        fn64_render_ir::AccessPurpose::CommandDecode
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            non_decode(&with.accesses),
+            non_decode(&without.accesses),
+            "SetScissor must declare no resource access of its own beyond the command read"
+        );
+        assert_eq!(
+            command_decode_span(&with.accesses),
+            command_decode_span(&without.accesses) + 4 * 8,
+            "the command-decode read grows by exactly the four SetScissor commands' own bytes"
+        );
+
+        assert_eq!(with.full_sync_sites, without.full_sync_sites);
+        assert_eq!(with.loads, without.loads);
+    }
+
+    /// The `before`/`after` identity pair one state command threads through
+    /// its own slot. `SyncLoad` has no identity pair (it threads TMEM load
+    /// epochs instead), so it reports `None`.
+    ///
+    /// Deliberately an **exhaustive** match with no `_` arm, for the same
+    /// reason [`state_command_value_debug`] is.
+    fn state_command_identities(
+        command: &RdpStateCommand,
+    ) -> Option<(Option<RdpStateIdentity>, RdpStateIdentity)> {
+        match command {
+            RdpStateCommand::SetOtherMode { before, after, .. }
+            | RdpStateCommand::SetColorImage { before, after, .. }
+            | RdpStateCommand::SetFillColor { before, after, .. }
+            | RdpStateCommand::SetEnvColor { before, after, .. }
+            | RdpStateCommand::SetPrimColor { before, after, .. }
+            | RdpStateCommand::SetBlendColor { before, after, .. }
+            | RdpStateCommand::SetFogColor { before, after, .. }
+            | RdpStateCommand::SetPrimDepth { before, after, .. }
+            | RdpStateCommand::SetCombine { before, after, .. }
+            | RdpStateCommand::SetScissor { before, after, .. }
+            | RdpStateCommand::SetTile { before, after, .. }
+            | RdpStateCommand::SetTileSize { before, after, .. }
+            | RdpStateCommand::SetTextureImage { before, after, .. } => Some((*before, *after)),
+            RdpStateCommand::SyncLoad { .. } => None,
+        }
+    }
+
+    /// The staged value of one state command, excluding `location` and
+    /// `raw_words` (both of which legitimately shift when other commands
+    /// are inserted ahead of them in the stream).
+    ///
+    /// Deliberately an **exhaustive** match with no `_` arm: a future
+    /// `RdpStateCommand` variant must be classified here explicitly rather
+    /// than silently escaping the no-pixel-change comparison above.
+    fn state_command_value_debug(command: &RdpStateCommand) -> String {
+        match command {
+            RdpStateCommand::SetOtherMode { other_mode, .. } => format!("{other_mode:?}"),
+            RdpStateCommand::SetColorImage { image, .. } => format!("{image:?}"),
+            RdpStateCommand::SetFillColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetEnvColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetPrimColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetBlendColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetFogColor { color, .. } => format!("{color:?}"),
+            RdpStateCommand::SetPrimDepth { depth, .. } => format!("{depth:?}"),
+            RdpStateCommand::SetCombine { combine, .. } => format!("{combine:?}"),
+            RdpStateCommand::SetScissor { scissor, .. } => format!("{scissor:?}"),
+            RdpStateCommand::SetTile {
+                tile_index,
+                descriptor,
+                ..
+            } => format!("{tile_index:?}{descriptor:?}"),
+            RdpStateCommand::SetTileSize {
+                tile_index, size, ..
+            } => format!("{tile_index:?}{size:?}"),
+            RdpStateCommand::SetTextureImage { image, .. } => format!("{image:?}"),
+            RdpStateCommand::SyncLoad {
+                input_epoch,
+                output_epoch,
+                ..
+            } => format!("{input_epoch:?}{output_epoch:?}"),
+        }
+    }
+
     #[test]
     fn set_prim_depth_is_admitted_and_matches_the_decoded_command() {
         let words = set_prim_depth(100, 200).to_vec();
@@ -2116,8 +3102,63 @@ mod tests {
         );
     }
 
+    /// A FullSync whose capture carries the matching boundary record is
+    /// admitted as a *site*: pushed into the plan, declaring zero resource
+    /// accesses, carrying the decoder's own boundary verbatim.
+    ///
+    /// The nonclaim is asserted, not merely documented: the admitted site's
+    /// `interrupt_after` is `Clear`, so nothing on this path can be read as
+    /// "the guest observed a DP interrupt". Admission records that the
+    /// opcode was reached and the DP slot was free -- no more.
     #[test]
-    fn full_sync_is_rejected_loudly_not_silently_omitted() {
+    fn full_sync_with_a_capture_boundary_is_admitted_as_a_site_claiming_no_observation() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 2, 8, 0x200));
+        words.extend(set_tile(7, 2, 0));
+        words.extend(load_sync());
+        words.extend([word(LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+        words.extend([word(0x29, 0), 0]); // FULL_SYNC
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+        let accesses_before = journal.accesses().len();
+
+        let plan = push_and_visit(&decoded, capture, journal);
+
+        assert_eq!(
+            plan.full_sync_sites.len(),
+            1,
+            "the site is pushed, not dropped"
+        );
+        let site = &plan.full_sync_sites[0];
+        assert_eq!(site.ordinal, 0);
+        assert!(site.dp_slot_reserved);
+        // THE NONCLAIM. A reservation is not an observation.
+        assert_eq!(
+            site.boundary.interrupt_after(),
+            fn64_render_ir::DpInterruptState::Clear,
+            "admitting a FullSync site must not report an observed DP interrupt"
+        );
+        // A sync journals no resource region, so admitting it added no
+        // access -- the plan's access list still matches the journal exactly
+        // (which `finish` inside `push_and_visit` already proved by not
+        // erroring).
+        assert_eq!(plan.accesses.len(), accesses_before);
+        // The surrounding TMEM stream is unaffected.
+        assert_eq!(plan.loads.len(), 1);
+        assert_eq!(plan.states.len(), 3);
+    }
+
+    /// A FullSync whose capture carries NO boundary record is still rejected
+    /// loudly, never silently omitted and never admitted as a site the
+    /// producer did not reserve. This is the narrowed rejection that
+    /// replaced the old blanket one.
+    ///
+    /// The fixture reaches this state by building the capture through
+    /// `OwnedRawDpcCapture::new` (the no-FullSync constructor) while the
+    /// ticket is finalized with the boundary the IR requires -- i.e. a
+    /// producer that satisfied stream derivation but never took the reserve
+    /// half.
+    #[test]
+    fn full_sync_without_a_capture_boundary_is_rejected_loudly_not_admitted() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 2, 8, 0x200));
         words.extend(set_tile(7, 2, 0));
@@ -2129,8 +3170,18 @@ mod tests {
         let layout = capture.memory_layout();
         let submission_start = capture.submission().start();
         let capture_words = capture.submission().command_words();
+        // Rebuild the capture WITHOUT its boundary list, modelling a producer
+        // that never reserved the DP slot.
+        let unreserved = OwnedRawDpcCapture::new(
+            capture.submission().clone(),
+            layout,
+            capture.transaction_sequence(),
+            capture.cmd_end(),
+        );
+        assert!(unreserved.full_sync_boundaries().is_empty());
+
         let (session, authority) = new_raw_dpc_roles().unwrap();
-        let request = session.plan_request(capture);
+        let request = session.plan_request(unreserved);
         let mut writer = authority.begin_plan(request);
         let outcome = push_decoded_raw_dpc(
             &mut writer,
@@ -2141,8 +3192,9 @@ mod tests {
         );
         let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
             panic!(
-                "FullSync must be rejected via UnadmittedRawDpcCommand, not admitted or \
-                    rejected for a different reason: {outcome:?}"
+                "a FullSync with no capture boundary must be rejected via \
+                 UnadmittedRawDpcCommand, not admitted or rejected for a different reason: \
+                 {outcome:?}"
             );
         };
         assert_eq!(rejection.opcode_name, "FullSync");
@@ -2217,8 +3269,19 @@ mod tests {
         let layout = capture.memory_layout();
         let submission_start = capture.submission().start();
         let capture_words = capture.submission().command_words();
+        // Strip the boundary so the trailing FullSync takes its narrowed
+        // rejection -- the rejection whose `command_index` this test is
+        // about. With the boundary present the site is admitted instead,
+        // which is a different test
+        // (`full_sync_with_a_capture_boundary_is_admitted_as_a_site_...`).
+        let unreserved = OwnedRawDpcCapture::new(
+            capture.submission().clone(),
+            layout,
+            capture.transaction_sequence(),
+            capture.cmd_end(),
+        );
         let (session, authority) = new_raw_dpc_roles().unwrap();
-        let request = session.plan_request(capture);
+        let request = session.plan_request(unreserved);
         let mut writer = authority.begin_plan(request);
         let outcome = push_decoded_raw_dpc(
             &mut writer,
@@ -2229,13 +3292,46 @@ mod tests {
         );
         let Err(PushDecodedRawDpcError::Unadmitted(rejection)) = outcome else {
             panic!(
-                "FullSync must still be rejected via UnadmittedRawDpcCommand even with NoOps \
-                 present in the stream: {outcome:?}"
+                "an unreserved FullSync must still be rejected via UnadmittedRawDpcCommand \
+                 even with NoOps present in the stream: {outcome:?}"
             );
         };
         assert_eq!(rejection.opcode_name, "FullSync");
-        assert_eq!(rejection.command_index, 5);
+        assert_eq!(
+            rejection.command_index, 5,
+            "every NoOp still counts as an ordinary indexed command"
+        );
         let _ = (session, journal);
+    }
+
+    /// The same NoOp-interleaved stream, this time WITH its capture boundary:
+    /// the trailing FullSync is admitted as a site at the same command index,
+    /// proving NoOps do not shift the admitted site's position either.
+    #[test]
+    fn no_op_interleaving_does_not_shift_an_admitted_full_sync_site() {
+        let mut words = Vec::new();
+        words.extend([word(0x00, 0), 0]); // NoOp, index 0
+        words.extend(set_texture_image(0, 2, 8, 0x200)); // index 1
+        words.extend([word(0x01, 0), 0]); // NoOp, index 2
+        words.extend(set_tile(7, 2, 0)); // index 3
+        words.extend([word(0x02, 0), 0]); // NoOp, index 4
+        words.extend([word(0x29, 0), 0]); // FULL_SYNC, index 5
+        let (decoded, capture, journal) = decode_admitted_capture(words, (0x214, 0x224));
+
+        let plan = push_and_visit(&decoded, capture, journal);
+        assert_eq!(plan.full_sync_sites.len(), 1);
+        assert_eq!(
+            plan.full_sync_sites[0].ordinal, 0,
+            "first site in the stream"
+        );
+        assert_eq!(
+            plan.full_sync_sites[0].location.command_index, 5,
+            "NoOps still count as ordinary indexed commands for an admitted site"
+        );
+        assert_eq!(
+            plan.full_sync_sites[0].boundary.interrupt_after(),
+            fn64_render_ir::DpInterruptState::Clear
+        );
     }
 
     #[test]
@@ -2248,23 +3344,17 @@ mod tests {
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     /// One base-edge (non-shaded, non-textured, non-Z) triangle command's
-    /// eight raw wire words -- the simplest admitted triangle opcode, same
-    /// shape `raw_dpc::mod::tests`' own `triangle_base_word0` builds.
+    /// eight raw wire words, from the crate's shared `wire_words` builder.
     fn triangle_base_edge_words(tile: u32, level: u32, yl: u16) -> [u32; 8] {
-        let w0 = word(
-            RAW_TRIANGLE_BASE_EDGE,
-            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
-        );
-        [
-            w0,
-            0,
-            0x0010_0000,
-            0,
-            0x0020_0000,
-            0x0000_8000,
-            0x0005_0000,
-            0,
-        ]
+        let mut words = crate::wire_words::EdgeWords {
+            tile,
+            level,
+            yl: yl as i16,
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(0, RAW_TRIANGLE_BASE_EDGE);
+        words[2..].copy_from_slice(&[0x0010_0000, 0, 0x0020_0000, 0x0000_8000, 0x0005_0000, 0]);
+        words
     }
 
     fn push_and_expect_error(words: Vec<u32>, source_range: (u32, u32)) -> PushDecodedRawDpcError {

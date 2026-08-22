@@ -61,8 +61,12 @@
 //! This module claims none of: physical TMEM addressing or reads, validity,
 //! epoch or generation binding, snapshot identity, tile-coordinate mapping,
 //! sub-16-entry footprints, sampling, filtering, bilerp, LOD, cache identity,
-//! RDRAM, GPU upload, production dispatch, YUV conversion, non-CI TLUT-mode
-//! behavior, RT64 pixel-for-pixel parity, or performance. Its indexed API is
+//! RDRAM, GPU upload, production dispatch, YUV conversion, 32-bit TLUT-mode
+//! indexing, RT64 pixel-for-pixel parity, or performance. Non-CI TLUT-mode
+//! behavior IS now claimed: under `tlut_en` the tile format is ignored and
+//! every 4/8/16-bit texel indexes the palette (16-bit through its high
+//! byte), matching `fn64-render-reference`, RT64's `sampleTMEM`, and the
+//! n64brew RDP pipeline page. Its indexed API is
 //! pure over already-isolated index and entry values; a later physical reader
 //! must bind both values to one immutable physical-state identity/generation.
 
@@ -351,12 +355,20 @@ pub fn resolve_indexed_texel(
     palette: Ci4Palette,
     lut_mode: TextureLutMode,
 ) -> Result<ResolvedIndexedTexel, IndexedTexelResolveError> {
-    if format != ImageFormat::ColorIndex {
+    // Only the TLUT-disabled CI alias is format-gated. With a TLUT enabled
+    // the tile format is ignored outright, so no format check runs here; see
+    // this module's header for the RT64 `sampleTMEM` citation.
+    if lut_mode == TextureLutMode::Disabled && format != ImageFormat::ColorIndex {
         return Err(IndexedTexelResolveError::FormatMustBeColorIndex { format });
     }
     let index = match raw_index.size() {
         PixelSize::Bits4 => (palette.value() << 4) | raw_index.value() as u8,
         PixelSize::Bits8 => raw_index.value() as u8,
+        // Under an enabled TLUT the size selects only which byte becomes the
+        // index; the 16-bit texel indexes through its high (unincremented,
+        // big-endian first) byte. With the TLUT disabled there is no CI16
+        // alias to admit, so that case stays refused.
+        PixelSize::Bits16 if lut_mode != TextureLutMode::Disabled => (raw_index.value() >> 8) as u8,
         size => return Err(IndexedTexelResolveError::UnsupportedIndexSize { size }),
     };
     match lut_mode {
@@ -1123,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_resolution_rejects_ci16_ci32_and_every_non_ci_format() {
+    fn disabled_tlut_rejects_ci16_ci32_and_every_non_ci_format() {
         for size in [PixelSize::Bits16, PixelSize::Bits32] {
             assert_eq!(
                 resolve_indexed_texel(
@@ -1154,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_format_size_mode_matrix_has_only_six_legal_cells() {
+    fn exhaustive_format_size_mode_matrix_is_gated_by_mode_then_size() {
         let modes = [
             TextureLutMode::Disabled,
             TextureLutMode::Rgba16,
@@ -1164,20 +1176,144 @@ mod tests {
             for size in ALL_SIZES {
                 for mode in modes {
                     let result = resolve_indexed_texel(format, raw(size, 0), palette(0), mode);
-                    match (format, size) {
-                        (ImageFormat::ColorIndex, PixelSize::Bits4 | PixelSize::Bits8) => {
+                    let enabled = mode != TextureLutMode::Disabled;
+                    match (enabled, format, size) {
+                        // Enabled TLUT: the tile format is ignored entirely.
+                        // 4/8/16-bit all index a palette; only 32-bit refuses.
+                        (true, _, PixelSize::Bits4 | PixelSize::Bits8 | PixelSize::Bits16) => {
                             assert!(result.is_ok(), "{format:?}/{size:?}/{mode:?}: {result:?}");
                         }
-                        (ImageFormat::ColorIndex, _) => assert_eq!(
+                        (true, _, PixelSize::Bits32) => assert_eq!(
                             result,
                             Err(IndexedTexelResolveError::UnsupportedIndexSize { size })
                         ),
-                        _ => assert_eq!(
+                        // Disabled TLUT: only the CI4/CI8 -> I8 alias exists,
+                        // and it genuinely is format-specific.
+                        (false, ImageFormat::ColorIndex, PixelSize::Bits4 | PixelSize::Bits8) => {
+                            assert!(result.is_ok(), "{format:?}/{size:?}/{mode:?}: {result:?}");
+                        }
+                        (false, ImageFormat::ColorIndex, _) => assert_eq!(
+                            result,
+                            Err(IndexedTexelResolveError::UnsupportedIndexSize { size })
+                        ),
+                        (false, ..) => assert_eq!(
                             result,
                             Err(IndexedTexelResolveError::FormatMustBeColorIndex { format })
                         ),
                     }
                 }
+            }
+        }
+    }
+
+    /// The two renderer lanes now AGREE, and this test pins the agreement.
+    ///
+    /// `fn64-render-reference` palettizes an `RGBA`/`Bits16` tile whenever
+    /// the TLUT mode is enabled, because WM2000 measurably programs exactly
+    /// that (gfx task #6146 of the attract loop: `fmt: 0, siz: 2, line: 9,
+    /// tmem: 0` sampled under `G_TT_RGBA16`) and both permissively-licensed
+    /// reimplementations of the RDP agree that hardware ignores the tile
+    /// format under `tlut_en` -- RT64's `sampleTMEM`
+    /// (`shaders/TextureDecoder.hlsli:174-188`, MIT) and paraLLEl-RDP's
+    /// `sample_texel_ci32_tlut` (`shaders/texture.h:201-216`, MIT). The
+    /// n64brew RDP pipeline page states it directly: "If tlut_en is set in
+    /// othermodes the final texel will be sourced from a palette and the
+    /// tile format is ignored ... the tile size is otherwise ignored."
+    ///
+    /// This lane previously refused the combination and pinned the
+    /// divergence as a cited gap. The refusal was wrong: `tlut_en` is a
+    /// pipeline mode, not a tile-format property. `resolve_indexed_texel`
+    /// now gates on format only while the TLUT is DISABLED, where the
+    /// `ColorIndex`-to-I8 alias genuinely is format-specific.
+    #[test]
+    fn enabled_tlut_over_a_sixteen_bit_rgba_tile_matches_the_reference_lane() {
+        // 0x42ff: only the high byte 0x42 may reach the palette. A decoder
+        // taking the low byte would resolve index 0xff, and one taking the
+        // whole word would exceed the 256-entry TLUT -- both distinguishable
+        // here because the two bytes differ.
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            let resolved = resolve_indexed_texel(
+                ImageFormat::Rgba,
+                raw(PixelSize::Bits16, 0x42ff),
+                palette(0),
+                mode,
+            )
+            .expect("enabled TLUT ignores the tile format");
+            let ResolvedIndexedTexel::Tlut(lookup) = resolved else {
+                panic!("enabled TLUT must yield a lookup, got {resolved:?}");
+            };
+            assert_eq!(lookup.index(), 0x42, "{mode:?} must index the high byte");
+            assert_eq!(lookup.byte_address(), 0x0800 + 0x42 * 8);
+        }
+    }
+
+    /// Every tile format sampling the same 16-bit texel must produce the
+    /// same lookup -- the format really is ignored -- and swapping ONLY the
+    /// low byte must not change it. Two sweeps rather than one case so a
+    /// decoder right for `Rgba` but wrong for `ColorIndex` cannot pass.
+    #[test]
+    fn enabled_tlut_sixteen_bit_ignores_the_low_byte_and_the_declared_format() {
+        for format in [
+            ImageFormat::Rgba,
+            ImageFormat::ColorIndex,
+            ImageFormat::IntensityAlpha,
+            ImageFormat::Intensity,
+        ] {
+            for low in [0x00u32, 0x7f, 0xff] {
+                let resolved = resolve_indexed_texel(
+                    format,
+                    raw(PixelSize::Bits16, 0x4200 | low),
+                    palette(0),
+                    TextureLutMode::Rgba16,
+                )
+                .expect("enabled TLUT ignores the tile format");
+                let ResolvedIndexedTexel::Tlut(lookup) = resolved else {
+                    panic!("{format:?} must yield a lookup");
+                };
+                assert_eq!(
+                    lookup.index(),
+                    0x42,
+                    "{format:?} with low byte {low:#04x} must index through 0x42"
+                );
+            }
+        }
+    }
+
+    /// WM2000's failing texrect: an `IntensityAlpha`/`Bits8` tile bound
+    /// under an enabled TLUT. This is the exact combination that aborted
+    /// the all-Rust stack at `tmem/read.rs`'s `preflight`.
+    #[test]
+    fn enabled_tlut_over_an_eight_bit_intensity_alpha_tile_palettizes() {
+        for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+            let resolved = resolve_indexed_texel(
+                ImageFormat::IntensityAlpha,
+                raw(PixelSize::Bits8, 0x42),
+                palette(0),
+                mode,
+            )
+            .expect("enabled TLUT ignores the tile format");
+            let ResolvedIndexedTexel::Tlut(lookup) = resolved else {
+                panic!("enabled TLUT must yield a lookup, got {resolved:?}");
+            };
+            assert_eq!(lookup.index(), 0x42);
+        }
+    }
+
+    /// The 32-bit index byte would have to be re-derived against the RGBA32
+    /// low/high bank split, and no title in this corpus reaches it. The
+    /// refusal stays loud rather than being widened on the 16-bit
+    /// precedent, matching `fn64-render-reference`'s own 32-bit refusal.
+    #[test]
+    fn enabled_tlut_still_refuses_thirty_two_bit_texels() {
+        for format in ALL_FORMATS {
+            for mode in [TextureLutMode::Rgba16, TextureLutMode::Ia16] {
+                assert_eq!(
+                    resolve_indexed_texel(format, raw(PixelSize::Bits32, 0), palette(0), mode),
+                    Err(IndexedTexelResolveError::UnsupportedIndexSize {
+                        size: PixelSize::Bits32
+                    }),
+                    "{format:?}/{mode:?}"
+                );
             }
         }
     }

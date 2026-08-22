@@ -1,13 +1,12 @@
-//! M4.3.4: Fill-cycle `FillRectangle` execution against a color target.
+//! M4.3.4: `FillRectangle` execution against a color target.
 //!
-//! Scope is exactly the `CycleType::Fill` branch of a decoded RDP
-//! `FILL_RECTANGLE` (opcode `0x36`) against an RGBA16 or RGBA32 color image:
-//! no combiner, blend, coverage, depth, texture, or triangle behavior. One-
-//! and two-cycle `G_FILLRECT` need the combiner (`evaluate_cycle`,
-//! `fn64-render-reference/src/raster/combiner.rs`, `pub(super)` and not
-//! ported here); Copy-cycle `G_FILLRECT` is out of scope per
+//! A decoded RDP `FILL_RECTANGLE` (opcode `0x36`) targets an RGBA16 or RGBA32
+//! color image. Fill cycle bypasses the pixel pipeline; one- and two-cycle
+//! `G_FILLRECT` use the same combiner and blender stages as the
+//! texture-rectangle path, with zero shade and texel inputs. Copy-cycle
+//! `G_FILLRECT` is refused per
 //! `fn64-render-reference/src/raster/draw.rs:120-124` ("no guaranteed public
-//! result; use `G_TEXRECT`"). Neither is decoded or executed by this module.
+//! result; use `G_TEXRECT`”).
 //!
 //! ## Coordinate provenance
 //!
@@ -66,9 +65,13 @@
 
 use crate::state::{CycleType, FillColor, OtherMode};
 
+use super::texrect::{
+    admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
+    TexrectBlendRegisters, TexrectExecutionError, TexrectFragmentStages, TexrectShading,
+};
 use super::{
     CandidateColorTarget, ColorTargetFormat, ColorTargetKey, CompletedColorTargetWrite,
-    DeviceColorBytes, Rgba8, TargetError, TargetRectangle,
+    DeviceColorBytes, RdpScissorRect, Rgba8, TargetError, TargetRectangle,
 };
 
 /// One RDP fill-cycle bypass hazard bit, decoded from [`OtherMode`]'s wire
@@ -186,6 +189,16 @@ impl FillPixelRectangle {
     pub const fn height(self) -> u32 {
         self.y1 - self.y0 + 1
     }
+
+    /// Whether this rectangle covers every pixel of `extent`.
+    ///
+    /// Inclusive edges, so the last covered column is `x1`, not `x1 - 1`.
+    pub const fn covers(self, extent: super::ColorTargetExtent) -> bool {
+        self.x0 == 0
+            && self.y0 == 0
+            && self.x1 + 1 == extent.width()
+            && self.y1 + 1 == extent.height()
+    }
 }
 
 fn whole_pixel(field: &'static str, raw: u16) -> Result<u32, FillCoordinateError> {
@@ -214,6 +227,76 @@ pub fn resolve_fill_pixel_rectangle(
         return Err(FillCoordinateError::ReversedRectangle { x0, y0, x1, y1 });
     }
     Ok(FillPixelRectangle { x0, y0, x1, y1 })
+}
+
+/// Clips one resolved fill rectangle against the scissor and the colour
+/// target extent, returning the surviving whole-pixel rectangle.
+///
+/// ## The scissor clips; it does not reject and it is not ignored
+///
+/// Pinned RT64 computes `scissorRect.intersection(drawRect)` and retains the
+/// result when it is non-empty (`src/hle/rt64_rdp.cpp:1214-1223`, commit
+/// `f0728a2`). Thus fn64 clips an overhanging fill to the intersection and
+/// leaves the remainder holding whatever the framebuffer already held. This
+/// is evidence for RT64's implementation, not an independently confirmed
+/// hardware rule.
+///
+/// fn64's own reference renderer computes the identical intersection at
+/// `fn64-render-reference/src/raster/draw.rs:191-208`, clamping with
+/// `.max(clip_min_x)` / `.min(clip_max_x - 1).min(self.width - 1)` and
+/// returning early only when the result is empty.
+///
+/// ## Precedence: the SCISSOR clips; the target extent still refuses
+///
+/// Deliberately not symmetric, and not the same rule
+/// [`super::clip_texrect_extent`] uses.
+///
+/// The scissor is hardware state whose whole function is to clip, so a
+/// rectangle overhanging it is ordinary content and is narrowed. The target
+/// extent is not hardware state at all -- it is this executor's own sized
+/// buffer, and `plan_fill` already refuses any `FillRectangle` whose
+/// `x1 >= image.width()` before the wire can reach here
+/// (`raw_dpc/mod.rs`). A rectangle that still overhangs the extent at this
+/// point therefore did not come from a decoded stream, and clamping it
+/// would convert a caller error into a silently smaller draw.
+///
+/// So the extent is left to [`super::CandidateColorTarget::plan_rows`],
+/// which refuses it as `TargetError::RectangleOutOfBounds`. Clamping here
+/// instead was tried and measured: it turned
+/// `out_of_bounds_rectangle_is_rejected_without_touching_the_target` from a
+/// refusal into an accepted 4x2 completion.
+///
+/// ## What this refuses
+///
+/// An empty result, as [`FillExecutionError::ScissoredAway`] -- never a
+/// silent no-op. See that variant's own doc.
+fn clip_fill_rectangle(
+    rectangle: FillPixelRectangle,
+    scissor: RdpScissorRect,
+    key: ColorTargetKey,
+) -> Result<FillPixelRectangle, FillExecutionError> {
+    let _ = key.extent();
+    // Half-open intersection of the rectangle's own span (inclusive `x1`,
+    // hence the `+ 1`) with the scissor's, then converted back to this
+    // module's inclusive-edge representation. The target extent is
+    // deliberately absent -- see this function's own doc.
+    let first_x = rectangle.x0().max(scissor.first_column());
+    let limit_x = (rectangle.x1() + 1).min(scissor.column_limit());
+    let first_y = rectangle.y0().max(scissor.first_row());
+    let limit_y = (rectangle.y1() + 1).min(scissor.row_limit());
+    if first_x >= limit_x || first_y >= limit_y {
+        return Err(FillExecutionError::ScissoredAway {
+            key,
+            rectangle,
+            scissor,
+        });
+    }
+    Ok(FillPixelRectangle {
+        x0: first_x,
+        y0: first_y,
+        x1: limit_x - 1,
+        y1: limit_y - 1,
+    })
 }
 
 /// 5-bit-per-channel expansion, matching
@@ -252,16 +335,59 @@ pub fn decode_fill_cycle_pixel(fill_color: FillColor, format: ColorTargetFormat,
     }
 }
 
-/// Why an RDP fill-cycle `FillRectangle` could not be executed against a
-/// color target. Every variant is a loud rejection, per AGENTS.md "loud
-/// traps, no silent shrugs" -- none of them mutate the target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why an RDP `FillRectangle` could not be executed against a color target.
+/// Every variant is a loud rejection, per AGENTS.md "loud traps, no silent
+/// shrugs" -- none of them mutate the target.
+///
+/// **Not `Eq`**, for the same reason [`TexrectExecutionError`] is not: the
+/// `CombinedPipeline` variant carries one, and two of ITS variants carry the
+/// `f32` texcoord that was refused. An `Eq` impl over `f32` would have to
+/// claim a total equality NaN does not satisfy. `PartialEq` is what this
+/// error genuinely supports, and it gained that constraint the moment the
+/// combined-cycle path started forwarding the texrect pipeline's errors
+/// rather than duplicating them.
+#[derive(Clone, Debug, PartialEq)]
 pub enum FillExecutionError {
     NotFillCycle,
-    UnsafeFillCycleBypass { hazards: FillCycleBypassHazards },
+    UnsupportedCombinedCycle {
+        cycle_type: CycleType,
+    },
+    MissingCombinedState {
+        register: &'static str,
+    },
+    CombinedPipeline(TexrectExecutionError),
+    UnsafeFillCycleBypass {
+        hazards: FillCycleBypassHazards,
+    },
     Coordinate(FillCoordinateError),
     Target(TargetError),
-    MissingResidentBytes { key: ColorTargetKey },
+    MissingResidentBytes {
+        key: ColorTargetKey,
+    },
+    /// The rectangle survived coordinate resolution but nothing of it
+    /// survived the intersection with the scissor and the target extent.
+    ///
+    /// A loud refusal rather than a silent no-op, for the same reason
+    /// [`super::TexrectExecutionError::ScissoredAway`] is one: an empty
+    /// result is either a genuinely off-screen primitive or a reversed or
+    /// degenerate scissor, and the two are worth telling apart. Both the
+    /// rectangle and the scissor are carried so a reader can.
+    ScissoredAway {
+        key: ColorTargetKey,
+        rectangle: FillPixelRectangle,
+        scissor: RdpScissorRect,
+    },
+    /// A partial fill into a brand-new target arrived with no seed bytes,
+    /// so the pixels it does not paint have no real value to take.
+    ///
+    /// Loud rather than zero-filled. The zeros are what the old
+    /// `PartialNewTargetInitialization` refusal was protecting against, and
+    /// they are observable: the differential measured `wgpu: 0x0000`
+    /// against a `0xffff` key for exactly this shape.
+    MissingSeedBytes {
+        key: ColorTargetKey,
+        rectangle: FillPixelRectangle,
+    },
 }
 
 impl core::fmt::Display for FillExecutionError {
@@ -270,6 +396,15 @@ impl core::fmt::Display for FillExecutionError {
             Self::NotFillCycle => {
                 write!(formatter, "execute_fill_rectangle requires CycleType::Fill")
             }
+            Self::UnsupportedCombinedCycle { cycle_type } => write!(
+                formatter,
+                "execute_combined_fill_rectangle requires one- or two-cycle mode, got {cycle_type:?}"
+            ),
+            Self::MissingCombinedState { register } => write!(
+                formatter,
+                "execute_combined_fill_rectangle requires command-position {register} state"
+            ),
+            Self::CombinedPipeline(error) => write!(formatter, "combined FillRectangle: {error}"),
             Self::UnsafeFillCycleBypass { hazards } => write!(
                 formatter,
                 "FillRectangle in Fill cycle retains unsafe {hazards} state; the public fill \
@@ -282,6 +417,21 @@ impl core::fmt::Display for FillExecutionError {
                 "execute_fill_rectangle requires resident_bytes for already-resident target \
                  {key:?}; treating a resident candidate as if it had no prior content would \
                  silently discard everything outside the claimed rectangle"
+            ),
+            Self::MissingSeedBytes { key, rectangle } => write!(
+                formatter,
+                "partial FillRectangle {rectangle:?} into brand-new target {key:?} has no seed \
+                 bytes; its unpainted pixels would be fabricated zeros rather than the guest's \
+                 own framebuffer content"
+            ),
+            Self::ScissoredAway {
+                key,
+                rectangle,
+                scissor,
+            } => write!(
+                formatter,
+                "FillRectangle {rectangle:?} against target {key:?} is empty after clipping to \
+                 scissor {scissor:?} and the target extent"
             ),
         }
     }
@@ -299,6 +449,138 @@ impl From<TargetError> for FillExecutionError {
     fn from(error: TargetError) -> Self {
         Self::Target(error)
     }
+}
+
+impl From<TexrectExecutionError> for FillExecutionError {
+    fn from(error: TexrectExecutionError) -> Self {
+        Self::CombinedPipeline(error)
+    }
+}
+
+/// Executes a one- or two-cycle `FillRectangle` through the existing
+/// combiner/blender pipeline. The rectangle primitive supplies zero shade,
+/// texel0, and texel1, matching the reference renderer and RT64's zero-color
+/// rectangle vertices. Unlike Fill cycle, the lower/right wire edges are
+/// exclusive.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_combined_fill_rectangle(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    combine: crate::CombineParams,
+    env_color: crate::Color4,
+    prim_color: crate::PrimColor,
+    blend_color: crate::Color4,
+    fog_color: crate::Color4,
+    rectangle: crate::FillRectangle,
+    scissor: RdpScissorRect,
+    resident_bytes: Option<&[u8]>,
+) -> Result<CompletedColorTargetWrite, FillExecutionError> {
+    let evaluation = match other_mode.cycle_type() {
+        CycleType::OneCycle | CycleType::TwoCycle => {
+            admitted_cycle_evaluation(other_mode.cycle_type())?
+        }
+        cycle_type => return Err(FillExecutionError::UnsupportedCombinedCycle { cycle_type }),
+    };
+    let cycles = evaluation
+        .validated_cycles()
+        .expect("one- and two-cycle modes always evaluate a combiner program");
+    let shading =
+        TexrectShading::new(combine, env_color, prim_color).validate_combiner_program(cycles)?;
+    let base_inputs = shading.base_inputs();
+    let blend_registers = TexrectBlendRegisters::new(blend_color, fog_color);
+    let blend_state = blend_registers.mode_state(other_mode);
+    require_blendable_mode(blend_state)?;
+    let stages = TexrectFragmentStages::try_new(other_mode, blend_color)?;
+
+    let decoded = resolve_fill_pixel_rectangle(
+        rectangle.upper_left_x(),
+        rectangle.upper_left_y(),
+        rectangle.lower_right_x(),
+        rectangle.lower_right_y(),
+    )?;
+    if decoded.x0() >= decoded.x1() || decoded.y0() >= decoded.y1() {
+        return Err(FillCoordinateError::ReversedRectangle {
+            x0: decoded.x0(),
+            y0: decoded.y0(),
+            x1: decoded.x1().saturating_sub(1),
+            y1: decoded.y1().saturating_sub(1),
+        }
+        .into());
+    }
+    let exclusive = FillPixelRectangle {
+        x0: decoded.x0(),
+        y0: decoded.y0(),
+        x1: decoded.x1() - 1,
+        y1: decoded.y1() - 1,
+    };
+    let key = candidate.key();
+    let clipped = clip_fill_rectangle(exclusive, scissor, key)?;
+    let claimed = TargetRectangle::try_new(
+        clipped.x0(),
+        clipped.y0(),
+        clipped.width(),
+        clipped.height(),
+    )?;
+    let plan = candidate.plan_rows(claimed)?;
+    let format = key.format();
+    let extent = key.extent();
+    let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    let full_len = (extent.pixels() as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or(TargetError::PixelBufferLengthOverflow {
+            pixels: extent.pixels() as usize,
+            bytes_per_pixel: format.bytes_per_pixel(),
+        })?;
+    let mut bytes = match resident_bytes {
+        Some(existing) if existing.len() == full_len => existing.to_vec(),
+        Some(existing) => {
+            return Err(TargetError::CompletedByteLengthMismatch {
+                key,
+                generation: candidate.generation(),
+                expected: full_len,
+                actual: existing.len(),
+            }
+            .into())
+        }
+        None if candidate.predecessor().is_some() => {
+            return Err(FillExecutionError::MissingResidentBytes { key })
+        }
+        None if clipped.covers(extent) => vec![0; full_len],
+        None => {
+            return Err(FillExecutionError::MissingSeedBytes {
+                key,
+                rectangle: clipped,
+            })
+        }
+    };
+
+    for row in plan.rows() {
+        let y = row.first_pixel() / extent.width();
+        let x0 = row.first_pixel() % extent.width();
+        for column in 0..row.pixel_count() {
+            let x = x0 + column;
+            let rgba = combine_one_texel(shading.combine(), base_inputs, [0; 4], evaluation);
+            let offset = (row.first_pixel() as usize + column as usize) * bytes_per_pixel;
+            blend_and_write_pixel(
+                format,
+                &mut bytes[offset..offset + bytes_per_pixel],
+                rgba,
+                blend_state,
+                stages,
+                x,
+                y,
+            )?;
+        }
+    }
+
+    let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
+    Ok(CompletedColorTargetWrite::new_for_fill(
+        key,
+        candidate.generation(),
+        key.range(),
+        claimed,
+        device_bytes,
+    ))
 }
 
 /// Executes one decoded fill-cycle `FillRectangle` against `candidate`,
@@ -330,6 +612,7 @@ pub fn execute_fill_rectangle(
     other_mode: OtherMode,
     fill_color: FillColor,
     rectangle: crate::FillRectangle,
+    scissor: RdpScissorRect,
     resident_bytes: Option<&[u8]>,
 ) -> Result<CompletedColorTargetWrite, FillExecutionError> {
     if !matches!(other_mode.cycle_type(), CycleType::Fill) {
@@ -343,15 +626,16 @@ pub fn execute_fill_rectangle(
         rectangle.lower_right_x(),
         rectangle.lower_right_y(),
     )?;
+    let key = candidate.key();
+    let clipped = clip_fill_rectangle(pixel_rect, scissor, key)?;
     let rectangle = TargetRectangle::try_new(
-        pixel_rect.x0(),
-        pixel_rect.y0(),
-        pixel_rect.width(),
-        pixel_rect.height(),
+        clipped.x0(),
+        clipped.y0(),
+        clipped.width(),
+        clipped.height(),
     )?;
     let plan = candidate.plan_rows(rectangle)?;
 
-    let key = candidate.key();
     let format = key.format();
     let extent = key.extent();
     let bytes_per_pixel = format.bytes_per_pixel() as usize;
@@ -384,7 +668,22 @@ pub fn execute_fill_rectangle(
             // prior generation's bytes through. Loud trap, not a fallback.
             return Err(FillExecutionError::MissingResidentBytes { key });
         }
-        None => vec![0u8; full_len],
+        // A brand-new target with no seed. Legitimate ONLY when this fill
+        // covers the whole target, because then every byte of the buffer is
+        // about to be overwritten and the initial content is unobservable.
+        //
+        // A partial fill reaching here would publish fabricated zeros
+        // outside its rectangle -- measured, not hypothesised: before the
+        // seed existed, the differential reported `wgpu: 0x0000` where both
+        // the reference and the hand-derived key say `0xffff`. So it is
+        // refused by name instead.
+        None if clipped.covers(extent) => vec![0u8; full_len],
+        None => {
+            return Err(FillExecutionError::MissingSeedBytes {
+                key,
+                rectangle: clipped,
+            })
+        }
     };
 
     for row in plan.rows() {

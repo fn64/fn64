@@ -8,7 +8,7 @@
 
 use sha2::{Digest, Sha256};
 
-use fn64_render_ir::{PhysicalMemoryLayout, TemporalBoundary};
+use fn64_render_ir::{FullSyncBoundary, PhysicalMemoryLayout, TemporalBoundary};
 
 use crate::{inspect_raw_rdp_full_sync, DpFullSyncStatus, RenderError};
 
@@ -206,16 +206,41 @@ pub struct RawDpcSubmissionIdentity {
 /// [`RawDpcBatch`], it never creates a synthetic RDRAM suffix and it retains
 /// exactly one submission's original DRAM/XBUS source, range, and payload for
 /// production planning rather than diagnostic staging.
+///
+/// A capture also carries the [`FullSyncBoundary`] list its command bytes
+/// require. `fn64-render-ir`'s stream derivation enforces one boundary per
+/// decoded `SYNC_FULL` opcode (`ValidationError::MissingFullSyncObservation`
+/// and `ExtraFullSyncObservation`), so a capture whose payload contains a
+/// FullSync cannot be planned at all unless the producer supplied a matching
+/// boundary here. [`Self::new`] keeps the historical no-FullSync shape --
+/// every producer of a stream without a `SYNC_FULL` opcode wants exactly the
+/// empty list, and it is *correct* for them, not a placeholder.
+///
+/// Nonclaim: a [`FullSyncBoundary`] carried here is a *capture-time* record.
+/// It does not assert that the guest observed a DP interrupt. See
+/// [`Self::with_full_sync_boundaries`] for what a producer must be able to
+/// prove before it may set `interrupt_after` to
+/// [`fn64_render_ir::DpInterruptState::Asserted`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedRawDpcCapture {
     submission: OwnedRawDpcSubmission,
     memory_layout: PhysicalMemoryLayout,
     transaction_sequence: u64,
     cmd_end: TemporalBoundary,
+    full_sync_boundaries: Box<[FullSyncBoundary]>,
 }
 
 impl OwnedRawDpcCapture {
-    pub const fn new(
+    /// Build a capture whose command payload contains no `SYNC_FULL` opcode.
+    ///
+    /// The empty boundary list this installs is exact, not a stand-in: a
+    /// stream with zero decoded FullSync sites requires exactly zero
+    /// boundaries, and supplying any would be rejected as
+    /// `ExtraFullSyncObservation`. A payload that *does* contain a FullSync
+    /// must use [`Self::with_full_sync_boundaries`]; building it here fails
+    /// later, loudly, at stream derivation rather than silently decoding a
+    /// site with no record.
+    pub fn new(
         submission: OwnedRawDpcSubmission,
         memory_layout: PhysicalMemoryLayout,
         transaction_sequence: u64,
@@ -226,6 +251,45 @@ impl OwnedRawDpcCapture {
             memory_layout,
             transaction_sequence,
             cmd_end,
+            full_sync_boundaries: Box::default(),
+        }
+    }
+
+    /// Build a capture that carries one [`FullSyncBoundary`] per `SYNC_FULL`
+    /// opcode in its payload, in stream order.
+    ///
+    /// # What the caller is asserting
+    ///
+    /// Each boundary's `sequence`/`interrupt_sequence` order the decoded site
+    /// against this capture's `cmd_end`, and `interrupt_before` must equal the
+    /// DP interrupt level the producer actually read before the site.
+    ///
+    /// `interrupt_after` is the load-bearing field. Setting it to
+    /// [`fn64_render_ir::DpInterruptState::Asserted`] asserts that the
+    /// producer **read the DP interrupt line after the boundary and found it
+    /// raised**. A producer that has merely *reserved* the DP completion slot
+    /// -- for example via `DeviceFabric::preflight_dp_full_sync`, whose whole
+    /// contract is that it is nonmutating and raises nothing -- has not
+    /// observed anything and must pass
+    /// [`fn64_render_ir::DpInterruptState::Clear`] for both fields.
+    ///
+    /// A reservation is not an observation. Reporting `Asserted` from a
+    /// reservation would make the resulting `FullSyncOccurrence` claim a
+    /// guest-visible interrupt edge that never happened, and every downstream
+    /// consumer reading `interrupt_after` would be reading a fabrication.
+    pub fn with_full_sync_boundaries(
+        submission: OwnedRawDpcSubmission,
+        memory_layout: PhysicalMemoryLayout,
+        transaction_sequence: u64,
+        cmd_end: TemporalBoundary,
+        full_sync_boundaries: Vec<FullSyncBoundary>,
+    ) -> Self {
+        Self {
+            submission,
+            memory_layout,
+            transaction_sequence,
+            cmd_end,
+            full_sync_boundaries: full_sync_boundaries.into_boxed_slice(),
         }
     }
 
@@ -245,6 +309,12 @@ impl OwnedRawDpcCapture {
         self.cmd_end
     }
 
+    /// The capture-time FullSync boundary records, in stream order. Empty for
+    /// every payload without a `SYNC_FULL` opcode.
+    pub fn full_sync_boundaries(&self) -> &[FullSyncBoundary] {
+        &self.full_sync_boundaries
+    }
+
     pub fn into_parts(
         self,
     ) -> (
@@ -252,12 +322,14 @@ impl OwnedRawDpcCapture {
         PhysicalMemoryLayout,
         u64,
         TemporalBoundary,
+        Vec<FullSyncBoundary>,
     ) {
         (
             self.submission,
             self.memory_layout,
             self.transaction_sequence,
             self.cmd_end,
+            self.full_sync_boundaries.into_vec(),
         )
     }
 }
@@ -347,9 +419,20 @@ impl RawDpcBatch {
             let full_sync =
                 inspect_raw_rdp_full_sync(&staged_commands, group_start as u32, group_end as u32)
                     .map_err(|error| RawDpcBatchPreflightError::InvalidStreamGroup {
-                    group: groups.len(),
-                    error: error.to_string(),
-                })?;
+                        group: groups.len(),
+                        error: error.to_string(),
+                    })?
+                    // A batch is a CLOSED capture, not an extendable hardware
+                    // stream: there is no later END write to expose the rest,
+                    // so an incomplete tail here is a malformed group and must
+                    // stay loud. Only raw CPU MMIO ingress may stall.
+                    .complete()
+                    .ok_or_else(|| RawDpcBatchPreflightError::InvalidStreamGroup {
+                        group: groups.len(),
+                        error: "raw RDP stream group ends inside a command; a batch capture \
+                                cannot be extended by a later END write"
+                            .to_string(),
+                    })?;
             groups.push(RawDpcStreamGroup {
                 first_submission,
                 submission_count: index - first_submission,
@@ -540,12 +623,95 @@ mod tests {
         assert_eq!(capture.memory_layout(), layout);
         assert_eq!(capture.transaction_sequence(), 7);
         assert_eq!(capture.cmd_end(), cmd_end);
+        // `new` is the no-FullSync constructor: its empty boundary list is
+        // exact for a payload with no `SYNC_FULL` opcode, and is what makes
+        // "a decoded site always has a record" enforceable.
+        assert!(capture.full_sync_boundaries().is_empty());
 
-        let (parts_submission, parts_layout, parts_sequence, parts_cmd_end) = capture.into_parts();
+        let (parts_submission, parts_layout, parts_sequence, parts_cmd_end, parts_boundaries) =
+            capture.into_parts();
         assert_eq!(parts_submission, submission);
         assert_eq!(parts_layout, layout);
         assert_eq!(parts_sequence, 7);
         assert_eq!(parts_cmd_end, cmd_end);
+        assert!(parts_boundaries.is_empty());
+    }
+
+    /// `with_full_sync_boundaries` round-trips its list verbatim -- neither
+    /// dropped (which would make a decoded site unplannable) nor rewritten
+    /// (which is how a `Clear` reservation would silently become an
+    /// `Asserted` observation).
+    #[test]
+    fn capture_retains_full_sync_boundaries_verbatim_without_promoting_interrupt_state() {
+        let submission =
+            OwnedRawDpcSubmission::from_rdram_words(0x100, 0x108, words(0x29)).unwrap();
+        let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+        let cmd_end = TemporalBoundary::new(11, DpInterruptState::Clear);
+        // Exactly what the production producer supplies: a reservation, so
+        // BOTH interrupt states are `Clear`.
+        let reserved =
+            FullSyncBoundary::new(12, 13, DpInterruptState::Clear, DpInterruptState::Clear);
+        let capture = OwnedRawDpcCapture::with_full_sync_boundaries(
+            submission.clone(),
+            layout,
+            7,
+            cmd_end,
+            vec![reserved],
+        );
+
+        assert_eq!(capture.full_sync_boundaries(), &[reserved]);
+        // The load-bearing nonclaim: nothing on the way in promoted the
+        // reservation into an observation.
+        assert_eq!(
+            capture.full_sync_boundaries()[0].interrupt_after(),
+            DpInterruptState::Clear
+        );
+
+        let (.., parts_boundaries) = capture.into_parts();
+        assert_eq!(parts_boundaries, vec![reserved]);
+    }
+
+    /// The site counter walks structurally, so a triangle coefficient whose
+    /// leading byte happens to spell `SYNC_FULL` is not miscounted as a site.
+    #[test]
+    fn full_sync_site_count_is_structural_not_a_byte_scan() {
+        // No FullSync at all.
+        assert_eq!(
+            crate::count_raw_rdp_full_sync_sites(&words(0xe6)).unwrap(),
+            crate::RawRdpScan::Complete(0)
+        );
+        // One, in its canonical 0x29 spelling.
+        assert_eq!(
+            crate::count_raw_rdp_full_sync_sites(&words(0x29)).unwrap(),
+            crate::RawRdpScan::Complete(1)
+        );
+        // Bits 63:62 are don't-care, so 0xe9 is the same command.
+        assert_eq!(
+            crate::count_raw_rdp_full_sync_sites(&words(0xe9)).unwrap(),
+            crate::RawRdpScan::Complete(1)
+        );
+        // Two sites are counted as two, not collapsed to a boolean.
+        let mut two = words(0x29);
+        two.extend(words(0x29));
+        assert_eq!(crate::count_raw_rdp_full_sync_sites(&two).unwrap(), crate::RawRdpScan::Complete(2));
+
+        // The real claim. A 0x08 triangle is a 32-byte (8-word) command whose
+        // seven payload words are coefficients, not opcodes. Plant a
+        // coefficient whose leading byte is exactly 0x29 and follow the
+        // triangle with one genuine FullSync. A flat byte scan would count
+        // two; a structural walk strides over the payload and counts one.
+        let mut triangle = vec![0x0800_0000_u32];
+        triangle.extend([0_u32; 6]);
+        triangle.push(0x2900_0000);
+        assert_eq!(triangle.len(), 8, "0x08 triangle is 32 bytes = 8 words");
+        let planted = triangle.clone();
+        assert_eq!(
+            crate::count_raw_rdp_full_sync_sites(&planted).unwrap(),
+            crate::RawRdpScan::Complete(0),
+            "a triangle coefficient spelling 0x29 is payload, not a FullSync site"
+        );
+        triangle.extend(words(0x29));
+        assert_eq!(crate::count_raw_rdp_full_sync_sites(&triangle).unwrap(), crate::RawRdpScan::Complete(1));
     }
 
     #[test]
@@ -618,7 +784,7 @@ mod tests {
         let image = batch.staged_image(&vec![0; 0x200]).unwrap();
         assert_eq!(
             inspect_raw_rdp_full_sync(&image, batch.staging_start(), batch.staging_end()).unwrap(),
-            DpFullSyncStatus::NotReached
+            crate::RawRdpScan::Complete(DpFullSyncStatus::NotReached)
         );
     }
 
@@ -699,7 +865,7 @@ mod tests {
         assert_eq!(&image[..8], &physical);
         assert_eq!(
             inspect_raw_rdp_full_sync(&image, batch.staging_start(), batch.staging_end()).unwrap(),
-            DpFullSyncStatus::Reached
+            crate::RawRdpScan::Complete(DpFullSyncStatus::Reached)
         );
     }
 

@@ -116,6 +116,32 @@ it, don't read it. Every design claim states which allowed source it came from.
   ownership of a queue, the single-runnable-thread token, an rdram address
   newtype — put it there. An invariant enforced by review is a bug with a
   delay timer.
+- **One vector type per port.** A ported struct field, function parameter, or
+  return value that upstream spells `float3`/`float4` is
+  `fn64_render_ir::Vec3`/`Vec4` (`crates/fn64-render-ir/src/rsp_math.rs:42`
+  and `:72` — `Copy`, `PartialEq`, `Default`, documented as "a backend-neutral
+  N-component float vector, matching HLSL `float3`/`float4`"). This holds
+  whether the C++ spelling is `hlslpp::float3` or `interop::float3`; the two
+  denote the same component set, and a rule splitting them by namespace was
+  reverse-engineered from a stale conflict, not decided. Three exceptions,
+  each for a reason, not a preference:
+  - **The shared type carries a contract your source does not define.** Prefer
+    a local type and say so in Nonclaims. `Mat4` documents `mul` semantics
+    (`rsp_math.rs:97`); `interop::float4x4` declares no multiplication at all,
+    so `rt64_hlsl_interop.rs:819`'s `Float4x4` stays local and
+    arithmetic-free. Adopting a shared type imports every claim it makes.
+  - **The value is shader-local, not a ported type.** Loose `float3`/`float4`
+    locals inside an HLSL body, and caller-supplied already-sampled values,
+    stay bare `[f32; N]` — there is no upstream type to reuse.
+  - **Independent test oracles.** An oracle written to check a `Vec3` port
+    should not be built from `Vec3`; the different shape is what makes it
+    independent evidence rather than a transcription of the implementation.
+
+  `fn64-render-ir` has no `Vec2` and no 3x3 type. Their absence is not a
+  license to invent a competing `Float3` — it is why a local `Mat3` or a bare
+  `[f32; 2]` is correct there. Make no `repr(C)`, size, alignment, or ABI
+  claim about any of these types when you reuse one; `rt64_hlsl.h` declares an
+  alignment mismatch across its own HLSL/C++ boundary.
 - **Mechanism over patch.** If you fix an instance of a bug class, build the
   sweep that finds the rest of the class. One-off fixes to recurring shapes
   get bounced in review. Doc drift is such a class and now has its sweep:
@@ -132,6 +158,77 @@ it, don't read it. Every design claim states which allowed source it came from.
   Check what you're staging.
 - If your task boundary says a path belongs to someone else, it does — even
   if your fix "would only take a second."
+
+## Commit messages
+
+No tool parses these — `grep -rln "git log\|commit message" scripts/*.py
+tools/*.py` returns nothing. Every line is written for the next human (or
+agent) reader, which means a message that has grown into a transcript of the
+lane's report is serving nobody: the reader wanted a record of the change, not
+a re-run of the work. A port-card message states the port's claim and the
+minimum evidence a reviewer needs to trust it; everything a reviewer would need
+to *extend* the port belongs in the module doc header, and everything they'd
+need to *audit the process* belongs in the lane's own report, not in git log.
+
+**Target ~20 lines for a port card, ~8 for a mechanical doc-regen commit.**
+Derived from what survives when transcript is cut, not asserted: the
+"what/why", the measured evidence line, nonclaims, and — when they happened —
+a correction or disproof compress to that range without losing a claim a
+reviewer needs. Regen commits carry only the delta, the reconciliation reason,
+and the measured evidence, which is naturally shorter.
+
+Load-bearing, keep in the commit:
+
+- **What changed and why**, in a few lines — the claim, not the investigation.
+- **Evidence, measured not quoted**: test counts before/after, the exact
+  command class (unit run, 10x/20x determinism, release-profile), and any
+  baseline you had to re-measure because a brief's number didn't match this
+  checkout. This project has shipped stale briefed numbers before; a commit
+  that states "baseline measured, not quoted" is recording that the discipline
+  was followed, not padding.
+- **Nonclaims**: what the change does *not* claim — unwired module, no
+  production admission, no `repr(C)`/size/alignment/ABI assertion, no behavior
+  change. This is the guard against the failure mode the project most fears
+  (an unwired characterization port read as a shipped feature), so it stays in
+  the commit even when it's also restated in the module doc.
+- **Corrections and disproofs**, compressed to the claim and the proof, not
+  the narrative. When a lane disproves a premise it was handed — including its
+  own earlier draft — record what was believed, what disproved it, and what is
+  true now. A "fix" that mutation testing disproved ships as a disproof, not
+  silently as a revert; the commit is the only place that history survives
+  once the module doc has been corrected to just state the truth.
+- **Per-file drift disclosure for batch cards**: which files in the batch got
+  no port, partial, or full credit, because the inventory credits a source
+  `ported` at file granularity and a citation can over-credit a mostly-unported
+  file by several times its real content. State the ratio (e.g. "4 of 68
+  lines, ~6%"), not the full per-file table — see below.
+
+Verified transcript — cut from the commit, but confirm where the fact still
+lives before cutting it:
+
+- **Per-file decision tables and full mutation tables are not transcript now —
+  check first.** Reading the actual module doc headers this convention
+  describes: `rt64_framebuffer_shaders.rs`'s per-file table (16 rows, each
+  with a line-range citation) is already in the module's own header in more
+  detail than any commit restates it, so a commit's copy is redundant and can
+  shrink to the one-line ratio above. But the *mutation* tables (which
+  mutation, which assertion killed it) in the same commits do **not** appear
+  in the module doc headers at all — `grep -n "kill\b"` against
+  `rt64_framebuffer_shaders.rs` and `rt64_render_pipeline_types.rs` finds
+  nothing. If the module doc doesn't carry the mutation list, the commit is
+  the only place it survives; cutting it there loses information, so keep a
+  compressed form (mutation count and kill count, e.g. "16 mutations, 16
+  kills") even where the per-file table can go.
+- **Hazards already stated in the module doc** — restating a doc's own caveat
+  in prose the commit re-derives. Cite the doc location instead of
+  re-explaining it.
+- **Process narrative**: what was tried first, ruled out, or re-derived by
+  hand before landing on the kept form. Valuable for a post-mortem, not for
+  the git log; it belongs in the lane's report, not in this repo's history.
+
+Trailers, unchanged and non-negotiable: every commit on this branch carries
+`Co-Authored-By:` and `Claude-Session:` — keep both on every commit regardless
+of message length.
 
 ## When you're stuck
 

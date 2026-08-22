@@ -229,11 +229,20 @@ use super::*;
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
 
         fabric.clear_interrupt(InterruptSource::Ai);
+        // The SECOND (final) completion raises AI too. This previously
+        // asserted no notification and no interrupt, which made the two
+        // completions asymmetric: the first raised because a buffer was
+        // queued behind it, the last did not. Hardware does not distinguish
+        // them: rcp.h documents `AI_STATUS_FIFO_FULL` as a read status bit
+        // (`ultra64/rcp.h:576`) and says only that a WRITE to
+        // `AI_STATUS_REG` clears the audio interrupt (`:570`). Nothing makes
+        // a FIFO-full transition the raising edge, and the libultra
+        // single-buffer contract requires the final completion to signal.
         let second_done = fabric.advance_to(Cycles::new(386), &mut rdram).unwrap();
-        assert!(second_done.is_empty());
+        assert_eq!(second_done, vec![DeviceNotification::AiDmaComplete(second)]);
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
         assert_eq!(fabric.ai_length(), 0);
-        assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+        assert!(fabric.interrupt_pending(InterruptSource::Ai));
     }
 
 
@@ -293,7 +302,7 @@ use super::*;
 
 
     #[test]
-    fn ai_disabled_fifo_accepts_two_slots_then_full_edge_interrupts_once() {
+    fn ai_disabled_fifo_accepts_two_slots_and_each_completion_interrupts() {
         let mut fabric = fabric();
         fabric.configure_tv_type(TvType::Ntsc).unwrap();
         let first = AiDmaRequest {
@@ -333,12 +342,16 @@ use super::*;
 
         fabric.clear_interrupt(InterruptSource::Ai);
         let second_deadline = fabric.current_ai.unwrap().deadline;
-        assert!(fabric
-            .advance_to(second_deadline, &mut rdram)
-            .unwrap()
-            .is_empty());
+        // The final buffer's completion raises AI as well -- see the note on
+        // `ai_fifo_drains_on_guest_cycles_and_raises_one_shared_mi_source`.
+        // The test name's "interrupts once" described fn64's FIFO-full gate,
+        // not any documented rule.
+        assert_eq!(
+            fabric.advance_to(second_deadline, &mut rdram).unwrap(),
+            vec![DeviceNotification::AiDmaComplete(second)]
+        );
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
-        assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+        assert!(fabric.interrupt_pending(InterruptSource::Ai));
     }
 
 
@@ -692,6 +705,66 @@ use super::*;
     }
 
 
+    /// The reserve half of the FullSync two-phase contract raises nothing.
+    ///
+    /// This is the evidence behind `RawDpcIrCapability::
+    /// TransactionalTmemFillFullSyncSiteOnly`'s nonclaim and behind the
+    /// `Clear`/`Clear` boundary the ABI producer supplies: a successful
+    /// `preflight_dp_full_sync` leaves the DP interrupt line down, the slot
+    /// free, no event scheduled, and the evidence snapshot byte-identical.
+    /// A renderer that has only reserved therefore has nothing to observe,
+    /// and a boundary claiming `interrupt_after == Asserted` off the back of
+    /// one would be fabricating an edge this test proves does not exist.
+    #[test]
+    fn preflight_dp_full_sync_reserves_without_raising_scheduling_or_consuming_the_slot() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0x100);
+        let before = fabric.evidence_snapshot();
+
+        fabric.preflight_dp_full_sync(Cycles::new(3)).unwrap();
+
+        // Nonmutating: no interrupt, no busy slot, no recorded evidence.
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+        assert!(!fabric.snapshot().dp_busy);
+        assert_eq!(fabric.evidence_snapshot(), before);
+
+        // No event was scheduled, so advancing well past any deadline the
+        // commit half would have used still produces nothing.
+        assert!(fabric
+            .advance_to(Cycles::new(10), &mut rdram)
+            .unwrap()
+            .is_empty());
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+
+        // The slot the reserve proved free is still free: the commit half
+        // succeeds afterwards, and only then does the interrupt arrive.
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        assert!(fabric.snapshot().dp_busy);
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+        assert_eq!(
+            fabric.advance_to(Cycles::new(13), &mut rdram).unwrap(),
+            vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
+        );
+        assert!(fabric.interrupt_pending(InterruptSource::Dp));
+    }
+
+    /// The reserve half rejects an occupied slot, which is what lets a
+    /// renderer be turned away before it observes or changes guest memory.
+    #[test]
+    fn preflight_dp_full_sync_rejects_an_occupied_slot_without_disturbing_it() {
+        let mut fabric = fabric();
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        let before = fabric.evidence_snapshot();
+
+        assert_eq!(
+            fabric.preflight_dp_full_sync(Cycles::new(1)),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.evidence_snapshot(), before);
+        assert!(fabric.snapshot().dp_busy);
+    }
+
+
     #[test]
     fn pi_channel_serializes_requests_and_time_never_moves_backward() {
         let mut fabric = fabric();
@@ -887,6 +960,61 @@ use super::*;
         );
     }
 
+
+    /// `vi_output_height` is the presenter's authority for how many lines
+    /// the guest actually scans out. Pinned against WM2000's measured
+    /// registers -- H_START `0x006c02ec`, V_START `0x002501ff` -- which
+    /// decode to a 640x237 output rectangle, the same values
+    /// `fn64_render::ViActiveWindow` asserts for the identical words.
+    ///
+    /// 237, not 240: a presenter that assumes 240 blits three rows of RDRAM
+    /// the game never rendered into, which is visible as an edge band.
+    #[test]
+    fn vi_output_height_decodes_the_programmed_half_line_interval() {
+        const VI_H_START_REG: MmioAddr = MmioAddr::new(0xA440_0024);
+        const VI_V_START_REG: MmioAddr = MmioAddr::new(0xA440_0028);
+
+        let mut fabric = fabric();
+        // Register initialization is not atomic: neither interval alone is
+        // an active window.
+        assert_eq!(fabric.vi_output_height(), None);
+        fabric.write_mmio(VI_V_START_REG, 0x0025_01ff).unwrap();
+        assert_eq!(
+            fabric.vi_output_height(),
+            None,
+            "V_START alone is not an active window"
+        );
+
+        fabric.write_mmio(VI_H_START_REG, 0x006c_02ec).unwrap();
+        // (0x1ff - 0x25) / 2 = (511 - 37) / 2 = 474 / 2 = 237.
+        assert_eq!(
+            fabric.vi_output_height(),
+            Some(237),
+            "WM2000's V_START programs 237 output lines, not 240"
+        );
+
+        // Derived a second, independent way from the raw half-line fields,
+        // so a transcription slip in either expression is caught.
+        let (start, end) = (0x25u32, 0x1ffu32);
+        assert_eq!(fabric.vi_output_height(), Some((end - start) / 2));
+
+        // A full 240-line window decodes to 240, so the accessor is not
+        // simply biased low.
+        fabric.write_mmio(VI_V_START_REG, (0x25 << 16) | 0x205).unwrap();
+        assert_eq!(fabric.vi_output_height(), Some(240));
+
+        // An ODD half-line interval must truncate, not round up. Every real
+        // window is an even number of half-lines (`ViActiveWindow` asserts
+        // that), but the arithmetic here must still be the plain halving --
+        // `(end - start + 1) / 2` agrees on every even interval and would
+        // otherwise be an invisible substitution.
+        fabric.write_mmio(VI_V_START_REG, (0x25 << 16) | 0x204).unwrap();
+        assert_eq!(
+            fabric.vi_output_height(),
+            Some(239),
+            "an odd half-line interval truncates; it does not round up"
+        );
+    }
 
     #[test]
     fn vi_current_and_field_follow_progressive_and_interlaced_half_line_sequences() {

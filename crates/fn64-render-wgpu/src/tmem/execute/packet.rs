@@ -662,7 +662,7 @@ mod tests {
             word(LOAD_BLOCK, 1 << 12),
             7 << 24 | 2 << 12,
         ];
-        (words, vec![(image_address + 2, image_address + 6)])
+        (words, vec![(image_address + 2, image_address + 10)])
     }
 
     fn tile_then_yuv_block_words(
@@ -811,7 +811,7 @@ mod tests {
             PixelSize::Bits32 => 3,
             _ => unreachable!("RGBA cell fixture is 16-bit or 32-bit"),
         };
-        let byte_count = if size == PixelSize::Bits16 { 8 } else { 16 };
+        let row_bytes = if size == PixelSize::Bits16 { 4 } else { 8 };
         (
             vec![
                 word(SET_TEXTURE_IMAGE, size_wire << 19 | 1),
@@ -823,7 +823,10 @@ mod tests {
                 word(LOAD_TILE, 0),
                 7 << 24 | 4 << 12 | 4,
             ],
-            vec![(image_address, image_address + byte_count)],
+            vec![
+                (image_address, image_address + 8),
+                (image_address + row_bytes, image_address + row_bytes + 8),
+            ],
         )
     }
 
@@ -833,7 +836,7 @@ mod tests {
         index_tmem: u16,
         tlut_address: u32,
     ) -> (Vec<u32>, Vec<(u32, u32)>) {
-        let index_bytes = index_width * 2;
+        let second_row = index_address + index_width;
         (
             vec![
                 word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | (index_width - 1)),
@@ -854,7 +857,8 @@ mod tests {
                 7 << 24 | 3 << 14,
             ],
             vec![
-                (index_address, index_address + index_bytes),
+                (index_address, index_address + 8),
+                (second_row, second_row + 8),
                 (tlut_address, tlut_address + 8),
             ],
         )
@@ -1105,8 +1109,8 @@ mod tests {
             let expected =
                 decode_direct_texel(format, RawTexel::try_new(size, raw).unwrap()).unwrap();
             assert_eq!(actual.texel(), expected);
-            assert_eq!(actual.snapshot().state(), state.identity());
-            assert_eq!(actual.snapshot().generation(), 2);
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), 2);
         }
 
         let rgba32 = read_committed_texel(
@@ -1143,6 +1147,21 @@ mod tests {
         assert_eq!(wrapped_even_second_row.texel().rgba8888(), [0x10; 4]);
     }
 
+    /// The point sampler preserves its snapshot identity, and the
+    /// caller-selected first-row parity is carried on the addressed texel
+    /// while NOT changing which byte is read.
+    ///
+    /// The exchange follows the tile-relative row alone (see
+    /// `tmem/read.rs::odd_row_exchange` for the RT64 citation), so the
+    /// two parity values must decode the SAME texel. This test previously
+    /// asserted they decoded different ones -- `0x0c` versus `0x08`, four
+    /// bytes apart, which is precisely the bank the removed origin term used
+    /// to move the read into. Requiring equality here is what makes a
+    /// reintroduced term fail: it would split these two apart again.
+    ///
+    /// The parity is still plumbed through to `AddressedTmemTexel`, and the
+    /// corner assertions below still pin that it round-trips, so the field
+    /// being inert in the address computation does not go unnoticed.
     #[test]
     fn committed_point_sampler_preserves_snapshot_and_caller_selected_row_parity() {
         let (words, ranges) = direct_reader_words();
@@ -1179,11 +1198,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(even.texel().rgba8888(), [0x0c; 4]);
-        assert_eq!(odd.texel().rgba8888(), [0x08; 4]);
+        // Row 0, so neither parity exchanges: both read byte 8.
+        assert_eq!(even.texel().rgba8888(), [0x08; 4]);
+        assert_eq!(
+            odd.texel().rgba8888(),
+            even.texel().rgba8888(),
+            "the caller's first-row parity must not change which byte is read"
+        );
         assert_eq!(even.snapshot(), odd.snapshot());
-        assert_eq!(even.snapshot().state(), state.identity());
-        assert_eq!(even.snapshot().generation(), before.generation);
+        assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(even.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
 
         let even_cell = gather_committed_texture_cell(
             &state,
@@ -1201,13 +1225,24 @@ mod tests {
             TextureLutMode::Disabled,
         )
         .unwrap();
+        // The cell spans rows 0 and 1. Hand-derived from the fixture's own
+        // two rules: the tile is `line_words = 1` based at TMEM word 511, so
+        // row 0's texel 0 is byte `511 * 8 = 0xff8` and row 1's wraps to
+        // `0x000` and then exchanges to `0x004`. The fixture's payload
+        // generator (`physical.rs::defined_physical_lanes`) numbers bytes by
+        // PHYSICAL lane as `first_byte + word.index() * 8 + ordinal`, so the
+        // exchange moves where a byte lands without renumbering it: word 0
+        // (row 0) carries 0x08..0x10 and word 2 (row 1) carries 0x10..0x18.
+        // Upper corners therefore read 0x08/0x09 and lower corners
+        // 0x10/0x11.
         assert_eq!(
             cell_colors(even_cell),
-            [[0x0c; 4], [0x14; 4], [0x0d; 4], [0x15; 4]]
+            [[0x08; 4], [0x10; 4], [0x09; 4], [0x11; 4]]
         );
         assert_eq!(
             cell_colors(odd_cell),
-            [[0x08; 4], [0x10; 4], [0x09; 4], [0x11; 4]]
+            cell_colors(even_cell),
+            "the caller's first-row parity must not change which bytes the cell reads"
         );
         for corner in [
             TextureCellCorner::UpperLeft,
@@ -1286,8 +1321,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(actual.texel().rgba8888(), expected);
-            assert_eq!(actual.snapshot().state(), state.identity());
-            assert_eq!(actual.snapshot().generation(), before.generation);
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+            assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
 
         let rgba32 = sample_committed_point(
@@ -1299,14 +1334,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rgba32.texel().rgba8888(), [32, 33, 34, 35]);
-        assert_eq!(rgba32.snapshot().state(), state.identity());
-        assert_eq!(rgba32.snapshot().generation(), before.generation);
+        assert_eq!(rgba32.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(rgba32.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         assert_eq!(observe_durable(&state), before);
     }
 
     #[test]
     fn committed_texture_cell_gathers_literal_rgba16_and_rgba32_corners() {
-        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let rgba16_source = [
+            0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff, 0xa1, 0xb2, 0xc3, 0xd4,
+        ];
         let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
         let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
         let before = observe_durable(&rgba16);
@@ -1328,8 +1365,8 @@ mod tests {
             ]
         );
         for texel in cell.texels() {
-            assert_eq!(texel.snapshot().state(), rgba16.identity());
-            assert_eq!(texel.snapshot().generation(), before.generation);
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), rgba16.identity());
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
         assert_eq!(observe_durable(&rgba16), before);
 
@@ -1358,8 +1395,8 @@ mod tests {
             ]
         );
         for texel in cell.texels() {
-            assert_eq!(texel.snapshot().state(), rgba32.identity());
-            assert_eq!(texel.snapshot().generation(), before.generation);
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), rgba32.identity());
+            assert_eq!(texel.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
         }
         assert_eq!(observe_durable(&rgba32), before);
     }
@@ -1370,7 +1407,9 @@ mod tests {
         // exact addressing (`cell_request` = raw S10.5 16, `reader_size(0, 0,
         // 4, 4)`, zero shift/mask) to produce `sf=16, tf=16`: the formula's
         // `<=` boundary, which the `<=` puts in the lower-left branch.
-        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let rgba16_source = [
+            0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff, 0xa1, 0xb2, 0xc3, 0xd4,
+        ];
         let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
         let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
         let cell = gather_committed_texture_cell(
@@ -1408,7 +1447,7 @@ mod tests {
 
     #[test]
     fn committed_texture_cell_resolves_each_ci_corner_through_its_tlut_entry() {
-        let ci4_indices = [0x12, 0x34];
+        let ci4_indices = [0x12, 0x34, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
         let rgba16_entries = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
         let (words, ranges) = ci_cell_tlut_words(0x200, 1, 8, 0x300);
         let ci4 = publish_sources(
@@ -1440,7 +1479,7 @@ mod tests {
             .all(|texel| texel.snapshot() == cell.texels()[0].snapshot()));
         assert_eq!(observe_durable(&ci4), before);
 
-        let ci8_indices = [0x01, 0x02, 0x03, 0x04];
+        let ci8_indices = [0x01, 0x02, 0x03, 0x04, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9];
         let ia16_entries = [0x10, 0x01, 0x20, 0x40, 0x80, 0xff, 0xff, 0x00];
         let (words, ranges) = ci_cell_tlut_words(0x400, 2, 16, 0x500);
         let ci8 = publish_sources(
@@ -1473,10 +1512,13 @@ mod tests {
         assert_eq!(observe_durable(&ci8), before);
     }
 
+    /// A two-byte logical image still yields a fully valid sampled cell because each
+    /// row copies its padded word of adjacent RDRAM bytes, matching RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn committed_texture_cell_reports_the_first_invalid_semantic_corner() {
+    fn committed_texture_cell_reads_padded_adjacent_bytes_for_every_corner() {
         let image_address = 0x200;
-        let source = [0x11, 0x22];
+        let source = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
         let words = vec![
             word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19),
             image_address,
@@ -1487,21 +1529,23 @@ mod tests {
             word(LOAD_TILE, 0),
             7 << 24 | 4,
         ];
-        let ranges = [(image_address, image_address + 2)];
+        let ranges = [
+            (image_address, image_address + 8),
+            (image_address + 1, image_address + 9),
+        ];
         let state = publish_sources(words, &ranges, &[(image_address, &source)]);
         let before = observe_durable(&state);
+        let cell = gather_committed_texture_cell(
+            &state,
+            reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
         assert_eq!(
-            gather_committed_texture_cell(
-                &state,
-                reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
-                reader_size(0, 0, 4, 4),
-                cell_request(TmemFirstRowParity::Even),
-                TextureLutMode::Disabled,
-            ),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::InvalidTexelByte { address: 0x001 },
-            })
+            cell_colors(cell),
+            [[0x11; 4], [0x22; 4], [0x22; 4], [0x33; 4]]
         );
         assert_eq!(observe_durable(&state), before);
     }
@@ -1563,17 +1607,20 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(actual.texel(), expected);
-                assert_eq!(actual.snapshot().state(), state.identity());
-                assert_eq!(actual.snapshot().generation(), 1);
+                assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+                assert_eq!(actual.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), 1);
             }
         }
 
+        // The offset palette must not be rebased onto lower indices: index
+        // 0 resolves to word 0x800, which this fixture never loaded, so the
+        // read still refuses. The refusal is now the file-wide
+        // `InvalidTexelByte` naming lane 0's own first byte, which is the
+        // rule that survived the wall-4/5 narrowing -- an unwritten byte is
+        // never invented, only lanes 1..3's validity stopped being consulted.
         assert_eq!(
             read_committed_texel(&state, unloaded_ci8, even, TextureLutMode::Rgba16),
-            Err(PhysicalTexelReadError::IncompleteTlutEntry {
-                byte_address: 0x800,
-                valid_mask: 0,
-            }),
+            Err(PhysicalTexelReadError::InvalidTexelByte { address: 0x800 }),
             "an offset partial palette must not be rebased onto lower indices"
         );
     }
@@ -1606,8 +1653,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ci4.texel().rgba8888(), [0, 0, 0, 255]);
-        assert_eq!(ci4.snapshot().state(), state.identity());
-        assert_eq!(ci4.snapshot().generation(), before.generation);
+        assert_eq!(ci4.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").state(), state.identity());
+        assert_eq!(ci4.snapshot().committed().expect("a read of durable PhysicalTmemState must report a Committed snapshot, never a proposal").generation(), before.generation);
 
         let ci8 = sample_committed_point(
             &state,
@@ -1622,8 +1669,17 @@ mod tests {
         assert_eq!(observe_durable(&state), before);
     }
 
+    /// Renamed from `committed_reader_rejects_partial_and_unequal_tlut_words`.
+    /// The reader no longer rejects either shape: RT64's palette read
+    /// (`src/shaders/TextureDecoder.hlsli:28,179`, pinned port source
+    /// `5473732a`) addresses lane 0's two bytes and nothing else, and
+    /// `fn64-render-reference`'s `read_tlut` (`src/gbi/state.rs:853-869`)
+    /// agrees. Both fixtures below still exercise the same TMEM states
+    /// this test always built; only the expected answer changed, and each
+    /// expected color is hand-derived from the fixture's own bytes rather
+    /// than read back from the reader.
     #[test]
-    fn committed_reader_rejects_partial_and_unequal_tlut_words() {
+    fn committed_reader_resolves_partial_and_unequal_tlut_words_from_lane_zero() {
         let ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
 
         let (words, ranges) = ci_and_hostile_tlut_word_words(2);
@@ -1646,14 +1702,18 @@ mod tests {
         );
         let size = reader_size(0, 0, 0, 0);
         let partial_before = observe_durable(&partial);
+        // `ci_and_hostile_tlut_word_words(2)` loads exactly two high-half
+        // bytes, so word 0x800 carries validity mask 0x03: lane 0 valid,
+        // lanes 1..3 never written. The fixture's RDRAM at 0x300 counts up
+        // from zero, so those two bytes are `00 01` and lane 0 is 0x0001.
+        // RGBA16 5/5/5/1 reads 0x0001 as r=0 g=0 b=0 a=1 -> [0, 0, 0, 255],
+        // derived here from the bit layout, not from the decoder.
         assert_eq!(
-            sample_committed_point(&partial, ci8, size, request, TextureLutMode::Rgba16,),
-            Err(crate::PointSampleError::Read(
-                PhysicalTexelReadError::IncompleteTlutEntry {
-                    byte_address: 0x800,
-                    valid_mask: 0x03,
-                }
-            ))
+            sample_committed_point(&partial, ci8, size, request, TextureLutMode::Rgba16,)
+                .expect("lanes 1..3's validity is not addressed by the RDP")
+                .texel()
+                .rgba8888(),
+            [0, 0, 0, 255]
         );
         assert_eq!(observe_durable(&partial), partial_before);
 
@@ -1666,21 +1726,36 @@ mod tests {
         let mut unequal = state;
         publish(&mut unequal, fixture, pending);
         let unequal_before = observe_durable(&unequal);
+        // `ci_and_hostile_tlut_word_words(8)` fills all eight bytes with
+        // `00 01 02 03 04 05 06 07`, so the four lanes are
+        // [0x0001, 0x0203, 0x0405, 0x0607] -- maximally non-canonical, and
+        // every lane distinct, so reading any lane but 0 gives a different
+        // answer. Lane 0 is 0x0001; IA16 splits it as intensity 0x00 and
+        // alpha 0x01, giving [0, 0, 0, 1]. Hand-derived.
         assert_eq!(
-            sample_committed_point(&unequal, ci8, size, request, TextureLutMode::Ia16),
-            Err(crate::PointSampleError::Read(
-                PhysicalTexelReadError::NonCanonicalTlutEntry {
-                    byte_address: 0x800,
-                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
-                }
-            ))
+            sample_committed_point(&unequal, ci8, size, request, TextureLutMode::Ia16)
+                .expect("an unequal TLUT word resolves from lane 0")
+                .texel()
+                .rgba8888(),
+            [0, 0, 0, 1],
+            "lane 0 is 0x0001; lane 1 (0x0203) would give [2, 2, 2, 3] and \
+             lane 3 (0x0607) would give [6, 6, 6, 7]"
         );
         assert_eq!(observe_durable(&unequal), unequal_before);
     }
 
+    /// Renamed from the earlier partial-tail names. The hostile Tile source now
+    /// copies a full padded word per RT64 `rt64_rdp.cpp:369-397` (`Copy the
+    /// entire word`), while TLUT lookup itself remains lane-0 based.
+    /// Both hostile TLUT words are now READ, from lane 0, so the cell
+    /// resolves instead of locating a corner error. The fixture is
+    /// unchanged: the second entry (0x808) is still the hostile one and
+    /// still differs from the canonical first entry, so a reader that
+    /// silently fell back to entry 0 would still be caught by the
+    /// upper-left/upper-right colors disagreeing.
     #[test]
-    fn committed_texture_cell_locates_nonfirst_partial_and_unequal_tlut_errors() {
-        let indices = [0x00, 0x01];
+    fn committed_texture_cell_resolves_nonfirst_padded_and_unequal_tlut_words() {
+        let indices = [0x00, 0x01, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7];
         let canonical = [0xf8, 0x01];
         let request = PointSampleRequest::new(
             PointSampleCoordinates::new(
@@ -1692,7 +1767,7 @@ mod tests {
         let tile = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
         let size = reader_size(0, 0, 4, 0);
 
-        let hostile_partial = [0xaa, 0xbb];
+        let hostile_padded = [0xaa, 0xbb, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7];
         let (words, ranges) = ci_cell_with_hostile_second_tlut_words(2);
         let partial = publish_sources(
             words,
@@ -1700,19 +1775,35 @@ mod tests {
             &[
                 (0x200, &indices),
                 (0x300, &canonical),
-                (0x400, &hostile_partial),
+                (0x400, &hostile_padded),
             ],
         );
         let before = observe_durable(&partial);
+        for (lane, expected) in hostile_padded.into_iter().enumerate() {
+            assert_eq!(partial.valid_byte(0x808 + lane as u16), Some(expected));
+        }
+        // Entry 0 at 0x800 is the canonical `[0xf8, 0x01]`: RGBA16 0xf801
+        // is r=0b11111 g=0 b=0 a=1, and 5-bit replication (v << 3 | v >> 2)
+        // sends 0b11111 to 0xff, so opaque red.
+        //
+        // Entry 1 at 0x808 is the hostile padded word beginning `[0xaa, 0xbb]`;
+        // every byte is valid, and lane 0 is 0xaabb == 1010101010111011:
+        // r=0b10101 (21), g=0b01010 (10), b=0b11101 (29), a=1. Replication
+        // gives 21 -> 168|5 = 173, 10 -> 80|2 = 82, 29 -> 232|7 = 239.
+        // Every number here is derived from the RGBA16 bit layout by hand.
+        const RED: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
+        const HOSTILE_PADDED: [u8; 4] = [173, 82, 239, 255];
+        assert_ne!(
+            RED, HOSTILE_PADDED,
+            "the two entries must differ, or the cell cannot show that the \
+             upper-right corner read its OWN entry"
+        );
+        let cell =
+            gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16)
+                .expect("a padded TLUT word resolves from lane 0");
         assert_eq!(
-            gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16,),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::IncompleteTlutEntry {
-                    byte_address: 0x808,
-                    valid_mask: 0x03,
-                },
-            })
+            cell.texels().map(|texel| texel.texel().rgba8888()),
+            [RED, RED, HOSTILE_PADDED, HOSTILE_PADDED],
         );
         assert_eq!(observe_durable(&partial), before);
 
@@ -1728,15 +1819,28 @@ mod tests {
             ],
         );
         let before = observe_durable(&unequal);
+        // Entry 0 at 0x800 is again `[0xf8, 0x01]`, read here as IA16:
+        // intensity 0xf8, alpha 0x01 -> [248, 248, 248, 1].
+        //
+        // Entry 1 at 0x808 is `00 01 02 03 04 05 06 07`, four distinct
+        // lanes. Lane 0 is 0x0001 -> intensity 0x00, alpha 0x01 ->
+        // [0, 0, 0, 1]. Lane 1 (0x0203) would give [2, 2, 2, 3] and lane 3
+        // (0x0607) would give [6, 6, 6, 7], so picking the wrong lane is
+        // detectable. Hand-derived from the IA16 split.
+        const CANONICAL_IA: [u8; 4] = [0xf8, 0xf8, 0xf8, 0x01];
+        const HOSTILE_UNEQUAL_IA: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+        assert_ne!(CANONICAL_IA, HOSTILE_UNEQUAL_IA);
+        let cell =
+            gather_committed_texture_cell(&unequal, tile, size, request, TextureLutMode::Ia16)
+                .expect("an unequal TLUT word resolves from lane 0");
         assert_eq!(
-            gather_committed_texture_cell(&unequal, tile, size, request, TextureLutMode::Ia16),
-            Err(TextureCellSampleError::Read {
-                corner: TextureCellCorner::UpperRight,
-                source: PhysicalTexelReadError::NonCanonicalTlutEntry {
-                    byte_address: 0x808,
-                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
-                },
-            })
+            cell.texels().map(|texel| texel.texel().rgba8888()),
+            [
+                CANONICAL_IA,
+                CANONICAL_IA,
+                HOSTILE_UNEQUAL_IA,
+                HOSTILE_UNEQUAL_IA
+            ],
         );
         assert_eq!(observe_durable(&unequal), before);
     }

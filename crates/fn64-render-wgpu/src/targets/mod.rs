@@ -22,16 +22,25 @@ use crate::{ColorImage, ImageFormat, PixelSize};
 mod fill;
 mod oracle;
 mod raster;
+mod raw_triangle;
+mod texrect;
 mod triangle_pipeline;
 
 pub use fill::{
-    decode_fill_cycle_pixel, execute_fill_rectangle, resolve_fill_pixel_rectangle,
-    FillCoordinateError, FillCycleBypassHazards, FillExecutionError, FillPixelRectangle,
+    decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
+    resolve_fill_pixel_rectangle, FillCoordinateError, FillCycleBypassHazards, FillExecutionError,
+    FillPixelRectangle,
 };
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
+};
+pub use raw_triangle::{execute_raw_triangle, RawTriangleTexture};
+pub use texrect::{
+    execute_texture_rectangle, ClippedTexrectExtent, RdpScissorRect, TexrectAxis,
+    TexrectBlendRegisters, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
+    TexrectShading, TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 pub use triangle_pipeline::{
@@ -412,30 +421,62 @@ impl CandidateColorTarget {
                 actual: completed.device_bytes.bytes.len(),
             });
         }
-        if !completed.rectangle.is_full(self.key.extent) && self.predecessor.is_none() {
-            // A brand-new target has no prior device-byte content to patch a
-            // sub-rectangle into: every byte must come from this write, so
-            // only a full-extent completion can prove the whole target is
-            // initialized. A resident target (self.predecessor.is_some())
-            // already has a full-extent byte buffer from its prior
-            // generation; a sub-rectangle write patches into that buffer
-            // (see fill::execute_fill_rectangle) and is admitted below --
-            // the full-extent byte-length check just above already proves
-            // completed.device_bytes still covers the whole target, so no
-            // separate resident-partial rejection is needed.
-            return Err(TargetError::PartialNewTargetInitialization {
-                key: self.key,
-                rectangle: completed.rectangle,
-            });
-        }
-
+        // **A partial rectangle is admitted, and the uncovered region is
+        // recorded rather than forgotten.**
+        //
+        // This used to refuse any partial completion of a brand-new target
+        // (`PartialNewTargetInitialization`), on the reasoning that its
+        // untouched bytes would be fabricated zeros. The premise was right
+        // -- `fill::execute_fill_rectangle`'s brand-new arm really does
+        // allocate a zero buffer -- but the reaction was wrong, and it was
+        // wrong about the hardware: an N64 colour image is just RDRAM, and
+        // the bytes outside a fill are whatever was already there. Hardware
+        // has no notion of an uninitialized framebuffer to refuse.
+        //
+        // Refusing also cost real content. A partial-rect fill is ordinary
+        // (the differential's `top-left-quadrant`, `single-pixel` and
+        // `last-column-last-row` cases are all completed by
+        // `fn64-render-reference`, which seeds its target from guest RDRAM
+        // at `backend/imp.rs:440-447`), and a scissored fill is partial by
+        // construction, so the refusal would have swallowed every clipped
+        // rectangle the scissor fix now produces.
+        //
+        // **What keeps the fabricated zeros from becoming content**, which
+        // is the invariant the old guard was really protecting:
+        //
+        // 1. They are never copied to guest RDRAM. The guest copy-back
+        //    slices this buffer strictly by the DECLARED write ranges
+        //    (`production.rs`'s `committed_guest_render_target_bytes`,
+        //    consumed by `fn64-abi`'s `copy_committed_guest_writes`), and
+        //    the decoder declares exactly the rectangle's own rows --
+        //    now including the scissor clip, so declared and painted agree.
+        //    A pixel this completion did not cover is in no declared range,
+        //    so no digest is taken over it and no guest byte is written
+        //    from it.
+        // 2. They are named here, not assumed away. `covered` carries the
+        //    rectangle this generation actually proved, so a later reader
+        //    that wants to know which pixels are real can ask instead of
+        //    inferring it from a row count.
+        //
+        // The residual, stated rather than hidden: a LATER packet against
+        // the same target seeds its accumulator from this resident's full
+        // buffer (`production.rs`'s `stage_and_report`), so an uncovered
+        // pixel's zero survives into the next generation's buffer. It still
+        // reaches no guest byte unless some later command declares a write
+        // over it -- and if one does, that command paints it, because
+        // declaration and execution now share one geometry. Closing the
+        // gap properly means seeding a brand-new target from guest memory;
+        // `docs/RT64-FILL-PARTIAL-SEED.md` records why that is possible and
+        // what it costs.
         Ok(InitializedCandidateColorTarget {
             candidate: self,
             proof: InitializedRegionProof {
                 range: completed.range,
                 rows: completed.rectangle.height,
+                covered: completed.rectangle,
                 generation: completed.generation,
             },
+            rectangle: completed.rectangle,
             device_bytes: completed.device_bytes,
         })
     }
@@ -501,12 +542,46 @@ impl CompletedColorTargetWrite {
     pub const fn device_bytes(&self) -> &DeviceColorBytes {
         &self.device_bytes
     }
+
+    /// Widens this completion's claimed rectangle to `rectangle`, leaving
+    /// every byte untouched.
+    ///
+    /// The N-command accumulation seam's own need: with several fills and
+    /// texrects composing into one buffer, the *last* command's completion
+    /// carries the composed bytes but claims only its own sub-rectangle,
+    /// while the region the composed buffer actually proves is the union of
+    /// every command's. `admit_completed_initialization` reads exactly this
+    /// rectangle to decide whether a brand-new target is fully initialized,
+    /// so reporting the last command's alone would understate what N proved
+    /// and reject a legitimately complete composition.
+    ///
+    /// Deliberately takes the rectangle rather than computing a union here:
+    /// the caller is the only party that saw every command, and a union
+    /// recomputed from one completion would have nothing to union with.
+    ///
+    /// Nonclaim: this asserts nothing about the bytes, and cannot -- the
+    /// caller vouches that every pixel in `rectangle` came from a proven
+    /// write, exactly as it vouches for the single-command case.
+    pub(crate) fn with_claimed_rectangle(self, rectangle: TargetRectangle) -> Self {
+        Self { rectangle, ..self }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitializedRegionProof {
     range: PhysicalRange,
     rows: u32,
+    /// The exact rectangle this generation proved, which is NOT always the
+    /// whole target: a partial fill is admitted (see
+    /// `admit_completed_initialization`), and the pixels outside this
+    /// rectangle were never written by the command that produced this
+    /// generation.
+    ///
+    /// Retained because `rows` cannot answer the question a reader actually
+    /// has. It is a height with no origin, so it can say "two rows are
+    /// real" but never *which* two -- and nothing in the crate reads it to
+    /// make a decision. This field is what a reader should consult.
+    covered: TargetRectangle,
     generation: TargetGeneration,
 }
 
@@ -519,6 +594,17 @@ impl InitializedRegionProof {
         self.rows
     }
 
+    /// The rectangle this generation actually wrote. Pixels outside it were
+    /// not covered by the completion that published this resident.
+    pub const fn covered(self) -> TargetRectangle {
+        self.covered
+    }
+
+    /// Whether this generation's completion covered the whole target.
+    pub const fn is_full(self, extent: ColorTargetExtent) -> bool {
+        self.covered.is_full(extent)
+    }
+
     pub const fn generation(self) -> TargetGeneration {
         self.generation
     }
@@ -528,6 +614,14 @@ impl InitializedRegionProof {
 pub struct InitializedCandidateColorTarget {
     candidate: CandidateColorTarget,
     proof: InitializedRegionProof,
+    /// The exact rectangle the admitted completion claimed.
+    ///
+    /// Retained alongside `proof`, which keeps only the row count:
+    /// composing a second write onto this generation's bytes needs to know
+    /// *where* the proven region is, not just how tall it is.
+    /// `InitializedRegionProof` is a published shape this file does not
+    /// widen for one caller.
+    rectangle: TargetRectangle,
     device_bytes: DeviceColorBytes,
 }
 
@@ -579,6 +673,12 @@ impl InitializedCandidateColorTarget {
 
     pub const fn initialized_region(&self) -> InitializedRegionProof {
         self.proof
+    }
+
+    /// The rectangle the admitted completion claimed -- what this
+    /// generation's bytes are proven to cover.
+    pub const fn initialized_rectangle(&self) -> TargetRectangle {
+        self.rectangle
     }
 
     pub const fn device_bytes(&self) -> &DeviceColorBytes {

@@ -61,6 +61,15 @@ fn os_get_count_oracle(count: u32) -> u64 {
     count as i32 as i64 as u64
 }
 
+/// Stands in for the generated module's `lookup` so the pasted body below
+/// compiles standalone. The only call site is the trailing-padding arm, which
+/// is unreachable: the `jr $ra` above it returns. Trapping here keeps that
+/// claim honest — if the arm ever were reached, the test would say so rather
+/// than silently continuing.
+fn lookup(vram: u32) -> fn(&mut RecompContext, &mut Rdram) {
+    panic!("os_get_count paste: unreachable padding arm dispatched to {vram:#010X}")
+}
+
 // --- The emitter's output, pasted VERBATIM (kept honest by the golden). ---
 //
 // `unused_labels` is allowed because this particular function returns without
@@ -87,7 +96,8 @@ pub fn os_get_count(ctx: &mut RecompContext, mem: &mut Rdram) {
             0x80004D5C => {
                 // 0x80004D5C: Nop
                 // nop
-                pc = 0x80004D60;
+                lookup(0x80004D60)(ctx, mem);
+                return;
             }
             _ => unreachable!("jumped to unmapped vram {:#X}", pc),
         }

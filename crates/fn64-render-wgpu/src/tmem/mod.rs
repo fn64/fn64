@@ -62,22 +62,27 @@ pub use execute::{
 };
 pub(crate) use execute::{map_physical_lanes_block, map_physical_lanes_tlut};
 pub use gpu_projection::{
-    project_committed_tmem, TileBindingParams, TmemGpuProjection, TILE_BINDING_PARAMS_BYTES,
-    TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
+    project_committed_tmem, project_tmem, TileBindingParams, TmemGpuProjection,
+    TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TLUT_MODE_DISABLED, TLUT_MODE_IA16,
+    TLUT_MODE_RGBA16, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
-    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
-    PhysicalTmemTransactionIdentity, StagedTmemTransaction,
+    PendingTmemImage, PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
+    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
+pub(crate) use physical::{PendingTmemPrefixImage, TmemPrefixSnapshot};
+#[cfg(test)]
+pub(crate) use read::proposed_identity_for_test;
 pub use read::{
-    read_committed_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
-    PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
+    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
+    PhysicalTexelReadError, PhysicalTmemSnapshotIdentity, ProposedTmemImageIdentity,
+    TmemByteSource, TmemFirstRowParity, TmemSnapshotIdentity,
 };
 pub use sample::{
     address_point_texel, address_texture_cell, filter_three_nearest_committed_cell,
-    gather_committed_texture_cell, sample_committed_point, AddressedTextureCell,
+    gather_committed_texture_cell, sample_committed_point, sample_point, AddressedTextureCell,
     CommittedTextureCell, PointAddressError, PointSampleCoordinates, PointSampleError,
     PointSampleRequest, TextureAxis, TextureCellCorner, TextureCellFractions,
     TextureCellSampleError, TextureCoordinateS10_5,

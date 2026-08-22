@@ -6,6 +6,7 @@ mod triangle;
 #[cfg(test)]
 mod triangle_composition;
 mod triangle_draw_data;
+pub(crate) mod triangle_span;
 mod triangle_vertices;
 
 pub use production_adapter::{
@@ -21,8 +22,8 @@ pub use triangle::{
     TriangleFlags,
 };
 pub use triangle_draw_data::{
-    neutral_vertex_to_raster_vertex, retrieve_triangle_draws, MissingTriangleDrawState,
-    RetrievedTriangleDraw, TriangleDrawStateCollector,
+    bound_tile_index, neutral_vertex_to_raster_vertex, retrieve_triangle_draws,
+    MissingTriangleDrawState, RetrievedTriangleDraw, TriangleDrawStateCollector,
 };
 pub use triangle_vertices::{decode_triangle_vertices, TriangleVertex, TriangleVertices};
 
@@ -49,10 +50,34 @@ use crate::tmem::{
 };
 
 const SET_OTHER_MODE: u8 = 0x2f;
+/// `G_SETSCISSOR` (`0xED`, as
+/// `crates/fn64-render-reference/src/gbi/wire.rs`'s `G_SETSCISSOR` already
+/// spells it); public SGI *RDP Command Summary* "Set Scissor". Admitted as
+/// tracked state only -- see [`RawDpcCommandKind::SetScissor`].
+const SET_SCISSOR: u8 = 0xed & 0x3f;
 const SET_COLOR_IMAGE: u8 = 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 const FULL_SYNC: u8 = 0x29;
+/// `G_RDPPIPESYNC` (`0xe7`, `crates/fn64-render-reference/src/gbi/wire.rs`'s
+/// `G_RDPPIPESYNC`); public SGI *RDP Command Summary* "Sync Pipe". WM2000's
+/// most-issued rejected command: 20,800 occurrences, 14.6% of its whole
+/// stream (`docs/RT64-WM2000-CENSUS.md` §3).
+const SYNC_PIPE: u8 = 0xe7 & 0x3f;
+/// `G_RDPTILESYNC` (`0xe8`); public SGI *RDP Command Summary* "Sync Tile".
+/// 1,808 occurrences in the same census.
+const SYNC_TILE: u8 = 0xe8 & 0x3f;
+/// The id WM2000 writes to end a submission (`0xdf`, the GBI's `G_ENDDL`,
+/// masked to its command bits). Not an assigned RDP command: it is carved
+/// out of the otherwise-rejected `0x10..=0x23` block by
+/// `fn64_render::raw_rdp_command_width`'s `RDP_STREAM_TERMINATOR_NOOP`,
+/// whose doc carries the measurement and the narrow-widening argument.
+///
+/// This decoder is length-delimited, so it needs to tolerate a terminator,
+/// never to act on one -- hence `NoOp` rather than an early `break`. A
+/// `break` here would silently discard every command after the first
+/// terminator in a coalesced stream.
+const STREAM_TERMINATOR: u8 = 0xdf & 0x3f;
 /// `G_TEXRECT` (`texrectLLE`, opcode `0x24`); public SGI *RDP Command
 /// Summary* "Texture Rectangle".
 const TEXRECT: u8 = 0x24;
@@ -146,7 +171,11 @@ pub struct FillRectangle {
 }
 
 impl FillRectangle {
-    #[cfg(test)]
+    /// Reconstructs the decode payload from the four raw 12-bit wire
+    /// fields. No longer test-only: `production`'s fill executor
+    /// reconstructs one from the neutral `RdpFillRectangleCommand`, which
+    /// carries the identical undivided wire fields precisely so the
+    /// execution-time rectangle is the decoder's own, not a re-derivation.
     pub(crate) const fn from_wire_fields(
         upper_left_x: u16,
         upper_left_y: u16,
@@ -184,6 +213,26 @@ pub enum RawDpcCommandKind {
         variant: u8,
     },
     SetOtherMode(OtherMode),
+    /// `G_SETSCISSOR` (`0x2d`), **staged RDP state**.
+    ///
+    /// Carries the rect exactly as
+    /// [`crate::rt64_gbi_rdp_decode::decode_set_scissor`] -- the pinned
+    /// RT64 port, reused verbatim rather than re-derived -- reads it, and
+    /// stages into [`RdpState`]/[`RdpStateDelta`] like every other `Set*`
+    /// kind here, as a [`crate::targets::RdpScissorRect`] in the same
+    /// quarter-pixel units the wire carries.
+    ///
+    /// It was previously tracked-only, and this doc previously claimed
+    /// "no draw, clip, or bounds computation in this crate reads a scissor
+    /// rect today". That was accurate when written, and is precisely why a
+    /// texrect overhanging the framebuffer was refused outright instead of
+    /// clipped. `execute_texture_rectangle` now clips against this rect;
+    /// pinned RT64 likewise intersects its current scissor with the draw
+    /// rectangle (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so the
+    /// value has to survive into durable state:
+    /// a display list commonly sets the scissor once per frame and then
+    /// submits several packets under it.
+    SetScissor(crate::rt64_gbi_rdp_decode::SetScissorDecoded),
     SetColorImage(ColorImage),
     SetFillColor(FillColor),
     SetEnvColor(Color4),
@@ -232,6 +281,47 @@ pub struct RawDpcResourcePlan {
     tmem_source_identity: TmemLoadSourceIdentity,
     accesses: Box<[ResourceAccess]>,
     tmem_transfers: Box<[TmemTransferRecord]>,
+    fill_spans: Box<[FillAccessSpan]>,
+    /// One entry per admitted `FillRectangle`, naming the declared guest
+    /// read that carries its colour-image seed, or `None` when the fill is
+    /// full-extent and needs none. See [`FillSeedRead`].
+    fill_seeds: Box<[FillSeedRead]>,
+}
+
+/// The exact ordered `ResourceAccess` run one admitted `FillRectangle`
+/// pushed into the plan's own access list, recorded by `plan_fill` at the
+/// moment it pushed them.
+///
+/// Exists so the production adapter can hand
+/// `ExactRawDpcPlanWriter::push_fill_rectangle` the *decoder's* access slice
+/// rather than re-deriving it: two independent derivations of the same
+/// access list is exactly the divergence `ExactRawDpcPlanWriter::finish`'s
+/// access-for-access check exists to catch, and re-deriving would turn that
+/// sealed guarantee into a runtime coin flip.
+///
+/// `count` is `1` for a full-image-width fill and the rectangle's pixel
+/// height otherwise -- a partial-width rectangle's rows occupy disjoint,
+/// width-strided RDRAM ranges, so collapsing them would declare untouched
+/// inter-row bytes as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillAccessSpan {
+    command_index: u32,
+    first_access_index: u32,
+    count: u32,
+}
+
+impl FillAccessSpan {
+    pub const fn command_index(self) -> u32 {
+        self.command_index
+    }
+
+    pub const fn first_access_index(self) -> u32 {
+        self.first_access_index
+    }
+
+    pub const fn count(self) -> u32 {
+        self.count
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,6 +358,39 @@ impl BoundTmemTransfer<'_> {
         self.words
     }
 }
+
+/// A recorded `FillRectangle` access span could not be bound back to the
+/// plan's own ordered access list. Every variant means the decoder and the
+/// resource plan disagree about what an admitted fill writes -- a loud
+/// rejection, never a silently substituted access slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillAccessSpanError {
+    FillNotDeclared { command_index: u32 },
+    AccessSliceOutOfBounds { command_index: u32 },
+    AccessDescriptorsDiffer { command_index: u32 },
+}
+
+impl fmt::Display for FillAccessSpanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FillNotDeclared { command_index } => write!(
+                formatter,
+                "no FillRectangle access span was declared for command #{command_index}"
+            ),
+            Self::AccessSliceOutOfBounds { command_index } => write!(
+                formatter,
+                "FillRectangle command #{command_index}'s access span is out of bounds"
+            ),
+            Self::AccessDescriptorsDiffer { command_index } => write!(
+                formatter,
+                "FillRectangle command #{command_index}'s access span is not a run of \
+                 RenderTarget color-framebuffer writes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FillAccessSpanError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmemLoadSourcePlanError {
@@ -315,6 +438,128 @@ impl std::error::Error for TmemLoadSourcePlanError {}
 impl RawDpcResourcePlan {
     pub fn accesses(&self) -> &[ResourceAccess] {
         &self.accesses
+    }
+
+    /// The exact ordered access slice `plan_fill` pushed for the admitted
+    /// `FillRectangle` at decode-order position `command_index`, together
+    /// with the span record itself.
+    ///
+    /// Every returned access is re-checked here to be an
+    /// `AccessMode::Write`/`AccessPurpose::RenderTarget` RDRAM
+    /// `ColorFramebuffer` region: the span was recorded by the decoder, but
+    /// a span that no longer describes render-target writes means the plan
+    /// and the decoder disagree, which is a loud rejection rather than a
+    /// slice handed on unchecked.
+    pub fn bind_fill_rectangle(
+        &self,
+        command_index: u32,
+    ) -> Result<(FillAccessSpan, &[ResourceAccess]), FillAccessSpanError> {
+        let span = self
+            .fill_spans
+            .iter()
+            .copied()
+            .find(|span| span.command_index == command_index)
+            .ok_or(FillAccessSpanError::FillNotDeclared { command_index })?;
+        let start = usize::try_from(span.first_access_index)
+            .map_err(|_| FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let end = start
+            .checked_add(span.count as usize)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        if accesses.is_empty() {
+            return Err(FillAccessSpanError::AccessSliceOutOfBounds { command_index });
+        }
+        let exact = accesses.iter().all(|access| {
+            access.mode() == AccessMode::Write
+                && access.purpose() == AccessPurpose::RenderTarget
+                && matches!(
+                    access.region(),
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        ..
+                    }
+                )
+        });
+        if !exact {
+            return Err(FillAccessSpanError::AccessDescriptorsDiffer { command_index });
+        }
+        Ok((span, accesses))
+    }
+
+    /// The declared guest read carrying the colour-image seed for the fill
+    /// at decode-order position `command_index`.
+    ///
+    /// `Ok(None)` means that fill covers the whole target and legitimately
+    /// declared no seed -- every byte comes from the command itself.
+    /// `Err(FillNotDeclared)` means no seed record exists for the command at
+    /// all, which is a decoder bug rather than a full-extent fill, and is
+    /// kept distinguishable for exactly that reason.
+    pub fn bind_fill_seed(&self, command_index: u32) -> Result<Option<u32>, FillAccessSpanError> {
+        self.fill_seeds
+            .iter()
+            .copied()
+            .find(|seed| seed.command_index == command_index)
+            .map(|seed| seed.access_index)
+            .ok_or(FillAccessSpanError::FillNotDeclared { command_index })
+    }
+
+    /// The exact ordered access slice `plan_texture_rectangle` pushed for the
+    /// admitted `TextureRectangle` at decode-order position `command_index`,
+    /// or an empty slice when that texrect declared no destination write.
+    ///
+    /// Mirrors [`Self::bind_fill_rectangle`] -- same span table, same
+    /// `Write`/`RenderTarget`/`ColorFramebuffer` re-check on every access, so
+    /// a span that no longer describes render-target writes is a loud
+    /// rejection rather than a slice handed on unchecked.
+    ///
+    /// Differs from the fill binder in exactly one way, deliberately: a
+    /// texrect with **no** recorded span is `Ok(&[])`, not
+    /// `FillNotDeclared`. A texrect legitimately declares no write when its
+    /// destination is not provable at decode time (see
+    /// `plan_texture_rectangle`'s contract), whereas an admitted fill that
+    /// declared none is a decoder bug.
+    pub fn bind_texture_rectangle(
+        &self,
+        command_index: u32,
+    ) -> Result<&[ResourceAccess], FillAccessSpanError> {
+        let Some(span) = self
+            .fill_spans
+            .iter()
+            .copied()
+            .find(|span| span.command_index == command_index)
+        else {
+            return Ok(&[]);
+        };
+        let start = usize::try_from(span.first_access_index)
+            .map_err(|_| FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let end = start
+            .checked_add(span.count as usize)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        let accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(FillAccessSpanError::AccessSliceOutOfBounds { command_index })?;
+        if accesses.is_empty() {
+            return Err(FillAccessSpanError::AccessSliceOutOfBounds { command_index });
+        }
+        let exact = accesses.iter().all(|access| {
+            access.mode() == AccessMode::Write
+                && access.purpose() == AccessPurpose::RenderTarget
+                && matches!(
+                    access.region(),
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        ..
+                    }
+                )
+        });
+        if !exact {
+            return Err(FillAccessSpanError::AccessDescriptorsDiffer { command_index });
+        }
+        Ok(accesses)
     }
 
     pub fn tmem_load_source_accesses(
@@ -450,29 +695,39 @@ fn transfer_record(
         let logical_offset = plan
             .logical_source_offset(index)
             .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
-        let mut preceding = 0_u32;
-        let mut source_binding = None;
-        for (source_ordinal, access) in sources.iter().enumerate() {
-            let bytes = access.region().declared_bytes();
-            let end = preceding
-                .checked_add(bytes)
-                .ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
-            if logical_offset < end {
-                let ordinal = u32::try_from(source_ordinal)
-                    .map_err(|_| TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
-                source_binding = Some((
-                    plan.source()
-                        .first_access_index()
-                        .checked_add(ordinal)
-                        .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?,
-                    logical_offset - preceding,
-                ));
-                break;
-            }
-            preceding = end;
+        // **Bound ROW-LOCALLY, not by walking concatenated lengths.**
+        //
+        // The declared source reads are PADDED to whole 64-bit words (each
+        // row reads `words_per_row * 8` bytes, because hardware copies whole
+        // words), so consecutive accesses are no longer contiguous in logical
+        // texel space. Walking their lengths against a LOGICAL offset -- what
+        // this did -- binds later rows into the wrong access as soon as a row
+        // carries any padding.
+        //
+        // Each transfer word's row and position within it are already known
+        // from the plan's own geometry, so the binding is direct: access
+        // `first + row`, offset `within_row * 8`. A single-access plan
+        // (LoadBlock, LoadTLUT) has `row == 0` and reduces to the previous
+        // behaviour.
+        let words_per_row = u32::from(plan.words_per_row().max(1));
+        let row = u32::from(index) / words_per_row;
+        let within_row = u32::from(index) % words_per_row;
+        let source_ordinal = if sources.len() == 1 { 0 } else { row };
+        let source_access_index = plan
+            .source()
+            .first_access_index()
+            .checked_add(source_ordinal)
+            .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+        let source_access_byte_offset = if sources.len() == 1 {
+            logical_offset
+        } else {
+            within_row
+                .checked_mul(8)
+                .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?
+        };
+        if usize::try_from(source_ordinal).unwrap_or(usize::MAX) >= sources.len() {
+            return Err(TmemLoadSourcePlanError::AccessSliceOutOfBounds);
         }
-        let (source_access_index, source_access_byte_offset) =
-            source_binding.ok_or(TmemLoadSourcePlanError::AccessDescriptorsDiffer)?;
         words.push(TmemTransferWord::new(
             index,
             logical_offset,
@@ -755,6 +1010,8 @@ fn decode_from_state(
 
     let mut delta = RdpStateDelta::default();
     let mut commands = Vec::new();
+    let mut fill_spans: Vec<FillAccessSpan> = Vec::new();
+    let mut fill_seeds: Vec<FillSeedRead> = Vec::new();
     for (stream_index, stream) in packet.streams().iter().enumerate() {
         let flattened = FlattenedStream::new(workload, stream_index, stream);
         decode_stream(
@@ -765,6 +1022,8 @@ fn decode_from_state(
             &mut delta,
             &mut planned,
             &mut commands,
+            &mut fill_spans,
+            &mut fill_seeds,
         )?;
     }
 
@@ -804,6 +1063,8 @@ fn decode_from_state(
             tmem_source_identity,
             accesses: resource_accesses,
             tmem_transfers,
+            fill_spans: fill_spans.into_boxed_slice(),
+            fill_seeds: fill_seeds.into_boxed_slice(),
         },
         origin,
     })
@@ -897,6 +1158,8 @@ fn decode_stream(
     delta: &mut RdpStateDelta,
     planned: &mut Vec<ResourceAccess>,
     commands: &mut Vec<DecodedRawDpcCommand>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+    fill_seeds: &mut Vec<FillSeedRead>,
 ) -> Result<(), RawDpcDecodeError> {
     let mut offset = 0usize;
     while offset < stream.bytes.len() {
@@ -919,6 +1182,33 @@ fn decode_stream(
         let opcode = wire_opcode & 0x3f;
         let kind = match opcode {
             0x00..=0x07 => RawDpcCommandKind::NoOp { variant: opcode },
+            // The three ids WM2000 issues that this decoder used to abort on.
+            // All three are admitted as `NoOp`, which is admitted and
+            // discarded (`production_adapter`'s `NoOp` arm) and stages no
+            // `RdpState`/`RdpStateDelta` -- so admitting them cannot move a
+            // pixel, exactly the property that makes this safe to do without
+            // designing a semantic.
+            //
+            // Measured, not assumed: 20,800 `SyncPipe` + 1,808 `SyncTile` +
+            // 219 terminators, across 218/218 frames
+            // (`docs/RT64-WM2000-CENSUS.md` §3). Each rejection aborted the
+            // WHOLE stream rather than one command, so these three ids alone
+            // held 0% of frames at zero decoded.
+            //
+            // `SyncPipe`/`SyncTile` are real RDP commands whose effect is
+            // pipeline sequencing, not rasterization; `ReferenceBackend`
+            // already groups them with `SyncLoad` as a no-op arm
+            // (`fn64-render-reference`'s `gbi/stream.rs`), and this follows
+            // that precedent rather than inventing a second reading.
+            //
+            // Nonclaim, and the reason these are `NoOp` rather than named
+            // kinds: discarding a sync is correct only because this backend
+            // has no pipeline to sequence. It is not a claim that RDP
+            // synchronization is semantically empty. A backend that later
+            // models pipeline hazards must revisit this arm, not inherit it.
+            SYNC_PIPE | SYNC_TILE | STREAM_TERMINATOR => {
+                RawDpcCommandKind::NoOp { variant: opcode }
+            }
             SET_OTHER_MODE => {
                 let value = OtherMode::from_wire(w0 & 0x00ff_ffff, w1);
                 delta.set_other_mode(value);
@@ -994,6 +1284,50 @@ fn decode_stream(
                 state.apply(delta);
                 RawDpcCommandKind::SetFogColor(value)
             }
+            SET_SCISSOR => {
+                // Reuses the pinned RT64 port verbatim. `ulx`/`uly` come
+                // from `p0(w0, 12, 12)`/`p0(w0, 0, 12)` -- both inside w0's
+                // low 24-bit payload -- so passing the full wire word here
+                // (opcode byte still in bits 24:31) reads exactly the same
+                // fields the RT64 decoder would; no masking is needed and
+                // none is applied, matching how `SET_COMBINE` below passes
+                // `w0` unmasked.
+                //
+                // **Staged now, not merely tracked.** It used to be
+                // tracked-only, on the reasoning that nothing in this crate
+                // read a scissor rect -- true when written, and no longer
+                // true: `execute_texture_rectangle` clips against it (see
+                // `targets::clip_texrect_extent`); pinned RT64 also
+                // intersects its scissor and draw rectangles
+                // (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so
+                // keeping it out of `RdpState`
+                // would silently unscissor every packet that inherits the
+                // rect from an earlier one.
+                //
+                // Latched in the decoder's own quarter-pixel wire units.
+                // Public libultra `include/ultra64/gbi.h:4794-4837` encodes
+                // the four coordinates as twelve-bit fields scaled by four,
+                // or accepts the fractional wire values directly.
+                let decoded = crate::rt64_gbi_rdp_decode::decode_set_scissor(w0, w1);
+                // `p0`/`p1` mask to twelve bits and never sign-extend, so
+                // every coordinate is in `0..=4095` and fits a `u16`. The
+                // `expect`s are loud traps on that invariant rather than
+                // silent `as` truncations, matching `neutral_scissor`'s own
+                // treatment of the identical decode.
+                let quarter = |value: i32, field: &str| {
+                    u16::try_from(value)
+                        .unwrap_or_else(|_| panic!("SetScissor {field} is a 12-bit field: {value}"))
+                };
+                delta.set_scissor(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    decoded.mode,
+                    quarter(decoded.ulx, "ulx"),
+                    quarter(decoded.uly, "uly"),
+                    quarter(decoded.lrx, "lrx"),
+                    quarter(decoded.lry, "lry"),
+                ));
+                state.apply(delta);
+                RawDpcCommandKind::SetScissor(decoded)
+            }
             SET_PRIM_DEPTH => {
                 let value = PrimDepth::from_wire(w1);
                 delta.set_prim_depth(value);
@@ -1019,7 +1353,28 @@ fn decode_stream(
                     lower_right_x: ((w0 >> 12) & 0x0fff) as u16,
                     lower_right_y: (w0 & 0x0fff) as u16,
                 };
-                plan_fill(location, rectangle, layout, state, planned)?;
+                // `commands.len()` is this command's own decode-order
+                // index: `commands` accumulates across every stream in the
+                // packet and this command is pushed at the bottom of this
+                // same loop iteration, so the value read here is exactly
+                // the index it will occupy. The span is recorded by
+                // `plan_fill` itself, at the moment it pushes the accesses,
+                // so the recorded run can never drift from the pushed one.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_fill(
+                    location,
+                    command_index,
+                    rectangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                    fill_seeds,
+                )?;
                 RawDpcCommandKind::FillRectangle(rectangle)
             }
             LOAD_SYNC | LOAD_TLUT | SET_TILE_SIZE | LOAD_BLOCK | LOAD_TILE | SET_TILE
@@ -1112,6 +1467,25 @@ fn decode_stream(
                 // opcode -- so this length can never actually mismatch here.
                 let triangle = triangle::RawTriangle::decode(opcode, command)
                     .expect("command slice length was already proven exact above");
+                // Same span-recording contract as `FILL_RECTANGLE` and
+                // `TEXTURE_RECTANGLE` above: `commands.len()` is this
+                // command's own decode-order index, and the access run is
+                // recorded by `plan_raw_triangle` at the moment it pushes,
+                // so the span can never drift from the pushed accesses.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_raw_triangle(
+                    location,
+                    command_index,
+                    &triangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                )?;
                 RawDpcCommandKind::RawTriangle(triangle)
             }
             TEXRECT | TEXRECT_FLIP => {
@@ -1124,6 +1498,25 @@ fn decode_stream(
                 // never actually mismatch here.
                 let rectangle = texture_rectangle::RawTextureRectangle::decode(opcode, command)
                     .expect("command slice length was already proven exact above");
+                // Same span-recording contract as `FILL_RECTANGLE` above:
+                // `commands.len()` is this command's own decode-order index,
+                // and the access run is recorded by `plan_render_target_rows`
+                // at the moment it pushes, so the span can never drift from
+                // the pushed accesses.
+                let command_index = u32::try_from(commands.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                plan_texture_rectangle(
+                    location,
+                    command_index,
+                    rectangle,
+                    layout,
+                    state,
+                    planned,
+                    fill_spans,
+                )?;
                 RawDpcCommandKind::TextureRectangle(rectangle)
             }
             _ => {
@@ -1142,16 +1535,66 @@ fn decode_stream(
 
 fn plan_fill(
     location: RawDpcCommandLocation,
+    command_index: u32,
     rectangle: FillRectangle,
     layout: fn64_render_ir::PhysicalMemoryLayout,
     state: &RdpState,
     planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+    fill_seeds: &mut Vec<FillSeedRead>,
 ) -> Result<(), RawDpcDecodeError> {
-    if state.other_mode().map(OtherMode::cycle_type) != Some(CycleType::Fill) {
+    // The cycle type selects how a rectangle's *content* is produced, not
+    // whether the command is legal. Three independent authorities agree:
+    //
+    // - **fn64's own reference lane.** `fn64-render-reference`'s
+    //   `raster/draw.rs:113-128` dispatches `G_FILLRECT` on cycle type and
+    //   sends one/two-cycle rectangles to `draw_combined_fill_rectangle`
+    //   (`draw.rs:223`), which runs them through the colour combiner with
+    //   `shade`/`texel0`/`texel1` all zero. Only the `CycleType::Fill` arm
+    //   uses the fill colour.
+    //
+    // - **RT64.** `RDP::fillRect` (`rt64_rdp.cpp:1033-1050`, pinned
+    //   `5473732a`) reads `otherMode` only to decide the `lrx |= 3`/
+    //   `lry |= 3` COPY/FILL rounding, then unconditionally calls
+    //   `drawRect(ulx, uly, lrx, lry, 0, 0, 0, 0, false, extAlignment)`.
+    //   The fill-colour *clear* is selected far downstream, at
+    //   `rt64_framebuffer_renderer.cpp:1518-1519`, and only when
+    //   `cycleType == G_CYC_FILL`; every other cycle type falls through to
+    //   the ordinary raster shader. RT64 never refuses the command.
+    //
+    // - **The guest.** Measured on the real ROM at VI swap 2522
+    //   (`docs/WM2000-FILLRECT-EVIDENCE.txt`): WM2000 stages four
+    //   `SetOtherMode`s, all one-cycle, then issues 60 full-width
+    //   `FillRectangle`s and **no `SetFillColor` at all**. It stages
+    //   `SetCombine`/`SetPrimColor`/`SetEnvColor` instead. There is no
+    //   fill colour because none is wanted; the rectangle's colour comes
+    //   from the combiner.
+    //
+    // One- and two-cycle rectangles now run through the same combiner and
+    // blender stages as texture rectangles, so they declare the bytes that
+    // executor writes. The lower/right edge is exclusive in those modes;
+    // applying that adjustment here as well as in the executor is required
+    // because `fill_completed_writes` publishes every declared byte without
+    // independently asking which pixels the raster touched.
+    //
+    // A `FillRectangle` before any `SetOtherMode` keeps its loud refusal:
+    // there is no wire fact saying which content producer the guest asked
+    // for. Copy cycle is also refused because it has no guaranteed public
+    // result.
+    let Some(other_mode) = state.other_mode() else {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
-            reason: "FillRectangle requires staged fill-cycle OtherMode",
+            reason: "FillRectangle requires staged OtherMode",
         });
+    };
+    match other_mode.cycle_type() {
+        CycleType::Copy => {
+            return Err(RawDpcDecodeError::InvalidCommand {
+                location,
+                reason: "G_FILLRECT in copy cycle has no guaranteed public result; use G_TEXRECT",
+            })
+        }
+        CycleType::Fill | CycleType::OneCycle | CycleType::TwoCycle => {}
     }
     let Some(image) = state.color_image() else {
         return Err(RawDpcDecodeError::InvalidCommand {
@@ -1159,7 +1602,7 @@ fn plan_fill(
             reason: "FillRectangle requires staged SetColorImage",
         });
     };
-    if state.fill_color().is_none() {
+    if other_mode.cycle_type() == CycleType::Fill && state.fill_color().is_none() {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
             reason: "FillRectangle requires staged SetFillColor",
@@ -1189,20 +1632,806 @@ fn plan_fill(
     }
     let x0 = u32::from(rectangle.upper_left_x) >> 2;
     let y0 = u32::from(rectangle.upper_left_y) >> 2;
-    let x1 = u32::from(rectangle.lower_right_x) >> 2;
-    let y1 = u32::from(rectangle.lower_right_y) >> 2;
-    if x0 > x1 || y0 > y1 {
+    let encoded_x1 = u32::from(rectangle.lower_right_x) >> 2;
+    let encoded_y1 = u32::from(rectangle.lower_right_y) >> 2;
+    if x0 > encoded_x1 || y0 > encoded_y1 {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
             reason: "FillRectangle coordinates are reversed",
         });
     }
+    let (x1, y1) = match other_mode.cycle_type() {
+        CycleType::Fill => (encoded_x1, encoded_y1),
+        CycleType::OneCycle | CycleType::TwoCycle => {
+            let Some(x1) = encoded_x1.checked_sub(1) else {
+                return Ok(());
+            };
+            let Some(y1) = encoded_y1.checked_sub(1) else {
+                return Ok(());
+            };
+            if x0 > x1 || y0 > y1 {
+                return Ok(());
+            }
+            (x1, y1)
+        }
+        CycleType::Copy => unreachable!("copy cycle was refused above"),
+    };
     if x1 >= image.width() {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
             reason: "FillRectangle exceeds the staged color-image width",
         });
     }
+    // **The scissor narrows what this command WRITES, so it must narrow what
+    // the journal DECLARES.**
+    //
+    // Pinned RT64 intersects its current scissor with the draw rectangle
+    // (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`), so a scissored
+    // fill never touches pixels outside that intersection, and the executor
+    // (`targets::execute_fill_rectangle`, via `clip_fill_rectangle`) now
+    // does the same.
+    //
+    // Declaring the UNCLIPPED extent while executing the clipped one is
+    // precisely the hazard this function's own doc names sixty lines above:
+    // `fill_completed_writes` slices the full-extent buffer for every
+    // declared range *without checking the raster touched it*, so a
+    // declared-but-unpainted row would publish a real digest of whatever the
+    // buffer held there and carry it into guest RDRAM. Declaration and
+    // execution must agree on the geometry, and the scissor is part of that
+    // geometry.
+    //
+    // `None` means no `SetScissor` has been staged, in which case the
+    // consumer's honest widest bound is the whole target -- the same
+    // fallback `texrect_scissor_or_full_target` supplies on the execute
+    // side. The clip below is then a no-op, so an unscissored stream
+    // declares exactly what it declared before this change.
+    let full_extent = RenderTargetRectangle { x0, y0, x1, y1 };
+    let Some(rectangle) = clip_fill_rows_to_scissor(full_extent, state.scissor()) else {
+        // Nothing survives the clip, so this command writes no guest byte
+        // and the journal must declare none. Not an error: a fully
+        // scissored-away rectangle is ordinary content (a sprite walked off
+        // the clip window), and the executor names the same case loudly as
+        // `FillExecutionError::ScissoredAway` only when it is asked to
+        // execute one, which it now never is.
+        return Ok(());
+    };
+    // **A partial fill declares a READ of the colour image it is patching
+    // into, so the pixels it does not paint have a real value.**
+    //
+    // A fill that covers the whole target needs no seed: every byte comes
+    // from the command. A partial one does, and the alternative is the
+    // fabricated zeros `targets/mod.rs` used to refuse the draw over --
+    // measured, not assumed: admitting partial fills without this read made
+    // the differential's `top-left-quadrant` report `wgpu: 0x0000` where
+    // both the reference and the hand-derived key say `0xffff`.
+    //
+    // The oracle does exactly this. `fn64-render-reference` seeds its
+    // target from guest RDRAM before rendering every raw-RDP task
+    // (`backend/imp.rs:440-447` calling `framebuffer_io.rs:12-44`), fills
+    // strictly inside the clipped rect, and writes the whole extent back.
+    // Its untouched pixels are the pre-existing guest bytes, which is what
+    // hardware gives: an N64 colour image is RDRAM, and the bytes outside a
+    // fill are whatever was already there.
+    //
+    // `TmemLoadSource` is the purpose because it is the one the deferred
+    // guest-read plan selects on -- `DeferredGuestReadPlan::try_from_journal`
+    // (`fn64-render-ir/src/guest_read.rs`) keys purely on
+    // `purpose == TmemLoadSource` and is otherwise resource-agnostic, and
+    // `ResourceAccess::try_new` explicitly admits
+    // `RdramResource::ColorFramebuffer` for it. Naming it `UploadSource`,
+    // which reads more honestly, would make the plan skip the read and hand
+    // the executor nothing. The narrower name is the load-bearing one here;
+    // `docs/RT64-FILL-PARTIAL-SEED.md` records the seam.
+    //
+    // **Pushed BEFORE the write span, never inside it.** `fill_accesses`
+    // re-checks that every access in a fill's recorded span is
+    // `Write`/`RenderTarget`, and `plan_render_target_rows` records the span
+    // starting at the next index, so a read pushed here stays outside it.
+    // **Full extent of the TARGET, not "unchanged by the scissor clip".**
+    //
+    // The question a seed answers is "are there pixels of this colour image
+    // that this command will not write", and that is a comparison against
+    // the image, not against the pre-clip rectangle. Comparing to
+    // `full_extent` instead was measured wrong: the differential's
+    // `top-left-quadrant`, `single-pixel` and `last-column-last-row` cases
+    // are unscissored, so the clip is a no-op and `rectangle == full_extent`
+    // held for every one of them -- while each covers a small corner of an
+    // 8x4 target and needs a seed badly.
+    //
+    // **The height is the host-configured one, and its absence is not an
+    // error here.** `SetColorImage` carries no height (see
+    // `RdpState::color_target_height`), and plenty of decode-only paths
+    // never configure one. A fill that spans the full image width and
+    // starts at row 0 with no known height is treated as covering the
+    // target -- the same thing this planner assumed before seeds existed,
+    // so those paths decode exactly as they did. Making the height
+    // mandatory instead broke twenty-odd decode tests that legitimately
+    // have none, which is how this arm got written.
+    //
+    // **A zero height declares no seed.** A degenerate target holds no
+    // pixels to seed from, and the honest refusal for a fill against one is
+    // the named downstream rejection the executor already produces
+    // (`resize_to_zero_is_recorded_and_rejected_by_name_at_the_fill`), not
+    // "color image lies outside installed RDRAM" raised while sizing a
+    // zero-pixel read. Preempting it here replaced a specific diagnosis
+    // with a misleading one, which is how this arm was found.
+    let covers_target = state
+        .color_target_height()
+        .is_some_and(|height| height == 0)
+        || (rectangle.x0 == 0
+            && rectangle.y0 == 0
+            && rectangle.x1 + 1 == image.width()
+            && state
+                .color_target_height()
+                .is_none_or(|height| rectangle.y1 + 1 == height));
+    let seed = if covers_target {
+        None
+    } else {
+        // A seed is only reachable when the fill does NOT cover the target,
+        // which above requires a known height whenever the rectangle is
+        // otherwise full-image -- but a partial-width fill can reach here
+        // with none, and the seed must still be sized. The colour image's
+        // own last covered row is the honest bound in that case.
+        let height = state.color_target_height().unwrap_or(rectangle.y1 + 1);
+        let pixels =
+            image
+                .width()
+                .checked_mul(height)
+                .ok_or(RawDpcDecodeError::InvalidCommand {
+                    location,
+                    reason: "color image pixel count overflows",
+                })?;
+        let bytes_per_pixel =
+            image
+                .size()
+                .bytes_per_pixel()
+                .ok_or(RawDpcDecodeError::InvalidCommand {
+                    location,
+                    reason: "color image size has no byte width",
+                })?;
+        let start = image.address().get();
+        let end = pixels
+            .checked_mul(bytes_per_pixel)
+            .and_then(|bytes| start.checked_add(bytes))
+            .ok_or(RawDpcDecodeError::InvalidCommand {
+                location,
+                reason: "color image byte range overflows",
+            })?;
+        let range = layout
+            .range(start, end)
+            .map_err(|_| RawDpcDecodeError::InvalidCommand {
+                location,
+                reason: "color image lies outside installed RDRAM",
+            })?;
+        let index =
+            u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
+                workload: location.workload,
+            })?;
+        push_access(
+            location.workload,
+            planned,
+            AccessMode::Read,
+            AccessPurpose::TmemLoadSource,
+            ResourceRegion::Rdram {
+                resource: RdramResource::ColorFramebuffer,
+                range,
+            },
+        )?;
+        Some(index)
+    };
+    fill_seeds.push(FillSeedRead {
+        command_index,
+        access_index: seed,
+    });
+    plan_render_target_rows(
+        location,
+        command_index,
+        rectangle,
+        image,
+        layout,
+        planned,
+        fill_spans,
+    )
+}
+
+/// Which declared guest read carries the colour-image seed for one admitted
+/// `FillRectangle`, or `None` when the fill covers the whole target and
+/// needs no seed.
+///
+/// Recorded per command rather than inferred at execute time: the executor
+/// must be able to tell "this fill declared no seed because it is
+/// full-extent" from "this fill declared a seed that failed to thread",
+/// and only the decoder knows which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillSeedRead {
+    command_index: u32,
+    access_index: Option<u32>,
+}
+
+impl FillSeedRead {
+    pub const fn command_index(self) -> u32 {
+        self.command_index
+    }
+
+    pub const fn access_index(self) -> Option<u32> {
+        self.access_index
+    }
+}
+
+/// Intersects one fill's whole-pixel destination rectangle with the staged
+/// scissor, in the scissor's own quarter-pixel domain, returning `None` when
+/// nothing survives.
+///
+/// Uses [`crate::targets::RdpScissorRect`]'s own pixel accessors rather than
+/// re-deriving the quarter-pixel rounding, so the decoder and the executor
+/// round the scissor identically by construction instead of by two
+/// agreeing-looking copies of `div_ceil`. The `ceil(q / 4)` rule is fn64's
+/// own reading and is not independently confirmed against an allowed
+/// hardware reference.
+///
+/// The target-extent bound is deliberately NOT applied here: `plan_fill`
+/// has already rejected `x1 >= image.width()` loudly, and the row planner
+/// derives its own ranges from the image, so adding a second extent clamp
+/// would silently admit a rectangle the width check exists to refuse.
+fn clip_fill_rows_to_scissor(
+    rectangle: RenderTargetRectangle,
+    scissor: Option<crate::targets::RdpScissorRect>,
+) -> Option<RenderTargetRectangle> {
+    let Some(scissor) = scissor else {
+        return Some(rectangle);
+    };
+    let RenderTargetRectangle { x0, y0, x1, y1 } = rectangle;
+    // Half-open intersection, then back to this struct's inclusive edges.
+    let first_x = x0.max(scissor.first_column());
+    let limit_x = (x1 + 1).min(scissor.column_limit());
+    let first_y = y0.max(scissor.first_row());
+    let limit_y = (y1 + 1).min(scissor.row_limit());
+    if first_x >= limit_x || first_y >= limit_y {
+        return None;
+    }
+    Some(RenderTargetRectangle {
+        x0: first_x,
+        y0: first_y,
+        x1: limit_x - 1,
+        y1: limit_y - 1,
+    })
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// `TextureRectangle` covers, so the journal carries a write for the
+/// composition layer to order a texrect against -- the gap that previously
+/// made a texrect indistinguishable from a triangle (which declares no write
+/// at all) and forced `MixedFillAndTrianglePacket`.
+///
+/// **Destination geometry only.** Nothing here reads TMEM, samples a texel,
+/// or claims what the rectangle's *content* will be. The access run is
+/// derived from the rasterized pixel extent and the staged `SetColorImage`
+/// exactly as `plan_fill`'s is, through the same [`plan_render_target_rows`].
+///
+/// The extent is read off [`texture_rectangle::texture_rectangle_vertices`]
+/// -- this crate's ported RT64 `drawTexRect`/`drawRect` -- rather than
+/// re-derived from the wire fields, because copy-mode `lrx |= 3`/`lry |= 3`
+/// mutation and fill/copy UL rounding live inside that function. A second
+/// derivation of the same rectangle is exactly the drift
+/// `ExactRawDpcPlanWriter::finish`'s access-for-access check exists to catch.
+///
+/// # Declaring nothing is not a silent no-op
+///
+/// Several conditions below return without pushing an access. That is a
+/// declaration that this command writes *no* `ColorFramebuffer` range the
+/// journal can name -- not a suppressed error, and not a skipped draw. The
+/// command is still decoded, still admitted, and still rasters through the
+/// triangle path exactly as it did before this planner existed; only the
+/// journal entry is absent, which is precisely the pre-existing behavior for
+/// every texrect. The conditions:
+///
+/// - **No staged `SetColorImage`**, or one outside the RGBA16/RGBA32 subset
+///   `plan_fill` admits: there is no destination image, so there is no range
+///   to name. This crate's own `tmem_then_texrect_words` fixture is such a
+///   stream, and it decoded before this planner existed.
+/// - **No staged `OtherMode`**: `texture_rectangle_vertices` reads
+///   `cycle_type` to decide copy-mode mutation and UL rounding, so the
+///   geometry is undefined. The production adapter already refuses this case
+///   by name (`TextureRectangleBeforeAnyOtherMode`) -- refusing it a second
+///   time here, at a different layer and with a different error, would just
+///   move which message a reader sees.
+/// - **`TextureRectangleFlip`**: flip's destination footprint is the same,
+///   but this slice does not execute it, and declaring a write no executor
+///   fills would promise content that never arrives.
+/// - **Fractional edges, a degenerate/empty extent, a negative origin, or a
+///   rectangle wider than the staged image**: the exact covered range is not
+///   provable here, and a clamped or rounded guess would declare bytes the
+///   RDP never covers.
+///
+/// A refusal that *must* be loud belongs at the executor, which knows it was
+/// asked to produce content and cannot -- not at the journal, which would be
+/// refusing streams that decode correctly today.
+fn plan_texture_rectangle(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    rectangle: texture_rectangle::RawTextureRectangle,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    state: &RdpState,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    if rectangle.flip() {
+        return Ok(());
+    }
+    let Some(other_mode) = state.other_mode() else {
+        return Ok(());
+    };
+    // Deliberately NOT gated on cycle type. The destination footprint this
+    // planner declares is a function of the wire coordinates and the staged
+    // `SetColorImage` only; the cycle type selects how the *content* is
+    // produced (Copy blits the texel, one/two-cycle runs it through the color
+    // combiner), which is the executor's concern, not the journal's. Gating
+    // here on Copy/Fill was tried and reverted: it would have refused the
+    // one-cycle texrects this crate's own fixtures carry, and no measurement
+    // in this repo establishes which mode WM2000's title-screen texrects use.
+    //
+    // `other_mode` is still required to be staged, because
+    // `texture_rectangle_vertices` reads `cycle_type` to decide copy-mode
+    // `dsdx`/`lrx`/`lry` mutation and fill/copy UL rounding -- a texrect
+    // before any `SetOtherMode` has no defined geometry, and the production
+    // adapter already refuses it by name (`TextureRectangleBeforeAnyOtherMode`).
+    let cycle_type = other_mode.cycle_type();
+    // No staged `SetColorImage` means this texrect has no destination image
+    // to write into, so it declares no write access and the stream still
+    // decodes. This is NOT a silent no-op: the command is still admitted and
+    // still rasters through the triangle path exactly as before this planner
+    // existed; there is simply no `ColorFramebuffer` range to declare. A
+    // decode refusal here would regress every already-decodable TMEM-then-
+    // texrect stream that never staged a color image (this crate's own
+    // `tmem_then_texrect_words` fixture is one).
+    let Some(image) = state.color_image() else {
+        return Ok(());
+    };
+    // Same narrow color-image subset `plan_fill` admits. An unsupported
+    // format declares no write rather than failing the decode, for the same
+    // reason as above -- the executor, not the journal, is where an
+    // unexecutable texrect must be refused by name.
+    if image.format() != ImageFormat::Rgba
+        || !matches!(image.size(), PixelSize::Bits16 | PixelSize::Bits32)
+    {
+        return Ok(());
+    }
+    if [
+        rectangle.ulx(),
+        rectangle.uly(),
+        rectangle.lrx(),
+        rectangle.lry(),
+    ]
+    .iter()
+    .any(|coordinate| coordinate & 0x3 != 0)
+    {
+        return Ok(());
+    }
+    // The destination footprint is read off the SAME geometry the executor
+    // will raster -- `texture_rectangle_vertices`, which is this crate's
+    // ported RT64 `drawTexRect`/`drawRect` -- never re-derived here. A second
+    // independent derivation of the rectangle is exactly the drift
+    // `ExactRawDpcPlanWriter::finish`'s access-for-access check exists to
+    // catch, and the copy-mode `lrx |= 3`/`lry |= 3` mutation and fill/copy UL
+    // rounding live inside that function, not on the wire fields.
+    //
+    // `None` is RT64's own `FixedRect::isEmpty()` early return (a reversed or
+    // zero-area rectangle draws nothing); it is a named refusal here rather
+    // than a silently-declared empty write run.
+    let Some(vertices) = texture_rectangle::texture_rectangle_vertices(rectangle, cycle_type)
+    else {
+        return Ok(());
+    };
+    let viewport = vertices.viewport;
+    // `RectViewportPixels` is RT64's own `left`/`top`/`right`/`bottom` pixel
+    // extent, half-open at right/bottom, in signed pixels. A negative origin
+    // would be a scissored rectangle this slice does not clip, so it is
+    // refused by name rather than saturated to zero -- clamping would declare
+    // a write run for pixels the RDP never covers.
+    if viewport.left < 0 || viewport.top < 0 {
+        return Ok(());
+    }
+    if viewport.right <= viewport.left || viewport.bottom <= viewport.top {
+        return Ok(());
+    }
+    let x0 = viewport.left as u32;
+    let y0 = viewport.top as u32;
+    let x1 = viewport.right as u32 - 1;
+    let y1 = viewport.bottom as u32 - 1;
+    if x1 >= image.width() {
+        return Ok(());
+    }
+    plan_render_target_rows(
+        location,
+        command_index,
+        RenderTargetRectangle { x0, y0, x1, y1 },
+        image,
+        layout,
+        planned,
+        fill_spans,
+    )
+}
+
+/// The raw triangles this backend can produce guest bytes for, and
+/// therefore the only ones it declares a write for: **opaque, with no depth
+/// plane** -- shaded or not, textured or not.
+///
+/// Shaded was admitted after the executor gained per-pixel shade plane
+/// interpolation; TEXTURED after it gained per-pixel S/T/W plane
+/// interpolation, the perspective divide and the TMEM fetch -- each time in
+/// that order. Widening this predicate first would declare rows the executor
+/// cannot fill.
+///
+/// Admitting the texture bit is what makes WM2000's geometry reachable at
+/// all: every one of the 1,314,648 raw triangles measured on the real ROM is
+/// opcode 0x0e, shaded AND textured, and this predicate refused all of them.
+///
+/// Depth (bit 0) stays out. It is not a rung this predicate can widen alone:
+/// it needs a depth image, its own journal declaration and the RDP's Z
+/// encoding, none of which exist here.
+///
+/// This is an *admission*, not an approximation. A triangle outside the
+/// subset declares nothing and behaves exactly as it did before this
+/// planner existed -- it still decodes, still pushes its command, still
+/// reaches the GPU triangle path. Declaring a write the CPU executor cannot
+/// fill would be strictly worse than declaring none: `fill_completed_writes`
+/// slices the full-extent buffer for every declared range without checking
+/// the raster touched it, so a declared-but-undrawn row yields a real digest
+/// of STALE bytes that passes `validate_effects` and reaches guest RDRAM.
+/// Convincing garbage beats a loud error nowhere.
+///
+/// The subset widens by widening the executor first, then this predicate --
+/// never the other way round.
+fn raw_triangle_is_executable(triangle: &triangle::RawTriangle) -> bool {
+    !triangle.flags().depth()
+}
+
+/// **Diagnostic-only.** Counts, per named reason, every raw triangle
+/// `plan_raw_triangle` declines to declare a write for -- the eight
+/// `return Ok(())` arms that are silent by design. Nothing in the render
+/// path reads these; they exist so a real ROM run can say WHICH silent
+/// arm a frozen frame is falling into, instead of inferring it.
+///
+/// Dumped to stderr at process exit when `FN64_TRI_DROP_STATS` is set.
+pub mod raw_triangle_drop_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The named arms of `plan_raw_triangle`, in source order.
+    pub const REASONS: [&str; 9] = [
+        "depth_bit_set",
+        "no_other_mode",
+        "fill_cycle",
+        "no_color_image",
+        "color_image_format",
+        "no_target_height",
+        "no_covered_rows",
+        "row_outside_rdram",
+        "ADMITTED",
+    ];
+
+    static COUNTS: [AtomicU64; 9] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn bump(index: usize) {
+        COUNTS[index].fetch_add(1, Ordering::Relaxed);
+        // Periodic self-report: the harness is a separate crate that does
+        // not call into this module, so the dump has to come from here.
+        // Every 100k decisions is ~1 line per few VI swaps on the real ROM.
+        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick % 100_000 == 0 && std::env::var_os("FN64_TRI_DROP_STATS").is_some() {
+            report(&format!("tick={tick}"));
+        }
+    }
+
+    /// Current counts, in `REASONS` order.
+    pub fn snapshot() -> [u64; 9] {
+        let mut out = [0u64; 9];
+        for (slot, counter) in out.iter_mut().zip(COUNTS.iter()) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Admitted-triangle destination addresses: the `SetColorImage` address
+    /// each admitted raw triangle declares its rows against, with a count.
+    /// This is the measurement that distinguishes "triangles are drawn but
+    /// into a buffer nobody scans out" from "triangles are drawn into the
+    /// scanned-out buffer and something later discards them".
+    static ADDRESSES: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// Whether each ADMITTED triangle carried the wire opcode's texture bit.
+    ///
+    /// Split out from `COUNTS` rather than added as two more `REASONS`
+    /// because these are not drop reasons: every triangle counted here was
+    /// admitted, and the two buckets sum to the `ADMITTED` count rather than
+    /// partitioning the same total the drop reasons partition. Folding them
+    /// into `REASONS` would make `total` double-count every admitted
+    /// triangle and silently corrupt the percentage the whole report exists
+    /// to state.
+    ///
+    /// This is the measurement named as the cheap next step in
+    /// `docs/RT64-WM2000-INMATCH-GAPS.md` once admission was shown not to be
+    /// the cause of flat-shaded models: it distinguishes "textured triangles
+    /// are drawn but sample wrongly" from "the game issues untextured
+    /// triangles here", which are different investigations and were not
+    /// separable from the drop counters alone.
+    static ADMITTED_TEXTURED: AtomicU64 = AtomicU64::new(0);
+    static ADMITTED_UNTEXTURED: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note_textured(textured: bool) {
+        if textured {
+            &ADMITTED_TEXTURED
+        } else {
+            &ADMITTED_UNTEXTURED
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The two admitted-triangle texture-bit counts, `(textured, untextured)`.
+    pub fn textured_snapshot() -> (u64, u64) {
+        (
+            ADMITTED_TEXTURED.load(Ordering::Relaxed),
+            ADMITTED_UNTEXTURED.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) fn note_address(address: u32) {
+        let mut guard = ADDRESSES.lock().expect("address histogram poisoned");
+        guard
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .entry(address)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    /// Prints the snapshot to stderr. Called by the harness, or by a test.
+    pub fn report(tag: &str) {
+        let counts = snapshot();
+        let total: u64 = counts.iter().sum();
+        eprintln!("[fn64-tri-drop] {tag} total={total}");
+        for (name, count) in REASONS.iter().zip(counts.iter()) {
+            if *count > 0 {
+                eprintln!("[fn64-tri-drop]   {name} = {count}");
+            }
+        }
+        // Reported separately and NEVER summed into `total`: these two
+        // partition the ADMITTED bucket, not the whole decision stream.
+        let (textured, untextured) = textured_snapshot();
+        if textured > 0 || untextured > 0 {
+            eprintln!(
+                "[fn64-tri-drop]   of ADMITTED: textured = {textured}, untextured = {untextured}"
+            );
+        }
+        if let Some(map) = ADDRESSES
+            .lock()
+            .expect("address histogram poisoned")
+            .as_ref()
+        {
+            for (address, count) in map.iter() {
+                eprintln!("[fn64-tri-drop]   admitted_target {address:#010x} = {count}");
+            }
+        }
+    }
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// raw triangle covers -- **one access per covered scanline** -- and records
+/// the run as a [`FillAccessSpan`].
+///
+/// Not routed through [`plan_render_target_rows`], which takes a single
+/// rectangle: a triangle's covered X range differs per scanline, so its rows
+/// are N genuinely different ranges rather than N copies of one. Feeding it
+/// the triangle's bounding box instead would declare, for every scanline,
+/// every pixel between the leftmost and rightmost the triangle reaches
+/// anywhere -- the exact over-declaration `plan_render_target_rows`' own
+/// per-row rule exists to prevent, one level up.
+///
+/// **The row list is `triangle_span::covered_rows`, and so is the
+/// rasterizer's.** That shared call is what makes the declaration honest:
+/// there is no row here that the raster will skip and no row the raster
+/// visits that is not here.
+///
+/// Declares nothing (and does not fail) when the triangle is outside the
+/// admitted subset, when no compatible `SetColorImage` is staged, or when
+/// any covered row would fall outside installed RDRAM -- the same
+/// "decode succeeds, journal stays silent" shape `plan_texture_rectangle`
+/// uses, because a triangle that declares no write is exactly today's
+/// behaviour and must stay decodable.
+fn plan_raw_triangle(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    triangle: &triangle::RawTriangle,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    state: &RdpState,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    if !raw_triangle_is_executable(triangle) {
+        raw_triangle_drop_stats::bump(0);
+        return Ok(());
+    }
+    // A triangle before any `SetOtherMode` has no defined blend or cycle
+    // state and the production adapter already refuses it by name
+    // (`TriangleBeforeAnyOtherMode`); declaring a write for one here would
+    // declare a write for a command that never executes.
+    let Some(other_mode) = state.other_mode() else {
+        raw_triangle_drop_stats::bump(1);
+        return Ok(());
+    };
+    // Fill cycle consults no combiner and no blender at all -- the RDP fills
+    // with the fill colour through a path this executor does not implement
+    // for triangles. Refused by declaring nothing rather than drawn as an
+    // approximation.
+    if matches!(other_mode.cycle_type(), CycleType::Fill) {
+        raw_triangle_drop_stats::bump(2);
+        return Ok(());
+    }
+    let Some(image) = state.color_image() else {
+        raw_triangle_drop_stats::bump(3);
+        return Ok(());
+    };
+    // The same narrow colour-image subset `plan_fill` and
+    // `plan_texture_rectangle` admit.
+    if image.format() != ImageFormat::Rgba
+        || !matches!(image.size(), PixelSize::Bits16 | PixelSize::Bits32)
+    {
+        raw_triangle_drop_stats::bump(4);
+        return Ok(());
+    }
+    let bytes_per_pixel = image
+        .size()
+        .bytes_per_pixel()
+        .expect("RGBA16/32 are byte-addressed");
+    // **Height is bounded by installed RDRAM, not by a target extent.**
+    // `SetColorImage` carries a width and no height, and the executor's own
+    // extent (`configured_target_extent`) does not exist at decode time. So
+    // the honest decode-time bound is "every row whose bytes are inside
+    // installed RDRAM", derived below by `layout.range` refusing the first
+    // row that is not. `MAX_RAW_TRIANGLE_ROWS` caps the walk itself so a
+    // wildly out-of-range YL cannot make this loop unbounded.
+    // **The row walk is bounded by the HOST-CONFIGURED target height**, the
+    // same value `configured_target_extent` gives the executor. Without it
+    // the only bound is installed RDRAM -- 4MB, hundreds of times the real
+    // target -- and a triangle whose YL reaches past the last row declares
+    // byte ranges outside the target, which `verify_accesses_inside` refuses
+    // for the WHOLE PACKET rather than for the one triangle.
+    //
+    // Measured on the real ROM: WM2000 aborted after 280 VI swaps naming
+    // "FillRectangle access #59". The defect predates the texture rung; it
+    // was unreachable only because the decoder refused every triangle the
+    // ROM emits.
+    //
+    // `None` (no `create` yet) declares nothing rather than guessing, the
+    // same shape every other missing precondition above takes.
+    let Some(height) = state.color_target_height() else {
+        raw_triangle_drop_stats::bump(5);
+        return Ok(());
+    };
+    let rows = triangle_span::covered_rows(triangle, image.width(), height);
+    if rows.is_empty() {
+        raw_triangle_drop_stats::bump(6);
+        return Ok(());
+    }
+    if planned
+        .len()
+        .checked_add(rows.len())
+        .is_none_or(|accesses| accesses > MAX_RESOURCE_ACCESSES)
+    {
+        return Err(RawDpcDecodeError::InvalidCommand {
+            location,
+            reason: "raw triangle exceeds the bounded resource-plan access count",
+        });
+    }
+    // Every row's range is derived and validated BEFORE any is pushed, so a
+    // triangle whose last row leaves installed RDRAM declares nothing at all
+    // rather than a truncated prefix that the rasterizer would then overrun.
+    let mut ranges = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(range) = row
+            .y
+            .checked_mul(image.width())
+            .and_then(|pixel| pixel.checked_add(row.x0))
+            .and_then(|pixel| pixel.checked_mul(bytes_per_pixel))
+            .and_then(|offset| image.address().get().checked_add(offset))
+            .and_then(|start| {
+                let bytes = (row.x1 - row.x0).checked_mul(bytes_per_pixel)?;
+                let end = start.checked_add(bytes)?;
+                layout.range(start, end).ok()
+            })
+        else {
+            raw_triangle_drop_stats::bump(7);
+            return Ok(());
+        };
+        ranges.push(range);
+    }
+    let first_access_index =
+        u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        })?;
+    for range in ranges {
+        push_access(
+            location.workload,
+            planned,
+            AccessMode::Write,
+            AccessPurpose::RenderTarget,
+            ResourceRegion::Rdram {
+                resource: RdramResource::ColorFramebuffer,
+                range,
+            },
+        )?;
+    }
+    let count = u32::try_from(planned.len() - first_access_index as usize).map_err(|_| {
+        RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        }
+    })?;
+    debug_assert_eq!(
+        count as usize,
+        rows.len(),
+        "plan_raw_triangle pushed a different number of accesses than it planned"
+    );
+    fill_spans.push(FillAccessSpan {
+        command_index,
+        first_access_index,
+        count,
+    });
+    raw_triangle_drop_stats::note_address(image.address().get());
+    // The wire opcode's own texture bit, read from the same `flags()` the
+    // executor's binding equality check reads (`raw_triangle.rs:158`), at the
+    // moment of admission -- so the count is over exactly the triangles that
+    // went on to draw.
+    raw_triangle_drop_stats::note_textured(triangle.flags().textured());
+    raw_triangle_drop_stats::bump(8);
+    Ok(())
+}
+
+/// One admitted command's whole-pixel destination rectangle in the staged
+/// color image, already validated as forward-ordered and inside the image
+/// width by its own caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderTargetRectangle {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+/// Declares the exact ordered `ColorFramebuffer` write accesses one admitted
+/// destination rectangle covers, and records the run as a [`FillAccessSpan`].
+///
+/// Shared verbatim by `plan_fill` and `plan_texture_rectangle`: both commands
+/// write the same resource through the same geometry, so a second copy of
+/// this arithmetic would be a second, independent model of one fact -- the
+/// divergence `ExactRawDpcPlanWriter::finish`'s access-for-access check
+/// exists to catch. `reason` strings stay generic across both callers for
+/// that reason; the command that failed is already named by `location`.
+///
+/// A full-image-width rectangle collapses to a single contiguous access; a
+/// partial-width one declares N disjoint per-row ranges strided by the image
+/// width, because collapsing those would declare untouched inter-row bytes as
+/// written.
+fn plan_render_target_rows(
+    location: RawDpcCommandLocation,
+    command_index: u32,
+    rectangle: RenderTargetRectangle,
+    image: ColorImage,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+    planned: &mut Vec<ResourceAccess>,
+    fill_spans: &mut Vec<FillAccessSpan>,
+) -> Result<(), RawDpcDecodeError> {
+    let RenderTargetRectangle { x0, y0, x1, y1 } = rectangle;
     let bytes_per_pixel = image
         .size()
         .bytes_per_pixel()
@@ -1212,7 +2441,7 @@ fn plan_fill(
             .checked_mul(bytes_per_pixel)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle row byte count overflows",
+                reason: "destination rectangle row byte count overflows",
             })?;
     let planned_rows = if x0 == 0 && x1 + 1 == image.width() {
         1
@@ -1226,9 +2455,17 @@ fn plan_fill(
     {
         return Err(RawDpcDecodeError::InvalidCommand {
             location,
-            reason: "FillRectangle exceeds the bounded resource-plan access count",
+            reason: "destination rectangle exceeds the bounded resource-plan access count",
         });
     }
+    // Recorded before the push loop below and paired with `planned_rows`
+    // after it, so the span this decoder publishes is derived from the same
+    // loop that pushes the accesses -- never from a second, independent
+    // derivation of the same math.
+    let first_access_index =
+        u32::try_from(planned.len()).map_err(|_| RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        })?;
     let rows: Box<dyn Iterator<Item = (u32, u32)>> = if planned_rows == 1 {
         Box::new(core::iter::once((y0, y1)))
     } else {
@@ -1240,7 +2477,7 @@ fn plan_fill(
             .and_then(|value| value.checked_add(x0))
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle pixel offset overflows",
+                reason: "destination rectangle pixel offset overflows",
             })?;
         let start = image
             .address()
@@ -1248,31 +2485,31 @@ fn plan_fill(
             .checked_add(pixel.checked_mul(bytes_per_pixel).ok_or(
                 RawDpcDecodeError::InvalidCommand {
                     location,
-                    reason: "FillRectangle byte offset overflows",
+                    reason: "destination rectangle byte offset overflows",
                 },
             )?)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle address overflows",
+                reason: "destination rectangle address overflows",
             })?;
         let rows = last_y - first_y + 1;
         let bytes = row_bytes
             .checked_mul(rows)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle byte count overflows",
+                reason: "destination rectangle byte count overflows",
             })?;
         let end = start
             .checked_add(bytes)
             .ok_or(RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle range end overflows",
+                reason: "destination rectangle range end overflows",
             })?;
         let range = layout
             .range(start, end)
             .map_err(|_| RawDpcDecodeError::InvalidCommand {
                 location,
-                reason: "FillRectangle writes outside installed RDRAM",
+                reason: "destination rectangle writes outside installed RDRAM",
             })?;
         push_access(
             location.workload,
@@ -1285,6 +2522,20 @@ fn plan_fill(
             },
         )?;
     }
+    let count = u32::try_from(planned.len() - first_access_index as usize).map_err(|_| {
+        RawDpcDecodeError::ResourcePlanOverflow {
+            workload: location.workload,
+        }
+    })?;
+    debug_assert_eq!(
+        count as usize, planned_rows,
+        "plan_render_target_rows pushed a different number of accesses than it planned"
+    );
+    fill_spans.push(FillAccessSpan {
+        command_index,
+        first_access_index,
+        count,
+    });
     Ok(())
 }
 
@@ -1322,15 +2573,95 @@ mod tests {
     const LAYOUT_BYTES: u32 = 0x4000;
     const COMMAND_START: u32 = 0x1000;
 
-    fn word(prefix: u8, opcode: u8, payload: u32) -> u32 {
-        u32::from(prefix | opcode) << 24 | payload
+    /// `note_textured` must route each arm to its OWN counter.
+    ///
+    /// Written against DELTAS rather than absolute values on purpose: the two
+    /// counters are process-global `AtomicU64`s that every other test in this
+    /// binary can also advance, so an absolute assertion would pass or fail
+    /// depending on test order. Deltas are order-independent.
+    ///
+    /// The fixture presses on the mutants that matter. Both arms are driven,
+    /// with a DIFFERENT number of calls each (2 textured, 3 untextured), so:
+    ///
+    /// - swapping the two arms is caught (2 and 3 would trade places, which
+    ///   equal counts would have hidden -- the exact fixture mistake
+    ///   `RT64-WM2000-HARNESS-TRAPS.md` names, where correct and incorrect
+    ///   answers coincide at the sampled point),
+    /// - routing both arms to one counter is caught (one delta goes to 0),
+    /// - dropping the `fetch_add` entirely is caught (both go to 0).
+    ///
+    /// Mutation-verified: each of those three mutants was applied and each
+    /// fails this test.
+    #[test]
+    fn admitted_texture_bit_counts_route_to_their_own_buckets() {
+        let (textured_before, untextured_before) = raw_triangle_drop_stats::textured_snapshot();
+
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(false);
+        raw_triangle_drop_stats::note_textured(false);
+        raw_triangle_drop_stats::note_textured(false);
+
+        let (textured_after, untextured_after) = raw_triangle_drop_stats::textured_snapshot();
+        assert_eq!(
+            textured_after - textured_before,
+            2,
+            "two textured notes must land in the textured bucket"
+        );
+        assert_eq!(
+            untextured_after - untextured_before,
+            3,
+            "three untextured notes must land in the untextured bucket"
+        );
     }
+
+    /// The texture-bit counters must NOT be folded into the drop-reason
+    /// `total`, which partitions the decision stream. Adding them would make
+    /// `total` double-count every admitted triangle and corrupt the
+    /// percentage the whole report exists to state.
+    #[test]
+    fn texture_bit_counts_are_not_part_of_the_drop_reason_total() {
+        let before: u64 = raw_triangle_drop_stats::snapshot().iter().sum();
+        raw_triangle_drop_stats::note_textured(true);
+        raw_triangle_drop_stats::note_textured(false);
+        let after: u64 = raw_triangle_drop_stats::snapshot().iter().sum();
+        assert_eq!(
+            before, after,
+            "note_textured must not advance any REASONS counter"
+        );
+    }
+
+    use crate::wire_words::word_with_prefix as word;
 
     fn state_words(prefix: u8) -> Vec<u32> {
         vec![
             word(prefix, SET_OTHER_MODE, 3 << 20),
             0,
             word(prefix, SET_COLOR_IMAGE, 3 << 19 | 1),
+            0,
+            word(prefix, SET_FILL_COLOR, 0),
+            0x213c_4d59,
+        ]
+    }
+
+    /// `state_words` with a color image wide and tall enough to contain
+    /// `texrect_words`' own destination rectangle (pixels x 16..=64,
+    /// y 0..=48).
+    ///
+    /// The narrow 2-pixel image `state_words` stages is enough for the fill
+    /// fixtures, but a texrect now declares real `ColorFramebuffer` writes
+    /// (`plan_texture_rectangle`), so its fixture must stage an image that
+    /// actually contains them. Widening the fixture is the correct repair:
+    /// the alternative -- relaxing the planner's width bound -- would let a
+    /// rectangle declare writes outside the staged image.
+    fn texrect_state_words(prefix: u8) -> Vec<u32> {
+        vec![
+            // Copy cycle (`cycle_type` 2 in bits 21:20), the mode a raw-DPC
+            // texrect runs in. `state_words`' own `3 << 20` is Fill.
+            word(prefix, SET_OTHER_MODE, 2 << 20),
+            0,
+            // RGBA16, width 65 (the wire field is width-1).
+            word(prefix, SET_COLOR_IMAGE, 3 << 19 | 64),
             0,
             word(prefix, SET_FILL_COLOR, 0),
             0x213c_4d59,
@@ -1402,6 +2733,21 @@ mod tests {
         words: Vec<u32>,
         effect_ranges: &[(u32, u32)],
     ) -> WorkloadPacket {
+        packet_with_seed(transaction_sequence, words, effect_ranges, None)
+    }
+
+    /// `packet`, plus the colour-image SEED read a partial `FillRectangle`
+    /// declares (`raw_dpc::plan_fill`).
+    ///
+    /// Ordered before the write accesses because `plan_fill` pushes the
+    /// seed before `plan_render_target_rows` pushes the span, and the
+    /// journal comparison is access-for-access.
+    fn packet_with_seed(
+        transaction_sequence: u64,
+        words: Vec<u32>,
+        effect_ranges: &[(u32, u32)],
+        seed_range: Option<(u32, u32)>,
+    ) -> WorkloadPacket {
         let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let bytes = u32::try_from(words.len() * 4).unwrap();
         let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
@@ -1430,18 +2776,41 @@ mod tests {
             .unwrap(),
         );
         let mut accesses = vec![command_access(layout, bytes, 0)];
+        if let Some((start, end)) = seed_range {
+            accesses.push(
+                ResourceAccess::try_new(
+                    OperationId::new(1),
+                    AccessMode::Read,
+                    AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        range: layout.range(start, end).unwrap(),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let first_effect = accesses.len() as u32;
         accesses.extend(
             effect_ranges
                 .iter()
                 .enumerate()
-                .map(|(index, &(start, end))| effect_access(layout, index as u32 + 1, start, end)),
+                .map(|(index, &(start, end))| {
+                    effect_access(layout, index as u32 + first_effect, start, end)
+                }),
         );
         let journal = ResourceJournal::try_new(
             ResourceJournalLimits::try_new(64, LAYOUT_BYTES).unwrap(),
             accesses,
         )
         .unwrap();
-        WorkloadPacket::try_new(
+        // Through the preflight + capture pair rather than
+        // `WorkloadPacket::try_new`, because a journal that declares any
+        // guest read must be finalized against captured bytes for it --
+        // the same two-step `packet_with_tmem_sources` uses, and for the
+        // identical reason. With no seed the plan declares no reads and the
+        // capture is empty, so the packets this builds are unchanged.
+        let preflight = WorkloadPacketPreflight::try_new(
             layout,
             WorkloadAdmission::RawDpc {
                 transaction_sequence,
@@ -1449,7 +2818,22 @@ mod tests {
             vec![stream],
             journal,
         )
-        .unwrap()
+        .unwrap();
+        let capture = DeferredGuestReadCapture::new(
+            preflight
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    CapturedGuestRead::try_new(
+                        *read,
+                        vec![read.operation().get() as u8; read.range().len() as usize],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        preflight.finalize(capture).unwrap()
     }
 
     fn submit(packet: WorkloadPacket) -> SubmittedTicket {
@@ -1784,6 +3168,8 @@ mod tests {
                 &mut delta,
                 &mut planned,
                 &mut commands,
+                &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap_err();
             assert!(matches!(
@@ -1821,6 +3207,8 @@ mod tests {
             &mut RdpState::default(),
             source_identity,
             &mut RdpStateDelta::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -1989,6 +3377,210 @@ mod tests {
         assert_eq!(decoded.state_delta(), &RdpStateDelta::default());
     }
 
+    // ------------------------------------------------------------------
+    // WM2000's three blocking opcodes: SyncPipe (0x27), SyncTile (0x28), and
+    // the 0x1f stream terminator.
+    //
+    // Measured motivation, not speculative coverage: the census
+    // (`docs/RT64-WM2000-CENSUS.md` §3) counted 20,800 + 1,808 + 219
+    // occurrences across 218/218 frames of a real WM2000 run. Each was a
+    // whole-stream abort, so these three ids alone held every frame at zero
+    // decoded commands.
+    // ------------------------------------------------------------------
+
+    /// All three newly-admitted ids decode as `NoOp` under all four wire
+    /// prefixes, and none of them stages any RDP state.
+    ///
+    /// The `state_delta` assertion is the load-bearing half. "It decodes" is
+    /// necessary but not sufficient: admitting an opcode that quietly staged
+    /// state would move pixels, and the whole argument for admitting these
+    /// three without designing a semantic is that `NoOp` cannot.
+    #[test]
+    fn the_three_wm2000_blocking_ids_decode_as_state_free_noops() {
+        for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+            for id in [SYNC_PIPE, SYNC_TILE, STREAM_TERMINATOR] {
+                // Nonzero payloads: the RDP assigns no field to any of these
+                // three, so a decoder that read one would be inventing it.
+                let words = vec![word(prefix, id, 0x005a_5a5a), 0xa5a5_a5a5];
+                let submitted = submit(packet(7, words, &[]));
+                let decoded =
+                    decode_raw_dpc(submitted, &RdpState::default()).unwrap_or_else(|error| {
+                        panic!("id {id:#04x} under prefix {prefix:#04x} must decode: {error}")
+                    });
+                assert_eq!(decoded.commands().len(), 1);
+                assert_eq!(
+                    decoded.commands()[0].kind(),
+                    RawDpcCommandKind::NoOp { variant: id },
+                    "id {id:#04x} must decode as a NoOp carrying its own variant"
+                );
+                assert_eq!(
+                    decoded.state_delta(),
+                    &RdpStateDelta::default(),
+                    "id {id:#04x} must stage no RDP state; admitting it must not be able to \
+                     move a pixel"
+                );
+            }
+        }
+    }
+
+    /// **The measurement this slice exists for.** A WM2000-shaped command
+    /// sequence -- fill state, a fill, the sync ops it really interleaves,
+    /// and its `0x1f` terminator -- decodes end to end instead of aborting.
+    ///
+    /// Shaped from the census's own per-frame profile (§3): every frame
+    /// issues `SyncPipe` many times, `SyncTile` occasionally, a
+    /// `FillRectangle`, and exactly one terminator last. Deliberately NOT a
+    /// mixed fill+TMEM packet -- this test is about DECODE, and keeping the
+    /// two concerns apart is what makes a failure here point at the decoder.
+    /// The fill+TMEM composition the census recorded as a hard refusal at
+    /// 218/218 frames is now admitted at execution
+    /// (`production::StagedOutcome::MixedFillAndTmemLoads`), and is proven
+    /// by that module's own tests plus `fn64-abi`'s
+    /// `raw_dpc_session_integration` end-to-end pair.
+    ///
+    /// The command count is asserted exactly, and the terminator's position
+    /// with it: a decoder that treated `0x1f` as a `break` would return 9
+    /// commands rather than 10 and would silently drop everything after the
+    /// first terminator in a coalesced stream.
+    #[test]
+    fn a_wm2000_shaped_stream_decodes_end_to_end_rather_than_aborting() {
+        let mut words = Vec::new();
+        // Frame setup, then the syncs WM2000 actually interleaves.
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend(state_words(0));
+        words.extend([word(0, SYNC_TILE, 0), 0]);
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend([word(0, FILL_RECTANGLE, 4 << 12 | 4), 0]);
+        words.extend([word(0, SYNC_PIPE, 0), 0]);
+        words.extend([word(0, FULL_SYNC, 0), 0]);
+        // The terminator the game writes to end every submission.
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+
+        let submitted = submit(packet(7, words, &[(0, 16)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default())
+            .expect("a WM2000-shaped stream must decode end to end");
+
+        // 4 syncs + 3 state + 1 fill + 1 FullSync + 1 terminator.
+        assert_eq!(
+            decoded.commands().len(),
+            10,
+            "every command must be decoded, including the ones after the terminator's \
+             predecessors -- a `break` on 0x1f would come up short"
+        );
+        assert_eq!(
+            decoded.commands().last().unwrap().kind(),
+            RawDpcCommandKind::NoOp {
+                variant: STREAM_TERMINATOR
+            },
+            "the terminator must be the last decoded command, not the end of decoding"
+        );
+        assert!(
+            decoded
+                .commands()
+                .iter()
+                .any(|command| matches!(command.kind(), RawDpcCommandKind::FillRectangle(_))),
+            "the fill must survive the syncs around it"
+        );
+        // The fill's own state really was staged, so "it decoded" is not
+        // passing on an empty stream.
+        assert_eq!(
+            decoded.staged_state().fill_color().unwrap().rgba32(),
+            [0x21, 0x3c, 0x4d, 0x59],
+            "the fill color from state_words must be staged"
+        );
+    }
+
+    /// A terminator mid-stream does not truncate the commands after it.
+    ///
+    /// This is the specific defect a `break`-based reading of `0x1f` would
+    /// introduce, and it is invisible to a fixture whose terminator is last.
+    /// Coalesced submissions really do carry more than one.
+    #[test]
+    fn a_mid_stream_terminator_does_not_truncate_what_follows() {
+        let mut words = Vec::new();
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+        words.extend(state_words(0));
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+        words.extend([word(0, FILL_RECTANGLE, 4 << 12 | 4), 0]);
+        words.extend([word(0, STREAM_TERMINATOR, 0), 0]);
+
+        let submitted = submit(packet(7, words, &[(0, 16)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default())
+            .expect("terminators must not abort the stream");
+        assert_eq!(
+            decoded.commands().len(),
+            7,
+            "three terminators plus three state commands plus the fill -- a decoder that \
+             stopped at the first terminator would report 1"
+        );
+        assert!(
+            decoded
+                .commands()
+                .iter()
+                .any(|command| matches!(command.kind(), RawDpcCommandKind::FillRectangle(_))),
+            "the fill sits after two terminators and must still be decoded"
+        );
+    }
+
+    /// Admitting three ids must not have widened the door for a fourth.
+    ///
+    /// The two neighbour classes are refused at *different layers*, and the
+    /// test asserts each where it actually happens rather than forcing both
+    /// through one path:
+    ///
+    /// - `0x1e`/`0x20` bracket the terminator inside the still-rejected
+    ///   `0x10..=0x23` block. They never reach this decoder at all --
+    ///   `WorkloadPacket` construction validates command widths through
+    ///   `fn64-render-ir`'s own copy of the table and refuses first, with
+    ///   `ValidationError::UnknownRdpOpcode`. Discovered by writing this
+    ///   test against `decode_raw_dpc` and watching the packet builder panic
+    ///   instead; asserting at the decoder would have been asserting against
+    ///   a layer that never sees the input.
+    /// - `0x2a`/`0x2b`/`0x2c` (`SetKeyGB`, `SetKeyR`, `SetConvert`) are real
+    ///   RDP commands with an admitted width but no decode arm, which the
+    ///   census measured at zero occurrences and says explicitly not to
+    ///   build. They reach the match's catch-all and name themselves.
+    #[test]
+    fn the_neighbouring_ids_are_still_refused() {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let one_command_stream = |id: u8| {
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                layout.range(COMMAND_START, COMMAND_START + 8).unwrap(),
+                vec![word(0, id, 0), 0],
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .expect("chunk construction validates length, not opcodes")])
+        };
+        for id in [0x1eu8, 0x20] {
+            let error = one_command_stream(id)
+                .expect_err("an id with no admitted width must be refused before decode");
+            assert!(
+                matches!(error, ValidationError::UnknownRdpOpcode { .. }),
+                "id {id:#04x} must still have no admitted width; the carve-out was one id \
+                 wide. Got {error:?}"
+            );
+        }
+        // The same construction with the carved-out id succeeds, so the two
+        // assertions above are discriminating rather than rejecting
+        // everything put in front of them.
+        one_command_stream(STREAM_TERMINATOR)
+            .expect("the measured terminator must be accepted where its neighbours are not");
+
+        for id in [0x2au8, 0x2b, 0x2c] {
+            let submitted = submit(packet(7, vec![word(0, id, 0), 0], &[]));
+            let error = decode_raw_dpc(submitted, &RdpState::default())
+                .expect_err("an unadmitted command must be refused");
+            let RawDpcDecodeError::UnsupportedCommand { decoded_opcode, .. } = error else {
+                panic!("id {id:#04x} must be refused as UnsupportedCommand, got {error:?}");
+            };
+            assert_eq!(
+                decoded_opcode, id,
+                "the refusal must name the offending opcode"
+            );
+        }
+    }
+
     #[test]
     fn every_admitted_state_command_accepts_all_four_wire_prefixes() {
         for prefix in [0x00, 0x40, 0x80, 0xc0] {
@@ -2047,6 +3639,7 @@ mod tests {
             other_mode,
             fill_color,
             fill_rectangle_command,
+            crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
             None,
         )
         .unwrap();
@@ -2178,33 +3771,260 @@ mod tests {
         }
     }
 
-    /// The decode-time gate this card removes was strictly redundant with
-    /// `plan_fill`'s own independent fill-cycle check (card Section 1/5):
-    /// a `FillRectangle` preceded by a non-`Fill` `SetOtherMode` must still
-    /// be rejected -- just later, at `plan_fill`, with its existing
-    /// `"FillRectangle requires staged fill-cycle OtherMode"` reason, not at
-    /// decode.
+    /// **Replaces the card that asserted a non-Fill cycle type is
+    /// *rejected*.** That assertion pinned scaffolding, not hardware: the
+    /// RDP defines `G_FILLRECT` in every cycle type, and cycle type selects
+    /// how the rectangle's content is produced, not whether the command is
+    /// legal. See `plan_fill`'s own doc for the three authorities
+    /// (fn64's reference lane `raster/draw.rs:113-128`, RT64
+    /// `rt64_rdp.cpp:1033-1050`, and the measured WM2000 packet in
+    /// `docs/WM2000-FILLRECT-EVIDENCE.txt`).
+    ///
+    /// FAILS BEFORE this change (`decode` returned `Err(InvalidCommand {
+    /// reason: "FillRectangle requires staged fill-cycle OtherMode" })`),
+    /// PASSES AFTER (the whole stream decodes and the fill is admitted).
+    ///
+    /// Both halves are asserted, and the second is the one that matters:
+    /// it is not enough that the decode stops failing, the `FillRectangle`
+    /// must actually be present as a decoded command. A change that
+    /// silently dropped the command would satisfy the first assertion
+    /// alone.
     #[test]
-    fn non_fill_cycle_other_mode_is_rejected_at_plan_fill_not_at_decode() {
+    fn a_combined_cycle_fill_rectangle_decodes_and_is_admitted() {
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1)] {
+            let words = vec![
+                word(0, SET_OTHER_MODE, cycle_bits << 20),
+                0,
+                word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
+                0,
+                word(0, SET_FILL_COLOR, 0),
+                0x213c_4d59,
+                word(0, FILL_RECTANGLE, 4 << 12 | 4),
+                0,
+            ];
+            // The packet carries no journal, so a command that DECLARES
+            // accesses now reports `JournalMismatch` rather than `Ok` --
+            // which is itself the fact this test exists to pin, since the
+            // dropped-command bug declared nothing at all. Re-decode against
+            // the planner's own expected list (the same technique
+            // `combined_cycle_fill_rectangles_declare_their_write_and_copy_cycle_declares_none`
+            // uses) so the assertion below is about the decoded COMMAND, not
+            // about journal bookkeeping.
+            let expected = match decode(words.clone()) {
+                Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+                Ok(_) => panic!(
+                    "{name}: a combined-cycle FillRectangle must DECLARE accesses; \
+                     an empty-journal packet decoding cleanly means it declared none, \
+                     which is exactly the bug that dropped WM2000's sixty clear bands"
+                ),
+                Err(error) => panic!("{name}: unexpected decode failure: {error:?}"),
+            };
+            // The declared set: the command read, the SEED read the combined
+            // path composes over, and the render-target write.
+            assert_eq!(
+                expected
+                    .iter()
+                    .filter(|access| access.mode() == AccessMode::Write
+                        && access.purpose() == AccessPurpose::RenderTarget)
+                    .count(),
+                1,
+                "{name}: exactly one render-target write must be declared"
+            );
+            assert_eq!(
+                expected
+                    .iter()
+                    .filter(|access| access.mode() == AccessMode::Read
+                        && access.purpose() == AccessPurpose::TmemLoadSource)
+                    .count(),
+                1,
+                "{name}: the combined path composes over prior content, so it must \
+                 declare a seed read -- the Fill-cycle path never needed one"
+            );
+            // The write targets the colour framebuffer, which is what makes
+            // this a real clear rather than a declaration against nothing.
+            assert!(
+                expected.iter().any(|access| {
+                    access.mode() == AccessMode::Write
+                        && access.purpose() == AccessPurpose::RenderTarget
+                }),
+                "{name}: the declared write must be a RenderTarget colour-framebuffer \
+                 write -- the command is admitted and executed, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_combined_cycle_fill_rectangle_does_not_require_set_fill_color() {
         let words = vec![
-            word(0, SET_OTHER_MODE, 2 << 20), // TwoCycle, not Fill
+            word(0, SET_OTHER_MODE, 0),
             0,
             word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
             0,
-            word(0, SET_FILL_COLOR, 0),
-            0x213c_4d59,
-            word(0, FILL_RECTANGLE, 4 << 12 | 4),
+            word(0, FILL_RECTANGLE, 8 << 12 | 8),
             0,
         ];
-        let error = decode(words).unwrap_err();
-        let RawDpcDecodeError::InvalidCommand { location, reason } = error else {
-            panic!("expected FillRectangle to be rejected by plan_fill's own check");
+        match decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()) {
+            Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => assert!(
+                expected.iter().any(|access| {
+                    access.mode() == AccessMode::Write
+                        && access.purpose() == AccessPurpose::RenderTarget
+                }),
+                "combined-cycle G_FILLRECT must declare its write without a SetFillColor"
+            ),
+            Ok(_) => panic!("the empty submitted journal cannot match the declared write"),
+            Err(error) => {
+                panic!("combined-cycle G_FILLRECT must not require SetFillColor, got {error:?}")
+            }
+        }
+    }
+
+    /// Fill cycle includes its lower/right edge; one-/two-cycle excludes it.
+    /// These fixtures therefore use encoded edge 1 for Fill and edge 2 for
+    /// combined mode so both cover the same 2x2 rectangle on a two-pixel-wide
+    /// target. Each must declare its one whole-width write. Copy cycle stays
+    /// a loud refusal because it has no guaranteed public result.
+    #[test]
+    fn combined_cycle_fill_rectangles_declare_their_write_and_copy_cycle_declares_none() {
+        let stream = |cycle_bits: u32| {
+            let lower_right = if cycle_bits == 3 { 4 } else { 8 };
+            vec![
+                word(0, SET_OTHER_MODE, cycle_bits << 20),
+                0,
+                word(0, SET_COLOR_IMAGE, 3 << 19 | 1),
+                0,
+                word(0, SET_FILL_COLOR, 0),
+                0x213c_4d59,
+                word(0, FILL_RECTANGLE, lower_right << 12 | lower_right),
+                0,
+            ]
         };
+        // The plan's OWN access list, read the way `plan_raw_dpc_inner`
+        // reads it in production: decode against a journal the packet does
+        // not carry, and take the planner's list off the resulting
+        // `JournalMismatch::expected`. Going through `decode`'s success
+        // path instead would require guessing the journal in advance --
+        // which is the very number under test.
+        let render_target_writes = |cycle_bits: u32| {
+            let submitted = submit(packet(7, stream(cycle_bits), &[]));
+            let accesses = match decode_raw_dpc(submitted, &RdpState::default()) {
+                Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+                Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+                Err(error) => panic!("every cycle type must decode or mismatch, got {error:?}"),
+            };
+            accesses
+                .iter()
+                .filter(|access| {
+                    access.mode() == AccessMode::Write
+                        && access.purpose() == AccessPurpose::RenderTarget
+                })
+                .count()
+        };
+
+        // The control arm. Fill cycle (bits 3) still declares its write --
+        // this is what makes the fixture non-degenerate: without it, a
+        // planner that declared nothing for EVERY cycle type would pass the
+        // zero-write assertions below.
         assert_eq!(
-            reason, "FillRectangle requires staged fill-cycle OtherMode",
-            "rejection must carry plan_fill's own reason, not a decode-time gate's"
+            render_target_writes(3),
+            1,
+            "a Fill-cycle FillRectangle must still declare its one whole-width write"
         );
-        assert_eq!(location.wire_opcode() & 0x3f, FILL_RECTANGLE);
+        // One- and two-cycle now DECLARE their write, because
+        // `execute_combined_fill_rectangle` executes them. Declaration and
+        // execution must agree on the geometry, which is the whole reason
+        // this assertion flipped rather than being deleted: while these
+        // declared nothing, WM2000's sixty one-cycle clear bands were
+        // dropped and the stale framebuffer reached VI
+        // (`docs/WM2000-FILLRECT-EVIDENCE.txt` captures the measured packet;
+        // the `one-cycle-fill-band` parity case pins the fix against RT64).
+        for (name, cycle_bits) in [("OneCycle", 0u32), ("TwoCycle", 1)] {
+            assert_eq!(
+                render_target_writes(cycle_bits),
+                1,
+                "{name}: a combined-cycle FillRectangle must declare the write its \
+                 executor performs -- declaring none is what dropped WM2000's clears"
+            );
+        }
+
+        // Copy cycle is REFUSED outright, which is stronger than declaring
+        // no write: `G_FILLRECT` in copy cycle has no guaranteed public
+        // result, so the decoder rejects the command by name rather than
+        // admitting it and quietly painting nothing. The reference backend
+        // asserts the same sentence
+        // (`fn64-render-reference/src/raster/draw.rs`), so this is the two
+        // backends agreeing on a refusal, not an fn64 limitation.
+        let copy_cycle = decode_raw_dpc(submit(packet(7, stream(2), &[])), &RdpState::default());
+        match copy_cycle {
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. }) => assert_eq!(
+                reason, "G_FILLRECT in copy cycle has no guaranteed public result; use G_TEXRECT",
+                "copy-cycle G_FILLRECT must be refused by that exact name"
+            ),
+            other => panic!("copy-cycle G_FILLRECT must be refused, got {other:?}"),
+        }
+    }
+
+    /// The real WM2000 packet, replayed from the measured wire bytes.
+    ///
+    /// Not a synthesized approximation: these are the first commands of the
+    /// 600-byte stream captured at VI swap 2522 on the real ROM and
+    /// recorded verbatim in `docs/WM2000-FILLRECT-EVIDENCE.txt`. The
+    /// `SetOtherMode` words are the guest's own
+    /// (`0xef08acff 0x00504240`, cycle bits 0 = one cycle), and the
+    /// `FillRectangle` is the guest's own first band
+    /// (`0xf677c010 0x00000000`).
+    ///
+    /// Hand-decoded from the wire, independently of any fn64 code: word 0
+    /// is `0xf677c010`, so `lrx = (0x77c010 >> 12) & 0xfff = 0x77c = 1916`
+    /// and `lry = 0x010 = 16`; word 1 is zero, so `ulx = uly = 0`. Divided
+    /// by 4 that is x 0..=478 (inclusive edges) and y 0..=4 -- a full-width
+    /// four-scanline band, one of the 60 that tile a 480x240 screen.
+    ///
+    /// FAILS BEFORE with the exact production error string, PASSES AFTER.
+    #[test]
+    fn the_measured_wm2000_swap_2522_packet_decodes() {
+        // The guest's own SetOtherMode: 0xef08acff / 0x00504240.
+        // Cycle bits are (0x08acff >> 20) & 3 == 0 -- one cycle.
+        let other_mode_high = 0x0008_acffu32;
+        assert_eq!(
+            (other_mode_high >> 20) & 3,
+            0,
+            "hand-check of the measured wire word: WM2000 stages ONE-cycle here"
+        );
+        let words = vec![
+            0xef00_0000 | other_mode_high,
+            0x0050_4240,
+            word(0, SET_COLOR_IMAGE, 3 << 19 | 479),
+            0,
+            // The guest's own first band, verbatim.
+            0xf677_c010,
+            0x0000_0000,
+        ];
+        let decoded = decode_raw_dpc(
+            submit(packet_with_seed(
+                7,
+                words,
+                &[(0, 1916), (1920, 3836), (3840, 5756), (5760, 7676)],
+                Some((0, 7680)),
+            )),
+            &RdpState::default(),
+        )
+        .expect(
+            "the measured WM2000 packet must decode; before this change it failed with              \"FillRectangle requires staged fill-cycle OtherMode\"",
+        );
+        let fill = decoded
+            .commands()
+            .iter()
+            .find_map(|command| match command.kind() {
+                RawDpcCommandKind::FillRectangle(rectangle) => Some(rectangle),
+                _ => None,
+            })
+            .expect("the guest's FillRectangle must be admitted");
+        // Hand-derived above from 0xf677c010, never read back from the
+        // decoder's own extraction.
+        assert_eq!(fill.lower_right_x(), 1916);
+        assert_eq!(fill.lower_right_y(), 16);
+        assert_eq!(fill.upper_left_x(), 0);
+        assert_eq!(fill.upper_left_y(), 0);
     }
 
     #[test]
@@ -2324,7 +4144,17 @@ mod tests {
             0x0102_0304,
         ];
         words.extend([word(0, FILL_RECTANGLE, 8 << 12 | 4), 4 << 12]);
-        let submitted = submit(packet(7, words, &[(4, 12), (20, 28)]));
+        // The fill covers x 1..=2 of rows 0..=1 in a 4-wide image, so it is
+        // partial and declares a colour-image seed over the whole target.
+        // Hand-derived: `SET_COLOR_IMAGE 3 << 19 | 3` gives width 4, RGBA16
+        // (2 bytes/pixel), address 0; no height is configured, so the seed
+        // spans the fill's own last row -- 4 x 2 pixels x 2 bytes = 32.
+        let submitted = submit(packet_with_seed(
+            7,
+            words,
+            &[(4, 12), (20, 28)],
+            Some((0, 32)),
+        ));
         let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
         assert_eq!(
             decoded.resource_plan().accesses(),
@@ -2808,15 +4638,18 @@ mod tests {
         assert_eq!(load.source_plan().total_bytes(), 8);
     }
 
+    /// The final logical tail still records six padding bytes, while RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`) makes every copied lane
+    /// defined and keeps destination wrap order independent of the union.
     #[test]
-    fn transfer_words_preserve_wrap_order_and_undefined_tail_separately_from_union() {
+    fn transfer_words_preserve_wrap_order_and_padded_tail_separately_from_union() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 0, 2, 8, 0x200));
         words.extend(set_tile(0, 7, 0, 511));
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 4 << 12]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x210, 0x21a)])),
+            submit(packet_with_tmem_sources(7, words, &[(0x210, 0x220)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -2831,8 +4664,13 @@ mod tests {
         assert_eq!(transfer.words()[0].destination_word(), 511);
         assert_eq!(transfer.words()[1].destination_word(), 0);
         assert_eq!(transfer.words()[0].defined_source_byte_mask(), 0xff);
-        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0x03);
-        assert!(transfer.words().iter().all(|word| word.odd_row_exchange()));
+        assert_eq!(transfer.words()[1].defined_source_byte_mask(), 0xff);
+        // **Neither word exchanges: both are tile-relative row 0.** This
+        // LoadBlock carries `DXT = 0`, so no word advances a row, and the
+        // block's own TL does not enter the exchange. This used to assert
+        // that ALL words exchanged, which was the writer's removed
+        // `source_t` term; see `tmem/read.rs::odd_row_exchange`.
+        assert!(transfer.words().iter().all(|word| !word.odd_row_exchange()));
         assert_eq!(
             transfer
                 .destination_accesses()
@@ -2847,6 +4685,8 @@ mod tests {
         assert_transfer_geometry_matches_destination_union(&decoded, load);
     }
 
+    /// DXT still selects each destination row while every source word is fully
+    /// defined by RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
     fn load_block_starting_tl_and_dxt_carry_select_each_word_row() {
         let mut words = Vec::new();
@@ -2855,7 +4695,7 @@ mod tests {
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_BLOCK, 1), 7 << 24 | 8 << 12 | 0x0400]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x220, 0x232)])),
+            submit(packet_with_tmem_sources(7, words, &[(0x220, 0x238)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -2873,9 +4713,16 @@ mod tests {
                     word.odd_row_exchange()
                 ))
                 .collect::<Vec<_>>(),
-            vec![(0, 10, true), (0, 11, true), (1, 14, false)]
+            // The exchange column is the TILE-RELATIVE row's parity alone --
+            // words 0-1 are row 0, word 2 is row 1. This used to read
+            // `true, true, false`, folding in the writer's removed
+            // `source_t` term (TL is 1 here). See
+            // pinned RT64's `TextureDecoder.hlsli:17-25,149-150`, where the
+            // tile-relative row parity selects a four-byte address exchange
+            // with no T-origin term (commit `f0728a2`).
+            vec![(0, 10, false), (0, 11, false), (1, 14, true)]
         );
-        assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0x03);
+        assert_eq!(transfer.words()[2].defined_source_byte_mask(), 0xff);
         assert_transfer_geometry_matches_destination_union(&decoded, load);
     }
 
@@ -3040,19 +4887,26 @@ mod tests {
                 .iter()
                 .map(|word| (word.destination_word(), word.physical()))
                 .collect::<Vec<_>>(),
+            // **Both words are tile-relative row 0, so neither exchanges.**
+            // This LoadBlock carries `DXT = 0`, and a word lands on row
+            // `(word * dxt) >> 11`, so no word here advances a row -- the
+            // block's own TL does not enter the exchange at all. The ranges
+            // used to be the exchanged ones (`2044`/`4`), which was the
+            // writer's removed `source_t` term; see
+            // `tmem/read.rs::odd_row_exchange`.
             vec![
                 (
                     255,
                     crate::TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap(),
                     },
                 ),
                 (
                     0,
                     crate::TmemTransferPhysicalWord::SplitBanks {
-                        low: fn64_render_ir::TmemRange::try_new(4, 8).unwrap(),
-                        high: fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap(),
+                        low: fn64_render_ir::TmemRange::try_new(0, 4).unwrap(),
+                        high: fn64_render_ir::TmemRange::try_new(2048, 2052).unwrap(),
                     },
                 ),
             ]
@@ -3063,11 +4917,13 @@ mod tests {
                 .iter()
                 .map(|access| access.region())
                 .collect::<Vec<_>>(),
+            // The union of the two unexchanged split-bank words above, in
+            // ascending order. Shifted down four bytes with them.
             vec![
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4, 8).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2044, 2048).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2052, 2056).unwrap()),
-                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4092, 4096).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(0, 4).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2040, 2044).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(2048, 2052).unwrap()),
+                ResourceRegion::Tmem(fn64_render_ir::TmemRange::try_new(4088, 4092).unwrap()),
             ]
         );
         assert_transfer_geometry_matches_destination_union(&odd_wrapped, odd_load);
@@ -3093,15 +4949,22 @@ mod tests {
         ));
     }
 
+    /// Tile rows bind independently and every transfer word is fully defined, as
+    /// RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`) requires; row parity
+    /// and logical offsets remain independently asserted.
     #[test]
-    fn load_tile_retains_row_local_defined_masks_and_source_row_parity() {
+    fn load_tile_retains_row_local_padded_words_and_source_row_parity() {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 0, 2, 5, 0x200));
         words.extend(set_tile(0, 7, 3, 0));
         words.extend(load_sync(0));
         words.extend([word(0, LOAD_TILE, 4), 7 << 24 | 16 << 12 | 8]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, words, &[(0x20a, 0x21e)])),
+            submit(packet_with_tmem_sources(
+                7,
+                words,
+                &[(0x20a, 0x21a), (0x214, 0x224)],
+            )),
             &RdpState::default(),
         )
         .unwrap();
@@ -3122,11 +4985,14 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>(),
+            // Words 0-1 are tile-relative row 0 and words 2-3 are row 1;
+            // the parity column used to be inverted by the writer's removed
+            // `low_t.integer()` term (1 for this fixture's S10.2 `low_t = 4`).
             vec![
-                (0, 0xff, 0, true),
-                (8, 0x03, 1, true),
-                (10, 0xff, 3, false),
-                (18, 0x03, 4, false)
+                (0, 0xff, 0, false),
+                (8, 0xff, 1, false),
+                (10, 0xff, 3, true),
+                (18, 0xff, 4, true)
             ]
         );
         assert_transfer_geometry_matches_destination_union(&decoded, load);
@@ -3180,7 +5046,7 @@ mod tests {
         unpaired_yuv.extend(load_sync(0));
         unpaired_yuv.extend([word(0, LOAD_BLOCK, 1 << 12), 7 << 24 | 2 << 12]);
         let yuv = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, unpaired_yuv, &[(0x202, 0x206)])),
+            submit(packet_with_tmem_sources(7, unpaired_yuv, &[(0x202, 0x20a)])),
             &RdpState::default(),
         )
         .unwrap();
@@ -3209,7 +5075,7 @@ mod tests {
             submit(packet_with_tmem_sources(
                 7,
                 yuv_tile,
-                &[(0x202, 0x206), (0x20a, 0x20e)],
+                &[(0x202, 0x20a), (0x20a, 0x212)],
             )),
             &RdpState::default(),
         )
@@ -3222,7 +5088,7 @@ mod tests {
             .tmem_load_source_accesses(yuv_tile_load.source_plan())
             .unwrap();
         assert_eq!(yuv_tile_load.source_plan().access_count(), 2);
-        assert_eq!(yuv_tile_load.source_plan().total_bytes(), 8);
+        assert_eq!(yuv_tile_load.source_plan().total_bytes(), 16);
         assert_eq!(
             yuv_tile_sources
                 .iter()
@@ -3233,14 +5099,14 @@ mod tests {
                     resource: RdramResource::Buffer,
                     range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
                         .unwrap()
-                        .range(0x202, 0x206)
+                        .range(0x202, 0x20a)
                         .unwrap(),
                 },
                 ResourceRegion::Rdram {
                     resource: RdramResource::Buffer,
                     range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
                         .unwrap()
-                        .range(0x20a, 0x20e)
+                        .range(0x20a, 0x212)
                         .unwrap(),
                 },
             ]
@@ -3364,8 +5230,10 @@ mod tests {
         );
     }
 
+    /// Every tile row has one padded whole-word access, including full-width rows,
+    /// matching RT64 `rt64_rdp.cpp:369-397` (`Copy the entire word`).
     #[test]
-    fn load_tile_plans_exact_fractional_subrows_and_collapses_full_rows() {
+    fn load_tile_plans_one_padded_access_per_row_for_fractional_and_full_rows() {
         let mut subrows = Vec::new();
         subrows.extend(set_texture_image(0, 2, 1, 9, 0x200));
         subrows.extend(set_tile(0, 3, 1, 0));
@@ -3375,7 +5243,7 @@ mod tests {
             submit(packet_with_tmem_sources(
                 7,
                 subrows,
-                &[(0x213, 0x216), (0x21c, 0x21f)],
+                &[(0x213, 0x21b), (0x21c, 0x224)],
             )),
             &RdpState::default(),
         )
@@ -3384,7 +5252,7 @@ mod tests {
             panic!("expected LoadTile");
         };
         assert_eq!(load.source_plan().access_count(), 2);
-        assert_eq!(load.source_plan().total_bytes(), 6);
+        assert_eq!(load.source_plan().total_bytes(), 16);
         let TmemLoadKind::Tile { bounds } = load.kind() else {
             panic!("expected tile bounds");
         };
@@ -3399,15 +5267,19 @@ mod tests {
         full_rows.extend(load_sync(0));
         full_rows.extend([word(0, LOAD_TILE, 0), 2 << 24 | 12 << 12 | 4]);
         let decoded = decode_raw_dpc(
-            submit(packet_with_tmem_sources(7, full_rows, &[(0x300, 0x308)])),
+            submit(packet_with_tmem_sources(
+                7,
+                full_rows,
+                &[(0x300, 0x308), (0x304, 0x30c)],
+            )),
             &RdpState::default(),
         )
         .unwrap();
         let RawDpcCommandKind::LoadTile(load) = decoded.commands()[3].kind() else {
             panic!("expected LoadTile");
         };
-        assert_eq!(load.source_plan().access_count(), 1);
-        assert_eq!(load.source_plan().total_bytes(), 8);
+        assert_eq!(load.source_plan().access_count(), 2);
+        assert_eq!(load.source_plan().total_bytes(), 16);
     }
 
     #[test]
@@ -3444,6 +5316,85 @@ mod tests {
             Err(RawDpcDecodeError::InvalidCommand { reason, .. })
                 if reason.contains("256-entry")
         ));
+    }
+
+    /// The canonical libultra `gDPLoadTLUT_pal16` destination tile is
+    /// `siz == G_IM_SIZ_4b`, and must decode.
+    ///
+    /// Public libultra `gbi.h` (identical in four independent SDK copies on
+    /// this machine: `sm64-decomp/include/PR/gbi.h:4229`,
+    /// `mm-decomp/include/PR/gbi.h:4655`,
+    /// `kirby64-decomp/include/PR/gbi.h:4239`,
+    /// `oot-decomp/include/ultra64/gbi.h:4657`) expands
+    /// `gDPLoadTLUT_pal16(pkt, pal, dram)` to
+    /// `gDPSetTextureImage(pkt, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, dram)`
+    /// followed by
+    /// `gDPSetTile(pkt, 0, 0, 0, (256+((pal&0xf)*16)), G_TX_LOADTILE, ...)`.
+    /// `gDPSetTile`'s parameter order is `(pkt, fmt, siz, line, tmem, tile,
+    /// ...)` (`sm64-decomp/include/PR/gbi.h:3401`), so that second `0` is
+    /// `siz`, and `G_IM_SIZ_4b == 0` (`:410`). `gDPLoadTLUT_pal256` (`:4283`)
+    /// and the generic `gDPLoadTLUT` (`:4331`) program the same `siz == 0`.
+    ///
+    /// Fail-against-bug: an earlier revision required the DESTINATION
+    /// descriptor to be `Bits16` and refused every canonical macro emission --
+    /// including all seven `LoadTLUT`s in WWF WrestleMania 2000's captured
+    /// frame-0 packet. The sibling SOURCE-image check is the correct one and
+    /// is asserted here too, so deleting either check fails this test.
+    ///
+    /// The `set_tile` helper hardcodes `siz == 2`, which is why no existing
+    /// fixture could reach this shape; these cases build the word directly.
+    #[test]
+    fn load_tlut_accepts_the_canonical_macro_four_bit_destination_descriptor() {
+        // `gDPSetTile(pkt, fmt=0, siz, line=0, tmem=256, tile=7, ...)`.
+        let set_tile_siz = |siz: u32| [word(0, SET_TILE, siz << 19 | 256), 7 << 24];
+
+        // Every destination `siz` decodes: the field describes a TMEM region
+        // for a quadricated palette write, not the palette's pixel format,
+        // and nothing downstream consumes it for this load kind.
+        for siz in 0..=3 {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 2, 1, 0x300));
+            words.extend(set_tile_siz(siz));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 15 << 14]);
+            let decoded = decode_raw_dpc(
+                submit(packet_with_tmem_sources(7, words, &[(0x300, 0x320)])),
+                &RdpState::default(),
+            )
+            .unwrap_or_else(|error| panic!("siz={siz} must decode: {error}"));
+            let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
+                panic!("siz={siz}: expected LoadTLUT");
+            };
+            let TmemLoadKind::Tlut { entries, .. } = load.kind() else {
+                panic!("siz={siz}: expected TLUT load kind");
+            };
+            // The transfer is sized from the SOURCE image and the entry
+            // count, never from the destination descriptor -- so the shape
+            // is identical across all four destination sizes.
+            assert_eq!(entries.get(), 16, "siz={siz}");
+            assert_eq!(load.source_plan().total_bytes(), 32, "siz={siz}");
+        }
+
+        // The sibling SOURCE check remains, and is the one the macro
+        // actually constrains: a non-16-bit `SetTextureImage` is refused
+        // even with the canonical 4-bit destination descriptor.
+        for source_siz in [0, 1, 3] {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, source_siz, 1, 0x300));
+            words.extend(set_tile_siz(0));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 15 << 14]);
+            let error =
+                decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RawDpcDecodeError::InvalidCommand { reason: ref actual, .. }
+                        if actual.contains("16-bit SetTextureImage source")
+                ),
+                "source siz={source_siz}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3549,11 +5500,13 @@ mod tests {
     // --- triangle decode wired into the real command stream ---
 
     fn triangle_base_word0(prefix: u8, opcode: u8, tile: u32, level: u32, yl: u16) -> u32 {
-        word(
-            prefix,
-            opcode,
-            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
-        )
+        crate::wire_words::EdgeWords {
+            tile,
+            level,
+            yl: yl as i16,
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .word0(prefix, opcode)
     }
 
     /// A base-edge (0x08) triangle decoded from a real command stream, with
@@ -3765,7 +5718,7 @@ mod tests {
             panic!("expected SetEnvColor");
         };
         assert_eq!(color.rgba8(), [0x11, 0x22, 0x33, 0x44]);
-        assert_eq!(decoded.staged_state().env_color(), Some(color));
+        assert_eq!(decoded.staged_state().env_color(), color);
     }
 
     #[test]
@@ -3793,7 +5746,7 @@ mod tests {
             panic!("expected SetBlendColor");
         };
         assert_eq!(color.rgba8(), [0xAA, 0xBB, 0xCC, 0xDD]);
-        assert_eq!(decoded.staged_state().blend_color(), Some(color));
+        assert_eq!(decoded.staged_state().blend_color(), color);
     }
 
     #[test]
@@ -3805,7 +5758,329 @@ mod tests {
             panic!("expected SetFogColor");
         };
         assert_eq!(color.rgba8(), [0x01, 0x02, 0x03, 0x04]);
-        assert_eq!(decoded.staged_state().fog_color(), Some(color));
+        assert_eq!(decoded.staged_state().fog_color(), color);
+    }
+
+    // -- SetScissor (tracked state only) --------------------------------
+
+    /// Hand-derived wire words for one `SetScissor`. `w0` payload packs
+    /// `ulx << 12 | uly`; `w1` packs `mode << 24 | lrx << 12 | lry`.
+    fn set_scissor_words(
+        prefix: u8,
+        mode: u32,
+        ulx: u32,
+        uly: u32,
+        lrx: u32,
+        lry: u32,
+    ) -> Vec<u32> {
+        vec![
+            word(prefix, SET_SCISSOR, ulx << 12 | uly),
+            mode << 24 | lrx << 12 | lry,
+        ]
+    }
+
+    /// **The DECLARED write rows follow the scissor, not just the painted
+    /// ones.**
+    ///
+    /// Mutation-driven: making `plan_fill` declare the unclipped extent --
+    /// while the executor still clips -- survived the whole unit suite and
+    /// the differential sweep. It is nonetheless the hazard `plan_fill`'s
+    /// own doc names: `fill_completed_writes` slices the full-extent buffer
+    /// for every declared range WITHOUT checking the raster touched it, so a
+    /// declared-but-unpainted row publishes a real digest of whatever the
+    /// buffer held and carries it into guest RDRAM.
+    ///
+    /// Pinned on `clip_fill_rows_to_scissor` directly rather than through a
+    /// decoded packet: `plan_fill` is reached by two decode passes and the
+    /// retained plan is not the one a journal probe reports, so a
+    /// packet-level fixture asserts the wrong pass. This is the function
+    /// whose result `plan_render_target_rows` is handed.
+    ///
+    /// Every expectation is hand-derived from the wire. The scissor latches
+    /// quarter-pixels and each edge becomes `ceil(q / 4)`
+    /// (`RdpScissorRect::quarter_to_pixel_ceil`). This `ceil(q / 4)` rule is
+    /// fn64's own reading and is not independently confirmed against an
+    /// allowed hardware reference.
+    #[test]
+    fn a_scissored_fill_declares_only_the_rows_that_survive_the_clip() {
+        let rect = |x0, y0, x1, y1| RenderTargetRectangle { x0, y0, x1, y1 };
+        // Rows 0..=1 requested; scissor `lry = 4` admits `ceil(4/4) = 1`
+        // row, so only row 0 survives. Full width either way.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 16, 4
+                )),
+            ),
+            Some(rect(0, 0, 3, 0)),
+            "the high row edge must clip y1 from 1 to 0"
+        );
+        // The X counterpart, asserted separately: a clip correct in Y and
+        // absent in X still narrows the rectangle, so one combined case
+        // would pass with either axis broken.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 8, 16
+                )),
+            ),
+            Some(rect(0, 0, 1, 1)),
+            "the high column edge must clip x1 from 3 to 1"
+        );
+        // Low edges, which a backend clamping only lrx/lry would miss.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(0, 0, 3, 3),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 4, 8, 16, 16
+                )),
+            ),
+            Some(rect(1, 2, 3, 3)),
+            "ulx = 4 -> first column 1; uly = 8 -> first row 2"
+        );
+        // Nothing survives: the rectangle sits entirely right of the
+        // scissor, which must be `None` rather than a silently empty rect.
+        assert_eq!(
+            clip_fill_rows_to_scissor(
+                rect(2, 0, 3, 1),
+                Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    0, 0, 0, 4, 16
+                )),
+            ),
+            None,
+            "an empty intersection declares nothing"
+        );
+        // No scissor staged: the rectangle passes through untouched, so an
+        // unscissored stream declares exactly what it always did.
+        assert_eq!(
+            clip_fill_rows_to_scissor(rect(0, 0, 3, 1), None),
+            Some(rect(0, 0, 3, 1)),
+            "absent scissor is not an empty scissor"
+        );
+    }
+
+    #[test]
+    fn set_scissor_is_admitted_rather_than_rejected_as_unsupported() {
+        // Before admission this exact stream returned
+        // `UnsupportedCommand { decoded_opcode: 0x2d, width: 8 }`.
+        let decoded = decode(set_scissor_words(0xc0, 0, 0, 0, 0, 0))
+            .expect("SetScissor must decode, not reject as UnsupportedCommand");
+        assert_eq!(decoded.commands().len(), 1);
+        assert!(matches!(
+            decoded.commands()[0].kind(),
+            RawDpcCommandKind::SetScissor(_)
+        ));
+    }
+
+    #[test]
+    fn set_scissor_opcode_constant_is_the_low_six_bits_of_g_setscissor() {
+        // `G_SETSCISSOR` is 0xED (fn64-render-reference's `gbi::wire`);
+        // the raw-DPC decoder keys on `opcode & 0x3f`.
+        assert_eq!(SET_SCISSOR, 0x2d);
+        assert_eq!(SET_SCISSOR, 0xedu8 & 0x3f);
+    }
+
+    /// **`SetScissor` now STAGES, where it used to be tracked-only.**
+    ///
+    /// The tracked-only shape is exactly what made a texrect overhanging
+    /// the framebuffer a refusal rather than a clip: with no latched rect,
+    /// `execute_texture_rectangle` had nothing to clip against. Public
+    /// libultra encodes all four scissor coordinates as twelve-bit
+    /// quarter-pixel fields (`include/ultra64/gbi.h:4794-4837`), and pinned
+    /// RT64 intersects its current scissor with the draw rectangle
+    /// (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`). Persisting the
+    /// rect as staged state is fn64's own reading; its exact lifetime is not
+    /// independently confirmed against an allowed hardware reference.
+    ///
+    /// Asserts the staged rect field by field, in the quarter-pixel wire
+    /// units the command carries, using four DISTINCT values so a staging
+    /// path that transposed two of them cannot pass.
+    #[test]
+    fn set_scissor_stages_its_rect_into_durable_rdp_state() {
+        let decoded = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let staged = decoded
+            .staged_state()
+            .scissor()
+            .expect("SetScissor stages a rect");
+        assert_eq!(staged.mode(), 2);
+        assert_eq!(staged.upper_left_x(), 0x123);
+        assert_eq!(staged.upper_left_y(), 0x456);
+        assert_eq!(staged.lower_right_x(), 0x789);
+        assert_eq!(staged.lower_right_y(), 0xABC);
+    }
+
+    /// A stream with no `SetScissor` stages none -- the consumer's own
+    /// fallback (the colour target's extent) applies, rather than a
+    /// fabricated rect latched here.
+    /// **A scissor latched by an earlier packet survives into a later
+    /// one.** `decode_raw_dpc` decodes against
+    /// `durable_state.fork_for_decode()`, so a fork that dropped the rect
+    /// would unscissor every packet after the one that set it -- and a
+    /// display list commonly sets the scissor once per frame and then
+    /// submits several packets under it.
+    ///
+    /// The second packet deliberately issues a DIFFERENT state command
+    /// (`SetEnvColor`) so its own decode really does run and really does
+    /// stage something, ruling out a vacuous pass.
+    #[test]
+    fn a_scissor_from_an_earlier_packet_survives_the_fork_into_a_later_one() {
+        let first = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let latched = first
+            .staged_state()
+            .scissor()
+            .expect("the first packet stages a rect");
+
+        // Feed the first packet's result forward as the second's durable
+        // state, which is what the backend does between packets.
+        let mut durable = RdpState::default();
+        let mut delta = RdpStateDelta::default();
+        delta.set_scissor(latched);
+        durable.apply(&delta);
+
+        let submitted = submit(packet(7, vec![word(0, SET_ENV_COLOR, 0), 0x1122_3344], &[]));
+        let second = decode_raw_dpc(submitted, &durable).unwrap();
+        assert_eq!(
+            second.staged_state().scissor(),
+            Some(latched),
+            "the second packet issued no SetScissor and must inherit the first packet's rect"
+        );
+        // The second packet's own command staged too, so the decode ran.
+        assert_eq!(
+            second.staged_state().env_color().rgba8(),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn a_stream_with_no_set_scissor_stages_no_rect() {
+        let words = vec![word(0, SET_BLEND_COLOR, 0), 0xAABBCCDD];
+        let decoded = decode(words).unwrap();
+        assert_eq!(decoded.staged_state().scissor(), None);
+    }
+
+    #[test]
+    fn set_scissor_decodes_each_field_from_its_own_wire_position() {
+        // ulx = 0x123 (291), uly = 0x456 (1110) from w0's low 24 bits;
+        // mode = 2, lrx = 0x789 (1929), lry = 0xABC (2748) from w1.
+        let decoded = decode(set_scissor_words(0x80, 2, 0x123, 0x456, 0x789, 0xABC)).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(scissor.mode, 2);
+        assert_eq!(scissor.ulx, 0x123);
+        assert_eq!(scissor.uly, 0x456);
+        assert_eq!(scissor.lrx, 0x789);
+        assert_eq!(scissor.lry, 0xABC);
+    }
+
+    #[test]
+    fn set_scissor_fields_saturate_at_their_own_widths_and_never_go_negative() {
+        // Every wire bit set: the opcode byte still selects SetScissor
+        // (0xff & 0x3f == 0x3f is SetColorImage, so build the word
+        // explicitly rather than flooding w0's top byte). mode is 2 bits
+        // (max 3), each coordinate is 12 bits (max 0xFFF = 4095).
+        let words = vec![word(0xc0, SET_SCISSOR, 0x00ff_ffff), 0xffff_ffff];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(scissor.mode, 3);
+        assert_eq!(scissor.ulx, 0xFFF);
+        assert_eq!(scissor.uly, 0xFFF);
+        assert_eq!(scissor.lrx, 0xFFF);
+        assert_eq!(scissor.lry, 0xFFF);
+        // The decoder's `int32_t` typing mirrors RT64's locals; the fields
+        // are zero-extended and can never be negative.
+        for value in [scissor.ulx, scissor.uly, scissor.lrx, scissor.lry] {
+            assert!(value >= 0, "scissor coordinates are zero-extended");
+        }
+    }
+
+    #[test]
+    fn set_scissor_matches_the_pinned_rt64_decoder_bit_for_bit() {
+        // Proves this arm reuses `decode_set_scissor` rather than
+        // re-deriving the layout: a hostile pattern that fills every
+        // unrelated bit must agree with the ported decoder exactly.
+        let w0 = word(0x40, SET_SCISSOR, 0x00ab_cdef);
+        let w1 = 0x3579_2468u32;
+        let decoded = decode(vec![w0, w1]).unwrap();
+        let RawDpcCommandKind::SetScissor(scissor) = decoded.commands()[0].kind() else {
+            panic!("expected SetScissor");
+        };
+        assert_eq!(
+            scissor,
+            crate::rt64_gbi_rdp_decode::decode_set_scissor(w0, w1)
+        );
+    }
+
+    /// Assert two decodes staged byte-identical RDP state.
+    ///
+    /// Compares every public [`StagedRdpState`] accessor rather than the
+    /// struct itself: `StagedRdpState` also carries the per-decode
+    /// `QueueIdentity`/`transaction_sequence` bookkeeping, which the
+    /// fixture's `decode` helper advances on each call and which has
+    /// nothing to do with the commands in the stream.
+    fn assert_same_staged_state(left: &StagedRdpState, right: &StagedRdpState) {
+        assert_eq!(left.other_mode(), right.other_mode());
+        assert_eq!(left.color_image(), right.color_image());
+        assert_eq!(left.fill_color(), right.fill_color());
+        assert_eq!(left.env_color(), right.env_color());
+        assert_eq!(left.prim_color(), right.prim_color());
+        assert_eq!(left.blend_color(), right.blend_color());
+        assert_eq!(left.fog_color(), right.fog_color());
+        assert_eq!(left.prim_depth(), right.prim_depth());
+        assert_eq!(left.combine(), right.combine());
+        assert_eq!(left.tmem(), right.tmem());
+    }
+
+    #[test]
+    fn set_scissor_stages_nothing_into_the_rdp_state() {
+        // The core no-pixel-change guarantee at the decode layer: a stream
+        // whose only command is SetScissor must leave every staged slot
+        // exactly as a stream carrying only a no-op leaves it. Nothing in
+        // `RdpState` can name a scissor, so nothing downstream can read one.
+        let noop_only = decode(vec![word(0, 0x00, 0), 0]).unwrap();
+        let scissored = decode(set_scissor_words(0, 1, 0x0a0, 0x0b0, 0x0c0, 0x0d0)).unwrap();
+        assert_same_staged_state(scissored.staged_state(), noop_only.staged_state());
+    }
+
+    #[test]
+    fn set_scissor_interleaved_between_state_commands_changes_no_staged_value() {
+        // Same guarantee against a realistic stream: dropping SetScissor
+        // commands in between real state commands must leave every staged
+        // slot exactly as the scissor-free stream produced it.
+        let prefix = 0xc0;
+        let without = decode(state_words(prefix)).unwrap();
+
+        let mut with_words = Vec::new();
+        with_words.extend(set_scissor_words(prefix, 0, 0, 0, 320 * 4, 240 * 4));
+        with_words.extend(state_words(prefix));
+        with_words.extend(set_scissor_words(prefix, 1, 16, 16, 300 * 4, 220 * 4));
+        let with = decode(with_words).unwrap();
+
+        assert_same_staged_state(with.staged_state(), without.staged_state());
+        // ...and the scissor commands are genuinely present, so the
+        // equality above is not vacuous.
+        assert_eq!(
+            with.commands().len(),
+            without.commands().len() + 2,
+            "both SetScissor commands must have been admitted"
+        );
+        // The non-scissor commands must also be unchanged, in order.
+        let with_kinds: Vec<_> = with
+            .commands()
+            .iter()
+            .map(|command| command.kind())
+            .filter(|kind| !matches!(kind, RawDpcCommandKind::SetScissor(_)))
+            .collect();
+        let without_kinds: Vec<_> = without
+            .commands()
+            .iter()
+            .map(|command| command.kind())
+            .collect();
+        assert_eq!(with_kinds, without_kinds);
     }
 
     #[test]
@@ -3821,7 +6096,7 @@ mod tests {
         assert_eq!(prim.lod().lod_frac(), 0x3c);
         assert_eq!(prim.lod().lod_min(), 0x0a);
         assert_eq!(prim.color().rgba8(), [0x11, 0x22, 0x33, 0x44]);
-        assert_eq!(decoded.staged_state().prim_color(), Some(prim));
+        assert_eq!(decoded.staged_state().prim_color(), prim);
     }
 
     #[test]
@@ -3954,16 +6229,16 @@ mod tests {
         assert_eq!(decoded.commands().len(), 10);
         let staged = decoded.staged_state();
         assert_eq!(
-            staged.env_color().unwrap().value(),
+            staged.env_color().value(),
             0x2222_2222,
             "last SetEnvColor in the packet must win"
         );
-        let prim = staged.prim_color().unwrap();
+        let prim = staged.prim_color();
         assert_eq!(prim.color().value(), 0x4444_4444);
         assert_eq!(prim.lod().lod_min(), 0x0b);
         assert_eq!(prim.lod().lod_frac(), 0x4d);
-        assert_eq!(staged.blend_color().unwrap().value(), 0x6666_6666);
-        assert_eq!(staged.fog_color().unwrap().value(), 0x8888_8888);
+        assert_eq!(staged.blend_color().value(), 0x6666_6666);
+        assert_eq!(staged.fog_color().value(), 0x8888_8888);
         let depth = staged.prim_depth().unwrap();
         assert_eq!(depth.z(), 300);
         assert_eq!(depth.dz(), 400);
@@ -4016,6 +6291,8 @@ mod tests {
             &mut delta,
             &mut planned,
             &mut commands,
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(error, RawDpcDecodeError::TruncatedCommand { .. }));
@@ -4024,10 +6301,12 @@ mod tests {
         // this assertion documents that invariant rather than proving new
         // behavior a compile error would already catch.
         assert_eq!(durable, RdpState::default());
-        assert!(durable.env_color().is_none());
-        assert!(durable.prim_color().is_none());
-        assert!(durable.blend_color().is_none());
-        assert!(durable.fog_color().is_none());
+        // The four constant-color registers are not `Option`: untouched
+        // means still holding their power-on zero, not "absent".
+        assert_eq!(durable.env_color(), Color4::from_wire(0));
+        assert_eq!(durable.prim_color(), PrimColor::from_wire(0, 0));
+        assert_eq!(durable.blend_color(), Color4::from_wire(0));
+        assert_eq!(durable.fog_color(), Color4::from_wire(0));
         assert!(durable.prim_depth().is_none());
     }
 
@@ -4057,7 +6336,7 @@ mod tests {
         assert_eq!(staged.other_mode(), expected_other_mode);
         assert_eq!(staged.color_image(), expected_color_image);
         assert_eq!(staged.fill_color(), expected_fill_color);
-        assert_eq!(staged.env_color().unwrap().value(), 0x0102_0304);
+        assert_eq!(staged.env_color().value(), 0x0102_0304);
     }
 
     #[test]
@@ -4285,6 +6564,276 @@ mod tests {
         assert!(
             decoded.state_delta().combine().is_none(),
             "packet N+1's own delta must not record a SetCombine it never decoded"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Raw triangle -> declared per-row ColorFramebuffer writes
+    // -----------------------------------------------------------------
+
+    /// One-cycle `OtherMode` (cycle_type 0) and an RGBA16 colour image 8
+    /// pixels wide at address 0 -- the narrowest staging a flat raw
+    /// triangle needs to declare a write.
+    ///
+    /// One cycle, not Fill: `plan_raw_triangle` refuses Fill cycle, where
+    /// the RDP consults no combiner at all.
+    /// `RdpState` with a host-configured colour-target height, which every
+    /// raw-triangle declaration test needs.
+    ///
+    /// `plan_raw_triangle` bounds its per-scanline row walk by this height --
+    /// the same value `create_inner` gives `configured_target_extent` -- and
+    /// declares NOTHING when it is absent, rather than guessing one. So a
+    /// fixture using bare `RdpState::default()` measures the missing-height
+    /// refusal instead of the row walk.
+    ///
+    /// Eight rows: taller than the three-row fixture triangle, so the height
+    /// bound is not what limits it and these tests keep measuring the edge
+    /// coefficients.
+    fn triangle_state() -> RdpState {
+        let mut state = RdpState::default();
+        state.set_color_target_height(8);
+        state
+    }
+
+    fn flat_triangle_state_words(prefix: u8) -> Vec<u32> {
+        vec![
+            word(prefix, SET_OTHER_MODE, 0),
+            0,
+            // RGBA16: format 0 (RGBA) and size 2 (`PixelSize::Bits16`) in
+            // bits 21:19; width 8 (the wire field is width-1); address 0.
+            word(prefix, SET_COLOR_IMAGE, 2 << 19 | 7),
+            0,
+        ]
+    }
+
+    /// The eight wire words of one flat (opcode 0x08) left-major triangle
+    /// whose two edges are vertical at x = 2 and x = 6, spanning scanlines
+    /// 0..3.
+    ///
+    /// Hand-derived footprint, from the wire fields and nothing else:
+    ///   yh = 0, yl = 3<<2 = 12 (S11.2) -> yh_eighth 0, yl_eighth 24
+    ///   min_y = ceil((0-7)/8) = 0, max_y = ceil((24-1)/8) = 3  -> rows 0,1,2
+    ///   xh = 2<<16, dxhdy = 0 -> left edge parked at 2.0
+    ///   xm = xl = 6<<16, slopes 0 -> right edge parked at 6.0
+    ///   x0 = ceil((2*65536 - 7*65536/8)/65536) = ceil(1.125) = 2
+    ///   x1 = ceil((6*65536 - 65536/8)/65536)   = ceil(5.875) = 6
+    /// So each row covers pixels 2..6 = 4 pixels = 8 bytes at RGBA16, and
+    /// row y starts at byte (y*8 + 2)*2 = 16y + 4: bytes 4, 20, 36.
+    fn flat_triangle_words(prefix: u8) -> Vec<u32> {
+        crate::wire_words::EdgeWords {
+            lft: true,
+            yl: crate::wire_words::line(3),
+            ym: crate::wire_words::line(3),
+            yh: 0,
+            xl: crate::wire_words::px(6),
+            xh: crate::wire_words::px(2),
+            xm: crate::wire_words::px(6),
+            ..crate::wire_words::EdgeWords::zeroed()
+        }
+        .words(prefix, 0x08)
+        .to_vec()
+    }
+
+    #[test]
+    fn a_flat_raw_triangle_declares_one_exact_access_per_covered_row() {
+        let mut words = flat_triangle_state_words(0);
+        words.extend(flat_triangle_words(0));
+        // The three hand-derived per-row ranges, in row order. A collapsed
+        // single span would be (4, 44) and this would fail.
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses(),
+            decoded.submitted().packet().journal().accesses(),
+            "the declared run must equal the journal's, access for access"
+        );
+        // The command is still decoded as a triangle, not swallowed.
+        assert!(matches!(
+            decoded.commands().last().map(|command| command.kind()),
+            Some(RawDpcCommandKind::RawTriangle(_))
+        ));
+    }
+
+    #[test]
+    fn a_flat_raw_triangles_declared_rows_bind_back_as_its_own_span() {
+        let mut words = flat_triangle_state_words(0);
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
+        // The triangle is command index 2 (two state commands precede it).
+        let accesses = decoded
+            .resource_plan()
+            .bind_texture_rectangle(2)
+            .expect("the triangle's own span binds");
+        assert_eq!(accesses.len(), 3, "one access per covered scanline");
+        for access in accesses {
+            assert_eq!(access.mode(), AccessMode::Write);
+            assert_eq!(access.purpose(), AccessPurpose::RenderTarget);
+        }
+    }
+
+    /// One triangle of `opcode`, with the right number of zeroed
+    /// coefficient words for its own flag bits, decoded through the real
+    /// planner -- returning how many accesses the plan declared.
+    ///
+    /// A plan with no triangle declares exactly ONE access (the state
+    /// commands' own), so "declared nothing" is `1` and "declared its rows"
+    /// is more.
+    fn declared_access_count_for_opcode(opcode: u8) -> usize {
+        let mut words = flat_triangle_state_words(0);
+        let mut triangle = flat_triangle_words(0);
+        triangle[0] = word(0, opcode, 1 << 23 | 12);
+        let extra_words = 8 * u32::from(opcode & 0x4 != 0)
+            + 8 * u32::from(opcode & 0x2 != 0)
+            + 2 * u32::from(opcode & 0x1 != 0);
+        triangle.extend(core::iter::repeat_n(0u32, (extra_words * 2) as usize));
+        words.extend(triangle);
+        // The journal the packet is submitted with must be the one the
+        // decoder produces, or `decode_raw_dpc` refuses with
+        // `JournalMismatch` before this helper can count anything. The three
+        // ranges are `flat_triangle_words`' own footprint, hand-derived the
+        // same way `a_flat_raw_triangle_declares_one_exact_access_per_
+        // covered_row` derives them -- and they are shared by every opcode
+        // here BECAUSE the footprint is a function of the edges alone, which
+        // is the very claim this helper's callers assert.
+        //
+        // A depth-bearing opcode declares none of them, so it is submitted
+        // with an empty journal instead.
+        let expected: &[(u32, u32)] = if opcode & 0x1 != 0 {
+            &[]
+        } else {
+            &[(4, 12), (20, 28), (36, 44)]
+        };
+        let submitted = submit(packet(7, words, expected));
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
+        decoded.resource_plan().accesses().len()
+    }
+
+    #[test]
+    fn a_depth_bearing_triangle_declares_no_write() {
+        // Depth is still outside the executor's subset -- there is no depth
+        // image, no depth journal declaration and no Z encoding -- so a
+        // depth-bearing triangle must declare nothing. Declaring a row the
+        // executor cannot fill would digest stale resident bytes into guest
+        // RDRAM.
+        //
+        // Opcodes: bit 0 = depth, bit 1 = textured, bit 2 = shaded. The
+        // refused set is now exactly the four with bit 0 set.
+        for opcode in [0x09u8, 0x0b, 0x0d, 0x0f] {
+            assert_eq!(
+                declared_access_count_for_opcode(opcode),
+                1,
+                "opcode {opcode:#04x} carries a depth plane and declared a write it cannot fill"
+            );
+        }
+    }
+
+    /// **The texture rung's decoder half.** Every depth-free opcode --
+    /// including 0x0a and 0x0e, the textured ones -- now declares its own
+    /// per-row run.
+    ///
+    /// This is the change WM2000's geometry needs: all 1,314,648 raw
+    /// triangles measured on the real ROM are opcode 0x0e, and this
+    /// predicate previously refused every one of them, so the ROM's entire
+    /// 3D scene declared nothing and drew nothing.
+    ///
+    /// Asserted as an EQUALITY against the flat opcode's own count, not as
+    /// "more than one": the footprint is a function of the edge
+    /// coefficients alone, and every opcode here carries identical edges, so
+    /// a textured triangle declaring a DIFFERENT number of rows than a flat
+    /// one would mean the coefficient-block length changed the geometry.
+    #[test]
+    fn every_depth_free_opcode_including_the_textured_ones_declares_its_rows() {
+        let flat = declared_access_count_for_opcode(0x08);
+        assert!(
+            flat > 1,
+            "the flat opcode must declare rows for this comparison to mean anything"
+        );
+        for opcode in [0x0au8, 0x0c, 0x0e] {
+            assert_eq!(
+                declared_access_count_for_opcode(opcode),
+                flat,
+                "opcode {opcode:#04x} is depth-free and must declare the same per-row run \
+                 the identically-edged flat triangle does"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shaded_triangle_declares_the_same_per_row_run_a_flat_one_does() {
+        // Opcode 0x0c is flat's shaded sibling: identical edge coefficients
+        // plus eight shade words. The footprint is a function of the EDGE
+        // coefficients alone, so the declared run must be byte-identical to
+        // `a_flat_raw_triangle_declares_one_exact_access_per_covered_row`'s.
+        //
+        // This is what the executor's shade interpolation bought: 100% of
+        // the 826,056 raw triangles WM2000 issues are shaded (and textured),
+        // so a decoder that refuses shaded declares nothing for the entire
+        // ROM.
+        let mut words = flat_triangle_state_words(0);
+        let mut triangle = flat_triangle_words(0);
+        triangle[0] = word(0, 0x0c, 1 << 23 | 12);
+        // Eight shade coefficient words = sixteen u32 halves.
+        triangle.extend(core::iter::repeat_n(0u32, 16));
+        words.extend(triangle);
+        let submitted = submit(packet(7, words, &[(4, 12), (20, 28), (36, 44)]));
+        let decoded = decode_raw_dpc(submitted, &triangle_state()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses(),
+            decoded.submitted().packet().journal().accesses()
+        );
+    }
+
+    #[test]
+    fn a_flat_triangle_in_fill_cycle_or_without_a_colour_image_declares_no_write() {
+        // Fill cycle: the RDP consults no combiner, a path this executor
+        // does not implement for triangles.
+        let mut words = vec![word(0, SET_OTHER_MODE, 3 << 20), 0];
+        words.extend([word(0, SET_COLOR_IMAGE, 2 << 19 | 7), 0]);
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(decoded.resource_plan().accesses().len(), 1);
+
+        // No staged colour image at all: nothing to write into.
+        let mut words = vec![word(0, SET_OTHER_MODE, 0), 0];
+        words.extend(flat_triangle_words(0));
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(decoded.resource_plan().accesses().len(), 1);
+    }
+
+    #[test]
+    fn a_flat_triangle_reaching_outside_installed_rdram_declares_nothing_at_all() {
+        // Not a truncated prefix: a partially-declarable triangle must
+        // declare NO row, because the rasterizer walks every row the span
+        // claims and a prefix would leave it writing rows nobody declared.
+        //
+        // Same vertical edges as `flat_triangle_words`, but 200 scanlines
+        // tall (YL = 200<<2) against an RGBA16 image 8 pixels wide parked at
+        // 0x3fc0, the last 64-byte-aligned address in the 0x4000 layout. Row
+        // 0 fits (bytes 0x3fc4..0x3fcc); row 4 already needs 0x4000, which is
+        // past installed RDRAM. So SOME rows are placeable and the whole
+        // triangle must still declare nothing.
+        let base = LAYOUT_BYTES - 64;
+        let mut words = vec![word(0, SET_OTHER_MODE, 0), 0];
+        words.extend([word(0, SET_COLOR_IMAGE, 2 << 19 | 7), base]);
+        words.extend([
+            word(0, 0x08, 1 << 23 | (200 << 2)),
+            (200u32 << 2) << 16,
+            6 << 16,
+            0,
+            2 << 16,
+            0,
+            6 << 16,
+            0,
+        ]);
+        let submitted = submit(packet(7, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        assert_eq!(
+            decoded.resource_plan().accesses().len(),
+            1,
+            "one command-decode read and no render-target write"
         );
     }
 }

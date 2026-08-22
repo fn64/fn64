@@ -1,0 +1,618 @@
+# The versus-screen plateau is guest state 18, waiting on a player-ready check
+
+Everything below marked CONFIRMED was read off a live run of the real ROM on
+the all-Rust lane (fn64's own recompiler + `fn64-render-wgpu`, no `--features
+rt64`), on the tree where the swap-1901 `lookup` trap is fixed
+(`recompile_rom` emits 2,480 functions). Everything marked HYPOTHESIS is not.
+
+## How the running code was identified
+
+Two read-only harness probes, both applied to a scratch copy of
+`~/Code/recomps/wm2000` (see `docs/tools/wm2000-versus-probe-harness.patch`):
+
+- `WM2000_WATCH` samples guest half-words once per VI swap.
+- `WM2000_CENSUS=<lo>-<hi>` counts every emitted function ENTERED inside a
+  swap window, through the existing
+  `fn64_abi::recompiled::copy_function_execution_destinations()`.
+
+**Gotcha that cost an hour, worth keeping:** fn64 backs RDRAM word-swapped.
+`Rdram::store_h` (`crates/fn64-cpu-runtime/src/runtime/host.rs:1014-1020`)
+writes at `backing_offset(vaddr) ^ 2` with `to_ne_bytes`. A probe reading
+`rdram[vram & 0xffffff]` big-endian therefore samples the guest variable at
+`vram ^ 2`, byte-reversed. Read at `off ^ 2`, decode little-endian.
+
+## CONFIRMED: the screen is guest state 18, and how it got there
+
+WM2000's global screen id is `D_8003DD04` (`0x8003DD04`). `func_801255E4`
+bounds-checks it against `0x22` and dispatches `jtbl_8016DAE8` at
+`0x80125AB4`. Watching it under the proven lead-in (START at 1100, A every 100
+swaps to 2400, then A every 60):
+
+| swap | `D_8003DD04` | menu depth `D_8016EC24` | arm |
+|---|---|---|---|
+| 1318 | 0 -> 1 | 0 | |
+| 1402 | 1 -> 5 | 0 -> 1 | |
+| 1502 | 5 -> 3 | 1 -> 2 | |
+| 1602 | 3 -> 4 | 2 -> 3 | |
+| 1702 | 4 -> 10 | 3 -> 4 | |
+| 1802 | 10 -> **19** | 4 -> 5 | `0x80125B8C` -- P1 select |
+| 1902 | 19 -> **20** | 5 -> 6 | `0x80125B8C` -- P2 select |
+| 2002 | 20 -> **17** | 6 -> 7 | `0x80126008` -> `func_80144A4C` |
+| 2102 | 17 -> **18** | 7 -> 8 | `0x80126048` -- **the plateau** |
+| 2520 | still 18 | 8 | through A at 2200/2300/2400/2460/2520 |
+
+Every A press advances the state exactly two swaps later, which is why the
+menus walked eight screens. At **state 18 that stops.** Two wrestler models on
+screen at 2300 is states 19 and 20 having each committed a character.
+
+## CONFIRMED: what state 18 polls
+
+The arm at `0x80126048`:
+
+```
+80126048  lhu $v0, 0xA($s3)      # sub-state
+8012604C  bnez -> .L80126074     # every frame after the first
+80126058  sw 0x53 -> D_8011BC84  # first frame only: request scene 0x53
+80126070  sh 1    -> 0xA($s3)
+.L80126074:
+80126074  jal func_8012BA94
+8012607C  beqz $v0 -> .L8012608C # advance only when it returns 0
+80126084  j func_801261D4        # else idle this frame
+.L8012608C:
+8012608C  lh $v0, 0x4($s3)
+80126090  bnez -> .L801260A8
+80126098  jal func_801456C8      # <-- reached EVERY frame
+```
+
+`func_8012BA94` (`0x8012BA94`, three instructions) returns the word at
+`D_80161FF8`. The census settles which branch is live.
+
+**Census over swaps 2600-2603 (14,652 entries, 201 distinct):**
+
+| function | entries | meaning |
+|---|---|---|
+| `func_801255E4` | 4 | the state machine, once per frame |
+| `func_8012BA94` | 4 | the poll, once per frame |
+| **`func_801456C8`** | **4** | reached every frame, so the poll returns 0 |
+| `func_80144A4C` | **0** | state 17's arm -- absent, so the state really is 18 |
+
+So the countdown at `D_80161FF8` is NOT the blocker: it completes, and the
+guest gets past it every single frame. The screen sits inside
+**`func_801456C8`**.
+
+## CONFIRMED: what `func_801456C8` is
+
+`func_801456C8` (`0x801456C8`) is a **player-ready check**. It loops over four
+player entries (`$a0 = D_801702A4 + 0x512`, stride `0x88`, `slti $a3, 4` at
+`0x801457AC`):
+
+```
+80145708  lhu $v0, 0x16($a0)     # per-entry port field
+8014570C  andi $v0, $v0, 0xF
+80145710  beqz -> .L801457A4     # 0 => entry SKIPPED entirely
+80145718..80145730                # index D_80095186[(field-1) * 12]
+80145738  andi $v0, $v1, 0x8000  # A
+8014577C  andi $v0, $v1, 0x4000  # B
+80145748  andi $v0, $v0, 0x1000  # START, via D_8011C37E
+801457B8  beqz $a2 -> .L801457F0 # nobody ready
+801457F8  addiu $v0, $zero, -1   # return -1
+```
+
+`D_80095186` is the **per-controller-port button array, stride 12** -- the
+same array `func_800E236C` (`0x800E236C`) merges into the global
+`D_8011C37E`/`D_8011C380` words at `0x800E23EC..0x800E2418`, gated on the
+controller count `D_800FEF2C` at `0x800E23A0`.
+
+The caller stores the return in `$s1`; `-1` is the "not ready" answer that
+leaves the state unchanged.
+
+## What is NOT yet established (SUPERSEDED -- all three are measured below)
+
+- **HYPOTHESIS**, not yet measured: which of the two exits of the loop is
+  taken -- every entry skipped because its `0x16 & 0xF` port field is 0, or
+  entries visited but `D_80095186[(field-1)*12]` never showing A. These are
+  different defects and the probe distinguishing them is
+  `WM2000_WATCH`/`WM2000_WATCHP` on `D_800FEF2C`, `D_80095186` and the four
+  entry port fields.
+- Whether fn64 populates `D_80095186` per port at stride 12 at all. fn64's
+  `PifModel` answers the controller-read block, and `osContGetReadData`
+  (`func_8002F788`) unpacks at stride 6 into `OSContPad[]`; `D_80095186` is a
+  *game* array the game fills from those pads, so the question is whether the
+  game's own fill loop runs for more than port 0.
+- No claim is made here that a match was reached. It was not.
+
+## CONFIRMED: fn64's controller path is NOT the defect
+
+> **Note added after measurement.** The conclusion in this section stands, but
+> the argument below it was not sufficient at the time it was written: it
+> leaned on a second-controller test that never pressed pad 1 (see "Why the
+> earlier second-controller test could not have settled this"), and it left
+> the deciding question -- which of the two loop exits is taken -- explicitly
+> unmeasured. Both are now measured, and the conclusion is re-established on
+> a counterfactual that moves the game. Read this section together with
+> "MEASURED: the loop VISITS its entries" and "THE PLATEAU IS BROKEN".
+
+The array `func_801456C8` reads, `D_80095186`, is filled by the game's own
+per-frame pad poll `func_80004628` (`0x80004628`), which:
+
+- loops all four ports unconditionally (`sltiu $s1, 4` at `0x800049BC`),
+- strides **12** bytes per port into `D_80095180` (`addiu $a1, $a1, 0xC` at
+  `0x800049C4`) and 6 bytes per port through the `OSContPad[]` at
+  `D_80057210`,
+- lays out `+0x4` = held, **`+0x6` = pressed-this-frame**, `+0x8` = released,
+- and **skips a port whose `OSContPad.errno` is nonzero** -- `lbu $v0,
+  %lo(D_80057214)($v0)` at `0x80004928`, which zeroes that port's entry.
+
+Watching `D_80095186` (port 0's pressed word) directly against the merged
+global `D_8011C37E`:
+
+| swap | `D_8011C37E` | `D_80095186` | script |
+|---|---|---|---|
+| 1102 | `0x1000` | **`0x1000`** | START press |
+| 1103 | 0 | 0 | released |
+| 1202 | `0x8000` | **`0x8000`** | A press |
+| 1203 | 0 | 0 | released |
+| 1302 | `0x8000` | **`0x8000`** | A press |
+
+Port 0's pressed word is populated correctly, at the right stride, with the
+right edge semantics, in the exact array the ready check reads. fn64's
+`osContGetReadData_recomp` (`crates/fn64-abi/src/si/mod.rs:1113+`) models
+`errno` deliberately: port 0 reports `errno == 0` with live input, ports 1-3
+report `CONT_NO_RESPONSE_ERROR`, which is the correct emulation of a console
+with one controller plugged in and is what makes the game's own poll zero
+ports 1-3.
+
+**So the plateau is not an input-delivery defect.** A is reaching the guest,
+in the right place, in the right format, every time it is pressed.
+
+## CONFIRMED: A is delivered during the plateau and the guest refuses it
+
+The same watch, inside the plateau (state 18, entered at swap 2102):
+
+| swap | `D_8011C37E` | `D_80095186` | `D_8003DD04` |
+|---|---|---|---|
+| 2102 | `0x8000` | `0x8000` | 17 -> **18** |
+| **2202** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2302** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2402** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2462** | **`0x8000`** | **`0x8000`** | **still 18** |
+| **2522** | **`0x8000`** | **`0x8000`** | **still 18** |
+
+Five presses inside the plateau. Port 0's pressed word carries A on every one
+of them, exactly as it did at 1202, 1302, 1402, ... 2002, each of which
+advanced the screen. The screen does not move. **The press is delivered and
+refused.** Zero traps and zero panics across the whole run.
+
+Two runs (`run3`, `run4`) produced this identical state ladder swap for swap,
+so the sequence is deterministic and not a sampling artefact.
+
+## CONFIRMED: why it is refused -- the menu graph is data-driven
+
+`func_801261D4` (`0x801261D4`) is the state machine's epilogue, and it is
+where every one of the eight advancing transitions actually happened:
+
+```
+801261D4  bgez $s1, .L80126608    # handler returned >= 0 -> no transition
+801261DC  lhu  $v1, D_8011C37E    # else read the pressed word
+801261E4  andi $v0, $v1, 0x9000   # A (0x8000) | START (0x1000)
+801261E8  beqz -> .L80126384      # neither pressed -> done
+801261F0  lw   $v0, 0x64($s2)
+801261F4  lh   $a1, 0x12($v0)     # the menu descriptor's NEXT-SCREEN field
+801261F8  bltz $a1, .L80126384    # <-- NEGATIVE => the press is DISCARDED
+...
+.L80126218:                       # the A path
+80126258  sh   $v1, D_8016EC24    # push: menu depth += 1
+80126270  sh   $v0, D_8016EB78[]  # push: remember the screen we came from
+80126280  lw   $v0, 0x64($s2)
+80126284  lh   $s1, 0x12($v0)     # the next screen id comes from THE SAME field
+```
+
+So WM2000's menu graph is not coded per screen -- it is **read out of a
+descriptor at `$s2->0x64`, field `+0x12`**, and the same field both gates the
+press (`bltz` at `0x801261F8`) and supplies the destination
+(`0x80126284`). `func_80126288` then decodes it: `< 0x23` is a literal screen
+id, otherwise the `0x7F00` bits pick an action.
+
+Note that state 15's arm (`0x80126010`) compares this very field against
+`0x41C` before advancing, and state 18's own arm reaches
+`func_801456C8` -- the four-player ready check -- every frame, which returns
+`-1` when nobody is ready and hands control to exactly this epilogue.
+
+## What this makes the plateau (SUPERSEDED by the measurements below)
+
+**HYPOTHESIS** (consistent with everything measured, not yet proven): state 18
+is the "waiting for players to be ready" screen, its descriptor's `+0x12`
+field is negative or names an action rather than a screen, and the transition
+out of it is meant to be driven by `func_801456C8` finding a *ready* player
+rather than by the epilogue's generic A handling. On a real console with the
+same single controller, the same code would have to reach the same decision --
+so the interesting question is which input `func_801456C8` accepts as "ready"
+that a bare A press is not.
+
+**What is ruled out, with measurements:** it is not input delivery (A reaches
+`D_80095186` in the plateau), not the `D_80161FF8` countdown (the census shows
+the guest clears it every frame), not a second controller (431 byte-identical
+frames, prior card), not the analog stick (identical gfx rate and frames), and
+not a recompiler trap (0 traps, 0 panics across every run here).
+
+**No fn64 defect has been demonstrated.** Every fn64 mechanism this path
+depends on -- the PIF controller-read block, `osContGetReadData`'s `errno`
+discipline and swizzle, the per-port stride-12 array the game builds from it,
+the state machine's own dispatch -- was measured working. That is a real
+result: it moves the remaining question from "what is fn64 failing to model"
+to "what does this screen actually want", and the next probe is a watch on
+`$s2->0x64 + 0x12` itself.
+
+## No match was reached (as of the ONE-PAD lane; see the two-pad result below)
+
+The furthest state reached remains the two-wrestler versus screen. The game
+walks eight menu states on scripted A presses and stops at state 18.
+
+## CONFIRMED: on the rs lane the pad seam is the PIF buffer, not fn64's shim
+
+The prior card attributed port 1-3's absence to
+`osContGetReadData_recomp` (`crates/fn64-abi/src/si/mod.rs:1113+`). On the
+**rs lane that shim does not run.** `recompile_rom`'s emitted table binds the
+address to the game's own code:
+
+```
+scratch/emit1/src/lib.rs:822:    (0x8002F788, func_8002F788 as RecompFunc),
+```
+
+`func_8002F788` is stock libultra `osContGetReadData`
+(`aki-recomp/games/NWXE/disasm/asm/1050.s`, `0x8002F788`), and reading it
+settles two things the shim's doc comment can only assert:
+
+- It loops **`D_800974B0` (`__osMaxControllers`) times**, and
+  `__osContInit` sets that to a literal **4** (`addiu $v0, $zero, 0x4` at
+  `0x8002F9C4`) with no dependence on how many ports answered. All four ports
+  are always visited.
+- Per port it reads the PIF output buffer `D_80090250` at **stride 8** and
+  computes `errno = (byte@+2 & 0xC0) >> 4` (`0x8002F7CC..0x8002F7D8`), then
+  fills `button`/`stick` **only when that errno is zero**
+  (`bnez $v0, .L8002F7F8`). `CHNL_ERR_NORESP = 0x80` shifted right by 4 is
+  `0x08` -- the same `CONT_NO_RESPONSE_ERROR` fn64 names.
+
+So the seam that decides ports 1-3 on this lane is **fn64's `PifModel`
+writing the SI/PIF output buffer**, and the game's own libultra derives
+`errno` from those bytes exactly as hardware does. Any claim about port 1-3
+`errno` on the rs lane has to be measured at `D_80057210`/`D_80057214`
+(where the game lands it) or at `D_80090250` (the wire), not at the shim.
+
+## CONFIRMED: the port field the ready check reads is TABLE data, not input
+
+`func_801456C8`'s `lhu $v0, 0x16($a0)` reads a halfword written by
+`func_801445BC` (`0x801445BC`), the match-setup fill:
+
+```
+80144680  addiu $s0, $s2, 0x4A      # $s2 = D_8017016C, the entry array
+80144684  lhu   $v0, 0x0($s3)       # $s3 = D_80167CE0[D_8009EAA0 >> 6]
+80144688  sh    $v0, 0x16($s0)      # <-- the ready check's port field
+...
+80144708  addiu $s2, $s2, 0x88      # stride 0x88, $s4 = table-supplied count
+```
+
+and `func_801455BC` computes the same array as `D_801702A4_val + 0x4C8`
+(`0x801455C8`), whose `+0x4A` is `D_801702A4_val + 0x512` -- the ready
+check's own base. **The two agree: one array, one field.**
+
+The consequence for this investigation: the `0x16 & 0xF` field is populated
+from a per-match-type ROM table selected by `D_8009EAA0`, and the number of
+entries filled is that table's own count. It is NOT derived from how many
+controllers fn64 reports. So "every entry skipped" and "entries visited but no
+A" have to be told apart by measurement -- neither is predictable from the
+controller model.
+
+## CONFIRMED: the word-read gotcha the earlier note did not cover
+
+This card's existing gotcha paragraph covers HALFWORDS (`Rdram::store_h`
+writes at `backing_offset(vaddr) ^ 2`). It does not cover WORDS, and a probe
+that generalises the `^2` rule to 32-bit reads gets a plausible-looking wrong
+answer rather than an obvious one.
+
+`Rdram::store_backed_word` (`crates/fn64-cpu-runtime/src/runtime/host.rs:815-817`):
+
+```rust
+let p = Self::backing_offset(vaddr);
+self.mem[p..p + 4].copy_from_slice(&value.to_ne_bytes());
+```
+
+**no `^` swizzle at all, and `to_ne_bytes` -- native, i.e. LITTLE-endian.**
+So a word is read at the plain offset and decoded `from_le_bytes`.
+
+Measured cost of getting this wrong, from this lane's first probe build,
+which read words big-endian at the plain offset:
+
+| variable | wrong (BE) | right (LE) |
+|---|---|---|
+| `D_801702A4` | `0x60f32580` | **`0x8025F360`** |
+| `D_800FEF2C` | `0x04000000` | **`4`** |
+| `D_8011BF50[0]` | `0x01000000` | **`1`** |
+
+`0x60f32580` is not obviously wrong -- it is not zero, it is stable across
+every swap, and it looks like it could be a pointer. Every entry read derived
+from it (`ptr + 0x512 + i*0x88`) landed on unrelated memory and reported
+`ports=[0,0,0,0]`, which is exactly the "every entry skipped" answer this card
+set out to test for. **A probe bug produced the more interesting of the two
+hypotheses.** The rule: for any pointer read out of fn64's RDRAM, check it is
+KSEG0 (`0x80......`) before believing anything computed from it.
+
+Summary of the three access widths:
+
+| width | offset | byte order |
+|---|---|---|
+| word (`store_backed_word`) | `off` | little-endian |
+| halfword (`store_h`) | `off ^ 2` | little-endian |
+| byte (`store_b`) | `off ^ 3` | n/a |
+
+## MEASURED: the loop VISITS its entries -- the second entry is on port 1
+
+Run `run3`, solo on an otherwise idle host, `rc=0`, 511 samples over swaps
+2090-2600 under the proven lead-in (START 1100, A every 100 to 2400, then A
+every 60). Probe: `WM2000_READY_PROBE`, reading words little-endian at the
+plain offset and halfwords little-endian at `off ^ 2`.
+
+`D_801702A4 = 0x8025F360` (KSEG0, so the entry addresses are real).
+
+| swaps | screen | `0x16 & 0xF` per entry | `D_8011BF50[0..4]` | entry `+0x00` |
+|---|---|---|---|---|
+| 2090-2101 | 17 | **`[1, 2, 3, 4]`** | `[0, 0, 0, 0]` | `[0,0,0,0]` |
+| 2102-2201 | **18** | **`[1, 2, 0, 0]`** | `[1, 1, 0, 0]` | `[0,0,1,1]` |
+| 2202-2600 | **18** | **`[1, 2, 0, 0]`** | **`[0, 1, 0, 0]`** | `[2,0,1,1]` |
+
+**This settles the card's open question. The first exit is NOT taken.** Two
+entries have a nonzero port field for the whole plateau, so the loop body runs
+for both. The fields are **1-based port indices**: `func_801456C8` computes
+`(field-1) * 12` into `D_80095186`, so field 1 is port 0's pressed word,
+field 2 is **port 1's**.
+
+### The A press is accepted -- for entry 0, and only entry 0
+
+At swap 2202 (A pressed, `pressed=[8000,0,0,0]`) the loop's own writes appear
+in the very next sample:
+
+- `D_8011BF50[0]`: `1 -> 0`, which is `sw $zero, 0x0($a1)` at `0x80145754`;
+- entry 0's `+0x00`: `0 -> 2`, which is `ori $v0, $v0, 0x2` at `0x80145768`.
+
+So entry 0 joined (B/`0x4000` path) and then confirmed (A/`0x8000` path)
+exactly as the disassembly says. `$a2` reaches 1 and the `beqz $a2` at
+`0x801457B8` is not taken.
+
+**`D_8011BF50[1]` never changes from 1, for all 233 plateau samples.** Entry 1
+reads `D_80095186 + 12` -- port 1's pressed word -- and that word is zero in
+every one of the 511 samples, because:
+
+```
+pad_errno = [0, 8, 8, 8]   (invariant across all 511 samples)
+pressed   = [8000, 0, 0, 0] on press swaps, [0,0,0,0] otherwise
+```
+
+### What fn64 reports for the empty ports, and whether that is right
+
+`8` is `CONT_NO_RESPONSE_ERROR`. On real hardware an empty port returns no PIF
+response, the SI channel's `CHNL_ERR_NORESP` (`0x80`) is set, and libultra's
+`osContGetReadData` computes `errno = (status & 0xC0) >> 4 = 0x08`. The game's
+own `func_8002F788` performs exactly that arithmetic at `0x8002F7CC`. **fn64
+models an empty port correctly**, and `D_800FEF2C = 4` (measured) is
+`__osMaxControllers`, not a count of connected pads -- the game's
+`func_800049E8(0xF)` likewise hardcodes its port mask to all four.
+
+So the plateau is: **the game is set up as a two-player match (entries on
+ports 0 and 1), the console it is running on has one controller, and player 2
+can never press anything.** That is the correct behaviour of the modeled
+hardware, not a defect in it.
+
+## Why the earlier second-controller test could not have settled this
+
+`RT64-WM2000-INPUT-GRAMMAR.md:889-905` closes the second-controller
+hypothesis on 431 byte-identical frames. That test did plug port 1 in --
+`WM2000_PORTS=2` called `fn64_abi::set_controller_port_state`, and the
+divergence it reports (`sim_time` 895,926,191 vs 895,940,131 at step 50,000)
+proves the port really was live.
+
+But the harness's scripted-input block only ever called
+`fn64_abi::set_controller_state(**0**, ...)`. **Port 1 was plugged in and
+never pressed anything.** Against `func_801456C8` that is not a two-player
+console, it is a console with a second controller nobody is holding: entry 1
+still reads `D_80095186 + 12`, which is still zero, so `D_8011BF50[1]` still
+never clears and the loop still returns `-1`.
+
+So "431 frames byte-identical" is a true statement about the SCREEN that
+carries no information about the ready check. It is exactly the conflation
+this card warns about -- the screen not changing was read as the second
+controller not mattering, when the experiment never exercised the thing the
+second controller is for. The measurement that distinguishes them is
+`D_8011BF50[1]`, and it needs pad 1 to be DRIVEN, not merely attached.
+
+## Is fn64's empty-port model right? Yes, on both sides of the seam
+
+The card asks what real hardware reports for an empty controller port and
+whether fn64 matches. Both halves are checkable in-tree.
+
+**Hardware.** An empty port produces no Joybus response. The SI/PIF marks that
+channel's status byte with `CHNL_ERR_NORESP = 0x80`, and libultra's
+`osContGetReadData` turns the channel status into
+`errno = (status & 0xC0) >> 4`, so a no-response port yields `errno = 0x08`
+(`CONT_NO_RESPONSE_ERROR`). A status query for such a port answers a zeroed
+type with `CONT_ABSENT = 0x80` set.
+
+**The game agrees, in its own code.** `func_8002F788` -- WM2000's own linked
+libultra, which is what actually runs on the rs lane -- does exactly that
+arithmetic:
+
+```
+8002F7CC  lbu  $v0, 0x2($sp)     # PIF status byte for this channel
+8002F7D0  andi $v0, $v0, 0xC0
+8002F7D4  srl  $v0, $v0, 4       # -> 0x08 for a no-response port
+8002F7D8  bnez $v0, .L8002F7F8   # nonzero errno: leave button/stick alone
+```
+
+**fn64 agrees.** `PifModel::query_response` returns `[0, 0, CONT_ABSENT]` for
+`PortState::Absent` (`crates/fn64-runtime/src/si.rs:216`), `CONT_ABSENT` is
+`0x80` (`si.rs:47`), and the default port table is port 0 populated with
+ports 1-3 `Absent` (`si.rs:121-123`, pinned by the `ports_1_to_3_report_absent`
+test at `si.rs:250`). `CONT_NO_RESPONSE_ERROR = 0x08` is named at
+`crates/fn64-abi/src/si/mod.rs:1075`.
+
+**And the measurement agrees with both:** `pad_errno = [0, 8, 8, 8]`,
+invariant across all 511 samples of run3.
+
+So the three descriptions -- hardware, the game's own libultra, and fn64's
+model -- coincide exactly. **fn64 is not reporting the wrong thing for ports
+1-3. It is correctly reporting a console with one controller plugged in.**
+
+## THE PLATEAU IS BROKEN: state 18 -> 34 at swap 2312
+
+Counterfactual run `run4`, solo, identical schedule, one change: **port 1 has
+a controller plugged in AND the scripted presses are mirrored onto it**
+(`WM2000_PORTS=2`). Nothing is fabricated -- pad 1 is a modeled standard
+controller receiving the same button schedule a second human would press.
+
+| | one pad (`run3`) | two pads (`run4`) |
+|---|---|---|
+| `pad_errno` | `[0, 8, 8, 8]` | **`[0, 0, 8, 8]`** |
+| `pressed` at 2102 | `[8000, 0, 0, 0]` | **`[8000, 8000, 0, 0]`** |
+| entry port fields | `[1, 2, 0, 0]` | `[1, 2, 0, 0]` (same) |
+| `D_8011BF50` after A at 2202 | `[0, **1**, 0, 0]` | **`[0, 0, 0, 0]`** |
+| entry `+0x00` after A at 2202 | `[2, **0**, 1, 1]` | **`[2, 2, 1, 1]`** |
+| screen | **18 forever** (to 2600, and 5021 in earlier lanes) | **18 -> 34 at swap 2312** |
+
+With player 2 able to press, entry 1 takes the same two steps entry 0 always
+took -- join, then confirm -- `D_8011BF50[1]` finally clears, `$a2` reaches 2,
+`func_801456C8` stops returning `-1`, and the state machine advances on the
+next A press with the usual ~10-swap latency (press at 2302, transition at
+2312).
+
+**State 34 is `0x22`**, the top of the value range `func_801255E4`
+bounds-checks at `0x80125AB4` -- i.e. the game left the versus screen through
+the front door, not into an invalid state.
+
+## VERDICT: this is not an fn64 defect
+
+Every fn64 mechanism on this path was measured behaving correctly, and the
+plateau is explained without invoking a defect in any of them:
+
+- **Port 0's input is delivered, formatted and edge-detected correctly**, into
+  the exact array the ready check reads (`pressed[0] = 0x8000` on press swaps,
+  clearing the next swap).
+- **The ready check consumes it** -- `D_8011BF50[0]: 1 -> 0` and entry 0's
+  `+0x00: 0 -> 2` are the loop's own stores at `0x80145754`/`0x80145768`.
+- **Ports 1-3 report `errno = 8`**, which is what hardware reports for an
+  empty port, what the game's own libultra computes from the PIF status bits,
+  and what fn64's `PifModel` is documented and unit-tested to produce.
+- **Plugging port 1 in advances the game**, so nothing upstream was broken or
+  missing -- the single missing ingredient was a second player.
+
+The plateau is the game correctly refusing to start a **two-player match**
+(entries on ports 0 and 1, `D_8009EAA0 = 0x12`) on a console with **one
+controller**. fn64 modelled that console faithfully; the harness simply never
+plugged in the second pad and pressed it.
+
+**What a "fix" is and is not.** There is no fn64 code change to make here --
+proposing one would mean making fn64 report a controller in a port that has
+none, which is precisely the fabrication this card forbids. The change that
+belongs in the repo is the one made: a harness knob
+(`WM2000_PORTS`) that ATTACHES real modeled controllers and drives them, so
+two-player content is reachable. That is console configuration, not
+fabricated input.
+
+**The correction this card owed.** The previous entry's conclusion ("fn64's
+controller path is NOT the defect") is upheld, but its supporting argument was
+not sound: it rested on a second-controller test that never pressed pad 1, and
+it left the deciding question -- which loop exit -- explicitly unmeasured. The
+loop exit is now measured (entries VISITED, fields `[1, 2, 0, 0]`), and the
+conclusion now rests on a counterfactual that moves the game.
+
+## NEW, and only reachable past the plateau: a missing entry point at 0x801226A0
+
+With the plateau broken, `run4` ran **171 further swaps of previously
+unreached game code** (state 34, swaps 2312-2483) and then stopped on a real
+fn64 gap:
+
+```
+panicked at crates/fn64-cpu-runtime/src/runtime/host.rs:549:
+lookup: no recompiled function or host shim at vram 0x801226A0
+```
+
+(The `rc=134` that followed is a *teardown* abort -- `run_dtors` -> `Executor`
+drop -> `force_unwind_slow` on a live coroutine, visible in the backtrace at
+frames 21-25. It is a consequence of aborting mid-coroutine, not a second
+defect, but it does mean a guest trap on this lane surfaces as SIGABRT rather
+than a clean exit.)
+
+**What 0x801226A0 is.** It is not a function start. In
+`aki-recomp/games/NWXE/disasm/asm/73390.s:6610` it is an **`alabel`** -- a
+mid-function branch target -- inside a loop body:
+
+```
+8012269C  lw    $v0, 0x2FC($s2)
+alabel func_801226A0
+801226A0  andi  $v0, $v0, 0x80        # <-- the jal target
+801226A4  bnez  $v0, .L801226B4
+```
+
+and the SAME address is a different instruction in a different overlay bank
+(`asm/809D0.s:6716`, `func_801226A0_bank3_text`, `beqz $v0, .L801226B8`).
+Meanwhile `asm/D2720.s:103` calls it as a function outright:
+
+```
+800E1CD0  jal   func_801226A0
+```
+
+So this is the **bank-overlaid interior-entry** class: `recompile_rom` emits
+whole functions, and a `jal` into another bank's function *interior* has no
+emitted entry point to bind. The address is genuinely ambiguous across banks,
+so the fix is not a one-line symbol addition -- it needs the bank the caller
+is running under to select which of the two `0x801226A0` bodies to enter.
+
+This is left as a measured, reproducible next card rather than fixed here: it
+is a recompiler-coverage question, not a controller question, and this card's
+scope is the controller/SI path. **Reproduce it with:**
+
+```
+WM2000_PORTS=2 WM2000_INPUT_SCRIPT=<the lead-in> WM2000_READY_PROBE=2090-3000
+```
+
+which reaches it deterministically at swap ~2483.
+
+## Reproducing this card
+
+Everything above comes from three solo runs on an otherwise idle host, each
+with its own scratch root and its own log; `rc` is recorded for every one,
+because a SIGKILL at a repeatable swap is indistinguishable from a plateau
+without it.
+
+| run | configuration | rc | outcome |
+|---|---|---|---|
+| `run1` | one pad | **137** | killed by the host at swap ~1910 -- discarded, see the INPUT-GRAMMAR note |
+| `run3` | one pad | **0** | 511 samples, swaps 2090-2600, screen 17 -> 18 and never past |
+| `run4` | two pads (`WM2000_PORTS=2`) | 134 | screen 17 -> 18 -> **34** at swap 2312, then the `0x801226A0` gap at swap 2483 |
+
+Build (fn64's own recompiler, `fn64-render-*` of your choice, **no**
+`--features rt64`):
+
+```
+cargo build --release --bin recompile_rom --offline
+recompile_rom --config $AKI/games/NWXE/wm2000.toml \
+              --rom    $AKI/games/NWXE/wm2000.z64 --out $SCRATCH/emit1
+# apply docs/tools/wm2000-ready-probe.patch to a COPY of
+# ~/Code/recomps/wm2000's packages/wm2000-boot/src/main.rs, then
+cargo build --manifest-path packages/wm2000-boot/rs/Cargo.toml --release
+```
+
+Run (the lead-in that reaches the plateau: START at 1100, A every 100 swaps to
+2400, then A every 60):
+
+```
+WM2000_PORTS=2 \
+WM2000_INPUT_SCRIPT="1100..1110:1000;1200..1210:8000;...;2400..2410:8000;2460..2470:8000;..." \
+WM2000_READY_PROBE=2090-3000 WM2000_STOP_AT_SWAP=3000 \
+WM2000_NO_TRACE=1 FN64_ABSENT_N64DD=1 FN64_NO_AUDIO=1 \
+  ./packages/wm2000-boot/rs/target/release/wm2000-boot
+```
+
+Drop `WM2000_PORTS=2` to reproduce the plateau instead of breaking it.
+
+Verification for the one code change (the `fn64-runtime` port-presence test):
+`cargo nextest run --workspace --offline` -> **8627 passed, 13 skipped**
+(baseline 8626/13; the +1 is this test).

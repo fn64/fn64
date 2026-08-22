@@ -142,6 +142,14 @@ pub struct TileAddressMode {
 }
 
 impl TileAddressMode {
+    /// Builds the mode from already-decoded mirror/clamp flags, for callers
+    /// holding `fn64_render`'s neutral `NeutralTileAddressMode` mirror
+    /// rather than the raw two-bit wire field. Same two flags,
+    /// already separated by the decoder -- not a second decode.
+    pub const fn from_mirror_clamp(mirror: bool, clamp: bool) -> Self {
+        Self { mirror, clamp }
+    }
+
     pub(crate) const fn from_wire(value: u8) -> Self {
         Self {
             mirror: value & 1 != 0,
@@ -174,6 +182,34 @@ pub struct TileDescriptor {
 }
 
 impl TileDescriptor {
+    /// Builds a descriptor from already-decoded parts, for callers holding
+    /// `fn64_render`'s neutral `NeutralTileDescriptor` mirror rather than
+    /// the raw wire words.
+    ///
+    /// Identical field set and identical argument order to
+    /// [`Self::from_wire`] -- deliberately the same shape, so the two
+    /// cannot drift into describing different tiles. `from_wire` stays
+    /// crate-private (it is the decoder's own seam); this one is public
+    /// because the neutral mirrors cross a crate boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_neutral_parts(
+        format: ImageFormat,
+        size: PixelSize,
+        line_words: u16,
+        tmem: TmemWordAddress,
+        palette: u8,
+        t: TileAddressMode,
+        mask_t: u8,
+        shift_t: u8,
+        s: TileAddressMode,
+        mask_s: u8,
+        shift_s: u8,
+    ) -> Self {
+        Self::from_wire(
+            format, size, line_words, tmem, palette, t, mask_t, shift_t, s, mask_s, shift_s,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn from_wire(
         format: ImageFormat,
@@ -257,6 +293,17 @@ pub struct TileSize {
 }
 
 impl TileSize {
+    /// Neutral-mirror counterpart to [`Self::from_wire`]; see
+    /// [`TileDescriptor::from_neutral_parts`] for why this pair exists.
+    pub const fn from_coordinates(
+        low_s: TileCoordinate,
+        low_t: TileCoordinate,
+        high_s: TileCoordinate,
+        high_t: TileCoordinate,
+    ) -> Self {
+        Self::from_wire(low_s, low_t, high_s, high_t)
+    }
+
     pub(crate) const fn from_wire(
         low_s: TileCoordinate,
         low_t: TileCoordinate,
@@ -484,7 +531,7 @@ pub(crate) fn project_tmem_transfer_word(
     let word = u64::from(word);
     let line = u64::from(descriptor.line_words());
     let (destination_word, row_advance, odd_row_exchange) = match kind {
-        TmemLoadKind::Block { source_t, dxt, .. } => {
+        TmemLoadKind::Block { dxt, .. } => {
             let advance = word
                 .checked_mul(u64::from(dxt.get()))
                 .ok_or("TMEM LoadBlock DXT product overflows")?
@@ -497,13 +544,29 @@ pub(crate) fn project_tmem_transfer_word(
                 TmemTransferLayout::Linear64 => 0x01ff,
                 TmemTransferLayout::SplitBanks64 => 0x00ff,
             };
-            (
-                (destination & mask) as u16,
-                advance,
-                (u64::from(source_t.raw()) + advance) & 1 != 0,
-            )
+            // **The exchange bit is the TILE-RELATIVE row, with no T-origin
+            // term.** See `odd_row_exchange`'s doc in `tmem/read.rs` for the
+            // full derivation; the short form is that
+            // `rdp_load_block` seeds the edgewalker's span T with `tl << 3`
+            // (`src/core/n64video/rdp/tex.c:929`) and `tc_pipeline_load`
+            // immediately subtracts that same `tl << 3` back off via
+            // `TRELATIVE` (`tcoord.c:998-999`), so `dswap = sst & 1`
+            // (`tex.c:583`) is taken on a row that starts at zero for every
+            // load whatever `tl` is.
+            //
+            // This previously read `(source_t.raw() + advance) & 1`. The
+            // `source_t` term is not on hardware, and it did not cancel
+            // against anything: the READER derives its own parity from the
+            // tile's `low_t` (a different field, and `.integer()` = `raw >> 2`
+            // rather than `.raw()`, so a different unit). Enumerated over
+            // `low_t` x `source_t` x `row`, writer and reader disagreed in 256
+            // of 512 cases, and on a disagreeing row every texel was fetched
+            // from the wrong 4-byte half of its 64-bit word -- wrong colour at
+            // correct coordinates, which is the "noise, not imagery" signature
+            // in `docs/RT64-WM2000-TEXTURE-STATE.md`.
+            ((destination & mask) as u16, advance, advance & 1 != 0)
         }
-        TmemLoadKind::Tile { bounds } => {
+        TmemLoadKind::Tile { .. } => {
             if words_per_row == 0 {
                 return Err("TMEM LoadTile row word count is zero");
             }
@@ -520,11 +583,18 @@ pub(crate) fn project_tmem_transfer_word(
                 TmemTransferLayout::Linear64 => 0x01ff,
                 TmemTransferLayout::SplitBanks64 => 0x00ff,
             };
-            (
-                (destination & mask) as u16,
-                row,
-                (u64::from(bounds.low_t().integer()) + row) & 1 != 0,
-            )
+            // Same rule as the Block arm above, and the same citation:
+            // `tile_tlut_common_cs_decoder` (`tex.c:939-970`) seeds the span
+            // from `tl` and `tc_pipeline_load`'s `TRELATIVE` takes it back
+            // off, so the exchange bit is the tile-relative row alone.
+            //
+            // This arm's previous `(low_t.integer() + row) & 1` was harmless
+            // in isolation -- the reader carried the identical term, so the
+            // two cancelled and LoadTile texels came back correct -- but it
+            // placed every odd-origin tile's bytes at non-hardware addresses,
+            // and it is the term whose LoadBlock counterpart did NOT cancel.
+            // Removing it from both sides makes the layout hardware's own.
+            ((destination & mask) as u16, row, row & 1 != 0)
         }
         TmemLoadKind::Tlut { .. } => {
             // SGI RDP Command Summary Table 10 / libultra `gbi.h`
@@ -741,15 +811,22 @@ impl TmemTransferPlan {
             return Ok(0x03);
         }
         let defined = match self.kind {
-            TmemLoadKind::Block { .. } => self
-                .logical_source_bytes
-                .saturating_sub(u32::from(word) * 8)
-                .min(8),
-            TmemLoadKind::Tile { .. } => {
-                let row_bytes = self.logical_source_bytes / u32::from(self.row_count);
-                let within = u32::from(word) % u32::from(self.words_per_row);
-                row_bytes.saturating_sub(within * 8).min(8)
-            }
+            // **Every Block/Tile word supplies all eight source bytes.**
+            //
+            // The DMA copies whole 64-bit words, so a row whose logical texels
+            // stop mid-word still reads that word's remaining bytes from the
+            // adjacent RDRAM -- the source plan declares the padded span, and
+            // the executors receive eight real bytes. Verified in the pinned
+            // RT64 oracle's live loader: `loadWord` is commented "Copy the
+            // entire word" and loops `i < 8` (`rt64_rdp.cpp:369-397`), driven
+            // `wordsPerRow` times per row (`:459-468`).
+            //
+            // **This was a partial count**, `logical_source_bytes` minus the
+            // word's offset, which made a short tail's lanes `None`. Those
+            // lanes then CLEARED destination validity (`physical.rs:656`, the
+            // only such site), so a later overlapping load punched holes in an
+            // already-loaded TLUT and a texrect sampling one aborted the run.
+            TmemLoadKind::Block { .. } | TmemLoadKind::Tile { .. } => 8,
             TmemLoadKind::Tlut { .. } => 0,
         };
         Ok(if defined == 8 {
@@ -863,6 +940,22 @@ impl TmemTransferWord {
             odd_row_exchange,
             physical,
         }
+    }
+
+    /// Test-only escape hatch that rewrites both defined-byte masks after
+    /// construction, bypassing [`TmemTransferWord::new`]'s `debug_assert!`
+    /// invariant checks. Exists solely so `tmem::physical`'s hostile tests can
+    /// build an invariant-violating word under a debug build and assert that
+    /// the release-surviving `physical_defined_lane_mask` check rejects it.
+    /// Never compiled into a non-test build.
+    #[cfg(test)]
+    pub(crate) fn forge_masks_for_test(
+        &mut self,
+        defined_source_byte_mask: u8,
+        defined_destination_byte_mask: u8,
+    ) {
+        self.defined_source_byte_mask = defined_source_byte_mask;
+        self.defined_destination_byte_mask = defined_destination_byte_mask;
     }
 
     pub const fn index(self) -> u16 {

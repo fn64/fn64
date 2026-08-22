@@ -2,10 +2,17 @@
 //!
 //! Characterization-first port. Source: MIT RT64, pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`'s
-//! Rust-port source pin), `src/shared/rt64_color_combiner.h` (fn64's own
+//! Rust-port source pin), `src/shared/rt64_color_combiner.h` (SHA-256 of the
+//! whole file,
+//! `bc116cd9d8a86ca74ebb8f3294fa48bc9e605c0eec53bcac5e07503dfd668b02`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! path, confirmed independently here by `shasum -a 256` against the pinned
+//! port-commit checkout; fn64's own
 //! `docs/RT64-PORT-INVENTORY.md:291` records this file `unchanged` /
-//! `source-digests-verified` against the executable-comparison oracle, so
-//! unlike `rt64_state.cpp` there is no drift caveat here).
+//! `source-digests-verified` against the executable-comparison oracle -- the
+//! `unchanged` delta is exactly the statement that this digest is also the
+//! file's `sources.oracle.sha256`, so unlike `rt64_state.cpp` there is no
+//! drift caveat here).
 //!
 //! Decode is exact and complete for every wire-legal `(slot, index,
 //! second_cycle)` triple: [`CombineParams::decode_color`]/[`decode_alpha`]
@@ -3630,5 +3637,758 @@ mod tests {
             | alpha_d;
         let params = CombineParams::from_wire(low, high);
         assert!(params.references_texels_in_first_cycle());
+    }
+}
+
+/// **Diagnostic-only.** Tallies which color/alpha selectors the combiner
+/// programs of actually-drawn triangles select, per slot.
+///
+/// Exists to answer one question with counts instead of impressions: when
+/// WM2000's models render flat despite every admitted triangle being
+/// textured and reaching `sample_point` (see
+/// `docs/RT64-WM2000-INMATCH-GAPS.md`), is the sampled texel being
+/// *discarded* by a program that never names `Texel0`, or is it being
+/// *selected* and merely wrong? A tally with `Texel0` near zero indicts the
+/// combiner; a tally where `Texel0` dominates the C or A slot indicts the
+/// sample.
+///
+/// Nothing in the render path reads these. Dumped to stderr every 100,000
+/// notes when `FN64_COMBINER_CENSUS` is set, matching
+/// `raw_dpc::raw_triangle_drop_stats`' self-reporting shape -- the harness
+/// is a separate crate and does not call in, so the dump has to come from
+/// here.
+///
+/// **The slice tallied is the one that will actually be evaluated**, chosen
+/// by the caller from the cycle type: one-cycle mode evaluates the *cycle-1*
+/// bitfield slice, so tallying the cycle-0 slice for a
+/// one-cycle program would report selectors the hardware never reads.
+pub mod census {
+    use super::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `ColorInput` in declaration order, used as the index space for
+    /// [`COLOR_COUNTS`]. A local table rather than a derive so the counter
+    /// index is stable and explicit.
+    pub const COLOR_NAMES: [&str; 21] = [
+        "Combined",
+        "Texel0",
+        "Texel1",
+        "Primitive",
+        "Shade",
+        "Environment",
+        "KeyCenter",
+        "KeyScale",
+        "CombinedAlpha",
+        "Texel0Alpha",
+        "Texel1Alpha",
+        "PrimitiveAlpha",
+        "ShadeAlpha",
+        "EnvAlpha",
+        "LodFraction",
+        "PrimLodFrac",
+        "Noise",
+        "K4",
+        "K5",
+        "One",
+        "Zero",
+    ];
+
+    pub const ALPHA_NAMES: [&str; 10] = [
+        "Combined",
+        "Texel0",
+        "Texel1",
+        "Primitive",
+        "Shade",
+        "Environment",
+        "LodFraction",
+        "PrimLodFrac",
+        "One",
+        "Zero",
+    ];
+
+    const fn color_index(input: ColorInput) -> usize {
+        match input {
+            ColorInput::Combined => 0,
+            ColorInput::Texel0 => 1,
+            ColorInput::Texel1 => 2,
+            ColorInput::Primitive => 3,
+            ColorInput::Shade => 4,
+            ColorInput::Environment => 5,
+            ColorInput::KeyCenter => 6,
+            ColorInput::KeyScale => 7,
+            ColorInput::CombinedAlpha => 8,
+            ColorInput::Texel0Alpha => 9,
+            ColorInput::Texel1Alpha => 10,
+            ColorInput::PrimitiveAlpha => 11,
+            ColorInput::ShadeAlpha => 12,
+            ColorInput::EnvAlpha => 13,
+            ColorInput::LodFraction => 14,
+            ColorInput::PrimLodFrac => 15,
+            ColorInput::Noise => 16,
+            ColorInput::K4 => 17,
+            ColorInput::K5 => 18,
+            ColorInput::One => 19,
+            ColorInput::Zero => 20,
+        }
+    }
+
+    const fn alpha_index(input: AlphaInput) -> usize {
+        match input {
+            AlphaInput::Combined => 0,
+            AlphaInput::Texel0 => 1,
+            AlphaInput::Texel1 => 2,
+            AlphaInput::Primitive => 3,
+            AlphaInput::Shade => 4,
+            AlphaInput::Environment => 5,
+            AlphaInput::LodFraction => 6,
+            AlphaInput::PrimLodFrac => 7,
+            AlphaInput::One => 8,
+            AlphaInput::Zero => 9,
+        }
+    }
+
+    const fn color_slot_index(slot: ColorInputSlot) -> usize {
+        match slot {
+            ColorInputSlot::A => 0,
+            ColorInputSlot::B => 1,
+            ColorInputSlot::C => 2,
+            ColorInputSlot::D => 3,
+        }
+    }
+
+    const fn alpha_slot_index(slot: AlphaInputSlot) -> usize {
+        match slot {
+            AlphaInputSlot::A => 0,
+            AlphaInputSlot::B => 1,
+            AlphaInputSlot::C => 2,
+            AlphaInputSlot::D => 3,
+        }
+    }
+
+    /// A flat counter bank indexed `slot * stride + selector`.
+    ///
+    /// Flat rather than `[[AtomicU64; N]; 4]` because `AtomicU64` is not
+    /// `Copy`, so the nested array cannot be built from a repeat expression
+    /// in a `static` initializer, and spelling out 84 constructors would be
+    /// its own transcription hazard.
+    macro_rules! counter_bank {
+        ($name:ident, $len:expr) => {
+            static $name: [AtomicU64; $len] = {
+                #[allow(clippy::declare_interior_mutable_const)]
+                const INIT: AtomicU64 = AtomicU64::new(0);
+                [INIT; $len]
+            };
+        };
+    }
+
+    counter_bank!(COLOR_COUNTS, 84);
+    counter_bank!(ALPHA_COUNTS, 40);
+    static NOTES: AtomicU64 = AtomicU64::new(0);
+    /// Programs whose evaluated slice names `Texel0`/`Texel0Alpha` anywhere
+    /// in color, versus programs that name it nowhere. This is the headline
+    /// number: a drawn textured triangle in the second bucket has its
+    /// sampled texel discarded outright.
+    static COLOR_READS_TEXEL0: AtomicU64 = AtomicU64::new(0);
+    static COLOR_IGNORES_TEXEL0: AtomicU64 = AtomicU64::new(0);
+
+    /// Records one drawn triangle's evaluated combiner slice.
+    ///
+    /// `color` and `alpha` are the four already-decoded selectors in
+    /// A, B, C, D order -- decoded by the CALLER from the slice it will
+    /// actually evaluate, so this module never re-derives which slice is
+    /// live and cannot disagree with the evaluator about it.
+    /// Whether the census is switched on, read ONCE.
+    ///
+    /// `var_os` allocates and the call site is per-draw; a live lane is
+    /// measuring frame rate and a probe must not become the thing it
+    /// measures.
+    pub fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some())
+    }
+
+    /// Which evaluated pass a note came from. Recorded because the whole
+    /// census turns on reading the slice the hardware reads, and a tally
+    /// that cannot say whether a program was one-cycle or two-cycle cannot
+    /// be checked against that rule by a later reader.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Pass {
+        /// One-cycle mode: the single pass, over the CYCLE-1 slice.
+        OneCycleOnly,
+        /// Two-cycle mode, first pass, over the cycle-0 slice.
+        TwoCycleFirst,
+        /// Two-cycle mode, second pass, over the cycle-1 slice.
+        TwoCycleSecond,
+    }
+
+    static PASS_COUNTS: [AtomicU64; 3] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 3]
+    };
+
+    pub fn note_program(
+        color: [ColorInput; 4],
+        alpha: [AlphaInput; 4],
+        textured: bool,
+        pass: Pass,
+    ) {
+        PASS_COUNTS[match pass {
+            Pass::OneCycleOnly => 0,
+            Pass::TwoCycleFirst => 1,
+            Pass::TwoCycleSecond => 2,
+        }]
+        .fetch_add(1, Ordering::Relaxed);
+        for (slot, input) in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ]
+        .into_iter()
+        .zip(color)
+        {
+            COLOR_COUNTS[color_slot_index(slot) * 21 + color_index(input)]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for (slot, input) in [
+            AlphaInputSlot::A,
+            AlphaInputSlot::B,
+            AlphaInputSlot::C,
+            AlphaInputSlot::D,
+        ]
+        .into_iter()
+        .zip(alpha)
+        {
+            ALPHA_COUNTS[alpha_slot_index(slot) * 10 + alpha_index(input)]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // The headline split, and it is restricted twice over.
+        //
+        // First to draws that HAVE a texel: an untextured draw ignoring
+        // Texel0 is correct and uninteresting, and counting it would
+        // dilute the ratio the card turns on.
+        //
+        // Second, and this one was earned by a wrong reading, to the FIRST
+        // evaluated pass. A two-cycle program's second pass routinely reads
+        // no texel: WM2000's dominant program is
+        // `cycle0 = (Texel0 - Zero) * ShadeAlpha + Zero` followed by
+        // `cycle1 = (Environment - Combined) * Primitive + Combined`, a fog
+        // lerp over the textured result. Counting that second pass as a
+        // Texel-ignoring draw made 54% of draws appear to discard their
+        // texture when they had sampled it in the pass immediately before.
+        // The ratio exists to answer "does this program consult the texel
+        // at all", and `Combined` carries the first pass's answer forward,
+        // so the first pass is where that question is decided.
+        if textured && pass != Pass::TwoCycleSecond {
+            if color.iter().any(|input| {
+                matches!(
+                    input,
+                    ColorInput::Texel0
+                        | ColorInput::Texel0Alpha
+                        | ColorInput::Texel1
+                        | ColorInput::Texel1Alpha
+                )
+            }) {
+                &COLOR_READS_TEXEL0
+            } else {
+                &COLOR_IGNORES_TEXEL0
+            }
+            .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let note = NOTES.fetch_add(1, Ordering::Relaxed) + 1;
+        if note % 100_000 == 0 {
+            // The caller only reaches this function when the env flag is
+            // set (it gates the call site behind a `OnceLock`), so the
+            // flag is not re-read here; doing so would allocate on the
+            // per-triangle path a live perf lane is measuring.
+            report(&format!("note={note}"));
+        }
+    }
+
+    /// The raw `SetCombine` wire words of the programs actually evaluated,
+    /// with a count each.
+    ///
+    /// The per-slot tallies above answer "which selectors appear"; they
+    /// cannot answer "which PROGRAM appears", because four independent
+    /// histograms do not reconstruct the joint distribution. Two different
+    /// programs can produce identical per-slot marginals. This map keeps the
+    /// wire words themselves, so the dominant program can be hand-decoded
+    /// from the layout rather than guessed from the margins.
+    static PROGRAMS: std::sync::Mutex<Option<std::collections::BTreeMap<(u32, u32), u64>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn note_wire(low: u32, high: u32) {
+        let Ok(mut guard) = PROGRAMS.lock() else {
+            return;
+        };
+        *guard
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .entry((low, high))
+            .or_insert(0) += 1;
+    }
+
+    /// The distinct evaluated programs, most frequent first.
+    pub fn program_histogram() -> Vec<((u32, u32), u64)> {
+        let Ok(guard) = PROGRAMS.lock() else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = guard
+            .as_ref()
+            .map(|map| map.iter().map(|(k, v)| (*k, *v)).collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
+    /// Coarse histograms of the two multiplicands WM2000's dominant program
+    /// actually multiplies: the sampled texel's luma and the interpolated
+    /// shade alpha, both bucketed into sixteenths.
+    ///
+    /// This is the measurement `docs/RT64-WM2000-INMATCH-GAPS.md` names as
+    /// the one that distinguishes its two surviving candidates -- "a texel
+    /// histogram with one or two distinct values indicts (1); a varied texel
+    /// histogram with a flat output indicts (2)" -- extended with the second
+    /// multiplicand, because the dominant program is
+    /// `texel.rgb * shade.a` and a constant shade alpha flattens a
+    /// perfectly-sampled texture just as effectively as a constant texel.
+    ///
+    /// Sixteen buckets, not 256, deliberately: the question is "is this
+    /// varying at all", which a coarse histogram answers, and a 256-wide
+    /// atomic bank on the per-PIXEL path would be a real cost to a lane
+    /// that is measuring frame rate.
+    static TEXEL_LUMA: [AtomicU64; 16] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 16]
+    };
+    static SHADE_ALPHA: [AtomicU64; 16] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 16]
+    };
+
+    /// Records one drawn pixel's texel and shade alpha.
+    ///
+    /// `texel` is the raw RGBA8888 the sampler returned, before any
+    /// normalization, so a decode fault shows up here as it was read rather
+    /// than after a float round trip. `shade_alpha` is the already-clamped
+    /// `0..=255` channel value.
+    pub fn note_pixel(texel: [u8; 4], shade_alpha: u8) {
+        // Luma rather than one channel: a wrong FORMAT decode usually moves
+        // all three, and a single channel would miss a texture that is
+        // varying in the other two.
+        let luma = (u32::from(texel[0]) + u32::from(texel[1]) + u32::from(texel[2])) / 3;
+        TEXEL_LUMA[(luma >> 4).min(15) as usize].fetch_add(1, Ordering::Relaxed);
+        SHADE_ALPHA[(shade_alpha >> 4) as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many DISTINCT texel values each drawn triangle sampled, bucketed.
+    ///
+    /// The luma histogram above is blind to spatial arrangement: a texture
+    /// sampled through wrong coordinates yields an identically varied
+    /// whole-frame histogram while every individual triangle comes out one
+    /// flat colour. This separates the two. A population concentrated in the
+    /// `1` bucket means each triangle is reading a single texel over and
+    /// over -- flat models with a varied frame -- which is exactly the state
+    /// the whole-frame histogram cannot distinguish from correct texturing.
+    ///
+    /// Buckets are `1`, `2`, `3-4`, `5-8`, `9-16`, `17-64`, `65-256`, `>256`.
+    static DISTINCT_PER_TRIANGLE: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+
+    pub const DISTINCT_BUCKETS: [&str; 8] =
+        ["1", "2", "3-4", "5-8", "9-16", "17-64", "65-256", ">256"];
+
+    /// Records one finished triangle's distinct-texel count.
+    pub fn note_triangle_distinct_texels(distinct: usize) {
+        let bucket = match distinct {
+            0 | 1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=64 => 5,
+            65..=256 => 6,
+            _ => 7,
+        };
+        DISTINCT_PER_TRIANGLE[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn distinct_histogram() -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = DISTINCT_PER_TRIANGLE[index].load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// The S/T coordinate SPREAD within each drawn triangle, in whole
+    /// texels, plus whether it took the perspective path.
+    ///
+    /// This is the follow-on to the distinct-texel count: once a triangle is
+    /// known to read one texel, the question is whether its coordinates were
+    /// constant (a coordinate-derivation fault) or whether they varied and
+    /// the addressing collapsed them (a masking/clamp fault). The two live
+    /// in different files and this tells them apart without a third run.
+    static SPREAD_S: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+    static SPREAD_T: [AtomicU64; 8] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 8]
+    };
+    static PERSPECTIVE: [AtomicU64; 2] = {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        [INIT; 2]
+    };
+
+    /// Same bucket edges as [`DISTINCT_BUCKETS`], read as whole texels.
+    pub fn note_triangle_spread(spread_s: i32, spread_t: i32, perspective: bool) {
+        let bucket = |value: i32| match value {
+            i32::MIN..=0 => 0,
+            1 => 1,
+            2..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=64 => 5,
+            65..=256 => 6,
+            _ => 7,
+        };
+        SPREAD_S[bucket(spread_s)].fetch_add(1, Ordering::Relaxed);
+        SPREAD_T[bucket(spread_t)].fetch_add(1, Ordering::Relaxed);
+        PERSPECTIVE[usize::from(perspective)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub const SPREAD_BUCKETS: [&str; 8] =
+        ["0", "1", "2-4", "5-8", "9-16", "17-64", "65-256", ">256"];
+
+    pub fn spread_histograms() -> ([u64; 8], [u64; 8], [u64; 2]) {
+        let load = |bank: &[AtomicU64; 8]| {
+            let mut out = [0u64; 8];
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = bank[index].load(Ordering::Relaxed);
+            }
+            out
+        };
+        (
+            load(&SPREAD_S),
+            load(&SPREAD_T),
+            [
+                PERSPECTIVE[0].load(Ordering::Relaxed),
+                PERSPECTIVE[1].load(Ordering::Relaxed),
+            ],
+        )
+    }
+
+    /// `(texel luma buckets, shade alpha buckets)`, each sixteen wide.
+    pub fn pixel_histograms() -> ([u64; 16], [u64; 16]) {
+        let mut luma = [0u64; 16];
+        let mut alpha = [0u64; 16];
+        for (index, slot) in luma.iter_mut().enumerate() {
+            *slot = TEXEL_LUMA[index].load(Ordering::Relaxed);
+        }
+        for (index, slot) in alpha.iter_mut().enumerate() {
+            *slot = SHADE_ALPHA[index].load(Ordering::Relaxed);
+        }
+        (luma, alpha)
+    }
+
+    /// `([slot][selector] color counts, alpha counts, (reads_texel, ignores_texel))`.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot() -> ([[u64; 21]; 4], [[u64; 10]; 4], (u64, u64)) {
+        let mut color = [[0u64; 21]; 4];
+        for (slot, row) in color.iter_mut().enumerate() {
+            for (index, slot_count) in row.iter_mut().enumerate() {
+                *slot_count = COLOR_COUNTS[slot * 21 + index].load(Ordering::Relaxed);
+            }
+        }
+        let mut alpha = [[0u64; 10]; 4];
+        for (slot, row) in alpha.iter_mut().enumerate() {
+            for (index, slot_count) in row.iter_mut().enumerate() {
+                *slot_count = ALPHA_COUNTS[slot * 10 + index].load(Ordering::Relaxed);
+            }
+        }
+        (
+            color,
+            alpha,
+            (
+                COLOR_READS_TEXEL0.load(Ordering::Relaxed),
+                COLOR_IGNORES_TEXEL0.load(Ordering::Relaxed),
+            ),
+        )
+    }
+
+    /// Writes the current tally to stderr, nonzero buckets only.
+    pub fn report(label: &str) {
+        let (color, alpha, (reads, ignores)) = snapshot();
+        eprintln!("[fn64-combiner] {label} programs={}", reads + ignores);
+        eprintln!(
+            "[fn64-combiner]   passes: one_cycle={} two_cycle_first={} two_cycle_second={}",
+            PASS_COUNTS[0].load(Ordering::Relaxed),
+            PASS_COUNTS[1].load(Ordering::Relaxed),
+            PASS_COUNTS[2].load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[fn64-combiner]   TEXTURED draws: color reads Texel* = {reads}, ignores Texel* = {ignores}"
+        );
+        for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
+            let mut line = String::new();
+            for (index, count) in color[slot].iter().enumerate() {
+                if *count > 0 {
+                    line.push_str(&format!(" {}={}", COLOR_NAMES[index], count));
+                }
+            }
+            eprintln!("[fn64-combiner]   color {name}:{line}");
+        }
+        for (slot, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
+            let mut line = String::new();
+            for (index, count) in alpha[slot].iter().enumerate() {
+                if *count > 0 {
+                    line.push_str(&format!(" {}={}", ALPHA_NAMES[index], count));
+                }
+            }
+            eprintln!("[fn64-combiner]   alpha {name}:{line}");
+        }
+        let (luma, shade_alpha) = pixel_histograms();
+        let render = |buckets: &[u64; 16]| {
+            buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, count)| format!(" {}:{count}", index * 16))
+                .collect::<String>()
+        };
+        eprintln!(
+            "[fn64-combiner]   texel luma /16 (pixels={}):{}",
+            luma.iter().sum::<u64>(),
+            render(&luma)
+        );
+        eprintln!(
+            "[fn64-combiner]   shade alpha /16 (pixels={}):{}",
+            shade_alpha.iter().sum::<u64>(),
+            render(&shade_alpha)
+        );
+        let (spread_s, spread_t, perspective) = spread_histograms();
+        let render8 = |buckets: &[u64; 8]| {
+            buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, count)| format!(" {}:{count}", SPREAD_BUCKETS[index]))
+                .collect::<String>()
+        };
+        eprintln!(
+            "[fn64-combiner]   S spread/triangle (texels):{}",
+            render8(&spread_s)
+        );
+        eprintln!(
+            "[fn64-combiner]   T spread/triangle (texels):{}",
+            render8(&spread_t)
+        );
+        eprintln!(
+            "[fn64-combiner]   perspective: off={} on={}",
+            perspective[0], perspective[1]
+        );
+        let distinct = distinct_histogram();
+        let distinct_line: String = distinct
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, count)| format!(" {}:{count}", DISTINCT_BUCKETS[index]))
+            .collect();
+        eprintln!(
+            "[fn64-combiner]   distinct texels per triangle (triangles={}):{}",
+            distinct.iter().sum::<u64>(),
+            distinct_line
+        );
+        let histogram = program_histogram();
+        eprintln!(
+            "[fn64-combiner]   distinct programs = {}, top 8 by count:",
+            histogram.len()
+        );
+        for ((low, high), count) in histogram.iter().take(8) {
+            eprintln!("[fn64-combiner]     {low:#010x} {high:#010x} x{count}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::census::{ALPHA_NAMES, COLOR_NAMES};
+    use super::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams};
+
+    /// The census's two name tables must be in the same order as the
+    /// index functions the counters use, or every reported bucket is
+    /// mislabelled while every count stays plausible -- a silent wrong
+    /// answer of exactly the kind this whole card is chasing.
+    ///
+    /// Checked by round-tripping the NAME through a fresh decode rather
+    /// than by re-listing the enum, which would just restate the table.
+    #[test]
+    fn the_census_name_tables_match_the_selector_order() {
+        // Hand-written from `color_input_common`/`color_input_c`, which are
+        // themselves the RT64 tables. Deliberately NOT derived from
+        // `COLOR_NAMES`.
+        assert_eq!(COLOR_NAMES[1], "Texel0");
+        assert_eq!(COLOR_NAMES[4], "Shade");
+        assert_eq!(COLOR_NAMES[9], "Texel0Alpha");
+        assert_eq!(COLOR_NAMES[20], "Zero");
+        assert_eq!(ALPHA_NAMES[1], "Texel0");
+        assert_eq!(ALPHA_NAMES[4], "Shade");
+        assert_eq!(ALPHA_NAMES[9], "Zero");
+    }
+
+    /// The census decodes the slice the evaluator will run. In one-cycle
+    /// mode that is the CYCLE-1 slice, so a program whose two slices name
+    /// different selectors must census as its cycle-1 selectors.
+    ///
+    /// **Fixture chosen to distinguish the two slices**: cycle 0 selects
+    /// `Shade` in every color slot and cycle 1 selects `Texel0`, so reading
+    /// the wrong slice reports the exact opposite of the answer this card
+    /// turns on. A fixture with both slices equal -- the obvious one to
+    /// write -- would pass under either slice and prove nothing.
+    #[test]
+    fn one_cycle_censuses_the_cycle_one_slice_not_the_cycle_zero_slice() {
+        // gbi.h GCCc*w* packing, hand-assembled: cycle 0 = SHADE (index 4)
+        // in a/b/c/d; cycle 1 = TEXEL0 (index 1) in a/b/c/d.
+        const SHADE: u32 = 4;
+        const TEXEL0: u32 = 1;
+        let w0 = (SHADE << 20) | (SHADE << 15) | (TEXEL0 << 5) | TEXEL0;
+        let w1 = (SHADE << 28) | (TEXEL0 << 24) | (SHADE << 15) | (TEXEL0 << 6);
+        let params = CombineParams::from_wire(w0, w1);
+
+        // second_cycle = true is what `run_one_cycle` passes.
+        for slot in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ] {
+            assert_eq!(
+                params.decode_color(slot, true),
+                ColorInput::Texel0,
+                "one-cycle slot {slot:?} must read the cycle-1 slice"
+            );
+            assert_eq!(
+                params.decode_color(slot, false),
+                ColorInput::Shade,
+                "the cycle-0 slice of this fixture is Shade, so the two differ"
+            );
+        }
+    }
+
+    /// WM2000's dominant measured program, hand-decoded from the wire words
+    /// the ROM actually issued, and pinned because misreading it is what
+    /// made 54% of draws look like they discarded their texture.
+    ///
+    /// `0xfc15fea3 / 0xf00ff23f`, measured at 73,925 of ~115,000 draws in
+    /// one in-match window. Expectations below are derived BY HAND from
+    /// gbi.h's `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1` bit positions, not
+    /// from the decoder under test.
+    ///
+    /// **Mutation scope, stated honestly.** Rewriting
+    /// `color_input_c`'s index 11 from `ShadeAlpha` to `PrimitiveAlpha`
+    /// fails this test. Narrowing `parse_color_c`'s second-cycle mask from
+    /// `0x1F` to `0xF` does NOT -- this program's `c1` is 3, which reads
+    /// identically under either mask, the coincident-fixture trap
+    /// `docs/RT64-WM2000-HARNESS-TRAPS.md` names. That mutant is caught by
+    /// three tests elsewhere in this crate
+    /// (`set_combine_w0_is_passed_through_completely_unmasked`,
+    /// `two_cycle_wire_program_decodes_to_both_slices`, and
+    /// `the_one_cycle_fixtures_really_do_admit_a_combining_texture_rectangle`),
+    /// verified by running the mutant against the full suite, so it is
+    /// covered -- just not here. This fixture's job is the ROM's real
+    /// program, not the mask widths.
+    #[test]
+    fn the_wm2000_fog_program_samples_the_texture_in_its_first_cycle() {
+        let params = CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f);
+
+        // Cycle 0 (two-cycle first pass, `second_cycle = false`).
+        // a0 = w0>>20 & 0xF = 0x1 = TEXEL0; b0 = w1>>28 & 0xF = 0xf -> ZERO;
+        // c0 = w0>>15 & 0x1F = 0x1b = 11 -> SHADE_ALPHA;
+        // d0 = w1>>15 & 0x7 = 0x7 -> ZERO.
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, false),
+            ColorInput::Texel0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, false),
+            ColorInput::Zero
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, false),
+            ColorInput::ShadeAlpha
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, false),
+            ColorInput::Zero
+        );
+
+        // Cycle 1: a1 = w0>>5 & 0xF = 0x5 = ENVIRONMENT;
+        // b1 = w1>>24 & 0xF = 0x0 = COMBINED; c1 = w0 & 0x1F = 0x3 = PRIMITIVE;
+        // d1 = w1>>6 & 0x7 = 0x0 = COMBINED. A fog lerp over cycle 0's result.
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, true),
+            ColorInput::Environment
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, true),
+            ColorInput::Combined
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::Primitive
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, true),
+            ColorInput::Combined
+        );
+
+        // The point of the whole fixture: the SECOND cycle names no texel,
+        // and reading only that cycle would conclude this draw throws its
+        // texture away. It does not -- cycle 0 sampled it and `Combined`
+        // carries it forward.
+        for slot in [
+            ColorInputSlot::A,
+            ColorInputSlot::B,
+            ColorInputSlot::C,
+            ColorInputSlot::D,
+        ] {
+            assert_ne!(
+                params.decode_color(slot, true),
+                ColorInput::Texel0,
+                "cycle 1 of the fog program names no Texel0 -- that is the trap"
+            );
+        }
+    }
+
+    /// Alpha slot C has its OWN index table, shifted from A/B/D's: index 1
+    /// is TEXEL0 there and COMBINED is unreachable. Pinned because the
+    /// census reports all four alpha slots through one name table, and a
+    /// reader comparing slot C's counts against slot A's would otherwise
+    /// silently compare two different index spaces.
+    #[test]
+    fn alpha_slot_c_uses_its_own_table() {
+        // alpha1 C sits at w1>>18; alpha1 A at w1>>21.
+        let params = CombineParams::from_wire(0, (0 << 21) | (0 << 18));
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::A, true),
+            AlphaInput::Combined,
+            "index 0 in the A/B/D table is COMBINED"
+        );
+        assert_eq!(
+            params.decode_alpha(AlphaInputSlot::C, true),
+            AlphaInput::LodFraction,
+            "index 0 in the C table is LOD_FRACTION, not COMBINED"
+        );
     }
 }

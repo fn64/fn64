@@ -26,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VERBOSE = "--verbose" in sys.argv
 errors: list[str] = []
+warnings: list[str] = []
 checked = 0
 
 
@@ -40,6 +41,16 @@ def check_generated_validators() -> None:
 
 def fail(where: str, msg: str) -> None:
     errors.append(f"{where}: {msg}")
+
+
+def warn(where: str, msg: str) -> None:
+    """A finding that is about FORM, not a broken claim -- reported, not gating.
+
+    check_stale_deferrals separates "this deferral is factually wrong" (fail)
+    from "this deferral is shaped so it will rot silently" (warn). Conflating
+    them produces noise on prose that is currently correct, which is how a
+    linter teaches people to ignore it."""
+    warnings.append(f"{where}: {msg}")
 
 
 def ignored(ref: str) -> bool:
@@ -571,6 +582,430 @@ def check_rt64_port_dashboard() -> None:
         print("  RT64 port ticket manifest and generated dashboards agree")
 
 
+# --- 4e. a module's "deliberately not ported" list must still be true --------
+# RT64 port modules document what they DID NOT port. Those deferrals are
+# load-bearing: the next card reads them to decide what is out of scope. When
+# one goes stale -- the symbol has since landed under its snake_case name --
+# the card either skips real work or re-ports a function that already exists
+# and is `pub`. That cost real work four times in one day: `rt64_math.rs`
+# still refuses nine symbols that `rt64_math_matrix.rs`/`rt64_math_decompose.rs`
+# have since landed, `rt64_rsp_segment.rs` still refuses `matrixCommon`, and
+# `rt64_blender_analysis.rs` still refuses `EmulationRequirements`.
+#
+# The rule: inside a sentence that REFUSES to port something, every backticked
+# upstream C++ identifier is mapped to its Rust spelling and looked up in the
+# same crate's public surface. A hit means the refusal is false.
+#
+# False positives are low BY CONSTRUCTION, not by an exception list: the
+# deferrals that are correct refuse things that were never ported under any
+# name -- XXH3, `nlohmann::json`, RHI/COM types, GBI dispatch orchestrators.
+# A symbol-existence check passes all of those silently, because no such
+# symbol exists to find.
+# `\*{0,2}` absorbs markdown emphasis: the live prose writes "does **not**
+# port" and "is **deliberately not ported**", and a regex that misses those
+# picks up a LATER verb in the same sentence instead, which silently moves the
+# extraction scope past the symbols the refusal actually names.
+_NOT = r"\*{0,2}not\*{0,2}"
+DEFERRAL = re.compile(
+    rf"deliberately {_NOT} ported|does {_NOT} port|{_NOT} re-ported"
+    # "is/are/were not ported", and the heading forms that introduce a list:
+    # "Specifically not ported, by category:", "Explicitly not ported:".
+    rf"|(?:are|is|were|was|specifically|explicitly|deliberately)\s+{_NOT} ported"
+    r"|\(deferred|deferred\s*--|out of scope",
+    re.I,
+)
+# A bare ticket ID with no symbol beside it rots silently: when the ticket
+# lands under a different module name, nothing connects the two. Form, not fact.
+TICKET = re.compile(r"\bM\d\.\d+[a-z]?\b")
+DOC_LINE = re.compile(r"^\s*//[/!] ?")
+# `[`Foo`]` is a rustdoc intra-doc link -- a LIVE reference to an item in this
+# crate, which is the opposite of a deferral. Strip before extracting.
+INTRA_DOC_LINK = re.compile(r"\[`[^`\n]+`\]")
+BACKTICKED = re.compile(r"`([^`\n]+)`")
+# A deferral's SUBJECT can be third person: a survey sentence names a sibling
+# module ("the closest sibling `foo.rs` defines `A`, `B` ... and it
+# deliberately does not port `C`") and the refusal is a claim about THAT
+# sibling, not about the module whose doc comment this is. Detect this by the
+# clause immediately before the verb being a bare pronoun -- no symbol of its
+# own, nothing but the pronoun and an optional bare adverb.
+THIRD_PERSON_SUBJECT = re.compile(
+    r"^\s*[-*]?\s*(?:it|this|that)\s*(?:deliberately|specifically|explicitly)?\s*$",
+    re.I,
+)
+# `foo.rs` cited in backticks -- used to find the pronoun's antecedent.
+MODULE_RS_REF = re.compile(r"`([A-Za-z0-9_]+\.rs)`")
+# A real sentence end, not a period inside a `foo.rs` citation: require it be
+# followed by space or end-of-text, and not immediately by a backtick (which
+# would mean the period is part of a `name.rs` extension, not a full stop).
+SENTENCE_END = re.compile(r"[.!?](?!`)(?:\s|$)")
+RUST_ITEM = re.compile(
+    r"^([^:]+):(\d+):(\s*)(pub(?:\([^)]*\))? )?(fn|struct|enum) ([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _is_upstream_symbol(token: str) -> bool:
+    """True for an upstream C++ name: camelCase, PascalCase, or a dimension
+    suffix (`extract3x3`) that has no case transition at all."""
+    if len(token) < 3:
+        return False
+    return bool(re.search(r"[a-z][A-Z]", token) or re.search(r"[a-z][0-9]", token))
+
+
+def _to_snake(name: str) -> str:
+    """camelCase -> snake_case, splitting at the digit boundary.
+
+    `extract3x3` -> `extract_3x3` and `lerpMatrix3x3` -> `lerp_matrix_3x3`:
+    the letter->digit boundary separates, but a DIMENSION RUN (`3x3`) is one
+    token and must not become `3x_3`."""
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", s)
+    s = re.sub(r"(?<=[A-Za-z])(?=[0-9])", "_", s).lower()
+    s = re.sub(r"(?<=[0-9]x)_(?=[0-9])", "", s)
+    return re.sub(r"__+", "_", s).strip("_")
+
+
+def _to_snake_joined(name: str) -> str:
+    """The other defensible digit reading: `mat4Mul` -> `mat4_mul`.
+
+    Which spelling a porter picked is not knowable from the C++ name, so try
+    both -- a deferral is stale if the symbol landed under EITHER."""
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", s).lower()
+    return re.sub(r"__+", "_", s).strip("_")
+
+
+def _refused_symbol(span: str) -> str | None:
+    """The one symbol a backticked span refuses.
+
+    `Foo::bar` refuses the MEMBER, not the parent type -- crediting the parent
+    reports `ProfilingTimer` as landed when the deferral is about
+    `ProfilingTimer::start`."""
+    s = span.strip()
+    if "::" in s:
+        s = s.split("::")[-1]
+    s = re.sub(r"\(.*$", "", s).strip()
+    return s if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", s) else None
+
+
+def _surveys_another_module(text: str, clause_start: int, own_file: str) -> bool:
+    """True if the deferral's subject clause is a pronoun standing in for
+    ANOTHER module named earlier in the same unbroken run of clauses.
+
+    `rt64_preset_material.rs:196` survives this: "...the closest sibling
+    `rt64_preset_draw_call_match.rs` defines `DrawCallKey`, ... and it
+    deliberately does not port `PresetBase` either." "it" refers to the
+    SIBLING just named, not to this module -- the claim is about that
+    sibling's port, and it is true (verified against
+    `rt64_preset_scene.rs:359`, which the sibling's OWN doc comment credits
+    for `PresetBase` after this check landed).
+
+    Two conditions, both required, because either alone is unsafe:
+
+    1. The clause is a BARE pronoun ("it", "this", "that", optionally with
+       one adverb) -- checked by the caller via THIRD_PERSON_SUBJECT before
+       this function runs. A pronoun clause is necessary but not
+       sufficient: `rt64_preset_scene.rs` has "- It does not port
+       `PresetLibrary`'s `load`/`save`..." where "It" is THIS module,
+       carried over from an earlier bullet's "This module is not wired
+       in:". Silencing every bare-pronoun deferral would swallow that one.
+
+    2. Scanning BACKWARD from the pronoun to the nearest real sentence end
+       -- not a `;` or `:` (those are clause breaks the survey uses freely
+       within one sentence) but an actual `.`/`!`/`?` not glued to a
+       backtick (so `rt64_common.rs` and `rt64_preset_scene.rs`'s `.` are
+       not mistaken for one) -- the NEAREST backtick-cited `foo.rs` module
+       is a file OTHER than this one. That is the pronoun's antecedent: a
+       named sibling, not "this module". In the PresetLibrary case, the
+       nearest earlier `foo.rs` citation across the true sentence boundary
+       is `lib.rs`, and it sits in a DIFFERENT, already-terminated sentence
+       ("...`lib.rs` declares it `mod`... It is a characterization
+       surface.") -- the scan stops at that terminator and finds no `.rs`
+       citation in the run the pronoun actually belongs to, so condition 2
+       correctly fails and the real deferral still fires.
+
+    A deferral that reads "this module does not port `X`, which lives in
+    `other.rs`" is NOT caught by this rule even though it names another
+    file: `other.rs` there sits AFTER the verb, never examined by this
+    backward scan, and the subject clause is "this module", not a pronoun,
+    so condition 1 already rejects it.
+    """
+    preceding = text[:clause_start]
+    ends = list(SENTENCE_END.finditer(preceding))
+    run_start = ends[-1].end() if ends else 0
+    run = preceding[run_start:]
+    return any(f != own_file for f in MODULE_RS_REF.findall(run))
+
+
+def _crate_of(path: str) -> str:
+    return path.split("/")[1] if path.startswith("crates/") else ""
+
+
+def _rust_item_index() -> tuple[dict, dict]:
+    """(public, private) maps of (crate, name) -> "file:line".
+
+    Indexed PER CRATE because a deferral in crate X is a claim about crate X's
+    port. Workspace-wide lookup makes every common name (`Vec3`, `LoadTile`,
+    `DepthMode`) collide with an unrelated definition elsewhere. Tests,
+    examples and bins are excluded: they are not the crate's ported surface."""
+    out = subprocess.run(
+        ["git", "grep", "-nE",
+         r"^\s*(pub(\([^)]*\))? )?(fn|struct|enum) [A-Za-z_]",
+         "--", "crates/*.rs", "crates/**/*.rs"],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout
+    public: dict[tuple[str, str], str] = {}
+    private: dict[tuple[str, str], str] = {}
+    for line in out.splitlines():
+        m = RUST_ITEM.match(line)
+        if not m:
+            continue
+        path, lineno, _, vis, _kind, name = m.groups()
+        if "/tests/" in path or "/examples/" in path or "/bin/" in path:
+            continue
+        # `pub(crate)`/`pub(super)` is NOT reachable from another module the
+        # way a card would need; count it with private.
+        target = public if (vis and "pub(" not in vis) else private
+        target.setdefault((_crate_of(path), name), f"{path}:{lineno}")
+    return public, private
+
+
+def _doc_blocks(lines: list[str]):
+    """Yield (first_lineno, [text...]) for each contiguous doc-comment run."""
+    i = 0
+    while i < len(lines):
+        if DOC_LINE.match(lines[i]):
+            j = i
+            while j < len(lines) and DOC_LINE.match(lines[j]):
+                j += 1
+            yield i, [DOC_LINE.sub("", line) for line in lines[i:j]]
+            i = j
+        else:
+            i += 1
+
+
+def check_stale_deferrals() -> None:
+    """A module's deferral list must not name a symbol that has since landed.
+
+    Three severities, deliberately kept apart:
+
+      fail  -- the refused symbol exists and is `pub` in this crate. The
+               deferral is FALSE; a card reading it will skip landed work or
+               duplicate a public function.
+      warn  -- the refused symbol exists but is PRIVATE. Different situation,
+               different fix (widen the visibility, do not re-port), and the
+               prose saying so may be exactly correct -- `rt64_rigid_body.rs`
+               correctly documents that `Quat::dot`/`neg`/`normalize` are
+               private and unreachable. Reporting that as stale would punish
+               accurate prose.
+      warn  -- the deferral cites only a bare ticket ID (M4.x) with no symbol.
+               It rots silently when the ticket lands under another module
+               name. A complaint about FORM; all such sites currently resolve.
+
+    LIMITATION 1 -- LIST-FORM deferrals. Findings are scoped to the sentence
+    that does the refusing, because every wider scope tried was measurably
+    worse (a 6-line window reported 141 findings against this tree, mostly
+    from neighbouring sentences; inheriting a colon heading across its whole
+    bullet run reported 88). The cost is that a deferral written as a bare
+    heading over a list -- "Specifically not ported, by category:" followed by
+    bullets, as in `rt64_rsp_segment.rs:232` -- is only caught when a bullet
+    carries its own refusal verb. That site's stale `matrixCommon` claim is
+    still reported here, but via `rt64_rsp_matrix_stack.rs:142`, which repeats
+    it in sentence form. Do not widen the scope to close this without
+    re-measuring the false-positive count.
+
+    LIMITATION 2 -- what this check CANNOT catch at all. It is referential: it asks
+    "does this name exist?". It cannot catch a GRAMMATICAL failure, where
+    prose describing an UN-PORTED upstream construct's requirements parses as
+    the module's own requirement. "it requires `WorkloadQueue`, `Workload`"
+    names symbols that correctly do NOT exist, so this check passes it
+    silently -- yet that one sentence made five landed modules read as
+    blocked. `rt64_frame_compatibility.rs:225-228` models the fix in prose:
+    "Read the exclusions below as refusals, not as a dependency list." No
+    symbol-existence check covers that class; do not assume it does."""
+    public, private = _rust_item_index()
+    sources = [
+        f for f in subprocess.run(
+            ["git", "ls-files", "crates/"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        if f.endswith(".rs") and "/tests/" not in f and "/examples/" not in f
+    ]
+    for path in sources:
+        crate = _crate_of(path)
+        lines = (ROOT / path).read_text().splitlines()
+        for start, body in _doc_blocks(lines):
+            text = " ".join(body)
+            offsets, pos = [], 0
+            for k, chunk in enumerate(body):
+                offsets.append((pos, start + k + 1))
+                pos += len(chunk) + 1
+
+            def lineno_at(offset: int, _o=offsets, _s=start) -> int:
+                found = _s + 1
+                for begin, num in _o:
+                    if begin <= offset:
+                        found = num
+                    else:
+                        break
+                return found
+
+            # A module that QUOTES the old deferral to announce it CLOSED it is
+            # citing history, not making a claim -- rt64_math_matrix.rs opens by
+            # quoting rt64_math.rs's refusal of the very cluster it just landed.
+            # Mask quoted spans so that citation is not read as a live refusal.
+            masked = re.sub(r'"[^"]*"', lambda m: " " * len(m.group(0)), text)
+
+            # A deferral often takes LIST form: a heading refuses ("Specifically
+            # not ported, by category:") and the symbols sit in the bullets
+            # under it. rt64_rsp_segment.rs's `matrixCommon` -- one of the three
+            # sites this check exists for -- is exactly that shape, so scoping
+            # to the trigger's own sentence alone would miss it. When a trigger
+            # sentence ends in a colon, the bullet run that follows inherits it.
+            # Scope each finding to the SENTENCE that does the refusing.
+            # Anything wider misfires: a 6-line window drags in symbols from
+            # neighbouring sentences, and inheriting a list heading across a
+            # whole bullet run sweeps in unrelated lists. Measured on this
+            # tree, sentence scope reports 30 findings that are all genuine,
+            # where window scope reported 141 and run-inheritance 88.
+            #
+            # The cost of this precision is stated in the docstring: a
+            # deferral written as a bare colon heading over a bullet list
+            # (rt64_rsp_segment.rs's `matrixCommon`) is NOT caught unless a
+            # bullet carries its own refusal verb.
+            # Split on sentence punctuation, but NOT on a period that is inside
+            # a ticket ID or version number ("M4.3", "1,314") -- otherwise the
+            # bare-ticket rule below can never see the ticket it is about.
+            spans: list[tuple[int, int]] = []
+            # A colon ends the refusing clause too: "...`.cpp` (SHA-256 ...):
+            # Only the `ShaderDescription` struct and its `toShader()`..." is
+            # two claims, and letting the first run into the second credits the
+            # refusal with names the module actually DOES port.
+            for m in re.finditer(r"(?:[^.;:]|\.(?=\d))*(?:\.|;|:|$)", masked):
+                if m.group(0).strip() and DEFERRAL.search(m.group(0)):
+                    spans.append((m.start(), m.end()))
+
+            for begin, finish in spans:
+                sentence = text[begin:finish]
+                # A split can land INSIDE a backticked span, leaving an
+                # unpaired backtick. That inverts every pair after it, so
+                # extraction yields the prose BETWEEN symbols instead of the
+                # symbols -- silently losing real findings. Re-pair by walking
+                # back to the split's own opening tick: everything before the
+                # first tick is a fragment of a span that started in the
+                # previous sentence, so only that fragment is dropped.
+                # The orphan may be at EITHER end: a split can cut into a span
+                # that opened in the previous sentence (leading orphan) or one
+                # that closes in the next (trailing orphan). Close a trailing
+                # opener rather than dropping it -- `lerpMatrix3x3` in
+                # rt64_math.rs's refusal is cut by its own "3." and is a real
+                # finding, not a fragment.
+                if sentence.count("`") % 2:
+                    # Two repairs are possible and which is right depends on
+                    # where the split fell: close a trailing opener (the span
+                    # continues past the cut, as with `lerpMatrix3x3` cut by
+                    # its own "3."), or drop a leading closer (the span opened
+                    # in the previous sentence). Guessing wrong silently loses
+                    # findings in the other case, so try both and keep whichever
+                    # actually yields upstream symbols.
+                    # Prefer closing a trailing opener: it keeps the symbol the
+                    # split cut in half without absorbing any text the refusal
+                    # does not govern. Dropping the leading fragment instead
+                    # re-pairs the WHOLE sentence, which on a survey paragraph
+                    # ("the closest sibling defines `A`, `B` ... and it
+                    # deliberately does not port `C`") credits the refusal with
+                    # every name in the survey. Only fall back to that when
+                    # closing yields nothing at all.
+                    closed = sentence + "`"
+                    if any(
+                        (tok := _refused_symbol(span)) and _is_upstream_symbol(tok)
+                        for span in BACKTICKED.findall(closed)
+                    ):
+                        sentence = closed
+                    else:
+                        head, _, rest = sentence.partition("`")
+                        sentence = head + " " + rest
+                where = f"{path}:{lineno_at(begin)}"
+                # A refusal's SUBJECT can be a pronoun standing in for a
+                # sibling module named earlier in the same run of clauses --
+                # "the closest sibling `foo.rs` defines `A` ... and it
+                # deliberately does not port `B`" is a claim about `foo.rs`,
+                # not this module. Check the clause right before the verb
+                # (same split used below for the trailing-form case) before
+                # doing anything else: if it is a bare pronoun whose nearest
+                # antecedent is another module's `.rs` citation, this is a
+                # survey sentence about THAT module and is not a claim this
+                # file's check should evaluate at all. See
+                # _surveys_another_module for why a bare pronoun alone is not
+                # enough (rt64_preset_scene.rs's "It does not port
+                # `PresetLibrary`..." is first person and must still fire).
+                subject_probe = DEFERRAL.search(sentence)
+                if subject_probe:
+                    subject_clause = re.split(
+                        r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                        sentence[:subject_probe.start()],
+                    )[-1]
+                    if THIRD_PERSON_SUBJECT.match(subject_clause):
+                        stripped = subject_clause.strip()
+                        clause_pos = text.find(stripped, begin) if stripped else -1
+                        if clause_pos != -1 and _surveys_another_module(
+                            text, clause_pos, os.path.basename(path)
+                        ):
+                            continue
+                # A refusal governs what FOLLOWS it, not what precedes it.
+                # "Only the `ShaderDescription` struct and its `toShader()`
+                # method are ported (the `hash()` ... are explicitly not
+                # ported)" refuses only the parenthetical -- crediting the
+                # whole clause reports the two symbols the module DOES port.
+                verb = DEFERRAL.search(sentence)
+                scope = sentence[verb.start():] if verb else sentence
+                # "does not port X" puts its objects AFTER the verb; the
+                # trailing form ("`X`/`Y` ... are explicitly not ported") puts
+                # them before it. Distinguish by the word order actually used:
+                # only a trailing-form verb (one with no backticked object
+                # following it) may look backwards, and then only as far as the
+                # nearest clause break, so a "these ARE ported" subject earlier
+                # in the sentence is not swept in.
+                if verb and not BACKTICKED.search(scope):
+                    head = sentence[:verb.start()]
+                    # Split on a parenthetical opener -- `\(\s` or `\((?=the)`
+                    # style -- never on the `()` inside a C++ method name like
+                    # `maskUnusedParameters()`, which would shred the clause.
+                    # A parenthetical opens after whitespace; the `()` inside a
+                    # C++ method name (`maskUnusedParameters()`) never does, so
+                    # requiring the space keeps such names intact.
+                    clause = re.split(r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                                      head)[-1]
+                    scope = clause if BACKTICKED.search(clause) else head
+                seen: set[str] = set()
+                found_symbol = False
+                for span in BACKTICKED.findall(INTRA_DOC_LINK.sub("", scope)):
+                    token = _refused_symbol(span)
+                    if not token or not _is_upstream_symbol(token) or token in seen:
+                        continue
+                    seen.add(token)
+                    found_symbol = True
+                    spellings = {token, _to_snake(token), _to_snake_joined(token)}
+                    hit = next(
+                        (public[(crate, s)] for s in spellings if (crate, s) in public),
+                        None,
+                    )
+                    if hit:
+                        fail(where, f"defers `{token}`, but it is public at {hit} "
+                                    f"-- the deferral is stale")
+                        continue
+                    hidden = next(
+                        (private[(crate, s)] for s in spellings if (crate, s) in private),
+                        None,
+                    )
+                    if hidden:
+                        warn(where, f"defers `{token}`, which exists but is private at "
+                                    f"{hidden} -- widening, not porting, is the fix")
+                if not found_symbol and TICKET.search(sentence):
+                    ticket = TICKET.findall(sentence)[0]
+                    warn(where, f"defers to bare ticket {ticket} with no symbol named "
+                                f"-- this rots silently if {ticket} lands elsewhere")
+
+
 # --- 5. no doc may cite a scripts/ entry point that isn't executable ---------
 def check_scripts() -> None:
     for doc in docs():
@@ -622,6 +1057,89 @@ def selftest() -> int:
          lambda: ENV.findall("set `FN64_TOTALLY_FAKE=1`") == ["FN64_TOTALLY_FAKE"]),
         ("closed-item cap fires", "a bloated [x] item must fail",
          _closed_item_check_fires),
+        # The digit boundary is the part that silently gets this wrong.
+        ("camel->snake digit boundary", "extract3x3 must not become extract_3x_3",
+         lambda: _to_snake("extract3x3") == "extract_3x3"
+         and _to_snake("lerpMatrix3x3") == "lerp_matrix_3x3"
+         and _to_snake("rotationFrom3x3") == "rotation_from_3x3"
+         and _to_snake("matrixRotationX") == "matrix_rotation_x"
+         and _to_snake("matrixCommon") == "matrix_common"),
+        ("upstream-symbol detection", "C++ names in, non-symbols out",
+         lambda: all(map(_is_upstream_symbol,
+                         ["extract3x3", "matrixCommon", "checkEmulationRequirements"]))
+         and not any(map(_is_upstream_symbol,
+                         # the correct deferrals this must stay silent on
+                         ["XXH3", "json", "RHI", "COM", "to_json", "hlslpp"]))),
+        ("qualified name credits the member", "Foo::bar defers bar, not Foo",
+         lambda: _refused_symbol("ProfilingTimer::start") == "start"
+         and _refused_symbol("Quat::dot") == "dot"
+         and _refused_symbol("Float4ToRGBA16(float4 i, uint d)") == "Float4ToRGBA16"),
+        ("deferral trigger fires and abstains", "refusals yes, incidental prose no",
+         lambda: DEFERRAL.search("Does not port `matrixScale`")
+         and DEFERRAL.search("**deliberately not ported**")
+         and not DEFERRAL.search("a YUV-deferred Tile/Block contract")
+         and not DEFERRAL.search("no deferred-selector rejection path")),
+        # The rt64_preset_material.rs:196 false positive, reduced to its
+        # shape: a survey sentence names a sibling module, then refers back
+        # to it with a bare pronoun. Must be recognized as third-person --
+        # the claim is about the SIBLING, not this module -- so
+        # check_stale_deferrals skips it rather than evaluating `PresetBase`
+        # against THIS crate's port surface.
+        ("third-person survey is recognized", "pronoun's antecedent is a NAMED sibling module",
+         lambda: (lambda text=(
+             "the closest sibling `rt64_preset_draw_call_match.rs` defines "
+             "`DrawCallKey`, `DrawCallMask` -- none preset-material-adjacent, "
+             "and it deliberately does not port `PresetBase` either."
+         ): (
+             (probe := DEFERRAL.search(text)) is not None
+             and THIRD_PERSON_SUBJECT.match(
+                 re.split(r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                          text[:probe.start()])[-1]
+             ) is not None
+             and _surveys_another_module(
+                 text, text.find("it deliberately"), "rt64_preset_material.rs"
+             )
+         ))()),
+        # The DANGEROUS twin: a genuine first-person deferral that happens to
+        # name another module too, but AFTER the verb ("this module does not
+        # port X, which lives in other.rs"). A careless discriminator keyed
+        # only on "another .rs file appears somewhere in this sentence" would
+        # silence this -- it is a real, live deferral and must still be
+        # findable. THIRD_PERSON_SUBJECT must reject its subject clause
+        # ("This module", not a bare pronoun), which is the guard that keeps
+        # check_stale_deferrals looking at it.
+        ("first-person deferral naming another file still fires", "the case a careless rule would silence",
+         lambda: not THIRD_PERSON_SUBJECT.match(
+             re.split(
+                 r"(?<=\s)\(|--|—|,\s+(?:and|but)\s",
+                 "This module does not port `X`, which lives in `other_module.rs`."[
+                     :DEFERRAL.search(
+                         "This module does not port `X`, which lives in `other_module.rs`."
+                     ).start()
+                 ],
+             )[-1]
+         )),
+        # The SECOND danger, reduced from the real rt64_preset_scene.rs:305
+        # site: a bare pronoun subject ("It does not port `PresetLibrary`")
+        # is NOT by itself proof of a third-person survey -- "It" there
+        # carries over from an earlier bullet's "This module is not wired
+        # in", so it is first person. A bare pronoun alone (condition 1)
+        # must NOT be enough; _surveys_another_module's antecedent scan
+        # (condition 2) is what correctly finds no OTHER module's `.rs` cited
+        # in this bullet's own run and so reports false -- the deferral stays
+        # live.
+        ("bare pronoun without a named sibling still fires", "It != a survey just because it's a pronoun",
+         lambda: not _surveys_another_module(
+             "- This module is not wired in: `lib.rs` declares it `mod`. "
+             "It is a characterization surface. "
+             "- It does not port `PresetLibrary`'s `load`/`save`.",
+             (
+                 "- This module is not wired in: `lib.rs` declares it `mod`. "
+                 "It is a characterization surface. "
+                 "- It does not port `PresetLibrary`'s `load`/`save`."
+             ).rfind("- It does not port") + 2,
+             "rt64_preset_scene.rs",
+         )),
     ]
     bad = [name for name, why, fn in cases if not fn()]
     for name in bad:
@@ -646,8 +1164,14 @@ def main() -> int:
                check_base_renderer_matrix,
                check_rt64_port_dashboard,
                check_generated_validators,
+               check_stale_deferrals,
                check_scripts):
         fn()
+    if warnings:
+        print(f"lint-docs: {len(warnings)} warning(s)\n")
+        for w in warnings:
+            print(f"  {w}")
+        print()
     if errors:
         print(f"lint-docs: {len(errors)} error(s)\n")
         for e in errors:

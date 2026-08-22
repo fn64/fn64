@@ -66,23 +66,26 @@ pub use raw_dpc_batch::{
     RawDpcBatchCapability, RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource,
     RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
-pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
+pub use rdp_completion::{
+    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width, RawRdpScan,
+};
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
     CommittedSemanticWorkloadRecord, ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter,
     ExactValidatedRawDpcPlan, GuestCommittedRawDpc, IrGuestMemoryPreimage, IrGuestMemorySnapshot,
     IrRawDpcBackendCompletion, IrRawDpcPacketPreflight, NeutralColor4, NeutralColorImage,
-    NeutralCombineParams, NeutralFillColor, NeutralImageFormat, NeutralOtherMode,
-    NeutralPixelSize, NeutralPrimColor, NeutralPrimDepth, NeutralTextureImage,
+    NeutralCombineParams, NeutralFillColor, NeutralImageFormat, NeutralOtherMode, NeutralPixelSize,
+    NeutralPrimColor, NeutralPrimDepth, NeutralScissor, NeutralTextureImage,
     NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
     NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
     RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
     RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    ReadyPublication, ReadyRawDpcCommitCapsule, RdpStateCommand, RdpStateIdentity,
-    RdpTriangleCommand, RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSemantics, TmemLoadShape, TmemTransferLayout, TriangleSource,
+    RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
+    RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
+    StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
+    TmemTransferLayout, TriangleAccessSpan, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
@@ -1922,6 +1925,65 @@ pub trait RenderBackend {
             backend: "render/raw-dpc-execute",
             reason: "registered backend does not implement raw-DPC execution".to_string(),
         })
+    }
+
+    /// The guest-visible `RenderTarget` writes this backend staged for
+    /// `submission` during its own [`Self::execute_raw_dpc`] call, in exact
+    /// journal order. Empty for every submission this backend staged no
+    /// color-target write for -- which is every TMEM-only and triangle-only
+    /// submission, and every submission at all for a backend that admits no
+    /// fill.
+    ///
+    /// The caller hands this list straight back to
+    /// [`render_ir::RawDpcAbiSession::commit_guest_render_target_writes`],
+    /// which re-validates it against the packet's own journal and against
+    /// the backend's already-issued `BackendEffectReport`. This method is
+    /// therefore a *transport*, not an authority: a backend that returned a
+    /// fabricated list would be caught by that constructor, not trusted here.
+    ///
+    /// Returning an empty list for a submission this backend did stage a
+    /// write for is also safe-by-loudness rather than silently wrong: the
+    /// caller then takes the zero-write branch, which fails against the
+    /// packet's own nonempty guest-write journal with `EffectCountMismatch`.
+    ///
+    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    fn staged_guest_render_target_writes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<fn64_render_ir::CompletedWrite> {
+        let _ = submission;
+        Vec::new()
+    }
+
+    /// The exact bytes behind each `CompletedWrite`
+    /// [`Self::staged_guest_render_target_writes`] reported for `submission`,
+    /// in the identical order, for a caller that has ALREADY committed that
+    /// list. This is the RDRAM-copyback transport, and it is deliberately a
+    /// second method rather than bytes added to `CompletedWrite`: that type
+    /// is `Copy`, shared across every backend, and its premise is that a
+    /// backend proves *what* it wrote without shipping the bytes through the
+    /// verification path. Widening it would break that premise everywhere.
+    ///
+    /// Element `i` must be exactly `writes[i].byte_count()` bytes whose
+    /// [`ir_effect_content_digest`] equals `writes[i].content()`. The caller
+    /// re-derives that digest before copying anything, so a backend returning
+    /// the wrong bytes for a correctly-committed range is caught loudly at
+    /// the copy site rather than silently corrupting guest memory. The digest
+    /// in the committed write is the authority; these bytes are the payload
+    /// it already vouched for.
+    ///
+    /// An empty list means this backend has no bytes for `submission` --
+    /// either it staged none, or the token has already been consumed. A
+    /// caller that committed a nonempty write list and then receives an empty
+    /// byte list must treat that as a defect, not as "nothing to copy".
+    ///
+    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    fn committed_guest_render_target_bytes(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Vec<Vec<u8>> {
+        let _ = submission;
+        Vec::new()
     }
 
     /// Jointly publish `publication`'s fabric commit, this backend's own

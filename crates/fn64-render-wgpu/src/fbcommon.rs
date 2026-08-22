@@ -3,7 +3,15 @@
 //! dispatch functions in the permitted MIT RT64 Rust-port source pinned at
 //! commit `5473732a822a4423b5696e7cb18fecc425a59875`
 //! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/FbCommon.hlsli:38-68` and
-//! `:89-142`:
+//! `:89-142` (SHA-256 of the whole file,
+//! `6ffa6f2d3e2cbb9ce92943ef9965ddefff0e5f4a4c936130308fbed646fc3591`,
+//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! path -- which for this file is identical to its `sources.oracle.sha256`,
+//! so the digest is simultaneously the oracle and port digest, confirmed
+//! independently here by `shasum -a 256` against the pinned port-commit
+//! checkout. The digest names the whole file; this module ports five of its
+//! ten functions and the sibling `endian_swap.rs` ports three more, leaving
+//! `Float4ToUINT16`/`Float4ToUINT` -- see "Nonclaims" below):
 //!
 //! ```text
 //! float4 UINT16ToFloat4(uint i, uint fmt) {
@@ -84,14 +92,19 @@
 //!
 //! ## Nonclaims
 //!
-//! This module does not port `Float4ToUINT16`'s or `Float4ToUINT`'s RGBA
-//! branch: both call `Float4ToRGBA16(float4 i, uint dither, bool usesHDR)`,
-//! whose full-`float4`+HDR signature `rgb_dither::
+//! This module does not port
+//! [`Float4ToUINT16`](crate::rt64_float4_quantize::float4_to_uint16)'s or
+//! [`Float4ToUINT`](crate::rt64_float4_quantize::float4_to_uint)'s RGBA
+//! branch *here*: both call `Float4ToRGBA16(float4 i, uint dither, bool
+//! usesHDR)`, whose full-`float4`+HDR signature `rgb_dither::
 //! quantize_post_float_rgba16_non_hdr` does not provide (it only accepts
 //! already-`u8` channels, a precomputed `CoverageModulo8`, and declines the
 //! `usesHDR == true` branch entirely -- see its own "Frontier" doc,
 //! `rgb_dither.rs:280-322`). Closing that frontier is a separate, larger
-//! slice and is not attempted here. This module does not claim the
+//! slice and is not attempted here. Read that as a refusal by *this*
+//! module, not as a claim the crate lacks the symbols: both functions,
+//! RGBA branch included, are fully ported in `rt64_float4_quantize.rs`,
+//! which does provide `usesHDR` handling for that branch. This module does not claim the
 //! `rt64-port-m4-src-shaders-fbcommon-hlsli` task card in
 //! `docs/rt64-port-inventory.json` is complete (5 of 7 named functions land;
 //! 2 do not). It does not claim GPU, WGSL-pipeline, TMEM-wiring, combiner,

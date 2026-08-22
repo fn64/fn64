@@ -12,9 +12,9 @@ use core::fmt;
 use crate::TextureLutMode;
 
 use super::{
-    read_committed_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
-    PhysicalTmemState, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
-    TmemFirstRowParity,
+    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
+    PhysicalTexelReadError, PhysicalTmemState, TileAddressMode, TileCoordinate, TileDescriptor,
+    TileSize, TmemByteSource, TmemFirstRowParity,
 };
 
 const TEXEL_FRACTION_BITS: u32 = 5;
@@ -389,8 +389,29 @@ pub fn sample_committed_point(
     request: PointSampleRequest,
     lut_mode: TextureLutMode,
 ) -> Result<DecodedPhysicalTexel, PointSampleError> {
+    sample_point(state, tile, size, request, lut_mode)
+}
+
+/// Point-samples one texel from any physical-TMEM image -- durable state or
+/// a sealed-but-unpublished [`super::PendingTmemTransaction`] post-image
+/// (via [`super::PendingTmemTransaction::pending_image`]).
+///
+/// [`sample_committed_point`] above is this function at
+/// `S = PhysicalTmemState`; there is one addressing path and one reader,
+/// not two. The returned texel's `snapshot()` distinguishes which image was
+/// observed -- `TmemSnapshotIdentity::Committed` for durable state,
+/// `Proposed` for a post-image -- so a caller requiring durability rejects
+/// the proposal case by name instead of being handed a fabricated durable
+/// receipt.
+pub fn sample_point<S: TmemByteSource + ?Sized>(
+    state: &S,
+    tile: TileDescriptor,
+    size: TileSize,
+    request: PointSampleRequest,
+    lut_mode: TextureLutMode,
+) -> Result<DecodedPhysicalTexel, PointSampleError> {
     let addressed = address_point_texel(tile, size, request)?;
-    read_committed_texel(state, tile, addressed, lut_mode).map_err(Into::into)
+    read_texel(state, tile, addressed, lut_mode).map_err(Into::into)
 }
 
 /// Reads all four semantic corners around one point from committed TMEM.
@@ -1184,8 +1205,12 @@ mod tests {
                 request(0, 0, TmemFirstRowParity::Odd),
                 TextureLutMode::Disabled,
             ),
+            // Row 0 does not exchange, whatever first-row parity the caller
+            // supplies, so the addressed byte is 0 -- see
+            // `tmem/read.rs::odd_row_exchange`. This asserted 4 while the
+            // reader still folded the caller's parity into the exchange.
             Err(PointSampleError::Read(
-                PhysicalTexelReadError::InvalidTexelByte { address: 4 }
+                PhysicalTexelReadError::InvalidTexelByte { address: 0 }
             ))
         );
         let cell_error = gather_committed_texture_cell(
@@ -1200,12 +1225,13 @@ mod tests {
             cell_error,
             TextureCellSampleError::Read {
                 corner: TextureCellCorner::UpperLeft,
-                source: PhysicalTexelReadError::InvalidTexelByte { address: 4 },
+                // Row 0 does not exchange; see the sibling assertion above.
+                source: PhysicalTexelReadError::InvalidTexelByte { address: 0 },
             }
         );
         assert_eq!(
             std::error::Error::source(&cell_error).unwrap().to_string(),
-            "physical TMEM texel byte 0x004 is invalid"
+            "physical TMEM texel byte 0x000 is invalid"
         );
         assert_eq!(observe(&state), before);
     }

@@ -20,7 +20,10 @@ use fn64_render_ir::{
 
 use crate::raw_dpc::BoundTmemTransfer;
 
-use super::{TmemLoadEpoch, TmemLoadSourceIdentity, TmemTransferPhysicalWord, TmemTransferWord};
+use super::{
+    ProposedTmemImageIdentity, TmemByteSource, TmemLoadEpoch, TmemLoadSourceIdentity,
+    TmemSnapshotIdentity, TmemTransferPhysicalWord, TmemTransferWord,
+};
 
 const TMEM_LEN: usize = TMEM_BYTES as usize;
 const PROPOSAL_DOMAIN: &[u8] = b"fn64.render-wgpu.physical-tmem-proposal.v1\0";
@@ -456,6 +459,49 @@ impl PhysicalTmemPacketTransaction {
         })
     }
 
+    /// Captures this packet transaction's TMEM post-image **as of every
+    /// load staged so far** -- a `bytes`/`valid` pair copied out mid-loop,
+    /// with no seal, no generation, and no digest of its own.
+    ///
+    /// ## Why this exists, and why it is not a second transaction
+    ///
+    /// A packet may interleave loads and texture rectangles, and the RDP's
+    /// TMEM is durable *within* a packet exactly as it is across packets: a
+    /// texrect samples whatever TMEM holds at its own stream position, not
+    /// what it holds after the packet's last load. Measured on WM2000, the
+    /// sixth gfx packet is a sprite strip of seven `LoadTile`/texrect pairs
+    /// in strict alternation whose loads all write the SAME TMEM range from
+    /// word 0 -- they overwrite each other, so the packet's single sealed
+    /// post-image holds only the seventh load's texels and all seven
+    /// texrects would draw the seventh sprite.
+    ///
+    /// The seal is still once per packet. This is a *prefix* of the very
+    /// same staging arrays `into_pending` will hand to
+    /// [`PendingTmemTransaction`], taken while the loop still owns them, so:
+    ///
+    /// - **No second seal.** `into_pending` still runs once, still requires
+    ///   access-for-access coverage of every journal destination write, and
+    ///   still computes exactly one `proposal_identity`.
+    /// - **No forged generation.** A prefix claims no generation at all;
+    ///   [`PendingTmemPrefixImage`] borrows the sealed transaction and
+    ///   reports *its* identity, so `binding.next_generation` is claimed
+    ///   exactly once, by the one seal.
+    /// - **No new digest.** The prefix's reads answer with the sealed
+    ///   transaction's own `proposal_identity`, the same value
+    ///   `validate_proposal` recomputes at both publication routes.
+    ///
+    /// A prefix therefore cannot publish, cannot advance anything, and
+    /// cannot outlive the seal it names -- [`PendingTmemPrefixImage`] holds
+    /// a shared borrow of the [`PendingTmemTransaction`], so the borrow
+    /// checker enforces that the reads happen before publication, exactly
+    /// as it already does for [`PendingTmemImage`].
+    pub(crate) fn capture_prefix(&self) -> TmemPrefixSnapshot {
+        TmemPrefixSnapshot {
+            bytes: self.bytes.clone(),
+            valid: self.valid.clone(),
+        }
+    }
+
     /// Seals all completed loads and exposes their immutable proposed effects.
     /// Sealing requires exact access-for-access coverage of every packet
     /// journal `TmemLoadDestination` write in journal order.
@@ -693,6 +739,73 @@ impl PendingTmemTransaction {
         &self.effects
     }
 
+    /// A read-only view of this transaction's **proposed post-image** --
+    /// the exact `bytes`/`valid` arrays a successful publication would
+    /// install -- usable as a [`super::TmemByteSource`] before any
+    /// publication exists.
+    ///
+    /// This is the seam a texture rectangle in the *same packet* as its own
+    /// `LoadBlock`/`LoadTile`/`LoadTLUT` needs. Such a texrect must sample
+    /// texels its own packet loaded, and those texels exist only in this
+    /// post-image until `into_physical_successor`/`publish` runs -- which
+    /// happens strictly *after* staging, i.e. after the point the texrect
+    /// has to produce its pixels. Census-measured, this is not a corner
+    /// case but the only case: of WM2000's 219 decode entries, 86 carry
+    /// both a `G_TEXRECT` and a TMEM load and **zero** carry a texrect
+    /// without a load in the same entry, so "sample a prior packet's
+    /// committed TMEM" is a shape that never occurs.
+    ///
+    /// ## What this does not relax
+    ///
+    /// Three things, each deliberately preserved:
+    ///
+    /// 1. **No publication.** This borrows; it cannot commit, cannot
+    ///    advance a generation, and cannot be converted into a
+    ///    `PhysicalTmemState`. `into_physical_successor` and
+    ///    `PhysicalTmemPublicationAuthority::publish` remain the only two
+    ///    routes to a durable post-image, with every base-state,
+    ///    generation, epoch, effect-report and `validate_proposal` check
+    ///    they already ran, unchanged and in the same order.
+    /// 2. **No forged snapshot identity.** Reads through this view answer
+    ///    with `TmemSnapshotIdentity::Proposed`, never `Committed`. A
+    ///    pending post-image genuinely has no durable `(state, generation)`
+    ///    pair: `binding.state` names the *base* state and
+    ///    `binding.next_generation` names a generation that will not exist
+    ///    if publication is rejected. Minting a
+    ///    `PhysicalTmemSnapshotIdentity` from that pair is precisely the
+    ///    forgery the committed/pending split prevents, so the type system
+    ///    prevents it instead of a convention.
+    /// 3. **No effect-report participation.** Reading is not a write.
+    ///    Nothing observed here enters `proposed_effects`, so
+    ///    `validate_proposal`'s recomputation and
+    ///    `validate_backend_effects`' supersequence walk see exactly what
+    ///    they saw before this method existed.
+    ///
+    /// The proposal digest the view reports is this transaction's own
+    /// `proposal_identity`, so a recorded pending read names the exact
+    /// proposal content it observed -- and `validate_proposal` recomputes
+    /// that digest at both publication routes, so a read cannot be
+    /// attributed to a proposal that has since changed.
+    pub fn pending_image(&self) -> PendingTmemImage<'_> {
+        PendingTmemImage { pending: self }
+    }
+
+    /// Binds a [`TmemPrefixSnapshot`] taken mid-loop to this sealed
+    /// transaction, producing a [`TmemByteSource`] that answers with the
+    /// texels TMEM held at that prefix while naming this proposal.
+    ///
+    /// See [`PhysicalTmemPacketTransaction::capture_prefix`] for why a
+    /// prefix is not a second transaction.
+    pub(crate) fn prefix_image<'a>(
+        &'a self,
+        prefix: &'a TmemPrefixSnapshot,
+    ) -> PendingTmemPrefixImage<'a> {
+        PendingTmemPrefixImage {
+            pending: self,
+            prefix,
+        }
+    }
+
     pub const fn proposal_identity(&self) -> ContentDigest {
         self.proposal_identity
     }
@@ -772,6 +885,138 @@ impl PendingTmemTransaction {
             generation: self.binding.next_generation,
             last_load_epoch: self.last_load_epoch,
         })
+    }
+}
+
+/// TMEM `bytes`/`valid` copied out of an in-progress
+/// [`PhysicalTmemPacketTransaction`] after some prefix of its loads.
+///
+/// Owns its arrays because the transaction it was taken from is move-only
+/// and is consumed by `into_pending` before any texrect executes; borrowing
+/// them would tie the packet's staging loop to its color-staging phase and
+/// reopen the "TMEM rejection leaves no color token in existence" ordering
+/// this backend keeps by running the two as sequential phases.
+///
+/// Carries no identity of its own. Pair it with the sealed transaction via
+/// [`PendingTmemTransaction::prefix_image`] to read it.
+#[derive(Clone)]
+pub(crate) struct TmemPrefixSnapshot {
+    bytes: Box<[u8; TMEM_LEN]>,
+    valid: Box<[bool; TMEM_LEN]>,
+}
+
+impl TmemPrefixSnapshot {
+    /// An all-invalid prefix, for tests that assert on WHICH prefix a
+    /// stream position selects rather than on the texels in it.
+    ///
+    /// Test-only, and deliberately so: production prefixes come from
+    /// [`PhysicalTmemPacketTransaction::capture_prefix`] alone, so no
+    /// caller can fabricate a post-image that no load produced.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            bytes: Box::new([0u8; TMEM_LEN]),
+            valid: Box::new([false; TMEM_LEN]),
+        }
+    }
+}
+
+impl fmt::Debug for TmemPrefixSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TmemPrefixSnapshot")
+            .field("valid_bytes", &self.valid.iter().filter(|v| **v).count())
+            .finish()
+    }
+}
+
+/// A [`TmemPrefixSnapshot`] bound to the sealed transaction it is a prefix
+/// of, as a [`TmemByteSource`].
+///
+/// Reads answer from the *prefix's* arrays -- what TMEM held at that stream
+/// position -- while the reported snapshot identity is the sealed
+/// transaction's own [`ProposedTmemImageIdentity`], because that is the one
+/// proposal in existence and the one `validate_proposal` recomputes. The
+/// prefix is a position inside that proposal, not a rival to it.
+#[derive(Debug)]
+pub(crate) struct PendingTmemPrefixImage<'pending> {
+    pending: &'pending PendingTmemTransaction,
+    prefix: &'pending TmemPrefixSnapshot,
+}
+
+impl PendingTmemPrefixImage<'_> {
+    /// The sealed transaction's identity -- the same value
+    /// [`PendingTmemImage::identity`] reports, deliberately.
+    pub(crate) const fn identity(&self) -> ProposedTmemImageIdentity {
+        ProposedTmemImageIdentity::new(
+            self.pending.proposal_identity,
+            self.pending.binding.state,
+            self.pending.binding.transaction,
+            self.pending.binding.next_generation,
+        )
+    }
+}
+
+impl TmemByteSource for PendingTmemPrefixImage<'_> {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Proposed(self.identity())
+    }
+
+    /// Answers from the PREFIX's arrays, with the identical validity gate
+    /// and out-of-range handling `PhysicalTmemState::valid_byte` and
+    /// [`PendingTmemImage::valid_byte`] apply. A byte a later load has not
+    /// yet written reads as whatever the prefix held -- which is the whole
+    /// point: a texrect must not observe a later load's texels.
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        let address = usize::from(address);
+        (address < TMEM_LEN && self.prefix.valid[address]).then(|| self.prefix.bytes[address])
+    }
+}
+
+/// Borrowed read-only view of a [`PendingTmemTransaction`]'s proposed
+/// post-image, as a [`TmemByteSource`].
+///
+/// Created only by [`PendingTmemTransaction::pending_image`], whose doc
+/// states what this view does and does not relax. It holds a shared borrow
+/// of the transaction, so the transaction cannot be published, converted
+/// into a successor, or otherwise consumed while any read is outstanding --
+/// the "read the post-image, then publish it" ordering is enforced by the
+/// borrow checker rather than by review.
+#[derive(Debug)]
+pub struct PendingTmemImage<'pending> {
+    pending: &'pending PendingTmemTransaction,
+}
+
+impl PendingTmemImage<'_> {
+    pub const fn binding(&self) -> PhysicalTmemBinding {
+        self.pending.binding
+    }
+
+    /// This view's own identity, the same value its reads report.
+    pub const fn identity(&self) -> ProposedTmemImageIdentity {
+        ProposedTmemImageIdentity::new(
+            self.pending.proposal_identity,
+            self.pending.binding.state,
+            self.pending.binding.transaction,
+            self.pending.binding.next_generation,
+        )
+    }
+}
+
+impl TmemByteSource for PendingTmemImage<'_> {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Proposed(self.identity())
+    }
+
+    /// Answers from the transaction's own staged post-image arrays -- the
+    /// exact `bytes`/`valid` a publication would install -- with the
+    /// identical validity gate and identical out-of-range handling
+    /// `PhysicalTmemState::valid_byte` applies. The two implementations
+    /// agree byte-for-byte on the same arrays by construction; only the
+    /// snapshot identity differs.
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        let address = usize::from(address);
+        (address < TMEM_LEN && self.pending.valid[address]).then(|| self.pending.bytes[address])
     }
 }
 
@@ -941,6 +1186,13 @@ pub enum PhysicalTmemError {
         field: &'static str,
     },
     DestinationPlanMismatch,
+    /// A load's ordered source-access run could not be expressed as a
+    /// physical binding -- today, only because its length exceeds `u16`.
+    /// Named separately from [`Self::DestinationPlanMismatch`] so a source
+    /// side failure is never reported as a destination one; the decoder
+    /// already bounds the run by `MAX_RESOURCE_ACCESSES`, so this is a
+    /// defence-in-depth refusal rather than a reachable production path.
+    SourcePlanMismatch,
     GenerationExhausted,
     EpochNotNewer {
         previous: Option<TmemLoadEpoch>,
@@ -1029,6 +1281,8 @@ impl fmt::Display for PhysicalTmemError {
             }
             Self::DestinationPlanMismatch => formatter
                 .write_str("TMEM physical fragments differ from the canonical destination plan"),
+            Self::SourcePlanMismatch => formatter
+                .write_str("TMEM load source-access run is not expressible as a physical binding"),
             Self::GenerationExhausted => formatter.write_str("physical TMEM generation exhausted"),
             Self::EpochNotNewer { previous, actual } => write!(
                 formatter,
@@ -1319,9 +1573,21 @@ fn neutral_validate_transfer(
     let destination_access_identity = access_identity(destination_accesses)?;
     Ok(PhysicalTmemLoadBinding {
         identity: mint_load_identity()?,
-        source_access_identity: access_identity(core::slice::from_ref(&load.source()))?,
+        // Mirrors the decoder-typed path's `plan.source().access_count()` /
+        // `source_access_identity()` above: the identity and the count are
+        // taken over the load's **whole** ordered source run, not just its
+        // first fragment. A partial-width `LoadTile` reads one access per
+        // source row, so hard-coding 1 here would hash a 49-row load's
+        // source identity over a single row. Both fields feed
+        // `proposal_digest`'s per-load projection, so a collapsed count
+        // would make a 49-row load's published proposal digest
+        // indistinguishable from a one-row load's over the same first row
+        // -- pinned by
+        // `neutral_source_run_widens_the_binding_count_and_identity`.
+        source_access_identity: access_identity(load.sources())?,
         source_first_access_index: load.source_access_index(),
-        source_access_count: 1,
+        source_access_count: u16::try_from(load.sources().len())
+            .map_err(|_| PhysicalTmemError::SourcePlanMismatch)?,
         destination_access_identity,
         destination_first_access_index: load.destination_access_index(),
         destination_access_count: u16::try_from(destination_accesses.len())
@@ -1360,6 +1626,14 @@ fn neutral_transfer_word(word: fn64_render::NeutralTmemTransferWord) -> TmemTran
 
 fn neutral_load_epoch(epoch: fn64_render::TmemLoadEpoch) -> TmemLoadEpoch {
     TmemLoadEpoch::new(core::num::NonZeroU64::new(epoch.get()).expect("neutral epoch is nonzero"))
+}
+
+/// A real minted transaction identity, for `read`'s `#[cfg(test)]`
+/// proposal-identity helper. Same mint as a live transaction's, so a test
+/// identity is indistinguishable from one a real transaction would carry.
+#[cfg(test)]
+pub(super) fn next_transaction_identity_for_test() -> PhysicalTmemTransactionIdentity {
+    mint_transaction_identity().expect("the test mint is not exhausted")
 }
 
 fn mint_transaction_identity() -> Result<PhysicalTmemTransactionIdentity, PhysicalTmemError> {
@@ -1867,31 +2141,67 @@ fn validate_gpu(
     Ok(())
 }
 
-/// Every proposed write must appear in `reported` at the same position with
-/// identical content -- no reorder, no substitution, no extra or missing
-/// write. `BackendEffectReport` exposes no queue/submission/workload
-/// identity to cross-check here; its own `try_new` already proved `reported`
-/// is exactly the write set its packet's journal declares.
+/// Every proposed write must appear in `reported` **in the same relative
+/// order** with identical content -- no reorder, no substitution, no missing
+/// or duplicated proposed write. `BackendEffectReport` exposes no
+/// queue/submission/workload identity to cross-check here; its own `try_new`
+/// already proved `reported` is exactly the write set its packet's journal
+/// declares, in that journal's own order.
+///
+/// **Order-preserving subsequence, not whole-list equality.** This method's
+/// own doc header already promised that "other declared backend writes may
+/// appear around the TMEM writes"; until the mixed fill+TMEM card, this
+/// function contradicted that promise with a positional `zip` over equal
+/// lengths, and no in-tree caller produced a mixed report to expose the
+/// contradiction. A packet interleaving an admitted `FillRectangle`'s
+/// `RenderTarget` writes with this transaction's `TmemLoadDestination`
+/// writes reports both, in the journal's own order; only the TMEM subset is
+/// this transaction's to vouch for, and the fill's writes are neither
+/// proposed here nor absent from the report.
+///
+/// This is exactly the walk `validate_gpu` above already performs against
+/// `GpuCompleteTicket::backend_writes` for the same proposed list -- the two
+/// now agree on what "the report contains my proposed writes" means, where
+/// before they disagreed by the strictness of one `zip`.
+///
+/// Relaxing the length equality does NOT relax the rejection: a report built
+/// for a genuinely different transaction still fails, now by name
+/// (`missing proposed write`) rather than by count. Nothing that was
+/// rejected becomes accepted -- a superset in journal order is admitted, an
+/// omission, a reorder, a substitution and a duplicate are each still a
+/// named error.
 fn validate_backend_effects(
     reported: &[CompletedWrite],
     proposed: &[CompletedWrite],
 ) -> Result<(), PhysicalTmemError> {
-    if reported.len() != proposed.len() {
+    if reported.len() < proposed.len() {
         return Err(PhysicalTmemError::BackendEffectMismatch {
             field: "write count",
         });
     }
-    for (actual, expected) in reported.iter().zip(proposed) {
-        if actual.access() != expected.access() {
-            return Err(PhysicalTmemError::BackendEffectMismatch {
-                field: "write access",
-            });
-        }
-        if actual != expected {
+    let mut cursor = 0;
+    for expected in proposed.iter().copied() {
+        let matching = reported[cursor..]
+            .iter()
+            .position(|actual| actual.access() == expected.access())
+            .map(|offset| cursor + offset)
+            .ok_or(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write",
+            })?;
+        if reported[matching] != expected {
             return Err(PhysicalTmemError::BackendEffectMismatch {
                 field: "write content",
             });
         }
+        if reported[matching + 1..]
+            .iter()
+            .any(|actual| actual.access() == expected.access())
+        {
+            return Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "duplicate proposed access",
+            });
+        }
+        cursor = matching + 1;
     }
     Ok(())
 }
@@ -1995,6 +2305,188 @@ mod tests {
 
     fn word(opcode: u8, payload: u32) -> u32 {
         u32::from(opcode) << 24 | payload
+    }
+
+    /// Builds a neutral [`fn64_render::TmemLoadSemantics`] whose source run
+    /// is `source_rows` accesses wide, each reading 8 bytes, with one
+    /// transfer word per row bound to its own row.
+    fn neutral_load_with_source_rows(
+        layout: PhysicalMemoryLayout,
+        source_rows: u32,
+    ) -> fn64_render::TmemLoadSemantics {
+        use fn64_render::{
+            NeutralImageFormat, NeutralPixelSize, NeutralTextureImage, NeutralTileAddressMode,
+            NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+            NeutralTmemTransferWord, RawDpcCommandLocation, TmemLoadEpoch, TmemLoadKind,
+            TmemTransferLayout,
+        };
+
+        // One 8-byte source access per row, spaced 16 bytes apart so the
+        // rows are disjoint and non-adjacent -- the real partial-width
+        // `LoadTile` shape, which cannot collapse to one range.
+        let sources: Vec<ResourceAccess> = (0..source_rows)
+            .map(|row| {
+                let start = 0x200 + row * 16;
+                ResourceAccess::try_new(
+                    OperationId::new(1 + row),
+                    AccessMode::Read,
+                    fn64_render_ir::AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::Buffer,
+                        range: layout.range(start, start + 8).unwrap(),
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let destination = ResourceAccess::try_new(
+            OperationId::new(1 + source_rows),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, source_rows * 8).unwrap()),
+        )
+        .unwrap();
+        let transfer_words: Vec<NeutralTmemTransferWord> = (0..source_rows)
+            .map(|row| NeutralTmemTransferWord {
+                index: row as u16,
+                logical_source_offset: row * 8,
+                source_access_index: 1 + row,
+                source_access_byte_offset: 0,
+                defined_source_byte_mask: 0xff,
+                defined_destination_byte_mask: 0xff,
+                destination_word: row as u16,
+                row_advance: 0,
+                odd_row_exchange: false,
+                physical: NeutralTmemTransferPhysicalWord::Linear(
+                    TmemRange::try_new(row * 8, row * 8 + 8).unwrap(),
+                ),
+            })
+            .collect();
+
+        fn64_render::TmemLoadSemantics::new(
+            RawDpcCommandLocation {
+                command_index: 0,
+                stream_index: 0,
+                chunk_index: 0,
+                source_address: layout.address(COMMAND_START).unwrap(),
+                source_byte_offset: 0,
+                source_byte_len: 8,
+                wire_opcode: 0xf4,
+            },
+            vec![0xf400_0000, 0],
+            TmemLoadEpoch::new(core::num::NonZeroU64::new(1).unwrap()),
+            TmemLoadKind::Tile {
+                bounds: NeutralTileSize {
+                    low_s: 0,
+                    low_t: 0,
+                    high_s: 3,
+                    high_t: (source_rows - 1) as u16,
+                },
+            },
+            0,
+            NeutralTextureImage {
+                format: NeutralImageFormat::Rgba,
+                size: NeutralPixelSize::Bits16,
+                width: 8,
+                address: layout.address(0x200).unwrap(),
+            },
+            NeutralTileDescriptor {
+                format: NeutralImageFormat::Rgba,
+                size: NeutralPixelSize::Bits16,
+                line_words: 1,
+                tmem_word_address: 0,
+                palette: 0,
+                s_mode: NeutralTileAddressMode::default(),
+                mask_s: 0,
+                shift_s: 0,
+                t_mode: NeutralTileAddressMode::default(),
+                mask_t: 0,
+                shift_t: 0,
+            },
+            sources,
+            1,
+            destination,
+            1 + source_rows,
+            source_rows * 8,
+            0,
+            1,
+            source_rows as u16,
+            TmemTransferLayout::Linear,
+            transfer_words,
+        )
+    }
+
+    /// The neutral path's physical binding must take its source identity
+    /// and count over the load's **whole** ordered source run, exactly as
+    /// the decoder-typed path takes `plan.source().access_count()`.
+    ///
+    /// Both fields feed `proposal_digest`'s per-load projection, so
+    /// hard-coding the count to 1 would let a many-row load publish the
+    /// same proposal digest as a one-row load reading the same first row.
+    /// This asserts the count widens AND that the two digests actually
+    /// differ -- the second half is what makes the first non-cosmetic.
+    #[test]
+    fn neutral_source_run_widens_the_binding_count_and_identity() {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let wide = neutral_load_with_source_rows(layout, 8);
+        let narrow = neutral_load_with_source_rows(layout, 1);
+
+        assert_eq!(wide.sources().len(), 8);
+        assert_eq!(narrow.sources().len(), 1);
+        assert_eq!(
+            wide.sources()[0],
+            narrow.sources()[0],
+            "both loads read the same first row, so only the run width can distinguish them"
+        );
+
+        let wide_identity = access_identity(wide.sources()).unwrap();
+        let narrow_identity = access_identity(narrow.sources()).unwrap();
+        assert_ne!(
+            wide_identity, narrow_identity,
+            "an 8-row source run must not hash to the same identity as its own first row"
+        );
+        assert_eq!(
+            access_identity(core::slice::from_ref(&wide.source())).unwrap(),
+            narrow_identity,
+            "positive control: hashing only the first fragment IS the collapsed identity, \
+             which is exactly the bug this test forbids"
+        );
+
+        // Now drive the real binding builder. `neutral_validate_transfer`
+        // ignores the identity argument (see its `_source` parameter's own
+        // comment), so any well-formed one serves.
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let submitted = queue.submit(DecodedTicket::new(planned_packet(1))).unwrap();
+        let identity = TmemLoadSourceIdentity::new(
+            submitted.packet().identity(),
+            submitted.packet().journal().identity(),
+            submitted.identity(),
+            submitted.packet().memory_layout(),
+        );
+
+        let wide_destination = [ResourceAccess::try_new(
+            OperationId::new(9),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, 64).unwrap()),
+        )
+        .unwrap()];
+        let wide_binding =
+            neutral_validate_transfer(&wide, &wide_destination, identity, None).unwrap();
+
+        assert_eq!(
+            wide_binding.source_access_count, 8,
+            "the binding's source_access_count must be the whole run's width, not 1"
+        );
+        assert_eq!(
+            wide_binding.source_access_identity, wide_identity,
+            "the binding's source identity must be hashed over the whole run"
+        );
+        assert_ne!(
+            wide_binding.source_access_identity, narrow_identity,
+            "a collapsed identity would make an 8-row load indistinguishable from a 1-row one"
+        );
+        assert_eq!(wide_binding.source_first_access_index, 1);
     }
 
     fn load_tile_words(load_count: usize) -> Vec<u32> {
@@ -2287,8 +2779,11 @@ mod tests {
         assert_eq!(state.bytes[untouched], 0xaa);
     }
 
+    /// An odd-width RGBA32 load still routes bytes through split banks, but its
+    /// padded word is fully valid per RT64 `rt64_rdp.cpp:369-397` (`Copy the
+    /// entire word`), including exact adjacent RDRAM bytes.
     #[test]
-    fn odd_width_rgba32_tail_uses_split_bank_physical_mask() {
+    fn odd_width_rgba32_padded_word_uses_full_split_bank_mask() {
         let words = vec![
             word(SET_TEXTURE_IMAGE, 3 << 19),
             0x200,
@@ -2306,8 +2801,8 @@ mod tests {
         let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
         assert_eq!(transfer.words().len(), 1);
         let word = transfer.words()[0];
-        assert_eq!(word.defined_source_byte_mask(), 0x0f);
-        assert_eq!(physical_defined_lane_mask(word).unwrap(), 0x33);
+        assert_eq!(word.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(word).unwrap(), 0xff);
         assert!(matches!(
             word.physical(),
             TmemTransferPhysicalWord::SplitBanks { .. }
@@ -2318,33 +2813,33 @@ mod tests {
         let mut staged = state
             .stage_transfer(decoded.submitted(), &transfer)
             .unwrap();
-        let logical_prefix = [
+        let partial_old_model = [
             Some(0x10),
             Some(0x11),
+            None,
+            None,
             Some(0x12),
             Some(0x13),
             None,
             None,
-            None,
-            None,
         ];
         assert!(matches!(
-            staged.physical_word_payload(word, logical_prefix),
+            staged.physical_word_payload(word, partial_old_model),
             Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
-                expected: 0x33,
-                actual: 0x0f,
+                expected: 0xff,
+                actual: 0x33,
                 ..
             })
         ));
         let physical = [
             Some(0x10),
             Some(0x11),
-            None,
-            None,
+            Some(0x14),
+            Some(0x15),
             Some(0x12),
             Some(0x13),
-            None,
-            None,
+            Some(0x16),
+            Some(0x17),
         ];
         let payload = staged.physical_word_payload(word, physical).unwrap();
         staged.stage_word(payload).unwrap();
@@ -2371,8 +2866,11 @@ mod tests {
             .all(|effect| effect.byte_count() == 4));
     }
 
+    /// The low-level mask mapper retains its partial-mask behavior for hostile
+    /// inputs, while real Tile words are fully valid under RT64
+    /// `rt64_rdp.cpp:369-397` (`Copy the entire word`) on both row parities.
     #[test]
-    fn linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange() {
+    fn linear_mask_mapping_and_real_padded_words_follow_row_exchange() {
         let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
         let even_masks = [0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff];
         let odd_masks = [0x10, 0x30, 0x70, 0xf0, 0xf1, 0xf3, 0xf7, 0xff];
@@ -2405,21 +2903,43 @@ mod tests {
             .resource_plan()
             .bind_tmem_transfer(load(&fixture.decoded, 0))
             .unwrap();
-        let odd_tail = transfer.words()[1];
-        assert!(odd_tail.odd_row_exchange());
-        assert_eq!(odd_tail.defined_source_byte_mask(), 0x03);
-        assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0x30);
+        // **Word 3, not word 1.** This LoadTile spans two rows (`low_t = 4`,
+        // `high_t = 8`) at three words per row, so words 0-1 are
+        // tile-relative row 0 and words 2-3 are row 1; the tail word that
+        // actually takes the exchange is word 3. This used to read word 1 and
+        // assert it exchanged, which held only while the writer folded the
+        // tile's `low_t` into the exchange -- a term that is not on hardware
+        // and has been removed (see `tmem/read.rs::odd_row_exchange`).
+        //
+        // Word 1 is asserted alongside as the row-0 control, so the pair
+        // discriminates "the exchange follows the row" from "the exchange is
+        // a constant" in either direction.
+        let even_tail = transfer.words()[1];
+        assert!(
+            !even_tail.odd_row_exchange(),
+            "words 0-1 are tile-relative row 0"
+        );
+        assert_eq!(even_tail.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(even_tail).unwrap(), 0xff);
+
+        let odd_tail = transfer.words()[3];
+        assert!(
+            odd_tail.odd_row_exchange(),
+            "words 2-3 are tile-relative row 1"
+        );
+        assert_eq!(odd_tail.defined_source_byte_mask(), 0xff);
+        assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0xff);
 
         let state = PhysicalTmemState::try_new().unwrap();
         let staged = state
             .stage_transfer(fixture.decoded.submitted(), &transfer)
             .unwrap();
-        let logical_prefix = [Some(0x10), Some(0x11), None, None, None, None, None, None];
+        let old_partial_payload = [None, None, None, None, Some(0x10), Some(0x11), None, None];
         assert!(matches!(
-            staged.physical_word_payload(odd_tail, logical_prefix),
+            staged.physical_word_payload(odd_tail, old_partial_payload),
             Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
-                expected: 0x30,
-                actual: 0x03,
+                expected: 0xff,
+                actual: 0x30,
                 ..
             })
         ));
@@ -2664,8 +3184,12 @@ mod tests {
         ));
     }
 
+    /// Padded Tile words project every copied lane as valid while invalid backing
+    /// outside the writes remains content-hidden; validity, epoch, and touch still
+    /// participate in the digest. RT64 authority: `rt64_rdp.cpp:369-397`,
+    /// `Copy the entire word`.
     #[test]
-    fn canonical_projection_hides_invalid_backing_and_hashes_validity_epoch_and_touch() {
+    fn canonical_projection_hashes_full_padded_validity_epoch_touch_and_hides_backing() {
         let mut first_state = PhysicalTmemState::try_new().unwrap();
         first_state.bytes.fill(0x11);
         let mut second_state = PhysicalTmemState::try_new().unwrap();
@@ -2697,13 +3221,10 @@ mod tests {
         let baseline = completed_effect(projection).unwrap();
         let byte_count = projection.normalized_bytes.len() as u32;
         assert_eq!(baseline.byte_count(), byte_count);
-        assert!(
-            projection
-                .validity
-                .iter()
-                .filter(|valid| **valid == 1)
-                .count()
-                < baseline.byte_count() as usize
+        assert!(projection.validity.iter().all(|valid| *valid == 1));
+        assert_eq!(
+            projection.normalized_bytes,
+            (0x20_u8..0x30).collect::<Vec<_>>().into_boxed_slice()
         );
         assert_eq!(
             baseline.content(),
@@ -3039,6 +3560,123 @@ mod tests {
         assert_eq!(state.generation(), 0);
     }
 
+    /// The relaxation `validate_backend_effects` took for the mixed
+    /// fill+TMEM card, tested directly at the function -- because no
+    /// legitimately-constructed `BackendEffectReport` can express these
+    /// shapes (`try_new` validates against the packet's own journal first),
+    /// and the mixed-packet path that exercises the relaxation lives two
+    /// crates up.
+    ///
+    /// The relaxation is: `reported` may be a strict SUPERSET of `proposed`,
+    /// in the journal's own order, so a composed packet's interleaved
+    /// `RenderTarget` writes do not read as this transaction's omission.
+    /// Every other divergence must still be a named rejection -- these
+    /// cases are what proves the weakening was surgical rather than a hole.
+    ///
+    /// Each case was confirmed to be a real kill: removing the
+    /// `missing proposed write` arm left the whole 4990-test suite green
+    /// before this test existed (a measured mutation survivor), which is
+    /// why it is pinned here.
+    #[test]
+    fn backend_effects_admit_a_superset_in_order_and_reject_everything_else() {
+        fn tmem_write(operation: u32, start: u32, domain: &[u8]) -> CompletedWrite {
+            CompletedWrite::try_new(
+                ResourceAccess::try_new(
+                    OperationId::new(operation),
+                    AccessMode::Write,
+                    AccessPurpose::TmemLoadDestination,
+                    ResourceRegion::Tmem(TmemRange::try_new(start, start + 8).unwrap()),
+                )
+                .unwrap(),
+                8,
+                ContentDigest::hash(domain, &[]),
+            )
+            .unwrap()
+        }
+        fn render_target_write(operation: u32) -> CompletedWrite {
+            let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+            CompletedWrite::try_new(
+                ResourceAccess::try_new(
+                    OperationId::new(operation),
+                    AccessMode::Write,
+                    AccessPurpose::RenderTarget,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::ColorFramebuffer,
+                        range: layout.range(0x2000, 0x2010).unwrap(),
+                    },
+                )
+                .unwrap(),
+                16,
+                ContentDigest::hash(b"fill-bytes", &[]),
+            )
+            .unwrap()
+        }
+
+        let first = tmem_write(1, 0, b"first");
+        let second = tmem_write(3, 8, b"second");
+        let proposed = vec![first, second];
+        let fill = render_target_write(2);
+
+        // Exactly the proposed list: accepted, as before the relaxation.
+        assert!(validate_backend_effects(&proposed, &proposed).is_ok());
+
+        // The relaxation itself: a fill's write INTERLEAVED between the two
+        // TMEM writes, in journal order. This is the shape a composed
+        // fill+TMEM packet reports, and the whole point of the change.
+        assert!(
+            validate_backend_effects(&[first, fill, second], &proposed).is_ok(),
+            "a superset carrying another source's write between two proposed ones, in order, \
+             must be admitted -- this is exactly the composed fill+TMEM report"
+        );
+        // And with the fill's write before and after the pair.
+        assert!(validate_backend_effects(&[fill, first, second], &proposed).is_ok());
+        assert!(validate_backend_effects(&[first, second, fill], &proposed).is_ok());
+
+        // A MISSING proposed write is still rejected by name. This is the
+        // arm whose removal survived the suite before this test existed.
+        assert!(matches!(
+            validate_backend_effects(&[first, fill], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write"
+            })
+        ));
+        assert!(matches!(
+            validate_backend_effects(&[fill], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write count"
+            })
+        ));
+
+        // A REORDER of two proposed writes is still rejected. The walk is
+        // order-preserving: once `second` is matched, `first` can no longer
+        // be found ahead of the cursor.
+        assert!(matches!(
+            validate_backend_effects(&[second, first], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write"
+            })
+        ));
+
+        // WRONG CONTENT at a matched access is still rejected.
+        let second_wrong = tmem_write(3, 8, b"tampered");
+        assert!(matches!(
+            validate_backend_effects(&[first, second_wrong], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write content"
+            })
+        ));
+
+        // A DUPLICATE of a proposed access is still rejected -- the same
+        // TMEM range written twice is not a superset, it is ambiguity about
+        // which write this transaction vouched for.
+        assert!(matches!(
+            validate_backend_effects(&[first, second, second], &proposed),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "duplicate proposed access"
+            })
+        ));
+    }
+
     #[test]
     fn successor_rejects_mismatched_backend_write_content() {
         let state = PhysicalTmemState::try_new().unwrap();
@@ -3249,8 +3887,8 @@ mod tests {
         fn direct_tile_masks_are_unchanged_by_the_destination_mask_split() {
             // Block/Tile: source and destination masks coincide, including
             // the odd-row partial tail and the split-bank RGBA32 case
-            // already covered by `linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange`
-            // and `odd_width_rgba32_tail_uses_split_bank_physical_mask`. This
+            // already covered by `linear_mask_mapping_and_real_padded_words_follow_row_exchange`
+            // and `odd_width_rgba32_padded_word_uses_full_split_bank_mask`. This
             // is a targeted regression that word minting itself (via
             // `raw_dpc::transfer_record`) still produces `source ==
             // destination` for a non-TLUT kind, now that both masks are
@@ -3269,51 +3907,98 @@ mod tests {
             }
         }
 
+        // Both hostiles below forge a `TmemTransferWord` whose destination
+        // mask violates one of the two minting invariants. Production code
+        // cannot reach either shape: `raw_dpc::transfer_record`
+        // (`raw_dpc/mod.rs:599`) always sources both masks from the same
+        // `TmemTransferPlan`, and `neutral_transfer_word` (`physical.rs:1340`)
+        // is a field-for-field copy of an already-validated neutral word.
+        //
+        // `TmemTransferWord::new` carries a matching pair of `debug_assert!`s
+        // (`tmem/types.rs:829-841`), but those are compiled out under
+        // `-C debug-assertions=off`, so a `#[should_panic]` test on them
+        // would assert a build-profile-dependent property -- precisely what
+        // `rt64_common.rs:246-251` declines to do. The invariant itself is
+        // *not* profile-dependent: `physical_defined_lane_mask`
+        // (`physical.rs:1578-1586`) re-checks both conditions unconditionally
+        // and returns `Err(DestinationPlanMismatch)`, and every consumption
+        // path runs it -- `validate_physical_plan` (`physical.rs:1547`) over
+        // every word of every staged transfer, and
+        // `DefinedPhysicalTmemWordBytes::try_from_physical_lanes`
+        // (`physical.rs:83`) on every payload. These tests therefore assert
+        // the release-surviving `Result` rejection, which holds in both
+        // profiles, rather than the debug-only panic.
+
         #[test]
-        #[should_panic(expected = "cannot claim fewer defined destination bytes")]
-        fn forged_mismatched_masks_are_rejected_by_the_private_constructor() {
-            // Production code cannot mint a `TmemTransferWord` at all except
-            // through `raw_dpc::transfer_record`, which always sources both
-            // masks from the same `TmemTransferPlan`. This forged combination
-            // is reachable only through this crate-private constructor, and
-            // its own `debug_assert!` invariant check catches it at mint
-            // time -- stronger than a runtime `Result`, and exactly why the
-            // check lives in the constructor rather than only in
-            // `physical_defined_lane_mask`.
+        fn forged_mismatched_masks_are_rejected_by_the_lane_mask_check() {
             let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
             // destination mask (0x01) claims fewer defined bytes than source
             // (0x03) -- forbidden for every current load kind.
-            let _ = TmemTransferWord::new(
-                0,
-                0,
-                0,
-                0,
-                0x03,
-                0x01,
-                0,
-                0,
-                false,
-                TmemTransferPhysicalWord::Linear(range),
-            );
+            let forged = forge_word(0x03, 0x01, range);
+            assert!(matches!(
+                physical_defined_lane_mask(forged),
+                Err(PhysicalTmemError::DestinationPlanMismatch)
+            ));
         }
 
         #[test]
-        #[should_panic(expected = "must be a nonzero low-bit prefix")]
         fn non_prefix_destination_mask_is_rejected() {
             let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
             // 0x05 (bits 0 and 2) is not a contiguous low-bit prefix.
-            let _ = TmemTransferWord::new(
-                0,
-                0,
-                0,
-                0,
-                0x01,
-                0x05,
-                0,
-                0,
-                false,
-                TmemTransferPhysicalWord::Linear(range),
-            );
+            let forged = forge_word(0x01, 0x05, range);
+            assert!(matches!(
+                physical_defined_lane_mask(forged),
+                Err(PhysicalTmemError::DestinationPlanMismatch)
+            ));
+        }
+
+        /// Mints a deliberately invariant-violating word for the two hostiles
+        /// above. Only ever called with mask pairs that the constructor's
+        /// `debug_assert!`s reject, so it must not run under debug
+        /// assertions; both callers assert on the release-surviving
+        /// `physical_defined_lane_mask` rejection instead. The `cfg!` guard
+        /// keeps the *test count* identical in both profiles (unlike
+        /// `#[cfg(not(debug_assertions))]` on the tests themselves) while
+        /// still exercising the real check whenever the constructor would
+        /// not abort first.
+        fn forge_word(
+            source_mask: u8,
+            destination_mask: u8,
+            range: fn64_render_ir::TmemRange,
+        ) -> TmemTransferWord {
+            if cfg!(debug_assertions) {
+                // Mint a valid word, then overwrite the masks so the
+                // constructor's debug-only asserts never observe the forged
+                // pair. Field access is legal here: `tests` is a descendant
+                // module of the crate that declares `TmemTransferWord`.
+                let mut word = TmemTransferWord::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xff,
+                    0xff,
+                    0,
+                    0,
+                    false,
+                    TmemTransferPhysicalWord::Linear(range),
+                );
+                word.forge_masks_for_test(source_mask, destination_mask);
+                word
+            } else {
+                TmemTransferWord::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_mask,
+                    destination_mask,
+                    0,
+                    0,
+                    false,
+                    TmemTransferPhysicalWord::Linear(range),
+                )
+            }
         }
     }
 }

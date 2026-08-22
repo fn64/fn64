@@ -215,7 +215,20 @@ fn decode_load_block(
         .ok_or(TmemWireError::new(
             "LoadBlock source texel offset overflows",
         ))?;
-    let range = source_range(layout, image, start_texel, texels, "LoadBlock source range")?;
+    // Padded to whole 64-bit words: hardware copies whole words, so the last
+    // word of the block reads its remaining bytes from adjacent RDRAM. See
+    // `source_row_range`.
+    let block_bytes = texel_bytes(image.size(), texels)?
+        .div_ceil(8)
+        .checked_mul(8)
+        .ok_or(TmemWireError::new("LoadBlock padded byte count overflows"))?;
+    let range = source_row_range(
+        layout,
+        image,
+        start_texel,
+        block_bytes,
+        "LoadBlock source range",
+    )?;
     let (source_plan, mut accesses) = source_accesses(
         source_identity,
         first_access_index,
@@ -285,22 +298,21 @@ fn decode_load_tile(
         ));
     }
     let width = high_s - low_s + 1;
-    let ranges = if low_s == 0 && width == u32::from(image.width()) {
-        let first = low_t
-            .checked_mul(u32::from(image.width()))
-            .ok_or(TmemWireError::new("LoadTile source texel offset overflows"))?;
-        let rows = high_t - low_t + 1;
-        let texels = rows
-            .checked_mul(width)
-            .ok_or(TmemWireError::new("LoadTile source texel count overflows"))?;
-        vec![source_range(
-            layout,
-            image,
-            first,
-            texels,
-            "LoadTile source range",
-        )?]
-    } else {
+    // **One padded access PER ROW, including the full-width case.**
+    //
+    // The collapsed single-range form this used for full-width loads cannot
+    // express row-local padding: each row's last 64-bit word reads bytes
+    // beyond that row's logical texels, so the reads are per-row spans with
+    // gaps, not one contiguous run. Hardware drives `wordsPerRow` whole-word
+    // copies per row (`rt64_rdp.cpp:459-468`), which is exactly this shape.
+    let row_bytes = texel_bytes(image.size(), width)?;
+    let padded_row_bytes = row_bytes
+        .div_ceil(8)
+        .checked_mul(8)
+        .ok_or(TmemWireError::new(
+            "LoadTile padded row byte count overflows",
+        ))?;
+    let ranges = {
         let rows = usize::try_from(high_t - low_t + 1)
             .map_err(|_| TmemWireError::new("LoadTile row count overflows usize"))?;
         if rows > MAX_RESOURCE_ACCESSES {
@@ -314,7 +326,13 @@ fn decode_load_tile(
                     .checked_mul(u32::from(image.width()))
                     .and_then(|value| value.checked_add(low_s))
                     .ok_or(TmemWireError::new("LoadTile source texel offset overflows"))?;
-                source_range(layout, image, first, width, "LoadTile source row")
+                source_row_range(
+                    layout,
+                    image,
+                    first,
+                    padded_row_bytes,
+                    "LoadTile source row",
+                )
             })
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -363,22 +381,31 @@ fn decode_load_tlut(
             "LoadTLUT destination tile is outside high TMEM",
         ));
     }
-    // Public libultra `gbi.h` `gDPLoadTLUTCmd`: the macro always programs a
-    // 16-bit-per-entry palette image, and this module's transfer-shape
-    // (`entries.get() * 2` source bytes) and destination projection are
-    // sized for exactly that. Reject any other `SetTextureImage` or tile
-    // descriptor size explicitly rather than silently mis-sizing the
-    // transfer -- see `AGENTS.md`'s "loud traps, no silent shrugs".
+    // Public libultra `gbi.h`, the `gDPLoadTLUT_pal16` / `gDPLoadTLUT_pal256`
+    // / `gDPLoadTLUT` macro bodies: every one emits
+    // `gDPSetTextureImage(..., G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, dram)`, so the
+    // SOURCE image is 16-bit per palette entry and this module's
+    // transfer-shape (`entries.get() * 2` source bytes) is sized for exactly
+    // that. Reject any other `SetTextureImage` size explicitly rather than
+    // silently mis-sizing the transfer -- `AGENTS.md`'s "loud traps, no
+    // silent shrugs".
     if image.size() != PixelSize::Bits16 {
         return Err(TmemWireError::new(
             "LoadTLUT public macro requires a 16-bit SetTextureImage source",
         ));
     }
-    if descriptor.size() != PixelSize::Bits16 {
-        return Err(TmemWireError::new(
-            "LoadTLUT public macro requires a 16-bit destination tile descriptor",
-        ));
-    }
+    // The DESTINATION tile descriptor's `siz` is deliberately NOT constrained
+    // here. The same macro bodies emit `gDPSetTile(pkt, 0, 0, 0, tmem,
+    // G_TX_LOADTILE, ...)`, whose second positional argument is `siz`
+    // (`gDPSetTile(pkt, fmt, siz, line, tmem, tile, ...)`), so the canonical
+    // destination `siz` is `0` == `G_IM_SIZ_4b` -- never 16-bit. A previous
+    // revision required `Bits16` here and refused every canonical
+    // `gDPLoadTLUT_pal16`; the load tile describes a TMEM region for a
+    // quadricated palette write, not the palette's own pixel format, and no
+    // code consumes the field for this kind: `transfer_shape`'s `Tlut` arm
+    // sizes from `entries` and `image.size()`, and
+    // `project_tmem_transfer_word`'s `Tlut` arm reads only `descriptor.tmem()`
+    // and `line_words()`.
     let low_s = (w0 >> 12) & 0x0fff;
     let low_t = w0 & 0x0fff;
     let count_fraction = (w1 >> 12) & 3;
@@ -636,8 +663,29 @@ fn transfer_shape(
     };
     let (logical_source_bytes, transfer_words, undefined_padding_bytes, words_per_row, row_count) =
         match kind {
-            TmemLoadKind::Block { .. } => {
-                let logical = source.total_bytes();
+            TmemLoadKind::Block {
+                source_s, high_s, ..
+            } => {
+                // **Derived from the COMMAND, not from `source.total_bytes()`.**
+                //
+                // The two are equal today, and the invariant below still
+                // asserts it. But the source plan is about to carry PADDED DMA
+                // bytes rather than logical texel bytes -- hardware copies
+                // whole 64-bit words (`rt64_rdp.cpp`'s `loadWord`: "Copy the
+                // entire word", `for i in 0..8`) -- and a logical length read
+                // back out of the padded plan would be circular. The Tile arm
+                // below already derives its own geometry this way; this makes
+                // Block match, with no behaviour change.
+                //
+                // Same inclusive span the decoder computes for the source
+                // range (`decode_load_block`: `high_s - source_s + 1`).
+                let texels = u32::from(
+                    high_s
+                        .raw()
+                        .checked_sub(source_s.raw())
+                        .ok_or(TmemWireError::new("LoadBlock source span is inverted"))?,
+                ) + 1;
+                let logical = texel_bytes(image.size(), texels)?;
                 let words = logical.div_ceil(8);
                 let written = words.checked_mul(8).ok_or(TmemWireError::new(
                     "LoadBlock transfer byte count overflows",
@@ -694,9 +742,23 @@ fn transfer_shape(
                 (logical, words, 0, words, 1)
             }
         };
-    if logical_source_bytes != source.total_bytes() {
+    // **The source plan carries what the DMA READS, and that is kind-specific.**
+    //
+    // Block and Tile read whole 64-bit words -- `logical` plus
+    // `undefined_padding_bytes` -- because hardware copies whole words and a
+    // short row tail still reads the adjacent RDRAM
+    // (`rt64_rdp.cpp:369-397`'s "Copy the entire word"). TLUT is the
+    // exception: it captures exactly two source bytes per entry and derives
+    // the other six by quadrication, so its plan stays logical.
+    let expected_source_bytes = match kind {
+        TmemLoadKind::Tlut { .. } => logical_source_bytes,
+        TmemLoadKind::Block { .. } | TmemLoadKind::Tile { .. } => logical_source_bytes
+            .checked_add(undefined_padding_bytes)
+            .ok_or(TmemWireError::new("TMEM padded source bytes overflow"))?,
+    };
+    if expected_source_bytes != source.total_bytes() {
         return Err(TmemWireError::new(
-            "TMEM logical transfer bytes differ from the exact source plan",
+            "TMEM transfer bytes differ from the exact source plan",
         ));
     }
     let transfer_words = u16::try_from(transfer_words)
@@ -771,6 +833,58 @@ fn texel_bytes(size: PixelSize, texels: u32) -> Result<u32, TmemWireError> {
             .checked_mul(size.bytes_per_pixel().expect("non-four-bit size has bytes"))
             .ok_or(TmemWireError::new("TMEM logical byte count overflows")),
     }
+}
+
+/// The DMA source range for one transfer row, in BYTES.
+///
+/// **Hardware copies whole 64-bit words**, so a row whose logical texels do
+/// not fill its last word still reads that word's remaining bytes from the
+/// adjacent RDRAM -- verified in the pinned RT64 oracle's live loader, where
+/// `loadWord` is commented "Copy the entire word" and loops `i < 8`
+/// (`src/hle/rt64_rdp.cpp:369-397`), driven `wordsPerRow` times per row
+/// (`:459-468`). There is no partial-tail concept and no clamp.
+///
+/// The byte count is therefore `words * 8`, never the logical texel span.
+/// A padded word that runs past installed RDRAM must FAIL rather than clamp:
+/// clamping would hand the executor fewer than eight bytes and recreate the
+/// partial-word ambiguity this exists to remove. `PhysicalMemoryLayout::range`
+/// supplies that rejection.
+fn source_row_range(
+    layout: PhysicalMemoryLayout,
+    image: TextureImage,
+    first_texel: u32,
+    byte_count: u32,
+    context: &'static str,
+) -> Result<PhysicalRange, TmemWireError> {
+    let bytes_per_texel = match image.size() {
+        PixelSize::Bits4 => {
+            return Err(TmemWireError::new(
+                "direct four-bit TMEM loads are unsupported; load through a public 16-bit form",
+            ));
+        }
+        size => size
+            .bytes_per_pixel()
+            .expect("only four-bit pixels are sub-byte"),
+    };
+    let first_byte = first_texel
+        .checked_mul(bytes_per_texel)
+        .ok_or(TmemWireError::new("TMEM load source byte offset overflows"))?;
+    let end_byte = first_byte
+        .checked_add(byte_count)
+        .ok_or(TmemWireError::new("TMEM load source byte end overflows"))?;
+    let start = image
+        .address()
+        .get()
+        .checked_add(first_byte)
+        .ok_or(TmemWireError::new(context))?;
+    let end = image
+        .address()
+        .get()
+        .checked_add(end_byte)
+        .ok_or(TmemWireError::new(context))?;
+    layout
+        .range(start, end)
+        .map_err(|_| TmemWireError::new(context))
 }
 
 fn source_range(

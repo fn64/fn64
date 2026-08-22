@@ -407,14 +407,14 @@ pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST_ENTRY_POINT: &str =
 // and assert they still match this frozen literal -- the public manifest
 // constant itself carries the real value, not a placeholder.
 pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256: [u8; 32] = [
-    0x62, 0x83, 0xae, 0xf7, 0xef, 0x4d, 0x5d, 0xe8, 0x76, 0xd2, 0xb7, 0x47, 0xe4, 0x98, 0x93, 0x61,
-    0x43, 0x75, 0x08, 0xef, 0x5f, 0xaa, 0xab, 0xa4, 0xa9, 0x07, 0x95, 0xdd, 0x26, 0xb9, 0x82, 0xd4,
+    0x0d, 0xa6, 0xd3, 0xe0, 0x58, 0xdf, 0xd4, 0x34, 0x71, 0x34, 0x3a, 0xef, 0xeb, 0x9d, 0xed, 0x31,
+    0x31, 0x59, 0x09, 0xb0, 0x9b, 0xeb, 0x14, 0x5c, 0x45, 0x4e, 0x44, 0xa1, 0x3b, 0xe8, 0x0d, 0x8d,
 ];
 pub const TRIANGLE_PIPELINE_FRAGMENT_FIXTURE_SHA256: [u8; 32] = [
-    0xe0, 0x91, 0xe0, 0x78, 0x73, 0xc2, 0x74, 0x7f, 0x52, 0x5f, 0x9e, 0x0e, 0xc6, 0xc9, 0x71, 0xbb,
-    0xc0, 0xb9, 0xeb, 0x54, 0x2d, 0xbb, 0x5c, 0xce, 0x75, 0x34, 0x3e, 0x56, 0xce, 0x2f, 0xc1, 0x59,
+    0xbf, 0x1d, 0x48, 0x22, 0xbe, 0xef, 0x4b, 0xcc, 0x8d, 0xc8, 0x57, 0xc7, 0x48, 0xbf, 0x6b, 0x0a,
+    0x5a, 0x4d, 0xbf, 0x67, 0xbf, 0x27, 0xed, 0xda, 0x3d, 0xd0, 0x71, 0x15, 0x4f, 0x62, 0x82, 0x7d,
 ];
-pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 86_405;
+pub const TRIANGLE_PIPELINE_FRAGMENT_SOURCE_BYTES: u32 = 101_425;
 
 pub const TRIANGLE_PIPELINE_FRAGMENT_MANIFEST: RuntimeShaderComponentManifest =
     RuntimeShaderComponentManifest {
@@ -1260,6 +1260,72 @@ mod tests {
         .unwrap();
     }
 
+    fn hex(bytes: [u8; 32]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").unwrap();
+            out
+        })
+    }
+
+    /// `deterministic_fixture_is_exact_and_oracle_derived` already recomputes
+    /// all four DirectTexelDecodeV1 identities, but it compares against
+    /// `[u8; 32]` literals. `docs/RT64-RUNTIME-SHADER-CORPUS.md` republishes
+    /// the same identities as hex text, and nothing tied the two
+    /// representations together -- so an identity could be re-frozen in code
+    /// while the doc kept asserting the stale digest as evidence. This test
+    /// owns the doc's hex rows directly: it re-derives each digest from
+    /// committed inputs, renders it as hex, and requires the published table
+    /// to contain exactly that string.
+    #[test]
+    fn published_corpus_doc_cites_the_recomputed_direct_texel_identities() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/RT64-RUNTIME-SHADER-CORPUS.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", doc_path.display()));
+
+        // The published hex appears here as source text on purpose. It makes
+        // the recomputation checkable against a literal a reader can compare
+        // to the doc by eye, and it is what `scripts/lint-docs.py` greps for
+        // when it asks whether a documented hash is owned by a test.
+        let fixture = fixture();
+        for (row, actual, published) in [
+            (
+                "source SHA-256",
+                digest(DIRECT_TEXEL_DECODE_WGSL.as_bytes()),
+                "2f59380f62db77f1c11b81e149894947d01ad8c812ee11e3771125317fff3880",
+            ),
+            (
+                "fixture SHA-256",
+                fixture.identity,
+                "f24aca795ae8954ae362280cd91c75017623bf7db1601688e9bc2775dcfb7d37",
+            ),
+            (
+                "input SHA-256",
+                digest(&fixture.input_bytes),
+                "6199dd74587f3a8ca86e24fbab5949bb0dcb04db8c4c47f3e9a65504edd9c274",
+            ),
+            (
+                "expected-output SHA-256",
+                digest(&fixture.expected_bytes),
+                "89bce88b397fa2a5e08eb1549498eba49465368968ff844ed0e42e407c17114f",
+            ),
+        ] {
+            assert_eq!(
+                hex(actual),
+                published,
+                "DirectTexelDecodeV1 {row} recomputed from committed inputs no \
+                 longer equals the frozen identity",
+            );
+            let expected = format!("| {row} | `{published}` |");
+            assert!(
+                doc.lines().any(|line| line.trim() == expected),
+                "docs/RT64-RUNTIME-SHADER-CORPUS.md must publish the recomputed \
+                 DirectTexelDecodeV1 {row} row as `{expected}`",
+            );
+        }
+    }
+
     #[test]
     fn typed_profile_rejects_each_insufficient_limit() {
         let profile = DirectTexelDecodeDeviceProfile;
@@ -1481,7 +1547,9 @@ mod tests {
         )?;
         let profile = DirectTexelDecodeDeviceProfile;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            backends: crate::device::adapter_selection::backends_for_request(
+                wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            ),
             flags: wgpu::InstanceFlags::VALIDATION,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
@@ -1496,6 +1564,7 @@ mod tests {
             .map_err(|error| {
                 DirectTexelDecodeNativeError::NativeAdapterUnavailable(error.to_string())
             })?;
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         let validated = profile
             .validate_adapter(adapter.features(), &adapter.limits())
             .map_err(DirectTexelDecodeNativeError::Profile)?;

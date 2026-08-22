@@ -35,11 +35,17 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use fn64_recomp::{load_config, Function, RecompConfig, Section};
 use fn64_cpu_runtime::{decode, Instruction};
-use fn64_cpu_runtime_codegen::{
-    emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
+use fn64_cpu_runtime_codegen::swallowed_entries::{
+    apply_gap_adoptions, apply_repairs, cross_check_region, CodeRegion, CrossCheck,
+    DumpFunction,
 };
+use fn64_cpu_runtime_codegen::{
+    emit_function_resolved, emit_lookup_dispatcher,
+    module::{audit_undispatchable_call_targets, SymbolTable, UndispatchableCallTarget},
+    FuncInput, ModuleFunc,
+};
+use fn64_recomp::{load_config, Function, InstructionPatch, RecompConfig, Section};
 
 fn main() -> std::process::ExitCode {
     let args = match Args::parse() {
@@ -94,6 +100,16 @@ fn main() -> std::process::ExitCode {
         },
         None => HashSet::new(),
     };
+
+    // Cross-check the pre-baked symbol dump against the ROM's own `jal`
+    // evidence BEFORE recompiling. A dump that swallowed a real function
+    // entry inside a preceding function's declared size produces a runtime
+    // `lookup: no recompiled function ... at vram` trap with no build-time
+    // signal at all; this turns that into a named build-time diagnostic, and
+    // repairs the entries whose containing function provably returned first.
+    let mut cfg = cfg;
+    let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+    eprint!("{diagnostic}");
 
     let report = run(&cfg, &rom, &force_recompile);
 
@@ -266,6 +282,15 @@ struct Report {
     results: Vec<FuncResult>,
     lookup_sites: usize,
     recompiled_symbols: usize,
+    /// Vrams claimed by more than one overlay bank, with every claimant's
+    /// `(section index, name)`. These are absent from the flat dispatch table
+    /// by construction; the report names them so a run that reads
+    /// "99%+ linkable" cannot hide bodies that no direct call can reach.
+    banked_claimants: Vec<(u32, Vec<(usize, String)>)>,
+    /// Static call targets that no emitted table can dispatch (see
+    /// `audit_undispatchable_call_targets`). Non-empty means the generated
+    /// crate contains a `lookup()` that WILL trap if the guest takes it.
+    undispatchable: Vec<UndispatchableCallTarget>,
 }
 
 /// Enough buckets to keep generated codegen units balanced without producing
@@ -276,6 +301,7 @@ const RECOMPILED_PART_COUNT: usize = 64;
 const GENERATED_USE: &str = "use fn64_cpu_runtime::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n";
 
 fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Report {
+    assert_every_instruction_patch_is_reachable(cfg);
     // The bootstrap config's stub scan treats every BREAK as privileged. MIPS
     // compilers also emit two rigid BREAK shapes after integer DIV/DIVU for
     // divide-by-zero and INT_MIN/-1. Recognize the complete guard sequences,
@@ -289,7 +315,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                 if !cfg.patches.stubs.iter().any(|name| name == &func.name) {
                     return None;
                 }
-                let words = read_func_words(rom, section, func)?;
+                let words = read_func_words(rom, section, func, &cfg.patches.instructions)?;
                 let instrs: Vec<_> = words.into_iter().map(decode).collect();
                 compiler_div_guards_only(&instrs).then_some(func.name.as_str())
             })
@@ -307,24 +333,33 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
     // Runtime-trap functions are absent from the recompiled table: direct JAL and
     // computed JALR calls to one must both use the host resolver, never bind
     // to a recompiled panic body merely because its name is statically known.
-    let symbols = SymbolTable::from_entries(cfg.sections.iter().flat_map(|s| {
-        s.functions.iter().filter_map(|f| {
-            if stubbed.contains(f.name.as_str()) || ignored.contains(f.name.as_str()) {
-                return None;
-            }
-            let forced = force_recompile.contains(f.name.as_str())
-                || auto_div_guards.contains(f.name.as_str());
-            let words = read_func_words(rom, s, f)?;
-            let mut decoded = words.iter().map(|&word| decode(word));
-            decoded
-                .all(|instr| {
-                    !matches!(instr, Instruction::Unknown { .. })
-                        && (forced && matches!(instr, Instruction::Break { .. })
-                            || trap_kind(&instr).is_none())
-                })
-                .then(|| (f.name.clone(), f.vram))
-        })
-    }));
+    // Section index is carried through: overlay banks share a VRAM window, so
+    // a collided vram is only dispatchable if the emitted table knows which
+    // section owns each claimant. The index is the config's section order,
+    // which is also `RECOMPILED_SECTION_GEOMETRY`'s emission order and the
+    // registration order the host's `SectionRegistry` assigns.
+    let symbols = SymbolTable::from_section_entries(cfg.sections.iter().enumerate().flat_map(
+        |(section_index, s)| {
+            let (stubbed, ignored, auto_div_guards, force_recompile) =
+                (&stubbed, &ignored, &auto_div_guards, &force_recompile);
+            s.functions.iter().filter_map(move |f| {
+                if stubbed.contains(f.name.as_str()) || ignored.contains(f.name.as_str()) {
+                    return None;
+                }
+                let forced = force_recompile.contains(f.name.as_str())
+                    || auto_div_guards.contains(f.name.as_str());
+                let words = read_func_words(rom, s, f, &cfg.patches.instructions)?;
+                let mut decoded = words.iter().map(|&word| decode(word));
+                decoded
+                    .all(|instr| {
+                        !matches!(instr, Instruction::Unknown { .. })
+                            && (forced && matches!(instr, Instruction::Break { .. })
+                                || trap_kind(&instr).is_none())
+                    })
+                    .then(|| (section_index, f.name.clone(), f.vram))
+            })
+        },
+    ));
 
     let mut module = String::new();
     module.push_str("// Generated by fn64-cpu-runtime whole-ROM driver (recompile_rom).\n");
@@ -343,6 +378,9 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
 
     let mut results = Vec::new();
     let mut lookup_sites = 0usize;
+    // Every body actually emitted, retained so the undispatchable-target
+    // audit can test each static call against the emitted span set.
+    let mut emitted_bodies: Vec<(String, u32, Vec<u32>)> = Vec::new();
     let mut part_bodies = vec![String::new(); RECOMPILED_PART_COUNT];
 
     for section in &cfg.sections {
@@ -355,7 +393,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                 results.push(FuncResult::simple(func, section, Outcome::Ignored));
                 continue;
             }
-            let words = match read_func_words(rom, section, func) {
+            let words = match read_func_words(rom, section, func, &cfg.patches.instructions) {
                 Some(w) => w,
                 None => {
                     results.push(FuncResult::simple(func, section, Outcome::RomRange));
@@ -423,6 +461,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                     .expect("RECOMPILED_PART_COUNT is non-zero");
                 part_bodies[bucket].push_str(&body);
                 part_bodies[bucket].push('\n');
+                emitted_bodies.push((func.name.clone(), func.vram, words.clone()));
             }
 
             let mut trap_kinds = trap_kinds;
@@ -473,12 +512,38 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
         render_generated_lib(&symbols, &cfg.sections),
     ));
 
+    let undispatchable = {
+        let funcs: Vec<ModuleFunc> = emitted_bodies
+            .iter()
+            .map(|(name, vram, words)| ModuleFunc {
+                name,
+                vram: *vram,
+                words,
+            })
+            .collect();
+        audit_undispatchable_call_targets(&funcs, &symbols)
+    };
+
     Report {
         module,
         crate_files,
         results,
         lookup_sites,
+        undispatchable,
         recompiled_symbols: symbols.len(),
+        banked_claimants: symbols
+            .ambiguous_claimants()
+            .into_iter()
+            .map(|(vram, claimants)| {
+                (
+                    vram,
+                    claimants
+                        .into_iter()
+                        .map(|(section, name)| (section, name.to_string()))
+                        .collect(),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -659,6 +724,108 @@ impl Report {
             clean + trap,
             100.0 * (clean + trap) as f64 / total as f64
         ));
+        let banked_bodies: usize = self.banked_claimants.iter().map(|(_, c)| c.len()).sum();
+        s.push_str(&format!(
+            "bank-ambiguous vrams: {} ({banked_bodies} bodies) -- dispatchable only via \
+             residency, absent from the flat table\n",
+            self.banked_claimants.len(),
+        ));
+        s
+    }
+
+    /// Name every static call target the emitted crate cannot dispatch.
+    ///
+    /// A row here is a latent mid-run abort: the body at that vram IS emitted,
+    /// but only as an interior `match` arm of the function whose declared size
+    /// covers it, so the entry-keyed dispatch tables cannot name it and the
+    /// emitted `lookup()` traps the first time the guest takes that call.
+    /// It is a symbol-boundary defect, and this table is where it becomes
+    /// visible at build time rather than at an arbitrary VI swap.
+    fn render_undispatchable_targets(&self) -> String {
+        let mut s = String::new();
+        s.push_str("## Undispatchable static call targets (latent runtime traps)\n\n");
+        if self.undispatchable.is_empty() {
+            s.push_str(
+                "None. Every static `JAL`/`J` target in this config is either a declared \
+                 function entry, a bank-ambiguous entry reachable through overlay residency, \
+                 or an address outside every emitted body (a host shim).\n\n",
+            );
+            return s;
+        }
+        s.push_str(&format!(
+            "**{} targets.** Each is the destination of a plain static `JAL`/`J` immediate \
+             whose vram carries NO function symbol, yet falls strictly inside the declared \
+             span of a function that is emitted. The instructions at that address are \
+             therefore emitted only as interior `match` arms, and neither `LOOKUP_TABLE` nor \
+             `BANKED_LOOKUP_TABLE` can hold the address because both are keyed on function \
+             ENTRY vrams. The emitted `lookup()` will call \
+             `trap_unsupported` the first time the guest takes this path -- an abort whose \
+             timing depends entirely on guest input, not on the build.\n\n\
+             The repair is upstream, in the symbol source: declare the target as its own \
+             function entry so the containing function's size no longer swallows it.\n\n",
+            self.undispatchable.len(),
+        ));
+        s.push_str("| target | swallowed by | callers |\n|---|---|---|\n");
+        for f in &self.undispatchable {
+            s.push_str(&format!(
+                "| `{:#010X}` | `{}` @ `{:#010X}` | {} |\n",
+                f.target,
+                f.containing_function,
+                f.containing_vram,
+                f.callers
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        s.push('\n');
+        s
+    }
+
+    /// Name every vram two or more overlay banks claim.
+    ///
+    /// The "linkable" percentage above counts a body as linkable when it
+    /// recompiled cleanly, which a bank-collided body does. What it cannot
+    /// say is whether a *call* can reach that body: two differently-named
+    /// functions at one vram are dropped from the flat `LOOKUP_TABLE`, so a
+    /// report that stopped at the percentage read clean while hiding the gap.
+    /// These rows are that gap, stated.
+    fn render_bank_ambiguity(&self) -> String {
+        let mut s = String::new();
+        s.push_str("## Bank-ambiguous vrams (dispatchable only via overlay residency)\n\n");
+        if self.banked_claimants.is_empty() {
+            s.push_str(
+                "None. Every recompiled vram in this config is claimed by exactly one body, so \
+                 the flat `LOOKUP_TABLE` expresses the whole dispatch surface.\n\n",
+            );
+            return s;
+        }
+        let bodies: usize = self.banked_claimants.iter().map(|(_, c)| c.len()).sum();
+        s.push_str(&format!(
+            "**{} vrams, {bodies} bodies.** Overlay banks share a VRAM window, so these \
+             addresses are claimed by more than one differently-named function and are \
+             deliberately absent from the flat `LOOKUP_TABLE` -- a flat `vram -> fn` array \
+             cannot say which bank is resident. They are emitted instead into \
+             `BANKED_LOOKUP_TABLE` and resolved at call time by \
+             `fn64_cpu_runtime::resolve_banked_function` against the section residency the \
+             host's `SectionRegistry` tracks from the guest's own DMA. A call arriving while \
+             zero or more than one claimant is resident is a named trap, not a guess.\n\n\
+             These bodies recompiled cleanly and are counted in the linkable percentage above; \
+             what this table adds is that reaching them requires residency, so a host that \
+             never marks their sections loaded cannot call them at all.\n\n",
+            self.banked_claimants.len(),
+        ));
+        s.push_str("| vram | claimants (section: name) |\n|---|---|\n");
+        for (vram, claimants) in &self.banked_claimants {
+            let names = claimants
+                .iter()
+                .map(|(section, name)| format!("{section}: `{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            s.push_str(&format!("| `{vram:#010X}` | {names} |\n"));
+        }
+        s.push('\n');
         s
     }
 
@@ -692,6 +859,8 @@ impl Report {
             total,
             100.0 * (clean + trap) as f64 / total as f64
         ));
+        s.push_str(&self.render_bank_ambiguity());
+        s.push_str(&self.render_undispatchable_targets());
 
         // Runtime-trap breakdown by kind.
         s.push_str("## Runtime-trap functions (host-bound; panic bodies are not emitted)\n\n");
@@ -893,12 +1062,146 @@ fn outcome_label(o: Outcome) -> &'static str {
 }
 
 /// Slice a function's instruction words out of the ROM (big-endian → host
-/// `u32`). Mirrors `RsRecompiler::read_func_words`, but here it is a
+/// `u32`), then apply every `[[patches.instruction]]` that targets this
+/// function. Mirrors `RsRecompiler::read_func_words`, but here it is a
 /// classification input, not a hard error.
-fn read_func_words(rom: &[u8], section: &Section, func: &Function) -> Option<Vec<u32>> {
-    let vram_delta = func.vram.checked_sub(section.vram)?;
-    let start = (section.rom as usize).checked_add(vram_delta as usize)?;
-    let len = (func.size as usize) & !0x3;
+///
+/// Patch application belongs here, at the single point all three callers
+/// (the div-guard prescan, the symbol table, and the emitter) read words
+/// through, so a patched word cannot classify one way and emit another.
+///
+/// `[patches].instructions` was parsed into the typed config and then read by
+/// nothing: WM2000's one entry rewrites `func_800004D0`'s idle-loop `j` at
+/// `0x800005AC` into the self-branch `0x1000FFFF`, which the emitter turns
+/// into `pause_self()`. Unapplied, the emitted body is a tight non-yielding
+/// `loop` and cooperative scheduling never resumes another thread — measured
+/// on WM2000: 100% of samples inside `func_800004D0`, no VI swap ever.
+/// The whole pre-pass `main` runs: cross-check the dump, report every
+/// swallowed entry, and repair the ones whose containing function provably
+/// returned. Returns the text to print (empty when the dump is clean), so the
+/// orchestration itself is testable rather than living inline in `main`.
+fn check_and_repair_symbol_dump(cfg: &mut RecompConfig, rom: &[u8]) -> String {
+    let check = cross_check_symbol_dump(cfg, rom);
+    if check.is_clean() {
+        return String::new();
+    }
+    let mut out = check.render_diagnostic();
+    let (applied, adopted) = repair_symbol_dump(cfg, &check);
+    out.push_str(&format!(
+        "swallowed-entry cross-check: {} proven root(s) examined, {} missing entry/entries, \
+         {} repaired by splitting, {} reported only\n",
+        check.proven_roots,
+        check.swallowed.len(),
+        applied,
+        check.refused().count(),
+    ));
+    if !check.uncovered.is_empty() {
+        out.push_str(&format!(
+            "uncovered-entry cross-check: {} entry/entries claimed by no declared function, \
+             {} adopted, {} reported only\n",
+            check.uncovered.len(),
+            adopted,
+            check.uncovered_refused().count(),
+        ));
+    }
+    out
+}
+
+/// Cross-check every configured section's function list against the `jal`
+/// evidence in the section's own ROM bytes.
+///
+/// Reuses the exact rule `fn64-discover`'s CFG builder applies to promote a
+/// `jal` target to a `proven_root`. `fn64-discover` depends on this crate, so
+/// the rule is applied through `fn64_cpu_runtime_codegen::swallowed_entries`
+/// rather than by importing the analysis back the other way.
+fn cross_check_symbol_dump(cfg: &RecompConfig, rom: &[u8]) -> CrossCheck {
+    let mut combined = CrossCheck::default();
+    for (index, section) in cfg.sections.iter().enumerate() {
+        let Some(words) = read_section_words(rom, section) else {
+            continue;
+        };
+        let region = CodeRegion {
+            name: section.name.clone(),
+            index,
+            vram: section.vram,
+            words: &words,
+        };
+        let functions: Vec<DumpFunction> = section
+            .functions
+            .iter()
+            .map(|f| DumpFunction {
+                name: f.name.clone(),
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+        let mut section_check = cross_check_region(&region, &functions);
+        combined.proven_roots += section_check.proven_roots;
+        combined.swallowed.append(&mut section_check.swallowed);
+        combined.uncovered.append(&mut section_check.uncovered);
+    }
+    combined
+}
+
+/// Apply the repairable splits from `check` to `cfg`'s function lists.
+///
+/// A split shrinks the containing entry's declared `size` to end exactly at
+/// the proven root and inserts a new entry covering the remainder. Every
+/// downstream stage — `read_func_words`, `SymbolTable`, `LOOKUP_TABLE`, and
+/// body emission — derives from this list, so the proven entry becomes
+/// dispatchable without any other change. Refused entries are left alone.
+fn repair_symbol_dump(cfg: &mut RecompConfig, check: &CrossCheck) -> (usize, usize) {
+    let mut applied = 0usize;
+    let mut adopted = 0usize;
+    for (index, section) in cfg.sections.iter_mut().enumerate() {
+        let mut functions: Vec<DumpFunction> = section
+            .functions
+            .iter()
+            .map(|f| DumpFunction {
+                name: f.name.clone(),
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+        let scoped = CrossCheck {
+            swallowed: check
+                .swallowed
+                .iter()
+                .filter(|e| e.region_index == index)
+                .cloned()
+                .collect(),
+            uncovered: check
+                .uncovered
+                .iter()
+                .filter(|e| e.region_index == index)
+                .cloned()
+                .collect(),
+            proven_roots: check.proven_roots,
+        };
+        let splits = apply_repairs(&mut functions, &scoped);
+        let adoptions = apply_gap_adoptions(&mut functions, &scoped);
+        if splits + adoptions == 0 {
+            continue;
+        }
+        applied += splits;
+        adopted += adoptions;
+        section.functions = functions
+            .into_iter()
+            .map(|f| Function {
+                name: f.name,
+                vram: f.vram,
+                size: f.size,
+            })
+            .collect();
+    }
+    (applied, adopted)
+}
+
+/// Read one whole section's big-endian words, or `None` when the section's
+/// declared ROM range does not fit the image.
+fn read_section_words(rom: &[u8], section: &Section) -> Option<Vec<u32>> {
+    let start = section.rom as usize;
+    let len = (section.size as usize) & !0x3;
     let end = start.checked_add(len)?;
     if end > rom.len() {
         return None;
@@ -909,6 +1212,63 @@ fn read_func_words(rom: &[u8], section: &Section, func: &Function) -> Option<Vec
             .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
+}
+
+fn read_func_words(
+    rom: &[u8],
+    section: &Section,
+    func: &Function,
+    patches: &[InstructionPatch],
+) -> Option<Vec<u32>> {
+    let vram_delta = func.vram.checked_sub(section.vram)?;
+    let start = (section.rom as usize).checked_add(vram_delta as usize)?;
+    let len = (func.size as usize) & !0x3;
+    let end = start.checked_add(len)?;
+    if end > rom.len() {
+        return None;
+    }
+    let mut words: Vec<u32> = rom[start..end]
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for patch in patches.iter().filter(|p| p.func == func.name) {
+        let offset = patch
+            .vram
+            .checked_sub(func.vram)
+            .filter(|delta| delta % 4 == 0)
+            .map(|delta| delta as usize / 4)
+            .filter(|index| *index < words.len())
+            .unwrap_or_else(|| {
+                panic!(
+                    "instruction patch for {} targets vram {:#010x}, which is not a word inside \
+                     that function ({:#010x}..{:#010x})",
+                    patch.func,
+                    patch.vram,
+                    func.vram,
+                    func.vram + func.size,
+                )
+            });
+        words[offset] = patch.value;
+    }
+    Some(words)
+}
+
+/// Refuse a config whose `[[patches.instruction]]` names a function this run
+/// never reads words for — a patch that silently applies to nothing is the
+/// same class of defect as the unapplied-patch bug itself.
+fn assert_every_instruction_patch_is_reachable(cfg: &RecompConfig) {
+    for patch in &cfg.patches.instructions {
+        let found = cfg
+            .sections
+            .iter()
+            .flat_map(|section| section.functions.iter())
+            .any(|func| func.name == patch.func);
+        assert!(
+            found,
+            "instruction patch names function {:?}, which is in no configured section",
+            patch.func
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1100,6 +1460,147 @@ mod tests {
         );
     }
 
+    /// Two overlay banks sharing one VRAM window — WM2000's real shape,
+    /// reduced. The collided vram must leave the flat table, enter the banked
+    /// table with BOTH claimants and their section indices, and be NAMED in
+    /// the gap report. The last part is the silent-exclusion fix: before it,
+    /// the report said "100% linkable" while two bodies were unreachable.
+    #[test]
+    fn colliding_banks_are_banked_dispatched_and_named_in_the_report() {
+        // Each bank: addiu v0,zero,N; jr ra; nop.
+        let bank_a = [0x2402_000Au32, 0x03E0_0008, 0x0000_0000];
+        let bank_b = [0x2402_000Bu32, 0x03E0_0008, 0x0000_0000];
+        let rom = bank_a
+            .into_iter()
+            .chain(bank_b)
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let shared_vram = 0x800E_1B90u32;
+        let cfg = RecompConfig {
+            entrypoint: shared_vram,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![
+                Section {
+                    name: "bank1_text".to_string(),
+                    rom: 0,
+                    vram: shared_vram,
+                    size: 0x0C,
+                    functions: vec![Function {
+                        name: "func_800E1B90".to_string(),
+                        vram: shared_vram,
+                        size: 0x0C,
+                    }],
+                },
+                Section {
+                    name: "bank4_text".to_string(),
+                    rom: 0x0C,
+                    vram: shared_vram,
+                    size: 0x0C,
+                    functions: vec![Function {
+                        name: "func_800E1B90_bank4_text".to_string(),
+                        vram: shared_vram,
+                        size: 0x0C,
+                    }],
+                },
+            ],
+            patches: Patches::default(),
+        };
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        // Both bodies are emitted — the collision is a dispatch problem, not
+        // a recompilation one.
+        assert!(report.module.contains("pub fn func_800E1B90("));
+        assert!(report.module.contains("pub fn func_800E1B90_bank4_text("));
+        // Neither is in the flat table: it cannot say which bank is resident.
+        assert!(!report
+            .module
+            .contains("(0x800E1B90, func_800E1B90 as RecompFunc)"));
+        assert_eq!(report.recompiled_symbols, 0);
+        // Both ARE in the banked table, each tagged with its section index.
+        assert!(
+            report.module.contains(
+                "(0x800E1B90, &[(0, \"func_800E1B90\", func_800E1B90 as RecompFunc), \
+                 (1, \"func_800E1B90_bank4_text\", func_800E1B90_bank4_text as RecompFunc), ]),"
+            ),
+            "banked row missing or malformed:\n{}",
+            report.module
+        );
+        assert_eq!(
+            report.banked_claimants,
+            vec![(
+                shared_vram,
+                vec![
+                    (0usize, "func_800E1B90".to_string()),
+                    (1usize, "func_800E1B90_bank4_text".to_string()),
+                ]
+            )]
+        );
+
+        // The report must NAME the gap, not merely be arithmetically correct.
+        let markdown = report.render_markdown(&cfg);
+        assert!(markdown.contains("## Bank-ambiguous vrams"));
+        assert!(
+            markdown.contains("`0x800E1B90`"),
+            "gap report must name the ambiguous vram:\n{markdown}"
+        );
+        assert!(
+            markdown.contains("0: `func_800E1B90`")
+                && markdown.contains("1: `func_800E1B90_bank4_text`"),
+            "gap report must name every claimant and its section:\n{markdown}"
+        );
+        assert!(markdown.contains("**1 vrams, 2 bodies.**"));
+        let summary = report.render_summary();
+        assert!(
+            summary.contains("bank-ambiguous vrams: 1 (2 bodies)"),
+            "summary must surface the gap too:\n{summary}"
+        );
+    }
+
+    /// The negative half: a config with no shared VRAM window says so
+    /// explicitly rather than omitting the section, so "no bank ambiguity"
+    /// is a stated measurement and not an absence a reader must infer.
+    #[test]
+    fn a_config_without_collisions_states_that_explicitly() {
+        let words = [0x2402_002Au32, 0x03E0_0008, 0x0000_0000];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "code".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "solo".to_string(),
+                    vram: 0x8000_0000,
+                    size: rom.len() as u32,
+                }],
+            }],
+            patches: Patches::default(),
+        };
+
+        let report = run(&cfg, &rom, &HashSet::new());
+        assert!(report.banked_claimants.is_empty());
+        assert!(report.module.contains("static BANKED_LOOKUP_TABLE"));
+        let markdown = report.render_markdown(&cfg);
+        assert!(markdown.contains("## Bank-ambiguous vrams"));
+        assert!(markdown.contains("None. Every recompiled vram in this config"));
+        assert!(report
+            .render_summary()
+            .contains("bank-ambiguous vrams: 0 (0 bodies)"));
+    }
+
     #[test]
     fn profile_override_recompiles_a_stubbed_divide_guard() {
         // addiu v0,zero,1; break 7; jr ra; nop. The profile is the evidence
@@ -1139,5 +1640,508 @@ mod tests {
         assert!(report.module.contains("pub fn guarded_div"));
         assert!(report.module.contains("panic!(\"break (code"));
         assert!(report.results[0].outcome == Outcome::Clean);
+    }
+
+    /// The idle-spin config shape, reduced to its two words: a backward `j`
+    /// that is not a self-branch, plus its delay-slot nop. Unpatched, the
+    /// emitter renders an ordinary `pc = ...; continue` — a tight loop that
+    /// never yields to the cooperative scheduler. `[[patches.instruction]]`
+    /// rewrites the `j` into the self-branch `0x1000FFFF`, which the emitter
+    /// special-cases into `pause_self()`.
+    ///
+    /// WM2000 is the live case: `func_800004D0`'s tail drops to priority 0 and
+    /// spins here, and with the patch unapplied 100% of samples sat inside
+    /// that function with no VI swap ever committed.
+    fn idle_spin_config(patches: Vec<InstructionPatch>) -> (RecompConfig, Vec<u8>) {
+        // 0x80000000: nop
+        // 0x80000004: nop
+        // 0x80000008: j 0x80000000  -- backward, NOT a self-branch
+        // 0x8000000C: nop
+        // This mirrors WM2000's `L_800005A4: jal ...; j L_800005A4` shape: the
+        // jump target is an EARLIER word, so the self-branch rule does not fire
+        // and the patch is the only thing that can make this yield.
+        let words = [0x0000_0000u32, 0x0000_0000, 0x0800_0000, 0x0000_0000];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "code".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "idle_spin".to_string(),
+                    vram: 0x8000_0000,
+                    size: rom.len() as u32,
+                }],
+            }],
+            patches: Patches {
+                instructions: patches,
+                ..Patches::default()
+            },
+        };
+        (cfg, rom)
+    }
+
+    #[test]
+    fn instruction_patch_rewrites_the_word_the_emitter_reads() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "idle_spin".to_string(),
+            vram: 0x8000_0008,
+            value: 0x1000_FFFF,
+        }]);
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        assert!(
+            report.module.contains("pause_self()"),
+            "a self-branch patch must reach the emitter as a cooperative yield; module was:\n{}",
+            report.module
+        );
+    }
+
+    /// The mutation that matters: drop the patch and the same config must
+    /// emit the non-yielding loop instead. Without this pairing, a test that
+    /// only asserts the patched form would still pass if `read_func_words`
+    /// ignored patches and the emitter happened to yield for another reason.
+    #[test]
+    fn without_the_patch_the_same_config_emits_no_yield() {
+        let (cfg, rom) = idle_spin_config(Vec::new());
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        assert!(
+            !report.module.contains("pause_self()"),
+            "unpatched, this body is a plain backward jump and must NOT yield"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is in no configured section")]
+    fn instruction_patch_naming_an_absent_function_is_refused() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "not_in_any_section".to_string(),
+            vram: 0x8000_0000,
+            value: 0x1000_FFFF,
+        }]);
+
+        let _ = run(&cfg, &rom, &HashSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a word inside that function")]
+    fn instruction_patch_outside_its_function_is_refused() {
+        let (cfg, rom) = idle_spin_config(vec![InstructionPatch {
+            func: "idle_spin".to_string(),
+            vram: 0x8000_0100,
+            value: 0x1000_FFFF,
+        }]);
+
+        let _ = run(&cfg, &rom, &HashSet::new());
+    }
+
+    /// Hand-built fixture reproducing the WM2000 defect shape:
+    ///
+    ///   0x80000000 jal 0x80000010   <- proves 0x80000010 is a real entry
+    ///   0x80000004 nop              (delay slot)
+    ///   0x80000008 jr $ra           <- head RETURNS here
+    ///   0x8000000C nop              (delay slot)
+    ///   0x80000010 nop              <- swallowed entry
+    ///   0x80000014 jr $ra
+    ///   0x80000018 nop
+    ///
+    /// The dump declares ONE function spanning 0x80000000..0x8000001C, so
+    /// 0x80000010 is absent from `LOOKUP_TABLE` and `jal 0x80000010` traps at
+    /// runtime. This is the exact shape of `func_8012079C_bank3_text`
+    /// swallowing `0x80120854` in WWF No Mercy.
+    fn swallowed_entry_config() -> (RecompConfig, Vec<u8>) {
+        let words = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,    // nop (delay slot)
+            0x03E0_0008,    // jr $ra
+            0x0000_0000,    // nop (delay slot)
+            0x0000_0000,    // 0x80000010: the swallowed entry
+            0x03E0_0008,    // jr $ra
+            0x0000_0000,    // nop (delay slot)
+        ];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "boot".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "head".to_string(),
+                    vram: 0x8000_0000,
+                    // Declared size swallows the 0x80000010 entry.
+                    size: 0x1C,
+                }],
+            }],
+            patches: Patches::default(),
+        };
+        (cfg, rom)
+    }
+
+    /// Before the cross-check existed, the swallowed entry was simply absent
+    /// from the emitted dispatch table and every call to it trapped at
+    /// runtime. This pins that the un-repaired config really does omit it,
+    /// so the repair test below is not asserting a coincidence.
+    #[test]
+    fn an_unrepaired_swallowed_entry_is_absent_from_the_lookup_table() {
+        let (cfg, rom) = swallowed_entry_config();
+
+        let report = run(&cfg, &rom, &HashSet::new());
+
+        // No LOOKUP_TABLE row exists for it...
+        assert!(
+            !report.module.contains("(0x80000010, "),
+            "the swallowed entry must have no dispatch row before repair"
+        );
+        // ...yet the `jal` to it is emitted as a `lookup(0x80000010)` call,
+        // which is precisely the call that traps at runtime.
+        assert!(
+            report.module.contains("lookup(0x80000010)"),
+            "the call site must route through lookup, proving the trap path"
+        );
+    }
+
+    #[test]
+    fn the_cross_check_names_the_swallowed_entry_and_its_jal_evidence() {
+        let (cfg, rom) = swallowed_entry_config();
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert_eq!(check.swallowed.len(), 1, "{:?}", check.swallowed);
+        let entry = &check.swallowed[0];
+        assert_eq!(entry.vram, 0x8000_0010);
+        assert_eq!(entry.containing_name, "head");
+        // Derived by hand: the only jal in the fixture is at 0x80000000.
+        assert_eq!(entry.jal_sites, vec![0x8000_0000]);
+        assert!(entry.is_repairable(), "{:?}", entry.refusal);
+        let text = check.render_diagnostic();
+        assert!(text.contains("SWALLOWED-FUNCTION-ENTRY"), "{text}");
+        assert!(text.contains("0x80000010"), "{text}");
+    }
+
+    #[test]
+    fn repairing_the_config_puts_the_swallowed_entry_in_the_lookup_table() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        let (applied, adopted) = repair_symbol_dump(&mut cfg, &check);
+
+        assert_eq!(applied, 1);
+        assert_eq!(adopted, 0, "this fixture is the swallowed class, not uncovered");
+        // By hand: head shrinks to 0x80000000..0x80000010, tail covers
+        // 0x80000010..0x8000001C. The two must tile the original range exactly.
+        let shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+
+        let report = run(&cfg, &rom, &HashSet::new());
+        assert!(
+            report
+                .module
+                .contains("(0x80000010, func_80000010_split as RecompFunc)"),
+            "the repaired entry must reach LOOKUP_TABLE"
+        );
+        // And the repaired config is itself clean: nothing is swallowed twice.
+        assert!(cross_check_symbol_dump(&cfg, &rom).is_clean());
+    }
+
+    /// MUTATION GUARD: the same fixture, but the head does NOT return before
+    /// the proven root. The entry is still REPORTED, and the config is left
+    /// exactly as-is -- a split here would redirect the `jal` into the middle
+    /// of a live body.
+    ///
+    /// This is the case that actually occurs in WM2000's `main_1050` section,
+    /// where words inside an embedded data table decode as `jal` and
+    /// "prove" roots that are really mid-instruction (e.g. the low half of a
+    /// lui/addiu address pair). Dropping the `jr $ra` precondition would
+    /// corrupt those functions.
+    #[test]
+    fn a_swallowed_entry_whose_head_never_returns_is_reported_but_not_split() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        // Replace the head's `jr $ra` at 0x80000008 with an ordinary
+        // `addiu $sp, $sp, -0x20`, so the head is still live at 0x80000010.
+        let rom: Vec<u8> = {
+            let mut bytes = rom;
+            bytes[8..12].copy_from_slice(&0x27BD_FFE0u32.to_be_bytes());
+            bytes
+        };
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert_eq!(check.swallowed.len(), 1, "still reported");
+        assert!(!check.swallowed[0].is_repairable());
+        assert_eq!(check.refused().count(), 1);
+        assert!(check.render_diagnostic().contains("REFUSED"));
+
+        let before = cfg.sections[0].functions.clone();
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), (0, 0));
+        assert_eq!(
+            cfg.sections[0].functions, before,
+            "config must be untouched"
+        );
+    }
+
+    /// MUTATION GUARD for the orchestration `main` actually runs.
+    ///
+    /// The individual pieces are tested above, but nothing exercised the
+    /// wiring: a build that detected and reported the defect yet silently
+    /// skipped the repair would still pass every other test here. This pins
+    /// that one call to the pre-pass both reports AND repairs.
+    #[test]
+    fn the_pre_pass_reports_and_repairs_in_one_call() {
+        let (mut cfg, rom) = swallowed_entry_config();
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        assert!(
+            diagnostic.contains("SWALLOWED-FUNCTION-ENTRY"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("0x80000010"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("1 repaired by splitting"),
+            "the pre-pass must actually apply the repair: {diagnostic}"
+        );
+        assert!(diagnostic.contains("0 reported only"), "{diagnostic}");
+        // ...and the config really was mutated, not just described.
+        let shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+    }
+
+    #[test]
+    fn a_clean_dump_makes_the_pre_pass_print_nothing() {
+        let (mut cfg, rom) = swallowed_entry_config();
+        cfg.sections[0].functions[0].size = 0x10;
+        cfg.sections[0].functions.push(Function {
+            name: "tail".to_string(),
+            vram: 0x8000_0010,
+            size: 0x0C,
+        });
+
+        assert_eq!(check_and_repair_symbol_dump(&mut cfg, &rom), "");
+    }
+
+    /// MUTATION GUARD for per-section repair scoping.
+    ///
+    /// Two sections each swallow an entry at the SAME vram offset within
+    /// their own address window. If repairs were applied without filtering by
+    /// section, each section would be handed the other's entry as well, and
+    /// the second (non-matching) repair would silently do nothing or split
+    /// the wrong function. Both sections must come out correctly split.
+    #[test]
+    fn repairs_are_scoped_to_the_section_that_owns_them() {
+        // Each section holds the identical 7-word shape from
+        // `swallowed_entry_config`, but at different vrams. The `jal`
+        // immediate is region-relative, so the same word works in both.
+        let words = [
+            0x0C00_0004u32, // jal <region>+0x10
+            0x0000_0000,
+            0x03E0_0008, // jr $ra
+            0x0000_0000,
+            0x0000_0000, // <region>+0x10: swallowed entry
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let one: Vec<u8> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+        let mut rom = one.clone();
+        rom.extend_from_slice(&one);
+        let section = |name: &str, rom_off: u32, vram: u32| Section {
+            name: name.to_string(),
+            rom: rom_off,
+            vram,
+            size: one.len() as u32,
+            functions: vec![Function {
+                name: format!("head_{name}"),
+                vram,
+                size: 0x1C,
+            }],
+        };
+        let mut cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![
+                section("alpha", 0, 0x8000_0000),
+                // 0x0C000004 in this window resolves to 0x80000010 as well,
+                // because `jal`'s target is region-relative -- so give the
+                // second section a vram whose 0x0FFFFFFF bits differ, forcing
+                // a genuinely different proven root.
+                section("beta", one.len() as u32, 0x8000_0100),
+            ],
+            patches: Patches::default(),
+        };
+        // Rewrite beta's jal so it targets 0x80000110, its own entry.
+        let beta_jal = (3u32 << 26) | (0x8000_0110 >> 2) & 0x03FF_FFFF;
+        let base = one.len();
+        rom[base..base + 4].copy_from_slice(&beta_jal.to_be_bytes());
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        assert!(
+            diagnostic.contains("2 repaired by splitting"),
+            "both sections must be repaired: {diagnostic}"
+        );
+        // By hand: each head shrinks to 0x10 and each tail covers 0xC.
+        for (index, base_vram) in [(0usize, 0x8000_0000u32), (1, 0x8000_0100)] {
+            let shape: Vec<(u32, u32)> = cfg.sections[index]
+                .functions
+                .iter()
+                .map(|f| (f.vram, f.size))
+                .collect();
+            assert_eq!(
+                shape,
+                vec![(base_vram, 0x10), (base_vram + 0x10, 0x0C)],
+                "section {index}"
+            );
+        }
+    }
+
+    /// MUTATION GUARD for the per-section repair filter.
+    ///
+    /// Overlay banks share a VRAM window by design (WM2000's `bank2_text` and
+    /// `bank3_text` are both based at 0x8011C900), so two sections can hold
+    /// functions with the SAME name at the SAME vram whose bytes differ. Here
+    /// only `alpha` swallows an entry; `beta` declares the identical
+    /// name/vram but its bytes make the split unsafe, and it is correctly
+    /// reported as refused.
+    ///
+    /// Without the `e.region == section.name` filter, alpha's repairable
+    /// entry is offered to beta as well, and beta's function -- which does
+    /// NOT return before that point -- gets split anyway, cutting a live body
+    /// in half. That is the exact corruption the safety check exists to
+    /// prevent, so the filter must not be removed.
+    #[test]
+    fn a_repair_proven_in_one_bank_is_not_applied_to_its_vram_twin() {
+        // alpha: head returns before the entry -> repairable.
+        let alpha = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,
+            0x03E0_0008, // jr $ra
+            0x0000_0000,
+            0x0000_0000, // 0x80000010: swallowed entry
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        // beta: identical layout EXCEPT the head never returns, so a split at
+        // 0x80000010 would cut it in half.
+        let beta = [
+            0x0C00_0004u32, // jal 0x80000010
+            0x0000_0000,
+            0x27BD_FFE0, // addiu $sp, $sp, -0x20 -- NOT a return
+            0x0000_0000,
+            0x0000_0000,
+            0x03E0_0008,
+            0x0000_0000,
+        ];
+        let mut rom: Vec<u8> = alpha.into_iter().flat_map(u32::to_be_bytes).collect();
+        let beta_bytes: Vec<u8> = beta.into_iter().flat_map(u32::to_be_bytes).collect();
+        let beta_rom = rom.len() as u32;
+        rom.extend_from_slice(&beta_bytes);
+
+        // Both sections base at the SAME vram with the SAME function name,
+        // exactly as two overlay banks sharing a window do.
+        let bank = |name: &str, rom_off: u32| Section {
+            name: name.to_string(),
+            rom: rom_off,
+            vram: 0x8000_0000,
+            size: 0x1C,
+            functions: vec![Function {
+                name: "shared_name".to_string(),
+                vram: 0x8000_0000,
+                size: 0x1C,
+            }],
+        };
+        let mut cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![bank("alpha", 0), bank("beta", beta_rom)],
+            patches: Patches::default(),
+        };
+
+        let diagnostic = check_and_repair_symbol_dump(&mut cfg, &rom);
+
+        // Exactly one repair: alpha's. Beta's identical-looking entry is
+        // reported but refused.
+        assert!(
+            diagnostic.contains("1 repaired by splitting"),
+            "only alpha may be repaired: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("1 reported only"),
+            "beta must be reported and refused: {diagnostic}"
+        );
+        // alpha split; beta untouched.
+        let alpha_shape: Vec<(u32, u32)> = cfg.sections[0]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(alpha_shape, vec![(0x8000_0000, 0x10), (0x8000_0010, 0x0C)]);
+        let beta_shape: Vec<(u32, u32)> = cfg.sections[1]
+            .functions
+            .iter()
+            .map(|f| (f.vram, f.size))
+            .collect();
+        assert_eq!(
+            beta_shape,
+            vec![(0x8000_0000, 0x1C)],
+            "beta's live body must not be split"
+        );
+    }
+
+    /// A dump with no swallowed entries must produce an empty diagnostic and
+    /// leave the config byte-identical -- the check must not be a source of
+    /// churn on healthy configs.
+    #[test]
+    fn a_healthy_dump_is_clean_and_unchanged() {
+        let (cfg, rom) = swallowed_entry_config();
+        let mut cfg = cfg;
+        // Declare the entry the evidence proves, as a correct dump would.
+        cfg.sections[0].functions[0].size = 0x10;
+        cfg.sections[0].functions.push(Function {
+            name: "tail".to_string(),
+            vram: 0x8000_0010,
+            size: 0x0C,
+        });
+
+        let check = cross_check_symbol_dump(&cfg, &rom);
+
+        assert!(check.is_clean(), "{:?}", check.swallowed);
+        assert_eq!(check.render_diagnostic(), "");
+        let before = cfg.sections[0].functions.clone();
+        assert_eq!(repair_symbol_dump(&mut cfg, &check), (0, 0));
+        assert_eq!(cfg.sections[0].functions, before);
     }
 }

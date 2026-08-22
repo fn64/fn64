@@ -1,0 +1,5 @@
+3894:lookup: no recompiled function or host shim at vram 0x80120854
+[wm2000-input] swap #1710: pad0 -> buttons=0x0000 stick=(0, 0)
+[wm2000-input] swap #1800: pad0 -> buttons=0x8000 stick=(0, 0)
+[wm2000-input] swap #1810: pad0 -> buttons=0x0000 stick=(0, 0)
+[wm2000-input] swap #1900: pad0 -> buttons=0x8000 stick=(0, 0)

@@ -316,9 +316,14 @@
 
 mod alpha_compare;
 mod blend;
+// Public only under `conformance-runner`: the adapterless entry point the
+// renderer-conformance harness's wgpu runner drives. Off by default, so the
+// default build's public surface is unchanged.
 mod color_converter;
 mod color_hlsli;
 mod combiner;
+#[cfg(feature = "conformance-runner")]
+pub mod conformance;
 mod coverage;
 mod depth_encode;
 mod depth_mode;
@@ -334,8 +339,71 @@ mod production;
 mod random;
 mod raster_vs;
 mod raw_dpc;
+#[cfg(test)]
+mod rdp_harness;
 mod rgb_dither;
+mod rt64_blender_analysis;
+mod rt64_blender_emulation;
+mod rt64_common;
+mod rt64_extended_gbi;
+mod rt64_extra_params;
+mod rt64_fb_reinterpret;
+mod rt64_float4_quantize;
+mod rt64_frame_compatibility;
+mod rt64_framebuffer_geometry;
+mod rt64_framebuffer_shaders;
+mod rt64_framebuffer_storage;
+mod rt64_framebuffer_tile;
+mod rt64_fullscreen_vs;
+mod rt64_gaussian_filter;
+mod rt64_gbi_extended_decode;
+mod rt64_gbi_f3d;
+mod rt64_gbi_f3d_variants;
+mod rt64_gbi_f3dex;
+mod rt64_gbi_f3dex2;
+mod rt64_gbi_opcodes;
+mod rt64_gbi_rdp_decode;
+mod rt64_gbi_s2dex2;
+mod rt64_hle_geometry;
+mod rt64_hlsl_interop;
+mod rt64_interpolation_helpers;
+mod rt64_light_estimation;
+mod rt64_lights_math;
+mod rt64_luminance_histogram;
 mod rt64_math;
+mod rt64_math_decompose;
+mod rt64_math_matrix;
+mod rt64_postprocess;
+mod rt64_present_shaders;
+mod rt64_preset_draw_call_match;
+mod rt64_preset_light;
+mod rt64_preset_material;
+mod rt64_preset_scene;
+mod rt64_profiling_timer;
+mod rt64_rdp_state;
+mod rt64_render_flags;
+mod rt64_render_pipeline_types;
+mod rt64_render_target_geometry;
+mod rt64_replacement_resolve;
+mod rt64_resample;
+mod rt64_rigid_body;
+mod rt64_rsp_matrix_stack;
+mod rt64_rsp_patch;
+mod rt64_rsp_process;
+mod rt64_rsp_segment;
+mod rt64_rsp_smooth_normal;
+mod rt64_rsp_world_modify;
+mod rt64_shader_description;
+mod rt64_shared_params;
+mod rt64_texture_map_lru;
+mod rt64_texture_sampler;
+mod rt64_tmem_hasher;
+mod rt64_tmem_regions;
+mod rt64_upload_geometry;
+mod rt64_user_configuration;
+mod rt64_vi_registers;
+mod rt64_vi_timing;
+mod rt64_workload_geometry;
 mod shader_manifest;
 mod state;
 mod targets;
@@ -343,11 +411,14 @@ mod texture_gen;
 mod texture_lod;
 mod tmem;
 mod vi;
+mod vi_scanout;
+#[cfg(test)]
+mod wire_words;
 
 pub use alpha_compare::{
-    alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
-    require_supported_alpha_compare, AlphaCompareNoise, CopyCycleSourceFormat,
-    ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_FRAGMENT_FN_WGSL, ALPHA_COMPARE_WGSL,
+    alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value, AlphaCompareNoise,
+    CopyCycleSourceFormat, ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_FRAGMENT_FN_WGSL,
+    ALPHA_COMPARE_WGSL,
 };
 pub use blend::{
     blend_a, blend_b, blend_color, blend_fragment, dual_source_blend_output,
@@ -467,10 +538,10 @@ pub use state::{
     AlphaCompare, AlphaDither, BlenderCycle, Color4, ColorImage, CoverageDestination, CycleType,
     DepthMode, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor, PrimDepth, PrimLod,
     RdpState, RdpStateDelta, RgbDither, StagedRdpState, TextureFilter, TextureLutMode,
-    TextureLutModeError,
 };
 pub use targets::{
-    decode_fill_cycle_pixel, execute_fill_rectangle, fixed_fixture_other_mode, pack_device_pixels,
+    decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
+    execute_texture_rectangle, fixed_fixture_other_mode, pack_device_pixels,
     resolve_fill_pixel_rectangle, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
     ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame,
     CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, FillCoordinateError,
@@ -478,9 +549,11 @@ pub use targets::{
     InFlightTriangleDraw, InitializedCandidateColorTarget, InitializedRegionProof,
     NativeRasterDeviceOutcome, NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit,
     RasterVertex, ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle,
-    TargetRowRange, TargetRows, TriangleDrawOutput, TriangleFixture, TrianglePipelineDeviceOutcome,
-    TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
-    UninitializedNativeRaster, UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_INVALID_BYTE,
+    TargetRowRange, TargetRows, TexrectAxis, TexrectConstantRegister, TexrectDraw,
+    TexrectExecutionError, TexrectShading, TexrectTileBinding, TriangleDrawOutput, TriangleFixture,
+    TrianglePipelineDeviceOutcome, TrianglePipelineError, TrianglePipelineRenderer,
+    TriangleRasterParams, TriangleTargetExtent, UninitializedNativeRaster,
+    UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_INVALID_BYTE,
     TMEM_SAMPLE_STATUS_NO_TILE_BINDING, TMEM_SAMPLE_STATUS_OK, TMEM_SAMPLE_STATUS_REVERSED_EXTENT,
     TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT,
 };
@@ -491,25 +564,26 @@ pub use texture_gen::{
 pub use tmem::{
     address_point_texel, address_texture_cell, decode_direct_texel, decode_tlut_entry,
     execute_ordered_tmem_loads, filter_three_nearest_committed_cell, gather_committed_texture_cell,
-    prepare_load_block, prepare_load_tile, prepare_load_tlut, project_committed_tmem,
-    read_committed_texel, resolve_indexed_texel, sample_committed_point, unpack_ci4_texel,
-    AddressedTextureCell, AddressedTmemTexel, Ci4Palette, Ci4PaletteError, Ci4UnpackError,
-    CommittedTextureCell, CommittedTmemTransaction, DecodedPhysicalTexel, DecodedTexel,
-    DefinedPhysicalTmemWordBytes, DirectTexelDecodeError, ExecutedLoadBlock, ExecutedLoadTile,
-    ExecutedLoadTlut, GpuBoundTmemTransaction, IndexedTexelResolveError, LoadBlockExecutionError,
-    LoadTileExecutionError, LoadTlutExecutionError, PendingTmemTransaction, PhysicalTexelReadError,
-    PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity, PhysicalTmemState,
-    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PointAddressError,
-    PointSampleCoordinates, PointSampleError, PointSampleRequest, PreparedLoadBlock,
-    PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError, ResolvedIndexedTexel,
-    StagedTmemTransaction, TexelColumnParity, TextureAxis, TextureCellCorner, TextureCellFractions,
-    TextureCellSampleError, TextureCoordinateS10_5, TextureImage, TileAddressMode,
-    TileBindingParams, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
-    TlutEntryCount, TlutEntryDecodeError, TlutLookup, TmemDxt, TmemFirstRowParity,
-    TmemGpuProjection, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
-    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
-    TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord,
-    TmemWordAddress, TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS,
-    TMEM_VALIDITY_WORDS,
+    prepare_load_block, prepare_load_tile, prepare_load_tlut, project_committed_tmem, project_tmem,
+    read_committed_texel, read_texel, resolve_indexed_texel, sample_committed_point, sample_point,
+    unpack_ci4_texel, AddressedTextureCell, AddressedTmemTexel, Ci4Palette, Ci4PaletteError,
+    Ci4UnpackError, CommittedTextureCell, CommittedTmemTransaction, DecodedPhysicalTexel,
+    DecodedTexel, DefinedPhysicalTmemWordBytes, DirectTexelDecodeError, ExecutedLoadBlock,
+    ExecutedLoadTile, ExecutedLoadTlut, GpuBoundTmemTransaction, IndexedTexelResolveError,
+    LoadBlockExecutionError, LoadTileExecutionError, LoadTlutExecutionError, PendingTmemImage,
+    PendingTmemTransaction, PhysicalTexelReadError, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity,
+    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
+    PointAddressError, PointSampleCoordinates, PointSampleError, PointSampleRequest,
+    PreparedLoadBlock, PreparedLoadTile, PreparedLoadTlut, ProposedTmemImageIdentity, RawTexel,
+    RawTexelError, ResolvedIndexedTexel, StagedTmemTransaction, TexelColumnParity, TextureAxis,
+    TextureCellCorner, TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
+    TextureImage, TileAddressMode, TileBindingParams, TileCoordinate, TileDescriptor, TileIndex,
+    TileSize, TileState, TlutEntryCount, TlutEntryDecodeError, TlutLookup, TmemByteSource, TmemDxt,
+    TmemFirstRowParity, TmemGpuProjection, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan,
+    TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan,
+    TmemPacketExecutionError, TmemSnapshotIdentity, TmemState, TmemTransferLayout,
+    TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord, TmemWordAddress,
+    TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
 };
+pub use vi_scanout::PresentedField;

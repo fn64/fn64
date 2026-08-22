@@ -197,6 +197,92 @@ pub unsafe fn register_section(
     })
 }
 
+/// Register one generated **section-local** callable for execution evidence.
+///
+/// N64Recomp emits `static_<section>_<vram>` bodies for game symbols that had
+/// file-local linkage: they are never indirect-call targets, so they appear in
+/// no `recomp_overlays.inl` `FuncEntry` table and [`register_section`] never
+/// sees them. They are nonetheless real recompiled bodies, reached by direct
+/// C-to-C calls, and the build instruments every `RECOMP_FUNC` body with
+/// [`fn64_c_recompiled_function_enter`] -- so the first one entered aborts
+/// unless its pointer is registered here.
+///
+/// This registers execution-evidence identity ONLY. It deliberately does not
+/// add a `FuncEntry` to the section registry: a section-local symbol is not an
+/// indirect-call target, so publishing it to [`get_function`] would invent a
+/// dispatch edge the generated corpus does not have.
+///
+/// `section_index` and `link_vram` come from the generated symbol name and are
+/// reconciled against the generated `section_table[]` geometry at build time
+/// (see `fn64-boot-harness/build_support.rs`), so a name that disagrees with
+/// the table fails the build rather than mislabelling an observation.
+///
+/// # Safety
+/// `function` must be a valid `RecompFunc` for the lifetime of the process --
+/// true for every file-scope generated `RECOMP_FUNC` definition.
+pub unsafe fn register_section_local_function(
+    section_index: u32,
+    link_vram: u32,
+    function: RecompFunc,
+) {
+    with_host(|host| {
+        // `function_offset` must stay the section-relative offset, so that
+        // `link_vram == ram_addr + function_offset` holds for EVERY registered
+        // destination, section-local or not. The base comes from the registry
+        // the C bridge already populated, not from a second transcription.
+        let section = usize::try_from(section_index)
+            .expect("generated section index exceeds host addressing");
+        let ram_addr = host.sections.section_ram_addr(section).unwrap_or_else(|| {
+            panic!(
+                "section-local function at link vram {link_vram:#010x} names section \
+                     {section_index}, which is not registered -- register the generated section \
+                     table before its section-local bodies"
+            )
+        });
+        let size = host
+            .sections
+            .section_size(section)
+            .expect("registered section must report its size");
+        // Containment is checked HERE, against the registry the bridge
+        // populated, and not only at build time. A build-time-only check
+        // validates the name the emitter parsed rather than the value it
+        // emitted, so an emitter that writes the wrong section index passes it
+        // -- proven by mutation (see this function's tests). Binding an
+        // execution observation to the wrong section would silently mislabel
+        // every downstream measurement, so it must abort at registration.
+        let function_offset = link_vram.checked_sub(ram_addr).unwrap_or_else(|| {
+            panic!(
+                "section-local function at link vram {link_vram:#010x} lies below section \
+                 {section_index}'s link base {ram_addr:#010x}"
+            )
+        });
+        assert!(
+            u64::from(function_offset) < u64::from(size),
+            "section-local function at link vram {link_vram:#010x} lies outside section \
+             {section_index}'s range [{ram_addr:#010x}, {:#010x}) -- refusing to bind an \
+             execution observation to a section the function does not belong to",
+            u64::from(ram_addr) + u64::from(size)
+        );
+        let destination = NativeExecutionDestination {
+            section_index,
+            function_offset,
+            link_vram,
+        };
+        match host.native_destination_by_pointer.entry(function as usize) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(destination);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                assert_eq!(
+                    *entry.get(),
+                    destination,
+                    "one native callable pointer is assigned to multiple generated destinations"
+                );
+            }
+        }
+    });
+}
+
 /// Register section geometry for a typed recompiled module. Function pointers
 /// stay in that module's safe dispatcher; this registry owns only the
 /// ROM/static/runtime-base mapping needed to canonicalize relocated callbacks.
@@ -221,6 +307,17 @@ pub fn set_section_loaded(index: fn64_runtime::SectionIndex) {
 
 pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
     with_host(|host| host.sections.set_section_unloaded(index));
+}
+
+/// Whether overlay section `index` is currently PI-swapped in.
+///
+/// The rs lane's emitted dispatcher asks this to disambiguate a vram claimed
+/// by more than one bank. An index past the registered sections answers
+/// `false` rather than panicking: an unregistered section is by definition not
+/// resident, and the dispatcher's own trap already names the vram and every
+/// claimant, which is the more useful message than an index assertion here.
+pub fn is_section_loaded(index: fn64_runtime::SectionIndex) -> bool {
+    with_host(|host| host.sections.is_section_loaded(index))
 }
 
 /// Honor a game-driven overlay DMA at the section registry: if `rom_addr`
@@ -329,6 +426,109 @@ mod tests {
 
         load_rom(Vec::new());
         assert!(copy_native_execution_destinations().is_empty());
+        with_host(|host| *host = HostState::default());
+    }
+
+    unsafe extern "C" fn observed_section_local(_rdram: *mut u8, _ctx: *mut RecompContext) {
+        std::hint::black_box(0xA11Cu16);
+        fn64_c_recompiled_function_enter(observed_section_local);
+    }
+
+    /// A section-local body is reachable ONLY through this registration: it is
+    /// absent from every `FuncEntry` table by construction, so without it the
+    /// entry observer aborts. Pins the exact recorded destination, because
+    /// `link_vram` is the one field an emitter can corrupt while leaving the
+    /// run's control flow untouched — a `+4` shift in the emitted value is
+    /// invisible to any harness that only checks the run completes.
+    #[test]
+    fn section_local_registration_records_its_exact_link_vram() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+        let section = unsafe { register_section(0x0010_0000, 0x8000_4000, 0x100, &[]) };
+        let section_index = u32::try_from(section).unwrap();
+        unsafe {
+            register_section_local_function(section_index, 0x8000_4080, observed_section_local)
+        };
+
+        let mut context = RecompContext::zeroed();
+        unsafe { observed_section_local(std::ptr::null_mut(), &mut context) };
+
+        assert_eq!(
+            copy_native_execution_destinations(),
+            vec![NativeExecutionDestinationEvent {
+                at: Cycles::new(0),
+                destination: NativeExecutionDestination {
+                    section_index,
+                    // Derived, not restated: the offset must be the link vram
+                    // minus the section's own base, so both spellings of the
+                    // same fact have to agree.
+                    function_offset: 0x8000_4080 - 0x8000_4000,
+                    link_vram: 0x8000_4080,
+                },
+            }]
+        );
+
+        with_host(|host| *host = HostState::default());
+    }
+
+    /// A section-local registration must never become a dispatch edge: the
+    /// generated corpus has no indirect call to a file-local symbol, so
+    /// publishing one to `get_function` would invent an edge the ROM lacks.
+    #[test]
+    fn section_local_registration_is_not_published_to_get_function() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+        let section = unsafe { register_section(0x0010_0000, 0x8000_4000, 0x100, &[]) };
+        set_section_loaded(section);
+        let section_index = u32::try_from(section).unwrap();
+        unsafe {
+            register_section_local_function(section_index, 0x8000_4080, observed_section_local)
+        };
+
+        // Asserted through the registry's own evidence snapshot rather than by
+        // calling `get_function`: a dispatch miss is a non-unwinding abort,
+        // which no test can catch. The snapshot carries every `FuncEntry` the
+        // registry would resolve through, so an empty function list is exactly
+        // the claim "this symbol is not a dispatch target".
+        with_host(|host| {
+            let snapshot = host.sections.evidence_snapshot();
+            assert!(
+                snapshot.sections[section].funcs.is_empty(),
+                "section-local registration must not add a dispatch-table entry"
+            );
+        });
+
+        with_host(|host| *host = HostState::default());
+    }
+
+    /// Containment is checked against the registry at registration time, not
+    /// only where a build script parsed the name. Proven necessary by
+    /// mutation: an emitter that writes the wrong section index passes every
+    /// build-time check, because those validate the parsed name rather than
+    /// the emitted value.
+    #[test]
+    fn section_local_registration_rejects_a_vram_outside_its_section() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+        let section = unsafe { register_section(0x0010_0000, 0x8000_4000, 0x100, &[]) };
+        let section_index = u32::try_from(section).unwrap();
+
+        let too_high = std::panic::catch_unwind(|| unsafe {
+            register_section_local_function(section_index, 0x8000_4100, observed_section_local)
+        });
+        assert!(
+            too_high.is_err(),
+            "a vram at the section's end is outside it"
+        );
+
+        let too_low = std::panic::catch_unwind(|| unsafe {
+            register_section_local_function(section_index, 0x8000_3FFC, observed_section_local)
+        });
+        assert!(
+            too_low.is_err(),
+            "a vram below the section's base is outside it"
+        );
+
         with_host(|host| *host = HostState::default());
     }
 

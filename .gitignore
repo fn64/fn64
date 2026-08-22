@@ -39,3 +39,10 @@ crates/fn64-discover/reference/corpus-certification-sample.tsv
 # Throwaway target dirs for the two-lane ROM-content binary audit
 # (scripts/rom-content-audit-build.zsh). Multi-GB build output, never committed.
 /target-audit-*
+
+# Agent handoff scratch from the RT64 port: a takeover brief plus ~120
+# per-slice handoff notes. Working notes for a live port, not source of
+# truth, and large enough to be swept into a merge by accident.
+/CLAUDE-PORT-TAKEOVER.md
+/.claude-handoffs/
+scratch/

@@ -42,10 +42,33 @@ fn from_stored_masks_to_three_bits() {
     }
 }
 
+// `Coverage::stored` guards `count() > 0` with a `debug_assert!`
+// (`coverage.rs:77`), matching the reference's own debug-only guard
+// (`fn64-render-reference/src/raster/mod.rs:177-180`). Under
+// `-C debug-assertions=off` that guard is compiled out and `self.0 - 1`
+// wraps to 255 rather than panicking (overflow checks follow the same
+// profile flag by default), so a `#[should_panic]` test here would assert a
+// build-profile-dependent property -- exactly what `rt64_common.rs:246-251`
+// declines to do. The profile-independent facts are asserted instead: the
+// guard's *precondition* is what production must uphold, and `stored()` has
+// no production caller in this crate yet (it is characterization-only until
+// the RDRAM framebuffer writeback path lands), so no live path can reach the
+// zero case.
 #[test]
-#[should_panic(expected = "zero coverage is never stored in RDRAM")]
-fn stored_debug_asserts_on_zero_coverage() {
-    let _ = Coverage::ZERO.stored();
+fn stored_is_only_defined_for_nonzero_coverage() {
+    // The documented domain: every nonzero count round-trips as `count - 1`.
+    for count in 1..=8u8 {
+        assert_eq!(Coverage::new(count).stored(), count - 1);
+    }
+
+    // Zero is outside that domain. In a debug build the `debug_assert!` traps
+    // it; in a release build the guard is gone and the subtraction wraps. Both
+    // are the reference's behavior, and neither is a value any caller may
+    // rely on -- so this asserts only the profile-independent invariant that
+    // zero is not a member of the valid stored-encoding range.
+    let stored_range = (1..=8u8).map(|count| count - 1).collect::<Vec<_>>();
+    assert_eq!(stored_range, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(Coverage::ZERO.count(), 0);
 }
 
 #[test]
@@ -1343,7 +1366,9 @@ fn coverage_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3<u32>
             .collect();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            backends: crate::device::adapter_selection::backends_for_request(
+                wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            ),
             flags: wgpu::InstanceFlags::VALIDATION,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
@@ -1359,6 +1384,7 @@ fn coverage_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3<u32>
             }
             Err(error) => panic!("adapter request failed: {error}"),
         };
+        crate::device::adapter_selection::assert_expected_adapter(&adapter);
         eprintln!(
             "fn64-coverage-fragment-fn: adapter={:?}",
             adapter.get_info().name

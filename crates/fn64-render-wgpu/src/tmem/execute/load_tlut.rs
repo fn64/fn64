@@ -1225,4 +1225,142 @@ mod tests {
             assert_eq!(snapshot(&state), before);
         }
     }
+
+    /// **Resolves the coverage audit's open ambiguity: `unreachable by
+    /// construction`, not a coverage gap.**
+    ///
+    /// `docs/RT64-COVERAGE-AUDIT.md` measured that deleting both of
+    /// `validate_transfer_shape`'s `TransferMismatch` checks leaves the
+    /// whole workspace green, and could not tell whether that meant the
+    /// checks were untested or unreachable. It is the latter, and this
+    /// test pins the two structural facts the proof rests on so a future
+    /// widening of either makes them reachable *and* red here.
+    ///
+    /// The proof, read off `raw_dpc/mod.rs` rather than inferred:
+    ///
+    /// 1. **Word count.** `BoundTmemTransfer`'s `words` field is private
+    ///    with no public constructor and no setter; its only assignment is
+    ///    `words: &record.words` at the single `BoundTmemTransfer { .. }`
+    ///    literal inside `bind_tmem_transfer`. That `record` is a
+    ///    `TmemTransferRecord`, a **private** struct whose only
+    ///    construction site is the `Ok(TmemTransferRecord { .. })` at the
+    ///    end of the private `transfer_record`, which fills `words` from
+    ///    `for index in 0..plan.transfer_words()` -- so `words.len()` is
+    ///    `plan.transfer_words()` by construction. Nothing mutates the
+    ///    field afterwards (`Box<[_]>`, no `&mut` path). `bind_tmem_transfer`
+    ///    selects the record by `record.plan == plan`, and
+    ///    `validate_transfer_shape` re-reads that same plan through
+    ///    `transfer.load().transfer_plan()`, so the two sides of the
+    ///    comparison are derived from one value.
+    /// 2. **Source access count.** `source_accesses` is assigned only from
+    ///    `tmem_load_source_accesses`, which returns
+    ///    `self.accesses.get(start..end)` with
+    ///    `end = start + plan.access_count()`. A slice of that range has
+    ///    `len() == access_count()` whenever it is `Some`, and the `None`
+    ///    case returns `AccessSliceOutOfBounds` before any
+    ///    `BoundTmemTransfer` exists.
+    ///
+    /// **What would make them reachable**, and therefore what this test
+    /// guards against: making `BoundTmemTransfer`'s fields `pub` or adding
+    /// a public constructor; making `TmemTransferRecord` public or adding
+    /// a second construction site; giving `words` a `&mut`/setter path; or
+    /// changing `transfer_record`'s loop bound to anything other than
+    /// `plan.transfer_words()`. Until one of those happens the checks are
+    /// defense-in-depth against a future decoder change, not dead code --
+    /// they are kept for the same reason `AGENTS.md`'s "loud traps" rule
+    /// exists, and deliberately **not** downgraded to `debug_assert!`,
+    /// which would make the refusal profile-dependent.
+    ///
+    /// This is the resolution of, and replaces, the audit's `#[ignore]`d
+    /// marker. It runs.
+    #[test]
+    fn validate_transfer_shape_mismatch_checks_are_unreachable_by_construction() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/raw_dpc/mod.rs"))
+                .expect("the module the proof reads is in this crate");
+
+        // Fact 1a: exactly one `BoundTmemTransfer` struct literal exists,
+        // and it takes `words` from a record rather than from a caller.
+        assert_eq!(
+            source.matches("BoundTmemTransfer {").count(),
+            1,
+            "a second BoundTmemTransfer construction site would break the word-count proof"
+        );
+        assert!(
+            source.contains("words: &record.words,"),
+            "the sole construction site must still source `words` from the record"
+        );
+
+        // Fact 1b: `TmemTransferRecord` is private with one construction
+        // site, and that site's loop is bound by `plan.transfer_words()`.
+        assert!(
+            source.contains("\nstruct TmemTransferRecord {"),
+            "TmemTransferRecord must stay private (no `pub`), or a caller could forge a record"
+        );
+        assert_eq!(
+            source.matches("TmemTransferRecord {").count(),
+            2,
+            "the declaration plus exactly one construction site"
+        );
+        assert!(
+            source.contains("for index in 0..plan.transfer_words() {"),
+            "the record's words are filled exactly plan.transfer_words() times"
+        );
+
+        // Fact 1c: no mutation path to the words after construction. The
+        // field is `Box<[TmemTransferWord]>`, so the only `push` in the
+        // module is the local `Vec` inside `transfer_record`'s own filling
+        // loop -- which is the construction, not a mutation of it. What
+        // must NOT exist is a `&mut`/accessor route reaching the field
+        // once the record is built.
+        assert!(
+            source.contains("words: Box<[TmemTransferWord]>,"),
+            "the field must stay a boxed slice, which has no push/truncate of its own"
+        );
+        assert_eq!(
+            source.matches("words.push(").count(),
+            1,
+            "the only push is transfer_record's own construction loop"
+        );
+        for forbidden in ["words_mut", "&mut record", "record.words ="] {
+            assert!(
+                !source.contains(forbidden),
+                "a post-construction mutation path ({forbidden}) would break the proof"
+            );
+        }
+
+        // Fact 2: the source-access slice's length is its plan's count.
+        assert!(
+            source.contains(".checked_add(usize::from(plan.access_count()))"),
+            "tmem_load_source_accesses must still slice exactly access_count() entries"
+        );
+
+        // And the two guards themselves are still present to be proven
+        // about -- this test is not a licence to delete them. Scoped to
+        // `validate_transfer_shape`'s own body rather than counting the
+        // file's `TransferMismatch` sites, of which `validate_word`
+        // contributes eight more (measured, not assumed).
+        let tlut = include_str!("load_tlut.rs");
+        let body = tlut
+            .split_once("fn validate_transfer_shape(")
+            .expect("the function under proof exists")
+            .1
+            .split_once("\nfn ")
+            .expect("and it is followed by another item")
+            .0;
+        assert!(
+            body.contains("field: \"word count\","),
+            "the word-count refusal must still exist"
+        );
+        assert!(
+            body.contains("field: \"source access count\","),
+            "the source-access-count refusal must still exist"
+        );
+        assert_eq!(
+            body.matches("LoadTlutExecutionError::TransferMismatch {")
+                .count(),
+            2,
+            "exactly the two arms this proof covers"
+        );
+    }
 }

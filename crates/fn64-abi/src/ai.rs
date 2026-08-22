@@ -321,14 +321,28 @@ mod tests {
 
         let second_deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(second_deadline);
+        // The FINAL buffer's completion interrupts and delivers too.
+        //
+        // This previously asserted no interrupt and `WouldBlock`, citing a
+        // "documented FULL edge". rcp.h documents no such edge -- it defines
+        // `AI_STATUS_FIFO_FULL` as a status bit (`ultra64/rcp.h:576`) and says
+        // nothing about what RAISES the interrupt -- only that a WRITE to
+        // `AI_STATUS_REG` clears it (`ultra64/rcp.h:570`). The libultra
+        // contract supplies the positive rule: `osAiSetNextBuffer` refuses
+        // only on a full FIFO, so a single-buffered guest must still be woken
+        // by its one completion.
+        //
+        // The old expectation IS the bug in guest-visible form: a guest that
+        // enqueues one buffer and blocks on OS_EVENT_AI got `WouldBlock`
+        // forever.
         assert!(
-            !crate::pi::cpu_interrupt_pending(),
-            "final BUSY 1 -> 0 does not reproduce the documented FULL edge"
+            crate::pi::cpu_interrupt_pending(),
+            "the final AI buffer's completion must raise MI"
         );
         assert_eq!(crate::pi::live_ai_status(), fn64_runtime::AI_STATUS_ENABLED);
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
-            fn64_runtime::RecvMesgOutcome::WouldBlock
+            fn64_runtime::RecvMesgOutcome::Delivered(0xA1)
         );
     }
 
@@ -725,18 +739,29 @@ mod tests {
     }
 
     #[test]
-    fn raw_busy_bitrate_write_traps_without_mutating_device_evidence() {
+    fn os_ai_set_frequency_applies_while_ai_fifo_is_busy() {
         configure_ntsc();
+        let mut initial = ctx_with(32_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut initial) };
         let mut submit = ctx_with(0xFFFF_FFFF_8000_2000, 0x80, 0);
         unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut submit) };
         assert_eq!(submit.r2, 0);
         let before = crate::device_evidence_snapshot();
+        assert_ne!(before.guest.ai_status & fn64_runtime::AI_STATUS_BUSY, 0);
 
-        let fault = std::panic::catch_unwind(|| {
-            crate::pi::write_raw_mmio_word(0xA450_0014, 7);
-        });
-        assert!(fault.is_err());
-        assert_eq!(crate::device_evidence_snapshot(), before);
+        let mut changed = ctx_with(96_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut changed) };
+        let after = crate::device_evidence_snapshot();
+
+        assert_eq!(changed.r2, 96_019);
+        assert_eq!(after.guest.ai_dacrate, 506);
+        assert_eq!(after.guest.ai_bitrate, 6);
+        assert_ne!(after.guest.ai_status & fn64_runtime::AI_STATUS_BUSY, 0);
+        assert_eq!(after.guest.ai_length, before.guest.ai_length);
+        assert!(
+            after.current_ai.unwrap().deadline < before.current_ai.unwrap().deadline,
+            "the higher live DAC rate must retime the occupied FIFO slot"
+        );
     }
 
     #[test]

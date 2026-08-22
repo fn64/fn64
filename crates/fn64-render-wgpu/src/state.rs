@@ -6,15 +6,69 @@
 //! field widths, and variant ordering match exactly), cross-checked against
 //! the permitted MIT RT64 source pinned by `docs/RT64-PORT-AUTHORITY.md`:
 //! `src/shared/rt64_other_mode.h` (field selection: `alphaCompare`,
-//! `cycleType`, `combKey`, `cvgDst`, `clrOnCvg`, `cvgXAlpha`, `alphaCvgSel`,
-//! `forceBlend`, `textPersp`, `textFilt`, `textLOD`, `textDetail`, `textLUT`,
-//! `alphaDither`, `rgbDither`, `aaEn`, `zCmp`, `zUpd`, `zMode`, `zSource`) and
+//! `blenderInputs`, `cycleType`, `combKey`, `cvgDst`, `clrOnCvg`, `cvgXAlpha`,
+//! `alphaCvgSel`, `forceBlend`, `textPersp`, `textFilt`, `textLOD`,
+//! `textDetail`, `textLUT`, `alphaDither`, `rgbDither`, `aaEn`, `zCmp`,
+//! `zUpd`, `zMode`, `zSource`) and
 //! `src/shared/rt64_f3d_defines.h` (the `G_MDSFT_*` shift constants and
 //! `AA_EN`/`Z_CMP`/`Z_UPD`/`IM_RD`/`CLR_ON_CVG`/`CVG_DST_*`/`ZMODE_*`/
 //! `CVG_X_ALPHA`/`ALPHA_CVG_SEL`/`FORCE_BL` masks), pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`. `one_primitive_pipeline` (high
 //! bit 23) is not present in RT64's `OtherMode` struct; it is carried over
 //! from the reference's public `ultra64/gbi.h` provenance only.
+//!
+//! ## Corroboration against the pinned RT64 header
+//!
+//! The cross-checked source is `src/shared/rt64_other_mode.h` at that pinned
+//! commit, SHA-256 of the whole file
+//! `01096cbd3ff147bba9bdc334d0112e3a1dfa0f09a87b858bac9965bdcf38ca67` (104
+//! lines). That digest was computed here with `shasum -a 256` against the
+//! pinned checkout and cross-checked verbatim against
+//! `docs/rt64-port-inventory.json`'s
+//! `files[path="src/shared/rt64_other_mode.h"].sources.port.sha256`, which
+//! records the identical digest; the inventory's `sources.oracle.sha256`
+//! agrees, so the oracle and port trees hold this file byte for byte alike.
+//!
+//! **The digest citation is not a transcription claim.** The bit positions,
+//! field widths, and encoding values here descend from the admitted
+//! reference, whose own provenance is the public SGI SDK header
+//! `ultra64/gbi.h` (`gbi.h:497-627` for the field shifts, values, and
+//! coverage/Z/blender packing). RT64 is the *second* authority the same facts
+//! were checked against, not their origin.
+//!
+//! A bit-by-bit comparison of the two found **21/21 of the header's accessors
+//! agreeing in bit position, width, and mask, with zero divergences** -- two
+//! independently derived readings of the same public hardware contract
+//! corroborating each other. `blenderInputs` (low 16:31) agrees as a
+//! decomposition rather than a single accessor: RT64 returns the whole
+//! 16-bit window and `shared/rt64_blender.h` shifts within it, while
+//! `blender_cycle_1`/`blender_cycle_2` here pre-split it into the same eight
+//! two-bit selectors at the same absolute positions.
+//!
+//! fn64 is a strict **superset** by three accessors the pinned header has no
+//! accessor for:
+//! - `image_read_enabled` (low bit 6). `IM_RD 0x40` is *defined* at
+//!   `shared/rt64_f3d_defines.h:87` but never read anywhere in the pinned
+//!   tree.
+//! - `texture_convert` (high bits 9:11). No `G_MDSFT_TEXTCONV` appears
+//!   anywhere in the pinned tree.
+//! - `one_primitive_pipeline` (high bit 23), whose `ultra64/gbi.h` provenance
+//!   is disclosed above.
+//!
+//! The calling convention differs, losslessly. RT64's multi-bit accessors
+//! return the field **masked in place, unshifted**, leaving callers to shift
+//! or to compare against pre-shifted constants (`cvgDst() == CVG_DST_WRAP`);
+//! `blenderInputs` is the one exception that does shift down. The accessors
+//! here shift down and decode to typed enums instead. Where RT64's *headers*
+//! name an encoding "reserved" but the silicon decodes the field as
+//! independent bits, this module follows the silicon: the texture-LUT field
+//! (high 15:14) and the alpha-compare field (low 1:0) each decode two
+//! independent bits, so their nominally-reserved encodings mean "feature off"
+//! and are not distinct variants (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`
+//! and `:659-660`; `docs/RT64-GUARD-AUDIT.md` findings A2 and A3). Encodings
+//! that are genuinely unverified are still preserved as distinct variants
+//! (`TextureFilter::Reserved`). No claim is made about byte layout,
+//! `repr(C)`, or ABI compatibility with the C++ struct.
 //!
 //! This module does not import `fn64-render-reference` (no such crate
 //! dependency exists for `fn64-render-wgpu`); it is a self-contained literal
@@ -33,36 +87,33 @@ use crate::tmem::TmemState;
 /// Texture lookup-table interpretation selected by `SetOtherModes` high bits
 /// 15:14 (`G_MDSFT_TEXTLUT`).
 ///
-/// The encodings follow the permitted MIT RT64 source pinned by
-/// `docs/RT64-PORT-AUTHORITY.md` (`shared/rt64_f3d_defines.h` and
-/// `shared/rt64_other_mode.h`): zero disables the TLUT, two selects RGBA16,
-/// and three selects IA16. Encoding one is reserved and is rejected rather
-/// than treated as a disabled table.
+/// **There is no two-bit TLUT enum on hardware.** Pinned RT64 decodes
+/// bits 15 and 14 as two *independent* one-bit fields
+/// (`src/core/n64video/rdp.c:630-631`):
+///
+/// ```c
+/// wstate->other_modes.en_tlut   = (args[0] >> 15) & 1;
+/// wstate->other_modes.tlut_type = (args[0] >> 14) & 1;
+/// ```
+///
+/// Every consumer gates on `en_tlut` alone (`rdp/rasterizer.c:73`, `:89`;
+/// `rdp/tex.c:180`, `:243`, `:385`; `rdp/tmem.c:2014`, `:2043`) and reads
+/// `tlut_type` only *inside* an `en_tlut`-true branch (`rasterizer.c:76`:
+/// `tformat = tlut_type ? FORMAT_IA : FORMAT_RGBA`; `tmem.c:1612`, `:1799`
+/// live inside `fetch_texel_entlut_quadro*`, only reached when the TLUT is
+/// on). Wire encoding 1 is therefore `en_tlut = 0, tlut_type = 1`: the TLUT
+/// is simply **off** and the type bit is dead. It is decoded as
+/// [`TextureLutMode::Disabled`], not refused.
+///
+/// The earlier "reserved encoding" refusal came from RT64's *header macros*
+/// (`shared/rt64_f3d_defines.h`), which name only 0/2/3. A missing macro is
+/// not an illegal encoding. See `docs/RT64-GUARD-AUDIT.md` finding A2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextureLutMode {
     Disabled,
     Rgba16,
     Ia16,
 }
-
-/// Why `SetOtherModes`' texture-LUT field could not be decoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextureLutModeError {
-    ReservedEncoding { encoding: u8 },
-}
-
-impl core::fmt::Display for TextureLutModeError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ReservedEncoding { encoding } => write!(
-                formatter,
-                "SetOtherModes texture-LUT field uses reserved encoding {encoding}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TextureLutModeError {}
 
 /// RDP cycle type, other-mode high bits 20:21 (`G_MDSFT_CYCLETYPE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +160,6 @@ pub enum AlphaDither {
 pub enum AlphaCompare {
     None,
     Threshold,
-    Reserved,
     Dither,
 }
 
@@ -177,15 +227,19 @@ impl OtherMode {
         }
     }
 
-    /// Decodes the two-bit texture-LUT selector without normalizing its
-    /// reserved encoding into a supported mode.
-    pub const fn texture_lut_mode(self) -> Result<TextureLutMode, TextureLutModeError> {
-        let encoding = ((self.high >> 14) & 0x3) as u8;
-        match encoding {
-            0 => Ok(TextureLutMode::Disabled),
-            2 => Ok(TextureLutMode::Rgba16),
-            3 => Ok(TextureLutMode::Ia16),
-            _ => Err(TextureLutModeError::ReservedEncoding { encoding }),
+    /// Decodes other-mode high bits 15:14 as the two independent hardware
+    /// bits they are: bit 15 is `en_tlut`, bit 14 is `tlut_type`
+    /// (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`). With `en_tlut` clear
+    /// the type bit is dead, so both encodings 0 and 1 are `Disabled`.
+    pub const fn texture_lut_mode(self) -> TextureLutMode {
+        let enabled = self.high & (1 << 15) != 0;
+        let ia = self.high & (1 << 14) != 0;
+        if !enabled {
+            TextureLutMode::Disabled
+        } else if ia {
+            TextureLutMode::Ia16
+        } else {
+            TextureLutMode::Rgba16
         }
     }
 
@@ -255,15 +309,29 @@ impl OtherMode {
         self.high & (1 << 23) != 0
     }
 
-    /// Other-mode low bits 0:1 (`G_MDSFT_ALPHACOMPARE`). Encoding 2 is
-    /// reserved and is surfaced as `AlphaCompare::Reserved` rather than
-    /// normalized into `None` or `Threshold`.
+    /// Other-mode low bits 0:1 (`G_MDSFT_ALPHACOMPARE`). **Not a two-bit
+    /// enum on hardware:** pinned RT64 decodes two independent bits
+    /// (`src/core/n64video/rdp.c:659-660`):
+    ///
+    /// ```c
+    /// wstate->other_modes.dither_alpha_en  = (args[1] >> 1) & 1;
+    /// wstate->other_modes.alpha_compare_en = (args[1] >> 0) & 1;
+    /// ```
+    ///
+    /// `rdp/blender.c`'s `alpha_compare` short-circuits on bit 0 alone
+    /// (`if (!alpha_compare_en) return 1;`), and the separate copy-mode
+    /// inline compare gates on the same bit alone
+    /// (`rdp/rasterizer.c:1971`). Wire encoding 2 is therefore
+    /// `alpha_compare_en = 0, dither_alpha_en = 1`: the compare is **off**
+    /// and the dither bit is ignored, i.e. behaviourally `G_AC_NONE`.
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     pub const fn alpha_compare(self) -> AlphaCompare {
-        match self.low & 0x3 {
-            0 => AlphaCompare::None,
-            1 => AlphaCompare::Threshold,
-            2 => AlphaCompare::Reserved,
-            _ => AlphaCompare::Dither,
+        if self.low & 0x1 == 0 {
+            AlphaCompare::None
+        } else if self.low & 0x2 != 0 {
+            AlphaCompare::Dither
+        } else {
+            AlphaCompare::Threshold
         }
     }
 
@@ -456,6 +524,16 @@ impl FillColor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color4(u32);
 
+/// The RDP color registers power up holding zero, so the `Default` of a
+/// color word is the all-zero wire value rather than an "absent" marker --
+/// see [`RdpState`]'s constant-color field doc for the reference-lane and
+/// RT64 citations.
+impl Default for Color4 {
+    fn default() -> Self {
+        Self::from_wire(0)
+    }
+}
+
 impl Color4 {
     pub(crate) const fn from_wire(value: u32) -> Self {
         Self(value)
@@ -549,6 +627,14 @@ pub struct PrimColor {
     color: Color4,
 }
 
+/// Zero LOD word and zero color word: `SetPrimColor`'s power-on state, the
+/// same all-zero `primColor` RT64 installs at `rt64_state.cpp:126`.
+impl Default for PrimColor {
+    fn default() -> Self {
+        Self::from_wire(0, 0)
+    }
+}
+
 impl PrimColor {
     pub(crate) const fn from_wire(w0: u32, w1: u32) -> Self {
         Self {
@@ -628,16 +714,89 @@ pub struct RdpState {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
-    env_color: Option<Color4>,
-    prim_color: Option<PrimColor>,
-    blend_color: Option<Color4>,
-    fog_color: Option<Color4>,
+    /// The four RDP constant-color registers are **not** `Option`: they are
+    /// registers with a defined power-on value, not state that can be
+    /// absent. `Default` gives each one all-zero wire bytes.
+    ///
+    /// Both other lanes model them exactly this way.
+    /// `fn64-render-reference/src/gbi/state.rs:227` declares
+    /// `blend_color: [u8; 4]` and `:387` initializes it to `[0; 4]`;
+    /// RT64's own C++ (`src/hle/rt64_state.cpp:126-131`) zero-initializes
+    /// `primColor`, `envColor`, `fogColor` and `blendColor` to
+    /// `{0.0f, 0.0f, 0.0f, 0.0f}`, then overwrites each only when its
+    /// `DrawAttribute` is marked changed (`loadDrawState`, `:174-197`).
+    ///
+    /// Modelling them as `Option` invented an "unset" state the RDP has no
+    /// way to be in, and turned it into a refusal: a `Threshold`
+    /// alpha-compare against a never-written blend color aborted the plan
+    /// instead of comparing against zero. Note this is *not* the same
+    /// question as whether a value was invented -- zero here is the
+    /// register's real content, cited above, not a stand-in for a value
+    /// nobody knows.
+    ///
+    /// `RdpStateDelta` keeps its `Option`s: there, `None` means "this
+    /// packet issued no such command", which is a real distinction.
+    env_color: Color4,
+    prim_color: PrimColor,
+    blend_color: Color4,
+    fog_color: Color4,
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
+    /// `G_SETSCISSOR`'s latched clip rect, in the quarter-pixel wire units
+    /// the scissor command latches. The public libultra macro
+    /// `gDPSetScissor` (`ultra64/gbi.h:4794-4837`) shows the wire
+    /// encoding: each bound is stored as `(int)(coord * 4.0f)`, i.e.
+    /// quarter-pixel units in two 12-bit fields.
+    ///
+    /// **Durable across packets, like every other `Set*` register here.**
+    /// A display list that sets the scissor once at the top of a frame and
+    /// then submits several packets expects the later packets to be
+    /// scissored too; keeping this per-packet would silently unscissor
+    /// everything after the first.
+    ///
+    /// `Option` rather than a defaulted rect for the reason the doc on
+    /// [`crate::targets::RdpScissorRect`]'s consumer gives: the honest
+    /// default is the colour target's extent, and this struct is not where
+    /// the extent is known. `None` means no `SetScissor` has been seen and
+    /// the consumer supplies its own widest bound.
+    scissor: Option<crate::targets::RdpScissorRect>,
     tmem: TmemState,
+    /// The HOST-configured colour-target height, in scanlines.
+    ///
+    /// **Not RDP state.** `SetColorImage` carries a width and no height, and
+    /// the RDP has no register that supplies one -- the height comes from
+    /// `RenderConfig`, the same value `configured_target_extent` records at
+    /// `create` time. It lives here because the DECODER needs it and has no
+    /// other route to it: `plan_raw_triangle` declares one write access per
+    /// covered scanline, and a triangle whose YL reaches past the target's
+    /// last row would otherwise declare byte ranges the target cannot hold.
+    ///
+    /// `None` means no `create` has run yet, in which case a raw triangle
+    /// declares nothing at all rather than guessing a height -- the same
+    /// "decode succeeds, journal stays silent" shape every other unavailable
+    /// precondition in `plan_raw_triangle` takes.
+    ///
+    /// Measured, not reasoned: with the decoder capped only by installed
+    /// RDRAM, WM2000 aborted after 280 VI swaps with "FillRectangle access
+    /// #59 names a range outside its own color target's full extent". The
+    /// defect predates the texture rung -- it was simply unreachable while
+    /// the decoder refused every triangle the ROM emits.
+    color_target_height: Option<u32>,
 }
 
 impl RdpState {
+    /// Records the host-configured colour-target height. Called once from
+    /// `create_inner`, from the same `RenderConfig` that fills
+    /// `configured_target_extent`, so the decoder's row bound and the
+    /// executor's extent cannot disagree.
+    pub(crate) fn set_color_target_height(&mut self, height: u32) {
+        self.color_target_height = Some(height);
+    }
+
+    pub(crate) const fn color_target_height(&self) -> Option<u32> {
+        self.color_target_height
+    }
+
     pub const fn other_mode(&self) -> Option<OtherMode> {
         self.other_mode
     }
@@ -650,20 +809,24 @@ impl RdpState {
         self.fill_color
     }
 
-    pub const fn env_color(&self) -> Option<Color4> {
+    pub const fn env_color(&self) -> Color4 {
         self.env_color
     }
 
-    pub const fn prim_color(&self) -> Option<PrimColor> {
+    pub const fn prim_color(&self) -> PrimColor {
         self.prim_color
     }
 
-    pub const fn blend_color(&self) -> Option<Color4> {
+    pub const fn blend_color(&self) -> Color4 {
         self.blend_color
     }
 
-    pub const fn fog_color(&self) -> Option<Color4> {
+    pub const fn fog_color(&self) -> Color4 {
         self.fog_color
+    }
+
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.scissor
     }
 
     pub const fn prim_depth(&self) -> Option<PrimDepth> {
@@ -684,6 +847,10 @@ impl RdpState {
 
     pub(crate) fn fork_for_decode(&self) -> Self {
         Self {
+            // Forked, not dropped: a scissor latched by an earlier packet
+            // still governs this one, so a fork that reset it would
+            // unscissor everything after the packet that set it.
+            scissor: self.scissor,
             other_mode: self.other_mode,
             color_image: self.color_image,
             fill_color: self.fill_color,
@@ -694,6 +861,10 @@ impl RdpState {
             prim_depth: self.prim_depth,
             combine: self.combine,
             tmem: self.tmem.clone(),
+            // Carried into the decode fork: it is what bounds
+            // `plan_raw_triangle`'s row walk, and a fork that dropped it
+            // would declare rows past the target's end.
+            color_target_height: self.color_target_height,
         }
     }
 
@@ -708,22 +879,25 @@ impl RdpState {
             self.fill_color = Some(value);
         }
         if let Some(value) = delta.env_color {
-            self.env_color = Some(value);
+            self.env_color = value;
         }
         if let Some(value) = delta.prim_color {
-            self.prim_color = Some(value);
+            self.prim_color = value;
         }
         if let Some(value) = delta.blend_color {
-            self.blend_color = Some(value);
+            self.blend_color = value;
         }
         if let Some(value) = delta.fog_color {
-            self.fog_color = Some(value);
+            self.fog_color = value;
         }
         if let Some(value) = delta.prim_depth {
             self.prim_depth = Some(value);
         }
         if let Some(value) = delta.combine {
             self.combine = Some(value);
+        }
+        if let Some(value) = delta.scissor {
+            self.scissor = Some(value);
         }
         if let Some(value) = &delta.tmem {
             self.tmem = value.clone();
@@ -742,6 +916,10 @@ pub struct RdpStateDelta {
     fog_color: Option<Color4>,
     prim_depth: Option<PrimDepth>,
     combine: Option<CombineParams>,
+    /// `None` here means "this packet issued no `SetScissor`", which is a
+    /// real distinction from `RdpState`'s own `None` ("none has ever been
+    /// issued") -- the same split every other field in this struct makes.
+    scissor: Option<crate::targets::RdpScissorRect>,
     tmem: Option<TmemState>,
 }
 
@@ -780,6 +958,14 @@ impl RdpStateDelta {
 
     pub const fn combine(&self) -> Option<CombineParams> {
         self.combine
+    }
+
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.scissor
+    }
+
+    pub(crate) fn set_scissor(&mut self, value: crate::targets::RdpScissorRect) {
+        self.scissor = Some(value);
     }
 
     pub const fn tmem(&self) -> Option<&TmemState> {
@@ -850,20 +1036,24 @@ impl StagedRdpState {
         self.state.fill_color()
     }
 
-    pub const fn env_color(&self) -> Option<Color4> {
+    pub const fn env_color(&self) -> Color4 {
         self.state.env_color()
     }
 
-    pub const fn prim_color(&self) -> Option<PrimColor> {
+    pub const fn prim_color(&self) -> PrimColor {
         self.state.prim_color()
     }
 
-    pub const fn blend_color(&self) -> Option<Color4> {
+    pub const fn blend_color(&self) -> Color4 {
         self.state.blend_color()
     }
 
-    pub const fn fog_color(&self) -> Option<Color4> {
+    pub const fn fog_color(&self) -> Color4 {
         self.state.fog_color()
+    }
+
+    pub const fn scissor(&self) -> Option<crate::targets::RdpScissorRect> {
+        self.state.scissor()
     }
 
     pub const fn prim_depth(&self) -> Option<PrimDepth> {
@@ -918,23 +1108,83 @@ impl StagedRdpState {
 mod tests {
     use super::*;
 
+    /// The four RDP constant-color registers power up with defined contents,
+    /// so a program that never issues `SetBlendColor`/`SetEnvColor`/
+    /// `SetPrimColor`/`SetFogColor` still reads a real value -- zero.
+    ///
+    /// Both other lanes model exactly this. `fn64-render-reference`'s
+    /// `gbi/state.rs:227` declares `blend_color: [u8; 4]` (not an `Option`)
+    /// and `:387` initializes it to `[0; 4]`; RT64's own C++
+    /// (`src/hle/rt64_state.cpp:126-131`) zero-initializes `primColor`,
+    /// `envColor`, `fogColor` and `blendColor` to `{0,0,0,0}` and only
+    /// overwrites them on a change. Modelling the durable register as
+    /// "absent" invents a state the hardware does not have.
+    ///
+    /// Derived by hand, not from the constructor: an RDP color register is
+    /// four bytes of zero at power-on, so the packed wire word is
+    /// `0x0000_0000` and the alpha byte the `Threshold` comparator reads is
+    /// `0`.
     #[test]
-    fn texture_lut_mode_decodes_all_four_wire_encodings_without_normalization() {
+    fn the_four_constant_color_registers_power_up_zeroed_rather_than_absent() {
+        let state = RdpState::default();
+        assert_eq!(state.blend_color(), Color4::from_wire(0));
+        assert_eq!(state.env_color(), Color4::from_wire(0));
+        assert_eq!(state.fog_color(), Color4::from_wire(0));
+        assert_eq!(state.prim_color(), PrimColor::from_wire(0, 0));
+        assert_eq!(
+            state.blend_color().rgba8()[3],
+            0,
+            "the power-on alpha byte is what a Threshold alpha-compare reads"
+        );
+    }
+
+    /// A written register must still win. Without this the previous test
+    /// could pass against a constant that ignores every `SetBlendColor`.
+    #[test]
+    fn a_written_constant_color_register_overrides_its_power_on_zero() {
+        let mut state = RdpState::default();
+        let mut delta = RdpStateDelta::default();
+        delta.set_blend_color(Color4::from_wire(0x1122_3344));
+        delta.set_env_color(Color4::from_wire(0x5566_7788));
+        delta.set_fog_color(Color4::from_wire(0x99aa_bbcc));
+        state.apply(&delta);
+        assert_eq!(state.blend_color(), Color4::from_wire(0x1122_3344));
+        assert_eq!(state.env_color(), Color4::from_wire(0x5566_7788));
+        assert_eq!(state.fog_color(), Color4::from_wire(0x99aa_bbcc));
+        assert_ne!(
+            state.blend_color(),
+            Color4::from_wire(0),
+            "a written register must differ from the power-on value, or this test cannot \
+             distinguish real tracking from a hardcoded zero"
+        );
+    }
+
+    #[test]
+    /// Hand-derived from the bit layout, not from the code under test:
+    /// bit 15 is `en_tlut`, bit 14 is `tlut_type` (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`
+    /// ). With `en_tlut` clear the type bit
+    /// is dead, so encodings 0 and 1 both mean the TLUT is off; with it set,
+    /// `tlut_type` picks IA16 over RGBA16 (`rdp/rasterizer.c:76`).
+    ///
+    /// Retargeted from `..._without_normalization`, which pinned encoding 1
+    /// as a refusal. See `docs/RT64-GUARD-AUDIT.md` finding A2.
+    fn texture_lut_mode_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0 << 14, u32::MAX).texture_lut_mode(),
-            Ok(TextureLutMode::Disabled)
+            TextureLutMode::Disabled
         );
         assert_eq!(
             OtherMode::from_wire(1 << 14, 0).texture_lut_mode(),
-            Err(TextureLutModeError::ReservedEncoding { encoding: 1 })
+            TextureLutMode::Disabled,
+            "encoding 1 is en_tlut=0 with a dead tlut_type bit: the TLUT is simply off"
         );
         assert_eq!(
             OtherMode::from_wire(2 << 14, 0).texture_lut_mode(),
-            Ok(TextureLutMode::Rgba16)
+            TextureLutMode::Rgba16
         );
         assert_eq!(
             OtherMode::from_wire(3 << 14, 0).texture_lut_mode(),
-            Ok(TextureLutMode::Ia16)
+            TextureLutMode::Ia16
         );
     }
 
@@ -943,18 +1193,29 @@ mod tests {
         let high = 0x00ff_ffff & !(0x3 << 14);
         assert_eq!(
             OtherMode::from_wire(high | (2 << 14), u32::MAX).texture_lut_mode(),
-            Ok(TextureLutMode::Rgba16)
+            TextureLutMode::Rgba16
         );
     }
 
     #[test]
-    fn reserved_texture_lut_encoding_is_a_public_typed_error() {
-        let error = OtherMode::from_wire(1 << 14, 0)
-            .texture_lut_mode()
-            .unwrap_err();
-        assert_eq!(error, TextureLutModeError::ReservedEncoding { encoding: 1 });
-        assert!(!error.to_string().is_empty());
-        let _: &dyn std::error::Error = &error;
+    /// Retargeted from `reserved_texture_lut_encoding_is_a_public_typed_error`.
+    /// Encoding 1 is no longer an error at all; it is the TLUT being off, and
+    /// it must be *observably distinct* from the enabled encodings, so that a
+    /// decoder that collapsed everything to one answer cannot pass.
+    /// pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`.
+    fn tlut_type_bit_alone_does_not_enable_the_table() {
+        let type_bit_only = OtherMode::from_wire(1 << 14, 0);
+        assert_eq!(type_bit_only.texture_lut_mode(), TextureLutMode::Disabled);
+        // The same tlut_type bit *with* en_tlut set must select IA16, or the
+        // "off" answer above would be indistinguishable from ignoring bit 14.
+        assert_eq!(
+            OtherMode::from_wire(3 << 14, 0).texture_lut_mode(),
+            TextureLutMode::Ia16
+        );
+        assert_ne!(
+            type_bit_only.texture_lut_mode(),
+            OtherMode::from_wire(3 << 14, 0).texture_lut_mode()
+        );
     }
 
     #[test]
@@ -1086,7 +1347,16 @@ mod tests {
     }
 
     #[test]
-    fn alpha_compare_decodes_all_four_wire_encodings_including_reserved() {
+    /// Hand-derived from the bit layout, not from the code under test: bit 0
+    /// is `alpha_compare_en`, bit 1 is `dither_alpha_en` (pinned RT64
+    /// `src/core/n64video/rdp.c:659-660`), and `rdp/blender.c`'s
+    /// `alpha_compare` returns 1 unconditionally when bit 0 is clear. So
+    /// encoding 2 (`dither_alpha_en` set, `alpha_compare_en` clear) is
+    /// behaviourally `G_AC_NONE`, exactly like encoding 0.
+    ///
+    /// Retargeted from `..._including_reserved`, which pinned encoding 2 as a
+    /// distinct `Reserved` variant. See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    fn alpha_compare_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0, 0).alpha_compare(),
             AlphaCompare::None
@@ -1097,11 +1367,19 @@ mod tests {
         );
         assert_eq!(
             OtherMode::from_wire(0, 2).alpha_compare(),
-            AlphaCompare::Reserved
+            AlphaCompare::None,
+            "encoding 2 clears alpha_compare_en; the dither bit alone never enables the compare"
         );
         assert_eq!(
             OtherMode::from_wire(0, 3).alpha_compare(),
             AlphaCompare::Dither
+        );
+        // Distinguishing check: the dither bit must still be live when the
+        // enable bit is set, so "2 -> None" cannot be produced by a decoder
+        // that simply ignores bit 1.
+        assert_ne!(
+            OtherMode::from_wire(0, 3).alpha_compare(),
+            OtherMode::from_wire(0, 1).alpha_compare()
         );
     }
 
@@ -1288,7 +1566,7 @@ mod tests {
         assert_eq!(OtherMode::from_wire(!(0x3 << 17), 0).texture_detail(), 0);
         assert_eq!(
             OtherMode::from_wire(!(0x3 << 14), 0).texture_lut_mode(),
-            Ok(TextureLutMode::Disabled)
+            TextureLutMode::Disabled
         );
     }
 
@@ -1349,7 +1627,7 @@ mod tests {
         assert_eq!(reset.alpha_dither(), AlphaDither::Disabled);
         assert!(!reset.combine_key());
         assert_eq!(reset.texture_convert(), 6);
-        assert_eq!(reset.texture_lut_mode(), Ok(TextureLutMode::Disabled));
+        assert_eq!(reset.texture_lut_mode(), TextureLutMode::Disabled);
         assert!(!reset.texture_lod());
         assert_eq!(reset.texture_detail(), 0);
         assert!(reset.texture_perspective());
@@ -1391,7 +1669,9 @@ mod tests {
         let compares = [
             AlphaCompare::None,
             AlphaCompare::Threshold,
-            AlphaCompare::Reserved,
+            // Encoding 2 clears `alpha_compare_en` (pinned RT64 `shaders/RasterPS.hlsl:203-213`), so
+            // it is `None`, not a fourth distinct mode.
+            AlphaCompare::None,
             AlphaCompare::Dither,
         ];
         for (value, expected) in compares.iter().enumerate() {

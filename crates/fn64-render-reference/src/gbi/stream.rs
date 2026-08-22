@@ -1,16 +1,13 @@
-use fn64_render::{
-    MicrocodeDataImageIdentity, TaskAdmissionGeneration,
-    TaskAdmissionSource,
-};
-use sha2::{Digest, Sha256};
-use super::*;
-use super::wire::*;
-use super::types::*;
-use super::matrix::*;
-use super::tmem::*;
-use super::state::*;
 use super::entries::*;
 use super::geometry::*;
+use super::matrix::*;
+use super::state::*;
+use super::tmem::*;
+use super::types::*;
+use super::wire::*;
+use super::*;
+use fn64_render::{MicrocodeDataImageIdentity, TaskAdmissionGeneration, TaskAdmissionSource};
+use sha2::{Digest, Sha256};
 
 pub(super) fn decode_stream(
     rdram: &mut [u8],
@@ -261,6 +258,12 @@ pub(super) fn decode_stream_impl(
             wire_opcode
         };
         pc += 8;
+
+        super::census::note(opcode, raw_rdp);
+        // Same `(w0, w1)` bindings dispatch matches on, and the same
+        // site the histogram counts from, so a dumped word pair and a
+        // census row cannot disagree about what was decoded.
+        super::census::packet::note(command_pc, w0, w1, raw_rdp);
 
         if !raw_rdp && family.is_line() && matches!(opcode, G_TRI2 | G_QUAD) {
             crate::render_unsupported_panic(
@@ -1008,6 +1011,11 @@ pub(super) fn decode_stream_impl(
                 // this path as well as the F3DEX2 partial setters.
                 state.other_mode.high = w0 & 0x00FF_FFFF;
                 state.other_mode.low = w1;
+                // Read-only tally of the depth bits in the word just
+                // latched, off unless `FN64_GBI_OTHERMODE_CENSUS` is set.
+                // Reads `state.other_mode` rather than `w0`/`w1` so the
+                // count is of what the renderer will act on.
+                super::census::othermode::note(state.other_mode, raw_rdp);
             }
             G_SETOTHERMODE_H => {
                 // F3DEX2 gSPSetOtherMode (`gbi.h:3353-3369`) stores
@@ -1321,6 +1329,15 @@ pub(super) fn decode_stream_impl(
             G_TEXRECT | G_TEXRECTFLIP => {
                 let (coords, gradients, continuation_bytes) =
                     decode_texture_rectangle_continuation(rdram, pc, *family, raw_rdp, opcode);
+                // The dispatch-site dump sees only (w0, w1). This pair
+                // carries the S/T origin and the per-pixel gradients, and a
+                // replay without them would fabricate texture coordinates.
+                // On the raw-RDP lane the pair IS the wire words at `pc`
+                // (`decode_texture_rectangle_continuation` returns them
+                // unmodified, 8 bytes), so a dumped row at `pc` reconstructs
+                // the wire stream exactly; on the GBI lane the same pair is
+                // the RDPHALF-envelope payload, which is what dispatch used.
+                super::census::packet::note_continuation(pc, coords, gradients, raw_rdp);
                 pc += continuation_bytes;
                 if continuation_bytes == 16 {
                     state.cmds_decoded += 2;
@@ -1332,6 +1349,16 @@ pub(super) fn decode_stream_impl(
                     );
                 }
                 let tile = ((w1 >> 24) & 0x07) as u8;
+                // Operand-level probe (env `FN64_GBI_TEXRECT_CENSUS`): the
+                // cycle mode latched for THIS rectangle, read from the same
+                // `state.other_mode` the rectangle below is built from, so
+                // the census and the decode cannot disagree about
+                // `G_MDSFT_CYCLETYPE`.
+                super::census::texrect::note(
+                    state.other_mode.cycle_type(),
+                    state.other_mode.raw_high(),
+                    &state.combiner.mode,
+                );
                 let storage = state.tex.tmem.clone();
                 state.ops.push(RenderOp::TextureRectangle(TextureRectangle {
                     ulx: ((w1 >> 12) & 0x0fff) as f32 / 4.0,
@@ -1348,6 +1375,20 @@ pub(super) fn decode_stream_impl(
                     combiner: state.combiner,
                     blender: active_blender(state),
                     scissor: state.scissor,
+                    // **`max_level` is 0 here deliberately, not for want of a
+                    // value to read.** `state.tex.tex_max_level` IS latched
+                    // (`G_TEXTURE`'s own field(w0,11,3), above), and the
+                    // TRIANGLE path passes it (`geometry.rs`'s
+                    // `active_texture`). A texture rectangle must not: it is
+                    // an RDP-side command that names its own tile in wire
+                    // word 1 bits 26:24 (`tile`, decoded just above), so it
+                    // deliberately consumes NONE of `G_TEXTURE`'s three
+                    // RSP-side fields -- not the on-bit (field(w0,1,7),
+                    // which gates only `active_texture`), not the tile
+                    // (field(w0,8,3), overridden by the wire tile here), and
+                    // therefore not max-level (field(w0,11,3)) either. All
+                    // three live in one word; honoring one while ignoring
+                    // the other two would be the inconsistency.
                     texture: bind_texture_set(&state.tex, tile, 0, state.other_mode.texture_lut()),
                     texture1: texture_for_tile(
                         &state.tex,
