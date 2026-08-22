@@ -711,6 +711,15 @@ pub fn execute_fill_rectangle(
     ))
 }
 
+/// Packs the decoded fill-register pixel without introducing pixel-pipeline
+/// state. The Programming Manual Chapter 12 "Fill Mode" says the programmable
+/// fill color is written while the arithmetic pipeline is largely unused, and
+/// §12.8.2 "Fill Color" identifies the 32-bit fill register as the FILL-cycle
+/// source. RT64 f0728a2 independently routes `G_CYC_FILL` through
+/// `InstanceDrawCall::FillRect`/`clearColor` after `RGBA16::toRGBAF` decodes
+/// source bit 0 as alpha, bypassing `RasterPS` coverage generation. RGBA16 bit
+/// 0 is therefore the selected fill halfword's bit verbatim; only one-/two-
+/// cycle pixel-pipeline packers replace it with stored coverage bit 2.
 fn write_pixel(format: ColorTargetFormat, dest: &mut [u8], pixel: Rgba8) {
     match format {
         ColorTargetFormat::Rgba16 => {
