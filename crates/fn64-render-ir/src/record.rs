@@ -1,14 +1,15 @@
 use core::num::NonZeroU32;
+use std::borrow::Cow;
 
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccessMode, AccessPurpose, CmdEndOccurrence, ContentDigest, DmemRange, DpInterruptState,
-    FullSyncOccurrence, GuestReadPlanIdentity, GuestReadSetIdentity, HostResource, JournalIdentity,
-    MicrocodeAdmissionIdentity, OperationId, PhysicalMemoryLayout, RawCommandStream,
-    RawStreamIdentity, RawStreamKind, RdramResource, RecordIdentity, ResourceAccess,
-    ResourceJournal, ResourceJournalLimits, ResourceRegion, TmemRange, ValidationError,
-    WorkloadAdmission, WorkloadIdentity, WorkloadPacket,
+    guest_read::CapturedGuestReadRecordContent, AccessMode, AccessPurpose, CmdEndOccurrence,
+    ContentDigest, DmemRange, DpInterruptState, FullSyncOccurrence, GuestReadPlanIdentity,
+    GuestReadSetIdentity, HostResource, JournalIdentity, MicrocodeAdmissionIdentity, OperationId,
+    PhysicalMemoryLayout, RawCommandStream, RawStreamIdentity, RawStreamKind, RdramResource,
+    RecordIdentity, ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion,
+    TmemRange, ValidationError, WorkloadAdmission, WorkloadIdentity, WorkloadPacket,
 };
 
 pub const WORKLOAD_RECORD_SCHEMA: &str = "fn64.render-ir.record.v3";
@@ -217,7 +218,7 @@ impl RawStreamRecord {
 }
 
 /// Deterministic, content-silent workload evidence and replay recipe.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct WorkloadRecord {
     workload: WorkloadIdentity,
     memory_layout: PhysicalMemoryLayout,
@@ -226,8 +227,67 @@ pub struct WorkloadRecord {
     journal: ResourceJournal,
     guest_read_plan: GuestReadPlanIdentity,
     guest_read_set: GuestReadSetIdentity,
-    guest_read_contents: Box<[ContentDigest]>,
+    guest_read_contents: GuestReadContents,
 }
+
+#[derive(Clone, Debug)]
+enum GuestReadContents {
+    Captured(Box<[CapturedGuestReadRecordContent]>),
+    Serialized(Box<[ContentDigest]>),
+}
+
+impl GuestReadContents {
+    fn len(&self) -> usize {
+        match self {
+            Self::Captured(contents) => contents.len(),
+            Self::Serialized(contents) => contents.len(),
+        }
+    }
+
+    fn serialized_digests(&self) -> Cow<'_, [ContentDigest]> {
+        match self {
+            Self::Captured(contents) => Cow::Owned(
+                contents
+                    .iter()
+                    .map(CapturedGuestReadRecordContent::content_digest)
+                    .collect(),
+            ),
+            Self::Serialized(contents) => Cow::Borrowed(contents),
+        }
+    }
+}
+
+impl PartialEq for GuestReadContents {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Captured(left), Self::Captured(right)) => left
+                .iter()
+                .map(CapturedGuestReadRecordContent::fast_content)
+                .eq(right
+                    .iter()
+                    .map(CapturedGuestReadRecordContent::fast_content)),
+            (Self::Serialized(left), Self::Serialized(right)) => left == right,
+            _ => self.serialized_digests() == other.serialized_digests(),
+        }
+    }
+}
+
+impl Eq for GuestReadContents {}
+
+impl PartialEq for WorkloadRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.workload == other.workload
+            && self.memory_layout == other.memory_layout
+            && self.admission == other.admission
+            && self.streams == other.streams
+            && self.journal == other.journal
+            && self.guest_read_plan == other.guest_read_plan
+            && self.guest_read_set == other.guest_read_set
+            && self.guest_read_contents == other.guest_read_contents
+    }
+}
+
+impl Eq for WorkloadRecord {}
 
 impl WorkloadRecord {
     pub fn from_packet(packet: &WorkloadPacket) -> Self {
@@ -243,12 +303,14 @@ impl WorkloadRecord {
             journal: packet.journal().clone(),
             guest_read_plan: packet.guest_reads().plan_identity(),
             guest_read_set: packet.guest_reads().identity(),
-            guest_read_contents: packet
-                .guest_reads()
-                .reads()
-                .iter()
-                .map(|read| read.content())
-                .collect(),
+            guest_read_contents: GuestReadContents::Captured(
+                packet
+                    .guest_reads()
+                    .reads()
+                    .iter()
+                    .map(|read| read.record_content())
+                    .collect(),
+            ),
         }
     }
 
@@ -280,8 +342,8 @@ impl WorkloadRecord {
         self.guest_read_set
     }
 
-    pub fn guest_read_content_digests(&self) -> &[ContentDigest] {
-        &self.guest_read_contents
+    pub fn guest_read_content_digests(&self) -> Cow<'_, [ContentDigest]> {
+        self.guest_read_contents.serialized_digests()
     }
 
     /// Encode no command bytes: only source geometry, temporal boundaries,
@@ -323,8 +385,17 @@ impl WorkloadRecord {
         encode_journal(&mut body, &self.journal);
         body.extend_from_slice(&self.guest_read_plan.as_bytes());
         body.extend_from_slice(&self.guest_read_set.as_bytes());
-        put_u32(&mut body, self.guest_read_contents.len() as u32);
-        for digest in &self.guest_read_contents {
+        let guest_read_contents = match &self.guest_read_contents {
+            GuestReadContents::Captured(contents) => Cow::Owned(
+                contents
+                    .iter()
+                    .map(CapturedGuestReadRecordContent::content_digest)
+                    .collect(),
+            ),
+            GuestReadContents::Serialized(contents) => Cow::Borrowed(contents.as_ref()),
+        };
+        put_u32(&mut body, guest_read_contents.len() as u32);
+        for digest in guest_read_contents.iter() {
             body.extend_from_slice(digest.as_ref());
         }
         let integrity = record_digest(&body);
@@ -496,17 +567,9 @@ impl WorkloadRecord {
                 actual: guest_read_contents.len(),
             });
         }
-        let derived_set = crate::guest_read::set_identity_from_digests(
-            guest_read_plan,
-            journal.identity(),
-            plan.reads()
-                .iter()
-                .copied()
-                .zip(guest_read_contents.iter().copied()),
-        );
-        if guest_read_set != derived_set {
-            return Err(ValidationError::ReplayGuestReadSetMismatch);
-        }
+        // The set identity binds runtime xxh3 content identities, while the
+        // wire carries stable SHA-256 values. Only replay has the bytes needed
+        // to validate both independently against the recorded set.
         if reader.remaining() != 0 {
             return Err(ValidationError::RecordTrailingBytes {
                 bytes: reader.remaining(),
@@ -520,7 +583,9 @@ impl WorkloadRecord {
             journal,
             guest_read_plan,
             guest_read_set,
-            guest_read_contents: guest_read_contents.into_boxed_slice(),
+            guest_read_contents: GuestReadContents::Serialized(
+                guest_read_contents.into_boxed_slice(),
+            ),
         })
     }
 
@@ -531,7 +596,7 @@ impl WorkloadRecord {
         &self,
         streams: Vec<RawCommandStream>,
     ) -> Result<WorkloadPacket, ValidationError> {
-        if !self.guest_read_contents.is_empty() {
+        if self.guest_read_contents.len() != 0 {
             return Err(ValidationError::ReplayGuestReadCaptureRequired {
                 count: self.guest_read_contents.len(),
             });
@@ -567,14 +632,34 @@ impl WorkloadRecord {
         )?;
         if packet.guest_reads().plan_identity() != self.guest_read_plan
             || packet.guest_reads().identity() != self.guest_read_set
-            || packet
-                .guest_reads()
-                .reads()
-                .iter()
-                .map(|read| read.content())
-                .ne(self.guest_read_contents.iter().copied())
         {
             return Err(ValidationError::ReplayGuestReadSetMismatch);
+        }
+        match &self.guest_read_contents {
+            GuestReadContents::Captured(expected) => {
+                if packet
+                    .guest_reads()
+                    .reads()
+                    .iter()
+                    .map(|read| read.fast_content())
+                    .ne(expected
+                        .iter()
+                        .map(CapturedGuestReadRecordContent::fast_content))
+                {
+                    return Err(ValidationError::ReplayGuestReadSetMismatch);
+                }
+            }
+            GuestReadContents::Serialized(expected) => {
+                if packet
+                    .guest_reads()
+                    .reads()
+                    .iter()
+                    .map(|read| read.content_digest())
+                    .ne(expected.iter().copied())
+                {
+                    return Err(ValidationError::ReplayGuestReadSetMismatch);
+                }
+            }
         }
         if packet.identity() != self.workload {
             return Err(ValidationError::RecordIdentityMismatch {

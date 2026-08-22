@@ -5,12 +5,14 @@
 //! packet finalization proves the capture still matches the plan one for one
 //! before any retained workload exists.
 
+use std::sync::Arc;
+
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccessPurpose, ContentDigest, GuestReadPlanIdentity, GuestReadSetIdentity, JournalIdentity,
-    OperationId, PhysicalMemoryLayout, PhysicalRange, RdramResource, ResourceJournal,
-    ResourceRegion, ValidationError,
+    AccessPurpose, ContentDigest, FastContentDigest, GuestReadPlanIdentity, GuestReadSetIdentity,
+    JournalIdentity, OperationId, PhysicalMemoryLayout, PhysicalRange, RdramResource,
+    ResourceJournal, ResourceRegion, ValidationError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -134,8 +136,8 @@ impl DeferredGuestReadPlan {
 #[derive(PartialEq, Eq)]
 pub struct CapturedGuestRead {
     read: DeferredGuestRead,
-    content: ContentDigest,
-    bytes: Box<[u8]>,
+    fast_content: FastContentDigest,
+    bytes: Arc<[u8]>,
 }
 
 impl core::fmt::Debug for CapturedGuestRead {
@@ -143,7 +145,7 @@ impl core::fmt::Debug for CapturedGuestRead {
         formatter
             .debug_struct("CapturedGuestRead")
             .field("read", &self.read)
-            .field("content", &self.content)
+            .field("fast_content", &self.fast_content)
             .field("byte_len", &self.bytes.len())
             .finish()
     }
@@ -172,11 +174,11 @@ impl CapturedGuestRead {
                 actual,
             });
         }
-        let content = guest_read_content_digest(&bytes);
+        let fast_content = guest_read_fast_content_digest(&bytes);
         Ok(Self {
             read,
             bytes: bytes.into(),
-            content,
+            fast_content,
         })
     }
 
@@ -203,8 +205,8 @@ impl CapturedGuestRead {
         }
         Ok(Self {
             read,
-            content: actual_content,
-            bytes: bytes.into_boxed_slice(),
+            fast_content: guest_read_fast_content_digest(&bytes),
+            bytes: bytes.into(),
         })
     }
 
@@ -212,12 +214,40 @@ impl CapturedGuestRead {
         self.read
     }
 
-    pub const fn content(&self) -> ContentDigest {
-        self.content
+    pub const fn fast_content(&self) -> FastContentDigest {
+        self.fast_content
+    }
+
+    /// Compute the stable serialized SHA-256 identity on the cold path.
+    pub fn content_digest(&self) -> ContentDigest {
+        guest_read_content_digest(&self.bytes)
     }
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn record_content(&self) -> CapturedGuestReadRecordContent {
+        CapturedGuestReadRecordContent {
+            fast: self.fast_content,
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CapturedGuestReadRecordContent {
+    fast: FastContentDigest,
+    bytes: Arc<[u8]>,
+}
+
+impl CapturedGuestReadRecordContent {
+    pub(crate) const fn fast_content(&self) -> FastContentDigest {
+        self.fast
+    }
+
+    pub(crate) fn content_digest(&self) -> ContentDigest {
+        guest_read_content_digest(&self.bytes)
     }
 }
 
@@ -360,17 +390,17 @@ pub(crate) fn set_identity(
     journal: JournalIdentity,
     reads: &[CapturedGuestRead],
 ) -> GuestReadSetIdentity {
-    set_identity_from_digests(
+    set_identity_from_fast_digests(
         plan,
         journal,
-        reads.iter().map(|read| (read.read, read.content)),
+        reads.iter().map(|read| (read.read, read.fast_content())),
     )
 }
 
-pub(crate) fn set_identity_from_digests(
+pub(crate) fn set_identity_from_fast_digests(
     plan: GuestReadPlanIdentity,
     journal: JournalIdentity,
-    reads: impl ExactSizeIterator<Item = (DeferredGuestRead, ContentDigest)>,
+    reads: impl ExactSizeIterator<Item = (DeferredGuestRead, FastContentDigest)>,
 ) -> GuestReadSetIdentity {
     let mut hash = Sha256::new();
     hash.update(b"fn64.render-ir.owned-guest-read-set.v1\0");
@@ -379,7 +409,7 @@ pub(crate) fn set_identity_from_digests(
     hash.update((reads.len() as u32).to_be_bytes());
     for read in reads {
         hash_read(&mut hash, read.0);
-        hash.update(read.1.as_ref());
+        hash.update(read.1.as_bytes());
     }
     GuestReadSetIdentity::new(ContentDigest::from_bytes(hash.finalize().into()))
 }
@@ -395,6 +425,10 @@ pub(crate) fn hash_read(hash: &mut Sha256, read: DeferredGuestRead) {
 
 fn guest_read_content_digest(bytes: &[u8]) -> ContentDigest {
     ContentDigest::hash(b"fn64.render-ir.guest-read-content.v1\0", &[bytes])
+}
+
+fn guest_read_fast_content_digest(bytes: &[u8]) -> FastContentDigest {
+    FastContentDigest::hash(b"fn64.render-ir.guest-read-content.v1\0", &[bytes])
 }
 
 #[cfg(test)]
@@ -583,6 +617,24 @@ mod tests {
             )
             .unwrap_err(),
             ValidationError::GuestReadDigestMismatch { index: 0 }
+        );
+    }
+
+    #[test]
+    fn capture_uses_fast_runtime_identity_and_retains_stable_serialized_digest() {
+        let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+        let plan = DeferredGuestReadPlan::try_from_journal(layout, &journal(layout)).unwrap();
+        let read = plan.reads()[0];
+        let bytes = vec![0x5a; read.range().len() as usize];
+        let capture = CapturedGuestRead::try_new(read, bytes.clone()).unwrap();
+        let same = CapturedGuestRead::try_new(read, bytes.clone()).unwrap();
+        let different = CapturedGuestRead::try_new(read, vec![0xa5; bytes.len()]).unwrap();
+
+        assert_eq!(capture.fast_content(), same.fast_content());
+        assert_ne!(capture.fast_content(), different.fast_content());
+        assert_eq!(
+            capture.content_digest(),
+            ContentDigest::hash(b"fn64.render-ir.guest-read-content.v1\0", &[&bytes])
         );
     }
 
