@@ -27,7 +27,7 @@ fi
 # exercising the case.
 export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-1}
 export EXPECTED_ONE_REFUSED=${EXPECTED_ONE_REFUSED:-1}
-export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-19}
+export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-24}
 
 echo "[gate-rt64-parity] building parity runner (RT64 C++ + wgpu)"
 cargo build -p fn64-render-conformance --features parity-runner \
