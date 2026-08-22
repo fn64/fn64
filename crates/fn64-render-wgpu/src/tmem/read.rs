@@ -700,8 +700,11 @@ fn linear_byte_address(tile: TileDescriptor, addressed: AddressedTmemTexel) -> u
 /// The odd-row XOR4 bank exchange: the TILE-RELATIVE row's parity, and
 /// nothing else.
 ///
-/// Pinned RT64 states the same rule, and takes the parity from a
-/// TILE-RELATIVE coordinate with no T-origin term:
+/// Pinned RT64 IMPLEMENTS this exchange, and derives its parity from a
+/// TILE-RELATIVE coordinate with no T-origin term. That is implementation
+/// evidence from an allowed MIT source, not a prose statement of the
+/// hardware rule -- no allowed source found so far states it directly, so
+/// the rule below is fn64's own reading of what these two agree on:
 ///
 /// - **The exchange.** `implLoadTMEM` (`shaders/TextureDecoder.hlsli:17-25`)
 ///   computes `wordIndex = (relativeAddress - rowStart) / 4`, then on
