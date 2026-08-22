@@ -11,13 +11,30 @@ This document tests each hypothesis against reference sources and classifies it.
 
 ## Reference sources and their authority
 
-1. **angrylion-rdp-plus**, `/private/tmp/angrylion-probe/src/core/n64video/` —
-   cycle-accurate LLE. Best available oracle for "what does the silicon do".
-2. **RT64 pinned C++**, `/Users/jer/Code/no-mercy-recompiled/third_party/rt64`
-   (worktree `5473732a`) — GPU HLE. Has been the wrong reference for CPU-side
-   questions before; angrylion wins where they disagree.
-3. **`crates/fn64-render-reference/`** — fn64's own software renderer. Where it
+> **PROVENANCE WARNING, added after this audit was written.** The ranking below
+> was inverted with respect to `AGENTS.md`'s clean-room protocol
+> (`AGENTS.md:26-45`), which EXCLUDES the Angrylion lineage
+> (`docs/DISCOVER-PLAN.md:2260`). This audit ranked it first and stated that it
+> "wins where they disagree". **Findings in this document whose only support is
+> Angrylion are not admissible as fn64 authority and are being re-grounded or
+> re-derived; see the per-finding notes.** The audit's conclusions may still be
+> correct -- several were acted on and are covered by tests -- but their stated
+> reasons need replacing with allowed evidence or with measurement.
+
+1. **RT64 pinned C++**, `/Users/jer/Code/no-mercy-recompiled/third_party/rt64`
+   (MIT, pinned) — GPU HLE. An ALLOWED source. It shows what an accepted
+   implementation does; it rarely states a hardware rule in prose, so cite it
+   as "RT64 implements X", not "hardware requires X".
+2. **Public libultra headers and manuals** (`ultra64/gbi.h`, `ultra64/rcp.h`)
+   and the MIT recompiler's generated C — the wire formats and the ABI fn64
+   serves. Strongest available for encoding questions.
+3. **Measured observations about a ROM**, permitted by owner decision (see
+   `AGENTS.md`). "Measured on WM2000: the guest emits X and fn64 rendered Y" is
+   both admissible and usually more relevant than another emulator's behaviour.
+4. **`crates/fn64-render-reference/`** — fn64's own software renderer. Where it
    already implements what wgpu refuses, that is a wiring gap inside this repo.
+
+**Excluded:** angrylion-rdp-plus, and any GPL runtime implementation.
 
 ## The single structural fact behind most findings
 

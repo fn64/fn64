@@ -1,5 +1,15 @@
 # Localising the wrong texel value
 
+
+> **PROVENANCE WARNING.** This document's stated authority is
+> angrylion-rdp-plus, which `AGENTS.md:26-45` EXCLUDES from fn64's clean-room
+> protocol (`docs/DISCOVER-PLAN.md:2260` records the exclusion). Its
+> observations about WM2000 and about fn64's own behaviour remain valid --
+> measured facts about a ROM are explicitly allowed -- but **any claim here
+> about what HARDWARE does, sourced only to angrylion, is not admissible as
+> fn64 authority.** Re-ground such a claim on pinned RT64 (MIT), the public
+> libultra headers, or a fresh measurement before acting on it.
+
 The defect bounded by [`RT64-WM2000-TEXTURE-STATE.md`](RT64-WM2000-TEXTURE-STATE.md):
 coordinates are right, the fetch at those coordinates returns wrong values, so
 surfaces render as noise rather than imagery.
