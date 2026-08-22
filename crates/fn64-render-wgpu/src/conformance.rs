@@ -362,8 +362,19 @@ fn build_capture(
     let submission =
         OwnedRawDpcSubmission::from_rdram_words(replay.command_start, end, replay.words.clone())
             .map_err(|error| ConformanceRefusal::Capture(format!("{error:?}")))?;
+    // A conformance replay is a CLOSED capture: its words are fixed and no
+    // later DPC_END can extend them, so a range ending inside a command is a
+    // malformed fixture rather than the hardware stall the raw CPU ingress
+    // parks. Refuse it by name instead of treating it as "wait for more".
     let sites = fn64_render::count_raw_rdp_full_sync_sites(&replay.words)
-        .map_err(|error| ConformanceRefusal::Capture(format!("{error:?}")))?;
+        .map_err(|error| ConformanceRefusal::Capture(format!("{error:?}")))?
+        .complete()
+        .ok_or_else(|| {
+            ConformanceRefusal::Capture(
+                "replay words end inside a command; a closed capture cannot be extended"
+                    .to_string(),
+            )
+        })?;
     let cmd_end = TemporalBoundary::new(1, DpInterruptState::Clear);
     if sites == 0 {
         return Ok(fn64_render::OwnedRawDpcCapture::new(
