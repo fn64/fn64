@@ -667,6 +667,134 @@ fn texture_rectangle_at_t(
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
 
 // ---------------------------------------------------------------------------
+// Direct intensity formats
+// ---------------------------------------------------------------------------
+//
+// The SGI RDP Command Summary's image-data-format matrix defines exactly
+// seven direct pairs: RGBA16/32, IA4/8/16 and I4/8. The RGBA16 cases above
+// cover only one of them. These rows cover the other five without importing
+// a captured packet or an answer from either backend.
+
+const IA8_SOURCE: u32 = 0x4200;
+const IA4_SOURCE: u32 = 0x4300;
+const IA16_SOURCE: u32 = 0x4400;
+const I4_SOURCE: u32 = 0x4500;
+const I8_SOURCE: u32 = 0x4600;
+
+/// Eight opaque IA8 texels. High nibble is intensity, low nibble is alpha;
+/// fixing alpha at `0xf` makes any accidental I8 interpretation visible.
+const IA8_BYTES: [u8; 8] = [0x1f, 0x2f, 0x3f, 0x4f, 0x5f, 0x6f, 0x7f, 0x8f];
+/// Seven opaque IA4 texels, packed high-nibble first. The final low nibble is
+/// padding outside the 7-pixel tile and therefore must never be sampled.
+const IA4_BYTES: [u8; 4] = [0x13, 0x57, 0x9b, 0xd0];
+/// Eight big-endian IA16 texels: one intensity byte then opaque alpha.
+const IA16_BYTES: [u8; 16] = [
+    0x08, 0xff, 0x28, 0xff, 0x48, 0xff, 0x68, 0xff, 0x88, 0xff, 0xa8, 0xff,
+    0xc8, 0xff, 0xe8, 0xff,
+];
+/// I4 is four-bit intensity replicated into RGB and alpha.
+const I4_BYTES: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+/// I8 is one byte replicated into RGB and alpha. Values straddle successive
+/// eight-count intensity boundaries so every five-bit RGB step is named.
+const I8_BYTES: [u8; 8] = [0x08, 0x1c, 0x28, 0x3c, 0x48, 0x5c, 0x68, 0x7c];
+
+/// Hand-derived RGBA16 target words for [`IA8_BYTES`].
+///
+/// For the first texel, wire byte `0x1f` splits into intensity `i4 = 1` and
+/// alpha `a4 = 15`. Nibble replication gives `i8 = (1 << 4) | 1 = 17` and
+/// `a8 = (15 << 4) | 15 = 255`. With dither disabled, RGBA16 keeps the upper
+/// five intensity bits: `i5 = 17 >> 3 = 2`. Replicating that gray value into
+/// R/G/B and retaining opaque coverage gives
+/// `(2 << 11) | (2 << 6) | (2 << 1) | 1 = 0x1085`. The remaining entries use
+/// the same arithmetic for intensity nibbles 2 through 8.
+const IA8_EXPECTED: [u16; 8] = [
+    0x1085, 0x2109, 0x318d, 0x4211, 0x5295, 0x6319, 0x739d, 0x8c63,
+];
+/// IA4 uses three intensity bits plus one alpha bit. For `0xb`, `i3 = 5`
+/// expands to `0xb6`, `i5 = 0xb6 >> 3 = 22`, and opaque RGBA16 gray is
+/// `(22 << 11)|(22 << 6)|(22 << 1)|1 = 0xb5ad`.
+const IA4_EXPECTED: [u16; 7] = [
+    0x0001, 0x2109, 0x4a53, 0x6b5b, 0x94a5, 0xb5ad, 0xdef7,
+];
+/// IA16 is already one intensity byte followed by one alpha byte. These
+/// intensities quantize to five bits 1,5,9,...,29 and alpha stays opaque.
+const IA16_EXPECTED: [u16; 8] = [
+    0x0843, 0x294b, 0x4a53, 0x6b5b, 0x8c63, 0xad6b, 0xce73, 0xef7b,
+];
+const I4_EXPECTED: [u16; 8] = [
+    0x1085, 0x2109, 0x318d, 0x4211, 0x5295, 0x6319, 0x739d, 0x8c63,
+];
+const I8_EXPECTED: [u16; 8] = [
+    0x0843, 0x18c7, 0x294b, 0x39cf, 0x4a53, 0x5ad7, 0x6b5b, 0x7bdf,
+];
+
+fn expected_direct_row(index: u32, texels: &[u16]) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if y == 0 && x < texels.len() as u32 {
+        texels[x as usize]
+    } else {
+        STALE
+    }
+}
+
+fn ia8_expected(index: u32) -> u16 {
+    expected_direct_row(index, &IA8_EXPECTED)
+}
+fn ia4_expected(index: u32) -> u16 {
+    expected_direct_row(index, &IA4_EXPECTED)
+}
+fn ia16_expected(index: u32) -> u16 {
+    expected_direct_row(index, &IA16_EXPECTED)
+}
+fn i4_expected(index: u32) -> u16 {
+    expected_direct_row(index, &I4_EXPECTED)
+}
+fn i8_expected(index: u32) -> u16 {
+    expected_direct_row(index, &I8_EXPECTED)
+}
+
+/// Seed, load through the public 16-bit transfer form, redescribe the same
+/// low-TMEM bytes with the direct format under test, then point-sample row 0.
+///
+/// `format` and `size` occupy SetTile bits 23:21 and 20:19. `line` is the
+/// row stride in 64-bit TMEM words. All rows start at TMEM byte zero, so texel
+/// x addresses byte `(x << size) >> 1`; 4-bit texels select the high nibble
+/// for even x and low nibble for odd x. Loading via RGBA16 is a byte transfer
+/// only and is required for 4-bit rows, whose direct load form is not public.
+fn one_direct_texture_rect(
+    source: u32,
+    width: u32,
+    load_texels_16b: u32,
+    format: u32,
+    size: u32,
+    line_words: u32,
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (load_texels_16b - 1), source),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        load_tile(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        (
+            0xf500_0000 | (format << 21) | (size << 19) | (line_words << 9),
+            0,
+        ),
+        set_tile_size(width, 1),
+    ]);
+    words.extend(texture_rectangle(0, 0, width, 1));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+// ---------------------------------------------------------------------------
 // Colour-indexed (CI4) with a TLUT
 // ---------------------------------------------------------------------------
 //
@@ -1344,6 +1472,60 @@ fn cases() -> Vec<Case> {
             expected: ci_expected,
         },
         Case {
+            name: "textured-rect-ia8",
+            intent: "an opaque IA8 row exercises the ROM's most-used missing \
+                     direct format: each byte must split into a high intensity \
+                     nibble and low alpha nibble. A disagreement means the \
+                     tile format/size dispatch, byte address, or IA8 channel \
+                     expansion differs from RT64; treating each byte as I8 \
+                     cannot reproduce this hand-derived key.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_direct_texture_rect(IA8_SOURCE, 8, 4, 3, 1, 1),
+            expected: ia8_expected,
+        },
+        Case {
+            name: "textured-rect-ia4",
+            intent: "a packed IA4 row exercises the other format measured \
+                     heavily in the decoded frame: high-nibble-first TMEM \
+                     addressing followed by a 3-bit intensity/1-bit alpha \
+                     split. A disagreement identifies packed-nibble address \
+                     selection or IA4 expansion, not filtering.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_direct_texture_rect(IA4_SOURCE, 7, 2, 3, 0, 1),
+            expected: ia4_expected,
+        },
+        Case {
+            name: "textured-rect-ia16",
+            intent: "an IA16 row names separate big-endian intensity and alpha \
+                     bytes per texel across a two-word TMEM stride. A \
+                     disagreement means the 16-bit direct decoder, byte \
+                     order, or line=2 address calculation differs from RT64.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_direct_texture_rect(IA16_SOURCE, 8, 8, 3, 2, 2),
+            expected: ia16_expected,
+        },
+        Case {
+            name: "textured-rect-i4",
+            intent: "a packed I4 row verifies that each high-nibble-first \
+                     intensity value feeds RGB and alpha together. A \
+                     disagreement means packed TMEM addressing or the I4 \
+                     replication path differs from RT64.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_direct_texture_rect(I4_SOURCE, 8, 2, 4, 0, 1),
+            expected: i4_expected,
+        },
+        Case {
+            name: "textured-rect-i8",
+            intent: "an I8 row verifies one-byte TMEM addressing and the \
+                     intensity-to-RGBA replication path across successive \
+                     five-bit quantization steps. A disagreement means \
+                     I8 was decoded as another direct format or addressed at \
+                     the wrong byte.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_direct_texture_rect(I8_SOURCE, 8, 4, 4, 1, 1),
+            expected: i8_expected,
+        },
+        Case {
             name: "textured-triangle-point-sampled",
             intent: "the first RAW TRIANGLE in the corpus, and the first case \
                      on the path WM2000 actually draws through. Every case \
@@ -1538,6 +1720,15 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
             .map(|pair| (pair[0] << 4) | (pair[1] & 0xf))
             .collect();
         view.write_logical_bytes(RdramAddr::from_offset(CI_SOURCE), &packed);
+        for (address, bytes) in [
+            (IA8_SOURCE, IA8_BYTES.as_slice()),
+            (IA4_SOURCE, IA4_BYTES.as_slice()),
+            (IA16_SOURCE, IA16_BYTES.as_slice()),
+            (I4_SOURCE, I4_BYTES.as_slice()),
+            (I8_SOURCE, I8_BYTES.as_slice()),
+        ] {
+            view.write_logical_bytes(RdramAddr::from_offset(address), bytes);
+        }
     }
     for (index, &(word0, word1)) in commands.iter().enumerate() {
         let offset = COMMAND_START as usize + index * 8;
