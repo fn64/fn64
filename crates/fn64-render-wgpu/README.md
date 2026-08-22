@@ -980,6 +980,19 @@ visible presentation, no raster parity, no native GPU testing.
 `WgpuBackend::process_task`/`present` are honest named rejections. See
 `docs/DESIGN.md`'s "T3 Phase A/B" section for the full account.
 
+**Raw-DPC carry-in is one stream-time snapshot.** `plan_raw_dpc` decodes a
+whole packet and then folds its `RdpStateDelta` into durable state before
+`execute_raw_dpc` walks the sealed plan. The executor therefore never seeds
+individual registers from that already-folded state. Immediately before the
+fold, it captures one typed `RawDpcCarryIn` containing the tile table,
+`OtherMode`, combine mode, primitive/environment/blend/fog colors, scissor,
+and color image; `PlanCollector` accepts that value as its sole carry-in seed
+and advances it in command order. This prevents a later `SetCombine` or
+`SetPrimColor` in the packet from changing an earlier draw. A GPU-free
+regression establishes flat white Primitive state in packet A, then submits a
+CI4 texrect before black Primitive/Texel0 state in packet B and proves from
+`(A-B)*C+D` that only the second rectangle reads Texel0.
+
 ## Depth: full four-mode compare/update (`depth_mode`)
 
 `depth_mode` extends `depth_strict_less`'s smallest-slice foundation to the
