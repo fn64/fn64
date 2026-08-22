@@ -233,6 +233,7 @@ fn build_synthetic_native_archives(manifest_dir: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FN64_RT64_DIR");
+    println!("cargo:rerun-if-env-changed=FN64_RT64_COVERAGE");
     println!("cargo:rerun-if-changed=ffi/CMakeLists.txt");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.cpp");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.h");
@@ -317,6 +318,7 @@ fn main() {
     std::fs::create_dir_all(&build_dir).expect("create RT64 CMake build directory");
 
     let mut configure = Command::new("cmake");
+    let rt64_coverage = env::var_os("FN64_RT64_COVERAGE").is_some();
     configure
         .arg("-S")
         .arg(&cmake_source)
@@ -330,6 +332,11 @@ fn main() {
         .arg("-DZSTD_BUILD_PROGRAMS=OFF")
         .arg("-DZSTD_BUILD_TESTS=OFF")
         .arg("-DPLUME_BUILD_EXAMPLES=OFF")
+        .arg(if rt64_coverage {
+            "-DFN64_RT64_COVERAGE=ON"
+        } else {
+            "-DFN64_RT64_COVERAGE=OFF"
+        })
         .arg(if env::var_os("CARGO_FEATURE_HFR_EVIDENCE").is_some() {
             "-DFN64_RT64_HFR_EVIDENCE=ON"
         } else {
@@ -369,6 +376,37 @@ fn main() {
         .arg("--parallel")
         .arg(cargo_jobs);
     run(&mut build, "RT64 static core/HLE build");
+
+    if rt64_coverage {
+        assert!(
+            target.contains("apple-darwin"),
+            "FN64_RT64_COVERAGE currently supports the Metal parity host only"
+        );
+        let cxx = env::var_os("CXX").unwrap_or_else(|| "clang++".into());
+        let resource_dir = Command::new(&cxx)
+            .arg("--print-resource-dir")
+            .output()
+            .unwrap_or_else(|error| panic!("failed to query Clang resource directory: {error}"));
+        assert!(
+            resource_dir.status.success(),
+            "Clang failed to report its resource directory: {}",
+            String::from_utf8_lossy(&resource_dir.stderr)
+        );
+        let profile_dir = PathBuf::from(
+            String::from_utf8(resource_dir.stdout)
+                .expect("Clang resource directory must be UTF-8")
+                .trim(),
+        )
+        .join("lib/darwin");
+        let profile_runtime = profile_dir.join("libclang_rt.profile_osx.a");
+        assert!(
+            profile_runtime.is_file(),
+            "Clang profile runtime is missing at {}; use the same Xcode toolchain for CXX and coverage tools",
+            profile_runtime.display()
+        );
+        println!("cargo:rustc-link-search=native={}", profile_dir.display());
+        println!("cargo:rustc-link-lib=static=clang_rt.profile_osx");
+    }
 
     // CMake owns the transitive build graph, while Cargo owns the final link.
     // Publish every directory containing the exact static targets linked by

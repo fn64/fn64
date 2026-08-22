@@ -1,96 +1,110 @@
-# The renderer is not the path to 60 fps
+# WM2000 performance: the 30 Hz budget and the open post-fix question
 
-**Read this before scoping, estimating, or reporting any renderer performance
-work.** It is short because the conclusion is one number.
+**Status corrected 2026-08-22.** This document previously framed WM2000 as a
+60 fps problem and compared one field's work with a 16.667 ms rendered-frame
+budget. That was wrong for the title under test: WM2000 renders at 30 Hz, so
+one rendered frame gets two 60 Hz fields, or **33.333 ms**. The correction is
+based on the measured live-shell diagnosis retained in
+`docs/RT64-WM2000-FRAME-RATE-MEASURED.md` and the scheduling change in commit
+`54a994c9`. No post-fix frame-rate measurement exists yet.
 
-## VERIFIED: an infinitely fast renderer still misses the budget
+## Current finding: scheduling, not a throughput ceiling
 
-`docs/plans/perf-method.md:3234-3260`, re-read and confirmed here. Set graphics
-to **exactly zero** and take everything else in `executor_ns`:
+The pre-fix observation was **28 rendered frames/s**:
 
-| row | rep1 (ms) | rep2 (ms) |
-|---|---:|---:|
-| translated guest code | 9.528 | 9.462 |
-| **mirror boundary** | **8.848** | **8.797** |
-| invalidate writes | 2.018 | 1.961 |
-| PARKED | 0.574 | 0.563 |
-| other OS-call work | 0.248 | 0.242 |
-| devtime | 0.246 | 0.243 |
-| guards + residual | 0.138 | 0.135 |
-| **HOST-SIDE TOTAL** | **21.554** | **21.361** |
-| **vs 16.667 ms budget** | **1.29x** | **1.28x** |
+| quantity | value |
+|---|---:|
+| time per rendered frame | 35.714 ms |
+| WM2000 budget | 33.333 ms |
+| measured miss | **2.381 ms (7.14%)** |
 
-Verified two independent ways per rep -- by subtraction
-(`executor_ns − gfx_ns − audio_lle_ns`) and by summing named rows -- agreeing
-to 0.046 ms.
+That refutes the old 26-34% gap derived from p95 pump time. A pump is a 60 Hz
+field-sized host slice, not a WM2000 rendered frame, so treating its p95 as a
+drawn-frame throughput requirement mixed two different denominators.
 
-**So a renderer speedup, however large, cannot by itself reach 60 fps.** The
-remaining 1.29x is runtime apparatus plus the CPU lane. Any RT64 or
-`fn64-render-wgpu` perf claim must say this explicitly, or a reader will take a
-renderer win as a path to 60 that it is not.
+The measured defect was **(c) scheduling**, not aggregate throughput and not
+submission distribution: a DP deadline strictly inside the current field was
+being observed only by the following wall-paced pump, delaying guest progress
+by an entire 16.667 ms field. Throughput was close enough to the 30 Hz budget
+that a residual 7.14% miss may still exist, but it did not explain why a
+nominal two-field rendered frame needed a third retrace pump.
 
-Note the source doc corrects itself in place on exactly this point: its author
-first wrote that the non-graphics rows "sum to well under the budget",
-asserting a sum without computing it, and left the error visible when the real
-figure inverted the conclusion. Worth emulating.
+The competing blocking/serialization hypothesis was also rejected. The wgpu
+raw-DPC coordinator is synchronous and CPU-side
+(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:427`). In the measured
+slow-pump breakdown, ordinary CPU rasterization was **28.0%** and the TMEM
+loop **8.2%**; no fence, mutex, wait, or other named candidate exceeded 28%.
+Those shares do not support one dominant serialization stall.
 
-## WM2000 renders at 30 Hz, so the budget is 33.333 ms
+## What commit `54a994c9` changed
 
-A drawn frame gets **two** field budgets. Measuring WM2000 against 16.667 ms
-overstates the gap by 2x. (`.claude/skills/fn64-perf-method/SKILL.md`)
+Landed 2026-08-22: when the guest is quiescent, a device deadline strictly
+before the next VI edge is serviced in the current pump; the VI edge itself
+belongs to the next wall-paced pump. The rule is characterized by
+`timing::tests::a_quiescent_pump_services_full_sync_before_the_next_vi_edge`.
+It adds no sleep and no pacing constant.
 
-## A benchmark trap that silently invalidates renderer numbers
+The evidence chain is explicit:
 
-The benchmark script does **not** export `FN64_RENDER`, so it defaults to the
-**software rasterizer** (`.claude/skills/fn64-perf-method/SKILL.md:29-38`).
-Any renderer benchmark must state which backend it actually exercised. This
-project has already shipped three "defects" that were measurement artifacts;
-this is the same shape.
+- The public RDP Programming Manual defines the Sync Full to DP-interrupt
+  contract (`docs/DESIGN.md:2219-2220`).
+- fn64's existing compatibility policy schedules a raw FullSync DP event one
+  cycle after synchronous publication
+  (`crates/fn64-abi/src/pi/mmio.rs`, `start_live_dp_full_sync`); this is a
+  deterministic policy, not a hardware-latency claim.
+- Pinned RT64 at `f0728a2` advances and enqueues its current workload at
+  FullSync before its workload thread consumes it (`rt64_state.cpp:1750-1755`,
+  `rt64_workload_queue.cpp:881-907`).
 
-## Where the time actually goes (measured, block lane, RT64)
+Together these establish that the sub-field completion is real work for the
+current guest drain, while the next VI edge remains the boundary of the next
+wall-paced pump.
 
-`docs/plans/rt64-on-the-block-lane.md:483-494`, render field 27.68 ms,
-perturbation-corrected:
+## What is not yet known
 
-| component | ms | share |
-|---|---:|---:|
-| graphics | 14.91 | 53.9% |
-| -- rasterization | 8.30 | |
-| -- **RSP interpretation** | **5.09** | |
-| -- staging memcpy | 1.45 | |
-| recompiled guest CPU | 8.23 | 29.7% |
-| invalidate writes | 1.68 | |
-| audio LLE | 0.98 | |
-| mirror boundary | 0.16 | |
+**The post-fix frame rate has not been measured.** The scheduling defect is
+identified and the ordering rule landed, but this document does not claim the
+30 Hz target is now met. If the pre-fix 28 fps observation exposes a residual
+throughput gap after remeasurement, it is approximately **7.14%**, and the
+measured next targets are **rasterization** first and **TMEM** second. Do not
+scope either optimization until the post-fix route has been measured.
 
-**RSP interpretation is 5.09 ms sitting inside the graphics bucket and is NOT
-rasterization.** A full RSP->Rust recompiler exists at
-`crates/fn64-audio/src/rsp/recomp/`, but it is out-of-tree artifact generation
-rather than the live path. Wiring it in is a renderer-adjacent win that is not
-an RT64 change -- and it is larger than most rasterization fixes on offer.
+## Historical measurements that remain valid, but are not the live ceiling
 
-## Two numbers that are frequently miscited
+The following numbers were measured before this correction and are retained
+for provenance. Their old interpretation is superseded.
 
-`docs/plans/rt64-on-the-block-lane.md:175-178, 296-306`: the **11.9x** and
-**1.28x** figures are **RT64-vs-reference RENDERER** speedups, not Rust-vs-C
-CPU results. 11.9x was measured on the function lane (`wm2000-boot`, carrying
-the `rt64` feature), not the block lane, and both are disclaimed as
-non-comparable because 1.28x predates the `abc7871` nested-writer fix
-(44.13 -> 22.51). Do not carry either as a CPU or general claim.
+**2026-08-20, older block-lane measurement.** With graphics subtracted, two
+repetitions reported host-side totals of **21.554 ms** and **21.361 ms**, with
+subtraction and named-row sums agreeing within 0.046 ms. The largest rows were
+translated guest code (9.528/9.462 ms) and the mirror boundary
+(8.848/8.797 ms). Those values were compared with 16.667 ms to produce the
+stale 1.29x/1.28x claim. They neither exceed WM2000's 33.333 ms rendered-frame
+budget nor describe today's shell route: the mirror boundary was subsequently
+reduced to approximately 0.001 ms on that route. They remain historical lane
+measurements, not a renderer-independent performance ceiling.
 
-## Precedent: apparatus wins are cheap, renderer wins are not
+**Older block-lane RT64 decomposition.** A 27.68 ms render-field sample
+attributed 14.91 ms to graphics (8.30 ms rasterization, 5.09 ms RSP
+interpretation, 1.45 ms staging), 8.23 ms to recompiled guest CPU, 1.68 ms to
+invalidate writes, 0.98 ms to audio LLE, and 0.16 ms to the mirror boundary.
+That decomposition remains a dated measurement of that lane. In particular,
+its 5.09 ms RSP cost must not be transplanted to the current shell route,
+where the retained measurement is 0.315 ms.
 
-A **one-line** mirror fix moved the mirror boundary from 25.9% of `executor_ns`
-to 0.16 ms -- worth -20% shipped frame time, **14.3 -> 29.0 fps**
-(`docs/plans/NEXT.md:9-16`). Set that against the effort every renderer
-micro-optimisation in this project has cost, and prefer measuring the apparatus
-first.
+**Historical renderer ratios.** The 11.9x and 1.28x figures in
+`docs/plans/rt64-on-the-block-lane.md` compare RT64 with the reference
+renderer; they are not Rust-vs-C CPU results. The 1.28x observation also
+predates the `abc7871` nested-writer fix. Neither ratio answers the 30 Hz
+scheduling question above.
 
-## Method caveats the repo enforces on itself
+## Measurement rules that still apply
 
-- **No automated perf regression gate.** `RELEASE-GATE.md` gates determinism and
-  byte-identity only, so a perf regression ships silently.
-- **The profiler once inflated its own subject by 26.4%.** Report profiler
-  overhead alongside any number.
-- **A predicted +0.029 ms landed at +1.62 ms -- 56x off**
-  (`perf-method.md:113-140, 2298-2299`). Predictions here are not evidence.
+- State the actual backend. `render-benchmark.zsh` does not export
+  `FN64_RENDER`, so an unlabeled run can silently exercise the software
+  rasterizer.
+- The release gate covers determinism and byte identity, not performance; no
+  automated performance-regression gate currently protects these numbers.
+- Report profiler overhead. This project has measured a profiler inflating
+  its own subject by 26.4%, and a predicted +0.029 ms change landing at
+  +1.62 ms. Predictions are not evidence.

@@ -11846,7 +11846,9 @@ mod tests {
     /// `fn64-abi`'s `raw_dpc_session_integration::expected_fill_halfword`
     /// exactly (that helper is private to its own test module, so this is a
     /// local, identical copy -- the same convention `set_other_mode` above
-    /// already follows).
+    /// already follows). Fill mode writes that register value while the RDP
+    /// arithmetic pipeline is largely unused (Programming Manual Chapter 12
+    /// "Fill Mode" and §12.8.2 "Fill Color"), so bit 0 remains verbatim.
     fn expected_fill_halfword(fill_color: u32, x: u32) -> u16 {
         if x % 2 == 0 {
             (fill_color >> 16) as u16
@@ -12045,6 +12047,12 @@ mod tests {
     ///    bytes must produce identical texels, and the executor used the
     ///    pending one.
     ///
+    /// This expectation formerly copied sampled texel alpha into RGBA16 bit
+    /// 0. That pinned the old defect. Under this fixture's `CVG_DST_CLAMP`
+    /// with `AA_EN=FORCE_BL=IM_RD=CVG_X_ALPHA=0`, the whole-pixel texrect
+    /// stores coverage 8 as 7, whose bit 2 is one (Programming Manual
+    /// §§15.5.3, 15.5.6, 15.7); composition does not change that rule.
+    ///
     /// Derivation 2 deliberately does NOT re-implement the texel decode.
     /// Re-deriving RGBA16 unpacking, XOR4 odd-row placement and LoadBlock
     /// DXT skewing by hand here would be a second, worse model of
@@ -12125,11 +12133,11 @@ mod tests {
                     "the ORACLE reads durable state, so its snapshot must be Committed -- if \
                      this is Proposed the oracle is not independent of the executor"
                 );
-                let [red, green, blue, alpha] = texel.texel().rgba8888();
+                let [red, green, blue, _alpha] = texel.texel().rgba8888();
                 let expected = (u16::from(red >> 3) << 11)
                     | (u16::from(green >> 3) << 6)
                     | (u16::from(blue >> 3) << 1)
-                    | u16::from(alpha >> 7);
+                    | 1;
                 assert_eq!(
                     actual, expected,
                     "pixel ({x}, {y}) is inside the texrect, so it must carry the texel the \
@@ -13317,6 +13325,13 @@ mod tests {
     /// A composition that dropped, reordered, or duplicated any command
     /// disagrees with derivation 1; a composition that wrote the right
     /// command's rectangle with the wrong bytes disagrees with derivation 2.
+    ///
+    /// The two owners deliberately use different bit-0 rules. Fill mode
+    /// bypasses the arithmetic pixel pipeline and writes the selected fill
+    /// halfword verbatim (Programming Manual Chapter 12 "Fill Mode" and
+    /// §12.8.2 "Fill Color"). The texrect runs the pixel pipeline, so its
+    /// `CVG_DST_CLAMP` result stores coverage 8 as 7 and exposes stored bit 2
+    /// in RGBA16 bit 0 (Programming Manual §§15.5.3, 15.5.6, 15.7).
     #[test]
     fn three_fills_and_three_texrects_compose_in_command_order() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
@@ -13458,11 +13473,11 @@ mod tests {
             "the ORACLE reads durable state, so its snapshot must be Committed -- if this is \
              Proposed the oracle is not independent of the executor"
         );
-        let [red, green, blue, alpha] = texel.texel().rgba8888();
+        let [red, green, blue, _alpha] = texel.texel().rgba8888();
         (u16::from(red >> 3) << 11)
             | (u16::from(green >> 3) << 6)
             | (u16::from(blue >> 3) << 1)
-            | u16::from(alpha >> 7)
+            | 1
     }
 
     /// **The overlap semantics, proven: two texrects whose rectangles
@@ -13906,7 +13921,8 @@ mod tests {
     ///
     /// This mirrors the executor's quantization -- normalize by `/ 255.0`,
     /// `run_one_cycle`, `* 255.0` and `round`, then `write_pixel`'s RGBA16
-    /// truncation -- and is deliberately written out here rather than
+    /// color truncation followed by this fixture's full stored-coverage bit --
+    /// and is deliberately written out here rather than
     /// calling a shared helper, so the two are independently authored
     /// statements of the same rule that must reconcile.
     fn expected_one_cycle_halfword(texel: [u8; 4], color: [u32; 4], alpha: [u32; 4]) -> u16 {
@@ -13948,11 +13964,12 @@ mod tests {
             crate::state::PrimColor::from_wire(0x05 << 8 | 0x40, prim_wire),
         );
         let (combined, _alpha_compare) = crate::combiner::run_one_cycle(params, inputs);
-        let [red, green, blue, a] = combined.map(|channel| (channel * 255.0).round() as u8);
+        let [red, green, blue, _alpha] =
+            combined.map(|channel| (channel * 255.0).round() as u8);
         (u16::from(red >> 3) << 11)
             | (u16::from(green >> 3) << 6)
             | (u16::from(blue >> 3) << 1)
-            | u16::from(a >> 7)
+            | 1
     }
 
     /// **The inversion: a texrect whose latched `SetCombine` references
@@ -14143,7 +14160,10 @@ mod tests {
     /// 1. Algebraically, the program is the primitive colour in every
     ///    channel, independent of the texel: `0x80FF4080` ->
     ///    `(128, 255, 64, 128)` -> RGBA16 `(128>>3)<<11 | (255>>3)<<6 |
-    ///    (64>>3)<<1 | (128>>7)` = `0x87D1`.
+    ///    (64>>3)<<1 | 1` = `0x87D1`. The final one is stored coverage bit
+    ///    2, not `(128>>7)`: this whole-pixel texrect uses `CVG_DST_CLAMP`
+    ///    with `AA_EN=FORCE_BL=IM_RD=CVG_X_ALPHA=0`, so coverage 8 stores as
+    ///    7 (Programming Manual §§15.5.3, 15.5.6, 15.7).
     /// 2. Independently, through `expected_one_cycle_halfword`, which runs
     ///    the real `run_one_cycle` over the real decoded `CombineParams`.
     ///
@@ -14182,11 +14202,11 @@ mod tests {
             .to_vec();
 
         // Derivation 1: the primitive colour, packed by hand.
-        let [red, green, blue, alpha_byte] = ONE_CYCLE_PRIM_WIRE.to_be_bytes();
+        let [red, green, blue, _alpha_byte] = ONE_CYCLE_PRIM_WIRE.to_be_bytes();
         let expected_literal = (u16::from(red >> 3) << 11)
             | (u16::from(green >> 3) << 6)
             | (u16::from(blue >> 3) << 1)
-            | u16::from(alpha_byte >> 7);
+            | 1;
         assert_eq!(
             expected_literal, 0x87D1,
             "the hand-packed literal must match the digit-by-digit derivation in this test's doc"
@@ -14252,7 +14272,7 @@ mod tests {
                 let raw = (u16::from(texel[0] >> 3) << 11)
                     | (u16::from(texel[1] >> 3) << 6)
                     | (u16::from(texel[2] >> 3) << 1)
-                    | u16::from(texel[3] >> 7);
+                    | 1;
                 assert_ne!(
                     actual, raw,
                     "pixel ({x}, {y})'s combined value must differ from the raw texel, or the \
@@ -14496,6 +14516,13 @@ mod tests {
     /// the packed literal from `MULTI_ONE_CYCLE_PRIM`, and
     /// `expected_one_cycle_halfword` running the real `run_one_cycle` over
     /// the real decoded `CombineParams`.
+    ///
+    /// The fill and texrect expectations deliberately differ at bit 0. Fill
+    /// mode bypasses the arithmetic pixel pipeline and retains the fill
+    /// register bit verbatim (Programming Manual Chapter 12 "Fill Mode" and
+    /// §12.8.2 "Fill Color"). Each one-cycle texrect instead stores its
+    /// `CVG_DST_CLAMP` result: coverage 8 as 7, with stored bit 2 visible in
+    /// RGBA16 bit 0 (Programming Manual §§15.5.3, 15.5.6, 15.7).
     #[test]
     fn three_one_cycle_texrects_compose_in_journal_order_against_the_accumulated_buffer() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
@@ -14562,11 +14589,12 @@ mod tests {
                          whole-target fill's own value"
                     ),
                     Some(index) => {
-                        let [red, green, blue, alpha] = MULTI_ONE_CYCLE_PRIM[index].to_be_bytes();
+                        let [red, green, blue, _alpha] =
+                            MULTI_ONE_CYCLE_PRIM[index].to_be_bytes();
                         let literal = (u16::from(red >> 3) << 11)
                             | (u16::from(green >> 3) << 6)
                             | (u16::from(blue >> 3) << 1)
-                            | u16::from(alpha >> 7);
+                            | 1;
                         assert_eq!(
                             actual, literal,
                             "pixel ({x}, {y}) belongs to texrect {index}, so it must carry that \
@@ -14593,11 +14621,11 @@ mod tests {
         let packed: std::collections::BTreeSet<u16> = MULTI_ONE_CYCLE_PRIM
             .iter()
             .map(|wire| {
-                let [r, g, b, a] = wire.to_be_bytes();
+                let [r, g, b, _a] = wire.to_be_bytes();
                 (u16::from(r >> 3) << 11)
                     | (u16::from(g >> 3) << 6)
                     | (u16::from(b >> 3) << 1)
-                    | u16::from(a >> 7)
+                    | 1
             })
             .collect();
         assert_eq!(
@@ -14618,13 +14646,13 @@ mod tests {
             FLAT_PRIM_ALPHA,
             MULTI_ONE_CYCLE_PRIM[1],
         );
-        let [r1, g1, b1, a1] = MULTI_ONE_CYCLE_PRIM[1].to_be_bytes();
+        let [r1, g1, b1, _a1] = MULTI_ONE_CYCLE_PRIM[1].to_be_bytes();
         assert_eq!(
             probe,
             (u16::from(r1 >> 3) << 11)
                 | (u16::from(g1 >> 3) << 6)
                 | (u16::from(b1 >> 3) << 1)
-                | u16::from(a1 >> 7),
+                | 1,
             "the real combiner over texrect 1's own primitive register must reconcile with the \
              packed literal this test asserted against the published buffer"
         );

@@ -234,6 +234,17 @@ const OTHER_MODES_ONE_CYCLE_TEXTURED_PERSPECTIVE: (u32, u32) =
 /// exactly the reasons [`OTHER_MODES_FILL_NO_AA`] documents.
 const OTHER_MODES_ONE_CYCLE_NO_AA: (u32, u32) = (0xef00_00f0, 0);
 
+/// One-cycle, forced general blending with `P = M = Combined`,
+/// `A = CombinedAlpha`, and `B = One`.
+///
+/// The low word is derived from the public `G_BL_*` selector packing:
+/// `B = One` is selector 2 in cycle 1's bits 18:19 and `FORCE_BL` is bit 14;
+/// every other selector is zero. This is deliberately not RT64's duplicate
+/// `P == M && B == OneMinusA` passthrough: `B == One` makes the numerator
+/// overflow classification true.
+const OTHER_MODES_ONE_CYCLE_BLEND_OVERFLOW: (u32, u32) =
+    (0xef00_00f0, (2 << 18) | (1 << 14));
+
 /// The colour the one-cycle band is asked to paint, and the seed it must
 /// replace. Deliberately not `STALE`, so "the band did nothing" and "the
 /// band worked" are different pictures.
@@ -844,9 +855,12 @@ fn one_direct_texture_rect(
 
 /// A true split-bank RGBA32 load and point-sampled draw. Unlike the smaller
 /// direct formats, RGBA32 must be loaded with size 32 on both the image and
-/// tile descriptors: the public header gives 32-bit tiles a two-byte-per-bank
-/// line calculation, and the SGI command summary requires the low half of
-/// TMEM because the R/G and B/A halves occupy paired banks.
+/// tile descriptors. The public `gDPLoadTextureTile` macro passes `siz`
+/// unchanged to both SetTile commands, while `G_IM_SIZ_32b_TILE_BYTES` and
+/// `G_IM_SIZ_32b_LINE_BYTES` are both 2: each texel advances two bytes in
+/// each half-bank, and `line = 1` is one padded 64-bit row per bank here.
+/// Programming Manual section 13.8.1 Figure 13-15 supplies the paired-bank
+/// layout; `gbi.h` supplies the independently checkable command derivation.
 fn one_rgba32_rect() -> Vec<(u32, u32)> {
     let width = RGBA32_EXPECTED.len() as u32;
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
@@ -857,9 +871,7 @@ fn one_rgba32_rect() -> Vec<(u32, u32)> {
         set_scissor(0, 0, WIDTH, HEIGHT),
         (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
         (0xfd00_0000 | (3 << 19) | (width - 1), RGBA32_SOURCE),
-        // The public command summary requires a 16-bit load descriptor for
-        // an RGBA32 image; the image size selects split-bank placement.
-        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        (0xf500_0000 | (3 << 19) | (1 << 9), 0),
         set_tile_size(width, 1),
         (0xe600_0000, 0),
         load_tile(width, 1),
@@ -1415,6 +1427,54 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     ));
     words.push((0xe900_0000, 0));
     words
+}
+
+/// A texrect whose combiner emits opaque white and whose blender evaluates
+/// `(white * 1 + white * 1) / (1 + 1)` through RT64's overflow path.
+///
+/// The target is seeded blue, which this all-white blend program cannot
+/// produce, so a dropped draw cannot accidentally satisfy the key. The
+/// texture setup is retained from [`one_textured_rect`] even though the
+/// Primitive combiner does not sample it, keeping the draw on the corpus's
+/// already-proven texrect command shape.
+fn blend_numerator_overflow_rect() -> Vec<(u32, u32)> {
+    let mut words = one_fill(BLUE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_BLEND_OVERFLOW,
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, 0xffff_ffff),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        set_tile(TEXTURE_LINE_WORDS, 0),
+        set_tile_size(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(texture_rectangle(
+        TEXRECT_ULX,
+        TEXRECT_ULY,
+        TEXRECT_LRX,
+        TEXRECT_LRY,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// Hand-derived key for [`blend_numerator_overflow_rect`]. In normalized
+/// units the wrapped channel is `(2 mod (1 + 8/255)) / 2 = 247/510`, which
+/// quantizes to RGB5 value 15 in every channel; opaque RGBA16 is therefore
+/// `(15 << 11) | (15 << 6) | (15 << 1) | 1 = 0x7bdf`.
+fn blend_numerator_overflow_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < TEXRECT_LRX && y < TEXRECT_LRY {
+        0x7bdf
+    } else {
+        BLUE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2077,6 +2137,18 @@ fn cases() -> Vec<Case> {
             authority: Authority::Rt64Authoritative,
             commands: one_cycle_fill_band(),
             expected: one_cycle_fill_band_expected,
+        },
+        Case {
+            name: "blend-numerator-overflow-wrap",
+            intent: "opaque white enters both P and M with A = B = 1, so each \
+                     general-path RGB numerator is 2. RT64 wraps it modulo \
+                     1 + 8/255 before dividing by 2; clamp-before-divide or \
+                     divide-without-wrap produces white instead of the \
+                     hand-derived 0x7bdf. The untouched target is blue, a \
+                     colour this all-white blend program cannot produce.",
+            authority: Authority::Rt64Authoritative,
+            commands: blend_numerator_overflow_rect(),
+            expected: blend_numerator_overflow_expected,
         },
         // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
@@ -3166,6 +3238,26 @@ mod tests {
         let count = names.len();
         names.dedup();
         assert_eq!(names.len(), count);
+    }
+
+    /// `gDPLoadTextureTile(..., G_IM_SIZ_32b, ...)` passes the same size to
+    /// its load and render SetTile commands. Its `G_IM_SIZ_32b_TILE_BYTES`
+    /// and `G_IM_SIZ_32b_LINE_BYTES` are both 2, so this two-texel fixture
+    /// derives `line = ((2 * 2) + 7) >> 3 = 1` for both descriptors.
+    #[test]
+    fn rgba32_case_uses_the_public_split_bank_tile_derivation() {
+        let set_tiles = one_rgba32_rect()
+            .into_iter()
+            .filter(|(word0, _)| word0 >> 24 == 0xf5)
+            .collect::<Vec<_>>();
+        assert_eq!(set_tiles.len(), 2);
+        for (word0, word1) in set_tiles {
+            assert_eq!((word0 >> 21) & 0x7, 0, "RGBA format");
+            assert_eq!((word0 >> 19) & 0x3, 3, "32-bit size");
+            assert_eq!((word0 >> 9) & 0x1ff, 1, "one word per bank row");
+            assert_eq!(word0 & 0x1ff, 0, "low-half TMEM base");
+            assert_eq!(word1, 0, "tile zero and default addressing fields");
+        }
     }
 
     /// A key that equals the seeded target would "pass" against a backend

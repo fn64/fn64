@@ -103,6 +103,23 @@ fn rdram_with_texture_source() -> Vec<u8> {
     rdram
 }
 
+/// Make the two S-probe texels differ in RGB, not only in RGBA16 bit 0.
+///
+/// The general source is the halfword counter `0, 1, 2, ...`; texels 0 and 1
+/// therefore differ only in bit 0. One-/two-cycle RGBA16 output replaces that
+/// source bit with destination coverage, so a correct full-coverage packer
+/// makes both pixels `0x0001` and the old S-variation assertion becomes
+/// incapable of detecting a constant sampler. These two integration fixtures
+/// instead stage texel 1 as `0x0002`: after RGB truncation plus full stored
+/// coverage the probes are `0x0001` and `0x0003`, retaining the independent
+/// load-bearing S check without asserting the superseded alpha-bit behavior.
+fn make_texrect_s_probe_visible(rdram: &mut [u8]) {
+    fn64_runtime::RdramViewMut::from_storage(rdram).write_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR + 2),
+        &2u16.to_be_bytes(),
+    );
+}
+
 /// Register a fresh `WgpuBackend` + paired `RawDpcAbiSession`, exactly the
 /// pairing `set_raw_dpc_session`'s own doc comment describes a shell/harness
 /// performing. Returns the RDRAM allocation the caller must keep alive and
@@ -1113,6 +1130,7 @@ fn expected_whole_target_image(fill_color: u32) -> Vec<u8> {
 fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
     crate::load_rom(Vec::new());
     let mut rdram = rdram_with_texture_source();
+    make_texrect_s_probe_visible(&mut rdram);
     register_session_backend_for_fills(rdram.len());
 
     let poisoned = poison_fill_target(&mut rdram);
@@ -1162,9 +1180,7 @@ fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
 
     // S varies across a row: it advances 2 texels over the 8 pixels, so a
     // row must contain at least two distinct values. A sampler that ignored
-    // S entirely would produce a uniform row and pass every assertion above
-    // -- measured, not hypothesised: a first draft's `dsdx` gave a half-
-    // texel span and this assertion is what caught it.
+    // S entirely would produce a uniform row and pass every assertion above.
     let first_row: std::collections::BTreeSet<u16> = inside_values[..W as usize]
         .iter()
         .map(|(_, _, value)| *value)
@@ -1192,10 +1208,10 @@ fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
     //
     // The TMEM content is `LoadBlock`'s own source, RDRAM bytes
     // `0x0000..` written by `rdram_with_texture_source` as the big-endian
-    // halfwords 0, 1, 2, ...; at `dxt = 0` they land contiguously, so
-    // texel `n` of row 0 is the halfword `n`. Columns 0..=3 must all read
-    // texel 0 and columns 4..=7 must all read texel 1, and the two must
-    // differ.
+    // halfwords 0, 1, 2, ... except for this fixture's explicit texel-1
+    // `0x0002` probe; at `dxt = 0` they land contiguously. Columns 0..=3 read
+    // texel 0 and columns 4..=7 read texel 1, whose packed RGB values differ
+    // even after bit 0 is correctly replaced with full destination coverage.
     let row0: Vec<u16> = (0..W)
         .map(|column| inside_values[column as usize].2)
         .collect();
@@ -1216,10 +1232,9 @@ fn a_fill_a_tmem_load_and_a_texrect_reach_guest_rdram_together() {
          exactly in half at column 4 -- an off-by-one in S stepping moves that boundary and is \
          invisible to any assertion that computes S the same way the executor does"
     );
-
     // T varies across rows: it advances 3 texels over the 3 rows, one per
     // row, so the three rows must not all be identical. A sampler that
-    // ignored T would make them identical and pass the S assertion above.
+    // ignored T would make them identical and pass the row-grouping checks above.
     let rows: Vec<Vec<u16>> = (0..H)
         .map(|row| {
             (0..W)
@@ -1367,6 +1382,7 @@ const MULTI_IS_TEXRECT: [bool; 6] = [false, true, false, true, false, true];
 fn three_fills_and_three_texrects_reach_guest_rdram_in_command_order() {
     crate::load_rom(Vec::new());
     let mut rdram = rdram_with_texture_source();
+    make_texrect_s_probe_visible(&mut rdram);
     register_session_backend_for_fills(rdram.len());
 
     let poisoned = poison_fill_target(&mut rdram);
@@ -1468,9 +1484,10 @@ fn three_fills_and_three_texrects_reach_guest_rdram_in_command_order() {
         "fill #2 must have overwritten the whole-target fill in its own rectangle"
     );
 
-    // A texrect's row must vary in S, or the sampler is not reading S at
-    // all and every "not a fill value" assertion above is satisfiable by a
-    // constant.
+    // A texrect's row must vary in S, or the sampler is not reading S at all
+    // and every "not a fill value" assertion above is satisfiable by a
+    // constant. `make_texrect_s_probe_visible` makes this assertion test RGB
+    // rather than the source halfword's superseded bit-0/alpha interpretation.
     let row: std::collections::BTreeSet<u16> = (4..12).map(|x| at(x, 2)).collect();
     assert!(
         row.len() >= 2,
