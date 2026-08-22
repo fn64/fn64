@@ -923,13 +923,14 @@ impl Framebuffer {
                         // bits of the s15.16 attribute planes and multiplies by
                         // a 2^15-normalized reciprocal of W, so the output is
                         // (S/W) * 2^15 in S10.5 units = (S/W) * 2^10 texels
-                        // (angrylion `tcdiv` persp path; RT64 divides s.w by
-                        // w and scales identically). Without the 2^10 the whole
+                        // (pinned RT64 `gbi/rt64_gbi_rdp.cpp:523-530` computes
+                        // `(texcoord / w) * 1024.0f`, the same 2^10 texel scale;
+                        // 2^15 in S10.5 is 2^10 texels). Without the 2^10 the whole
                         // title-screen quad collapsed onto texel (0,0) -- every
                         // pixel sampled the image's corner and the presented
                         // frame was a uniform field. With G_TP_NONE the divide
                         // is skipped entirely and the plane's integer part IS
-                        // the S10.5 coordinate (angrylion `tcdiv_nopersp`).
+                        // the S10.5 coordinate.
                         let persp = triangle.other_mode.texture_perspective();
                         let corrected = move |values: [i64; 3]| {
                             if persp {

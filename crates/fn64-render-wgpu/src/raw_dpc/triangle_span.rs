@@ -545,7 +545,7 @@ fn coefficient_components(
 /// `stw` is the three planes' Q16.16 values at that point, already evaluated
 /// by [`attribute_plane`]; `perspective` is `OtherMode::texture_perspective`.
 ///
-/// # The perspective factor is DERIVED from angrylion; the other is cited
+/// # Both factors are grounded on pinned RT64 and the S10.5 wire format
 ///
 /// Both come from `fn64-render-reference`'s `draw_raw_rdp_triangle_impl`
 /// (`raster/draw.rs:898`), which derived them against WM2000's own title
@@ -554,7 +554,7 @@ fn coefficient_components(
 /// 1. **Perspective.** Hardware `tcdiv` is not a bare `S/W` ratio. The
 ///    pipeline feeds tcdiv the HIGH bits of the s15.16 attribute planes and
 ///    multiplies by a 2^15-normalized reciprocal of W, so the output is
-///    `(S/W) * 2^15` in S10.5 units = `(S/W) * 2^10` texels (angrylion's
+///    `(S/W) * 2^15` in S10.5 units = `(S/W) * 2^10` texels (pinned RT64's
 ///    `tcdiv` perspective path; RT64 divides `s.w` by `w` and scales
 ///    identically). So the RAW S10.5 value this function returns carries
 ///    `2^15`, and `2^10` is what that same value denotes in TEXELS -- the
@@ -575,8 +575,9 @@ fn coefficient_components(
 ///    `docs/RT64-WM2000-COMBINER-CENSUS.md`.
 /// 2. **Non-perspective (`G_TP_NONE`).** The divide is skipped entirely and
 ///    the plane's own s15.16 value converts to S10.5 by dividing by `2^16`
-///    -- angrylion's `ss = s >> 16` (`rasterizer.c:479`); `tcdiv_nopersp`
-///    itself applies no scale. The further `>>5` to whole texels is the
+///    -- the plane is s15.16, so `>> 16` yields S10.5, and the
+///    non-perspective path applies no further scale of its own.
+///    The remaining `>>5` to whole texels is the
 ///    SAMPLER's, not this function's, so the total is `2^21`. See
 ///    [`PLANE_TO_TEXEL`] for the measurement that corrected this.
 ///
@@ -661,12 +662,17 @@ fn saturate_s10_5(value: f32) -> i16 {
 /// texel histogram, which is why every aggregate instrument missed it. See
 /// `docs/RT64-WM2000-COMBINER-CENSUS.md`.
 ///
-/// The value is angrylion's, not a refit: `tcdiv_persp`
-/// (`src/core/n64video/rdp/tcoord.c:1027`) returns `(ss/sw) * 2^15`
-/// (verified by building its `tcdiv_table` exactly and evaluating it),
-/// `tcshift_cycle` (`:83`) takes `SIGN16` of that, and
-/// `texture_pipeline_cycle` reads `sfrac = sss1 & 0x1f` (`tex.c:182`) --
-/// five fractional bits over a `2^15`-scaled value.
+/// **The value is independently derivable from pinned RT64**, so it is not a
+/// refit and no longer rests on an excluded source. RT64's triangle path
+/// (`src/gbi/rt64_gbi_rdp.cpp:523-530`) computes the perspective texture
+/// coordinate as `(texcoord / w) * 1024.0f` -- 1024 whole TEXELS. This
+/// function produces S10.5, which carries five fractional bits, so the
+/// equivalent plane scale is `1024 * 2^5 = 2^15 = 32768`. That reconciles
+/// exactly, and the `2^15` here is the S10.5 spelling of RT64's `* 1024`.
+///
+/// RT64's non-perspective arm in the same block is `(texcoord * 1024) /
+/// 16384`, consistent with the `2^16` sibling constant below composing with
+/// the sampler's own `>>5`.
 const PERSPECTIVE_TEXEL_SCALE: f32 = 32768.0;
 
 /// s15.16 plane value -> S10.5 texel coordinate, for the `G_TP_NONE` path.
@@ -676,7 +682,7 @@ const PERSPECTIVE_TEXEL_SCALE: f32 = 32768.0;
 ///
 /// | step | hardware | fn64 |
 /// |---|---|---|
-/// | plane -> S10.5 | `ss = s >> 16` (angrylion `rasterizer.c:479`) | this constant |
+/// | plane -> S10.5 | `>> 16`, the s15.16 wire scale | this constant |
 /// | S10.5 -> texel | `*S = locs >> 5` (`tcoord.c:143`) | `sample.rs`'s `div_euclid(TEXEL_FRACTION_SCALE)` |
 ///
 /// `tcdiv_nopersp` itself applies NO scale at all (`tcoord.c:1024`: it is

@@ -3660,8 +3660,7 @@ mod tests {
 ///
 /// **The slice tallied is the one that will actually be evaluated**, chosen
 /// by the caller from the cycle type: one-cycle mode evaluates the *cycle-1*
-/// bitfield slice (angrylion `combiner_1cycle`, `combiner.c:173-220`,
-/// dereferences index `[1]` throughout), so tallying the cycle-0 slice for a
+/// bitfield slice, so tallying the cycle-0 slice for a
 /// one-cycle program would report selectors the hardware never reads.
 pub mod census {
     use super::{AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot};
