@@ -233,6 +233,15 @@ const OTHER_MODES_ONE_CYCLE_NO_AA: (u32, u32) = (0xef00_00f0, 0);
 /// band worked" are different pictures.
 const BAND_FILL_COLOR: u16 = 0xf801;
 
+/// The seed the band must overwrite. Deliberately NOT white: the combiner
+/// WM2000 stages resolves to white, so a white seed would make this case
+/// pass even if the command were dropped entirely.
+const BAND_SEED: u16 = 0x0843;
+
+/// What the measured combiner produces with `shade = texel0 = texel1 = 0`.
+/// Both RT64 and the reference backend were observed to write this.
+const BAND_COMBINED_OUTPUT: u16 = 0xffff;
+
 /// The band's own rows, chosen inside the target and away from every edge so
 /// a clipping defect cannot be mistaken for a dropped command.
 const BAND_TOP: u32 = 64;
@@ -266,12 +275,23 @@ const BAND_BOTTOM: u32 = 127;
 fn one_cycle_fill_band() -> Vec<(u32, u32)> {
     // The Fill-cycle seed. This half is already proven: `full-target-red`
     // and the textured cases all rely on it.
-    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    let mut words = one_fill(BAND_SEED, 0, 0, WIDTH - 1, HEIGHT - 1);
     // Drop the seed's own FullSync; one closes the whole packet.
     words.pop();
     words.extend([
         // The ONLY difference from a working fill: the cycle type.
         OTHER_MODES_ONE_CYCLE_NO_AA,
+        // **The combined path needs the combiner state a fill cycle never
+        // reads.** These three words are lifted verbatim from the measured
+        // WM2000 packet in `docs/WM2000-FILLRECT-EVIDENCE.txt`, which stages
+        // exactly this before its sixty one-cycle bands: `SetPrimColor`,
+        // `SetEnvColor`, then the `SetCombine` immediately preceding them.
+        // Using the ROM's own words keeps the fixture honest about what the
+        // game actually programs, rather than inventing a combiner that
+        // happens to be convenient.
+        (0xfa00_0000, 0xffff_ffef),
+        (0xfb00_0000, 0xffff_ffff),
+        (0xfcff_ffff, 0xfffd_f6fb),
         (0xf700_0000, (BAND_FILL_COLOR as u32) * 0x1_0001),
         fill_rect(WIDTH - 1, BAND_BOTTOM, 0, BAND_TOP),
         (0xe900_0000, 0),
@@ -279,11 +299,30 @@ fn one_cycle_fill_band() -> Vec<(u32, u32)> {
     words
 }
 
-/// The seed everywhere: what a backend that DROPS the one-cycle band
-/// produces. A backend that honours the band paints [`BAND_FILL_COLOR`]
-/// across rows [`BAND_TOP`]..=[`BAND_BOTTOM`] and differs here.
-fn one_cycle_fill_band_expected(_index: u32) -> u16 {
-    STALE
+/// The hand-derived key.
+///
+/// Outside the band the seed survives. INSIDE it, both engines were measured
+/// to resolve WM2000's own combiner to white with `shade = texel0 = texel1 =
+/// 0`, and the band uses the EXCLUSIVE lower/right edge that one-/two-cycle
+/// mode takes (`crates/fn64-render-reference/src/raster/draw.rs:113-135`),
+/// so the final column and row keep the seed.
+///
+/// **The seed is deliberately not white.** An earlier revision seeded
+/// `STALE` (0xffff), which is exactly what this combiner paints -- so the
+/// case passed whether or not the command executed at all, and could not
+/// tell "wrote white" from "wrote nothing". That is the
+/// fixture-cannot-detect-the-bug trap `docs/RT64-WM2000-HARNESS-TRAPS.md`
+/// records; seeding a distinct colour is what gives this case teeth.
+fn one_cycle_fill_band_expected(index: u32) -> u16 {
+    let y = index / WIDTH;
+    let x = index % WIDTH;
+    let inside_rows = y >= BAND_TOP && y < BAND_BOTTOM;
+    let inside_columns = x < WIDTH - 1;
+    if inside_rows && inside_columns {
+        BAND_COMBINED_OUTPUT
+    } else {
+        BAND_SEED
+    }
 }
 
 fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
@@ -1373,15 +1412,13 @@ fn cases() -> Vec<Case> {
             name: "one-cycle-fill-band",
             intent: "a G_FILLRECT band issued in ONE-CYCLE mode over a \
                      STALE-seeded target. WM2000 clears its framebuffer with \
-                     ~60 such bands per frame; fn64's fill executor is reached \
-                     only for CycleType::Fill, so they stage no write and the \
-                     stale framebuffer survives to VI -- the measured cause of \
+                     ~60 such bands per frame; dropping those writes leaves the \
+                     stale framebuffer at VI -- the measured cause of \
                      the foreign content on the AKI/THQ/JAKKS/Asmik logo \
                      screens. RT64 calls drawRect unconditionally \
-                     (rt64_rdp.cpp:1043), so it draws where fn64 does nothing. \
-                     The key states the SEED, i.e. what dropping the command \
-                     produces, so a wgpu-matches-key/RT64-differs verdict is \
-                     the finding rather than a predicted RT64 answer.",
+                     (rt64_rdp.cpp:1043). The key requires the measured white \
+                     combiner result across exactly the exclusive 319x63 \
+                     extent, with the distinct seed surviving outside it.",
             authority: Authority::Rt64Authoritative,
             commands: one_cycle_fill_band(),
             expected: one_cycle_fill_band_expected,

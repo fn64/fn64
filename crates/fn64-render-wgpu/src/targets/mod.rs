@@ -27,8 +27,9 @@ mod texrect;
 mod triangle_pipeline;
 
 pub use fill::{
-    decode_fill_cycle_pixel, execute_fill_rectangle, resolve_fill_pixel_rectangle,
-    FillCoordinateError, FillCycleBypassHazards, FillExecutionError, FillPixelRectangle,
+    decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
+    resolve_fill_pixel_rectangle, FillCoordinateError, FillCycleBypassHazards, FillExecutionError,
+    FillPixelRectangle,
 };
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{

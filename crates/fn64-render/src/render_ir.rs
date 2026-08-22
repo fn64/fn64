@@ -1606,8 +1606,10 @@ mod production {
         /// for the visitor to track) so the execution-time color-target
         /// identity is derived from the same value plan time used.
         pub color_image: NeutralColorImage,
-        /// The staged `SetFillColor` wire value.
-        pub fill_color: NeutralFillColor,
+        /// The staged `SetFillColor` wire value. Required and present in
+        /// Fill cycle; irrelevant to one-/two-cycle rectangles, whose color
+        /// comes from the combiner, so those commands preserve its absence.
+        pub fill_color: Option<NeutralFillColor>,
         /// Index into the owning plan's ordered access list of this
         /// command's first `RenderTarget` write access.
         pub first_access_index: u32,
@@ -2606,7 +2608,7 @@ mod production {
             self.accesses.extend_from_slice(accesses);
         }
 
-        /// Pushes one admitted fill-cycle `FillRectangle` and **every**
+        /// Pushes one admitted `FillRectangle` and **every**
         /// [`ResourceAccess`] it declares, in the exact order the decoder
         /// produced them.
         ///
