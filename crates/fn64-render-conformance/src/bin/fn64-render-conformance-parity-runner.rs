@@ -688,19 +688,22 @@ fn texture_rectangle_at_t(ulx: u32, uly: u32, lrx: u32, lry: u32, low_t: u32) ->
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
 
 // ---------------------------------------------------------------------------
-// Direct intensity formats
+// Direct texture formats
 // ---------------------------------------------------------------------------
 //
-// The SGI RDP Command Summary's image-data-format matrix defines exactly
-// seven direct pairs: RGBA16/32, IA4/8/16 and I4/8. The RGBA16 cases above
-// cover only one of them. These rows cover the other five without importing
-// a captured packet or an answer from either backend.
+// The N64 Programming Manual's "Texture Image Types and Format" table and
+// texture-unit list define exactly ten legal pairs: RGBA16/32, YUV16, CI4/8,
+// IA4/8/16 and I4/8 (chapter 13, pp. 189 and 216). The cases in this file now
+// cover that complete matrix without importing a captured packet or an answer
+// from either backend.
 
+const RGBA32_SOURCE: u32 = 0x4700;
 const IA8_SOURCE: u32 = 0x4200;
 const IA4_SOURCE: u32 = 0x4300;
 const IA16_SOURCE: u32 = 0x4400;
 const I4_SOURCE: u32 = 0x4500;
 const I8_SOURCE: u32 = 0x4600;
+const YUV16_SOURCE: u32 = 0x4800;
 
 /// Eight opaque IA8 texels. High nibble is intensity, low nibble is alpha;
 /// fixing alpha at `0xf` makes any accidental I8 interpretation visible.
@@ -717,6 +720,15 @@ const I4_BYTES: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 /// I8 is one byte replicated into RGB and alpha. Values straddle successive
 /// eight-count intensity boundaries so every five-bit RGB step is named.
 const I8_BYTES: [u8; 8] = [0x08, 0x1c, 0x28, 0x3c, 0x48, 0x5c, 0x68, 0x7c];
+/// Two big-endian RGBA32 texels. Every channel is authored on an eight-count
+/// boundary so RGBA32 -> RGBA16 quantization is exact and hand-checkable.
+const RGBA32_BYTES: [u8; 8] = [0x10, 0x28, 0x40, 0xff, 0x50, 0x68, 0x80, 0xff];
+/// Four YUV16 pairs in the public `Y0,U,Y1,V` wire order. Neutral chroma makes
+/// the texture filter's R'/G'/B' channels equal the selected Y regardless of
+/// its conversion coefficients; every Y still differs from the seed.
+const YUV16_BYTES: [u8; 16] = [
+    0x10, 0x80, 0x28, 0x80, 0x40, 0x80, 0x58, 0x80, 0x70, 0x80, 0x88, 0x80, 0xa0, 0x80, 0xb8, 0x80,
+];
 
 /// Hand-derived RGBA16 target words for [`IA8_BYTES`].
 ///
@@ -745,6 +757,18 @@ const I4_EXPECTED: [u16; 8] = [
 const I8_EXPECTED: [u16; 8] = [
     0x0843, 0x18c7, 0x294b, 0x39cf, 0x4a53, 0x5ad7, 0x6b5b, 0x7bdf,
 ];
+/// Hand-derived RGBA16 target words for [`RGBA32_BYTES`]. For texel zero,
+/// `r5=0x10>>3=2`, `g5=0x28>>3=5`, `b5=0x40>>3=8`, and opaque alpha gives
+/// `(2<<11)|(5<<6)|(8<<1)|1 = 0x1151`. The other entries use the identical
+/// upper-five-bit packing; no renderer output participates in this table.
+const RGBA32_EXPECTED: [u16; 2] = [0x1151, 0x5361];
+/// With U=V=128, the public first-stage equations reduce to `R'=G'=B'=Y`.
+/// The fixture's Texel0-pass combiner selects those values directly. For the
+/// first Y byte, `y5=0x10>>3=2`, hence
+/// `(2<<11)|(2<<6)|(2<<1)|1 = 0x1085`.
+const YUV16_EXPECTED: [u16; 8] = [
+    0x1085, 0x294b, 0x4211, 0x5ad7, 0x739d, 0x8c63, 0xa529, 0xbdef,
+];
 
 fn expected_direct_row(index: u32, texels: &[u16]) -> u16 {
     let x = index % WIDTH;
@@ -770,6 +794,12 @@ fn i4_expected(index: u32) -> u16 {
 }
 fn i8_expected(index: u32) -> u16 {
     expected_direct_row(index, &I8_EXPECTED)
+}
+fn rgba32_expected(index: u32) -> u16 {
+    expected_direct_row(index, &RGBA32_EXPECTED)
+}
+fn yuv16_expected(index: u32) -> u16 {
+    expected_direct_row(index, &YUV16_EXPECTED)
 }
 
 /// Seed, load through the public 16-bit transfer form, redescribe the same
@@ -805,6 +835,62 @@ fn one_direct_texture_rect(
             0xf500_0000 | (format << 21) | (size << 19) | (line_words << 9),
             0,
         ),
+        set_tile_size(width, 1),
+    ]);
+    words.extend(texture_rectangle(0, 0, width, 1));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// A true split-bank RGBA32 load and point-sampled draw. Unlike the smaller
+/// direct formats, RGBA32 must be loaded with size 32 on both the image and
+/// tile descriptors: the public header gives 32-bit tiles a two-byte-per-bank
+/// line calculation, and the SGI command summary requires the low half of
+/// TMEM because the R/G and B/A halves occupy paired banks.
+fn one_rgba32_rect() -> Vec<(u32, u32)> {
+    let width = RGBA32_EXPECTED.len() as u32;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (3 << 19) | (width - 1), RGBA32_SOURCE),
+        // The public command summary requires a 16-bit load descriptor for
+        // an RGBA32 image; the image size selects split-bank placement.
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(width, 1),
+        (0xe600_0000, 0),
+        load_tile(width, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (3 << 19) | (1 << 9), 0),
+        set_tile_size(width, 1),
+    ]);
+    words.extend(texture_rectangle(0, 0, width, 1));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// A legal YUV16 load in the public even-S, paired-chroma form. Neutral
+/// chroma removes every conversion-coefficient term before the Texel0-pass
+/// combiner, so the hand-derived key needs no unstated matrix assumption.
+fn one_yuv16_rect() -> Vec<(u32, u32)> {
+    let width = YUV16_EXPECTED.len() as u32;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (1 << 21) | (2 << 19) | (width - 1), YUV16_SOURCE),
+        (0xf500_0000 | (1 << 21) | (2 << 19) | (1 << 9), 0),
+        set_tile_size(width, 1),
+        (0xe600_0000, 0),
+        load_tile(width, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (1 << 21) | (2 << 19) | (1 << 9), 0),
         set_tile_size(width, 1),
     ]);
     words.extend(texture_rectangle(0, 0, width, 1));
@@ -855,6 +941,27 @@ const PALETTE: [u16; 16] = [
     0x0843, 0x0843, 0x0843, 0x0843,
 ];
 
+const CI8_SOURCE: u32 = 0x4900;
+const CI8_PALETTE_SOURCE: u32 = 0x4a00;
+const CI8_INDICES: [u8; 8] = [0x03, 0x20, 0x55, 0x81, 0xa7, 0xc2, 0xe6, 0xf4];
+
+/// The eight named CI8 palette entries are deliberately sparse across the
+/// full 0..255 index domain. Every unnamed entry is a marker distinct from
+/// both the key colours and `STALE`.
+const fn ci8_palette_entry(index: u8) -> u16 {
+    match index {
+        0x03 => 0xf801,
+        0x20 => 0x07c1,
+        0x55 => 0x003f,
+        0x81 => 0x7fff,
+        0xa7 => 0x8421,
+        0xc2 => 0xc631,
+        0xe6 => 0x4211,
+        0xf4 => 0xfc01,
+        _ => 0x0843,
+    }
+}
+
 /// The expected pixel for the CI4 case: pixel `x` reads index
 /// `CI_INDICES[x]`, which selects `PALETTE[that]`.
 fn ci_expected(index: u32) -> u16 {
@@ -862,6 +969,16 @@ fn ci_expected(index: u32) -> u16 {
     let y = index / WIDTH;
     if x < CI_INDICES.len() as u32 && y < 1 {
         PALETTE[CI_INDICES[x as usize] as usize]
+    } else {
+        STALE
+    }
+}
+
+fn ci8_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x < CI8_INDICES.len() as u32 && y == 0 {
+        ci8_palette_entry(CI8_INDICES[x as usize])
     } else {
         STALE
     }
@@ -919,6 +1036,41 @@ fn one_ci4_rect() -> Vec<(u32, u32)> {
         set_tile_size(CI_INDICES.len() as u32, 1),
     ]);
     words.extend(texture_rectangle(0, 0, CI_INDICES.len() as u32, 1));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// CI8 uses all eight index bits and a 256-entry high-TMEM TLUT. The index
+/// bytes are loaded through four public 16-bit transfer texels, then the same
+/// low-TMEM bytes are redescribed as CI8 without reloading.
+fn one_ci8_rect() -> Vec<(u32, u32)> {
+    let entries = 256u32;
+    let load_texels_16b = CI8_INDICES.len() as u32 / 2;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        (
+            OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15),
+            OTHER_MODES_ONE_CYCLE_TEXTURED.1,
+        ),
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (entries - 1), CI8_PALETTE_SOURCE),
+        (0xf500_0000 | (2 << 19) | PALETTE_TMEM_WORD, 1 << 24),
+        (0xe600_0000, 0),
+        (0xf000_0000, (1 << 24) | ((entries - 1) << 14)),
+        (0xe600_0000, 0),
+        (0xfd00_0000 | (2 << 19) | (load_texels_16b - 1), CI8_SOURCE),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        load_tile(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (2 << 21) | (1 << 19) | (1 << 9), 0),
+        set_tile_size(CI8_INDICES.len() as u32, 1),
+    ]);
+    words.extend(texture_rectangle(0, 0, CI8_INDICES.len() as u32, 1));
     words.push((0xe900_0000, 0));
     words
 }
@@ -1706,6 +1858,37 @@ fn cases() -> Vec<Case> {
             expected: ci_expected,
         },
         Case {
+            name: "textured-rect-rgba32",
+            intent: "two opaque RGBA32 texels exercise one complete split-bank TMEM \
+                     layout and 8/8/8/8 channel decode. The seed is 0xffff, \
+                     which no authored texel can quantize to, and each \
+                     RGBA16 key word is packed directly from its wire bytes.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_rgba32_rect(),
+            expected: rgba32_expected,
+        },
+        Case {
+            name: "textured-rect-ci8-tlut",
+            intent: "eight sparse full-byte indices exercise CI8 addressing \
+                     and all 256 high-TMEM palette entries. The index set \
+                     crosses every nibble range, so truncating CI8 to CI4 or \
+                     selecting palette entry x cannot match the key.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_ci8_rect(),
+            expected: ci8_expected,
+        },
+        Case {
+            name: "textured-rect-yuv16",
+            intent: "four even-S YUV16 pairs exercise the only legal YUV \
+                     cell and its Y0,U,Y1,V wire layout. Neutral chroma \
+                     reduces the public first-stage equations to gray=Y, \
+                     selected by the explicit Texel0-pass combiner without \
+                     borrowing an answer from either renderer.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_yuv16_rect(),
+            expected: yuv16_expected,
+        },
+        Case {
             name: "textured-rect-ia8",
             intent: "an opaque IA8 row exercises the ROM's most-used missing \
                      direct format: each byte must split into a high intensity \
@@ -2010,12 +2193,21 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
             .map(|pair| (pair[0] << 4) | (pair[1] & 0xf))
             .collect();
         view.write_logical_bytes(RdramAddr::from_offset(CI_SOURCE), &packed);
+        view.write_logical_bytes(RdramAddr::from_offset(CI8_SOURCE), &CI8_INDICES);
+        for index in 0u16..=255 {
+            view.write_u16(
+                RdramAddr::from_offset(CI8_PALETTE_SOURCE + u32::from(index) * 2),
+                ci8_palette_entry(index as u8),
+            );
+        }
         for (address, bytes) in [
+            (RGBA32_SOURCE, RGBA32_BYTES.as_slice()),
             (IA8_SOURCE, IA8_BYTES.as_slice()),
             (IA4_SOURCE, IA4_BYTES.as_slice()),
             (IA16_SOURCE, IA16_BYTES.as_slice()),
             (I4_SOURCE, I4_BYTES.as_slice()),
             (I8_SOURCE, I8_BYTES.as_slice()),
+            (YUV16_SOURCE, YUV16_BYTES.as_slice()),
         ] {
             view.write_logical_bytes(RdramAddr::from_offset(address), bytes);
         }
@@ -2134,6 +2326,23 @@ fn wgpu_bytes(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
         &published[..FRAMEBUFFER_BYTES as usize],
     );
     Ok(observation_bytes(&rdram))
+}
+
+/// Keep one loud backend trap from erasing every other case's differential.
+/// The gate still treats the structured refusal as non-parity; this only
+/// preserves the remaining rows and the trapped message as evidence.
+fn wgpu_outcome(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
+    match std::panic::catch_unwind(|| wgpu_bytes(commands)) {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            Err(format!("wgpu trapped: {message}"))
+        }
+    }
 }
 
 /// The hand-derived key, materialised in the same guest byte order the
@@ -2468,7 +2677,7 @@ fn run() -> Value {
     for case in cases() {
         let key = pixels(&key_bytes(&case));
         let rt64 = rt64_bytes(&case.commands);
-        let wgpu = wgpu_bytes(&case.commands);
+        let wgpu = wgpu_outcome(&case.commands);
         let reference = reference_bytes(&case.commands);
 
         let verdict = Verdict::of(&rt64, &wgpu);
