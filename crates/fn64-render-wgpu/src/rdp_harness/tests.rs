@@ -1059,11 +1059,11 @@ fn a_textured_triangle_samples_the_tile_its_own_wire_word_names() {
 ///
 /// TMEM's odd rows carry a 4-byte bank exchange, and the reader must land on
 /// the same bank the writer used. What decides that bank is the
-/// TILE-RELATIVE row and nothing else -- angrylion takes `dswap = sst & 1`
-/// on the write side after `TRELATIVE` has made the row tile-relative
-/// (`tex.c:583`, `tcoord.c:998-999`) and `(t & 1)` on the read side over the
-/// equally tile-relative row, with `fetch_texel` never reading `tile->tl` at
-/// all (`tmem.c:63`). See `tmem/read.rs::odd_row_exchange`.
+/// TILE-RELATIVE row and nothing else. Pinned RT64 derives `oddRow` from
+/// `texelInt.y & 1` with no T-origin term, then exchanges adjacent four-byte
+/// words while preserving the byte offset
+/// (`src/shaders/TextureDecoder.hlsli:17-25,149-150`, commit `f0728a2`). See
+/// `tmem/read.rs::odd_row_exchange`.
 ///
 /// The T ORIGIN is therefore not part of the rule, and this test's job is to
 /// prove that an odd origin does not perturb the round trip. It is the

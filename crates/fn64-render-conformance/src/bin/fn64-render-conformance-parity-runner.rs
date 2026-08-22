@@ -148,8 +148,10 @@ struct Case {
 /// `SetScissor` over a whole-pixel box, in the wire's own field order.
 ///
 /// **The bounds are SPLIT ACROSS BOTH WORDS**, and getting that wrong is
-/// silent. angrylion's `rdp_set_scissor` (`rasterizer.c:2779`) reads the
-/// UPPER-LEFT from word 0 and the LOWER-RIGHT from word 1:
+/// silent. The public libultra macro `gDPSetScissor`
+/// (`ultra64/gbi.h:4794-4817`) packs the UPPER-LEFT into word 0 and the
+/// LOWER-RIGHT into word 1, each bound as `(int)((float)(coord) * 4.0f)`
+/// -- quarter-pixel units in two 12-bit fields. A decoder therefore reads:
 ///
 /// ```text
 /// clip.xh = (w0 >> 12) & 0xfff     clip.xl = (w1 >> 12) & 0xfff
@@ -187,9 +189,14 @@ const OTHER_MODES_FILL_NO_AA: (u32, u32) = (0xef30_00f0, 0);
 /// no-AA / no-dither / no-coverage properties [`OTHER_MODES_FILL_NO_AA`]
 /// does, so a textured case stays inside the RT64-authoritative partition.
 ///
-/// Hand-derived field by field from angrylion's `rdp_set_other_modes`
-/// (`src/core/n64video/rdp.c:623-660`), which is the authority for every bit
-/// position below:
+/// Derived from the public libultra encoding, not from any emulator:
+/// `gDPSetOtherMode` packs `w0 = G_RDPSETOTHERMODE << 24 | mode0`, and the
+/// `G_*` field constants in `ultra64/gbi.h` supply every position below.
+/// With `G_CYC_1CYCLE`, `G_TP_NONE`, `G_TT_NONE`, `G_TF_POINT` all zero and
+/// `G_CD_DISABLE = 3 << 6`, `G_AD_DISABLE = 3 << 4`, `mode0 = 0xf0`, giving
+/// exactly the `(0xef00_00f0, 0)` below. **Re-derived and confirmed to
+/// reproduce bit-for-bit from the public header alone**, so this literal is
+/// independently obtainable:
 ///
 /// | field | bits | value | meaning |
 /// |---|---|---|---|
@@ -388,20 +395,29 @@ fn textured_expected(index: u32) -> u16 {
 /// `SetTextureImage` naming the staged source as RGBA16.
 ///
 /// Wire: `format` 0 (RGBA) at bits 23:21, `size` 2 (16-bit) at 20:19, and a
-/// width field of `width - 1` at 11:0, matching angrylion's
-/// `rdp_set_texture_image` (`src/core/n64video/rdp/tex.c:1002-1008`).
+/// width field of `width - 1` at 11:0 -- the public libultra encoding, from
+/// `gDPSetTextureImage`/`gSetImage` and the `G_IM_FMT_*`/`G_IM_SIZ_*`
+/// constants in `ultra64/gbi.h`. Re-derived and confirmed to reproduce
+/// bit-for-bit from the header alone.
 const fn set_texture_image(width: u32, address: u32) -> (u32, u32) {
     (0xfd00_0000 | (2 << 19) | (width - 1), address)
 }
 
 /// `SetTile` for tile 0, RGBA16, at TMEM word 0.
 ///
-/// Wire, from angrylion's `rdp_set_tile` (`tex.c:979-1000`): `format` 23:21,
-/// `size` 20:19, `line` 17:9, `tmem` 8:0 in word 0; `tile` 26:24, `palette`
-/// 23:20, and the S/T clamp/mirror/mask/shift fields in word 1. Everything
-/// not named here is zero: no palette, no mirror, and `mask_s`/`mask_t` zero,
-/// which forces the CLAMP arm so a coordinate cannot wrap onto a neighbour
-/// and hide an addressing error.
+/// Wire, from the public libultra `gDPSetTile` encoding (`ultra64/gbi.h`):
+/// `format` 23:21, `size` 20:19, `line` 17:9, `tmem` 8:0 in word 0; `tile`
+/// 26:24, `palette` 23:20, and the S/T clamp/mirror/mask/shift fields in
+/// word 1. Re-derived and confirmed to reproduce bit-for-bit from the header
+/// alone. Everything not named here is zero: no palette and no mirror.
+///
+/// **Correction.** This comment used to say the zero `mask_s`/`mask_t`
+/// "forces the CLAMP arm". It does not: `ultra64/gbi.h:323-326` defines
+/// `G_TX_WRAP = 0 << 1` and `G_TX_CLAMP = 1 << 1`, so the zero encoding is
+/// WRAP. A zero mask still pins addressing -- with no mask bits the wrapped
+/// coordinate cannot move -- so the fixture's intent survives, but the
+/// stated reason was wrong. Found while re-grounding this file's citations
+/// on allowed sources.
 const fn set_tile(line_words: u32, tmem_word: u32) -> (u32, u32) {
     (0xf500_0000 | (2 << 19) | (line_words << 9) | tmem_word, 0)
 }

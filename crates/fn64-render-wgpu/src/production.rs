@@ -909,11 +909,13 @@ struct PlanCollector {
     /// single whole-plan-final value".
     ///
     /// The `RdpScissorRect` snapshot is taken at the same stream position
-    /// and for the same reason. angrylion clips every span against the
-    /// `clip` rect latched by `rdp_set_scissor` (`rasterizer.c:2779-2784`),
-    /// applied at `:2349-2363` for X and `:2284-2305` for Y -- so a fill
-    /// observes the scissor current where IT sits, not the one a later
-    /// `SetScissor` installed for a following primitive. `None` here means
+    /// and for the same reason. Pinned RT64 intersects its current scissor
+    /// with each draw rectangle (`src/hle/rt64_rdp.cpp:1214-1223`, commit
+    /// `f0728a2`), so fn64 snapshots the scissor current where THIS fill
+    /// sits, not the one a later `SetScissor` installs for a following
+    /// primitive. The exact relatch sequencing is fn64's own reading and is
+    /// not independently confirmed against an allowed hardware reference.
+    /// `None` here means
     /// the plan issued no `SetScissor` before this fill, and the consumer
     /// (`fill_scissor_or_full_target`) supplies the whole-target fallback,
     /// exactly as the texrect path already does.
@@ -1100,8 +1102,10 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
                 }
-                // Latched verbatim in wire quarter-pixels, matching
-                // `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`).
+                // Latched verbatim in wire quarter-pixels. Public libultra
+                // `include/ultra64/gbi.h:4794-4837` encodes each coordinate
+                // as a twelve-bit value scaled by four (or accepts the
+                // fractional wire value directly).
                 RdpStateCommand::SetScissor { scissor, .. } => {
                     self.current_scissor =
                         Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
@@ -1207,8 +1211,11 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     // own module doc: `Dither` never reaches
                     // `submit_admitted_triangle` -- a loud, named panic here,
                     // not a silent None/Threshold coercion. Wire encoding 2
-                    // is not reserved; it decodes to `None` (angrylion
-                    // `src/core/n64video/rdp.c:659-660`).
+                    // is not reserved. Pinned RT64's shader branches only
+                    // for `G_AC_DITHER` and `G_AC_THRESHOLD`, so wire
+                    // encoding 2 falls through to no compare
+                    // (`src/shaders/RasterPS.hlsl:203-213`, commit
+                    // `f0728a2`).
                     match other_mode.alpha_compare() {
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
@@ -4111,10 +4118,8 @@ fn execute_scheduled_fill(
 
     // **The same scissor the texrect path already honours, from the same
     // latched state and through the same whole-target fallback.**
-    // angrylion clips a fill's spans against `clip` exactly as it clips a
-    // texrect's -- the edgewalker's X clamp at `rasterizer.c:2349-2363` and
-    // its Y limits at `:2284-2305` are shared by every primitive the
-    // rasterizer walks, not specialised per command. Reusing
+    // Pinned RT64 clips by intersecting its current scissor and draw
+    // rectangle (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`). Reusing
     // `texrect_scissor_or_full_target` rather than writing a second
     // fallback keeps one model of "no SetScissor means the whole target".
     let scissor = texrect_scissor_or_full_target(*fill_scissor, candidate.key().extent());
@@ -4278,8 +4283,10 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
             },
         )?;
         // High bit 15 is `en_tlut`, bit 14 `tlut_type`; with the enable bit
-        // clear the type bit is dead and the TLUT is simply off (angrylion
-        // `src/core/n64video/rdp.c:630-631`).
+        // clear fn64 treats the TLUT as off. Pinned RT64 likewise maps only
+        // the exact `G_TT_RGBA16` and `G_TT_IA16` values to a TLUT and maps
+        // every other value to `None`
+        // (`src/hle/rt64_rdp_tmem.cpp:176-185`, commit `f0728a2`).
         let lut_mode = draw_state.other_mode.texture_lut_mode();
         // The image this call was handed must answer the identity its CALLER
         // selected: a pending post-image answers `Proposed`, durable state
@@ -4405,8 +4412,10 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     verify_accesses_inside(&accesses, key)?;
 
     // High bit 15 is `en_tlut`, bit 14 `tlut_type`; with the enable bit clear
-    // the type bit is dead and the TLUT is simply off (angrylion
-    // `src/core/n64video/rdp.c:630-631`).
+    // fn64 treats the TLUT as off. Pinned RT64 likewise maps only the exact
+    // `G_TT_RGBA16` and `G_TT_IA16` values to a TLUT and maps every other
+    // value to `None` (`src/hle/rt64_rdp_tmem.cpp:176-185`, commit
+    // `f0728a2`).
     let lut_mode = other_mode.texture_lut_mode();
     // **The committed/pending distinction, asserted where it is crossed.**
     //
@@ -4461,9 +4470,10 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // `RetrievedTriangleDraw::scissor` leaves the fallback to the consumer
     // instead of defaulting in the collector, which does not know it.
     //
-    // Quarter-pixels, because that is the domain `RdpScissorRect` latches
-    // in (angrylion `rasterizer.c:2779-2784`); `extent` is in pixels, so it
-    // is scaled by four.
+    // Quarter-pixels, because public libultra's `gDPSetScissor` encodes each
+    // coordinate after multiplying it by four
+    // (`include/ultra64/gbi.h:4794-4804`); `extent` is in pixels, so it is
+    // scaled by four.
     let scissor = texrect_scissor_or_full_target(draw_state.scissor, candidate.key().extent());
     let completed = crate::targets::execute_texture_rectangle(
         candidate,
@@ -4494,9 +4504,10 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
 /// consumer rather than defaulting in the collector, which does not know
 /// the extent.
 ///
-/// Quarter-pixels, because that is the domain `RdpScissorRect` latches in
-/// (angrylion `rdp_set_scissor`, `rasterizer.c:2779-2784`), while `extent`
-/// is in pixels -- hence the factor of four on each axis.
+/// Quarter-pixels, because public libultra's `gDPSetScissor` encodes each
+/// coordinate after multiplying it by four
+/// (`include/ultra64/gbi.h:4794-4804`), while `extent` is in pixels -- hence
+/// the factor of four on each axis.
 ///
 /// A named function rather than an inline closure so a mutation that
 /// derives the height bound from the width is reachable from a unit test;
@@ -7939,12 +7950,14 @@ mod tests {
     /// **`SetScissor` is a per-triangle snapshot, not the walk's running
     /// final value.**
     ///
-    /// One packet can carry several rectangles under different scissors --
-    /// the RDP re-latches `wstate->clip` on every `rdp_set_scissor`
-    /// (angrylion `rasterizer.c:2779-2784`) and the edgewalker clips each
-    /// primitive against whatever was latched when it arrived
-    /// (`:2349-2363`). Collecting a single running value would clip the
-    /// earlier rectangles with the later one's rect.
+    /// One packet can carry several rectangles under different scissors.
+    /// Pinned RT64 intersects its current scissor with each draw rectangle
+    /// (`src/hle/rt64_rdp.cpp:1214-1223`, commit `f0728a2`); fn64 therefore
+    /// snapshots the value current when each primitive arrives. Collecting a
+    /// single running value would clip earlier rectangles with the later
+    /// one's rect. The exact per-command relatch rule is fn64's own reading
+    /// and is not independently confirmed against an allowed hardware
+    /// reference.
     ///
     /// Mirrors `plan_collector_snapshots_fog_color_per_triangle` exactly,
     /// and uses two rects sharing NO coordinate so a snapshot that mixed
