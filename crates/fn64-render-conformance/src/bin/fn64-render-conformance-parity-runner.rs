@@ -698,6 +698,20 @@ fn texture_rectangle_at_t(ulx: u32, uly: u32, lrx: u32, lry: u32, low_t: u32) ->
 /// the add-RGB and add-alpha tables alike.
 const SET_COMBINE_TEXEL0: (u32, u32) = (0xfc88_7f10, 0x88fc_f279);
 
+/// `SetCombine` selecting `(Zero - Zero) * Zero + Shade` in BOTH the colour
+/// and the alpha pipe, for both cycles -- the shade-passthrough twin of
+/// [`SET_COMBINE_TEXEL0`].
+///
+/// Word 0 (`sub_a`/`mul` for cycle 0, `sub_b` for both cycles) is untouched:
+/// none of those fields differ between the two programs. Only the four
+/// "add" fields in word 1 change, from Texel0's code `1` to Shade's code
+/// `4`, at the same bit positions the table on [`SET_COMBINE_TEXEL0`]
+/// documents (`add_rgb0` 17:15, `add_rgb1` 8:6, `add_a0` 11:9, `add_a1`
+/// 2:0). Re-deriving `SET_COMBINE_TEXEL0`'s own word 1 confirms all four
+/// fields read `1` there, so flipping just those nibbles from `1` to `4`
+/// gives `0x88fe_793c`.
+const SET_COMBINE_SHADE: (u32, u32) = (0xfc88_7f10, 0x88fe_793c);
+
 // ---------------------------------------------------------------------------
 // Direct texture formats
 // ---------------------------------------------------------------------------
@@ -1641,6 +1655,95 @@ fn flat_triangle_expected(index: u32) -> u16 {
     }
 }
 
+/// A shade-only raw triangle (opcode `0x0c` = `G_RDPTRI_BASE | Shaded`)
+/// covering [`TRI_LEFT`, `TRI_RIGHT`) x [`TRI_TOP`, `TRI_BOTTOM`), built from
+/// the same edge words [`flat_triangle_words`] uses plus one 8-word shade
+/// coefficient block.
+///
+/// **RT64's own field layout is the authority for the shade block**
+/// (`rt64_gbi_rdp.cpp` `decodeTriangles`, shaded branch): `curData[0]`/
+/// `curData[2]` supply the base RGBA (word 0 = R:G, word 1 = B:A, each split
+/// integer-high/fraction-low across the pair), `curData[1]`/`curData[3]`
+/// supply d/dx, and `curData[4]`/`curData[6]` supply d/de -- exactly
+/// [`coefficient_block`]'s `(value, dx, de, dy)` grouping, so that helper
+/// (already proven correct for the S/T/W block) packs the shade block too.
+///
+/// Every derivative is zero: FLAT shade, so every covered pixel reads the
+/// same RGBA color regardless of where it falls in the triangle, and the
+/// key is a single named value rather than a per-pixel interpolation.
+fn shade_triangle_words(
+    x_h: u32,
+    x_l: u32,
+    y_h: u32,
+    y_l: u32,
+    y_m: u32,
+    rgba: [i32; 4],
+) -> Vec<(u32, u32)> {
+    let yl = ((y_l as i32) << 2) as u16 as u32;
+    let ym = ((y_m as i32) << 2) as u16 as u32;
+    let yh = ((y_h as i32) << 2) as u16 as u32;
+    let base = [
+        (0x0c00_0000 | (1 << 23) | yl, (ym << 16) | yh),
+        (x_l << 16, 0),
+        (x_h << 16, 0),
+        (x_l << 16, 0),
+    ];
+    let shade = coefficient_block(rgba, [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]);
+    let mut words: Vec<(u32, u32)> = base.to_vec();
+    for pair in shade.chunks_exact(2) {
+        words.push((pair[0], pair[1]));
+    }
+    words
+}
+
+/// Shade RGBA8888 = (0x20, 0xc0, 0xe0, 0xff), the same base color
+/// [`one_flat_triangle_pair`] uses via `SET_COMBINE_PRIMITIVE`, packed here
+/// as Q16.16 integers for the shade coefficient block. With every
+/// derivative zero the interpolated color is this constant everywhere, and
+/// with dither off the quantization arithmetic is identical to the
+/// primitive case: RGB5=(4,24,28) with the coverage bit set gives the same
+/// [`FLAT_TRIANGLE_COLOR`] (`0x2639`).
+const SHADE_TRIANGLE_RGBA: [i32; 4] = [0x20 << 16, 0xc0 << 16, 0xe0 << 16, 0xff << 16];
+
+fn one_shade_triangle_pair() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_NO_AA,
+        SET_COMBINE_SHADE,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(shade_triangle_words(
+        TRI_LEFT,
+        TRI_RIGHT,
+        TRI_TOP,
+        TRI_BOTTOM,
+        TRI_BOTTOM,
+        SHADE_TRIANGLE_RGBA,
+    ));
+    words.extend(shade_triangle_words(
+        TRI_RIGHT,
+        TRI_LEFT,
+        TRI_TOP,
+        TRI_BOTTOM,
+        TRI_TOP,
+        SHADE_TRIANGLE_RGBA,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+fn shade_triangle_expected(index: u32) -> u16 {
+    let x = index % WIDTH;
+    let y = index / WIDTH;
+    if x >= TRI_LEFT && x < TRI_RIGHT && y >= TRI_TOP && y < TRI_BOTTOM {
+        FLAT_TRIANGLE_COLOR
+    } else {
+        STALE
+    }
+}
+
 fn skew_textured_rect(line_words: u32, low_t: u32) -> Vec<(u32, u32)> {
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
     words.pop();
@@ -2045,6 +2148,22 @@ fn cases() -> Vec<Case> {
             authority: Authority::Rt64Authoritative,
             commands: one_flat_triangle_pair(),
             expected: flat_triangle_expected,
+        },
+        Case {
+            name: "shade-only-triangle",
+            intent: "the first opcode 0x0c triangle (`G_RDPTRI_BASE | \
+                     Shaded`), carrying an 8-word shade coefficient block and \
+                     no texture coefficients. A public G_CC_SHADE combiner \
+                     makes every covered pixel the shade colour, isolating \
+                     the shade-interpolation path from both the base \
+                     edge-walk (`flat-triangle-primitive`, opcode 0x08) and \
+                     the texture pipeline (`textured-triangle-point-sampled`, \
+                     opcode 0x0e). Every shade derivative is zero, so the \
+                     covered rectangle is one flat colour and the key stays \
+                     arithmetic rather than a per-pixel interpolation.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_shade_triangle_pair(),
+            expected: shade_triangle_expected,
         },
         Case {
             name: "perspective-textured-triangle-negative-w",
