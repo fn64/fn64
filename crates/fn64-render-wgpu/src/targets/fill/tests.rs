@@ -608,9 +608,11 @@ fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectan
 /// trap `docs/RT64-WM2000-HARNESS-TRAPS.md` names.
 ///
 /// Each expectation is derived from the wire, not the executor: the scissor
-/// is latched in quarter-pixels and its pixel bounds are `ceil(q / 4)` on
-/// every edge (`RdpScissorRect::quarter_to_pixel_ceil`, whose derivation is
-/// angrylion's `rasterizer.c:2349-2363` for X and `:2284-2305` for Y).
+/// is latched in quarter-pixels and fn64 resolves its pixel bounds as
+/// `ceil(q / 4)` on every edge
+/// (`RdpScissorRect::quarter_to_pixel_ceil`). That rounding rule is fn64's
+/// own reading and is not independently confirmed against an allowed
+/// hardware reference.
 fn fill_clipped_by(scissor: RdpScissorRect) -> (TargetRectangle, Vec<u8>) {
     // A 4x4 RGBA16 target, seeded 0x1234 everywhere -- neither the fill
     // colour nor zero, so "kept the seed", "painted the fill" and

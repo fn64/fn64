@@ -291,10 +291,11 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     // never reaches `submit_admitted_triangle` -- a loud,
                     // named panic here, not a silent None/Threshold coercion
                     // (AGENTS.md "loud traps, no silent shrugs"). There is no
-                    // reserved encoding to gate: other-mode low bits 1:0 are
-                    // two independent hardware bits and wire 2 decodes to
-                    // `None` (angrylion `src/core/n64video/rdp.c:659-660`;
-                    // `docs/RT64-GUARD-AUDIT.md` A3).
+                    // reserved encoding to gate: pinned RT64's shader
+                    // branches only for `G_AC_DITHER` and `G_AC_THRESHOLD`,
+                    // so wire 2 falls through to no compare
+                    // (`src/shaders/RasterPS.hlsl:203-213`, commit
+                    // `f0728a2`; `docs/RT64-GUARD-AUDIT.md` A3).
                     match other_mode.alpha_compare() {
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
@@ -350,12 +351,13 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
                 }
-                // Latched verbatim in wire quarter-pixels, matching
-                // `rdp_set_scissor` (angrylion `rasterizer.c:2779-2784`),
-                // which stores the four twelve-bit fields into
-                // `wstate->clip` with no rescale and no reordering. A
-                // reversed or empty rect latches too; it becomes visible
-                // at clip time, not at latch time.
+                // Latched verbatim in wire quarter-pixels. Public libultra
+                // `include/ultra64/gbi.h:4794-4837` encodes the four
+                // coordinates as twelve-bit fields scaled by four, or
+                // accepts the fractional wire values directly. Retaining a
+                // reversed or empty rect until clip time is fn64's own
+                // reading and is not independently confirmed against an
+                // allowed hardware reference.
                 RdpStateCommand::SetScissor { scissor, .. } => {
                     self.current_scissor = Some(RdpScissorRect::from_wire_quarter_pixels(
                         scissor.mode,
@@ -717,12 +719,6 @@ mod tests {
         );
     }
 
-    /// Retargeted from `a_reserved_alpha_compare_triangle_panics_loudly_at_
-    /// retrieval_time`. Other-mode low bits 1:0 are two independent hardware
-    /// bits (angrylion `src/core/n64video/rdp.c:659-660`); wire 2 clears
-    /// `alpha_compare_en`, so `rdp/blender.c`'s `alpha_compare` returns 1 and
-    /// the triangle is ordinary no-compare content, not a refusal.
-    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     /// **A raw triangle binds ITS OWN tile, not tile 0.**
     ///
     /// A triangle names its tile in wire word 0 bits 18:16 -- the field
@@ -814,6 +810,12 @@ mod tests {
         );
     }
 
+    /// Retargeted from `a_reserved_alpha_compare_triangle_panics_loudly_at_
+    /// retrieval_time`. Pinned RT64's shader branches only for
+    /// `G_AC_DITHER` and `G_AC_THRESHOLD`, so wire 2 falls through and the
+    /// triangle is ordinary no-compare content, not a refusal
+    /// (`src/shaders/RasterPS.hlsl:203-213`, commit `f0728a2`).
+    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
     #[test]
     fn an_alpha_compare_wire_two_triangle_is_retrieved_as_no_compare() {
         let mut collector = TriangleDrawStateCollector::default();
