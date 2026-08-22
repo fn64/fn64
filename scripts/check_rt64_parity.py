@@ -13,9 +13,9 @@ p = d["parity"]
 auth = p["rt64_authoritative"]
 cov = p["rt64_not_authoritative_coverage"]
 
-exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "2"))
+exp_differs = int(os.environ.get("EXPECTED_DIFFERS", "3"))
 exp_refused = int(os.environ.get("EXPECTED_ONE_REFUSED", "1"))
-min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "29"))
+min_cases = int(os.environ.get("MIN_AUTHORITATIVE_CASES", "32"))
 
 # Known, measured divergences. Each is explained in the runner's `intent`.
 KNOWN_DIVERGENCES = {
@@ -40,6 +40,20 @@ KNOWN_DIVERGENCES = {
     # entry. Changing its expected pixels to match would leave a green
     # fixture that pins nothing.
     "perspective-textured-triangle-negative-w",
+    # OPEN DEFECTS, newly found by extending the corpus past RGBA16/CI4.
+    # Recorded so the rest of the corpus stays enforceable while these are
+    # investigated -- NOT accepted as correct behaviour. Delete each entry
+    # when its defect is fixed and the gate will demand byte-identity.
+    #
+    # RGBA32: wgpu and RT64 produce different pixels. RGBA/32b was one of the
+    # nine format x size combinations the corpus never exercised, which is
+    # exactly why a green gate coexisted with visibly wrong output.
+    "textured-rect-rgba32",
+    # YUV16: wgpu REFUSES where RT64 renders. YUV is the one format family
+    # fn64 has never implemented; the refusal is loud rather than silent,
+    # which is correct behaviour for an unimplemented feature, but it is a
+    # capability gap a ROM using YUV would hit.
+    "textured-rect-yuv16",
 }
 
 failures = []
