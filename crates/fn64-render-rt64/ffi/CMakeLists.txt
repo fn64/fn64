@@ -21,6 +21,16 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 
+option(FN64_RT64_COVERAGE "Instrument the RT64 parity oracle with Clang source coverage" OFF)
+if(FN64_RT64_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang)$")
+        message(FATAL_ERROR "FN64_RT64_COVERAGE requires Clang or AppleClang")
+    endif()
+    target_compile_options(rt64 PRIVATE
+        -fprofile-instr-generate
+        -fcoverage-mapping)
+endif()
+
 # The pinned S2DEX implementation loads the public uObjTxtr prefix for
 # G_OBJ_LDTX_RECT and then unconditionally asserts instead of drawing the
 # documented uObjSprite tail. Stage one deliberately bounded implementation:
@@ -1376,6 +1386,11 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
 endif()
 
 add_library(fn64_rt64_shim STATIC fn64_rt64_shim.cpp)
+if(FN64_RT64_COVERAGE)
+    target_compile_options(fn64_rt64_shim PRIVATE
+        -fprofile-instr-generate
+        -fcoverage-mapping)
+endif()
 target_compile_definitions(fn64_rt64_shim PRIVATE
     HLSL_CPU
     FFX_GCC
