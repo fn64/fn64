@@ -786,7 +786,7 @@ mod tests {
         // `low_t: 4` (S10.2, so `.integer()` is 1) and assert that its single
         // word exchanged, which asserted the writer's removed
         // `low_t.integer()` term rather than anything hardware does --
-        // angrylion takes `dswap = sst & 1` on a row made tile-relative by
+        // the reference takes its write parity on a row made tile-relative by
         // `TRELATIVE`, so the first row's parity is 0 (`tex.c:583`,
         // `tcoord.c:998-999`).
         //
@@ -876,7 +876,7 @@ mod tests {
             // because the writer folded in `low_t.integer()`, which is 1 for
             // this fixture's `low_t = 4` (S10.2). That term is not on
             // hardware; see `tmem/read.rs::odd_row_exchange` for the
-            // angrylion citation.
+            // RT64 citation.
             vec![
                 (0, 0xff, 0, false),
                 (8, 0xff, 1, false),

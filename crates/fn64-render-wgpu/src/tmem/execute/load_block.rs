@@ -848,7 +848,7 @@ mod tests {
     /// advances exactly one row per word and word 1 is row 1. This fixture
     /// used to set `source_t: 1` and assert that word 0 -- row ZERO --
     /// exchanged, which asserted fn64's own removed `source_t` term rather
-    /// than anything hardware does. angrylion's write parity is `dswap =
+    /// than anything hardware does. The reference write parity is `dswap =
     /// sst & 1` on a row made tile-relative by `TRELATIVE` (`tex.c:583`,
     /// `tcoord.c:998-999`), and a load's first row is always zero; see
     /// `tmem/read.rs::odd_row_exchange`.
@@ -1415,7 +1415,7 @@ mod tests {
     /// address the exchange lands on, but that the WRITER and the READER
     /// compute the same exchange bit for the same row.
     ///
-    /// angrylion guarantees this structurally for LoadBlock. `rdp_load_block`
+    /// The reference lane guarantees this structurally for LoadBlock. Its loader
     /// (`src/core/n64video/rdp/tex.c:907-937`) ASSIGNS the command's TL into
     /// the tile: `wstate->tile[tilenum].tl = tl`. The write side then makes
     /// its row tile-relative through `tc_pipeline_load`'s
@@ -1470,7 +1470,7 @@ mod tests {
         // The reader's rule, applied to the same word. `row_advance` is the
         // tile-relative row this word lands on, and that row's parity is the
         // whole rule -- see `tmem/read.rs::odd_row_exchange` for the
-        // angrylion citation that there is no T-origin term on either side.
+        // RT64 citation that there is no T-origin term on either side.
         let row = words[0].0.row_advance();
         let reader_exchange = row & 1 != 0;
 

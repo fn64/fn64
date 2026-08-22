@@ -546,7 +546,7 @@ pub(crate) fn project_tmem_transfer_word(
             };
             // **The exchange bit is the TILE-RELATIVE row, with no T-origin
             // term.** See `odd_row_exchange`'s doc in `tmem/read.rs` for the
-            // full angrylion derivation; the short form is that
+            // full derivation; the short form is that
             // `rdp_load_block` seeds the edgewalker's span T with `tl << 3`
             // (`src/core/n64video/rdp/tex.c:929`) and `tc_pipeline_load`
             // immediately subtracts that same `tl << 3` back off via
