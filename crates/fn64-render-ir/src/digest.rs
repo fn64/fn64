@@ -1,6 +1,33 @@
 use core::fmt;
 
 use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::Xxh3;
+
+/// One fast 128-bit content identity for runtime-only comparisons.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FastContentDigest(u128);
+
+impl FastContentDigest {
+    pub fn hash(domain: &[u8], fields: &[&[u8]]) -> Self {
+        let mut hash = Xxh3::new();
+        hash.update(domain);
+        for field in fields {
+            hash.update(&(field.len() as u64).to_be_bytes());
+            hash.update(field);
+        }
+        Self(hash.digest128())
+    }
+
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0.to_be_bytes()
+    }
+}
+
+impl fmt::Debug for FastContentDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "xxh3-128:{:032x}", self.0)
+    }
+}
 
 /// One SHA-256 content digest at a semantic boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

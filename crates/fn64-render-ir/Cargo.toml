@@ -8,3 +8,4 @@ description = "GPU-independent renderer semantics, immutable workloads, and type
 
 [dependencies]
 sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
