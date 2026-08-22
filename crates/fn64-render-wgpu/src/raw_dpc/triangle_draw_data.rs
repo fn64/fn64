@@ -750,10 +750,16 @@ mod tests {
             line_words: 1,
             tmem_word_address,
             palette: 0,
-            s_mode: fn64_render::NeutralTileAddressMode { mirror: false, clamp: true },
+            s_mode: fn64_render::NeutralTileAddressMode {
+                mirror: false,
+                clamp: true,
+            },
             mask_s: 0,
             shift_s: 0,
-            t_mode: fn64_render::NeutralTileAddressMode { mirror: false, clamp: true },
+            t_mode: fn64_render::NeutralTileAddressMode {
+                mirror: false,
+                clamp: true,
+            },
             mask_t: 0,
             shift_t: 0,
         };
@@ -796,7 +802,14 @@ mod tests {
         words[0] = 0x0800_0000 | (5 << 16);
         triangle.raw_words = words.into_boxed_slice();
 
-        for command in [&other_mode, &combine, &tile0, &tile0_size, &tile5, &tile5_size] {
+        for command in [
+            &other_mode,
+            &combine,
+            &tile0,
+            &tile0_size,
+            &tile5,
+            &tile5_size,
+        ] {
             collector.command(RawDpcSemanticCommandRef::State(command));
         }
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
@@ -804,8 +817,7 @@ mod tests {
         let draws = collector.finish().expect("the triangle is admitted");
         let draw = draws.into_iter().next().expect("one triangle was staged");
         assert_eq!(
-            draw.tile_binding.tmem_word_address,
-            256,
+            draw.tile_binding.tmem_word_address, 256,
             "a triangle naming tile 5 must bind tile 5's descriptor, not tile 0's"
         );
     }

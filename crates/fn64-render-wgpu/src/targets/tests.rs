@@ -241,7 +241,9 @@ fn a_partial_new_target_completion_is_admitted_and_names_what_it_covered() {
     let rectangle = TargetRectangle::try_new(0, 1, 4, 1).unwrap();
     let partial = candidate.plan_rows(rectangle).unwrap();
     let completion = completed(&candidate, partial, &[Rgba8::new(255, 0, 0, 255); 8]);
-    let initialized = candidate.admit_completed_initialization(completion).unwrap();
+    let initialized = candidate
+        .admit_completed_initialization(completion)
+        .unwrap();
     assert_eq!(
         initialized.initialized_region().covered(),
         rectangle,

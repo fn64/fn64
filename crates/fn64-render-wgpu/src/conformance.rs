@@ -127,10 +127,9 @@ impl core::fmt::Display for ConformanceRefusal {
                 write!(out, "commit_guest_render_target_writes refused: {message}")
             }
             Self::Seal(message) => write!(out, "seal_publication refused: {message}"),
-            Self::NoResident { address } => write!(
-                out,
-                "no color-target resident published at {address:#010x}"
-            ),
+            Self::NoResident { address } => {
+                write!(out, "no color-target resident published at {address:#010x}")
+            }
             Self::GuestReadOutOfBounds { start, end } => write!(
                 out,
                 "a declared guest read [{start:#x}, {end:#x}) lies outside the replay's RDRAM"
