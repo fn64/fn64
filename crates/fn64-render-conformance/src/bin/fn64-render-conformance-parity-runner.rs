@@ -218,6 +218,74 @@ const OTHER_MODES_FILL_NO_AA: (u32, u32) = (0xef30_00f0, 0);
 /// `filter_three_nearest_committed_cell`).
 const OTHER_MODES_ONE_CYCLE_TEXTURED: (u32, u32) = (0xef00_00f0, 0);
 
+/// `SetOtherModes` for a ONE-CYCLE fill: byte-identical to
+/// [`OTHER_MODES_FILL_NO_AA`] except the cycle-type field.
+///
+/// The two words differ only in w0 bits 21:20 (`G_MDSFT_CYCLETYPE`), which
+/// carry `G_CYC_FILL = 3` in the fill constant and `G_CYC_1CYCLE = 0` here.
+/// Every other property -- no AA, no dither, no coverage read -- is
+/// unchanged, so this case stays in the RT64-authoritative partition for
+/// exactly the reasons [`OTHER_MODES_FILL_NO_AA`] documents.
+const OTHER_MODES_ONE_CYCLE_NO_AA: (u32, u32) = (0xef00_00f0, 0);
+
+/// The colour the one-cycle band is asked to paint, and the seed it must
+/// replace. Deliberately not `STALE`, so "the band did nothing" and "the
+/// band worked" are different pictures.
+const BAND_FILL_COLOR: u16 = 0xf801;
+
+/// The band's own rows, chosen inside the target and away from every edge so
+/// a clipping defect cannot be mistaken for a dropped command.
+const BAND_TOP: u32 = 64;
+const BAND_BOTTOM: u32 = 127;
+
+/// A **one-cycle** `G_FILLRECT` band over a `STALE`-seeded target.
+///
+/// **What this case is for.** WM2000 clears its framebuffer with roughly
+/// sixty full-width `G_FILLRECT` bands per frame issued in ONE-CYCLE mode,
+/// not fill cycle. fn64's fill executor is reached only for
+/// `CycleType::Fill`, so those bands stage no framebuffer write at all: ABI
+/// dispatch then takes `commit_zero_guest_writes`, whose RDRAM copyback is
+/// guarded by `if !commit_writes.is_empty()`, and VI scans out the
+/// untouched framebuffer. The visible result on the AKI, THQ, JAKKS and
+/// Asmik logo screens is stale content surviving wherever a later primitive
+/// does not happen to overwrite it.
+///
+/// RT64 does not treat cycle type as a gate on whether to draw:
+/// `RDP::fillRect` calls `drawRect` unconditionally and the cycle check only
+/// ORs `lrx |= 3` for COPY/FILL (`rt64_rdp.cpp:1043`), so the rectangle
+/// enters the ordinary draw pipeline as two triangles with zero vertex
+/// colour (`rectColorFloats`, `rt64_rdp.cpp:1253`).
+///
+/// **The key is deliberately NOT asserted here.** What RT64's zero-shade
+/// rectangle resolves to under this combiner is exactly the open question,
+/// so this case is authored to expose the DIFFERENCE between the two
+/// backends rather than to encode a predicted answer. The `expected`
+/// function below states the seed, which is what a backend that drops the
+/// command produces -- so wgpu matching the key while RT64 differs is
+/// itself the finding.
+fn one_cycle_fill_band() -> Vec<(u32, u32)> {
+    // The Fill-cycle seed. This half is already proven: `full-target-red`
+    // and the textured cases all rely on it.
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    // Drop the seed's own FullSync; one closes the whole packet.
+    words.pop();
+    words.extend([
+        // The ONLY difference from a working fill: the cycle type.
+        OTHER_MODES_ONE_CYCLE_NO_AA,
+        (0xf700_0000, (BAND_FILL_COLOR as u32) * 0x1_0001),
+        fill_rect(WIDTH - 1, BAND_BOTTOM, 0, BAND_TOP),
+        (0xe900_0000, 0),
+    ]);
+    words
+}
+
+/// The seed everywhere: what a backend that DROPS the one-cycle band
+/// produces. A backend that honours the band paints [`BAND_FILL_COLOR`]
+/// across rows [`BAND_TOP`]..=[`BAND_BOTTOM`] and differs here.
+fn one_cycle_fill_band_expected(_index: u32) -> u16 {
+    STALE
+}
+
 fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
     vec![
         OTHER_MODES_FILL_NO_AA,
@@ -1300,6 +1368,23 @@ fn cases() -> Vec<Case> {
             authority: Authority::Rt64Authoritative,
             commands: skew_textured_rect(SKEW_LINE_WORDS - 1, SKEW_LOW_T_ODD),
             expected: skew_expected,
+        },
+        Case {
+            name: "one-cycle-fill-band",
+            intent: "a G_FILLRECT band issued in ONE-CYCLE mode over a \
+                     STALE-seeded target. WM2000 clears its framebuffer with \
+                     ~60 such bands per frame; fn64's fill executor is reached \
+                     only for CycleType::Fill, so they stage no write and the \
+                     stale framebuffer survives to VI -- the measured cause of \
+                     the foreign content on the AKI/THQ/JAKKS/Asmik logo \
+                     screens. RT64 calls drawRect unconditionally \
+                     (rt64_rdp.cpp:1043), so it draws where fn64 does nothing. \
+                     The key states the SEED, i.e. what dropping the command \
+                     produces, so a wgpu-matches-key/RT64-differs verdict is \
+                     the finding rather than a predicted RT64 answer.",
+            authority: Authority::Rt64Authoritative,
+            commands: one_cycle_fill_band(),
+            expected: one_cycle_fill_band_expected,
         },
         // ------------------------------------------------------------------
         // The partition boundary. Everything below exercises a stage RT64
