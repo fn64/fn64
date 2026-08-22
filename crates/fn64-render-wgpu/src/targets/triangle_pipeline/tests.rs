@@ -693,11 +693,12 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
     assert_eq!(&max_threshold[4..8], &255u32.to_le_bytes());
 }
 
-/// Retargeted from `..._rejects_reserved_mode_defensively`. Other-mode low
-/// bits 1:0 are two independent hardware bits (angrylion
-/// `src/core/n64video/rdp.c:659-660`), so wire encoding 2 decodes to `None`
-/// and reaches the pipeline as an admitted mode carrying wire 0 -- there is
-/// no reserved mode to reject. See `docs/RT64-GUARD-AUDIT.md` finding A3.
+/// Retargeted from `..._rejects_reserved_mode_defensively`. Pinned RT64's
+/// shader branches only for `G_AC_DITHER` and `G_AC_THRESHOLD`, so wire
+/// encoding 2 falls through to no compare
+/// (`src/shaders/RasterPS.hlsl:203-213`, commit `f0728a2`) and reaches the
+/// pipeline as an admitted mode carrying wire 0. See
+/// `docs/RT64-GUARD-AUDIT.md` finding A3.
 #[test]
 fn alpha_compare_wire_two_reaches_the_pipeline_as_no_compare() {
     let decoded = crate::state::OtherMode::from_wire(0, 2).alpha_compare();
@@ -2472,9 +2473,11 @@ mod host_gpu_tests {
         /// - `tmem/execute/load_tile.rs`'s `map_physical_lanes` writes lane
         ///   `source_lane ^ (4 * odd_row_exchange)` with
         ///   `odd_row_exchange = row & 1` -- the tile-relative row's parity
-        ///   alone, with no T-origin term. See
-        ///   `tmem/read.rs::odd_row_exchange` for the angrylion citation;
-        ///   this line used to read `(low_t.integer() + row) & 1`, mirroring
+        ///   alone, with no T-origin term. Pinned RT64 derives `oddRow` from
+        ///   `texelInt.y & 1` and exchanges adjacent four-byte words
+        ///   (`src/shaders/TextureDecoder.hlsli:17-25,149-150`, commit
+        ///   `f0728a2`); see `tmem/read.rs::odd_row_exchange` too.
+        ///   This line used to read `(low_t.integer() + row) & 1`, mirroring
         ///   a writer term that has since been removed.
         pub fn bytes() -> std::collections::BTreeMap<u16, u8> {
             let mut bytes = std::collections::BTreeMap::new();
