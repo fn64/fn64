@@ -228,15 +228,12 @@ pub fn resolve_fill_pixel_rectangle(
 ///
 /// ## The scissor clips; it does not reject and it is not ignored
 ///
-/// angrylion applies the `clip` rect latched by `rdp_set_scissor`
-/// (`rasterizer.c:2779-2784`) inside the edgewalker, which every primitive
-/// the rasterizer walks shares -- there is no fill-specific bypass. The X
-/// clamp at `:2349-2363` drives a span endpoint out to `clipxhshift` on the
-/// low side and `clipxlshift` on the high side rather than discarding the
-/// span, and the Y limits at `:2284-2305` (`yllimit = yllimit ? yl :
-/// wstate->clip.yl;`) bound the walked scanline range the same way. So a
-/// fill whose rectangle overhangs the scissor paints the intersection and
-/// leaves the remainder holding whatever the framebuffer already held.
+/// Pinned RT64 computes `scissorRect.intersection(drawRect)` and retains the
+/// result when it is non-empty (`src/hle/rt64_rdp.cpp:1214-1223`, commit
+/// `f0728a2`). Thus fn64 clips an overhanging fill to the intersection and
+/// leaves the remainder holding whatever the framebuffer already held. This
+/// is evidence for RT64's implementation, not an independently confirmed
+/// hardware rule.
 ///
 /// fn64's own reference renderer computes the identical intersection at
 /// `fn64-render-reference/src/raster/draw.rs:191-208`, clamping with
