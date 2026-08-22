@@ -21,6 +21,57 @@ The pump census's own `over_budget` column is taken against 16.667 ms and is
 therefore a FIELD statistic, not a drawn-frame one -- do not read it as "35% of
 frames are late".
 
+## 2026-08-22 pacing diagnosis: sub-field DP completion was rounded to a field
+
+This supersedes the hypothesis that the renderer's submissions merely needed
+to be spread more evenly across pumps. The live path had two distinct facts:
+
+1. **Measured number:** after the diagnostic GPU draw was removed, the slow
+   pump mean was 28.58/28.63 ms; later exact raster changes reduced it to
+   26.32/26.49 ms with p95 31.8/32.1 ms. The contemporaneous rigid sequence
+   was 3.5 ms, 4.4 ms plus swap, and one graphics pump; before the later raster
+   reductions those three costs totalled about 41 ms per swap. A reported 28
+   rendered frames/s is 35.71 ms per rendered frame, only 7.1% over the
+   33.333 ms budget -- not 26-34%.
+
+   **Inference:** throughput was close to the budget and could own a small
+   residual miss, but it did not explain why a nominal two-field frame needed
+   a third retrace pump.
+
+2. **Source fact:** fn64's raw FullSync policy schedules DP completion exactly
+   one cycle after renderer publication
+   (`crates/fn64-abi/src/pi/mmio.rs`, `start_live_dp_full_sync`). The ABI's
+   `next_device_deadline` documentation already states that a pump advancing
+   only in field-sized steps delivers such mid-slice completions a full field
+   late. The headless `GuestDrain` already services the exact device deadline
+   before the next VI edge; the live shell did not. Pinned RT64 likewise
+   advances and enqueues the current workload at FullSync before its independent
+   workload thread consumes it (`rt64_state.cpp:1750-1755`,
+   `rt64_workload_queue.cpp:881-907`, pin f0728a2).
+
+   **Inference:** the dominant defect was scheduling, not submission
+   distribution. Renderer work completed synchronously, then the scheduler
+   waited until the next 16.667 ms host pump to observe a one-cycle DP event.
+   The fix services exact non-VI device deadlines while the current retrace
+   pump is quiescent, resumes the guest work they wake, and stops at the next
+   armed VI edge. It also advances later pumps to the fabric's exact VI
+   deadline so sub-field advances cannot drift the VI cadence.
+
+The blocking hypothesis is also rejected for this wgpu route. Its production
+raw-DPC coordinator is explicitly synchronous and CPU-side; the direct timing
+split after the GPU-draw gate measured 5.29 s in `execute_raw_dpc_inner`, of
+which 3.88 s was ordinary CPU rasterization. The later 9.72 s slow-pump
+breakdown found rasterization at 2.72 s (28.0%), the TMEM loop at 0.80 s
+(8.2%), and no named candidate above 28%; that is accumulated CPU work, not one
+fence, mutex, or FullSync wait.
+
+The deterministic characterization is
+`timing::tests::a_quiescent_pump_services_full_sync_before_the_next_vi_edge`:
+a one-cycle device deadline must remain in the current pump, while a deadline
+equal to the next VI edge must remain for the next pump. This is an ordering
+rule derived from the existing device schedule, not an assertion of WM2000's
+current submission counts.
+
 ## CONFIRMED: the ranked breakdown, per drawn frame
 
 Per graphics task (= per drawn frame), 600-pump window, 212 graphics tasks:
