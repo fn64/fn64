@@ -50,8 +50,10 @@
 //! state itself). `Dither` remains a loud, named, unimplemented trap
 //! (no fragment-callable RT64 PRNG binding and no frame-count concept in
 //! this pipeline). There is no `Reserved` mode: wire encoding 2 clears
-//! `alpha_compare_en` and is decoded as `None` (angrylion
-//! `src/core/n64video/rdp.c:659-660`; `docs/RT64-GUARD-AUDIT.md` A3).
+//! `alpha_compare_en` and is decoded as `None` (pinned RT64
+//! `shaders/RasterPS.hlsl:203-213` compares only `G_AC_DITHER` and
+//! `G_AC_THRESHOLD`, so encoding 2 falls through to no compare;
+//! `docs/RT64-GUARD-AUDIT.md` A3).
 
 use crate::state::{
     AlphaCompare as AlphaCompareMode, AlphaDither as AlphaDitherMode, RgbDither as RgbDitherMode,
@@ -103,9 +105,9 @@ impl CopyCycleSourceFormat {
 ///   §15.5.4's "alpha greater than a random value in [0,1)".
 ///
 /// There is no fourth mode: other-mode low bits 1:0 are two independent
-/// hardware bits, and wire encoding 2 decodes to `None` (angrylion
-/// `src/core/n64video/rdp.c:659-660`, `rdp/blender.c`'s `alpha_compare`
-/// early return; see `docs/RT64-GUARD-AUDIT.md` finding A3).
+/// hardware bits, and wire encoding 2 decodes to `None` (pinned RT64
+/// `shaders/RasterPS.hlsl:203-213` branches only on `G_AC_DITHER` and
+/// `G_AC_THRESHOLD`; see `docs/RT64-GUARD-AUDIT.md` finding A3).
 pub const fn alpha_compare_value(
     mode: AlphaCompareMode,
     alpha: u8,
@@ -127,8 +129,9 @@ pub const fn alpha_compare_value(
 /// threshold/dither arithmetic in [`alpha_compare_value`].
 ///
 /// Hardware likewise gates this whole block on `alpha_compare_en` (bit 0)
-/// alone -- angrylion's separate copy-mode inline compare at
-/// `rdp/rasterizer.c:1971` -- so wire encoding 2 is "no compare" here too.
+/// alone, so wire encoding 2 is "no compare" here too. Copy cycle keeps its
+/// own compare path rather than sharing the fragment one; that split is
+/// fn64's own structure and is exercised by this module's tests.
 pub const fn copy_alpha_compare_value(
     mode: AlphaCompareMode,
     source: CopyCycleSourceFormat,
@@ -415,8 +418,8 @@ mod tests {
     /// Retargeted from the three `reserved_*_panics_loudly` /
     /// `require_supported_alpha_compare_*` tests, which pinned wire encoding 2
     /// as a refusal. There is no reserved encoding: other-mode low bits 1:0
-    /// are two independent hardware bits (angrylion
-    /// `src/core/n64video/rdp.c:659-660`) and `rdp/blender.c`'s
+    /// are two independent hardware bits (pinned RT64
+    /// `shaders/RasterPS.hlsl:203-213`) and `rdp/blender.c`'s
     /// `alpha_compare` returns 1 whenever bit 0 (`alpha_compare_en`) is clear,
     /// so wire 2 decodes to `None` and always passes. The copy path gates on
     /// the same bit alone (`rdp/rasterizer.c:1971`).
@@ -972,7 +975,7 @@ mod tests {
     /// Wire encoding for a decoded mode. `None` has two wire spellings --
     /// 0 (`alpha_compare_en` and `dither_alpha_en` both clear) and 2
     /// (`dither_alpha_en` set but `alpha_compare_en` clear, so still no
-    /// compare; angrylion `src/core/n64video/rdp.c:659-660`). This helper
+    /// compare; pinned RT64 `shaders/RasterPS.hlsl:203-213`). This helper
     /// returns the canonical 0; `WIRE_MODE_DITHER_BIT_WITHOUT_ENABLE` below
     /// names the other one for the fixtures that exercise it.
     const fn wire_mode(mode: AlphaCompareMode) -> u32 {
@@ -1033,7 +1036,7 @@ mod tests {
                 expected: true,
             },
             // Wire encoding 2 -- `dither_alpha_en` set, `alpha_compare_en`
-            // clear (angrylion `src/core/n64video/rdp.c:659-660`). Hardware
+            // clear (pinned RT64 `shaders/RasterPS.hlsl:203-213`). Hardware
             // never compares (`rdp/blender.c`'s `alpha_compare` returns 1 on
             // a clear bit 0), so this PASSES. Hand-derived, not read off the
             // code under test. Deliberately uses alpha 0 with threshold 255
@@ -1273,8 +1276,8 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
         /// at all -- only string-contains and naga-parse assertions. That
         /// gap let a mutant that re-added a `mode == 2u -> return false`
         /// rejection survive. Wire encoding 2 must PASS here for the same
-        /// reason it does in the fragment-callable twin (angrylion
-        /// `src/core/n64video/rdp.c:659-660`; `docs/RT64-GUARD-AUDIT.md` A3).
+        /// reason it does in the fragment-callable twin (pinned RT64
+        /// `shaders/RasterPS.hlsl:203-213`; `docs/RT64-GUARD-AUDIT.md` A3).
         #[test]
         fn required_host_characterization_shader_matches_cpu_oracle_across_frozen_fixtures() {
             dispatch_and_check(
@@ -1450,8 +1453,8 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
                 // checked in the same assertion pass, not just WGSL-vs-
                 // hand-derived.
                 // Decoded via the real wire decoder, so wire 2 exercises
-                // the `alpha_compare_en`-clear path (angrylion
-                // `src/core/n64video/rdp.c:659-660`) rather than a
+                // the `alpha_compare_en`-clear path (pinned RT64
+                // `shaders/RasterPS.hlsl:203-213`) rather than a
                 // test-local table.
                 let mode = crate::state::OtherMode::from_wire(0, fixture.mode).alpha_compare();
                 let alpha = fixture.alpha as u8;
