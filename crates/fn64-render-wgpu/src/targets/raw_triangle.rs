@@ -519,12 +519,9 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     if census_pixels {
                         coordinate_range = Some(match coordinate_range {
                             None => (s, s, t, t),
-                            Some((s_low, s_high, t_low, t_high)) => (
-                                s_low.min(s),
-                                s_high.max(s),
-                                t_low.min(t),
-                                t_high.max(t),
-                            ),
+                            Some((s_low, s_high, t_low, t_high)) => {
+                                (s_low.min(s), s_high.max(s), t_low.min(t), t_high.max(t))
+                            }
                         });
                     }
                     let request = PointSampleRequest::new(
