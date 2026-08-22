@@ -2373,19 +2373,19 @@ impl TexrectFragmentStages {
     /// determined without them. Asserted over all eight possible memory
     /// counts in `wraps_is_determined_for_a_full_coverage_fragment`.
     ///
-    /// What is *not* determined is the `destination` count itself, which
-    /// `Wrap` computes as `sum - 8 = memory` and `Clamp` as `min(sum, 8)`.
-    /// That value is discarded here: this executor writes no coverage count
-    /// (RGBA16's single stored bit is written by [`write_pixel`] from
-    /// alpha, and there is no sidecar to write the other two to), so a
-    /// `destination` derived from unknown bits cannot reach an observable.
-    /// `Save` is the one mode that would make it observable by passing
-    /// `memory` straight through, and it is refused by name -- as is any
-    /// fragment whose pixel coverage is not full, which is unreachable for
-    /// a texrect but is checked rather than assumed.
+    /// The complete destination count remains unknown. For a full fragment,
+    /// Wrap's visible stored bit is exact for either endpoint supplied by the
+    /// RGBA16 decoder, while Clamp and Full store full coverage. Save is
+    /// different: it preserves the genuine three-bit memory coverage, so an
+    /// image-read Save cannot consume the endpoint substituted for RGBA16's
+    /// two unavailable hidden bits and is refused by name. A partial fragment
+    /// with image read could likewise make those bits affect wrap and is
+    /// refused; texrects normally cannot produce one unless CVG_X_ALPHA
+    /// reduces their full primitive coverage.
     fn coverage_for(
         self,
         pixel_coverage: Coverage,
+        memory_coverage: Coverage,
     ) -> Result<crate::coverage::CoverageResult, TexrectExecutionError> {
         if self.coverage_mode.image_read_enabled {
             if matches!(
@@ -2402,15 +2402,9 @@ impl TexrectFragmentStages {
                 });
             }
         }
-        // The stored destination count is unknown in its low two bits but
-        // is provably in `1..=8`; `Coverage::FULL` is a member of that set
-        // and, by the derivation above, every observable this function
-        // produces is identical for all eight members. Not a substituted
-        // value: a witness for a quantity proven not to matter here, and
-        // the proof is a test rather than a comment.
         Ok(coverage_result(
             pixel_coverage,
-            Coverage::FULL,
+            memory_coverage,
             self.coverage_mode,
         ))
     }
@@ -2649,12 +2643,11 @@ pub(super) fn blend_and_write_pixel(
     // whole pixels, so no edge produces a partial mask. This executor
     // rasterizes no edges and computes no subpixel mask, which is why that
     // is a fact about the primitive rather than an assumption.
-    let coverage = stages.coverage_for(Coverage::FULL)?;
     let (combined, pixel_coverage) = apply_coverage_alpha(
         stages.coverage_times_alpha,
         stages.alpha_coverage_select,
         combined,
-        coverage.pixel,
+        Coverage::FULL,
     );
 
     // Zero coverage writes nothing, and `CLR_ON_CVG` without a wrap writes
@@ -2663,6 +2656,23 @@ pub(super) fn blend_and_write_pixel(
     if pixel_coverage.count() == 0 {
         return Ok(());
     }
+    let memory_coverage = match format {
+        // RGBA16 exposes only stored coverage bit 2. The missing low bits
+        // cannot affect the admitted full-fragment Clamp or Wrap result. Use
+        // an endpoint with the same visible bit; image-read Save and partial
+        // fragments with IM_RD are refused below.
+        ColorTargetFormat::Rgba16 => {
+            if dest[1] & 1 == 0 {
+                Coverage::new(1)
+            } else {
+                Coverage::FULL
+            }
+        }
+        // RGBA32 keeps the complete three-bit stored coverage value in the
+        // high bits of byte three.
+        ColorTargetFormat::Rgba32 => Coverage::from_stored(dest[3] >> 5),
+    };
+    let coverage = stages.coverage_for(pixel_coverage, memory_coverage)?;
     if !alpha_compare_texrect_fragment(stages, combined[3])? {
         return Ok(());
     }
@@ -2701,7 +2711,7 @@ pub(super) fn blend_and_write_pixel(
     // above -- it is a real input to a stage that IS ported, not a
     // placeholder for this one.
     let _ = stages.rgb_dither;
-    write_pixel(format, dest, blended);
+    write_pixel(format, dest, blended, coverage.destination);
     Ok(())
 }
 
@@ -2741,20 +2751,24 @@ fn alpha_compare_texrect_fragment(
 
 /// Packs one decoded RGBA8888 texel into the target's own pixel format.
 ///
-/// Mirrors `targets::fill`'s private `write_pixel` exactly -- deliberately
-/// the identical truncation (`>> 3` per color channel, `>> 7` for alpha into
-/// RGBA16's single coverage bit), so a texel and a fill color written to the
-/// same target agree on what a pixel value means. A second, different
-/// packing would make the composed image's two halves disagree about the
-/// format they share.
-fn write_pixel(format: ColorTargetFormat, dest: &mut [u8], rgba: [u8; 4]) {
+/// Programming Manual §§15.5.3, 15.5.6, and 15.7 define RGBA16 bit 0 as
+/// stored coverage bit 2, not primitive alpha. `coverage` is the post-
+/// `CVG_DST_CLAMP/WRAP/FULL/SAVE` destination count; `Coverage::stored()`
+/// converts it to the documented three-bit `count - 1` representation.
+/// RT64 independently uses the same encoding in `Float4ToRGBA16`.
+fn write_pixel(
+    format: ColorTargetFormat,
+    dest: &mut [u8],
+    rgba: [u8; 4],
+    coverage: Coverage,
+) {
     let [red, green, blue, alpha] = rgba;
     match format {
         ColorTargetFormat::Rgba16 => {
             let packed = (u16::from(red >> 3) << 11)
                 | (u16::from(green >> 3) << 6)
                 | (u16::from(blue >> 3) << 1)
-                | u16::from(alpha >> 7);
+                | u16::from((coverage.stored() >> 2) & 1);
             dest.copy_from_slice(&packed.to_be_bytes());
         }
         ColorTargetFormat::Rgba32 => {
@@ -4540,22 +4554,19 @@ mod blend_stage_tests {
         assert_eq!(derived_alpha, 255);
         assert_eq!(blended[3], derived_alpha);
 
-        // And the packed RGBA16 halfword the executor writes, derived from
-        // `write_pixel`'s own `>> 3` / `>> 7` packing rather than quoted.
+        // Full destination coverage supplies RGBA16 bit 0 independently of
+        // the blender's alpha result.
         let mut packed = [0u8; 2];
-        write_pixel(ColorTargetFormat::Rgba16, &mut packed, blended);
+        write_pixel(ColorTargetFormat::Rgba16, &mut packed, blended, Coverage::FULL);
         let five = 223u16 >> 3;
-        let expected = (five << 11) | (five << 6) | (five << 1) | u16::from(blended[3] >> 7);
+        let expected = (five << 11) | (five << 6) | (five << 1) | 1;
         assert_eq!(u16::from_be_bytes(packed), expected);
         assert_eq!(
             expected, 0xdef7,
             "27 in all three channels, coverage bit set"
         );
-        // The alpha correction above does not move this pixel: 223 and 255
-        // both set `>> 7`, so the packed halfword is the same either way.
-        // Stated because it is the reason the wrong expectation could have
-        // survived a whole-image comparison unnoticed.
-        assert_eq!(223u8 >> 7, blended[3] >> 7);
+        // Changing blended alpha cannot move bit 0; only destination coverage
+        // can do that.
     }
 
     /// The unblended value the executor produced before this stage existed,
@@ -4574,7 +4585,12 @@ mod blend_stage_tests {
     fn skipping_the_blender_would_produce_a_different_pixel() {
         const COMBINED: [u8; 4] = [255, 255, 255, 223];
         let mut unblended = [0u8; 2];
-        write_pixel(ColorTargetFormat::Rgba16, &mut unblended, COMBINED);
+        write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut unblended,
+            COMBINED,
+            Coverage::FULL,
+        );
         assert_eq!(
             u16::from_be_bytes(unblended),
             0xffff,
@@ -4819,7 +4835,17 @@ mod blend_stage_tests {
             let stored = raw.to_be_bytes();
             let sample = read_pixel(ColorTargetFormat::Rgba16, &stored);
             let mut round_tripped = [0u8; 2];
-            write_pixel(ColorTargetFormat::Rgba16, &mut round_tripped, sample.rgba);
+            let coverage = if raw & 1 == 0 {
+                Coverage::new(1)
+            } else {
+                Coverage::FULL
+            };
+            write_pixel(
+                ColorTargetFormat::Rgba16,
+                &mut round_tripped,
+                sample.rgba,
+                coverage,
+            );
             assert_eq!(
                 u16::from_be_bytes(round_tripped),
                 raw,
@@ -5359,15 +5385,16 @@ mod fragment_stage_tests {
         let stages =
             TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
                 .unwrap();
-        let result = stages.coverage_for(Coverage::FULL).unwrap();
+        let result = stages
+            .coverage_for(Coverage::FULL, Coverage::FULL)
+            .unwrap();
         assert!(result.wraps);
         assert!(result.blend_enabled);
     }
 
-    /// `cvg_dst = Save` is the one mode that makes the unknown destination
-    /// count observable, and it is refused by name. So is a
-    /// partial-coverage fragment, which a texrect cannot produce but which
-    /// is checked rather than assumed.
+    /// Image-read Save still exposes the unavailable three-bit destination
+    /// coverage. A partial fragment with image read is likewise refused
+    /// because its wrap state is ambiguous.
     #[test]
     fn the_modes_that_expose_the_missing_coverage_bits_are_refused_by_name() {
         // cvg_dst = Save is low bits 8:9 == 3.
@@ -5375,7 +5402,7 @@ mod fragment_stage_tests {
         assert_eq!(save.coverage_destination(), CoverageDestination::Save);
         let stages = TexrectFragmentStages::try_new(save, Color4::from_wire(0)).unwrap();
         assert_eq!(
-            stages.coverage_for(Coverage::FULL),
+            stages.coverage_for(Coverage::FULL, Coverage::FULL),
             Err(TexrectExecutionError::DestinationCoverageUnavailable {
                 consumer: "cvg_dst = Save"
             })
@@ -5385,7 +5412,7 @@ mod fragment_stage_tests {
             TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
                 .unwrap();
         assert_eq!(
-            stages.coverage_for(Coverage::new(4)),
+            stages.coverage_for(Coverage::new(4), Coverage::FULL),
             Err(TexrectExecutionError::DestinationCoverageUnavailable {
                 consumer: "a partial-coverage fragment's cvg_dst accumulation"
             })
@@ -5397,7 +5424,70 @@ mod fragment_stage_tests {
         let no_read = mode(WM2000_HIGH, (WM2000_LOW & !0x40 & !(0x3 << 8)) | (0x3 << 8));
         assert!(!no_read.image_read_enabled());
         let stages = TexrectFragmentStages::try_new(no_read, Color4::from_wire(0)).unwrap();
-        assert!(stages.coverage_for(Coverage::new(4)).is_ok());
+        assert!(stages.coverage_for(Coverage::new(4), Coverage::FULL).is_ok());
+    }
+
+    /// The visible RGBA16 coverage bit follows the post-accumulation coverage
+    /// destination, not fragment alpha. Programming Manual §§15.5.3, 15.5.6,
+    /// and 15.7 define the stored `count - 1` encoding; RT64's
+    /// `Float4ToRGBA16` independently extracts its bit 2.
+    #[test]
+    fn rgba16_bit_zero_follows_each_coverage_destination_mode() {
+        let cases = [
+            (CoverageDestination::Clamp, 1u16),
+            (CoverageDestination::Wrap, 0),
+            (CoverageDestination::Full, 1),
+            (CoverageDestination::Save, 1),
+        ];
+        for (destination, expected_bit) in cases {
+            let result = coverage_result(
+                Coverage::new(4),
+                Coverage::FULL,
+                CoverageModeBits {
+                    image_read_enabled: true,
+                    force_blend: true,
+                    antialias_enabled: false,
+                    coverage_destination: destination,
+                },
+            );
+            let mut packed = [0u8; 2];
+            write_pixel(
+                ColorTargetFormat::Rgba16,
+                &mut packed,
+                [0, 0, 0, 0],
+                result.destination,
+            );
+            assert_eq!(u16::from_be_bytes(packed) & 1, expected_bit);
+        }
+
+        let (selected, coverage) =
+            apply_coverage_alpha(false, true, [0, 0, 0, 0], Coverage::new(4));
+        assert_eq!(selected[3], coverage.alpha());
+        assert_eq!(coverage, Coverage::new(4));
+        let mut packed = [0u8; 2];
+        write_pixel(ColorTargetFormat::Rgba16, &mut packed, selected, coverage);
+        assert_eq!(u16::from_be_bytes(packed) & 1, 0);
+
+        let (unselected, coverage) =
+            apply_coverage_alpha(false, false, [0, 0, 0, 0], Coverage::FULL);
+        assert_eq!(unselected[3], 0);
+        let full = coverage_result(
+            coverage,
+            Coverage::new(1),
+            CoverageModeBits {
+                image_read_enabled: false,
+                force_blend: false,
+                antialias_enabled: false,
+                coverage_destination: CoverageDestination::Full,
+            },
+        );
+        write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut packed,
+            unselected,
+            full.destination,
+        );
+        assert_eq!(u16::from_be_bytes(packed) & 1, 1);
     }
 
     /// The alpha-compare gate, hand-derived at the threshold boundary in
