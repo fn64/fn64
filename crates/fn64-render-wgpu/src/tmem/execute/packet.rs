@@ -1152,7 +1152,7 @@ mod tests {
     /// while NOT changing which byte is read.
     ///
     /// The exchange follows the tile-relative row alone (see
-    /// `tmem/read.rs::odd_row_exchange` for the angrylion citation), so the
+    /// `tmem/read.rs::odd_row_exchange` for the RT64 citation), so the
     /// two parity values must decode the SAME texel. This test previously
     /// asserted they decoded different ones -- `0x0c` versus `0x08`, four
     /// bytes apart, which is precisely the bank the removed origin term used

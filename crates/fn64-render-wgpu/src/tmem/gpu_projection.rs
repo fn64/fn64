@@ -137,7 +137,7 @@ pub struct TileBindingParams {
 /// `TextureLutMode` wire codes shared with `tmem_sample.wgsl`'s own
 /// `TMEM_TLUT_MODE_*` constants. Wire encoding 1 never reaches this struct
 /// because it is not a distinct mode: high bit 15 is `en_tlut` and bit 14 is
-/// `tlut_type` (angrylion `src/core/n64video/rdp.c:630-631`), so with the
+/// `tlut_type` (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`), so with the
 /// enable bit clear `OtherMode::texture_lut_mode()` decodes it to
 /// `Disabled`, i.e. code 0. See `docs/RT64-GUARD-AUDIT.md` finding A2.
 pub const TLUT_MODE_DISABLED: u32 = 0;
