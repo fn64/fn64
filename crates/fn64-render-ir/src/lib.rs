@@ -32,8 +32,8 @@ pub use command::{
     MAX_RAW_STREAM_BYTES,
 };
 pub use digest::{
-    ContentDigest, EffectIdentity, GuestReadPlanIdentity, GuestReadSetIdentity, JournalIdentity,
-    RawStreamIdentity, RecordIdentity, WorkloadIdentity,
+    ContentDigest, EffectIdentity, FastContentDigest, GuestReadPlanIdentity, GuestReadSetIdentity,
+    JournalIdentity, RawStreamIdentity, RecordIdentity, WorkloadIdentity,
 };
 pub use error::ValidationError;
 pub use guest_read::{

@@ -110,9 +110,12 @@ copies only the named half-open ranges through fn64's canonical N64Recomp
 byte-lane mapping into N64-logical-order owned bytes. Finalization consumes
 the plan and capture and requires exact access index, operation ID, resource,
 range, order, byte length, and content digest before it can construct a
-`WorkloadPacket`. The packet identity and content-silent v3 replay record bind
-the resulting read-set identity and per-read digests; replay must supply the
-same owned bytes again. A missing, extra, reordered, overlapping substitute,
+`WorkloadPacket`. Runtime content identity and read-set comparison use
+xxh3-128; the content-silent v3 replay encoding still carries stable per-read
+SHA-256 digests, computed only when encoding and checked during cold replay.
+The packet identity and replay record bind the resulting read-set identity and
+per-read digests; replay must supply the same owned bytes again. A missing,
+extra, reordered, overlapping substitute,
 layout alias, short/long capture, or digest mutation therefore fails before a
 packet or record can be retained. No renderer type retains an RDRAM pointer or
 borrow, and the normal capture path allocates only the sum of declared reads,
