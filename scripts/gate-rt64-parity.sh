@@ -25,7 +25,7 @@ fi
 # `intent` text. Any NEW divergence fails the gate; any of these DISAPPEARING
 # also fails it, because a vanished known-difference means the corpus stopped
 # exercising the case.
-export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-2}
+export EXPECTED_DIFFERS=${EXPECTED_DIFFERS:-1}
 export EXPECTED_ONE_REFUSED=${EXPECTED_ONE_REFUSED:-1}
 export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-19}
 

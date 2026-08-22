@@ -4316,13 +4316,22 @@ mod census_tests {
         // a0 = w0>>20 & 0xF = 0x1 = TEXEL0; b0 = w1>>28 & 0xF = 0xf -> ZERO;
         // c0 = w0>>15 & 0x1F = 0x1b = 11 -> SHADE_ALPHA;
         // d0 = w1>>15 & 0x7 = 0x7 -> ZERO.
-        assert_eq!(params.decode_color(ColorInputSlot::A, false), ColorInput::Texel0);
-        assert_eq!(params.decode_color(ColorInputSlot::B, false), ColorInput::Zero);
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, false),
+            ColorInput::Texel0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, false),
+            ColorInput::Zero
+        );
         assert_eq!(
             params.decode_color(ColorInputSlot::C, false),
             ColorInput::ShadeAlpha
         );
-        assert_eq!(params.decode_color(ColorInputSlot::D, false), ColorInput::Zero);
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, false),
+            ColorInput::Zero
+        );
 
         // Cycle 1: a1 = w0>>5 & 0xF = 0x5 = ENVIRONMENT;
         // b1 = w1>>24 & 0xF = 0x0 = COMBINED; c1 = w0 & 0x1F = 0x3 = PRIMITIVE;
