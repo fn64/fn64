@@ -543,6 +543,15 @@ impl CompletedColorTargetWrite {
         &self.device_bytes
     }
 
+    /// Transfers the already-validated full-target bytes to the next
+    /// scheduled color command. An intermediate completion has no authority
+    /// consumer of its own; only the schedule's final completion is admitted
+    /// for publication, so retaining this buffer's sole owner avoids a
+    /// duplicate full-target copy without widening construction authority.
+    pub(crate) fn into_device_color_bytes(self) -> DeviceColorBytes {
+        self.device_bytes
+    }
+
     /// Widens this completion's claimed rectangle to `rectangle`, leaving
     /// every byte untouched.
     ///
