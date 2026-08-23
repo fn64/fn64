@@ -1353,6 +1353,11 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
             );
         }
     }
+    assert_eq!(
+        renderer.compute_hot_color_resource_generations(),
+        1,
+        "ten identical submissions must allocate one high-water resource generation"
+    );
 }
 
 #[test]
