@@ -713,6 +713,59 @@ mod tests {
         }
     }
 
+    /// Pins the addressing of a texrect's RIGHTMOST column when it lands ONE
+    /// texel past the tile's loaded S extent -- the shape task 35 inferred
+    /// and task 36 built into the parity corpus
+    /// (`gen-texrect-right-edge-overread-{clamp,wrap}`). The corpus proved
+    /// wgpu == angrylion == RT64 on that column for both addressing modes;
+    /// this test freezes the underlying texel address so a revert of the
+    /// addressing math re-breaks it.
+    ///
+    /// A four-texel row (`low_s = 0`, `high_s = 3` texels, i.e. `3 << 2` in
+    /// S10.2) sampled at S10.5 coordinate `4 << 5 = 128` -- integer texel 4,
+    /// one past the loaded `[0, 3]` extent:
+    /// - CLAMP (`mask_s == 0`) must clamp to the last loaded texel, column 3.
+    /// - WRAP (`mask_s == 2`, non-clamp mode) must wrap to column 0.
+    ///
+    /// Neither is a read past the loaded extent: the address never lands on
+    /// texel 4.
+    #[test]
+    fn right_edge_one_past_extent_addresses_within_the_loaded_row() {
+        // high_s = 3 texels << 2 = 12 (S10.2); a four-texel row [0, 3].
+        let four_texel_row = size(0, 0, 3 << 2, 0);
+        // S10.5 coordinate at the over-wide rightmost column: texel index 4.
+        let past_extent = 4i16 << 5;
+        let t_center = 0i16;
+
+        // CLAMP: mask_s == 0 forces the clamp arm regardless of mode.
+        let clamp_tile = tile(mode(false, false), 0, 0, mode(false, false), 0, 0);
+        let clamped = address_point_texel(
+            clamp_tile,
+            four_texel_row,
+            request(past_extent, t_center, TmemFirstRowParity::Even),
+        )
+        .unwrap();
+        assert_eq!(
+            clamped.column(),
+            3,
+            "clamp must pin the rightmost over-wide column to the last loaded texel, not texel 4"
+        );
+
+        // WRAP: mask_s == 2 addresses [0, 3]; texel 4 wraps to column 0.
+        let wrap_tile = tile(mode(false, false), 2, 0, mode(false, false), 2, 0);
+        let wrapped = address_point_texel(
+            wrap_tile,
+            four_texel_row,
+            request(past_extent, t_center, TmemFirstRowParity::Even),
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped.column(),
+            0,
+            "wrap must fold the rightmost over-wide column back to texel 0, not read texel 4"
+        );
+    }
+
     #[test]
     fn origin_and_negative_fraction_use_exact_integer_floor() {
         let tile = tile(mode(false, false), 4, 0, mode(false, false), 4, 0);
