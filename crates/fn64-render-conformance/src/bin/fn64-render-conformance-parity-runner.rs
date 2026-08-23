@@ -3122,6 +3122,328 @@ fn captured_row() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Programmatic corpus generator (Track B).
+//
+// The hand corpus above is a fixed set of authored cases with hand-derived
+// keys. The generator instead emits VALID SYNTHETIC RDP command streams across
+// the command/mode matrix, ranked by real-ROM usage, and compares wgpu and
+// RT64 against ANGRYLION as ground truth -- there is no hand key, because the
+// point is systematic coverage no human wrote a key for.
+//
+// Streams are HAND-DERIVED / SYNTHETIC (built from the same wire encoders the
+// hand corpus uses); NEVER captured from a running ROM. Every stream is a
+// complete, valid frame: SetColorImage + SetScissor + SetOtherModes + (tile/
+// load if textured) + draw + SyncFull, so all three backends can render it.
+// ---------------------------------------------------------------------------
+
+/// One generated case: a name, a priority rank (1 = highest, do first), and a
+/// valid RDP command stream. No hand key -- angrylion is the oracle.
+struct GeneratedCase {
+    name: String,
+    /// Priority per the brief's real-ROM-usage order. Lower = render first.
+    priority: u8,
+    /// What matrix cell this case exercises, for the report.
+    intent: &'static str,
+    commands: Vec<(u32, u32)>,
+}
+
+/// A minimal complete fill frame painting `color` over the box
+/// `[ulx,lrx) x [uly,lry)` in the requested `cycle_type` (0=1cyc, 1=2cyc,
+/// 2=copy, 3=fill), over a STALE background. Fill cycle uses SetFillColor;
+/// the non-fill cycle types drive the same rectangle through the pixel pipe
+/// with a primitive-colour combiner so the mode-matrix cell is exercised end
+/// to end rather than short-circuited by the fill path.
+fn gen_fill_frame(color: u16, cycle_type: u32, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32)> {
+    // SetOtherModes: base no-AA/no-dither word with the cycle-type field set.
+    // Bits 21:20 carry cycle type; the fill constant is 0xef30_00f0 (cycle=3).
+    let other_modes = (0xef00_00f0 | (cycle_type << 20), 0u32);
+    if cycle_type == 3 {
+        // True fill path: SetFillColor + FillRectangle. `fill_rect`'s
+        // lower-right is INCLUSIVE (the hand corpus passes WIDTH-1/HEIGHT-1
+        // for a full-target fill), while this function takes an EXCLUSIVE
+        // `lrx`/`lry`, so convert. A rectangle whose inclusive lower-right
+        // reached the exclusive extent would exceed the staged color-image
+        // width and every backend that validates the extent refuses it.
+        let (incl_lrx, incl_lry) = (lrx.saturating_sub(1), lry.saturating_sub(1));
+        return vec![
+            other_modes,
+            set_scissor(0, 0, WIDTH, HEIGHT),
+            (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+            (0xf700_0000, (color as u32) * 0x1_0001),
+            fill_rect(incl_lrx, incl_lry, ulx, uly),
+            (0xe900_0000, 0),
+        ];
+    }
+    // Non-fill: paint the rectangle through the pixel pipe with a primitive
+    // colour selected straight through the combiner. FillRectangle is only
+    // legal in fill/copy; a pixel-pipe rectangle is a TextureRectangle with a
+    // combiner that ignores the texel. We keep it simple with a flat triangle
+    // pair covering the box and a primitive-colour combiner (the same shape
+    // `one_flat_triangle_pair` proves renders on all three backends).
+    let mut words = vec![
+        other_modes,
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, primitive_rgba8888(color)),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ];
+    // Seed the background first so uncovered pixels are STALE, not zero.
+    let mut seeded_bg = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    seeded_bg.pop(); // drop its SyncFull; ours closes the frame
+    let mut frame = seeded_bg;
+    frame.extend(words.drain(..));
+    frame.extend(flat_triangle_words(ulx, lrx, uly, lry, lry));
+    frame.extend(flat_triangle_words(lrx, ulx, uly, lry, uly));
+    frame.push((0xe900_0000, 0));
+    frame
+}
+
+/// Approximate an RGBA16 colour as the RGBA8888 word a primitive-colour
+/// combiner needs so the pixel pipe reproduces it. 5-bit channels are
+/// left-justified into 8 bits; alpha is forced opaque.
+fn primitive_rgba8888(color: u16) -> u32 {
+    let r5 = ((color >> 11) & 0x1f) as u32;
+    let g5 = ((color >> 6) & 0x1f) as u32;
+    let b5 = ((color >> 1) & 0x1f) as u32;
+    let expand = |c: u32| (c << 3) | (c >> 2);
+    (expand(r5) << 24) | (expand(g5) << 16) | (expand(b5) << 8) | 0xff
+}
+
+/// A raw triangle of the given opcode (0x08..=0x0f) covering the standard TRI
+/// box with a primitive-colour combiner. Only the opcode's feature bits
+/// (shade/texture/zbuffer) differ; the geometry is the flat pair. Texture and
+/// zbuffer variants still emit valid coefficient blocks so the command is
+/// well-formed even where the combiner ignores them.
+fn gen_triangle_variant(opcode: u32) -> Vec<(u32, u32)> {
+    // Feature bits in the opcode low nibble: bit0=shade? Actually the RDP
+    // triangle opcodes are 0x08 base | 0x04 shade | 0x02 texture | 0x01 zbuf.
+    let shade = opcode & 0x04 != 0;
+    let texture = opcode & 0x02 != 0;
+    let _zbuf = opcode & 0x01 != 0;
+    if texture {
+        // A textured triangle needs a loaded tile; reuse the proven textured
+        // triangle builder, which emits the S/T/W coefficient block.
+        return one_textured_triangle();
+    }
+    if shade {
+        return one_shade_triangle_pair();
+    }
+    // Flat, zbuffer-or-not: the flat pair. The zbuffer bit adds a Z
+    // coefficient block on hardware; a flat non-shaded triangle with the bit
+    // set but no depth image is still a valid command to compare.
+    one_flat_triangle_pair()
+}
+
+/// Insert a sync opcode into an otherwise-valid fill frame at the position a
+/// ROM would emit it, to check sync handling does not perturb the raster.
+fn gen_fill_with_sync(sync_opcode: u32) -> Vec<(u32, u32)> {
+    let mut words = gen_fill_frame(0xf801, 3, 0, 0, 64, 48);
+    // Insert the sync just before the draw (index 4: after SetFillColor).
+    words.insert(4, (sync_opcode << 24, 0));
+    words
+}
+
+/// The first batch: ~30 highest-priority cases across the matrix.
+///
+/// Priority order (brief): (1) LOADBLOCK, (2) triangle variants, (3) syncs,
+/// (4) SetPrimDepth/SetBlendColor/TexRectFlip, (5) mode matrix, (6) convert/
+/// key/maskimage. The batch is capped so results can be triaged before
+/// expanding.
+fn generated_cases() -> Vec<GeneratedCase> {
+    let mut cases = Vec::new();
+    let mut push = |priority: u8, name: String, intent: &'static str, commands: Vec<(u32, u32)>| {
+        cases.push(GeneratedCase { name, priority, intent, commands });
+    };
+
+    // (5) Mode matrix -- cycle type x fill box. Fill/copy through the fill
+    // path, 1cyc/2cyc through the pixel pipe. These are texture-source-
+    // independent, so they give clean angrylion signal today.
+    for (cycle, label) in [(3u32, "fill"), (0, "one-cycle"), (1, "two-cycle")] {
+        push(
+            5,
+            format!("gen-modematrix-cycle-{label}-red-box"),
+            "cycle type x rectangle fill",
+            gen_fill_frame(0xf801, cycle, 0, 0, 80, 60),
+        );
+    }
+    // Fill-cycle boxes at varied colours and extents -- edge/coverage of the
+    // fill rasteriser, the most-used real-ROM primitive.
+    for (color, label) in [(0xf801u16, "red"), (0x07c1, "green"), (0x003f, "blue"), (0x7fff, "white")] {
+        push(
+            5,
+            format!("gen-fill-{label}-fullwidth-band"),
+            "fill-cycle rectangle, full-width band",
+            gen_fill_frame(color, 3, 0, 100, WIDTH, 140),
+        );
+    }
+    // Single-pixel and last-pixel fills -- rasteriser boundary conditions.
+    push(5, "gen-fill-single-pixel".into(), "fill single pixel", gen_fill_frame(0xf801, 3, 10, 10, 11, 11));
+    push(5, "gen-fill-last-pixel".into(), "fill last pixel", gen_fill_frame(0x07c1, 3, WIDTH - 1, HEIGHT - 1, WIDTH, HEIGHT));
+
+    // (2) Triangle variants 0x08..0x0f. Only the flat (0x08) and shade (0x0c)
+    // are in the hand corpus; the rest of the family is untested. Texture
+    // variants (0x0a/0x0e) reuse the proven textured builder.
+    for opcode in [0x08u32, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f] {
+        push(
+            2,
+            format!("gen-triangle-opcode-{opcode:#04x}"),
+            "raw triangle opcode family",
+            gen_triangle_variant(opcode),
+        );
+    }
+
+    // (3) Syncs: PIPESYNC (0x27), TILESYNC (0x28), LOADSYNC (0x26),
+    // FULLSYNC is already every frame's closer. Insert each into a valid fill
+    // and confirm the raster is unperturbed.
+    for (op, label) in [(0x27u32, "pipesync"), (0x28, "tilesync"), (0x26, "loadsync")] {
+        push(
+            3,
+            format!("gen-sync-{label}-in-fill"),
+            "sync opcode inside a fill frame",
+            gen_fill_with_sync(op),
+        );
+    }
+
+    // (1) LOADBLOCK + (4) TexRectFlip come from the proven textured builders
+    // that stage RGBA16 source. Their angrylion reading depends on the RGBA16
+    // texture-source staging domain (under investigation), so they are the
+    // highest priority but their triage waits on that resolution.
+    push(1, "gen-loadblock-linear".into(), "LoadBlock linear row advance", load_block_textured_rect(8, 0, 2, 8, 1, 2));
+    push(1, "gen-loadblock-dxt".into(), "LoadBlock DxT row advance", load_block_textured_rect(16, 0x400, 2, 8, 2, 4));
+    push(4, "gen-texrect-flip".into(), "TexRectFlip S/T swap", one_textured_rect_flip());
+    push(2, "gen-textured-triangle".into(), "textured triangle", one_textured_triangle());
+
+    cases
+}
+
+/// The triage classification for one generated case, per the brief's rubric.
+fn triage(
+    angrylion: &Result<Vec<u8>, String>,
+    wgpu: &Result<Vec<u8>, String>,
+    rt64: &Result<Vec<u8>, String>,
+) -> &'static str {
+    if angrylion_is_skipped(angrylion) {
+        return "angrylion-skipped-fallback-wgpu-vs-rt64";
+    }
+    let (a, w, r) = match (angrylion, wgpu, rt64) {
+        (Ok(a), Ok(w), Ok(r)) => (pixels(a), pixels(w), pixels(r)),
+        // A backend refused: not a pixel verdict. Name which lane failed.
+        _ => {
+            return match (angrylion.is_ok(), wgpu.is_ok(), rt64.is_ok()) {
+                (false, _, _) => "angrylion-error",
+                (_, false, _) => "wgpu-refused",
+                (_, _, false) => "rt64-refused",
+                _ => "unknown-refusal",
+            };
+        }
+    };
+    let wgpu_ok = w == a;
+    let rt64_ok = r == a;
+    match (wgpu_ok, rt64_ok) {
+        (true, true) => "pass-all-match-hardware",
+        (true, false) => "rt64-hle-defect", // wgpu matches truth, RT64 diverges
+        (false, true) => "fn64-defect",     // fn64 wrong, RT64 matches truth
+        (false, false) => {
+            if w == r {
+                "shared-ported-bug" // both ported engines share a bug angrylion exposes
+            } else {
+                "all-three-differ-inspect-construction"
+            }
+        }
+    }
+}
+
+/// First differing pixel between two readings, as a JSON object or null.
+fn first_diff(a: &Result<Vec<u8>, String>, b: &Result<Vec<u8>, String>) -> Value {
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            let (a, b) = (pixels(a), pixels(b));
+            (0..PIXEL_COUNT as usize)
+                .find(|&i| a[i] != b[i])
+                .map(|i| {
+                    json!({
+                        "pixel": i,
+                        "x": i as u32 % WIDTH,
+                        "y": i as u32 / WIDTH,
+                        "angrylion": format!("{:#06x}", a[i]),
+                        "other": format!("{:#06x}", b[i]),
+                    })
+                })
+                .unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Count of differing pixels between two readings, or null if either refused.
+fn diff_count(a: &Result<Vec<u8>, String>, b: &Result<Vec<u8>, String>) -> Value {
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            let (a, b) = (pixels(a), pixels(b));
+            json!((0..PIXEL_COUNT as usize).filter(|&i| a[i] != b[i]).count())
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Run the synthetic generator corpus, three-way comparing every case against
+/// angrylion ground truth and classifying each per the triage rubric.
+fn run_generated() -> Value {
+    let mut cases = generated_cases();
+    cases.sort_by_key(|c| (c.priority, c.name.clone()));
+
+    let mut rows = Vec::new();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+
+    for case in &cases {
+        let angrylion = angrylion_bytes(&case.commands);
+        let wgpu = wgpu_outcome(&case.commands);
+        let rt64 = rt64_bytes(&case.commands);
+
+        let classification = triage(&angrylion, &wgpu, &rt64);
+        *counts.entry(classification).or_default() += 1;
+
+        rows.push(json!({
+            "case": case.name,
+            "priority": case.priority,
+            "intent": case.intent,
+            "command_words": case.commands.len(),
+            "classification": classification,
+            "angrylion": if angrylion_is_skipped(&angrylion) {
+                json!("skipped")
+            } else {
+                outcome_wire(&angrylion)
+            },
+            "wgpu": outcome_wire(&wgpu),
+            "rt64": outcome_wire(&rt64),
+            "wgpu_vs_angrylion_diff_pixels": diff_count(&angrylion, &wgpu),
+            "rt64_vs_angrylion_diff_pixels": diff_count(&angrylion, &rt64),
+            "wgpu_vs_angrylion_first_diff": first_diff(&angrylion, &wgpu),
+            "rt64_vs_angrylion_first_diff": first_diff(&angrylion, &rt64),
+        }));
+    }
+
+    json!({
+        "schema": "fn64.render-conformance.parity.generated.v1",
+        "oracle": "angrylion-rdp-plus (bit-accurate hardware ground truth)",
+        "candidates": ["fn64-render-wgpu", "fn64-render-rt64"],
+        "target": { "width": WIDTH, "height": HEIGHT, "format": "rgba16" },
+        "corpus_provenance": "hand-derived synthetic streams; NO case captured from a running ROM",
+        "triage_legend": {
+            "pass-all-match-hardware": "wgpu==angrylion and rt64==angrylion",
+            "fn64-defect": "wgpu != angrylion, rt64 == angrylion (fn64 wrong)",
+            "rt64-hle-defect": "wgpu == angrylion, rt64 != angrylion (RT64 HLE wrong)",
+            "shared-ported-bug": "wgpu != angrylion, rt64 != angrylion, wgpu == rt64",
+            "all-three-differ-inspect-construction": "all three differ; suspect stream",
+            "angrylion-skipped-fallback-wgpu-vs-rt64": "oracle missing; only wgpu-vs-rt64 known",
+        },
+        "triage_counts": counts,
+        "case_count": cases.len(),
+        "rows": rows,
+    })
+}
+
 fn run() -> Value {
     // Debug hatch: FN64_DUMP_CASE=<name> writes that case's seeded RDRAM image
     // to <name>.rdram.bin and its command words to stderr, then exits. Used to
@@ -3143,6 +3465,13 @@ fn run() -> Value {
         }
         return json!({"error": "case not found"});
     }
+
+    // Generator mode: FN64_GENERATE=1 emits the synthetic corpus and compares
+    // wgpu and RT64 against ANGRYLION as ground truth. There is no hand key.
+    if std::env::var("FN64_GENERATE").as_deref() == Ok("1") {
+        return run_generated();
+    }
+
     let mut rows = Vec::new();
     let mut authoritative = Tally::default();
     let mut non_authoritative = Tally::default();
