@@ -95,6 +95,14 @@ pub const THREE_NEAREST_FILTER_EXPECTED_SHA256: [u8; 32] = [
 
 pub const THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS: [&str; 0] = [];
 
+/// Exact packed-RGBA16 storage-buffer transport used to qualify the dynamic
+/// target and bounded-readback substrate before compute-raster arithmetic is
+/// admitted. This is repository-owned transport code, not an emulation
+/// behavior claim or an RT64-derived shader component.
+pub const COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL: &str =
+    include_str!("shaders/compute_raster_rgba16_round_trip.wgsl");
+pub const COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT: &str = "round_trip_rgba16";
+
 pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
     "src-shaders-rasterpsdynamic",
     "src-shaders-rasterpsdynamicms",
