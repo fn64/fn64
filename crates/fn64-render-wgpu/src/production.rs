@@ -3307,7 +3307,8 @@ fn stage_and_report(
                 .map_err(WgpuRawDpcExecutionError::Physical)?,
         };
 
-        for word in staged.expected_words().to_vec() {
+        let expected_words = staged.expected_words().to_vec();
+        for word in expected_words.iter().copied() {
             let bytes = word_source_bytes(&source_bytes, load.source_access_index(), word)
                 .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
             let physical_lanes = map_physical_lanes(load, word, bytes)
@@ -3318,6 +3319,37 @@ fn stage_and_report(
             staged
                 .stage_word(payload)
                 .map_err(WgpuRawDpcExecutionError::Physical)?;
+        }
+
+        // A LoadBlock with DXT >= 0x800 advances its destination by more than
+        // one TMEM word per source word -- the row advance for tile rows
+        // >= 1 -- so it writes scattered words (e.g. DXT=0x800 -> words 0, 2,
+        // 4, 6) and skips the words between them. Hardware and both oracles
+        // (RT64, angrylion) read those skipped words back as their prior,
+        // zero-initialised content; only fn64's validity tracking would
+        // otherwise refuse a render tile that re-describes the block with a
+        // `line` reading a skipped word. The sweep is contiguous, so mark
+        // every word in `[low, high]` valid. Scoped to Block: a LoadTile
+        // that reads outside its own footprint still refuses (its interior
+        // has no such sweep gaps), keeping the WM2000 origin-term guard.
+        if matches!(load.shape(), TmemLoadShape::Block) {
+            let footprint = expected_words
+                .iter()
+                .filter_map(|word| match word.physical() {
+                    crate::tmem::TmemTransferPhysicalWord::Linear(_) => {
+                        Some(word.destination_word())
+                    }
+                    crate::tmem::TmemTransferPhysicalWord::SplitBanks { .. } => None,
+                })
+                .fold(None, |bounds: Option<(u16, u16)>, destination| {
+                    Some(match bounds {
+                        None => (destination, destination),
+                        Some((low, high)) => (low.min(destination), high.max(destination)),
+                    })
+                });
+            if let Some((low_word, high_word)) = footprint {
+                staged.mark_block_footprint_valid(low_word, high_word);
+            }
         }
 
         let finished = staged
