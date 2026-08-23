@@ -222,12 +222,17 @@ pub struct WgpuBackend {
 /// intentionally does not pretend those costs are shader-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComputeRasterProbeReceipt {
+    batch_count: u32,
     draw_count: u32,
     target_pixels: u32,
     elapsed: Duration,
 }
 
 impl ComputeRasterProbeReceipt {
+    pub const fn batch_count(self) -> u32 {
+        self.batch_count
+    }
+
     pub const fn draw_count(self) -> u32 {
         self.draw_count
     }
@@ -358,15 +363,42 @@ fn retain_compute_probe_draw<S: crate::TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     index: usize,
     tmem: &S,
-) -> Result<(), WgpuRawDpcExecutionError> {
-    let keep = match builder.as_mut() {
-        Some(builder) => builder.push(collector, candidate, index, tmem)?,
-        None => return Ok(()),
-    };
-    if !keep {
-        *builder = None;
+    resident_before: &[u8],
+) -> Result<Option<ComputeRasterProbeBuilder>, WgpuRawDpcExecutionError> {
+    if let Some(active) = builder.as_mut() {
+        if active.push(collector, candidate, index, tmem)? {
+            return Ok(None);
+        }
     }
-    Ok(())
+    let previous = builder.take();
+    let mut next = ComputeRasterProbeBuilder::new(candidate, resident_before.to_vec());
+    if next.push(collector, candidate, index, tmem)? {
+        *builder = Some(next);
+    }
+    Ok(previous)
+}
+
+fn flush_compute_probe(
+    builder: &mut Option<ComputeRasterProbeBuilder>,
+    ordinal: u64,
+    expected_bytes: &[u8],
+    probes: &mut Vec<ComputeRasterProbe>,
+) {
+    let Some(builder) = builder.take() else {
+        return;
+    };
+    push_finished_compute_probe(builder, ordinal, expected_bytes, probes);
+}
+
+fn push_finished_compute_probe(
+    builder: ComputeRasterProbeBuilder,
+    ordinal: u64,
+    expected_bytes: &[u8],
+    probes: &mut Vec<ComputeRasterProbe>,
+) {
+    if let Some(probe) = builder.finish(ordinal, expected_bytes.to_vec()) {
+        probes.push(probe);
+    }
 }
 
 /// Capacity rationale: 4 is the fixed bounded ceiling for concurrently
@@ -1809,8 +1841,10 @@ pub enum WgpuRawDpcExecutionError {
     /// from the existing CPU executor's complete target.
     ComputeRasterProbeMismatch {
         ordinal: u64,
-        command_index: u32,
-        triangle_index: usize,
+        first_command_index: u32,
+        last_command_index: u32,
+        first_triangle_index: usize,
+        last_triangle_index: usize,
         x: u32,
         y: u32,
         expected: u16,
@@ -2054,8 +2088,10 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::TriangleDraw(error) => write!(formatter, "triangle draw failed: {error}"),
             Self::ComputeRasterProbeMismatch {
                 ordinal,
-                command_index,
-                triangle_index,
+                first_command_index,
+                last_command_index,
+                first_triangle_index,
+                last_triangle_index,
                 x,
                 y,
                 expected,
@@ -2063,8 +2099,9 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             } => write!(
                 formatter,
                 "compute-raster probe disagreed with the CPU target in packet ordinal {ordinal}, \
-                 command #{command_index}, triangle #{triangle_index}, pixel ({x}, {y}): expected \
-                 RGBA16 {expected:#06x}, got {actual:#06x}"
+                 command range #{first_command_index}..=#{last_command_index}, triangle range \
+                 #{first_triangle_index}..=#{last_triangle_index}, pixel ({x}, {y}): expected RGBA16 \
+                 {expected:#06x}, got {actual:#06x}"
             ),
             Self::ComputeRasterProbeLength { expected, actual } => write!(
                 formatter,
@@ -2640,16 +2677,23 @@ impl RenderBackend for WgpuBackend {
                     probe.expected_bytes[pair + 1],
                 ]);
                 let actual = u16::from_be_bytes([actual_bytes[pair], actual_bytes[pair + 1]]);
-                let draw = probe
+                let first_draw = probe
                     .batch
                     .draws()
                     .first()
                     .expect("a sealed compute batch contains at least one draw");
+                let last_draw = probe
+                    .batch
+                    .draws()
+                    .last()
+                    .expect("a sealed compute batch contains at least one draw");
                 return Err(RenderError::from(
                     WgpuRawDpcExecutionError::ComputeRasterProbeMismatch {
                         ordinal: probe.ordinal,
-                        command_index: draw.command_index(),
-                        triangle_index: draw.triangle_index(),
+                        first_command_index: first_draw.command_index(),
+                        last_command_index: last_draw.command_index(),
+                        first_triangle_index: first_draw.triangle_index(),
+                        last_triangle_index: last_draw.triangle_index(),
                         x: pixel as u32 % probe.extent.width,
                         y: pixel as u32 / probe.extent.width,
                         expected,
@@ -2668,6 +2712,7 @@ impl RenderBackend for WgpuBackend {
         }
         if probe_batches != 0 {
             self.compute_raster_probe_receipt = Some(ComputeRasterProbeReceipt {
+                batch_count: probe_batches,
                 draw_count: probe_draws,
                 target_pixels: probe_pixels,
                 elapsed: probe_elapsed,
@@ -4142,8 +4187,19 @@ fn stage_color_commands(
 
     let move_accumulator = move_color_accumulator_enabled();
     let own_command_input = own_color_command_input_enabled();
+    let mut compute_probe_builder = None;
     for (schedule_index, (_, kind)) in schedule.iter().enumerate() {
-        let mut compute_probe_builder = None;
+        if compute_probe_builder.is_some() && !matches!(*kind, ColorCommandKind::RawTriangle(_)) {
+            let expected = accumulated
+                .as_deref()
+                .expect("an active compute batch has resident CPU output");
+            flush_compute_probe(
+                &mut compute_probe_builder,
+                collector.ordinal,
+                expected,
+                &mut collector.compute_probes,
+            );
+        }
         let (completed, accesses) = match *kind {
             ColorCommandKind::Fill(index) => {
                 execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
@@ -4201,14 +4257,6 @@ fn stage_color_commands(
                 // Same resident-bytes requirement as a texrect and for the
                 // same reason: a triangle writes a sub-region, so every
                 // pixel outside it must come from real prior content.
-                compute_probe_builder = collector
-                    .collect_compute_probe
-                    .then(|| {
-                        accumulated.as_ref().map(|resident| {
-                            ComputeRasterProbeBuilder::new(&candidate, resident.clone())
-                        })
-                    })
-                    .flatten();
                 let resident = color_command_input(&mut accumulated, own_command_input, key)?;
                 // **A raw triangle samples TMEM at its OWN stream position,
                 // by the SAME rule a texrect does.**
@@ -4227,13 +4275,23 @@ fn stage_color_commands(
                         match prefix_before(prefixes, command_index) {
                             Some(prefix) => {
                                 let image = pending.prefix_image(prefix);
-                                retain_compute_probe_draw(
-                                    &mut compute_probe_builder,
-                                    collector,
-                                    &candidate,
-                                    index,
-                                    &image,
-                                )?;
+                                if collector.collect_compute_probe {
+                                    if let Some(previous) = retain_compute_probe_draw(
+                                        &mut compute_probe_builder,
+                                        collector,
+                                        &candidate,
+                                        index,
+                                        &image,
+                                        resident.as_ref(),
+                                    )? {
+                                        push_finished_compute_probe(
+                                            previous,
+                                            collector.ordinal,
+                                            resident.as_ref(),
+                                            &mut collector.compute_probes,
+                                        );
+                                    }
+                                }
                                 execute_scheduled_raw_triangle(
                                     collector,
                                     &candidate,
@@ -4251,13 +4309,23 @@ fn stage_color_commands(
                             // of a preceding load IS the stream fact that
                             // makes committed correct; it is not a fallback.
                             None => {
-                                retain_compute_probe_draw(
-                                    &mut compute_probe_builder,
-                                    collector,
-                                    &candidate,
-                                    index,
-                                    collector.physical,
-                                )?;
+                                if collector.collect_compute_probe {
+                                    if let Some(previous) = retain_compute_probe_draw(
+                                        &mut compute_probe_builder,
+                                        collector,
+                                        &candidate,
+                                        index,
+                                        collector.physical,
+                                        resident.as_ref(),
+                                    )? {
+                                        push_finished_compute_probe(
+                                            previous,
+                                            collector.ordinal,
+                                            resident.as_ref(),
+                                            &mut collector.compute_probes,
+                                        );
+                                    }
+                                }
                                 execute_scheduled_raw_triangle(
                                     collector,
                                     &candidate,
@@ -4271,13 +4339,23 @@ fn stage_color_commands(
                         }
                     }
                     TexrectTmemSource::Committed(state) => {
-                        retain_compute_probe_draw(
-                            &mut compute_probe_builder,
-                            collector,
-                            &candidate,
-                            index,
-                            state,
-                        )?;
+                        if collector.collect_compute_probe {
+                            if let Some(previous) = retain_compute_probe_draw(
+                                &mut compute_probe_builder,
+                                collector,
+                                &candidate,
+                                index,
+                                state,
+                                resident.as_ref(),
+                            )? {
+                                push_finished_compute_probe(
+                                    previous,
+                                    collector.ordinal,
+                                    resident.as_ref(),
+                                    &mut collector.compute_probes,
+                                );
+                            }
+                        }
                         execute_scheduled_raw_triangle(
                             collector,
                             &candidate,
@@ -4291,13 +4369,13 @@ fn stage_color_commands(
                 }
             }
         };
-        if let Some(builder) = compute_probe_builder {
-            if let Some(probe) = builder.finish(
+        if schedule_index + 1 == schedule.len() {
+            flush_compute_probe(
+                &mut compute_probe_builder,
                 collector.ordinal,
-                completed.device_bytes().device_bytes().to_vec(),
-            ) {
-                collector.compute_probes.push(probe);
-            }
+                completed.device_bytes().device_bytes(),
+                &mut collector.compute_probes,
+            );
         }
         claimed = Some(union_target_rectangle(completed.rectangle(), claimed));
         declared.extend(accesses);
