@@ -27,6 +27,10 @@ mod raw_triangle;
 mod texrect;
 mod triangle_pipeline;
 
+pub(crate) use compute_batch::{
+    ComputeRasterBatch, ComputeRasterBatchBuilder, ComputeRasterDrawAdmission,
+    ComputeRasterProgramKey,
+};
 pub use fill::{
     decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
     resolve_fill_pixel_rectangle, FillCoordinateError, FillCycleBypassHazards, FillExecutionError,
