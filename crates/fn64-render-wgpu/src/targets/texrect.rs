@@ -229,6 +229,7 @@ use crate::tmem::{
 use crate::{CycleType, ImageFormat, OtherMode, PixelSize, TextureLutMode};
 
 use fn64_render::RectViewportPixels;
+use std::borrow::Cow;
 
 /// The already-decoded S10.5 texture-coordinate endpoints and pixel extent
 /// one admitted `TextureRectangle` rasterizes over.
@@ -1723,7 +1724,7 @@ impl core::fmt::Display for TexrectConstantRegister {
 /// post-image, so a `LoadBlock` staged before this call is visible and one
 /// staged after is not.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
+pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     other_mode: OtherMode,
     draw: TexrectDraw,
@@ -1733,9 +1734,10 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     shading: TexrectShading,
     blend_registers: TexrectBlendRegisters,
     scissor: RdpScissorRect,
-    resident_bytes: &[u8],
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
     already_initialized: Option<TargetRectangle>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    let mut bytes = resident_bytes.into().into_owned();
     // Copy cycle blits the texel to the destination with no combiner, which
     // is what the RDP itself does in that mode. One-cycle runs the texel
     // through the color combiner once per fragment; two-cycle runs it twice
@@ -1810,17 +1812,15 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
             pixels: extent.pixels() as usize,
             bytes_per_pixel: format.bytes_per_pixel(),
         })?;
-    if resident_bytes.len() != full_len {
+    if bytes.len() != full_len {
         return Err(TargetError::CompletedByteLengthMismatch {
             key,
             generation: candidate.generation(),
             expected: full_len,
-            actual: resident_bytes.len(),
+            actual: bytes.len(),
         }
         .into());
     }
-    let mut bytes = resident_bytes.to_vec();
-
     // **First-row parity comes from the tile's own T origin, not a
     // constant.** [`crate::TmemFirstRowParity`] is explicit caller input by
     // design -- the reader never infers it -- so this executor owes the
@@ -6810,6 +6810,14 @@ mod scissor_execution_tests {
         draw: TexrectDraw,
         scissor: RdpScissorRect,
     ) -> Result<(Vec<Rgba8>, TargetRectangle), TexrectExecutionError> {
+        run_with_input_ownership(draw, scissor, false)
+    }
+
+    fn run_with_input_ownership(
+        draw: TexrectDraw,
+        scissor: RdpScissorRect,
+        owned: bool,
+    ) -> Result<(Vec<Rgba8>, TargetRectangle), TexrectExecutionError> {
         let key = key();
         let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
         let candidate = registry.begin_candidate(key).unwrap();
@@ -6828,6 +6836,11 @@ mod scissor_execution_tests {
             })
             .unwrap();
         let candidate = registry.begin_candidate(key).unwrap();
+        let input = if owned {
+            Cow::Owned(resident_bytes)
+        } else {
+            Cow::Borrowed(resident_bytes.as_slice())
+        };
         let completed = execute_texture_rectangle(
             &candidate,
             copy_cycle_other_mode(),
@@ -6842,7 +6855,7 @@ mod scissor_execution_tests {
             ),
             TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0)),
             scissor,
-            &resident_bytes,
+            input,
             None,
         )?;
         let rectangle = completed.rectangle;
@@ -6872,6 +6885,14 @@ mod scissor_execution_tests {
 
     fn pixel(pixels: &[Rgba8], x: u32, y: u32) -> Rgba8 {
         pixels[(y * TARGET_WIDTH + x) as usize]
+    }
+
+    #[test]
+    fn owned_and_borrowed_resident_inputs_produce_identical_texrect_bytes() {
+        let scissor = RdpScissorRect::from_wire_quarter_pixels(0, 16, 16, 48, 48);
+        let borrowed = run_with_input_ownership(full_rect_draw(), scissor, false).unwrap();
+        let owned = run_with_input_ownership(full_rect_draw(), scissor, true).unwrap();
+        assert_eq!(owned, borrowed);
     }
 
     /// **The executor writes only the scissored span.**
