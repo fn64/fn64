@@ -104,7 +104,14 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    `triangle_span` formulas into WGSL using explicit multiword signed arithmetic
    where WGSL lacks 64/128-bit integers. Exhaustively compare every covered
    sample and plane value against the CPU implementation before color work is
-   enabled.
+   enabled. The first coverage-only slice now evaluates the exact checkerboard
+   eight-subsample rule with signed 64-bit edge products represented as two
+   32-bit words. Its closed WGSL validates under Naga, and three triangles
+   covering live WM2000 coefficients, both major-edge polarities, and negative
+   slopes matched the CPU `triangle_span::pixel_coverage` oracle for 10
+   consecutive runs on the native Metal adapter on 2026-08-23. Attribute-point
+   selection and plane evaluation remain open, and this differential substrate
+   is not yet connected to production dispatch.
 5. **TMEM, combiner, and blend.** Reuse the repository-owned callable WGSL
    functions where they are already CPU-differentially proven. Add packed
    RGBA16 destination decode/write and the two-cycle path required by the
