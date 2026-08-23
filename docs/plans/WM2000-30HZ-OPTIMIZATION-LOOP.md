@@ -200,3 +200,39 @@ restoration row from 3,235 to 2,155 samples (33%); total sampled time fell from
 consecutive runs. This is retained as fixed-cost headroom, but the acceptance
 bar remains unmet: p95 is still about 39.1 ms and roughly one quarter of drawn
 frames miss 33.333 ms.
+
+## Prepared two-cycle triangle combiner
+
+The post-VI profile changed the next combiner experiment's scope. Earlier
+one-cycle preparation was limited to texrect execution and produced no gain,
+but full call paths attributed most combiner work to raw triangles. WM2000's
+measured raw-triangle programs are predominantly two-cycle, so the retained
+path decodes both cycles' sixteen selectors once per draw and passes the typed
+prepared program through both scalar and parallel scanline traversal.
+`FN64_PREPARED_TRIANGLE_COMBINER=0` retains the original per-pixel decode as a
+same-binary control; absent selects the prepared path, and other values trap.
+
+| Order | Mean ms/drawn | p95 ms/drawn | p99 ms/drawn | Over 33.333 ms |
+| --- | ---: | ---: | ---: | ---: |
+| control 1 | 24.381 | 39.278 | 42.907 | 24.7% |
+| candidate 1 | 24.277 | 38.784 | 42.688 | 25.1% |
+| candidate 2 | 24.352 | 39.110 | 42.715 | 25.1% |
+| control 2 | 24.474 | 39.535 | 43.082 | 26.1% |
+
+Both pair orders improve mean by 0.10--0.12 ms and p95 by 0.43--0.49 ms.
+A fresh 1,200-pump, 34,465-sample Time Profiler capture reduced the combiner
+cycle evaluator from 1,340 samples before this change to 1,091 (19%); selector
+construction itself accounted for one sample, confirming that work moved to
+the draw boundary rather than another hot leaf. The prepared and checked paths
+were byte-identical for 120 live frames. Exact equivalence over the eight
+measured WM2000 programs plus the focused raw-triangle suite passed 10/10
+consecutive runs.
+
+This is retained as additive fixed-cost headroom, not as closure. Current p95
+is still about 39 ms, leaving roughly 6 ms to reach 30 Hz reliability and about
+14 ms to reach the 25 ms extension-headroom target. The same capture's largest
+active renderer leaf is now `blend_and_write_pixel` (2,396 samples), followed
+by VI restoration (2,323), full-target copies (1,585), SHA-256 (1,212), and
+combiner arithmetic (1,091). Because over-budget frames carry roughly twice
+the RDP work of within-budget frames, the next loop must keep prioritizing
+per-fragment triangle costs and copies over fixed presentation work.

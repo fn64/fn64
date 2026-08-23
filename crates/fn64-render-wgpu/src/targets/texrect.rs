@@ -213,6 +213,7 @@ use crate::blend::{
 use crate::combiner::{
     combiner_inputs_from_fragment_registers, run_one_cycle, run_two_cycle, AlphaInput,
     AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams, CombinerInputs,
+    PreparedTwoCycleCombiner,
 };
 use crate::coverage::{apply_coverage_alpha, coverage_result, Coverage, CoverageModeBits};
 use crate::state::{AlphaCompare, AlphaDither, Color4, PrimColor, RgbDither};
@@ -2075,8 +2076,28 @@ pub(super) fn combine_one_texel(
     texel: [u8; 4],
     evaluation: TexrectCombinerEvaluation,
 ) -> [u8; 4] {
+    let inputs = inputs_with_texel(base, texel);
+    let (combined_color, _alpha_compare) = match evaluation {
+        TexrectCombinerEvaluation::OneCycle | TexrectCombinerEvaluation::BlitsTheTexel => {
+            run_one_cycle(combine, inputs)
+        }
+        TexrectCombinerEvaluation::TwoCycle => run_two_cycle(combine, inputs),
+    };
+    quantize_combined_color(combined_color)
+}
+
+pub(super) fn combine_one_texel_prepared_two_cycle(
+    combine: PreparedTwoCycleCombiner,
+    base: CombinerInputs,
+    texel: [u8; 4],
+) -> [u8; 4] {
+    let (combined_color, _alpha_compare) = combine.run(inputs_with_texel(base, texel));
+    quantize_combined_color(combined_color)
+}
+
+fn inputs_with_texel(base: CombinerInputs, texel: [u8; 4]) -> CombinerInputs {
     let [red, green, blue, alpha] = texel;
-    let inputs = CombinerInputs {
+    CombinerInputs {
         tex_val0: [
             f32::from(red) / 255.0,
             f32::from(green) / 255.0,
@@ -2084,13 +2105,10 @@ pub(super) fn combine_one_texel(
             f32::from(alpha) / 255.0,
         ],
         ..base
-    };
-    let (combined_color, _alpha_compare) = match evaluation {
-        TexrectCombinerEvaluation::OneCycle | TexrectCombinerEvaluation::BlitsTheTexel => {
-            run_one_cycle(combine, inputs)
-        }
-        TexrectCombinerEvaluation::TwoCycle => run_two_cycle(combine, inputs),
-    };
+    }
+}
+
+fn quantize_combined_color(combined_color: [f32; 4]) -> [u8; 4] {
     combined_color.map(|channel| (channel * 255.0).round() as u8)
 }
 
