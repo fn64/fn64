@@ -1,6 +1,24 @@
 use super::*;
 
     #[test]
+    fn session_stream_dump_window_is_bounded_and_saturating() {
+        assert!(!session_stream_dump_selected(6, 7, 3));
+        assert!(session_stream_dump_selected(7, 7, 3));
+        assert!(session_stream_dump_selected(9, 7, 3));
+        assert!(!session_stream_dump_selected(10, 7, 3));
+        assert!(session_stream_dump_selected(u64::MAX, u64::MAX, 2));
+        assert!(!session_stream_dump_selected(0, 0, 0));
+    }
+
+    #[test]
+    fn session_stream_dump_serializes_canonical_big_endian_words() {
+        assert_eq!(
+            raw_dpc_stream_bytes(&[0x0123_4567, 0x89ab_cdef]),
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+    }
+
+    #[test]
     fn diagnostic_graphics_skip_advances_the_sp_then_dp_scheduler() {
         let full_sync =
             diagnostic_graphics_dp_full_sync(GraphicsTaskExecutionPolicy::DiagnosticSkip)
