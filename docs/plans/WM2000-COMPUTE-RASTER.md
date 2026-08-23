@@ -146,6 +146,40 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
   readback, or command-order race kills the candidate rather than weakening
   the oracle.
 
+## Remaining-gap ledger
+
+The certification gap is 13.8 ms at p95 (`38.8 -> 25.0 ms`). Nothing is
+credited before a same-binary A/B; the rows below are measured cost pools,
+not promised savings. They prevent the work list from quietly adding up to
+less than the target:
+
+| Cost pool | Current evidence | Optimization that can retire it |
+| --- | ---: | --- |
+| Scalar triangle execution | 7.939 ms in the 13-packet replay; 48.2% of live raster time belongs to the first admitted key and 98.4% to the first five keys | Exact pixel-owned compute for keys 1--5 |
+| Declared reads + copyback + commit | 2.722 ms in the replay | Keep the packed RGBA16 target resident through the burst and read back once at publication |
+| Planning | 2.232 ms in the replay | Build one sealed batch from already-decoded state and remove repeated per-packet target/TMEM preparation |
+| Boundary-heavy packet 2657 | 3.27 ms of its 4.405 ms total lies outside execute | Add exact fill/texrect device execution and remove CPU/GPU batch turns |
+
+These pools overlap at packet boundaries, so they must not be summed as a
+forecast. They do show why a triangle-only shader with per-draw transfers is
+insufficient: even eliminating all measured scalar execution would leave the
+live 13.8 ms p95 gap underfunded. The retained order is therefore:
+
+1. finish one complete color-producing state and require a >=3 ms live p95
+   win;
+2. make target residency span packet-local triangle batches, measuring the
+   transfer terms separately;
+3. widen exact color execution through the five keys covering 98.4% of live
+   raster time;
+4. absorb fill and texrect boundaries, starting with packet 2657's measured
+   non-execute spike;
+5. reprofile after every item and stop only at the ten-run certification bar.
+
+Headroom beyond 25 ms must come from the same ledger: a lower shader time does
+not authorize spending the transfer/planning savings twice. If the complete
+first state misses its 3 ms kill gate, the next action is GPU timestamp and
+boundary-count attribution in `raw_dpc_replay`, not adding more state keys.
+
 ## Replay baseline (2026-08-23)
 
 On the host Metal adapter, after priming packets 0 through 2646, a 30-repeat
