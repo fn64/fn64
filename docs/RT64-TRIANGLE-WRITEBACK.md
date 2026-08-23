@@ -24,9 +24,16 @@
    `stage_color_commands` (production.rs:3393) composes N of these into one
    accumulated buffer and calls `fill_completed_writes` once at the end.
 
-5. **`draw_admitted_triangles` (production.rs:387) needs a real GPU.** It starts
-   with `self.triangle_pipeline.as_mut().ok_or(TriangleDrawBeforeCreate)?`. So
-   `triangle_draw_output` does not exist at all in the default-feature suite.
+5. **`draw_admitted_triangles` is diagnostic, while its admission checks remain
+   production behavior.** A normal play run does not submit its unpresented GPU
+   fixture and does not materialize the fixture's per-triangle 4 KiB TMEM
+   projections. It still resolves every collected draw, requires a successful
+   prior `RenderBackend::create`, and rejects unsupported framebuffer-alpha
+   blending by name. `FN64_DIAGNOSTIC_TMEM_PROJECTION=1` restores the former
+   projection work without submitting the GPU draw, providing a same-binary
+   performance control. `FN64_GPU_TRIANGLE_DRAW=1` retains the real GPU fixture
+   path used by host-GPU tests. Guest pixels continue to come exclusively from
+   the CPU color-target path described above.
 
 ## Consequence: the briefed fork is not the real fork
 
