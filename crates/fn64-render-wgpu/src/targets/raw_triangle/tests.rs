@@ -213,6 +213,41 @@ fn sentinel_resident(key: ColorTargetKey) -> Vec<u8> {
     vec![0x5A; key.extent().pixels() as usize * 2]
 }
 
+#[test]
+fn owned_and_borrowed_resident_inputs_produce_identical_triangle_bytes() {
+    let key = key_at(8, 4);
+    let triangle = box_triangle();
+    let resident = sentinel_resident(key);
+    let declared = declared_accesses(key, &triangle, None);
+
+    let execute = |input| {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        execute_raw_triangle(
+            &candidate,
+            one_cycle_other_mode(),
+            &triangle,
+            flat_shading(),
+            TexrectBlendRegisters::default(),
+            input,
+            &declared,
+            NO_TEXTURE,
+            None,
+        )
+        .unwrap()
+        .device_bytes()
+        .device_bytes()
+        .to_vec()
+    };
+
+    let borrowed = execute(std::borrow::Cow::Borrowed(resident.as_slice()));
+    // The ownership mode is the variable under test; both executions must
+    // begin from identical bytes without coupling their input lifetimes.
+    let owned_resident = resident.clone();
+    let owned = execute(std::borrow::Cow::Owned(owned_resident));
+    assert_eq!(owned, borrowed);
+}
+
 // ---------------------------------------------------------------------------
 // The bytes a flat triangle actually produces
 // ---------------------------------------------------------------------------

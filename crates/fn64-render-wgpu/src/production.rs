@@ -49,6 +49,7 @@ use fn64_render_ir::{
     DecodedTicket, ResourceAccess, ResourceJournal, ResourceJournalLimits, SubmittedTicket,
     TicketAuthoritySet, ValidationError, WorkloadAdmission, WorkloadPacket,
 };
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::raw_dpc::push_decoded_raw_dpc;
@@ -3829,6 +3830,7 @@ fn stage_color_commands(
     let mut last_completed: Option<CompletedColorTargetWrite> = None;
 
     let move_accumulator = move_color_accumulator_enabled();
+    let own_command_input = own_color_command_input_enabled();
     for (schedule_index, (_, kind)) in schedule.iter().enumerate() {
         let (completed, accesses) = match *kind {
             ColorCommandKind::Fill(index) => {
@@ -3846,9 +3848,7 @@ fn stage_color_commands(
                 // decoder's own stream walk assigned -- the same index this
                 // schedule is sorted by -- keeps that a recovery of the
                 // stream's order rather than a policy.
-                let resident = accumulated
-                    .as_deref()
-                    .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+                let resident = color_command_input(&mut accumulated, own_command_input, key)?;
                 let command_index = collector.plan.texrect_commands[index].3;
                 match tmem {
                     TexrectTmemSource::Pending { pending, prefixes } => {
@@ -3889,9 +3889,7 @@ fn stage_color_commands(
                 // Same resident-bytes requirement as a texrect and for the
                 // same reason: a triangle writes a sub-region, so every
                 // pixel outside it must come from real prior content.
-                let resident = accumulated
-                    .as_deref()
-                    .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+                let resident = color_command_input(&mut accumulated, own_command_input, key)?;
                 // **A raw triangle samples TMEM at its OWN stream position,
                 // by the SAME rule a texrect does.**
                 //
@@ -4009,6 +4007,35 @@ fn move_color_accumulator_enabled() -> bool {
         Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
     })
+}
+
+fn own_color_command_input_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_OWN_COLOR_COMMAND_INPUT") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_OWN_COLOR_COMMAND_INPUT must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_OWN_COLOR_COMMAND_INPUT is not valid Unicode: {error}"),
+    })
+}
+
+fn color_command_input<'a>(
+    accumulated: &'a mut Option<Vec<u8>>,
+    owned: bool,
+    key: crate::targets::ColorTargetKey,
+) -> Result<Cow<'a, [u8]>, crate::targets::TexrectExecutionError> {
+    if owned {
+        accumulated
+            .take()
+            .map(Cow::Owned)
+            .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })
+    } else {
+        accumulated
+            .as_deref()
+            .map(Cow::Borrowed)
+            .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })
+    }
 }
 
 /// The TMEM prefix a command at `command_index` observes: the one taken
@@ -4291,7 +4318,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
     index: usize,
-    resident_bytes: &[u8],
+    resident_bytes: Cow<'_, [u8]>,
     tmem: &S,
     expect_proposed: bool,
     depth_cells: Option<&mut [crate::targets::DepthCell]>,
@@ -4452,7 +4479,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     tmem: &S,
     expect_proposed: bool,
     index: usize,
-    resident_bytes: &[u8],
+    resident_bytes: Cow<'_, [u8]>,
     already_initialized: Option<TargetRectangle>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let (span, triangle_index, tile_index, _, flipped_axes) =
@@ -5030,6 +5057,61 @@ fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_color_command_input_transfers_the_same_allocation() {
+        let mut accumulated = Some(vec![1, 2, 3, 4]);
+        let pointer = accumulated.as_ref().unwrap().as_ptr();
+        let input = super::color_command_input(
+            &mut accumulated,
+            true,
+            crate::targets::ColorTargetKey::try_new(
+                fn64_render_ir::PhysicalAddress::try_new(0x1000).unwrap(),
+                crate::targets::ColorTargetExtent::try_new(1, 2).unwrap(),
+                crate::targets::ColorTargetFormat::Rgba16,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let std::borrow::Cow::Owned(bytes) = input else {
+            panic!("the ownership lane must not downgrade to a borrowed slice");
+        };
+        assert!(
+            accumulated.is_none(),
+            "owned input consumes the accumulator"
+        );
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(
+            bytes.as_ptr(),
+            pointer,
+            "ownership transfer must retain the exact allocation"
+        );
+    }
+
+    #[test]
+    fn borrowed_color_command_control_leaves_the_accumulator_owned_by_the_schedule() {
+        let mut accumulated = Some(vec![1, 2, 3, 4]);
+        let pointer = accumulated.as_ref().unwrap().as_ptr();
+        let input = super::color_command_input(
+            &mut accumulated,
+            false,
+            crate::targets::ColorTargetKey::try_new(
+                fn64_render_ir::PhysicalAddress::try_new(0x1000).unwrap(),
+                crate::targets::ColorTargetExtent::try_new(1, 2).unwrap(),
+                crate::targets::ColorTargetFormat::Rgba16,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let std::borrow::Cow::Borrowed(bytes) = input else {
+            panic!("the control lane must retain the former borrowed input");
+        };
+        assert_eq!(bytes.as_ptr(), pointer);
+        drop(input);
+        assert_eq!(accumulated.unwrap(), [1, 2, 3, 4]);
+    }
+
     /// **The seed's byte-lane inversion, pinned against a hand-built pair.**
     ///
     /// Mutation-driven: replacing `captured[word + lane]` with
