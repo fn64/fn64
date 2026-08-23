@@ -330,6 +330,10 @@ Two CPU follow-ups were rejected:
   27.184/26.266 and 26.772/26.120 ms mean, and 40.156/39.359 and
   39.955/38.868 ms p95. Rayon scheduling smaller draws adds 0.65--0.92 ms mean
   and 0.80--1.09 ms p95, so the retained threshold remains 4,096.
+- Caching the first covered subsample between the row's at-most-sixteen edge
+  interval endpoints measured 580.956 ns per covered pixel versus 577.803 for
+  the direct row scan. Interior pixels normally pass its first sample test, so
+  endpoint bookkeeping is an added cost; the candidate was removed.
 
 These results trigger item 4's stop condition. The CPU raster specialization
 budget is smaller than the roughly 5.8 ms reliability gap and far smaller than
@@ -340,3 +344,5 @@ ordered draws against one device-resident target, preserve command-order
 barriers where target reads make them observable, and perform one bounded
 readback at the existing guest-effect publication boundary. Program admission
 is keyed only by typed RDP state; unsupported state remains on the CPU path.
+The [compute-raster execution plan](WM2000-COMPUTE-RASTER.md) defines the
+ordered implementation and kill gates.
