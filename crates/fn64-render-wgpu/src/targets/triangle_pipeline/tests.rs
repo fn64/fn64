@@ -1978,7 +1978,7 @@ mod host_gpu_tests {
     }
 
     #[test]
-    fn required_host_compute_triangle_coverage_matches_the_cpu_oracle_ten_times() {
+    fn required_host_compute_triangle_coverage_and_attributes_match_cpu_ten_times() {
         let mut renderer = tlut_renderer();
         let extent = TriangleTargetExtent {
             width: 96,
@@ -2027,26 +2027,83 @@ mod host_gpu_tests {
                 ..crate::wire_words::EdgeWords::zeroed()
             }),
         ];
-        let device_triangles: Vec<_> = raw
+        let oracle_planes = [
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: 0x1234_5678,
+                dx: i32::MAX,
+                de: i32::MIN,
+                dy: 17,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: -0x1234_567,
+                dx: i32::MIN + 1,
+                de: i32::MAX,
+                dy: -19,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: -65_537,
+                dx: -33_333,
+                de: -77_777,
+                dy: 0,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: 65_535,
+                dx: 98_765,
+                de: -12_345,
+                dy: 0,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: 1,
+                dx: -1,
+                de: 1,
+                dy: 0,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: -1,
+                dx: 1,
+                de: -1,
+                dy: 0,
+            },
+            crate::raw_dpc::triangle_span::AttributePlane {
+                base: 0,
+                dx: 0,
+                de: 0,
+                dy: i32::MAX,
+            },
+        ];
+        let mut device_triangles: Vec<_> = raw
             .iter()
             .copied()
             .map(ComputeCoverageTriangle::from_raw)
             .collect();
+        for triangle in &mut device_triangles {
+            triangle.planes = oracle_planes.map(ComputeAttributePlane::from);
+        }
         let mut expected = Vec::new();
         for triangle in &raw {
             for y in 0..extent.height as i32 {
                 for x in 0..extent.width as i32 {
-                    expected.push(crate::raw_dpc::triangle_span::pixel_coverage(
-                        triangle, x, y,
-                    ));
+                    let attribute_sample =
+                        crate::raw_dpc::triangle_span::attribute_sample(triangle, x, y);
+                    expected.push(ComputeRasterSample {
+                        coverage: crate::raw_dpc::triangle_span::pixel_coverage(triangle, x, y),
+                        attribute_sample,
+                        plane_values: attribute_sample.map(|(delta_y, delta_x)| {
+                            oracle_planes.map(|plane| {
+                                crate::raw_dpc::triangle_span::attribute_plane(
+                                    plane, delta_y, delta_x,
+                                )
+                            })
+                        }),
+                    });
                 }
             }
         }
         for run in 1..=10 {
             let actual = renderer
-                .compute_triangle_coverage(extent, &device_triangles)
-                .expect("integer coverage compute must complete");
-            assert_eq!(actual, expected, "coverage differential run {run}");
+                .compute_triangle_samples(extent, &device_triangles)
+                .expect("integer coverage and sample compute must complete");
+            assert_eq!(actual, expected, "coverage/sample differential run {run}");
         }
     }
 

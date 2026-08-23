@@ -109,9 +109,13 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    32-bit words. Its closed WGSL validates under Naga, and three triangles
    covering live WM2000 coefficients, both major-edge polarities, and negative
    slopes matched the CPU `triangle_span::pixel_coverage` oracle for 10
-   consecutive runs on the native Metal adapter on 2026-08-23. Attribute-point
-   selection and plane evaluation remain open, and this differential substrate
-   is not yet connected to production dispatch.
+   consecutive runs on the native Metal adapter on 2026-08-23. The follow-on
+   slice selects the first covered subsample and evaluates all seven shade and
+   texture planes with an exact signed 32-by-64-bit multiply represented in
+   32-bit words. Mixed-sign and extreme coefficient fixtures matched
+   `attribute_sample` and `attribute_plane` for another 10 consecutive native
+   Metal runs. This completes the integer coverage-and-attributes unit; the
+   differential substrate is not yet connected to production dispatch.
 5. **TMEM, combiner, and blend.** Reuse the repository-owned callable WGSL
    functions where they are already CPU-differentially proven. Add packed
    RGBA16 destination decode/write and the two-cycle path required by the

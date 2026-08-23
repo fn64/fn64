@@ -1436,11 +1436,41 @@ pub struct ComputeCoverageTriangle {
     dxldy: i32,
     dxhdy: i32,
     dxmdy: i32,
+    planes: [ComputeAttributePlane; 7],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ComputeAttributePlane {
+    base: i32,
+    dx: i32,
+    de: i32,
+    dy: i32,
+}
+
+impl From<crate::raw_dpc::triangle_span::AttributePlane> for ComputeAttributePlane {
+    fn from(plane: crate::raw_dpc::triangle_span::AttributePlane) -> Self {
+        Self {
+            base: plane.base,
+            dx: plane.dx,
+            de: plane.de,
+            dy: plane.dy,
+        }
+    }
+}
+
+/// Exact coverage count and first-covered-subsample attribute origin emitted
+/// by the integer compute prototype. A zero-coverage pixel has no attribute
+/// origin; nonzero coverage always carries one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeRasterSample {
+    pub coverage: u32,
+    pub attribute_sample: Option<(i32, i64)>,
+    pub plane_values: Option<[i64; 7]>,
 }
 
 impl ComputeCoverageTriangle {
-    pub const fn from_raw(triangle: crate::RawTriangle) -> Self {
-        Self {
+    pub fn from_raw(triangle: crate::RawTriangle) -> Self {
+        let mut result = Self {
             // `triangle_span::left_major` proves the decoder's historically
             // named `right_major` accessor is the left-major wire bit.
             left_major: triangle.right_major(),
@@ -1453,11 +1483,34 @@ impl ComputeCoverageTriangle {
             dxldy: triangle.dxldy(),
             dxhdy: triangle.dxhdy(),
             dxmdy: triangle.dxmdy(),
+            planes: [ComputeAttributePlane {
+                base: 0,
+                dx: 0,
+                de: 0,
+                dy: 0,
+            }; 7],
+        };
+        if let Some(shade) = triangle.shade() {
+            for (destination, source) in result.planes[..4]
+                .iter_mut()
+                .zip(crate::raw_dpc::triangle_span::shade_planes(shade))
+            {
+                *destination = source.into();
+            }
         }
+        if let Some(texture) = triangle.texture() {
+            for (destination, source) in result.planes[4..]
+                .iter_mut()
+                .zip(crate::raw_dpc::triangle_span::texture_planes(texture))
+            {
+                *destination = source.into();
+            }
+        }
+        result
     }
 
-    fn storage_bytes(self) -> [u8; 40] {
-        let words = [
+    fn storage_bytes(self) -> [u8; 152] {
+        let edge_words = [
             u32::from(self.left_major),
             self.yl as u32,
             self.ym as u32,
@@ -1469,9 +1522,18 @@ impl ComputeCoverageTriangle {
             self.dxhdy as u32,
             self.dxmdy as u32,
         ];
-        let mut bytes = [0u8; 40];
-        for (index, word) in words.into_iter().enumerate() {
+        let mut bytes = [0u8; 152];
+        for (index, word) in edge_words.into_iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        for (plane_index, plane) in self.planes.into_iter().enumerate() {
+            for (field_index, field) in [plane.base, plane.dx, plane.de, plane.dy]
+                .into_iter()
+                .enumerate()
+            {
+                let offset = 40 + plane_index * 16 + field_index * 4;
+                bytes[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+            }
         }
         bytes
     }
@@ -1613,6 +1675,21 @@ impl TrianglePipelineRenderer {
         extent: TriangleTargetExtent,
         triangles: &[ComputeCoverageTriangle],
     ) -> Result<Vec<u32>, TrianglePipelineError> {
+        Ok(self
+            .compute_triangle_samples(extent, triangles)?
+            .into_iter()
+            .map(|sample| sample.coverage)
+            .collect())
+    }
+
+    /// Evaluate coverage and the first covered subsample used as the exact
+    /// attribute-plane origin. Output ordering matches
+    /// [`Self::compute_triangle_coverage`].
+    pub fn compute_triangle_samples(
+        &mut self,
+        extent: TriangleTargetExtent,
+        triangles: &[ComputeCoverageTriangle],
+    ) -> Result<Vec<ComputeRasterSample>, TrianglePipelineError> {
         validate_triangle_extent(extent)?;
         if triangles.is_empty() {
             return Err(TrianglePipelineError::EmptyCoverageBatch);
@@ -1626,8 +1703,8 @@ impl TrianglePipelineRenderer {
         let output_words = pixels
             .checked_mul(triangle_count)
             .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-        let output_bytes = u64::from(output_words) * 4;
-        let triangle_bytes = u64::from(triangle_count) * 40;
+        let output_bytes = u64::from(output_words) * 72;
+        let triangle_bytes = u64::from(triangle_count) * 152;
         let workgroups = output_words.div_ceil(64);
         let limits = self.device.limits();
         if workgroups > limits.max_compute_workgroups_per_dimension
@@ -1720,8 +1797,29 @@ impl TrianglePipelineRenderer {
             .map_err(|_| TrianglePipelineError::CompletionCallbackNotObserved)?;
         let bytes = map_and_read(&self.device, &readback)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four coverage bytes")))
+            .chunks_exact(72)
+            .map(|sample| {
+                let word = |index: usize| {
+                    u32::from_le_bytes(
+                        sample[index * 4..index * 4 + 4]
+                            .try_into()
+                            .expect("four compute sample bytes"),
+                    )
+                };
+                let coverage = word(0);
+                let delta_y_eighth = word(1) as i32;
+                let delta_x_q16 = i64::from(word(2)) | (i64::from(word(3) as i32) << 32);
+                let plane_values = core::array::from_fn(|plane| {
+                    let low = word(4 + plane * 2);
+                    let high = word(5 + plane * 2) as i32;
+                    i64::from(low) | (i64::from(high) << 32)
+                });
+                ComputeRasterSample {
+                    coverage,
+                    attribute_sample: (coverage != 0).then_some((delta_y_eighth, delta_x_q16)),
+                    plane_values: (coverage != 0).then_some(plane_values),
+                }
+            })
             .collect())
     }
 
