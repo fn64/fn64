@@ -73,27 +73,37 @@ row0: 0001 0001 ffff ffff   row1: c631 8421 0001 4211
 Probes (standalone oracle, `/tmp/probe*.py`):
 - A 40x40 texrect sampling ONLY texel(0,0) reads `0x0001` everywhere — texel 0
   is uniformly wrong, NOT a coverage edge effect.
-- Re-seeding the RGBA16 source in five different byte orders (LE/BE halfword,
-  no-xor, u32-pack hi-even/hi-odd) changes row1's texels but **never fixes
-  row0** and never yields all 8 texels. So it is not a simple source byte-order
-  swap.
-- texels 4,5,6 read correctly under the shipped LE seeding while texels
-  0,1,3,7 read `0x0001`. This word-position-dependent asymmetry points at the
-  16bpp TMEM hi/lo bank interleave (RGBA16 texels split high/low bytes across
-  the two TMEM banks), i.e. how `LoadTile`/`LoadBlock` deposits a 16bpp source
-  into TMEM vs. how the sampler reads it back — not the source image bytes.
+- **Source byte order EMPIRICALLY RULED OUT.** Re-seeding the RGBA16 source
+  seven ways — `write_u16` LE (shipped), BE/LE halfword no-xor, u32-pack
+  hi-even/hi-odd, and `write_logical_bytes` big-endian (the exact path IA16
+  uses, which passes) — the last gives **byte-identical output to the shipped
+  seeding**, and none yields all 8 texels. The source image is not the
+  variable.
+- **Not a multi-row effect.** Reshaping the same 8 texels to an 8x1 single-row
+  texrect (like the passing IA16 case) reproduces the identical broken pattern.
+- The asymmetry is stable and word-position-dependent: texels 4,5,6 read
+  correctly, texels 0,1,3,7 read `0x0001`, and some columns aren't drawn at
+  all. IA16 (also a 2-byte 16bpp texel, via `write_logical_bytes`) loads all 8
+  correctly, so it is specific to the RGBA/CI/RGBA32 fetch path, not to 16bpp
+  width.
+- Codex's static `tex.c`/`tmem.c` trace PREDICTS all 8 texels should read
+  correctly for this exact image — but the oracle's ACTUAL output does not
+  match that prediction. So the disagreement is inside angrylion's
+  LoadTile→TMEM→fetch path (or the harness's `--rdram` DP setup), NOT the
+  staged bytes.
 
-**Verdict pending** a Codex investigation tracing angrylion's `tmem.c` 16bpp
-LoadTile → TMEM → sample path. Two live hypotheses:
-1. Harness staging: fn64's `seeded()` RGBA16 source is in a byte order the
-   oracle's 16bpp LoadTile does not read the way fn64/RT64 do — a fixable
-   transformation in `angrylion_bytes()` for the texture-source region only.
-2. Genuine angrylion 16bpp TMEM behaviour that wgpu AND RT64 both diverge from
-   — which would make these 7+ cases real shared ported-from-RT64 defects.
+**Verdict pending** a Codex empirical run (its first pass was sandbox-blocked
+from a writable workspace; relaunched pointing at
+`/Users/jer/Code/angrylion-oracle/scratch/`). Two live hypotheses:
+1. Harness: the oracle's `--rdram` DP/config setup subtly mis-drives the RGBA16
+   fetch for this image — a fix in `oracle.c`, external to fn64.
+2. Genuine angrylion RGBA16-fetch behaviour that wgpu AND RT64 both diverge
+   from — which would make these 7+ cases real shared ported-from-RT64 defects,
+   a high-value find.
 
-Because wgpu==RT64==hand-key (three implementations) on all of them, the strong
-prior is (1); I will NOT report these as fn64 defects until the load path is
-traced and a reproduction reads all 8 texels correctly.
+Because wgpu==RT64==hand-key (three implementations agree) on all of them, and
+the source bytes are proven equivalent, I will NOT report these as fn64 defects
+until the fetch path is instrumented and a reproduction reads all 8 texels.
 
 ## Step 2 — generator and first batch (24 cases)
 
