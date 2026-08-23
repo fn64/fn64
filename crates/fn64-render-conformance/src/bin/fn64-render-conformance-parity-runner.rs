@@ -2509,6 +2509,19 @@ fn seeded(commands: &[(u32, u32)]) -> Vec<u8> {
             .collect();
         view.write_logical_bytes(RdramAddr::from_offset(CI_SOURCE), &packed);
         view.write_logical_bytes(RdramAddr::from_offset(CI8_SOURCE), &CI8_INDICES);
+        // loadblock-deep slice: an independent RGBA16 strip and CI8 index
+        // strip, staged the same way as the sources above, so its LoadBlock
+        // DxT cases read real bytes rather than zeroed RDRAM.
+        for (index, texel) in LOADBLOCK_DEEP_RGBA16_TEXELS.iter().enumerate() {
+            view.write_u16(
+                RdramAddr::from_offset(LOADBLOCK_DEEP_RGBA16_SOURCE + index as u32 * 2),
+                *texel,
+            );
+        }
+        view.write_logical_bytes(
+            RdramAddr::from_offset(LOADBLOCK_DEEP_CI8_SOURCE),
+            &LOADBLOCK_DEEP_CI8_INDICES,
+        );
         for index in 0u16..=255 {
             view.write_u16(
                 RdramAddr::from_offset(CI8_PALETTE_SOURCE + u32::from(index) * 2),
@@ -3273,6 +3286,772 @@ fn gen_fill_with_sync(sync_opcode: u32) -> Vec<(u32, u32)> {
     words
 }
 
+
+// =============================================================================
+// Track-B fan-out pass 1: designed slices (blend-modes, alpha-compare,
+// coverage-modes, formats-deep, zbuffer, loadblock-deep) integrated into the
+// generator corpus below. Each slice's builders precede `generated_cases()`;
+// each slice's `push(...)` calls are inside it.
+// =============================================================================
+
+// -----------------------------------------------------------------------
+// slice blend-modes
+// -----------------------------------------------------------------------
+//
+// Mode matrix -- BLENDER mode. One-cycle P/A/M/B selector matrix.
+//
+// GBI selector semantics (verified against this crate's own reference
+// decoder, `fn64-render-reference/src/gbi/types.rs:511-525` and
+// `raster/blend.rs:242-292`, which is itself sourced from public
+// `ultra64/gbi.h:612-627`):
+//
+//   P / M (color, 2 bits): 0=Combined(clr_in) 1=Framebuffer(clr_mem)
+//                          2=BlendColor       3=FogColor
+//   A     (alpha, 2 bits): 0=CombinedAlpha 1=FogAlpha 2=ShadeAlpha 3=Zero
+//   B     (alpha, 2 bits): 0=1-A 1=FramebufferCoverage/8 2=One 3=Zero
+//
+// `SetOtherModes` word1 (low) packs the ACTIVE cycle -- cycle 2's slot, which
+// is what one-cycle mode evaluates -- at bits 31:30 (P), 29:28 (A), 27:26
+// (M), 25:24 (B); confirmed against `OtherMode::blender_cycle_2` in the same
+// file. `FORCE_BL` is bit 14 (`0x4000`); without it the last blend stage is
+// bypassed and simply selects P. `IM_RD` (framebuffer-read enable) is word1
+// bit 6 (`0x0040`) and must be set whenever P, A, or M reads memory/coverage.
+
+/// Pack a one-cycle blender word (SetOtherModes word1) from its four GBI
+/// selectors plus FORCE_BL/IM_RD flags, per the bit table above.
+const fn blend_other_modes(p: u32, a: u32, m: u32, b: u32, force_bl: bool, im_rd: bool) -> (u32, u32) {
+    let mut low = (p << 30) | (a << 28) | (m << 26) | (b << 24);
+    if force_bl {
+        low |= 1 << 14;
+    }
+    if im_rd {
+        low |= 1 << 6;
+    }
+    (0xef00_00f0, low)
+}
+
+/// A flat-shaded triangle pair covering the standard TRI box, drawn with a
+/// primitive-colour combiner (`SET_COMBINE_PRIMITIVE`, opaque alpha) over a
+/// distinct memory seed, under the given one-cycle blender word.
+fn gen_blend_rect(memory_seed: u16, primitive_rgba8888: u32, blend_words: (u32, u32)) -> Vec<(u32, u32)> {
+    let mut words = one_fill(memory_seed, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        blend_words,
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, primitive_rgba8888),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(flat_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(flat_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// The blend-color / fog-color twin of [`gen_blend_rect`] that also programs
+/// `SetBlendColor`/`SetFogColor` before the draw.
+fn gen_blend_rect_with_state_color(
+    memory_seed: u16,
+    primitive_rgba8888: u32,
+    set_state_color: (u32, u32),
+    blend_words: (u32, u32),
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(memory_seed, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        set_state_color,
+        blend_words,
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, primitive_rgba8888),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(flat_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(flat_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// The shade-driven twin of [`gen_blend_rect`]: a `SET_COMBINE_SHADE`
+/// triangle pair with a non-opaque, non-zero flat shade alpha.
+fn gen_blend_rect_shade_alpha(memory_seed: u16, shade_rgba: [i32; 4], blend_words: (u32, u32)) -> Vec<(u32, u32)> {
+    let mut words = one_fill(memory_seed, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        blend_words,
+        SET_COMBINE_SHADE,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(shade_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM, shade_rgba));
+    words.extend(shade_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP, shade_rgba));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+const BLEND_MATRIX_MEMORY_SEED: u16 = GREEN;
+const BLEND_MATRIX_PRIMITIVE_RGBA8888: u32 = 0xff00_00ff; // opaque red
+const BLEND_MATRIX_SHADE_RGBA: [i32; 4] = [0x80 << 16, 0x7f << 16, 0x00 << 16, 0x80 << 16];
+
+// -----------------------------------------------------------------------
+// slice alpha-compare
+// -----------------------------------------------------------------------
+//
+// Alpha compare matrix -- alpha_compare_en / dither_alpha, threshold vs
+// dither compare mode, plus a disabled-bits control.
+//
+// `gDPSetOtherMode`'s low mode word carries `G_MDSFT_ALPHACOMPARE` at bits
+// 1:0 (`ultra64/gbi.h`): `G_AC_NONE = 0`, `G_AC_THRESHOLD = 1` (compare
+// combined alpha against `SetBlendColor`'s alpha byte), `G_AC_DITHER = 3`
+// (compare against per-pixel noise in [0,255]; value 2 is reserved).
+//
+// `SetBlendColor` is opcode `0xf9`; its low byte is the alpha channel the
+// compare tests against. Every case runs `SET_COMBINE_PRIMITIVE`, so
+// `SetPrimColor`'s low byte is the alpha the compare unit evaluates.
+
+/// One-cycle `SetOtherModes` with `alpha_compare_en` set to `compare_mode`
+/// (0=disabled, 1=threshold, 3=dither) in word 1 bits 1:0.
+const fn other_modes_alpha_compare(compare_mode: u32) -> (u32, u32) {
+    (OTHER_MODES_ONE_CYCLE_NO_AA.0, compare_mode & 0x3)
+}
+
+/// A flat-triangle-pair rectangle painted with a primitive colour of alpha
+/// `prim_alpha`, under alpha-compare mode `compare_mode` against
+/// `SetBlendColor`'s alpha byte `blend_alpha`, over a STALE background.
+fn gen_alpha_compare_rect(compare_mode: u32, prim_alpha: u8, blend_alpha: u8) -> Vec<(u32, u32)> {
+    const ULX: u32 = 0;
+    const ULY: u32 = 0;
+    const LRX: u32 = 80;
+    const LRY: u32 = 60;
+
+    let mut seeded_bg = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    seeded_bg.pop();
+
+    let mut frame = seeded_bg;
+    frame.extend([
+        other_modes_alpha_compare(compare_mode),
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, 0x20c0_e000 | prim_alpha as u32),
+        (0xf900_0000, 0x0000_0000 | blend_alpha as u32),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    frame.extend(flat_triangle_words(ULX, LRX, ULY, LRY, LRY));
+    frame.extend(flat_triangle_words(LRX, ULX, ULY, LRY, ULY));
+    frame.push((0xe900_0000, 0));
+    frame
+}
+
+// -----------------------------------------------------------------------
+// slice coverage-modes
+// -----------------------------------------------------------------------
+//
+// Coverage-modes matrix: cvg_dest x color_on_cvg x cvg_x_alpha x
+// force_blend, across fill and one-cycle rects. All eight fields live in
+// SetOtherModes' LOW word (word1), per public libultra `gbi.h`
+// (`G_MDSFT_RENDERMODE` field group):
+//
+//   bit  3        AA_EN           0x8
+//   bit  6        IM_RD           0x40
+//   bit  7        CLR_ON_CVG      0x80
+//   bits 9:8      CVG_DST select  0x000/0x100/0x200/0x300
+//   bit  12       CVG_X_ALPHA     0x1000
+//   bit  13       ALPHA_CVG_SEL   0x2000
+//   bit  14       FORCE_BL        0x4000
+//
+// These are switches the RT64 guard audit names as unmodeled
+// ("Coverage is not emulated" in `rt64_blender.h`). Every case here routes
+// through angrylion as the oracle, so wgpu-vs-RT64 disagreement on these
+// rows is evidence about RT64's own modelling gap, not a wgpu defect.
+
+/// A fill-cycle full-target box with `word1` set directly, everything else
+/// identical to [`gen_fill_frame`] at `cycle_type = 3`.
+fn gen_fill_coverage_mode(color: u16, other_modes_word1: u32) -> Vec<(u32, u32)> {
+    let other_modes = (0xef30_00f0, other_modes_word1);
+    vec![
+        other_modes,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xf700_0000, (color as u32) * 0x1_0001),
+        fill_rect(WIDTH - 1, HEIGHT - 1, 0, 0),
+        (0xe900_0000, 0),
+    ]
+}
+
+/// A one-cycle flat-shaded triangle pair with `other_modes_word1` set
+/// directly, over a `STALE`-seeded target.
+fn gen_one_cycle_coverage_mode(other_modes_word1: u32) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        (0xef00_00f0, other_modes_word1),
+        SET_COMBINE_PRIMITIVE,
+        (0xfa00_0000, 0x20c0_e0ff),
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.extend(flat_triangle_words(
+        TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM,
+    ));
+    words.extend(flat_triangle_words(
+        TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP,
+    ));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// Register the coverage-modes slice's cases into the generator corpus.
+fn push_coverage_mode_cases(
+    push: &mut impl FnMut(u8, String, &'static str, Vec<(u32, u32)>),
+) {
+    for (bits, label) in [
+        (0x000u32, "clamp"),
+        (0x100, "wrap"),
+        (0x200, "zap"),
+        (0x300, "save"),
+    ] {
+        push(
+            6,
+            format!("gen-coverage-cvgdest-{label}-fill"),
+            "cvg_dest selector x fill-cycle rectangle (fill bypasses cvg_dest; \
+             non-authoritative for RT64 per guard-audit C4-C6)",
+            gen_fill_coverage_mode(0xf801, bits),
+        );
+    }
+
+    for (bits, label) in [
+        (0x000u32, "clamp"),
+        (0x100, "wrap"),
+        (0x200, "zap"),
+        (0x300, "save"),
+    ] {
+        push(
+            6,
+            format!("gen-coverage-cvgdest-{label}-one-cycle"),
+            "cvg_dest selector x one-cycle flat triangle, AA off (full \
+             coverage in, destination-write policy under test)",
+            gen_one_cycle_coverage_mode(bits),
+        );
+    }
+
+    push(
+        6,
+        "gen-coverage-color-on-cvg-one-cycle".into(),
+        "CLR_ON_CVG with CVG_DST_WRAP: color write gated on coverage \
+         reaching full",
+        gen_one_cycle_coverage_mode(0x080 /* CLR_ON_CVG */ | 0x100 /* CVG_DST_WRAP */),
+    );
+
+    push(
+        6,
+        "gen-coverage-cvg-x-alpha-aa-one-cycle".into(),
+        "CVG_X_ALPHA with AA_EN: coverage-weighted alpha on an antialiased \
+         triangle edge",
+        gen_one_cycle_coverage_mode(0x1000 /* CVG_X_ALPHA */ | 0x8 /* AA_EN */),
+    );
+
+    push(
+        6,
+        "gen-coverage-force-blend-one-cycle".into(),
+        "FORCE_BL with IM_RD + CVG_DST_WRAP: general blender forced on over \
+         a one-cycle triangle",
+        gen_one_cycle_coverage_mode(
+            0x4000 /* FORCE_BL */ | 0x40 /* IM_RD */ | 0x100 /* CVG_DST_WRAP */
+                | (2 << 18), /* cycle-1 B = One */
+        ),
+    );
+
+    push(
+        6,
+        "gen-coverage-all-modes-combined-one-cycle".into(),
+        "AA_EN + CVG_DST_WRAP + CLR_ON_CVG + FORCE_BL together (matches the \
+         public G_RM_AA_XLU_SURF bit combination) over a one-cycle triangle",
+        gen_one_cycle_coverage_mode(
+            0x8 /* AA_EN */ | 0x100 /* CVG_DST_WRAP */ | 0x80 /* CLR_ON_CVG */
+                | 0x4000 /* FORCE_BL */ | 0x40 /* IM_RD, required for FORCE_BL's M/B reads */
+                | (2 << 18), /* cycle-1 B = One */
+        ),
+    );
+}
+
+// -----------------------------------------------------------------------
+// slice formats-deep
+// -----------------------------------------------------------------------
+//
+// The direct/CI texture formats sampled through a TEXTURED TRIANGLE rather
+// than a texture rectangle, reusing each format's proven texrect staging
+// (`one_direct_texture_rect`, `one_ci4_rect`, `one_ci8_rect`) but drawing
+// with [`textured_triangle_pair`] instead. Every case sets BI_LERP_0 except
+// IA/I formats, which are immune (their value already lives in the blue
+// channel the color-convert collapse preserves).
+
+/// A direct-format (IA8/IA4/IA16/I4/I8) texture sampled by a textured
+/// triangle instead of a texrect. Mirrors [`one_direct_texture_rect`]'s
+/// staging exactly; only the final draw command differs.
+fn direct_format_textured_triangle(
+    source: u32,
+    load_texels_16b: u32,
+    format: u32,
+    size: u32,
+    line_words: u32,
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (load_texels_16b - 1), source),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        load_tile(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        (
+            0xf500_0000 | (format << 21) | (size << 19) | (line_words << 9),
+            0,
+        ),
+        set_tile_size(TRI_RIGHT - TRI_LEFT, 1),
+    ]);
+    words.extend(textured_triangle_pair());
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// RGBA32 as a textured-triangle source. `bilerp`: whether BI_LERP_0 (mode
+/// word bit 11) is set. **The corrected case (`bilerp = true`) is the one to
+/// trust**; the `false` variant is kept only as the corpus's documented
+/// bilerp-gap witness for the triangle path, mirroring
+/// `gen-loadblock-linear-missing-bilerp`'s texrect-path witness.
+fn rgba32_textured_triangle(bilerp: bool) -> Vec<(u32, u32)> {
+    let width = RGBA32_EXPECTED.len() as u32; // 2
+    let other_modes = if bilerp {
+        (OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 11), OTHER_MODES_ONE_CYCLE_TEXTURED.1)
+    } else {
+        OTHER_MODES_ONE_CYCLE_TEXTURED
+    };
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        other_modes,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (3 << 19) | (width - 1), RGBA32_SOURCE),
+        (0xf500_0000 | (3 << 19) | (1 << 9), 0),
+        set_tile_size(width, 1),
+        (0xe600_0000, 0),
+        load_tile(width, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (3 << 19) | (1 << 9), 0),
+        set_tile_size(width, 1),
+    ]);
+    words.extend(textured_triangle_pair());
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// CI4+16-entry TLUT as a textured-triangle source, mirroring
+/// [`one_ci4_rect`]'s staging exactly; only the final draw differs.
+fn ci4_textured_triangle() -> Vec<(u32, u32)> {
+    let entries = PALETTE.len() as u32;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        (
+            OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15) | (1 << 11),
+            OTHER_MODES_ONE_CYCLE_TEXTURED.1,
+        ),
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (entries - 1), PALETTE_SOURCE),
+        (0xf500_0000 | (2 << 19) | PALETTE_TMEM_WORD, 1 << 24),
+        (0xe600_0000, 0),
+        (0xf000_0000, (1 << 24) | ((entries - 1) << 14)),
+        (0xe600_0000, 0),
+        (0xfd00_0000 | (2 << 19) | (CI_LOAD_TEXELS - 1), CI_SOURCE),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(CI_LOAD_TEXELS, 1),
+        (0xe600_0000, 0),
+        load_tile(CI_LOAD_TEXELS, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (2 << 21) | (0 << 19) | (1 << 9), 0),
+        set_tile_size(TRI_RIGHT - TRI_LEFT, 1),
+    ]);
+    words.extend(textured_triangle_pair());
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// CI8+256-entry TLUT as a textured-triangle source, mirroring
+/// [`one_ci8_rect`]'s staging exactly; only the final draw differs.
+fn ci8_textured_triangle() -> Vec<(u32, u32)> {
+    let entries = 256u32;
+    let load_texels_16b = CI8_INDICES.len() as u32 / 2;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        (
+            OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15) | (1 << 11),
+            OTHER_MODES_ONE_CYCLE_TEXTURED.1,
+        ),
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (entries - 1), CI8_PALETTE_SOURCE),
+        (0xf500_0000 | (2 << 19) | PALETTE_TMEM_WORD, 1 << 24),
+        (0xe600_0000, 0),
+        (0xf000_0000, (1 << 24) | ((entries - 1) << 14)),
+        (0xe600_0000, 0),
+        (0xfd00_0000 | (2 << 19) | (load_texels_16b - 1), CI8_SOURCE),
+        (0xf500_0000 | (2 << 19) | (1 << 9), 0),
+        set_tile_size(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        load_tile(load_texels_16b, 1),
+        (0xe600_0000, 0),
+        (0xf500_0000 | (2 << 21) | (1 << 19) | (1 << 9), 0),
+        set_tile_size(TRI_RIGHT - TRI_LEFT, 1),
+    ]);
+    words.extend(textured_triangle_pair());
+    words.push((0xe900_0000, 0));
+    words
+}
+
+// -----------------------------------------------------------------------
+// slice zbuffer
+// -----------------------------------------------------------------------
+//
+// Z-BUFFER matrix: SetOtherModes z_compare_en/z_update_en/z_source_sel,
+// SetMaskImage(0x3e) as an alternate z-image binding, and two overlapping
+// flat triangles at different depths so z-compare/z-update actually decide
+// which one's colour survives.
+//
+// Every case uses G_ZS_PRIM (`SetOtherModes` low-word bit 2) except case 5,
+// which uses G_ZS_PIXEL with an explicit per-triangle Z coefficient block.
+//
+// SetOtherModes bit layout (public libultra `gbi.h`):
+//   word1 bit 2       G_MDSFT_ZSRCSEL   0 = G_ZS_PIXEL, 1 = G_ZS_PRIM
+//   word1 bit 4       Z_CMP             z_compare_en
+//   word1 bit 5       Z_UPD             z_update_en
+//
+// SetZImage (0xfe) / SetMaskImage (0x3e): opcode in top byte of word0,
+// address in low 24 bits of word1 -- byte-identical wire handling in
+// angrylion (`rdp_set_depth_image` / `rdp_set_mask_image` both do
+// `wstate->zb_address = args[1] & 0x00ffffff`).
+//
+// **fn64 gap under test.** wgpu's raw-DPC decoder has no dispatch arm for
+// opcode 0x3e (own unit test asserts `UnsupportedCommand`). Case 6 below is
+// expected to make wgpu REFUSE while angrylion and RT64 accept and agree.
+
+const ZBUF_Z_IMAGE: u32 = 0x9000;
+
+/// `SetZImage` (opcode `0xfe`).
+const fn set_z_image(address: u32) -> (u32, u32) {
+    (0xfe00_0000, address & 0x00ff_ffff)
+}
+
+/// `SetMaskImage` (opcode `0x3e`), byte-identical wire shape to
+/// [`set_z_image`].
+const fn set_mask_image(address: u32) -> (u32, u32) {
+    (0x3e00_0000, address & 0x00ff_ffff)
+}
+
+/// `SetPrimDepth` (opcode `0xee`): word0 bare, word1 = `(z << 16) | delta_z`.
+const fn set_prim_depth(z: u16, delta_z: u16) -> (u32, u32) {
+    (0xee00_0000, ((z as u32) << 16) | (delta_z as u32))
+}
+
+/// `SetOtherModes` one-cycle word carrying the requested Z fields.
+const fn other_modes_one_cycle_z(z_source_prim: bool, z_compare_en: bool, z_update_en: bool) -> (u32, u32) {
+    let mut w1 = 0u32;
+    if z_source_prim {
+        w1 |= 1 << 2;
+    }
+    if z_compare_en {
+        w1 |= 1 << 4;
+    }
+    if z_update_en {
+        w1 |= 1 << 5;
+    }
+    (0xef00_00f0, w1)
+}
+
+const ZBUF_NEAR_COLOR: u32 = 0xff00_00ff; // opaque red, RGBA8888
+const ZBUF_FAR_COLOR: u32 = 0x00ff_00ff; // opaque green, RGBA8888
+
+/// One full frame exercising two overlapping flat triangles under
+/// G_ZS_PRIM: a "far" triangle (green) drawn first covering the whole TRI
+/// box, then a "near" triangle (red) drawn second over the identical box.
+fn zbuffer_overlap_case(
+    other_modes_word1: u32,
+    far_z: u16,
+    near_z: u16,
+    mask_image_instead_of_setzimage: bool,
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        if mask_image_instead_of_setzimage {
+            set_mask_image(ZBUF_Z_IMAGE)
+        } else {
+            set_z_image(ZBUF_Z_IMAGE)
+        },
+        (0xef00_00f0, other_modes_word1),
+        SET_COMBINE_PRIMITIVE,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.push(set_prim_depth(far_z, 0));
+    words.push((0xfa00_0000, ZBUF_FAR_COLOR));
+    words.extend(flat_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(flat_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push(set_prim_depth(near_z, 0));
+    words.push((0xfa00_0000, ZBUF_NEAR_COLOR));
+    words.extend(flat_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(flat_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// Case 1 / 2 builder: z_compare_en + z_update_en both on, G_ZS_PRIM.
+fn gen_zbuffer_compare_and_update(second_draw_z: u16, first_draw_z: u16) -> Vec<(u32, u32)> {
+    zbuffer_overlap_case(
+        other_modes_one_cycle_z(true, true, true).1,
+        first_draw_z,
+        second_draw_z,
+        false,
+    )
+}
+
+/// Case 3: z_compare_en OFF, G_ZS_PRIM.
+fn gen_zbuffer_compare_disabled(second_draw_z: u16, first_draw_z: u16) -> Vec<(u32, u32)> {
+    zbuffer_overlap_case(
+        other_modes_one_cycle_z(true, false, false).1,
+        first_draw_z,
+        second_draw_z,
+        false,
+    )
+}
+
+/// Case 4: z_compare_en ON, z_update_en OFF, G_ZS_PRIM -- the update-disabled
+/// twin of [`gen_zbuffer_compare_and_update`]'s "nearer wins" key.
+fn gen_zbuffer_update_disabled() -> Vec<(u32, u32)> {
+    zbuffer_overlap_case(other_modes_one_cycle_z(true, true, false).1, 0x8000, 0x4000, false)
+}
+
+/// Case 5: `z_source_sel` itself. G_ZS_PIXEL with an explicit per-pixel Z
+/// coefficient block on a raw `0x09` triangle, drawn OVER a G_ZS_PRIM
+/// triangle whose PrimDepth is farther everywhere in the box.
+fn gen_zbuffer_source_sel_pixel_wins() -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        set_z_image(ZBUF_Z_IMAGE),
+        SET_COMBINE_PRIMITIVE,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+    ]);
+    words.push((0xef00_00f0, other_modes_one_cycle_z(true, true, true).1));
+    words.push(set_prim_depth(0x8000, 0));
+    words.push((0xfa00_0000, ZBUF_FAR_COLOR));
+    words.extend(flat_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(flat_triangle_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push((0xef00_00f0, other_modes_one_cycle_z(false, true, true).1));
+    words.push((0xfa00_0000, ZBUF_NEAR_COLOR));
+    let z_words = |x_h: u32, x_l: u32, y_h: u32, y_l: u32, y_m: u32| -> Vec<(u32, u32)> {
+        let yl = ((y_l as i32) << 2) as u16 as u32;
+        let ym = ((y_m as i32) << 2) as u16 as u32;
+        let yh = ((y_h as i32) << 2) as u16 as u32;
+        vec![
+            (0x0900_0000 | (1 << 23) | yl, (ym << 16) | yh),
+            (x_l << 16, 0),
+            (x_h << 16, 0),
+            (x_l << 16, 0),
+            (2 << 16, 0), // z = 0x0002_0000, dzdx = 0
+            (0, 0),       // dzde = 0, dzdy = 0
+        ]
+    };
+    words.extend(z_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM));
+    words.extend(z_words(TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+/// Case 6: identical to case 1 except the z-image is bound with
+/// `SetMaskImage` (`0x3e`) instead of `SetZImage` (`0xfe`).
+fn gen_zbuffer_setmaskimage_binds_z_image() -> Vec<(u32, u32)> {
+    zbuffer_overlap_case(other_modes_one_cycle_z(true, true, true).1, 0x8000, 0x2000, true)
+}
+
+// -----------------------------------------------------------------------
+// slice loadblock-deep
+// -----------------------------------------------------------------------
+//
+// LOADBLOCK (0x33) DxT row-advance, sampled by TEXTURED TRIANGLES (not
+// texrects), across RGBA16 and CI8 sources.
+
+const LOADBLOCK_DEEP_RGBA16_SOURCE: u32 = 0x6000;
+const LOADBLOCK_DEEP_RGBA16_WIDTH: u32 = 8;
+
+const LOADBLOCK_DEEP_RGBA16_TEXELS: [u16; 32] = [
+    0xf801, 0x07c1, 0x003f, 0x7fff, 0x8421, 0xc631, 0x4211, 0xfc01,
+    0xf841, 0x0641, 0x0079, 0xffbf, 0x8461, 0xc671, 0x4251, 0xfc41,
+    0xf803, 0x07c3, 0x003d, 0x7ffd, 0x8423, 0xc633, 0x4213, 0xfc03,
+    0xf843, 0x0643, 0x007b, 0xffbd, 0x8463, 0xc673, 0x4253, 0xfc43,
+];
+
+/// A LoadBlock case over [`LOADBLOCK_DEEP_RGBA16_TEXELS`], sampled by a
+/// TEXTURED TRIANGLE rather than a texture rectangle.
+fn load_block_deep_triangle(
+    texel_count: u32,
+    dxt: u32,
+    load_line_words: u32,
+    render_width: u32,
+    render_height: u32,
+    render_line_words: u32,
+) -> Vec<(u32, u32)> {
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        OTHER_MODES_ONE_CYCLE_TEXTURED,
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(LOADBLOCK_DEEP_RGBA16_WIDTH, LOADBLOCK_DEEP_RGBA16_SOURCE),
+        (0xe800_0000, 0),
+        set_tile(load_line_words, 0),
+        (0xe600_0000, 0),
+        load_block(texel_count, dxt),
+        (0xe700_0000, 0),
+        set_tile(render_line_words, 0),
+        set_tile_size(render_width, render_height),
+    ]);
+
+    let s_base = PLANE_HALF_TEXEL;
+    let t_base = PLANE_HALF_TEXEL;
+    let x_left = 0u32;
+    let x_right = render_width;
+    let y_top = 0u32;
+    let y_bottom = render_height;
+
+    let triangle = |x_h: u32, x_l: u32, y_m: u32, s_at_h: i32| {
+        let yl = ((y_bottom as i32) << 2) as u16 as u32;
+        let ym = ((y_m as i32) << 2) as u16 as u32;
+        let yh = ((y_top as i32) << 2) as u16 as u32;
+        let base = [
+            (0x0a00_0000 | (1 << 23) | yl, (ym << 16) | yh),
+            (x_l << 16, 0),
+            (x_h << 16, 0),
+            (x_l << 16, 0),
+        ];
+        let texture = coefficient_block(
+            [s_at_h, t_base, 1, 0],
+            [PLANE_PER_TEXEL, 0, 0, 0],
+            [0, PLANE_PER_TEXEL, 0, 0],
+            [0, 0, 0, 0],
+        );
+        let mut w = base.to_vec();
+        for pair in texture.chunks_exact(2) {
+            w.push((pair[0], pair[1]));
+        }
+        w
+    };
+
+    words.extend(triangle(x_left, x_right, y_bottom, s_base));
+    let right_s = s_base + PLANE_PER_TEXEL * (x_right - x_left) as i32;
+    words.extend(triangle(x_right, x_left, y_top, right_s));
+
+    words.push((0xe900_0000, 0));
+    words
+}
+
+const LOADBLOCK_DEEP_CI8_SOURCE: u32 = 0x7000;
+
+const LOADBLOCK_DEEP_CI8_INDICES: [u8; 32] = [
+    0x03, 0x20, 0x55, 0x81, 0xa7, 0xc2, 0xe6, 0xf4,
+    0x10, 0x30, 0x60, 0x90, 0xb0, 0xd0, 0xf0, 0x01,
+    0x11, 0x31, 0x61, 0x91, 0xb1, 0xd1, 0xf1, 0x02,
+    0x12, 0x32, 0x62, 0x92, 0xb2, 0xd2, 0xf2, 0x04,
+];
+
+/// A LoadBlock case over CI8 indices, sampled by a TEXTURED TRIANGLE.
+fn load_block_ci8_deep_triangle(
+    source_addr: u32,
+    indices: &[u8],
+    texel_count: u32,
+    dxt: u32,
+    load_line_words: u32,
+    render_width: u32,
+    render_height: u32,
+    render_line_words: u32,
+) -> Vec<(u32, u32)> {
+    let entries = 256u32;
+    let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
+    words.pop();
+    words.extend([
+        (
+            OTHER_MODES_ONE_CYCLE_TEXTURED.0 | (1 << 15),
+            OTHER_MODES_ONE_CYCLE_TEXTURED.1,
+        ),
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        (0xfd00_0000 | (2 << 19) | (entries - 1), CI8_PALETTE_SOURCE),
+        (0xf500_0000 | (2 << 19) | PALETTE_TMEM_WORD, 1 << 24),
+        (0xe600_0000, 0),
+        (0xf000_0000, (1 << 24) | ((entries - 1) << 14)),
+        (0xe600_0000, 0),
+        (0xe800_0000, 0),
+        set_texture_image(texel_count / 2, source_addr),
+        set_tile(load_line_words, 0),
+        (0xe600_0000, 0),
+        load_block(texel_count, dxt),
+        (0xe700_0000, 0),
+        (0xf500_0000 | (2 << 21) | (1 << 19) | (render_line_words << 9), 0),
+        set_tile_size(render_width, render_height),
+    ]);
+
+    let _ = indices;
+
+    let s_base = PLANE_HALF_TEXEL;
+    let t_base = PLANE_HALF_TEXEL;
+    let x_right = render_width;
+    let y_bottom = render_height;
+
+    let triangle = |x_h: u32, x_l: u32, y_m: u32, s_at_h: i32| {
+        let yl = ((y_bottom as i32) << 2) as u16 as u32;
+        let ym = ((y_m as i32) << 2) as u16 as u32;
+        let yh = 0u32;
+        let base = [
+            (0x0a00_0000 | (1 << 23) | yl, (ym << 16) | yh),
+            (x_l << 16, 0),
+            (x_h << 16, 0),
+            (x_l << 16, 0),
+        ];
+        let texture = coefficient_block(
+            [s_at_h, t_base, 1, 0],
+            [PLANE_PER_TEXEL, 0, 0, 0],
+            [0, PLANE_PER_TEXEL, 0, 0],
+            [0, 0, 0, 0],
+        );
+        let mut w = base.to_vec();
+        for pair in texture.chunks_exact(2) {
+            w.push((pair[0], pair[1]));
+        }
+        w
+    };
+
+    words.extend(triangle(0, x_right, y_bottom, s_base));
+    let right_s = s_base + PLANE_PER_TEXEL * x_right as i32;
+    words.extend(triangle(x_right, 0, 0, right_s));
+
+    words.push((0xe900_0000, 0));
+    words
+}
+
 /// The first batch: ~30 highest-priority cases across the matrix.
 ///
 /// Priority order (brief): (1) LOADBLOCK, (2) triangle variants, (3) syncs,
@@ -3350,6 +4129,351 @@ fn generated_cases() -> Vec<GeneratedCase> {
     // reproduce the wgpu==RT64 vs angrylion divergence — documents the finding
     // as a live, reproducible corpus row.
     push(1, "gen-loadblock-linear-missing-bilerp".into(), "LoadBlock WITHOUT BI_LERP_0 (bilerp-gap witness)", load_block_textured_rect(8, 0, 2, 8, 1, 2));
+
+    // -------------------------------------------------------------------
+    // Track-B fan-out pass 1: designed slices.
+    // -------------------------------------------------------------------
+
+    // (5) Mode matrix -- BLENDER. P/A/M/B mux across the common real-ROM
+    // configurations: passthrough, alpha-blend over clr_mem, blend-color,
+    // fog-color, shade-alpha-driven, and coverage-driven blends. All draw a
+    // primitive- or shade-combined triangle pair over a GREEN memory seed
+    // with an opaque RED primitive/shade, so the visible outcome always
+    // distinguishes "used P" from "used M" from "mixed the two".
+    push(
+        5,
+        "gen-blender-passthrough".into(),
+        "blender P=Combined A=Combined M=Combined B=Zero (b==0 bypass): pure clr_in*1 passthrough, memory untouched by the blend math",
+        gen_blend_rect(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            blend_other_modes(0, 0, 0, 3, true, false),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-alpha-blend-over-mem".into(),
+        "blender P=Combined A=CombinedAlpha M=Framebuffer B=1-A: opaque-alpha combined color alpha-composited over clr_mem (opaque primitive -> full replace, exercises the clr_mem read path)",
+        gen_blend_rect(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            blend_other_modes(0, 0, 1, 0, true, true),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-blend-color-over-mem".into(),
+        "blender P=BlendColor A=CombinedAlpha M=Framebuffer B=1-A: SetBlendColor supplies P, composited over clr_mem with opaque combiner alpha",
+        gen_blend_rect_with_state_color(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            (0xf900_0000, 0x4080_c0ff),
+            blend_other_modes(2, 0, 1, 0, true, true),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-fog-color-over-mem".into(),
+        "blender P=FogColor A=CombinedAlpha M=Framebuffer B=1-A: SetFogColor supplies P, composited over clr_mem with opaque combiner alpha",
+        gen_blend_rect_with_state_color(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            (0xf800_0000, 0x2060_a0ff),
+            blend_other_modes(3, 0, 1, 0, true, true),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-shade-alpha-driven".into(),
+        "blender P=Combined(shade) A=ShadeAlpha M=Framebuffer B=1-A: a genuine fractional shade alpha (0x80/0xff) drives a real P/M mix rather than the 0/1 extremes",
+        gen_blend_rect_shade_alpha(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_SHADE_RGBA,
+            blend_other_modes(0, 2, 1, 0, true, true),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-coverage-driven".into(),
+        "blender P=Combined A=CombinedAlpha M=Framebuffer B=FramebufferCoverage/8: the AA/coverage-substituted-for-B path -- full interior coverage makes B=1, mixing P and M through the general divisor rather than either short-circuit branch",
+        gen_blend_rect(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            blend_other_modes(0, 0, 1, 1, true, true),
+        ),
+    );
+    push(
+        5,
+        "gen-blender-force-bl-off-selects-p".into(),
+        "FORCE_BL=0 (bit 14 clear): the last blend stage is bypassed and unconditionally selects P (BlendColor here), independent of A/M/B, exercising the non-blended one-cycle default every WM2000 opaque draw actually uses",
+        gen_blend_rect_with_state_color(
+            BLEND_MATRIX_MEMORY_SEED,
+            BLEND_MATRIX_PRIMITIVE_RGBA8888,
+            (0xf900_0000, 0x4080_c0ff),
+            blend_other_modes(2, 0, 0, 0, false, false),
+        ),
+    );
+
+    // (5) Alpha compare matrix -- threshold-compare and dither-compare, plus
+    // a disabled-bits control that proves the bits gate the test rather
+    // than the primitive alpha value alone suppressing output.
+    push(
+        5,
+        "gen-alpha-compare-threshold-pass".into(),
+        "alpha_compare_en=threshold (mode word1 bits1:0=1); prim alpha 0xff \
+         exceeds SetBlendColor's threshold 0x80, so the compare passes and \
+         the rectangle is written",
+        gen_alpha_compare_rect(1, 0xff, 0x80),
+    );
+    push(
+        5,
+        "gen-alpha-compare-threshold-reject".into(),
+        "alpha_compare_en=threshold; prim alpha 0x20 is below SetBlendColor's \
+         threshold 0x80, so every covered pixel fails the compare and the \
+         STALE background survives the whole rectangle",
+        gen_alpha_compare_rect(1, 0x20, 0x80),
+    );
+    push(
+        5,
+        "gen-alpha-compare-threshold-boundary-equal".into(),
+        "alpha_compare_en=threshold with prim alpha EQUAL to SetBlendColor's \
+         threshold (0x80==0x80), isolating hardware's exact boundary \
+         predicate (strictly-less-than rejects vs less-or-equal rejects) \
+         rather than assuming either",
+        gen_alpha_compare_rect(1, 0x80, 0x80),
+    );
+    push(
+        5,
+        "gen-alpha-compare-dither-forced-pass".into(),
+        "alpha_compare_en=dither (mode word1 bits1:0=3): compares combined \
+         alpha against a per-pixel pseudorandom noise value in [0,255] \
+         instead of a fixed threshold. Prim alpha is forced to the maximum \
+         0xff, which no possible noise sample in [0,255] exceeds, so the \
+         compare is deterministically a pass everywhere regardless of the \
+         dither seed a backend implements",
+        gen_alpha_compare_rect(3, 0xff, 0x00),
+    );
+    push(
+        5,
+        "gen-alpha-compare-dither-forced-reject".into(),
+        "alpha_compare_en=dither with prim alpha forced to the minimum \
+         0x00: any nonzero noise sample exceeds it, so the compare rejects \
+         almost everywhere. The single-noise-value-of-zero corner is the \
+         one pixel-level case a dither implementation's exact PRNG can \
+         disagree on; every other covered pixel is a deterministic reject",
+        gen_alpha_compare_rect(3, 0x00, 0x00),
+    );
+    push(
+        5,
+        "gen-alpha-compare-disabled-control".into(),
+        "alpha_compare_en=NONE (mode word1 bits1:0=0) with the SAME prim \
+         alpha (0x20) and threshold (0x80) as the threshold-reject case: \
+         proves the compare bits themselves gate rejection, not the low \
+         alpha value alone suppressing output -- with the unit disabled \
+         the rectangle must be written in full",
+        gen_alpha_compare_rect(0, 0x20, 0x80),
+    );
+
+    // (6) Coverage-modes matrix -- cvg_dest x color_on_cvg x cvg_x_alpha x
+    // force_blend, across fill and one-cycle rects. RT64-non-authoritative
+    // per guard-audit C4-C6 ("Coverage is not emulated"); angrylion is the
+    // sole judge for these rows.
+    push_coverage_mode_cases(&mut push);
+
+    // (6) Formats-deep -- direct/CI texture formats sampled by a TEXTURED
+    // TRIANGLE instead of a texture rectangle, reusing each format's proven
+    // texrect staging. IA/I formats are immune to the BI_LERP_0 collapse
+    // (their value already lives in the blue channel); RGBA32/CI4/CI8 all
+    // set BI_LERP_0.
+    push(
+        6,
+        "gen-triangle-ia8".into(),
+        "IA8 as a textured-triangle source (format=3,size=1,line=1)",
+        direct_format_textured_triangle(IA8_SOURCE, 8, 3, 1, 1),
+    );
+    push(
+        6,
+        "gen-triangle-ia4".into(),
+        "IA4 as a textured-triangle source (format=3,size=0,line=1), packed-nibble addressing through triangles",
+        direct_format_textured_triangle(IA4_SOURCE, 7, 3, 0, 1),
+    );
+    push(
+        6,
+        "gen-triangle-ia16".into(),
+        "IA16 as a textured-triangle source (format=3,size=2,line=2)",
+        direct_format_textured_triangle(IA16_SOURCE, 8, 3, 2, 2),
+    );
+    push(
+        6,
+        "gen-triangle-i4".into(),
+        "I4 as a textured-triangle source (format=4,size=0,line=1), packed-nibble intensity replication via triangles",
+        direct_format_textured_triangle(I4_SOURCE, 8, 4, 0, 1),
+    );
+    push(
+        6,
+        "gen-triangle-i8".into(),
+        "I8 as a textured-triangle source (format=4,size=1,line=1), byte-addressed intensity replication via triangles",
+        direct_format_textured_triangle(I8_SOURCE, 8, 4, 1, 1),
+    );
+    push(
+        6,
+        "gen-triangle-rgba32-bilerp".into(),
+        "RGBA32 as a textured-triangle source (bilerp corrected: BI_LERP_0 set so RGBA is not collapsed to blue)",
+        rgba32_textured_triangle(true),
+    );
+    push(
+        1,
+        "gen-triangle-rgba32-missing-bilerp".into(),
+        "RGBA32 textured triangle WITHOUT BI_LERP_0 (bilerp-gap witness, triangle path)",
+        rgba32_textured_triangle(false),
+    );
+    push(
+        6,
+        "gen-triangle-ci4-bilerp".into(),
+        "CI4+16-entry TLUT as a textured-triangle source (bilerp corrected), en_tlut bit set; expects palette lookup via triangle decode",
+        ci4_textured_triangle(),
+    );
+    push(
+        6,
+        "gen-triangle-ci8-bilerp".into(),
+        "CI8+256-entry TLUT as a textured-triangle source (bilerp corrected); expects sparse palette lookup via triangle decode",
+        ci8_textured_triangle(),
+    );
+
+    // (5) Z-buffer matrix -- z_compare_en / z_update_en / z_source_sel
+    // deciding which of two overlapping flat triangles survives, plus the
+    // SetMaskImage alternate z-image binding (priority 6, per the brief's
+    // own "(6) convert/key/maskimage" bucket).
+    push(
+        5,
+        "gen-zbuffer-nearer-wins".into(),
+        "z_compare_en+z_update_en on, G_ZS_PRIM: nearer (smaller Z) triangle drawn \
+         second over a farther one must win and paint red",
+        gen_zbuffer_compare_and_update(0x1000, 0x8000),
+    );
+    push(
+        5,
+        "gen-zbuffer-farther-loses".into(),
+        "z_compare_en+z_update_en on, G_ZS_PRIM: farther (larger Z) triangle drawn \
+         second over a nearer one must be REJECTED -- the first (nearer, green) \
+         triangle's colour survives",
+        gen_zbuffer_compare_and_update(0x8000, 0x1000),
+    );
+    push(
+        5,
+        "gen-zbuffer-compare-disabled".into(),
+        "z_compare_en off, G_ZS_PRIM: depth never gates the write, so the \
+         second-drawn triangle (nominally farther, Z=0x8000) wins purely by \
+         draw order over the first (Z=0x1000) -- painter's-order behaviour",
+        gen_zbuffer_compare_disabled(0x8000, 0x1000),
+    );
+    push(
+        5,
+        "gen-zbuffer-update-disabled".into(),
+        "z_compare_en on, z_update_en off, G_ZS_PRIM: the twin of \
+         gen-zbuffer-nearer-wins with the same far/near Z pair but update \
+         disabled, so the first triangle's depth is never committed and the \
+         second compares against the freshly-staged (zeroed) z-image instead -- \
+         a backend that ignores z_update_en renders this identically to the \
+         compare-and-update twin, which is the defect signal",
+        gen_zbuffer_update_disabled(),
+    );
+    push(
+        5,
+        "gen-zbuffer-source-sel-pixel-wins".into(),
+        "z_source_sel: a G_ZS_PIXEL raw triangle (opcode 0x09, explicit per-pixel \
+         Z coefficient block) drawn over a farther G_ZS_PRIM triangle must win \
+         under z_compare_en, proving compare read the coefficient-block Z and \
+         not a stale PrimDepth register",
+        gen_zbuffer_source_sel_pixel_wins(),
+    );
+    push(
+        6,
+        "gen-zbuffer-setmaskimage-binds-z-image".into(),
+        "SetMaskImage (0x3e) as an alternate z-image binding, otherwise identical \
+         to gen-zbuffer-nearer-wins. EXPECTED wgpu-refused: wgpu's raw-DPC \
+         decoder has no dispatch arm for 0x3e (own unit test asserts \
+         UnsupportedCommand) -- a real fn64 gap, logged here rather than fixed, \
+         since angrylion and RT64 both treat 0x3e as a plain SetZImage alias.",
+        gen_zbuffer_setmaskimage_binds_z_image(),
+    );
+
+    // (1) Loadblock-deep -- LOADBLOCK DxT row-advance sampled by TEXTURED
+    // TRIANGLES (not texrects), across RGBA16 and CI8 sources, including
+    // non-power-of-two DXT values that cross the 0x800 accumulator on a
+    // fractional word boundary.
+    push(
+        1,
+        "gen-loadblock-deep-rgba16-dxt400-triangle".into(),
+        "LOADBLOCK 0x33 RGBA16, DXT=0x400 crossing 0x800 three times over four \
+         rows, sampled by a textured TRIANGLE (bilerp corrected)",
+        set_bilerp0(load_block_deep_triangle(32, 0x400, 2, 8, 4, 2)),
+    );
+    push(
+        1,
+        "gen-loadblock-deep-rgba16-dxt800-triangle".into(),
+        "LOADBLOCK 0x33 RGBA16, DXT=0x800 advances every word (max stride), \
+         sampled by a textured TRIANGLE (bilerp corrected)",
+        set_bilerp0(load_block_deep_triangle(16, 0x800, 1, 4, 4, 1)),
+    );
+    push(
+        1,
+        "gen-loadblock-deep-rgba16-dxt-fractional-triangle".into(),
+        "LOADBLOCK 0x33 RGBA16, DXT=0x300 crosses the 0x800 accumulator on a \
+         fractional-word boundary, sampled by a textured TRIANGLE (bilerp \
+         corrected)",
+        set_bilerp0(load_block_deep_triangle(24, 0x300, 3, 8, 3, 2)),
+    );
+    push(
+        1,
+        "gen-loadblock-deep-ci8-dxt400-triangle".into(),
+        "LOADBLOCK 0x33 CI8, DXT=0x400 row-advance at the CI8 (8 texels/word) \
+         cadence, sampled by a textured TRIANGLE (bilerp corrected)",
+        set_bilerp0(load_block_ci8_deep_triangle(
+            LOADBLOCK_DEEP_CI8_SOURCE,
+            &LOADBLOCK_DEEP_CI8_INDICES,
+            32,
+            0x400,
+            2,
+            16,
+            2,
+            2,
+        )),
+    );
+    push(
+        1,
+        "gen-loadblock-deep-ci8-dxt800-triangle".into(),
+        "LOADBLOCK 0x33 CI8, DXT=0x800 advances every word (8 texels/row), \
+         sampled by a textured TRIANGLE (bilerp corrected)",
+        set_bilerp0(load_block_ci8_deep_triangle(
+            LOADBLOCK_DEEP_CI8_SOURCE,
+            &LOADBLOCK_DEEP_CI8_INDICES,
+            16,
+            0x800,
+            1,
+            8,
+            2,
+            1,
+        )),
+    );
+    push(
+        1,
+        "gen-loadblock-deep-ci8-dxt-fractional-triangle".into(),
+        "LOADBLOCK 0x33 CI8, DXT=0x600 crosses the 0x800 accumulator on a \
+         fractional-word boundary at the CI8 cadence, sampled by a textured \
+         TRIANGLE (bilerp corrected)",
+        set_bilerp0(load_block_ci8_deep_triangle(
+            LOADBLOCK_DEEP_CI8_SOURCE,
+            &LOADBLOCK_DEEP_CI8_INDICES,
+            24,
+            0x600,
+            2,
+            12,
+            2,
+            2,
+        )),
+    );
+
 
     cases
 }
