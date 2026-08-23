@@ -2678,6 +2678,126 @@ fn wgpu_outcome(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The default path to the external angrylion bit-accurate RDP oracle.
+///
+/// angrylion-rdp-plus is MAME-licensed. It lives OUTSIDE fn64 and is invoked
+/// only as an external process; nothing from it is linked or vendored, and
+/// this runner never depends on it at build time. If the binary is absent the
+/// leg is skipped (fail-open), never a build or test failure.
+const ANGRYLION_ORACLE_DEFAULT: &str = "/Users/jer/Code/angrylion-oracle/oracle";
+const ANGRYLION_ORACLE_ENV: &str = "FN64_ANGRYLION_ORACLE";
+
+/// Sentinel a skipped angrylion leg returns instead of an error, so a missing
+/// oracle never turns a wgpu-vs-RT64 verdict into a failure.
+const ANGRYLION_SKIPPED: &str = "angrylion-oracle-skipped";
+
+/// angrylion's committed guest framebuffer -- BIT-ACCURATE hardware ground
+/// truth, produced by shelling out to the external oracle binary.
+///
+/// **Byte domain.** angrylion's RDP core applies exactly fn64's storage lane
+/// XORs: `BYTE_ADDR_XOR = 3` (byte reads), `WORD_ADDR_XOR = 1` (halfword
+/// reads, i.e. fn64's `^2` on a u16), and no XOR on 32-bit word reads/command
+/// fetch. So the runner's `seeded()` storage image is already in angrylion's
+/// native RDRAM domain, on BOTH the texture-read side and the framebuffer-
+/// write side, and no re-swizzle is applied in either direction: the oracle's
+/// raw framebuffer bytes are compared directly against `observation_bytes`.
+/// Verified: a `0xf801` fill returns all-`0xf801`, and a two-colour probe
+/// (green drawn at x=1 over red) places green at raw slot 0 (`0 ^ 1 = 1`) --
+/// the same slot fn64 stores logical pixel 1 in.
+///
+/// **The whole seeded image is handed to the oracle**, not just the commands.
+/// A textured draw reads texture source memory the command stream never wrote;
+/// seeding only the commands (the oracle's original mode) makes angrylion read
+/// texel 0 everywhere and every textured case reports a spurious disagreement.
+/// So the runner writes `seeded(commands)` to a temp file and invokes the
+/// oracle's `--rdram` mode with the `[COMMAND_START, command_end)` byte range,
+/// so angrylion renders from byte-identical guest memory to wgpu and RT64.
+///
+/// Missing binary -> `Err(ANGRYLION_SKIPPED)`, a skip sentinel the caller
+/// treats as "no reading", not as a defect.
+fn angrylion_bytes(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
+    let oracle = std::env::var(ANGRYLION_ORACLE_ENV)
+        .unwrap_or_else(|_| ANGRYLION_ORACLE_DEFAULT.to_string());
+    if !std::path::Path::new(&oracle).exists() {
+        return Err(ANGRYLION_SKIPPED.to_string());
+    }
+
+    // The full guest memory image every backend renders from: STALE
+    // background, GUARDs, staged texture sources, and the command words at
+    // COMMAND_START -- byte-identical to what wgpu and RT64 receive.
+    let rdram = seeded(commands);
+
+    let dir = std::env::temp_dir();
+    let unique = format!(
+        "{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let cmds_path = dir.join(format!("fn64-angrylion-rdram-{unique}.bin"));
+    let out_path = dir.join(format!("fn64-angrylion-out-{unique}.bin"));
+
+    std::fs::write(&cmds_path, &rdram)
+        .map_err(|error| format!("angrylion: writing RDRAM image: {error}"))?;
+
+    let cleanup = |cmds: &std::path::Path, out: &std::path::Path| {
+        let _ = std::fs::remove_file(cmds);
+        let _ = std::fs::remove_file(out);
+    };
+
+    let status = std::process::Command::new(&oracle)
+        .arg("--rdram")
+        .arg(&cmds_path)
+        .arg(format!("{COMMAND_START:x}"))
+        .arg(format!("{:x}", command_end(commands)))
+        .arg(format!("{FRAMEBUFFER:x}"))
+        .arg(WIDTH.to_string())
+        .arg(HEIGHT.to_string())
+        .arg("2")
+        .arg(&out_path)
+        .output();
+
+    let output = match status {
+        Ok(output) => output,
+        Err(error) => {
+            cleanup(&cmds_path, &out_path);
+            return Err(format!("angrylion: spawning oracle: {error}"));
+        }
+    };
+    if !output.status.success() {
+        cleanup(&cmds_path, &out_path);
+        return Err(format!(
+            "angrylion: oracle exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let bytes = match std::fs::read(&out_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            cleanup(&cmds_path, &out_path);
+            return Err(format!("angrylion: reading framebuffer: {error}"));
+        }
+    };
+    cleanup(&cmds_path, &out_path);
+
+    if bytes.len() < FRAMEBUFFER_BYTES as usize {
+        return Err(format!(
+            "angrylion: oracle wrote {} bytes, fewer than the declared {FRAMEBUFFER_BYTES}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes[..FRAMEBUFFER_BYTES as usize].to_vec())
+}
+
+/// Whether an angrylion result is the skip sentinel rather than a real answer.
+fn angrylion_is_skipped(outcome: &Result<Vec<u8>, String>) -> bool {
+    matches!(outcome, Err(message) if message == ANGRYLION_SKIPPED)
+}
+
 /// The hand-derived key, materialised in the same guest byte order the
 /// backends' observations are read in.
 fn key_bytes(case: &Case) -> Vec<u8> {
@@ -3003,6 +3123,26 @@ fn captured_row() -> Value {
 }
 
 fn run() -> Value {
+    // Debug hatch: FN64_DUMP_CASE=<name> writes that case's seeded RDRAM image
+    // to <name>.rdram.bin and its command words to stderr, then exits. Used to
+    // reproduce a single case through the standalone oracle while iterating on
+    // the angrylion byte domain. Never on in normal runs.
+    if let Ok(target) = std::env::var("FN64_DUMP_CASE") {
+        for case in cases() {
+            if case.name == target {
+                let rdram = seeded(&case.commands);
+                let path = format!("/tmp/{}.rdram.bin", case.name);
+                std::fs::write(&path, &rdram).unwrap();
+                eprintln!("wrote {path}");
+                eprintln!("cmd_start=0x{COMMAND_START:x} cmd_end=0x{:x}", command_end(&case.commands));
+                for (i, (w0, w1)) in case.commands.iter().enumerate() {
+                    eprintln!("  [{i:2}] {w0:#010x} {w1:#010x}  op={:#04x}", w0 >> 24);
+                }
+                return json!({"dumped": case.name});
+            }
+        }
+        return json!({"error": "case not found"});
+    }
     let mut rows = Vec::new();
     let mut authoritative = Tally::default();
     let mut non_authoritative = Tally::default();
@@ -3012,6 +3152,21 @@ fn run() -> Value {
         let rt64 = rt64_bytes(&case.commands);
         let wgpu = wgpu_outcome(&case.commands);
         let reference = reference_outcome(&case.commands);
+        let angrylion = angrylion_bytes(&case.commands);
+
+        // angrylion is bit-accurate ground truth. Classify each backend's
+        // agreement with it (when it produced a reading) so the report carries
+        // the truth partition directly, not only the wgpu-vs-RT64 differential.
+        let agrees_with_angrylion = |outcome: &Result<Vec<u8>, String>| -> Value {
+            match (&angrylion, outcome) {
+                (Ok(truth), Ok(bytes)) => json!(pixels(truth) == pixels(bytes)),
+                _ => Value::Null,
+            }
+        };
+        let angrylion_matches_key = match &angrylion {
+            Ok(bytes) => json!(pixels(bytes) == key),
+            Err(_) => Value::Null,
+        };
 
         let verdict = Verdict::of(&rt64, &wgpu);
         match case.authority {
@@ -3106,6 +3261,7 @@ fn run() -> Value {
                 "rt64": read(&rt64),
                 "wgpu": read(&wgpu),
                 "reference": read(&reference),
+                "angrylion": read(&angrylion),
             })
         };
 
@@ -3125,9 +3281,17 @@ fn run() -> Value {
             "rt64": outcome_wire(&rt64),
             "wgpu": outcome_wire(&wgpu),
             "reference": outcome_wire(&reference),
+            "angrylion": if angrylion_is_skipped(&angrylion) {
+                json!("skipped")
+            } else {
+                outcome_wire(&angrylion)
+            },
             "rt64_matches_key": matches_key(&rt64),
             "wgpu_matches_key": matches_key(&wgpu),
             "reference_matches_key": matches_key(&reference),
+            "angrylion_matches_key": angrylion_matches_key,
+            "wgpu_agrees_with_angrylion": agrees_with_angrylion(&wgpu),
+            "rt64_agrees_with_angrylion": agrees_with_angrylion(&rt64),
         }));
     }
 
