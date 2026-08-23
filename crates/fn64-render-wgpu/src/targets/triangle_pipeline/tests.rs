@@ -341,6 +341,19 @@ fn compute_raster_rgba16_round_trip_wgsl_parses_and_validates() {
 }
 
 #[test]
+fn compute_triangle_coverage_wgsl_parses_and_validates() {
+    let module =
+        naga::front::wgsl::parse_str(crate::shader_manifest::COMPUTE_TRIANGLE_COVERAGE_WGSL)
+            .unwrap();
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
 fn combined_fragment_wgsl_reuses_color_combiner_wgsl_byte_for_byte() {
     let source = crate::shader_manifest::triangle_pipeline_fragment_wgsl();
     assert!(source.starts_with(crate::combiner::COLOR_COMBINER_WGSL));
@@ -1955,6 +1968,85 @@ mod host_gpu_tests {
                 .round_trip_compute_raster_rgba16(extent, &resident_bytes)
                 .expect("dynamic packed-RGBA16 target must round-trip");
             assert_eq!(output, resident_bytes, "extent {extent:?}");
+        }
+    }
+
+    fn coverage_triangle(edges: crate::wire_words::EdgeWords) -> crate::RawTriangle {
+        let bytes = edges.bytes(crate::wire_words::RAW_TRIANGLE_BASE_EDGE);
+        crate::RawTriangle::decode(crate::wire_words::RAW_TRIANGLE_BASE_EDGE, &bytes)
+            .expect("coverage fixture is one complete base-edge triangle")
+    }
+
+    #[test]
+    fn required_host_compute_triangle_coverage_matches_the_cpu_oracle_ten_times() {
+        let mut renderer = tlut_renderer();
+        let extent = TriangleTargetExtent {
+            width: 96,
+            height: 32,
+        };
+        let raw = [
+            // Live WM2000 title-scene edge coefficients. This exercises a
+            // large negative slope product and the proven left-major bit.
+            coverage_triangle(crate::wire_words::EdgeWords {
+                lft: true,
+                yl: 106,
+                ym: 106,
+                yh: 17,
+                xl: 6_832_128,
+                dxldy: -16_842_729,
+                xh: 770_048,
+                dxhdy: 0,
+                xm: 701_940,
+                dxmdy: 272_435,
+                ..crate::wire_words::EdgeWords::zeroed()
+            }),
+            coverage_triangle(crate::wire_words::EdgeWords {
+                lft: true,
+                yl: 64,
+                ym: 32,
+                yh: -3,
+                xl: 22 << 16,
+                dxldy: -(1 << 15),
+                xh: 2 << 16,
+                dxhdy: 1 << 14,
+                xm: 10 << 16,
+                dxmdy: 1 << 15,
+                ..crate::wire_words::EdgeWords::zeroed()
+            }),
+            coverage_triangle(crate::wire_words::EdgeWords {
+                lft: false,
+                yl: 79,
+                ym: 40,
+                yh: 5,
+                xl: 3 << 16,
+                dxldy: 1 << 15,
+                xh: 25 << 16,
+                dxhdy: -(1 << 14),
+                xm: 8 << 16,
+                dxmdy: -(1 << 15),
+                ..crate::wire_words::EdgeWords::zeroed()
+            }),
+        ];
+        let device_triangles: Vec<_> = raw
+            .iter()
+            .copied()
+            .map(ComputeCoverageTriangle::from_raw)
+            .collect();
+        let mut expected = Vec::new();
+        for triangle in &raw {
+            for y in 0..extent.height as i32 {
+                for x in 0..extent.width as i32 {
+                    expected.push(crate::raw_dpc::triangle_span::pixel_coverage(
+                        triangle, x, y,
+                    ));
+                }
+            }
+        }
+        for run in 1..=10 {
+            let actual = renderer
+                .compute_triangle_coverage(extent, &device_triangles)
+                .expect("integer coverage compute must complete");
+            assert_eq!(actual, expected, "coverage differential run {run}");
         }
     }
 
