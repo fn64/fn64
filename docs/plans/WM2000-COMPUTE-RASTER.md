@@ -247,6 +247,17 @@ status and target readbacks for every draw. Persistent high-water resources are
 therefore the next independently measured mechanism; this result does not yet
 credit the compute path with an end-to-end live-frame win.
 
+The second isolated optimization retained one high-water set of those nine
+buffers and its two bind groups. A required Metal differential proves ten
+identical submissions create exactly one resource generation. On the same
+two-warmup, ten-repeat game window, all 500 draws again matched and the effect
+digest remained `1ac409f336397652`; mean compute-probe time fell from 22.267 ms
+to 16.556 ms (-5.711 ms, 25.6%), and mean total window time fell from 39.396 ms
+to 33.714 ms (-5.682 ms, 14.4%). The remaining probe still performs 50 ordered
+submit/wait/status-map/target-map cycles and uploads the complete target and
+TMEM for each call. Packet-local compatible batching is now the selected
+mechanism; resource reuse alone is retained but is not a production A/B.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
