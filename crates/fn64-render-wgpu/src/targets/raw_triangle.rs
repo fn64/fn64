@@ -63,14 +63,16 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use super::texrect::{
-    admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
-    TexrectBlendRegisters, TexrectCombinerEvaluation, TexrectExecutionError, TexrectFragmentStages,
-    TexrectShading, TexrectTileBinding,
+    admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel,
+    combine_one_texel_prepared_two_cycle, require_blendable_mode, TexrectBlendRegisters,
+    TexrectCombinerEvaluation, TexrectExecutionError, TexrectFragmentStages, TexrectShading,
+    TexrectTileBinding,
 };
 use super::{
     CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
     TargetError, TargetRectangle,
 };
+use crate::combiner::PreparedTwoCycleCombiner;
 use crate::raw_dpc::{triangle_span, RawTriangle};
 use crate::tmem::{
     sample_point, PointSampleCoordinates, PointSampleRequest, TextureCoordinateS10_5,
@@ -474,6 +476,28 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         })
     }
 
+    fn prepared_combiner_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("FN64_PREPARED_TRIANGLE_COMBINER") {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => {
+                panic!("FN64_PREPARED_TRIANGLE_COMBINER must be exactly 0 or 1, got {value:?}")
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(error) => {
+                panic!("FN64_PREPARED_TRIANGLE_COMBINER is not valid Unicode: {error}")
+            }
+        })
+    }
+
+    let prepared_two_cycle = match evaluation {
+        TexrectCombinerEvaluation::TwoCycle if prepared_combiner_enabled() => {
+            Some(PreparedTwoCycleCombiner::new(shading.combine()))
+        }
+        _ => None,
+    };
+
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
     let contiguous_rows = rows
         .windows(2)
@@ -522,6 +546,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     blend_state,
                     stages,
                     evaluation,
+                    prepared_two_cycle,
                     None,
                     y,
                 )
@@ -543,6 +568,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         blend_state,
         stages,
         evaluation,
+        prepared_two_cycle,
         depth,
         0,
     )
@@ -564,6 +590,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
+    prepared_two_cycle: Option<PreparedTwoCycleCombiner>,
     mut depth: Option<RawTriangleDepth<'_>>,
     base_y: u32,
 ) -> Result<(), TexrectExecutionError> {
@@ -847,7 +874,10 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             if !passes_depth {
                 continue;
             }
-            let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
+            let combined = match prepared_two_cycle {
+                Some(prepared) => combine_one_texel_prepared_two_cycle(prepared, inputs, texel),
+                None => combine_one_texel(shading.combine(), inputs, texel, evaluation),
+            };
             let offset =
                 ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
