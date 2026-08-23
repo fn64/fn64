@@ -487,8 +487,8 @@ impl PhysicalTmemPacketTransaction {
     ///   reports *its* identity, so `binding.next_generation` is claimed
     ///   exactly once, by the one seal.
     /// - **No new digest.** The prefix's reads answer with the sealed
-    ///   transaction's own `proposal_identity`, the same value
-    ///   `validate_proposal` recomputes at both publication routes.
+    ///   transaction's own `proposal_identity`. The move-only transaction's
+    ///   private immutable fields keep that identity bound to its post-image.
     ///
     /// A prefix therefore cannot publish, cannot advance anything, and
     /// cannot outlive the seal it names -- [`PendingTmemPrefixImage`] holds
@@ -799,8 +799,8 @@ impl PendingTmemTransaction {
     ///    `PhysicalTmemState`. `into_physical_successor` and
     ///    `PhysicalTmemPublicationAuthority::publish` remain the only two
     ///    routes to a durable post-image, with every base-state,
-    ///    generation, epoch, effect-report and `validate_proposal` check
-    ///    they already ran, unchanged and in the same order.
+    ///    generation, epoch and effect-report checks they already ran,
+    ///    unchanged and in the same order.
     /// 2. **No forged snapshot identity.** Reads through this view answer
     ///    with `TmemSnapshotIdentity::Proposed`, never `Committed`. A
     ///    pending post-image genuinely has no durable `(state, generation)`
@@ -811,16 +811,14 @@ impl PendingTmemTransaction {
     ///    forgery the committed/pending split prevents, so the type system
     ///    prevents it instead of a convention.
     /// 3. **No effect-report participation.** Reading is not a write.
-    ///    Nothing observed here enters `proposed_effects`, so
-    ///    `validate_proposal`'s recomputation and
-    ///    `validate_backend_effects`' supersequence walk see exactly what
-    ///    they saw before this method existed.
+    ///    Nothing observed here enters `proposed_effects`, so the sealed
+    ///    proposal and `validate_backend_effects`' supersequence walk see
+    ///    exactly what they saw before this method existed.
     ///
     /// The proposal digest the view reports is this transaction's own
     /// `proposal_identity`, so a recorded pending read names the exact
-    /// proposal content it observed -- and `validate_proposal` recomputes
-    /// that digest at both publication routes, so a read cannot be
-    /// attributed to a proposal that has since changed.
+    /// proposal content it observed. The sealed transaction cannot change
+    /// afterward, so a read cannot be attributed to a different proposal.
     pub fn pending_image(&self) -> PendingTmemImage<'_> {
         PendingTmemImage { pending: self }
     }
@@ -874,12 +872,14 @@ impl PendingTmemTransaction {
     /// (`CrossStatePublication`/`StaleBaseGeneration`/`StaleLoadEpoch`),
     /// then an exact match between `effects`' declared writes and this
     /// transaction's own proposed effects -- same access, same order, no
-    /// extra or missing write (`BackendEffectMismatch`) -- then
-    /// self-consistency (`validate_proposal`) last, exactly as `publish`
-    /// orders its own final check. No `GuestCommittedTicket`/
-    /// `GpuCompleteTicket` receipt is consulted or required: this method
-    /// exists to hand a backend a durable-shaped candidate before any guest
-    /// commit exists, not to publish one.
+    /// extra or missing write (`BackendEffectMismatch`). The proposal's
+    /// internal consistency was established by its only constructor and its
+    /// fields remain private and immutable, so the successor path does not
+    /// hash every projected byte a second time. Diagnostic runs can restore
+    /// that redundant audit with `FN64_REVALIDATE_SEALED_TMEM=1`. No
+    /// `GuestCommittedTicket`/`GpuCompleteTicket` receipt is consulted or
+    /// required: this method exists to hand a backend a durable-shaped
+    /// candidate before any guest commit exists, not to publish one.
     pub fn into_physical_successor(
         self,
         base: &PhysicalTmemState,
@@ -904,7 +904,9 @@ impl PendingTmemTransaction {
             });
         }
         validate_backend_effects(effects.writes(), &self.effects)?;
-        validate_proposal(&self)?;
+        if revalidate_sealed_tmem_enabled() {
+            validate_proposal(&self)?;
+        }
 
         let identity = NEXT_PHYSICAL_TMEM_STATE_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -971,7 +973,7 @@ impl fmt::Debug for TmemPrefixSnapshot {
 /// Reads answer from the *prefix's* arrays -- what TMEM held at that stream
 /// position -- while the reported snapshot identity is the sealed
 /// transaction's own [`ProposedTmemImageIdentity`], because that is the one
-/// proposal in existence and the one `validate_proposal` recomputes. The
+/// sealed proposal in existence. The
 /// prefix is a position inside that proposal, not a rival to it.
 #[derive(Debug)]
 pub(crate) struct PendingTmemPrefixImage<'pending> {
@@ -2105,6 +2107,19 @@ fn validate_proposal(pending: &PendingTmemTransaction) -> Result<(), PhysicalTme
         return Err(PhysicalTmemError::ProposalMismatch);
     }
     Ok(())
+}
+
+fn revalidate_sealed_tmem_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_REVALIDATE_SEALED_TMEM") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            panic!("FN64_REVALIDATE_SEALED_TMEM must be exactly 0 or 1, got {value:?}")
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("FN64_REVALIDATE_SEALED_TMEM is not valid Unicode: {error}"),
+    })
 }
 
 fn validate_gpu(

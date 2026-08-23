@@ -3219,8 +3219,9 @@ fn stage_and_report(
     // 2. `PhysicalTmemBinding`'s single `next_generation` is claimed once,
     //    by that one seal. A prefix claims no generation.
     // 3. `proposal_identity` is computed once over the whole projection and
-    //    effect list, and `validate_proposal` recomputes that same digest at
-    //    both publication routes. A prefix read reports it verbatim.
+    //    effect list. A prefix read reports it verbatim; the move-only sealed
+    //    transaction prevents later mutation, while the diagnostic audit can
+    //    recompute it when explicitly armed.
     // 4. The TMEM loop and `stage_color_commands` remain sequential PHASES.
     //    `capture_prefix` copies `bytes`/`valid` out during the load loop --
     //    it is a read, it cannot fail, and it touches no registry -- so
@@ -4733,8 +4734,9 @@ fn texrect_scissor_or_full_target(
 /// - **No publication.** This borrows the transaction and copies bytes out.
 ///   It cannot commit, cannot advance a generation, and cannot produce a
 ///   `PhysicalTmemState`. `into_physical_successor` still runs afterwards
-///   with every base-state, generation, epoch and `validate_proposal` check
-///   unchanged and in the same order, and if it rejects, this packet's
+///   with every base-state, generation, epoch and backend-effect check, and
+///   the sealed-proposal revalidation remains available diagnostically. If
+///   any check rejects, this packet's
 ///   `execute_raw_dpc` returns `Err` and no draw output is stored -- the
 ///   pixels never become observable.
 /// - **No forged snapshot identity.** Verified, not trusted: both
@@ -4743,9 +4745,9 @@ fn texrect_scissor_or_full_target(
 ///   `Committed` in `PendingTmemImage`'s impl passed the entire suite before
 ///   `execute_scheduled_texrect`'s equivalent check existed.
 /// - **No effect-report participation.** Reading is not a write. Nothing
-///   projected here enters `proposed_effects`, so `validate_proposal`'s
-///   recomputation and `validate_backend_effects`' supersequence walk see
-///   exactly what they saw before.
+///   projected here enters `proposed_effects`, so the sealed proposal and
+///   `validate_backend_effects`' supersequence walk see exactly what they saw
+///   before.
 ///
 /// Nonclaim: the returned `TmemGpuProjection` carries bytes, not identity.
 /// It is not a receipt and nothing downstream may read a publication out of

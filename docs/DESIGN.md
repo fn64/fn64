@@ -392,9 +392,12 @@ coordinator's active slot to it. It runs the identical three ordinal checks
 `PhysicalTmemPublicationAuthority::publish` runs
 (`CrossStatePublication`/`StaleBaseGeneration`/`StaleLoadEpoch`), then a new
 `BackendEffectMismatch` check that the backend report's declared writes
-exactly match this transaction's own proposed effects, then
-`validate_proposal` self-consistency last -- the same order `publish` itself
-uses.
+exactly match this transaction's own proposed effects. The move-only pending
+transaction's only constructor establishes its internal projection/digest
+consistency and its fields stay private and immutable, so this successor path
+does not re-hash the same projected bytes. `FN64_REVALIDATE_SEALED_TMEM=1`
+restores that redundant audit for diagnostic runs; it does not relax any
+base-state or externally supplied backend-effect check.
 
 T3 Phase B adds `fn64-render-wgpu`'s `production` module: a concrete
 `WgpuBackend` owning `fn64_render::RawDpcCoordinator<PhysicalTmemState>`,
