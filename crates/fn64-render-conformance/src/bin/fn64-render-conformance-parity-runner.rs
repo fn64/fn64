@@ -3210,6 +3210,34 @@ fn primitive_rgba8888(color: u16) -> u32 {
     (expand(r5) << 24) | (expand(g5) << 16) | (expand(b5) << 8) | 0xff
 }
 
+/// Set `BI_LERP_0` (SetOtherModes word0 bit 11) on every one-cycle textured
+/// SetOtherModes in the stream.
+///
+/// **This corrects a corpus-wide fixture gap the angrylion leg surfaced.** The
+/// hand corpus's `OTHER_MODES_ONE_CYCLE_TEXTURED = 0xef0000f0` leaves bit 11
+/// clear. Bit-accurate hardware (angrylion) then routes an RGBA texel through
+/// the colour-convert/YUV unit — with zero SetConvert coefficients that
+/// collapses every channel to the texel's blue channel (grayscale). wgpu and
+/// RT64 both ignore the missing bit and pass the full RGBA texel through, so
+/// they agree with the hand key yet diverge from hardware. IA/I textures are
+/// unaffected because their value already lives in the blue channel. Proven by
+/// instrumenting angrylion: setting bit 11 makes all three backends agree.
+///
+/// SetOtherModes is opcode `0xef` in word0's top byte; bit 11 is the mode-word
+/// `bi_lerp0`. The fill/copy other-modes (cycle-type 3/2) are left untouched —
+/// bilerp is meaningless there — by only touching one-cycle/two-cycle words.
+fn set_bilerp0(mut stream: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    for (word0, _) in stream.iter_mut() {
+        if *word0 >> 24 == 0xef {
+            let cycle_type = (*word0 >> 20) & 0x3;
+            if cycle_type == 0 || cycle_type == 1 {
+                *word0 |= 1 << 11;
+            }
+        }
+    }
+    stream
+}
+
 /// A raw triangle of the given opcode (0x08..=0x0f) covering the standard TRI
 /// box with a primitive-colour combiner. Only the opcode's feature bits
 /// (shade/texture/zbuffer) differ; the geometry is the flat pair. Texture and
@@ -3223,8 +3251,9 @@ fn gen_triangle_variant(opcode: u32) -> Vec<(u32, u32)> {
     let _zbuf = opcode & 0x01 != 0;
     if texture {
         // A textured triangle needs a loaded tile; reuse the proven textured
-        // triangle builder, which emits the S/T/W coefficient block.
-        return one_textured_triangle();
+        // triangle builder, which emits the S/T/W coefficient block. Correct
+        // its missing BI_LERP_0 so angrylion samples the full RGBA texel.
+        return set_bilerp0(one_textured_triangle());
     }
     if shade {
         return one_shade_triangle_pair();
@@ -3309,10 +3338,18 @@ fn generated_cases() -> Vec<GeneratedCase> {
     // that stage RGBA16 source. Their angrylion reading depends on the RGBA16
     // texture-source staging domain (under investigation), so they are the
     // highest priority but their triage waits on that resolution.
-    push(1, "gen-loadblock-linear".into(), "LoadBlock linear row advance", load_block_textured_rect(8, 0, 2, 8, 1, 2));
-    push(1, "gen-loadblock-dxt".into(), "LoadBlock DxT row advance", load_block_textured_rect(16, 0x400, 2, 8, 2, 4));
-    push(4, "gen-texrect-flip".into(), "TexRectFlip S/T swap", one_textured_rect_flip());
-    push(2, "gen-textured-triangle".into(), "textured triangle", one_textured_triangle());
+    // Textured rects/blocks: correct the missing BI_LERP_0 so angrylion
+    // samples the full RGBA texel instead of collapsing it to the blue
+    // channel. Also emit the UNCORRECTED loadblock-linear as an explicit
+    // regression witness for the bilerp finding.
+    push(1, "gen-loadblock-linear".into(), "LoadBlock linear row advance (bilerp corrected)", set_bilerp0(load_block_textured_rect(8, 0, 2, 8, 1, 2)));
+    push(1, "gen-loadblock-dxt".into(), "LoadBlock DxT row advance (bilerp corrected)", set_bilerp0(load_block_textured_rect(16, 0x400, 2, 8, 2, 4)));
+    push(4, "gen-texrect-flip".into(), "TexRectFlip S/T swap (bilerp corrected)", set_bilerp0(one_textured_rect_flip()));
+    push(2, "gen-textured-triangle".into(), "textured triangle (bilerp corrected)", set_bilerp0(one_textured_triangle()));
+    // Witness: the SAME loadblock WITHOUT the bilerp correction. Expected to
+    // reproduce the wgpu==RT64 vs angrylion divergence — documents the finding
+    // as a live, reproducible corpus row.
+    push(1, "gen-loadblock-linear-missing-bilerp".into(), "LoadBlock WITHOUT BI_LERP_0 (bilerp-gap witness)", load_block_textured_rect(8, 0, 2, 8, 1, 2));
 
     cases
 }
