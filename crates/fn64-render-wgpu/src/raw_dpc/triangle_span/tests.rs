@@ -530,6 +530,59 @@ fn texture_planes_read_s_t_and_w_from_the_same_layout() {
 }
 
 #[test]
+fn stepping_a_plane_across_a_continued_run_matches_the_full_formula() {
+    // The incremental texture/shade run in `raw_triangle.rs` steps each S/T/W
+    // (and shade) plane by `attribute_plane_step` on a continued run instead
+    // of re-evaluating `attribute_plane`. That is only sound if, holding the
+    // Y subsample fixed and advancing the X delta by exactly `Q16_ONE`, the
+    // single-add step reproduces the full i128-multiply-and-`div_euclid`
+    // formula bit-for-bit. This test walks a run pixel-by-pixel and asserts
+    // the two agree at every step, over slopes and deltas of BOTH signs --
+    // the identity the optimization stands on. A step that added the wrong
+    // amount (e.g. `plane.de` instead of `plane.dx`, or stepped from x=0
+    // instead of the run's start) diverges here.
+    let slopes: [i32; 6] = [0, 1, -1, 0x0001_2345, -0x0007_edcb, i16::MAX as i32];
+    let starts: [i64; 5] = [
+        0,
+        3 * super::Q16_ONE + 12345,
+        -(5 * super::Q16_ONE) - 999,
+        super::Q16_ONE / 2,
+        -(super::Q16_ONE / 3),
+    ];
+    for &dx in &slopes {
+        let plane = AttributePlane {
+            base: 0x0004_2000,
+            dx,
+            de: 0x0011_3300, // must NOT be what the step adds
+            dy: -0x0002_1100,
+        };
+        for &start_x in &starts {
+            for delta_y_eighth in [-24_i32, -1, 0, 7, 40] {
+                // Run start: both paths use the full formula.
+                let mut stepped = attribute_plane(plane, delta_y_eighth, start_x);
+                assert_eq!(
+                    stepped,
+                    attribute_plane(plane, delta_y_eighth, start_x),
+                    "run-start disagreement dx={dx} start_x={start_x} y={delta_y_eighth}",
+                );
+                // Advance the run: each pixel adds exactly Q16_ONE to the X
+                // delta with the Y subsample unchanged -- the continued-run
+                // condition the caller enforces.
+                for pixel in 1..=16_i64 {
+                    let delta_x = start_x + pixel * super::Q16_ONE;
+                    stepped = attribute_plane_step(plane, stepped);
+                    let full = attribute_plane(plane, delta_y_eighth, delta_x);
+                    assert_eq!(
+                        stepped, full,
+                        "step diverged at pixel {pixel} dx={dx} start_x={start_x} y={delta_y_eighth}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_negative_coefficient_sign_extends_from_its_integer_half_only() {
     // The integer half is signed and the fraction half is NOT: a value of
     // -1.5 is integer 0xFFFE with fraction 0x8000, and reassembling it must
@@ -635,4 +688,69 @@ fn the_perspective_scale_is_linear_in_the_ratio() {
         eighth * 2,
         "halving the ratio must halve the coordinate"
     );
+}
+
+/// Isolation timing: the per-pixel COST of the three texture planes computed
+/// the two ways -- full `attribute_plane` (i128 mul + div_euclid) vs stepped
+/// `attribute_plane_step` (one add) -- over a long run. `#[ignore]`; run with
+/// `--ignored --nocapture`. This is the THEORETICAL CEILING of the Task 6
+/// optimization: the whole-raster win cannot exceed this per-pixel delta.
+#[test]
+#[ignore = "timing microbenchmark; run with --ignored --nocapture"]
+fn texture_plane_step_vs_full_isolation() {
+    let planes = [
+        AttributePlane { base: 0x0004_2000, dx: 0x0001_2345, de: 0x0011_3300, dy: -0x0002_1100 },
+        AttributePlane { base: -0x0003_1000, dx: -0x0000_edcb, de: 0x0004_0000, dy: 0x0001_0000 },
+        AttributePlane { base: 1 << 20, dx: 0x0000_0080, de: 0, dy: 0 },
+    ];
+    let run_len: i64 = 300; // pixels per run
+    let runs: u64 = 400_000; // enough runs for a stable mean
+
+    // FULL: recompute attribute_plane every pixel.
+    let start = std::time::Instant::now();
+    let mut acc_full: i64 = 0;
+    for r in 0..runs {
+        let start_x = (r as i64 % 7) * super::Q16_ONE;
+        let dy = (r % 5) as i32;
+        for pixel in 0..run_len {
+            let delta_x = start_x + pixel * super::Q16_ONE;
+            for p in &planes {
+                acc_full = acc_full.wrapping_add(attribute_plane(*p, dy, delta_x));
+            }
+        }
+    }
+    let full_ns = start.elapsed().as_nanos();
+    std::hint::black_box(acc_full);
+
+    // STEP: full on run-start, add thereafter.
+    let start = std::time::Instant::now();
+    let mut acc_step: i64 = 0;
+    for r in 0..runs {
+        let start_x = (r as i64 % 7) * super::Q16_ONE;
+        let dy = (r % 5) as i32;
+        let mut vals = [0i64; 3];
+        for pixel in 0..run_len {
+            let delta_x = start_x + pixel * super::Q16_ONE;
+            for (i, p) in planes.iter().enumerate() {
+                vals[i] = if pixel == 0 {
+                    attribute_plane(*p, dy, delta_x)
+                } else {
+                    attribute_plane_step(*p, vals[i])
+                };
+                acc_step = acc_step.wrapping_add(vals[i]);
+            }
+        }
+    }
+    let step_ns = start.elapsed().as_nanos();
+    std::hint::black_box(acc_step);
+
+    let total_pixels = (runs * run_len as u64) as f64;
+    println!(
+        "[plane-iso] pixels={total_pixels:.0} full_ns={full_ns} step_ns={step_ns} \
+         full_ns_per_px={:.4} step_ns_per_px={:.4} delta_ns_per_px={:.4}",
+        full_ns as f64 / total_pixels,
+        step_ns as f64 / total_pixels,
+        (full_ns as f64 - step_ns as f64) / total_pixels,
+    );
+    assert_eq!(acc_full, acc_step, "the two paths must agree bit-for-bit");
 }
