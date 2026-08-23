@@ -128,7 +128,8 @@ use std::time::Duration;
 use crate::device::{HeadlessBackend, NoAdapter};
 use crate::shader_manifest::{
     triangle_pipeline_fragment_wgsl, COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT,
-    COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
+    COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL, COMPUTE_TRIANGLE_COVERAGE_ENTRY_POINT,
+    COMPUTE_TRIANGLE_COVERAGE_WGSL, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
 use crate::state::{AlphaCompare, Color4, CoverageDestination, OtherMode, PrimColor};
@@ -873,6 +874,20 @@ impl UninitializedTrianglePipeline {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let compute_triangle_coverage_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fn64-compute-triangle-coverage"),
+                source: wgpu::ShaderSource::Wgsl(COMPUTE_TRIANGLE_COVERAGE_WGSL.into()),
+            });
+        let compute_triangle_coverage_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fn64-compute-triangle-coverage"),
+                layout: None,
+                module: &compute_triangle_coverage_shader,
+                entry_point: Some(COMPUTE_TRIANGLE_COVERAGE_ENTRY_POINT),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let raster_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fn64-triangle-pipeline-raster-params"),
@@ -1203,6 +1218,7 @@ impl UninitializedTrianglePipeline {
                 pipelines,
                 bind_group_layout,
                 compute_raster_round_trip_pipeline,
+                compute_triangle_coverage_pipeline,
                 framebuffer_color_dummy_buffer,
                 fixture_buffers: Vec::new(),
                 errors,
@@ -1297,6 +1313,9 @@ pub struct TrianglePipelineRenderer {
     /// Precreated transport-only compute pipeline for qualifying a dynamic
     /// packed-RGBA16 target before raster arithmetic is admitted.
     compute_raster_round_trip_pipeline: wgpu::ComputePipeline,
+    /// Exact integer coverage prototype. It writes one 0..=8 count per
+    /// target pixel and triangle; no color or production state reaches it.
+    compute_triangle_coverage_pipeline: wgpu::ComputePipeline,
     /// Binding 9's shared dummy resource for every fixture in a submission
     /// whose `reads_framebuffer_color` is false -- one always-allocated
     /// buffer reused across every non-reading fixture and every submission,
@@ -1398,6 +1417,63 @@ impl FixtureBuffers {
             ),
             blend_params: uniform("fn64-triangle-pipeline-blend-params", BLEND_PARAMS_BYTES),
         }
+    }
+}
+
+/// The edge fields consumed by the integer coverage prototype, in the same
+/// order as `compute_triangle_coverage.wgsl`'s `TriangleEdges`. Constructed
+/// only from the real raw-triangle decoder; callers cannot supply a partial
+/// or float-converted edge set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeCoverageTriangle {
+    left_major: bool,
+    yl: i32,
+    ym: i32,
+    yh: i32,
+    xl: i32,
+    xh: i32,
+    xm: i32,
+    dxldy: i32,
+    dxhdy: i32,
+    dxmdy: i32,
+}
+
+impl ComputeCoverageTriangle {
+    pub const fn from_raw(triangle: crate::RawTriangle) -> Self {
+        Self {
+            // `triangle_span::left_major` proves the decoder's historically
+            // named `right_major` accessor is the left-major wire bit.
+            left_major: triangle.right_major(),
+            yl: triangle.yl() as i32,
+            ym: triangle.ym() as i32,
+            yh: triangle.yh() as i32,
+            xl: triangle.xl(),
+            xh: triangle.xh(),
+            xm: triangle.xm(),
+            dxldy: triangle.dxldy(),
+            dxhdy: triangle.dxhdy(),
+            dxmdy: triangle.dxmdy(),
+        }
+    }
+
+    fn storage_bytes(self) -> [u8; 40] {
+        let words = [
+            u32::from(self.left_major),
+            self.yl as u32,
+            self.ym as u32,
+            self.yh as u32,
+            self.xl as u32,
+            self.xh as u32,
+            self.xm as u32,
+            self.dxldy as u32,
+            self.dxhdy as u32,
+            self.dxmdy as u32,
+        ];
+        let mut bytes = [0u8; 40];
+        for (index, word) in words.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -1525,6 +1601,128 @@ impl TrianglePipelineRenderer {
         let mut output = map_and_read(&self.device, &readback)?;
         output.truncate(expected_bytes);
         Ok(output)
+    }
+
+    /// Evaluate the repository's eight-subsample raw-triangle coverage rule
+    /// on the GPU. The output is triangle-major, then row-major pixels, with
+    /// one `u32` count per pixel. This is a differential substrate only: it
+    /// neither reads nor writes a color target and is not on production
+    /// dispatch.
+    pub fn compute_triangle_coverage(
+        &mut self,
+        extent: TriangleTargetExtent,
+        triangles: &[ComputeCoverageTriangle],
+    ) -> Result<Vec<u32>, TrianglePipelineError> {
+        validate_triangle_extent(extent)?;
+        if triangles.is_empty() {
+            return Err(TrianglePipelineError::EmptyCoverageBatch);
+        }
+        let pixels = extent
+            .width
+            .checked_mul(extent.height)
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        let triangle_count = u32::try_from(triangles.len())
+            .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+        let output_words = pixels
+            .checked_mul(triangle_count)
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        let output_bytes = u64::from(output_words) * 4;
+        let triangle_bytes = u64::from(triangle_count) * 40;
+        let workgroups = output_words.div_ceil(64);
+        let limits = self.device.limits();
+        if workgroups > limits.max_compute_workgroups_per_dimension
+            || output_bytes > limits.max_buffer_size
+            || output_bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || triangle_bytes > limits.max_buffer_size
+            || triangle_bytes > u64::from(limits.max_storage_buffer_binding_size)
+        {
+            return Err(TrianglePipelineError::CoverageTooLarge);
+        }
+
+        let mut packed_triangles = Vec::with_capacity(triangle_bytes as usize);
+        for triangle in triangles {
+            packed_triangles.extend_from_slice(&triangle.storage_bytes());
+        }
+        let mut params = Vec::with_capacity(16);
+        for word in [extent.width, extent.height, pixels, triangle_count] {
+            params.extend_from_slice(&word.to_le_bytes());
+        }
+        let triangle_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-triangle-coverage-edges"),
+            size: triangle_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-triangle-coverage-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-triangle-coverage-output"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-triangle-coverage-readback"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&triangle_buffer, 0, &packed_triangles);
+        self.queue.write_buffer(&params_buffer, 0, &params);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-compute-triangle-coverage-bind-group"),
+            layout: &self.compute_triangle_coverage_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: triangle_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fn64-compute-triangle-coverage"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fn64-compute-triangle-coverage"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compute_triangle_coverage_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, output_bytes);
+        let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
+        encoder.on_submitted_work_done(move || {
+            let _ = callback_sender.try_send(());
+        });
+        let submission = self.queue.submit([encoder.finish()]);
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(POLL_TIMEOUT),
+            })
+            .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
+        callback_receiver
+            .recv_timeout(CALLBACK_TIMEOUT)
+            .map_err(|_| TrianglePipelineError::CompletionCallbackNotObserved)?;
+        let bytes = map_and_read(&self.device, &readback)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four coverage bytes")))
+            .collect())
     }
 
     /// Submits one fixed-fixture triangle draw (`draw(0..3, 0..1)`) into a
@@ -2309,6 +2507,9 @@ pub enum TrianglePipelineError {
         expected: usize,
         actual: usize,
     },
+    EmptyCoverageBatch,
+    CoverageSizeOverflow,
+    CoverageTooLarge,
     ExactSubmissionWait(String),
     CompletionCallbackNotObserved,
     Readback(String),
@@ -2350,6 +2551,15 @@ impl fmt::Display for TrianglePipelineError {
                 formatter,
                 "packed RGBA16 target byte length mismatch: expected {expected}, got {actual}"
             ),
+            Self::EmptyCoverageBatch => {
+                formatter.write_str("compute triangle coverage batch is empty")
+            }
+            Self::CoverageSizeOverflow => {
+                formatter.write_str("compute triangle coverage output size overflows")
+            }
+            Self::CoverageTooLarge => {
+                formatter.write_str("compute triangle coverage batch exceeds device limits")
+            }
             Self::ExactSubmissionWait(reason) => {
                 write!(formatter, "exact triangle-pipeline submission wait failed: {reason}")
             }
