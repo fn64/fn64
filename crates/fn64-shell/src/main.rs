@@ -66,6 +66,7 @@
 /// RDRAM field, so a checkout with no game content can still open the window.
 #[cfg(not(fn64_game_linked))]
 mod demo;
+mod app_identity;
 #[allow(dead_code)]
 mod frame_trip;
 mod framebuffer;
@@ -1159,7 +1160,8 @@ mod game {
             }
             let size = LogicalSize::new((FB_WIDTH * 2) as f64, (FB_HEIGHT * 2) as f64);
             let attrs = Window::default_attributes()
-                .with_title("fn64 -- N64 recompilation")
+                .with_title(crate::app_identity::WINDOW_TITLE)
+                .with_window_icon(Some(crate::app_identity::window_icon()))
                 .with_inner_size(size)
                 .with_min_inner_size(LogicalSize::new(FB_WIDTH as f64, FB_HEIGHT as f64));
             let window = match event_loop.create_window(attrs) {
@@ -1171,6 +1173,7 @@ mod game {
                     return;
                 }
             };
+            crate::app_identity::install_platform_application_icon();
             let win_size = window.inner_size();
             // `Arc<Window>` is `'static + HasWindowHandle`, so the resulting
             // Pixels is `Pixels<'static>` and can be stored alongside the
