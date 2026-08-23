@@ -152,6 +152,12 @@ pub struct WgpuBackend {
     /// where it is ~65% of frame time and never reaches the screen.
     /// `FN64_GPU_TRIANGLE_DRAW=1` forces it on.
     gpu_triangle_draw_enabled: bool,
+    /// Whether to build TMEM projections and complete GPU triangle fixtures.
+    /// This is normally identical to `gpu_triangle_draw_enabled`; the
+    /// separate value exists so `FN64_DIAGNOSTIC_TMEM_PROJECTION=1` can
+    /// restore the former CPU preparation work without also submitting to
+    /// the GPU, giving performance measurements an exact in-process control.
+    project_gpu_tmem: bool,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -268,6 +274,10 @@ impl WgpuBackend {
             fn64_render::new_raw_dpc_roles().map_err(WgpuBackendConstructionError::RawDpcRoles)?;
         let initial = PhysicalTmemState::try_new()
             .map_err(WgpuBackendConstructionError::PhysicalTmemState)?;
+        let gpu_triangle_draw_enabled =
+            cfg!(test) || std::env::var_os("FN64_GPU_TRIANGLE_DRAW").is_some_and(|v| v == "1");
+        let project_gpu_tmem = gpu_triangle_draw_enabled
+            || std::env::var_os("FN64_DIAGNOSTIC_TMEM_PROJECTION").is_some_and(|v| v == "1");
         Ok((
             Self {
                 coordinator: authority.into_coordinator(initial),
@@ -276,8 +286,8 @@ impl WgpuBackend {
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
-                gpu_triangle_draw_enabled: cfg!(test)
-                    || std::env::var_os("FN64_GPU_TRIANGLE_DRAW").is_some_and(|v| v == "1"),
+                gpu_triangle_draw_enabled,
+                project_gpu_tmem,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -462,14 +472,8 @@ impl WgpuBackend {
         &mut self,
         triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
         pending_tmem: Option<Vec<TmemGpuProjection>>,
+        project_gpu_tmem: bool,
     ) -> Result<(), WgpuRawDpcExecutionError> {
-        let pipeline = self
-            .triangle_pipeline
-            .as_mut()
-            .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
-        let extent = self
-            .triangle_target_extent
-            .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
         // **The TMEM byte images this draw samples: one per triangle, from
         // this packet's OWN sealed transaction, not the published slot.**
         //
@@ -519,10 +523,10 @@ impl WgpuBackend {
         // repeat removes the second code path that could disagree with the
         // first, at a clone the pipeline was going to make per fixture
         // regardless.
-        let per_triangle: Vec<TmemGpuProjection> = match pending_tmem {
+        let per_triangle = project_gpu_tmem.then(|| match pending_tmem {
             Some(projections) => projections,
             None => vec![project_committed_tmem(self.coordinator.physical()); triangles.len()],
-        };
+        });
         // A list shorter than the draw would leave a triangle with no
         // image, and the only images available to substitute are the two
         // this whole change exists to withhold: another triangle's, or the
@@ -532,17 +536,21 @@ impl WgpuBackend {
         // `plan.triangles`, two vectors pushed at one site, so a mismatch
         // is a structural break rather than a length a caller could
         // legitimately vary.
-        if per_triangle.len() != triangles.len() {
-            return Err(WgpuRawDpcExecutionError::TmemProjectionCountMismatch {
-                projections: per_triangle.len(),
-                triangles: triangles.len(),
-            });
+        if let Some(per_triangle) = &per_triangle {
+            if per_triangle.len() != triangles.len() {
+                return Err(WgpuRawDpcExecutionError::TmemProjectionCountMismatch {
+                    projections: per_triangle.len(),
+                    triangles: triangles.len(),
+                });
+            }
         }
 
         let mut fixtures = Vec::with_capacity(triangles.len());
         for (triangle_index, draw) in triangles.into_iter().enumerate() {
             let draw = draw.map_err(WgpuRawDpcExecutionError::MissingTriangleDrawState)?;
-            let tmem = per_triangle[triangle_index];
+            let extent = self
+                .triangle_target_extent
+                .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
             // Per-triangle, not loop-invariant: a `TextureRectangle`-sourced
             // draw's `screen_scale`/`screen_offset` come from its own
             // `viewport` override (RT64's `convertViewportRect`,
@@ -617,27 +625,32 @@ impl WgpuBackend {
                 fog_color: draw.fog_color,
                 reads_framebuffer_color,
             };
-            fixtures.push(admitted_triangle_fixture(
-                draw.vertices,
-                draw.other_mode,
-                draw.combine_params,
-                raster_params,
-                extent,
-                tmem,
-                tile_binding,
-                draw.blend_color,
-                draw.env_color,
-                draw.prim_color,
-                blend_params,
-                draw.source == TriangleSource::TextureRectangle,
-            ));
+            if let Some(per_triangle) = &per_triangle {
+                fixtures.push(admitted_triangle_fixture(
+                    draw.vertices,
+                    draw.other_mode,
+                    draw.combine_params,
+                    raster_params,
+                    extent,
+                    per_triangle[triangle_index],
+                    tile_binding,
+                    draw.blend_color,
+                    draw.env_color,
+                    draw.prim_color,
+                    blend_params,
+                    draw.source == TriangleSource::TextureRectangle,
+                ));
+            }
         }
 
         if fixtures.is_empty() {
+            self.triangle_pipeline
+                .as_ref()
+                .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
             return Ok(());
         }
 
-        // **Everything above this line is VALIDATION and always runs.**
+        // **Everything above this line is admission validation and always runs.**
         //
         // An earlier version of this gate sat at the CALL SITE and skipped
         // this whole function on the play path. That was wrong: this is not
@@ -645,7 +658,7 @@ impl WgpuBackend {
         // boundary. Skipping it returned `Ok(())` for packets that should
         // have been refused -- `TriangleDrawBeforeCreate`,
         // `TmemProjectionCountMismatch`, `MissingTriangleDrawState`,
-        // `BlendRequiresFramebuffer` and the per-fixture checks above all
+        // `BlendRequiresFramebuffer` above all
         // stopped firing. Found by an independent audit, which also showed
         // `cfg!(test)` does NOT hold for other crates: `fn64-render-conformance`
         // depends on this crate and its adapterless runner expects
@@ -660,6 +673,10 @@ impl WgpuBackend {
             return Ok(());
         }
 
+        let pipeline = self
+            .triangle_pipeline
+            .as_mut()
+            .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
         let in_flight = pipeline
             .submit_triangles(&fixtures)
             .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
@@ -1451,6 +1468,10 @@ struct ExecutionCollector<'coord> {
     /// `TexrectTmemSource::Committed` hands the CPU texel reader for that
     /// packet.
     draw_tmem: Option<Vec<TmemGpuProjection>>,
+    /// Whether this run materializes diagnostic GPU triangle projections.
+    /// The measurement control can request them without submitting a draw;
+    /// the guest-visible CPU raster path never consumes them.
+    project_gpu_tmem: bool,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -2342,6 +2363,7 @@ impl RenderBackend for WgpuBackend {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&self.rdp_state)),
             &mut self.color_targets,
             self.configured_target_extent,
+            self.project_gpu_tmem,
         )
         .map_err(RenderError::from)?;
 
@@ -2376,7 +2398,7 @@ impl RenderBackend for WgpuBackend {
         if !triangles.is_empty() {
             // Always called: it validates. Only its GPU submission is gated,
             // inside the function -- see the note there.
-            self.draw_admitted_triangles(triangles, draw_tmem)
+            self.draw_admitted_triangles(triangles, draw_tmem, self.project_gpu_tmem)
                 .map_err(RenderError::from)?;
         }
 
@@ -2808,6 +2830,7 @@ fn execute_raw_dpc_inner(
     carry_in: RawDpcCarryIn,
     color_targets: &mut Option<ColorTargetRegistry>,
     configured_target_extent: Option<TriangleTargetExtent>,
+    project_gpu_tmem: bool,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -2829,6 +2852,7 @@ fn execute_raw_dpc_inner(
         color_targets,
         configured_target_extent,
         draw_tmem: None,
+        project_gpu_tmem,
     };
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
@@ -3436,12 +3460,14 @@ fn stage_and_report(
     // defect: a texrect whose combine references `TEXEL0` sampled invalid
     // bytes and the fragment shader reported
     // `TMEM_SAMPLE_STATUS_INVALID_BYTE`.
-    collector.draw_tmem = Some(project_pending_tmem_per_triangle(
-        &collector.plan.triangle_commands,
-        &prefixes,
-        &pending,
-        collector.physical,
-    )?);
+    if collector.project_gpu_tmem {
+        collector.draw_tmem = Some(project_pending_tmem_per_triangle(
+            &collector.plan.triangle_commands,
+            &prefixes,
+            &pending,
+            collector.physical,
+        )?);
+    }
 
     // **The color-target half: every admitted fill and texrect in this
     // packet, accumulated into one buffer in the packet's own command
@@ -6959,7 +6985,7 @@ mod tests {
             prim_depth: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(good_triangle)], None)
+            .draw_admitted_triangles(vec![Ok(good_triangle)], None, true)
             .expect("a single valid triangle must draw successfully");
         let first_output_extent = backend
             .last_triangle_draw()
@@ -6970,7 +6996,7 @@ mod tests {
             Ok(good_triangle),
             Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 1 }),
         ];
-        let result = backend.draw_admitted_triangles(failing_triangles, None);
+        let result = backend.draw_admitted_triangles(failing_triangles, None, true);
         assert!(
             result.is_err(),
             "a batch containing a MissingTriangleDrawState entry must fail, not silently skip it"
@@ -7077,7 +7103,7 @@ mod tests {
         let left_triangle = half_covering_triangle(0.0, 4.0, 1.0);
         let right_triangle = half_covering_triangle(4.0, 8.0, 1.0);
         backend
-            .draw_admitted_triangles(vec![Ok(left_triangle), Ok(right_triangle)], None)
+            .draw_admitted_triangles(vec![Ok(left_triangle), Ok(right_triangle)], None, true)
             .expect("two well-formed triangles in one call must draw successfully");
 
         let output = backend
@@ -7144,7 +7170,7 @@ mod tests {
             prim_depth: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(good_triangle)], None)
+            .draw_admitted_triangles(vec![Ok(good_triangle)], None, true)
             .expect("a single valid triangle must draw successfully");
         let prior_color = backend
             .last_triangle_draw()
@@ -7157,7 +7183,7 @@ mod tests {
             Ok(half_covering_triangle(4.0, 8.0, 1.0)),
             Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 2 }),
         ];
-        let result = backend.draw_admitted_triangles(batch_with_trailing_failure, None);
+        let result = backend.draw_admitted_triangles(batch_with_trailing_failure, None, true);
         assert!(
             result.is_err(),
             "a batch whose last entry is a MissingTriangleDrawState must fail as a whole, even \
@@ -8351,7 +8377,7 @@ mod tests {
             prim_depth: None,
         };
         let error = backend
-            .draw_admitted_triangles(vec![Ok(triangle)], None)
+            .draw_admitted_triangles(vec![Ok(triangle)], None, true)
             .expect_err(
                 "a framebuffer-alpha-dependent blend cycle must be rejected before submission",
             );
@@ -8430,7 +8456,7 @@ mod tests {
             prim_depth: None,
         };
         backend
-            .draw_admitted_triangles(vec![Ok(triangle)], None)
+            .draw_admitted_triangles(vec![Ok(triangle)], None, true)
             .expect("a color-only framebuffer blend cycle must be admitted, not rejected");
     }
 
@@ -9796,6 +9822,7 @@ mod tests {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
+            true,
         )
         .expect("the fill half must stage a real token");
         assert!(
@@ -9809,6 +9836,7 @@ mod tests {
                 triangle_index: 0,
             })],
             None,
+            true,
         );
         assert!(
             matches!(
@@ -9841,7 +9869,7 @@ mod tests {
         let body = &source[body_start..body_end];
 
         let draw_at = body
-            .find("self.draw_admitted_triangles(triangles, draw_tmem)")
+            .find("self.draw_admitted_triangles(")
             .expect("execute_raw_dpc must still call draw_admitted_triangles");
         let store_at = body
             .find("self.pending_fill_publication = pending;")
@@ -11214,6 +11242,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -11527,6 +11556,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -12553,6 +12583,7 @@ mod tests {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
+            true,
         )
         .expect("the sprite strip must execute");
 
@@ -12600,6 +12631,42 @@ mod tests {
             projections[0].bytes[LOADED].iter().any(|byte| *byte != 0),
             "the first projection's loaded range must carry real texels, or the comparisons \
              above are over zeroes"
+        );
+    }
+
+    /// The playable CPU-raster lane consumes the pending TMEM transaction
+    /// directly while executing each textured primitive. Disabling the
+    /// diagnostic GPU fixtures must therefore omit their owned 4 KiB images,
+    /// even for a load-bearing packet that would otherwise produce one image
+    /// per admitted triangle.
+    #[test]
+    fn a_cpu_only_draw_omits_diagnostic_tmem_projections() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (planned, per_read_bytes) = plan_with_deterministic_reads_for_every_load(
+            &mut backend,
+            &session,
+            sprite_strip_words(SPRITE_STRIP_PAIRS),
+        );
+        let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
+        let bound = session.finalize_and_submit(planned, capture).unwrap();
+
+        let (_prepared, triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+            &mut backend.coordinator,
+            bound,
+            backend
+                .raw_dpc_carry_in_before_last_plan
+                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+            &mut backend.color_targets,
+            backend.configured_target_extent,
+            false,
+        )
+        .expect("the CPU-raster sprite strip must execute");
+
+        assert_eq!(triangles.len(), SPRITE_STRIP_PAIRS * 2);
+        assert!(
+            draw_tmem.is_none(),
+            "a CPU-only draw must not materialize GPU-only TMEM byte images"
         );
     }
 
@@ -12700,6 +12767,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan.triangle_commands
@@ -12738,6 +12806,7 @@ mod tests {
                 triangle_index: 0,
             })],
             Some(Vec::new()),
+            true,
         );
         assert!(
             matches!(
@@ -12762,6 +12831,7 @@ mod tests {
                 triangle_index: 0,
             })],
             Some(vec![one]),
+            true,
         );
         assert!(
             matches!(
@@ -12874,6 +12944,7 @@ mod tests {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
+            true,
         )
         .expect("a texrect before the packet's own load reads durable TMEM and executes");
 
@@ -13351,6 +13422,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -13399,6 +13471,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -15440,6 +15513,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent: backend.configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         backend
             .coordinator
@@ -15772,6 +15846,7 @@ mod tests {
             color_targets: &mut color_targets,
             configured_target_extent,
             draw_tmem: None,
+            project_gpu_tmem: true,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -15984,6 +16059,7 @@ mod tests {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut color_targets,
             backend.configured_target_extent,
+            true,
         )
         .expect("the triangle-then-SetOtherMode submission executes cleanly");
 

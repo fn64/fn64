@@ -59,6 +59,8 @@ use fn64_render::{
     RenderError, ViFilterControl, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
     ViScanoutRegisters,
 };
+use rayon::prelude::*;
+use std::sync::OnceLock;
 
 /// A VI feature this scanout genuinely does not implement, named
 /// individually so a rejection says *which* filter was programmed rather
@@ -835,36 +837,71 @@ impl SourcePlane {
     /// filtering in place would feed already-restored components back in as
     /// neighbors and make the result scan-order dependent.
     fn restore_dither(&mut self) {
+        self.restore_dither_with_parallelism(parallel_vi_dither_enabled());
+    }
+
+    fn restore_dither_with_parallelism(&mut self, parallel: bool) {
         let original = self.rgba8.clone();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let pixel = y * self.width + x;
-                if self.coverage[pixel] != 8 {
-                    continue;
-                }
-                for channel in 0..3 {
-                    let center = original[pixel * 4 + channel] >> 3;
-                    let mut neighbors = [0u8; 8];
-                    let mut count = 0;
-                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
-                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
-                            if neighbor_x == x && neighbor_y == y {
-                                continue;
-                            }
-                            neighbors[count] =
-                                original[(neighbor_y * self.width + neighbor_x) * 4 + channel] >> 3;
-                            count += 1;
-                        }
-                    }
-                    self.rgba8[pixel * 4 + channel] =
-                        restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
-                }
+        let row_bytes = self.width * 4;
+        if parallel {
+            self.rgba8
+                .par_chunks_mut(row_bytes)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    restore_dither_row(row, y, self.width, self.height, &original, &self.coverage);
+                });
+        } else {
+            for (y, row) in self.rgba8.chunks_mut(row_bytes).enumerate() {
+                restore_dither_row(row, y, self.width, self.height, &original, &self.coverage);
             }
         }
     }
 
     fn component(&self, x: usize, y: usize, channel: usize) -> u8 {
         self.rgba8[(y * self.width + x) * 4 + channel]
+    }
+}
+
+fn parallel_vi_dither_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_PARALLEL_VI_DITHER") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_PARALLEL_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_PARALLEL_VI_DITHER is not valid Unicode: {error}"),
+    })
+}
+
+fn restore_dither_row(
+    row: &mut [u8],
+    y: usize,
+    width: usize,
+    height: usize,
+    original: &[u8],
+    coverage: &[u8],
+) {
+    for x in 0..width {
+        let pixel = y * width + x;
+        if coverage[pixel] != 8 {
+            continue;
+        }
+        for channel in 0..3 {
+            let center = original[pixel * 4 + channel] >> 3;
+            let mut neighbors = [0u8; 8];
+            let mut count = 0;
+            for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                    if neighbor_x == x && neighbor_y == y {
+                        continue;
+                    }
+                    neighbors[count] =
+                        original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
+                    count += 1;
+                }
+            }
+            row[x * 4 + channel] = restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
+        }
     }
 }
 

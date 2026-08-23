@@ -50,6 +50,15 @@ No GPL runtime implementation was consulted.
 The implemented composition order is STATUS-selected per-sample coverage AA or
 full-coverage RGBA16 restoration, divot, STATUS-selected vertical resampling,
 horizontal resampling, gamma, then gamma dither.
+
+The wgpu scanout takes one immutable pre-restoration source snapshot and assigns
+distinct output rows to Rayon workers. Rows therefore share no mutable bytes;
+every neighbor read still comes from the same immutable snapshot, so scheduling
+cannot feed a restored output back into another pixel. Setting
+`FN64_PARALLEL_VI_DITHER=0` restores the scalar row walk as a measurement
+control; absent or `1` selects the byte-identical parallel path, and every other
+value traps rather than silently selecting a policy. A direct scalar/parallel
+test covers borders, interior pixels, and mixed restoration eligibility.
 `crates/fn64-render-reference/src/vi.rs`
 contains exact vectors for the signed 3x3 and border cases, the preferred AA
 footprint and interlaced row spacing, partial-neighbor rejection, the
