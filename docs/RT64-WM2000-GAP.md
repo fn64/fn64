@@ -125,12 +125,19 @@ the VI-presented frame is not blank"). `ReferenceBackend` honors this via
 
 ---
 
-## 2. The command census: not reachable, and exactly what is needed
+## 2. The command census and replay input
 
-**No WM2000 display-list or RDP-command capture exists in this checkout or on
-this machine.** Rendered *frames* do exist (see below) — what is absent is any
-record of the commands that produced them. This is a measured absence, not an
-assumption:
+**No WM2000 display-list or RDP-command capture is committed, by policy.** A
+fresh private capture now exists outside git on this machine. On 2026-08-23 the
+production-session tap captured 2,670 command streams (21 MiB including
+sidecars) from a bounded 400-pump attract-mode run. Packet 2659 was selected as
+a replay receipt: 1,032 command bytes containing five full shaded+textured raw
+triangles plus its one 8 MiB RDRAM image. A second deterministic run produced
+the same packet bytes at the same index (SHA-256 comparison passed). These are
+game-derived bytes and remain under `/tmp`, never in the repository.
+
+The earlier measured absence remains useful history because it explains why
+the capture mechanism was added:
 
 - No file in the repository matches `*wm2000*` (case-insensitive) outside
   generic corpus/build plumbing; no `xbus-*.bin` exists anywhere under
@@ -153,15 +160,22 @@ command words when `FN64_XBUS_STREAM_DUMP_DIR` is set, and
 path variable is `FN64_WM2000_ROM`
 (`crates/fn64-audio/tests/rsp_predecode_equivalence.rs:74`).
 
-**What blocks a fresh capture today.** Less than expected, and the blocker is
-not the ROM. `/Users/jer/Code/aki-recomp/games/NWXE/wm2000.z64` exists and is
+The production wgpu session now has its own equivalent capture tap because it
+bypasses `dispatch_captured_raw_rdp`: `FN64_RAW_DPC_STREAM_DUMP_DIR`, optional
+`FN64_RAW_DPC_STREAM_DUMP_SKIP`/`FN64_RAW_DPC_STREAM_DUMP_COUNT`, and the
+single-index `FN64_RAW_DPC_STREAM_DUMP_RDRAM`. The capture records canonical
+big-endian command words and source/range metadata at the owned-submission
+boundary before planning consumes it.
+
+**What used to block a fresh capture.** It was not the ROM.
+`/Users/jer/Code/aki-recomp/games/NWXE/wm2000.z64` exists and is
 byte-identical to `/Users/jer/Downloads/WWF WrestleMania 2000 (USA).z64`
 (verified with `cmp`; both files' SHA-1 also matches the `rom_sha1` recorded at
 `aki-recomp/games/NWXE/profile.toml:14`, which is the authority for that
 digest -- this doc deliberately does not restate the hash, since no test here
 gates it).
 
-The standalone runner at `/Users/jer/Code/wm2000-run/run.sh` is pinned to an
+The standalone runner at `/Users/jer/Code/wm2000-run/run.sh` was pinned to an
 fn64 checkout 291 commits behind current HEAD, and its recorded run aborted at
 `RSP task exceeded deterministic 67108864-instruction admission bound at PC
 0x1128`. That bound is `MAX_TASK_STEPS` and the identical `panic!` still exists
