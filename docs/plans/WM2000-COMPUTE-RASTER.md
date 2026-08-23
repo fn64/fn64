@@ -120,7 +120,18 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    functions where they are already CPU-differentially proven. Add packed
    RGBA16 destination decode/write and the two-cycle path required by the
    census. Every one of the eight state keys must match complete CPU target
-   bytes; a mutation of any stage must fail the comparison.
+   bytes; a mutation of any stage must fail the comparison. The first
+   color-producing prototype now covers the leading one-cycle key with one
+   shared immutable TMEM projection: a two-pixel invocation owns each packed
+   RGBA16 storage word, visits overlapping triangles in command order, and
+   reuses the existing TMEM, combiner, coverage, and framebuffer-blend WGSL
+   callables. Two fully overlapping draws with distinct primitive/environment
+   registers matched the CPU raw-triangle executor's complete target bytes
+   for 10 consecutive native Metal runs on 2026-08-23. The oracle caught and
+   rejected the initial direct-count coverage encoding before the corrected
+   `count - 1` stored representation passed. Game-derived replay, production
+   wiring, timing, additional TMEM identities, and the remaining seven keys
+   are still open.
 6. **Production A/B seam.** Add a strict same-binary CPU-versus-compute control.
    Run counterbalanced `A/B, B/A`, then re-profile. Retain only if both orders
    improve p95 and the named RDP cost falls.

@@ -342,9 +342,20 @@ fn compute_raster_rgba16_round_trip_wgsl_parses_and_validates() {
 
 #[test]
 fn compute_triangle_coverage_wgsl_parses_and_validates() {
-    let module =
-        naga::front::wgsl::parse_str(crate::shader_manifest::COMPUTE_TRIANGLE_COVERAGE_WGSL)
-            .unwrap();
+    let source = crate::shader_manifest::compute_triangle_color_wgsl();
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn compute_triangle_color_composition_parses_and_validates() {
+    let source = crate::shader_manifest::compute_triangle_color_wgsl();
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),
