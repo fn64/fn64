@@ -1240,6 +1240,8 @@ impl UninitializedTrianglePipeline {
                 compute_triangle_color_pipeline,
                 framebuffer_color_dummy_buffer,
                 fixture_buffers: Vec::new(),
+                compute_hot_color_buffers: None,
+                compute_hot_color_resource_generations: 0,
                 errors,
             },
         )))
@@ -1365,7 +1367,157 @@ pub struct TrianglePipelineRenderer {
     /// already applies, extended from one shared buffer to the per-fixture
     /// set.
     fixture_buffers: Vec<FixtureBuffers>,
+    /// High-water resource set for the exact compute-color path. Recreated
+    /// only when a later batch exceeds one of the three variable capacities;
+    /// identical steady-state draws rewrite and reuse every GPU allocation.
+    compute_hot_color_buffers: Option<ComputeHotColorBuffers>,
+    compute_hot_color_resource_generations: u64,
     errors: Arc<BoundedErrorSink>,
+}
+
+struct ComputeHotColorBuffers {
+    triangle_capacity: u64,
+    target_capacity: u64,
+    status_capacity: u64,
+    triangle: wgpu::Buffer,
+    params: wgpu::Buffer,
+    target: wgpu::Buffer,
+    status: wgpu::Buffer,
+    tmem_bytes: wgpu::Buffer,
+    tmem_validity: wgpu::Buffer,
+    tile: wgpu::Buffer,
+    target_readback: wgpu::Buffer,
+    status_readback: wgpu::Buffer,
+    tmem_group: wgpu::BindGroup,
+    compute_group: wgpu::BindGroup,
+}
+
+impl ComputeHotColorBuffers {
+    fn new(
+        device: &wgpu::Device,
+        pipeline: &wgpu::ComputePipeline,
+        triangle_capacity: u64,
+        target_capacity: u64,
+        status_capacity: u64,
+    ) -> Self {
+        let create = |label, size, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let triangle = create(
+            "fn64-compute-hot-color-triangles",
+            triangle_capacity,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let params = create(
+            "fn64-compute-hot-color-params",
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let target = create(
+            "fn64-compute-hot-color-target",
+            target_capacity,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        );
+        let status = create(
+            "fn64-compute-hot-color-status",
+            status_capacity,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let tmem_bytes = create(
+            "fn64-compute-hot-color-tmem",
+            TMEM_BYTE_WORDS as u64 * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let tmem_validity = create(
+            "fn64-compute-hot-color-tmem-validity",
+            TMEM_VALIDITY_WORDS as u64 * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let tile = create(
+            "fn64-compute-hot-color-tile",
+            TILE_BINDING_PARAMS_BYTES,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let target_readback = create(
+            "fn64-compute-hot-color-target-readback",
+            target_capacity,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        );
+        let status_readback = create(
+            "fn64-compute-hot-color-status-readback",
+            status_capacity,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        );
+        let tmem_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-compute-hot-color-tmem-group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tmem_bytes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tmem_validity.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile.as_entire_binding(),
+                },
+            ],
+        });
+        let compute_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-compute-hot-color-state-group"),
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: triangle.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: target.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: status.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            triangle_capacity,
+            target_capacity,
+            status_capacity,
+            triangle,
+            params,
+            target,
+            status,
+            tmem_bytes,
+            tmem_validity,
+            tile,
+            target_readback,
+            status_readback,
+            tmem_group,
+            compute_group,
+        }
+    }
+
+    const fn fits(&self, triangle_bytes: u64, target_bytes: u64, status_bytes: u64) -> bool {
+        self.triangle_capacity >= triangle_bytes
+            && self.target_capacity >= target_bytes
+            && self.status_capacity >= status_bytes
+    }
 }
 
 /// One fixture's ten reusable GPU buffers. Created once per pool slot and
@@ -1577,6 +1729,11 @@ impl ComputeCoverageTriangle {
 impl TrianglePipelineRenderer {
     pub const fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    #[cfg(all(test, feature = "host-gpu-tests"))]
+    pub(crate) const fn compute_hot_color_resource_generations(&self) -> u64 {
+        self.compute_hot_color_resource_generations
     }
 
     /// Runs the transport-only compute shader over an arbitrary packed
@@ -1919,114 +2076,36 @@ impl TrianglePipelineRenderer {
         }
         let mut padded_target = resident_bytes.to_vec();
         padded_target.resize(target_bytes as usize, 0);
-        let create = |label, size, usage| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-        let triangle_buffer = create(
-            "fn64-compute-hot-color-triangles",
-            triangle_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
-        let params_buffer = create(
-            "fn64-compute-hot-color-params",
-            16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        let target_buffer = create(
-            "fn64-compute-hot-color-target",
-            target_bytes,
-            wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        );
-        let status_buffer = create(
-            "fn64-compute-hot-color-status",
-            status_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-        let tmem_bytes = create(
-            "fn64-compute-hot-color-tmem",
-            TMEM_BYTE_WORDS as u64 * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
-        let tmem_validity = create(
-            "fn64-compute-hot-color-tmem-validity",
-            TMEM_VALIDITY_WORDS as u64 * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
-        let tile_buffer = create(
-            "fn64-compute-hot-color-tile",
-            TILE_BINDING_PARAMS_BYTES,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        let target_readback = create(
-            "fn64-compute-hot-color-target-readback",
-            target_bytes,
-            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        );
-        let status_readback = create(
-            "fn64-compute-hot-color-status-readback",
-            status_bytes,
-            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        );
+        let replace_resources = self
+            .compute_hot_color_buffers
+            .as_ref()
+            .is_none_or(|buffers| !buffers.fits(triangle_bytes, target_bytes, status_bytes));
+        if replace_resources {
+            self.compute_hot_color_buffers = Some(ComputeHotColorBuffers::new(
+                &self.device,
+                &self.compute_triangle_color_pipeline,
+                triangle_bytes,
+                target_bytes,
+                status_bytes,
+            ));
+            self.compute_hot_color_resource_generations = self
+                .compute_hot_color_resource_generations
+                .checked_add(1)
+                .expect("compute-color resource generation overflow");
+        }
+        let buffers = self
+            .compute_hot_color_buffers
+            .as_ref()
+            .expect("validated nonempty compute batch owns high-water resources");
         self.queue
-            .write_buffer(&triangle_buffer, 0, &packed_triangles);
-        self.queue.write_buffer(&params_buffer, 0, &params);
-        self.queue.write_buffer(&target_buffer, 0, &padded_target);
+            .write_buffer(&buffers.triangle, 0, &packed_triangles);
+        self.queue.write_buffer(&buffers.params, 0, &params);
+        self.queue.write_buffer(&buffers.target, 0, &padded_target);
         self.queue
-            .write_buffer(&tmem_bytes, 0, &tmem.byte_words_bytes());
+            .write_buffer(&buffers.tmem_bytes, 0, &tmem.byte_words_bytes());
         self.queue
-            .write_buffer(&tmem_validity, 0, &tmem.validity_words_bytes());
-        self.queue.write_buffer(&tile_buffer, 0, &tile.to_bytes());
-        let tmem_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fn64-compute-hot-color-tmem-group"),
-            layout: &self
-                .compute_triangle_color_pipeline
-                .get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: tmem_bytes.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tmem_validity.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: tile_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let compute_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fn64-compute-hot-color-state-group"),
-            layout: &self
-                .compute_triangle_color_pipeline
-                .get_bind_group_layout(1),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: triangle_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: target_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: status_buffer.as_entire_binding(),
-                },
-            ],
-        });
+            .write_buffer(&buffers.tmem_validity, 0, &tmem.validity_words_bytes());
+        self.queue.write_buffer(&buffers.tile, 0, &tile.to_bytes());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2038,12 +2117,24 @@ impl TrianglePipelineRenderer {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.compute_triangle_color_pipeline);
-            pass.set_bind_group(0, &tmem_group, &[]);
-            pass.set_bind_group(1, &compute_group, &[]);
+            pass.set_bind_group(0, &buffers.tmem_group, &[]);
+            pass.set_bind_group(1, &buffers.compute_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&target_buffer, 0, &target_readback, 0, target_bytes);
-        encoder.copy_buffer_to_buffer(&status_buffer, 0, &status_readback, 0, status_bytes);
+        encoder.copy_buffer_to_buffer(
+            &buffers.target,
+            0,
+            &buffers.target_readback,
+            0,
+            target_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &buffers.status,
+            0,
+            &buffers.status_readback,
+            0,
+            status_bytes,
+        );
         let submission = self.queue.submit([encoder.finish()]);
         self.device
             .poll(wgpu::PollType::Wait {
@@ -2051,7 +2142,7 @@ impl TrianglePipelineRenderer {
                 timeout: Some(POLL_TIMEOUT),
             })
             .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
-        let statuses = map_and_read(&self.device, &status_readback)?;
+        let statuses = map_and_read_prefix(&self.device, &buffers.status_readback, status_bytes)?;
         if let Some((pixel, status)) = statuses
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four status bytes")))
@@ -2060,7 +2151,7 @@ impl TrianglePipelineRenderer {
         {
             return Err(TrianglePipelineError::ComputeColorTmemStatus { pixel, status });
         }
-        let mut bytes = map_and_read(&self.device, &target_readback)?;
+        let mut bytes = map_and_read_prefix(&self.device, &buffers.target_readback, target_bytes)?;
         bytes.truncate(expected_bytes);
         Ok(bytes)
     }
@@ -2782,12 +2873,19 @@ fn map_and_read(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,
 ) -> Result<Vec<u8>, TrianglePipelineError> {
+    map_and_read_prefix(device, buffer, buffer.size())
+}
+
+fn map_and_read_prefix(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    bytes: u64,
+) -> Result<Vec<u8>, TrianglePipelineError> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    buffer
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.try_send(result);
-        });
+    let slice = buffer.slice(..bytes);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.try_send(result);
+    });
     device
         .poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -2798,8 +2896,7 @@ fn map_and_read(
         .recv_timeout(CALLBACK_TIMEOUT)
         .map_err(|_| TrianglePipelineError::Readback("map callback timeout".into()))?
         .map_err(|error| TrianglePipelineError::Readback(error.to_string()))?;
-    let mapped = buffer
-        .slice(..)
+    let mapped = slice
         .get_mapped_range()
         .map_err(|error| TrianglePipelineError::Readback(error.to_string()))?;
     let output = mapped.to_vec();
