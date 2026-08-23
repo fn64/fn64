@@ -127,7 +127,8 @@ use std::time::Duration;
 
 use crate::device::{HeadlessBackend, NoAdapter};
 use crate::shader_manifest::{
-    triangle_pipeline_fragment_wgsl, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
+    triangle_pipeline_fragment_wgsl, COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT,
+    COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL, TRIANGLE_PIPELINE_FRAGMENT_ENTRY_POINT,
     TRIANGLE_PIPELINE_VERTEX_ENTRY_POINT, TRIANGLE_PIPELINE_VERTEX_WGSL,
 };
 use crate::state::{AlphaCompare, Color4, CoverageDestination, OtherMode, PrimColor};
@@ -858,6 +859,20 @@ impl UninitializedTrianglePipeline {
             label: Some("fn64-triangle-pipeline-fragment"),
             source: wgpu::ShaderSource::Wgsl(fragment_source.into()),
         });
+        let compute_raster_round_trip_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fn64-compute-raster-rgba16-round-trip"),
+                source: wgpu::ShaderSource::Wgsl(COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL.into()),
+            });
+        let compute_raster_round_trip_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fn64-compute-raster-rgba16-round-trip"),
+                layout: None,
+                module: &compute_raster_round_trip_shader,
+                entry_point: Some(COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let raster_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fn64-triangle-pipeline-raster-params"),
@@ -1187,6 +1202,7 @@ impl UninitializedTrianglePipeline {
                 queue,
                 pipelines,
                 bind_group_layout,
+                compute_raster_round_trip_pipeline,
                 framebuffer_color_dummy_buffer,
                 fixture_buffers: Vec::new(),
                 errors,
@@ -1278,6 +1294,9 @@ pub struct TrianglePipelineRenderer {
     /// [`depth_pipeline_index`]; see module doc and [`DEPTH_STENCIL_VARIANTS`].
     pipelines: [wgpu::RenderPipeline; 4],
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Precreated transport-only compute pipeline for qualifying a dynamic
+    /// packed-RGBA16 target before raster arithmetic is admitted.
+    compute_raster_round_trip_pipeline: wgpu::ComputePipeline,
     /// Binding 9's shared dummy resource for every fixture in a submission
     /// whose `reads_framebuffer_color` is false -- one always-allocated
     /// buffer reused across every non-reading fixture and every submission,
@@ -1385,6 +1404,127 @@ impl FixtureBuffers {
 impl TrianglePipelineRenderer {
     pub const fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    /// Runs the transport-only compute shader over an arbitrary packed
+    /// RGBA16 target and returns exactly the guest-visible bytes. The GPU
+    /// buffers are word-addressed, so a final two-byte pixel is zero-padded
+    /// only for device transport and truncated after readback.
+    pub fn round_trip_compute_raster_rgba16(
+        &mut self,
+        extent: TriangleTargetExtent,
+        resident_bytes: &[u8],
+    ) -> Result<Vec<u8>, TrianglePipelineError> {
+        validate_triangle_extent(extent)?;
+        let expected_bytes_u64 = u64::from(extent.width)
+            .checked_mul(u64::from(extent.height))
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or(TrianglePipelineError::Rgba16TargetSizeOverflow {
+                width: extent.width,
+                height: extent.height,
+            })?;
+        let expected_bytes = usize::try_from(expected_bytes_u64).map_err(|_| {
+            TrianglePipelineError::Rgba16TargetSizeOverflow {
+                width: extent.width,
+                height: extent.height,
+            }
+        })?;
+        if resident_bytes.len() != expected_bytes {
+            return Err(TrianglePipelineError::Rgba16TargetByteLength {
+                expected: expected_bytes,
+                actual: resident_bytes.len(),
+            });
+        }
+
+        let transport_bytes = expected_bytes_u64
+            .checked_add(3)
+            .map(|bytes| bytes / 4 * 4)
+            .ok_or(TrianglePipelineError::Rgba16TargetSizeOverflow {
+                width: extent.width,
+                height: extent.height,
+            })?;
+        let word_count = transport_bytes / 4;
+        let workgroups = word_count.div_ceil(64);
+        let limits = self.device.limits();
+        if workgroups > u64::from(limits.max_compute_workgroups_per_dimension)
+            || transport_bytes > limits.max_buffer_size
+            || transport_bytes > u64::from(limits.max_storage_buffer_binding_size)
+        {
+            return Err(TrianglePipelineError::Rgba16TargetTooLarge {
+                width: extent.width,
+                height: extent.height,
+            });
+        }
+        let mut padded = vec![0_u8; transport_bytes as usize];
+        padded[..resident_bytes.len()].copy_from_slice(resident_bytes);
+
+        let source = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-raster-rgba16-round-trip-source"),
+            size: transport_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let target = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-raster-rgba16-round-trip-target"),
+            size: transport_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fn64-compute-raster-rgba16-round-trip-readback"),
+            size: transport_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&source, 0, &padded);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fn64-compute-raster-rgba16-round-trip-bind-group"),
+            layout: &self
+                .compute_raster_round_trip_pipeline
+                .get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: source.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: target.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fn64-compute-raster-rgba16-round-trip"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fn64-compute-raster-rgba16-round-trip"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compute_raster_round_trip_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&target, 0, &readback, 0, transport_bytes);
+        let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
+        encoder.on_submitted_work_done(move || {
+            let _ = callback_sender.try_send(());
+        });
+        let submission = self.queue.submit([encoder.finish()]);
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(POLL_TIMEOUT),
+            })
+            .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
+        callback_receiver
+            .recv_timeout(CALLBACK_TIMEOUT)
+            .map_err(|_| TrianglePipelineError::CompletionCallbackNotObserved)?;
+        let mut output = map_and_read(&self.device, &readback)?;
+        output.truncate(expected_bytes);
+        Ok(output)
     }
 
     /// Submits one fixed-fixture triangle draw (`draw(0..3, 0..1)`) into a
@@ -2157,6 +2297,18 @@ pub enum TrianglePipelineError {
         first: TriangleTargetExtent,
         other: TriangleTargetExtent,
     },
+    Rgba16TargetSizeOverflow {
+        width: u32,
+        height: u32,
+    },
+    Rgba16TargetTooLarge {
+        width: u32,
+        height: u32,
+    },
+    Rgba16TargetByteLength {
+        expected: usize,
+        actual: usize,
+    },
     ExactSubmissionWait(String),
     CompletionCallbackNotObserved,
     Readback(String),
@@ -2185,6 +2337,18 @@ impl fmt::Display for TrianglePipelineError {
                 formatter,
                 "triangle-pipeline batch has mixed target extents: {}x{} vs {}x{}",
                 first.width, first.height, other.width, other.height
+            ),
+            Self::Rgba16TargetSizeOverflow { width, height } => write!(
+                formatter,
+                "packed RGBA16 target size overflows host addressing: {width}x{height}"
+            ),
+            Self::Rgba16TargetTooLarge { width, height } => write!(
+                formatter,
+                "packed RGBA16 target exceeds one-dimensional compute dispatch limits: {width}x{height}"
+            ),
+            Self::Rgba16TargetByteLength { expected, actual } => write!(
+                formatter,
+                "packed RGBA16 target byte length mismatch: expected {expected}, got {actual}"
             ),
             Self::ExactSubmissionWait(reason) => {
                 write!(formatter, "exact triangle-pipeline submission wait failed: {reason}")
