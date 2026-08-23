@@ -714,6 +714,15 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         (width != 0).then_some(width)
     }
 
+    /// The live VI_STATUS/VI_CONTROL register (`vi_registers[0]`), read as a
+    /// direct field access. This is the cheap presenter path: it is the same
+    /// value `read_live_device_mmio(0xA440_0000)` returns, but without the
+    /// per-call MMIO address-decode the raw read routes through -- which a
+    /// host presenter must not pay once per presented frame.
+    pub fn vi_control(&self) -> u32 {
+        self.vi_registers[0]
+    }
+
     /// The guest-programmed active digital output height in lines, decoded
     /// from VI_V_START (`vi_registers[10]`) exactly as
     /// `fn64_render::ViActiveWindow` decodes it: the half-line interval
