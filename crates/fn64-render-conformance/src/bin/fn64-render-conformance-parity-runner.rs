@@ -1476,6 +1476,72 @@ fn one_textured_rect() -> Vec<(u32, u32)> {
     words
 }
 
+/// `SetTile` for tile 0, RGBA16, with an explicit **S mask** and the WRAP
+/// (non-clamp, non-mirror) S mode, for the right-edge over-read reproduction.
+///
+/// The `set_tile` above leaves `mask_s == 0`, which `tmem/sample.rs` treats
+/// as a forced clamp regardless of mode. To exercise the WRAP arm this case
+/// must carry a nonzero mask. Public `gDPSetTile` (`ultra64/gbi.h`) places
+/// S mode at bits 9:8 (0 = WRAP) and S mask at 7:4; `mask_s = 2` addresses a
+/// four-texel row (`0..3`), so a coordinate at texel 4 wraps to texel 0.
+const fn set_tile_wrap_s(line_words: u32, tmem_word: u32, mask_s: u32) -> (u32, u32) {
+    (
+        0xf500_0000 | (2 << 19) | (line_words << 9) | tmem_word,
+        mask_s << 4,
+    )
+}
+
+/// A one-cycle texrect whose right edge lands ONE pixel past the tile's
+/// loaded S extent, so the rightmost destination column samples texel index
+/// `TEXTURE_WIDTH` -- one texel beyond the `[0, TEXTURE_WIDTH-1]` the
+/// `LoadTile` actually wrote. This is the exact shape #35 inferred but the
+/// then-existing corpus never constructed: the intersection of a textured
+/// rectangle, its right screen column, and a tile whose valid texels end at
+/// that column.
+///
+/// The rectangle is `TEXTURE_WIDTH + 1` pixels wide over a `TEXTURE_WIDTH`-
+/// texel tile at one texel per pixel (`dsdx = 1<<10`), so `s_at(column)`
+/// equals `column` texels and the last column (index `TEXTURE_WIDTH`) lands
+/// on the first out-of-extent texel. `addressing` (`wrap` vs `clamp`) is the
+/// only thing that varies between the two variants, and the two produce a
+/// DIFFERENT rightmost-column texel -- so a right-edge over-read is visible
+/// no matter which addressing the sampler is asked for.
+fn right_edge_overread_rect(addressing: RightEdgeAddressing) -> Vec<(u32, u32)> {
+    // Draw one pixel wider than the loaded tile so the last column samples
+    // texel TEXTURE_WIDTH.
+    let draw_width = TEXTURE_WIDTH + 1;
+    let mut words = set_bilerp0(one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1));
+    words.pop();
+    let tile_word = match addressing {
+        // mask_s == 0 forces clamp: texel TEXTURE_WIDTH clamps to
+        // TEXTURE_WIDTH-1 (the last loaded texel).
+        RightEdgeAddressing::Clamp => set_tile(TEXTURE_LINE_WORDS, 0),
+        // mask_s == 2 + WRAP mode: texel TEXTURE_WIDTH wraps to texel 0.
+        RightEdgeAddressing::Wrap => set_tile_wrap_s(TEXTURE_LINE_WORDS, 0, 2),
+    };
+    words.extend([
+        set_bilerp0(vec![OTHER_MODES_ONE_CYCLE_TEXTURED])[0],
+        SET_COMBINE_TEXEL0,
+        set_scissor(0, 0, WIDTH, HEIGHT),
+        (0xff10_0000 | (WIDTH - 1), FRAMEBUFFER),
+        set_texture_image(TEXTURE_WIDTH, TEXTURE_SOURCE),
+        tile_word,
+        set_tile_size(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+        load_tile(TEXTURE_WIDTH, TEXTURE_HEIGHT),
+        (0xe600_0000, 0),
+    ]);
+    words.extend(texture_rectangle(0, 0, draw_width, TEXTURE_HEIGHT));
+    words.push((0xe900_0000, 0));
+    words
+}
+
+#[derive(Clone, Copy)]
+enum RightEdgeAddressing {
+    Clamp,
+    Wrap,
+}
+
 /// The one-cycle point-sampled fixture with only its draw cycle changed to
 /// two-cycle mode. [`SET_COMBINE_TEXEL0`] programs Texel0 passthrough in both
 /// cycles, so its hand-derived key remains [`textured_expected`].
@@ -5109,6 +5175,15 @@ fn generated_cases() -> Vec<GeneratedCase> {
     // reproduce the wgpu==RT64 vs angrylion divergence — documents the finding
     // as a live, reproducible corpus row.
     push(1, "gen-loadblock-linear-missing-bilerp".into(), "LoadBlock WITHOUT BI_LERP_0 (bilerp-gap witness)", load_block_textured_rect(8, 0, 2, 8, 1, 2));
+
+    // Right-edge texel over-read (task 36 reproduction). A one-cycle texrect
+    // drawn one pixel wider than the loaded tile, so the rightmost column
+    // samples texel TEXTURE_WIDTH -- one past the loaded S extent. The two
+    // addressing modes give a DIFFERENT rightmost-column texel, so whichever
+    // the sampler produces, a right-edge over-read shows up as a wgpu-vs-
+    // angrylion divergence on the last column.
+    push(1, "gen-texrect-right-edge-overread-clamp".into(), "texrect right edge one past loaded S extent, CLAMP (mask_s==0): last column must clamp to the last loaded texel", right_edge_overread_rect(RightEdgeAddressing::Clamp));
+    push(1, "gen-texrect-right-edge-overread-wrap".into(), "texrect right edge one past loaded S extent, WRAP (mask_s==2): last column must wrap to texel 0", right_edge_overread_rect(RightEdgeAddressing::Wrap));
 
     // -------------------------------------------------------------------
     // Track-B fan-out pass 1: designed slices.
