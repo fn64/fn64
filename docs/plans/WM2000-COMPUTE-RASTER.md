@@ -129,9 +129,20 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    registers matched the CPU raw-triangle executor's complete target bytes
    for 10 consecutive native Metal runs on 2026-08-23. The oracle caught and
    rejected the initial direct-count coverage encoding before the corrected
-   `count - 1` stored representation passed. Game-derived replay, production
-   wiring, timing, additional TMEM identities, and the remaining seven keys
-   are still open.
+   `count - 1` stored representation passed. The prototype is now wired to an
+   explicitly enabled production replay probe: it seals each admitted draw
+   from the real command-time target generation, TMEM image, tile, accesses,
+   and material state, runs compute, and compares the complete target against
+   the CPU result. The first game-derived run rejected the shader at packet
+   2648, command 6, pixel `(95,95)`. Stage tracing proved coverage and S10.5
+   coordinates agreed (`S=1997`, `T=3028`) while the CPU point sampler
+   produced `[f7,f7,f7,ff]` and the shader's unconditional three-nearest path
+   produced `[f1,c8,cf,ff]`. A distinct point-sampling callable fixed the
+   filter-selection boundary; fractional-coordinate synthetic coverage then
+   passed its 10-run native Metal differential, and the 13-packet game window
+   passed 10 consecutive complete-target runs (500 admitted draws). Additional
+   state keys and replacement of per-draw prototype resources/readbacks remain
+   open.
 6. **Production A/B seam.** Add a strict same-binary CPU-versus-compute control.
    Run counterbalanced `A/B, B/A`, then re-profile. Retain only if both orders
    improve p95 and the named RDP cost falls.
@@ -215,6 +226,15 @@ and packet 2657 at 4.4 ms total despite only 1.13 ms execute because its
 plan/read/copy boundary dominates. This selects packet-local triangle batches
 as the compute unit and keeps resident-target transfer removal as the next,
 independently measured optimization.
+
+The first production-probe timing intentionally includes the unoptimized
+diagnostic mechanism: 10 repetitions of the same 13-packet window averaged
+53.386 ms total, of which 35.697 ms was 50 per-draw compute calls creating
+buffers/bind groups and synchronously reading back both the full target and a
+four-word-per-pixel stage trace. This is not a candidate performance result;
+it quantifies the setup/readback class the plan already requires production to
+remove. The byte differential is now trustworthy enough to optimize that
+mechanism without weakening correctness.
 
 ## Sources and nonclaims
 
