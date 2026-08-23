@@ -14,6 +14,7 @@
 
 use crate::gamepad::{apply_deadzone_f, Gamepads};
 use crate::input_map::{BindTarget, InputConfig, N64Button, StickDir};
+use crate::video_config::VideoConfig;
 use egui::{Align2, Color32, Pos2, Rect, RichText, Rounding, Stroke, Vec2};
 // pixels' re-export, so the render pass talks to the same wgpu 0.19 instance
 // pixels' surface lives in (egui-wgpu resolves to that same version).
@@ -39,8 +40,19 @@ pub enum Capture {
     Pad(N64Button),
 }
 
+/// Which settings tab the overlay is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Input,
+    Video,
+    Audio,
+}
+
 pub struct Overlay {
     pub open: bool,
+    /// The selected settings tab, persisted across redraws (not to disk).
+    tab: Tab,
     /// The always-cheap stack/framerate HUD (F3), independent of the settings
     /// panel: a player who wants to SEE which stack a build is on should not
     /// have to open a modal that neutralizes their input to read it.
@@ -70,6 +82,7 @@ impl Overlay {
         ctx.set_visuals(visuals);
         Overlay {
             open: false,
+            tab: Tab::default(),
             hud: false,
             capture: None,
             ctx,
@@ -161,6 +174,13 @@ impl Overlay {
     /// A keyboard key arrived while a capture was armed. Delete/Backspace
     /// clears either kind of slot; any other key binds a keyboard slot.
     /// Returns true when the event changed the active capture.
+    /// Jump to a tab (F1/F2/F3 while the panel is open). A pending key capture
+    /// is dropped -- switching tabs abandons an armed rebind.
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.capture = None;
+    }
+
     pub fn apply_key_capture(&mut self, config: &mut InputConfig, key: KeyCode) -> bool {
         let clear = matches!(key, KeyCode::Delete | KeyCode::Backspace);
         match self.capture {
@@ -198,6 +218,7 @@ impl Overlay {
         window_size: (u32, u32),
         scale_factor: f32,
         config: &mut InputConfig,
+        video: &mut VideoConfig,
         gamepads: &Gamepads,
         hud: Option<&HudReadout>,
     ) -> Result<(), pixels::Error> {
@@ -218,7 +239,9 @@ impl Overlay {
 
         let mut capture = self.capture;
         let mut reset_armed = self.reset_armed;
+        let mut tab = self.tab;
         let mut dirty = false;
+        let mut video_dirty = false;
         let mut close_requested = false;
         let settings_open = self.open;
         let full_output = self.ctx.clone().run(raw, |ctx| {
@@ -229,16 +252,20 @@ impl Overlay {
                 draw_ui(
                     ctx,
                     config,
+                    video,
                     gamepads,
+                    &mut tab,
                     &mut capture,
                     &mut reset_armed,
                     &mut dirty,
+                    &mut video_dirty,
                     &mut close_requested,
                 );
             }
         });
         self.capture = capture;
         self.reset_armed = reset_armed;
+        self.tab = tab;
         if close_requested {
             self.open = false;
             self.capture = None;
@@ -246,6 +273,9 @@ impl Overlay {
         }
         if dirty {
             config.save();
+        }
+        if video_dirty {
+            video.save();
         }
 
         let pixels_per_point = full_output.pixels_per_point;
@@ -385,13 +415,17 @@ fn key_label(key: KeyCode) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_ui(
     ctx: &egui::Context,
     config: &mut InputConfig,
+    video: &mut VideoConfig,
     gamepads: &Gamepads,
+    tab: &mut Tab,
     capture: &mut Option<Capture>,
     reset_armed: &mut bool,
     dirty: &mut bool,
+    video_dirty: &mut bool,
     close_requested: &mut bool,
 ) {
     // Dim the game underneath so the panel reads as a modal layer.
@@ -423,13 +457,90 @@ fn draw_ui(
     // reachable by dragging the window down. Clamp to something still usable
     // instead, and let the ScrollArea scroll.
     let body_max_height = (screen.height() - chrome).clamp(48.0, screen.height());
-    egui::Window::new(RichText::new("INPUT SETTINGS").strong().color(INK))
+    egui::Window::new(RichText::new("SETTINGS").strong().color(INK))
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
         .max_height(screen.height() - 24.0)
         .max_width(screen.width() - 24.0)
         .show(ctx, |ui| {
+            // Tab bar: Input / Video / Audio. Selection lives in `tab`, owned
+            // by the Overlay so it survives redraws. The F-key affordance
+            // matches the shortcuts wired in main.rs (F1/F2/F3 while open).
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(*tab == Tab::Input, RichText::new("Input  F1").strong())
+                    .clicked()
+                {
+                    *tab = Tab::Input;
+                    *capture = None;
+                }
+                if ui
+                    .selectable_label(*tab == Tab::Video, RichText::new("Video  F2").strong())
+                    .clicked()
+                {
+                    *tab = Tab::Video;
+                    *capture = None;
+                }
+                if ui
+                    .selectable_label(*tab == Tab::Audio, RichText::new("Audio  F3").strong())
+                    .clicked()
+                {
+                    *tab = Tab::Audio;
+                    *capture = None;
+                }
+            });
+            ui.separator();
+            ui.add_space(4.0);
+
+            match *tab {
+                Tab::Input => draw_input_tab(
+                    ui,
+                    config,
+                    gamepads,
+                    capture,
+                    reset_armed,
+                    dirty,
+                    body_max_height,
+                ),
+                Tab::Video => draw_video_tab(ui, video, video_dirty),
+                Tab::Audio => draw_audio_tab(ui),
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("Done").strong()).clicked() {
+                    *close_requested = true;
+                }
+                ui.label(
+                    RichText::new("Changes save automatically")
+                        .color(MUTED)
+                        .small(),
+                );
+            });
+            ui.add_space(3.0);
+            let hint = match capture {
+                Some(Capture::Key(_)) => "press a key to bind · Delete clears · Esc cancels",
+                Some(Capture::Pad(_)) => "press a controller button · Delete clears · Esc cancels",
+                None => "F1/F2/F3 switch tabs · Esc closes · F11 fullscreen",
+            };
+            ui.label(RichText::new(hint).color(MUTED).small());
+        });
+}
+
+/// The Input tab: the existing bindings + analog-stick UI, unchanged, hosted
+/// under the tab bar.
+fn draw_input_tab(
+    ui: &mut egui::Ui,
+    config: &mut InputConfig,
+    gamepads: &Gamepads,
+    capture: &mut Option<Capture>,
+    reset_armed: &mut bool,
+    dirty: &mut bool,
+    body_max_height: f32,
+) {
+    {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("PLAYER 1").color(MUTED).small().strong());
                 ui.separator();
@@ -499,26 +610,55 @@ fn draw_ui(
                     *capture = None;
                     *reset_armed = true;
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(RichText::new("Done").strong()).clicked() {
-                        *close_requested = true;
-                    }
-                    ui.label(
-                        RichText::new("Changes save automatically")
-                            .color(MUTED)
-                            .small(),
-                    );
-                });
             });
-            ui.add_space(3.0);
-            let hint = match capture {
-                Some(Capture::Key(_)) => "press a key to bind · Delete clears · Esc cancels",
-                Some(Capture::Pad(_)) => "press a controller button · Delete clears · Esc cancels",
-                None => "F1 or Esc closes · F3 stack/fps HUD · F11 toggles fullscreen",
-            };
-            ui.label(RichText::new(hint).color(MUTED).small());
-        });
+    }
+}
+
+/// The Video tab: the overscan crop and the zoom-to-fill toggle.
+fn draw_video_tab(ui: &mut egui::Ui, video: &mut VideoConfig, video_dirty: &mut bool) {
+    ui.label(RichText::new("DISPLAY").color(MUTED).small().strong());
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Overscan crop");
+        if ui
+            .add(egui::Slider::new(&mut video.overscan, 0..=16).suffix(" px"))
+            .changed()
+        {
+            *video_dirty = true;
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Columns cropped from the right edge on present. Hides the uncovered \
+             overscan column some games leave as stale pixels. 0 shows the raw scanout.",
+        )
+        .color(MUTED)
+        .small(),
+    );
+
+    ui.add_space(8.0);
+    if ui
+        .checkbox(&mut video.zoom_fill, "Zoom to fill window")
+        .changed()
+    {
+        *video_dirty = true;
+    }
+    ui.label(
+        RichText::new(
+            "Stretch the picture to fill the whole window instead of keeping the \
+             native aspect ratio with a matte. Distorts the aspect ratio.",
+        )
+        .color(MUTED)
+        .small(),
+    );
+}
+
+/// The Audio tab: a placeholder frame for future audio settings.
+fn draw_audio_tab(ui: &mut egui::Ui) {
+    ui.label(RichText::new("AUDIO").color(MUTED).small().strong());
+    ui.add_space(4.0);
+    ui.label(RichText::new("No audio settings yet.").color(MUTED));
 }
 
 fn bindings_grid(ui: &mut egui::Ui, config: &mut InputConfig, capture: &mut Option<Capture>) {

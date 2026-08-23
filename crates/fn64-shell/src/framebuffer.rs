@@ -247,6 +247,80 @@ mod tests {
     }
 
     #[test]
+    fn cropping_the_overscan_column_leaves_the_kept_columns_identical() {
+        // The VI-overscan crop: the guest fills a 480-wide line but the
+        // scanout only addresses columns 0..479 (visible width 479), so the
+        // presenter passes dst_width = 479 while the stride stays 480. The
+        // kept columns must be byte-for-byte the same as a full-width present,
+        // and the stale overscan column must never be read into the surface.
+        const STRIDE: usize = 480;
+        const VISIBLE: usize = 479;
+        const ROWS: usize = 4;
+
+        // Fill the whole framebuffer with a per-column shade, then poison the
+        // last column of every row with a distinct "stale RDRAM" value so its
+        // absence in the cropped surface is a real assertion.
+        let stale = 0x0843u16;
+        let mut src_px = vec![0u16; STRIDE * ROWS];
+        for row in 0..ROWS {
+            for col in 0..STRIDE {
+                let shade = ((col as u16) & 0x1F) << 11 | 1;
+                src_px[row * STRIDE + col] = shade;
+            }
+            src_px[row * STRIDE + (STRIDE - 1)] = stale; // overscan column
+        }
+        let src = fb_with(&src_px);
+
+        let mut full = vec![0u8; STRIDE * ROWS * 4];
+        rgba5551_to_rgba8888(
+            RdramView::from_storage(&src),
+            RdramAddr::from_offset(0),
+            STRIDE,
+            STRIDE, // full-width present (the pre-fix behavior)
+            ROWS,
+            &mut full,
+        );
+
+        let mut cropped = vec![0u8; VISIBLE * ROWS * 4];
+        rgba5551_to_rgba8888(
+            RdramView::from_storage(&src),
+            RdramAddr::from_offset(0),
+            STRIDE,   // stride unchanged -- row offsets stay correct
+            VISIBLE,  // present only the scanned-out columns
+            ROWS,
+            &mut cropped,
+        );
+
+        // Every kept column of every row is identical to the full present.
+        for row in 0..ROWS {
+            let full_row = &full[row * STRIDE * 4..row * STRIDE * 4 + VISIBLE * 4];
+            let cropped_row = &cropped[row * VISIBLE * 4..(row + 1) * VISIBLE * 4];
+            assert_eq!(
+                cropped_row, full_row,
+                "row {row}: cols 0..{VISIBLE} must be pixel-identical to the full present"
+            );
+        }
+
+        // The stale overscan value expands to a distinct RGBA; it must appear
+        // in the full present (proving the fixture exercises it) and never in
+        // the cropped surface.
+        let stale_rgba = [
+            expand5((stale >> 11) & 0x1F),
+            expand5((stale >> 6) & 0x1F),
+            expand5((stale >> 1) & 0x1F),
+            255,
+        ];
+        assert!(
+            full.chunks_exact(4).any(|px| px == stale_rgba),
+            "the full present shows the overscan column (fixture is meaningful)"
+        );
+        assert!(
+            !cropped.chunks_exact(4).any(|px| px == stale_rgba),
+            "the cropped present must never read the overscan column"
+        );
+    }
+
+    #[test]
     fn narrow_surface_crops_but_keeps_row_alignment() {
         // If the surface stays 320 while the source is wider, each row still
         // reads from its real stride (no shear), just cropped to the left 320.
