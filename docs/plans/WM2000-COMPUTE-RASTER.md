@@ -236,6 +236,17 @@ it quantifies the setup/readback class the plan already requires production to
 remove. The byte differential is now trustworthy enough to optimize that
 mechanism without weakening correctness.
 
+Removing that successful-path stage trace was the first isolated optimization.
+The same 13-packet window, with two warmups and ten measured repetitions, kept
+the exact `1ac409f336397652` effect digest and completed 500 admitted draws
+without a target mismatch. Mean compute-probe time fell from 35.697 ms to
+22.267 ms (-13.430 ms, 37.6%), while mean total window time fell from 53.386 ms
+to 39.396 ms (-13.990 ms, 26.2%). The remaining call still creates nine GPU
+buffers and two bind groups, submits and synchronously waits once, and maps the
+status and target readbacks for every draw. Persistent high-water resources are
+therefore the next independently measured mechanism; this result does not yet
+credit the compute path with an end-to-end live-frame win.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
