@@ -117,6 +117,17 @@ pub fn is_uniform(region: &[u8]) -> bool {
     }
 }
 
+/// Replace a decoded framebuffer with opaque black VI output.
+pub fn fill_opaque_black(rgba: &mut [u8]) {
+    assert!(
+        rgba.len().is_multiple_of(4),
+        "RGBA buffer length is not pixel-aligned"
+    );
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[0, 0, 0, 255]);
+    }
+}
+
 /// Stable diagnostic fingerprint of the decoded RGBA frame. Unlike the old
 /// `NON-BLANK` label this makes two capture paths mechanically comparable;
 /// it is evidence of equality, not a claim that either image is faithful.
@@ -399,6 +410,13 @@ mod tests {
         assert!(is_uniform(&[0, 0, 0, 0]));
         assert!(is_uniform(&[]));
         assert!(!is_uniform(&[0, 0, 1, 0]));
+    }
+
+    #[test]
+    fn blank_vi_output_is_opaque_black() {
+        let mut rgba = vec![0x55; 3 * 4];
+        fill_opaque_black(&mut rgba);
+        assert_eq!(rgba, [0, 0, 0, 255].repeat(3));
     }
 
     #[test]
