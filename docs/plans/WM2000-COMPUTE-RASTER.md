@@ -1,0 +1,122 @@
+# WM2000 exact compute-raster execution plan
+
+Status: active architecture pivot, 2026-08-23.
+
+## Why this is now the shortest path
+
+The retained unprofiled lane is approximately 24.3 ms mean and 38.8--39.1 ms
+p95 per drawn frame. Reliable 30 Hz still needs about 5.8 ms from p95; the
+extension-headroom bar needs about 14 ms and a p95 at or below 25 ms.
+
+Fresh phase attribution places 83.4% of slow-pump excess in raw-DPC RDP work.
+Over-budget drawn frames average 26.862 ms of RDP work versus 17.135 ms within
+budget, while presentation differs by only 0.023 ms. The draw census further
+shows that eight textured, perspective, depth-free RGBA16 state keys cover the
+observed triangle workload and that the five leading keys account for 98.4%
+of raster time.
+
+The CPU alternatives have now failed their kill tests: prepared two-cycle
+combining saved only about 0.45 ms p95, incremental texture planes were slower,
+lowering the Rayon cutoff was slower in both pair orders, and caching coverage
+sample intervals was also slower. Direct bracket experiments retained outside
+git additionally leave approximately 99% of the synthetic raster cost after
+sampling, combining, blending, and coordinate math are removed. The remaining
+cost scales with scalar fragment visits. Another selector or bounds-check
+micro-optimization cannot credibly supply 14 ms.
+
+## Execution shape
+
+The production path will retain one packed RGBA16 storage buffer per resident
+color target. A compute submission owns a target pixel, not a triangle:
+
+```text
+ordered packet commands
+        |
+        v
+typed admitted draw records + TMEM snapshots
+        |
+        v
+one compute invocation per target pixel
+        |
+        +-- visits affecting draws in command order
+        +-- coverage -> attributes -> TMEM -> combine -> blend
+        +-- updates its own packed RGBA16 value only
+        |
+        v
+one bounded target readback at effect publication
+```
+
+Pixel ownership removes write races without atomics. Iterating a pixel's
+affecting draws in command order preserves painter's order and framebuffer
+reads. TMEM loads do not force a color-target barrier: each draw record binds
+the immutable TMEM snapshot visible at its own stream position. A fill,
+texrect, target change, unsupported state, or other CPU-only color command is
+a typed batch boundary until that command kind has an exact device executor.
+The boundary flushes once, continues through the existing CPU path, and may
+start a later batch from the resulting resident bytes. No unsupported state is
+silently approximated.
+
+The existing diagnostic triangle render pipeline is not the implementation:
+its target is RGBA8 at `RenderConfig` extent and its hardware interpolation and
+coverage are not the guest-visible CPU raster's exact semantics. The compute
+path instead uses the `SetColorImage` RGBA16 extent and a storage buffer, the
+same representation proven by `targets/native_fill_rgba16.wgsl`.
+
+## Ordered implementation units
+
+1. **Replay receipt.** Capture a bounded, game-derived packet plus its exact
+   guest-read sources outside git. Repeated replay must compare complete target
+   bytes and effect digests against the CPU path on every iteration. This is
+   the fast optimization loop; full linked-shell LTO is reserved for retained
+   candidates.
+2. **Dynamic RGBA16 target.** Generalize the proven native-fill storage-buffer
+   and bounded-readback mechanism to a `SetColorImage` extent. A no-op compute
+   round trip must reproduce arbitrary resident bytes exactly, including odd
+   widths and row ends.
+3. **Typed batch admission.** Define a move-only batch containing the target
+   identity/generation, ordered draw records, per-position TMEM snapshots, and
+   the exact journal accesses it can publish. Admission initially accepts only
+   the census-observed textured, perspective, depth-free RGBA16 subset.
+4. **Integer coverage and attributes.** Port this repository's
+   `triangle_span` formulas into WGSL using explicit multiword signed arithmetic
+   where WGSL lacks 64/128-bit integers. Exhaustively compare every covered
+   sample and plane value against the CPU implementation before color work is
+   enabled.
+5. **TMEM, combiner, and blend.** Reuse the repository-owned callable WGSL
+   functions where they are already CPU-differentially proven. Add packed
+   RGBA16 destination decode/write and the two-cycle path required by the
+   census. Every one of the eight state keys must match complete CPU target
+   bytes; a mutation of any stage must fail the comparison.
+6. **Production A/B seam.** Add a strict same-binary CPU-versus-compute control.
+   Run counterbalanced `A/B, B/A`, then re-profile. Retain only if both orders
+   improve p95 and the named RDP cost falls.
+7. **Batch-boundary widening.** Add exact GPU fill and texrect execution so a
+   whole raw-DPC packet normally incurs one upload/readback pair rather than a
+   pair around every triangle run. Only measured boundary frequency decides
+   this order.
+8. **Certification.** Require 120 live framebuffer swaps byte-identical,
+   applicable differential suites, then ten consecutive clean performance
+   runs with p95 <=25 ms, p99 <=28 ms, zero frames over 33.333 ms, and at least
+   97% gap-two cadence.
+
+## Kill gates
+
+- The dynamic-target no-op must be byte-exact before shader arithmetic lands.
+- A one-state prototype must remove at least 3 ms p95 in the live lane. If it
+  does not, measure upload/readback and batch-boundary counts before adding
+  more shader programs.
+- All eight observed states plus boundary widening must reach p95 <=25 ms.
+  Merely crossing 33.333 ms is not completion because it leaves no extension
+  budget.
+- Any byte mismatch, effect-digest mismatch, untyped fallback, per-draw
+  readback, or command-order race kills the candidate rather than weakening
+  the oracle.
+
+## Sources and nonclaims
+
+The semantic oracle is fn64's existing CPU raster and its cited allowed
+sources: public N64 documentation, pinned MIT RT64, and the repository's own
+behavioral specs. The plan does not read or use a GPL runtime. It does not
+claim that existing RGBA8 diagnostic GPU output is guest-correct, nor that a
+GPU result is portable until the same byte-identity gates pass on another
+supported adapter.
