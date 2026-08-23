@@ -22,6 +22,8 @@ struct TriangleEdges {
     dxhdy: i32,
     dxmdy: i32,
     planes: array<AttributePlane, 7>,
+    env_rgba8: u32,
+    prim_rgba8: u32,
 }
 
 struct CoverageParams {
@@ -44,14 +46,23 @@ struct CoverageSample {
     plane_values: array<I64, 7>,
 }
 
-@group(0) @binding(0)
+// Group 1 is reserved for compute-raster state. Group 0 remains compatible
+// with `tmem_sample.wgsl` so the color-producing entry point can reuse its
+// already-proven committed-TMEM bindings without renumbering either module.
+@group(1) @binding(0)
 var<storage, read> triangles: array<TriangleEdges>;
 
-@group(0) @binding(1)
+@group(1) @binding(1)
 var<uniform> params: CoverageParams;
 
-@group(0) @binding(2)
+@group(1) @binding(2)
 var<storage, read_write> samples: array<CoverageSample>;
+
+@group(1) @binding(3)
+var<storage, read_write> color_target_words: array<u32>;
+
+@group(1) @binding(4)
+var<storage, read_write> color_status: array<u32>;
 
 fn i64_from_i32(value: i32) -> I64 {
     return I64(u32(value), select(0, -1, value < 0));
@@ -135,6 +146,14 @@ fn evaluate_plane(plane: AttributePlane, delta_y_eighth: i32, delta_x_q16: I64) 
     return i64_add(i64_add(i64_from_i32(plane.base), edge_term), x_term);
 }
 
+fn i64_to_f32(value: I64) -> f32 {
+    if value.hi < 0 {
+        let magnitude = i64_neg(value);
+        return -(f32(u32(magnitude.hi)) * 4294967296.0 + f32(magnitude.lo));
+    }
+    return f32(u32(value.hi)) * 4294967296.0 + f32(value.lo);
+}
+
 fn i64_less(a: I64, b: I64) -> bool {
     return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
 }
@@ -178,18 +197,7 @@ fn sample_is_covered(line: SampleLine, sample_x: I64) -> bool {
     return i64_greater_equal(sample_x, line.left) && i64_less(sample_x, line.right);
 }
 
-@compute @workgroup_size(64)
-fn compute_triangle_coverage(@builtin(global_invocation_id) id: vec3<u32>) {
-    let output_index = id.x;
-    let output_count = params.pixels_per_triangle * params.triangle_count;
-    if output_index >= output_count {
-        return;
-    }
-    let triangle_index = output_index / params.pixels_per_triangle;
-    let pixel_index = output_index % params.pixels_per_triangle;
-    let x = pixel_index % params.width;
-    let y = pixel_index / params.width;
-    let triangle = triangles[triangle_index];
+fn evaluate_coverage_sample(triangle: TriangleEdges, x: u32, y: u32) -> CoverageSample {
     let sample_y_offsets = array<i32, 4>(1, 3, 5, 7);
     let high_origin_eighth = (triangle.yh & ~3) * 2;
     let yh_eighth = triangle.yh * 2;
@@ -229,16 +237,155 @@ fn compute_triangle_coverage(@builtin(global_invocation_id) id: vec3<u32>) {
     if found_sample {
         for (var plane = 0u; plane < 7u; plane += 1u) {
             plane_values[plane] = evaluate_plane(
-                triangle.planes[plane],
-                first_delta_y_eighth,
-                first_delta_x_q16,
+                triangle.planes[plane], first_delta_y_eighth, first_delta_x_q16
             );
         }
     }
-    samples[output_index] = CoverageSample(
-        count,
-        first_delta_y_eighth,
-        first_delta_x_q16,
-        plane_values,
-    );
+    return CoverageSample(count, first_delta_y_eighth, first_delta_x_q16, plane_values);
+}
+
+@compute @workgroup_size(64)
+fn compute_triangle_coverage(@builtin(global_invocation_id) id: vec3<u32>) {
+    let output_index = id.x;
+    let output_count = params.pixels_per_triangle * params.triangle_count;
+    if output_index >= output_count {
+        return;
+    }
+    let triangle_index = output_index / params.pixels_per_triangle;
+    let pixel_index = output_index % params.pixels_per_triangle;
+    let x = pixel_index % params.width;
+    let y = pixel_index / params.width;
+    samples[output_index] = evaluate_coverage_sample(triangles[triangle_index], x, y);
+}
+
+fn packed_rgba8(value: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32((value >> 24u) & 0xffu),
+        f32((value >> 16u) & 0xffu),
+        f32((value >> 8u) & 0xffu),
+        f32(value & 0xffu),
+    ) / 255.0;
+}
+
+fn rgba16_color(value: u32) -> vec4<f32> {
+    let r = (value >> 11u) & 0x1fu;
+    let g = (value >> 6u) & 0x1fu;
+    let b = (value >> 1u) & 0x1fu;
+    let a = select(0u, 255u, (value & 1u) != 0u);
+    return vec4<f32>(
+        f32((r << 3u) | (r >> 2u)),
+        f32((g << 3u) | (g >> 2u)),
+        f32((b << 3u) | (b >> 2u)),
+        f32(a),
+    ) / 255.0;
+}
+
+fn pack_rgba16(color: vec4<f32>, coverage_bit: u32) -> u32 {
+    let bytes = vec3<u32>(round(clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0));
+    return ((bytes.r >> 3u) << 11u)
+        | ((bytes.g >> 3u) << 6u)
+        | ((bytes.b >> 3u) << 1u)
+        | (coverage_bit & 1u);
+}
+
+fn perspective_coordinate(numerator: I64, denominator: I64) -> i32 {
+    let raw = i64_to_f32(numerator) / i64_to_f32(denominator) * 32768.0;
+    if raw != raw {
+        return 0;
+    }
+    return i32(clamp(raw, -32768.0, 32767.0));
+}
+
+struct ColorPixelResult {
+    rgba16: u32,
+    status: u32,
+}
+
+fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelResult {
+    let x = pixel_index % params.width;
+    let y = pixel_index / params.width;
+    var current = initial_rgba16;
+    var status = 0u;
+    for (var triangle_index = 0u; triangle_index < params.triangle_count; triangle_index += 1u) {
+        let triangle = triangles[triangle_index];
+        let raster = evaluate_coverage_sample(triangle, x, y);
+        if raster.coverage == 0u {
+            continue;
+        }
+        let raw_s = perspective_coordinate(raster.plane_values[4], raster.plane_values[6]);
+        let raw_t = perspective_coordinate(raster.plane_values[5], raster.plane_values[6]);
+        let texel = sample_committed_rgba16_three_nearest_bound(raw_s, raw_t);
+        if texel.status != TMEM_SAMPLE_STATUS_OK {
+            status = texel.status;
+            continue;
+        }
+        var inputs: CombinerInputs;
+        inputs.tex_val0 = texel.color;
+        inputs.tex_val1 = texel.color;
+        inputs.prim_color = packed_rgba8(triangle.prim_rgba8);
+        inputs.shade_color = vec4<f32>(
+            clamp(i64_to_f32(raster.plane_values[0]) / 65536.0, 0.0, 255.0),
+            clamp(i64_to_f32(raster.plane_values[1]) / 65536.0, 0.0, 255.0),
+            clamp(i64_to_f32(raster.plane_values[2]) / 65536.0, 0.0, 255.0),
+            clamp(i64_to_f32(raster.plane_values[3]) / 65536.0, 0.0, 255.0),
+        ) / 255.0;
+        inputs.env_color = packed_rgba8(triangle.env_rgba8);
+        inputs.key_center = vec3<f32>(0.0);
+        inputs.key_scale = vec3<f32>(0.0);
+        inputs.lod_fraction = 0.0;
+        inputs.prim_lod_frac = 0.0;
+        inputs.noise = 0.0;
+        inputs.k4 = 0.0;
+        inputs.k5 = 0.0;
+        let combined = run_one_cycle(CombineParams(0xfc5196a3u, 0x112cfe7fu), inputs);
+        let memory_count = select(1u, 8u, (current & 1u) != 0u);
+        let coverage = coverage_fragment_fn(8u, memory_count, 1u, 1u, 1u, 1u, 0u, 0u, 0u);
+        if coverage.wraps == 0u {
+            continue;
+        }
+        let destination = rgba16_color(current);
+        let blended = blend_fragment_memory_composite_fn(
+            1u,
+            0u, 0u, 1u, 0u,
+            0u, 0u, 0u, 0u,
+            combined.combiner_color,
+            inputs.shade_color.a,
+            vec4<f32>(0.0),
+            vec4<f32>(0.0),
+            coverage.blend_enabled,
+            destination,
+        );
+        current = pack_rgba16(blended, (coverage.destination_count - 1u) >> 2u);
+    }
+    return ColorPixelResult(current, status);
+}
+
+// One invocation owns both halfwords of a storage word. This closes the
+// read-modify-write race two independent pixel invocations would have on a
+// packed RGBA16 target.
+@compute @workgroup_size(64)
+fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
+    let word_index = id.x;
+    if word_index >= arrayLength(&color_target_words) {
+        return;
+    }
+    let device_word = color_target_words[word_index];
+    let first_pixel = word_index * 2u;
+    let first_device = device_word & 0xffffu;
+    let first_logical = ((first_device & 0xffu) << 8u) | (first_device >> 8u);
+    let first = execute_hot_color_pixel(first_pixel, first_logical);
+    var output_word = ((first.rgba16 & 0xffu) << 8u) | (first.rgba16 >> 8u);
+    color_status[first_pixel] = first.status;
+    let second_pixel = first_pixel + 1u;
+    if second_pixel < params.pixels_per_triangle {
+        let second_device = device_word >> 16u;
+        let second_logical = ((second_device & 0xffu) << 8u) | (second_device >> 8u);
+        let second = execute_hot_color_pixel(second_pixel, second_logical);
+        let packed_device = ((second.rgba16 & 0xffu) << 8u) | (second.rgba16 >> 8u);
+        output_word |= packed_device << 16u;
+        color_status[second_pixel] = second.status;
+    } else {
+        output_word |= device_word & 0xffff0000u;
+    }
+    color_target_words[word_index] = output_word;
 }
