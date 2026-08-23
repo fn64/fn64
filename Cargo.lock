@@ -995,6 +995,7 @@ dependencies = [
  "fn64-render-wgpu",
  "fn64-runtime",
  "gilrs",
+ "naga 0.19.2",
  "pixels",
  "serde",
  "tempfile",
