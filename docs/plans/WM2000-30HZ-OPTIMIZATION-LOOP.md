@@ -88,14 +88,13 @@ full differential suites and ten-run certification series.
    of cloning and immediately dropping the same full-target bytes. **Measured
    and retained; evidence below.**
 2. Remove the next measured copy at the command executor boundary by passing
-   the owned accumulator into raw-triangle/texrect execution. Preserve the old
-   borrowed path as the same-binary control.
-3. Re-profile and use the drawn-frame population receipt to select the next
-   RDP mechanism. Current likely candidates are texrect blend/write, combiner
-   evaluation, texture sampling, and raw-triangle raster traversal.
-4. Optimize fixed VI restoration only when the variable RDP population is
-   safely below the headroom bar; VI presentation is flat across the current
-   within/over-budget populations and does not explain the tail.
+   the owned accumulator into raw-triangle/texrect execution. **Measured and
+   retained.**
+3. Re-profile and use full call paths, not leaf names alone. The shared
+   texrect blend/combiner helpers are now attributed mostly to raw triangles;
+   optimize their triangle callers before the minority texrect callers.
+4. Continue reducing fixed VI cost for extension headroom, but do not mistake
+   it for the variable RDP tail. Typed five-bit restoration is retained below.
 5. Reconsider command-level validation only when the fresh profile attributes a
    material cost to it. Move stable invariants into types or once-per-command
    validation; never delete guest-visible RDP semantics to meet the budget.
@@ -161,3 +160,43 @@ presentation is 0.09 ms lower in the over-budget population. The tail is
 variable RDP workload, not VI presentation or command-boundary checks. The
 post-change profile's next full-target copy is 531 memmove samples attributed
 to `execute_scheduled_raw_triangle`, which selects queue item 2.
+
+## Post-ownership attribution and typed VI restoration
+
+A fresh 1,200-pump Time Profiler capture after the ownership, sealed-TMEM, and
+grouped-VI changes recorded 34,827 one-millisecond samples. The largest active
+rows were VI dither restoration (3,235), blend/write (2,160), memmove (1,632),
+combiner-cycle evaluation (1,340), SHA-256 compression (1,207), raw-triangle
+scalar traversal (749 + 599), and texel combining (915). Full call paths changed
+the interpretation of the shared helper names: raw triangles account for about
+1,295 blend/write samples and 611 texel-combine samples, while direct texrect
+callers account for about 330 and 207 respectively.
+
+Three same-binary candidates were rejected and removed: preparing one-cycle
+texrect combiner selectors, preparing the common texrect blend, and extending
+scanline parallelism to depth-bearing triangles. None improved both mean and
+tail latency. The existing depth-free parallel raster path remains valuable:
+its ABBA control measured about 1.0 ms lower mean and 3.0 ms lower p95 than the
+scalar lane.
+
+VI restoration previously rechecked per pixel that components produced by
+`byte >> 3` were five-bit and that a local neighborhood held at most eight
+entries. `Rgba16Rgb5` now carries the component invariant in its private type,
+and a fixed eight-entry array bounds neighborhood storage while retaining a
+loud slice-bound trap. The checked API remains selectable with
+`FN64_TYPED_VI_DITHER=0` as the same-binary control.
+
+| Order | Mean ms/drawn | p95 ms/drawn | p99 ms/drawn | Over 33.333 ms |
+| --- | ---: | ---: | ---: | ---: |
+| control 1 | 24.431 | 39.290 | 42.882 | 25.4% |
+| candidate 1 | 24.326 | 39.136 | 42.724 | 25.1% |
+| candidate 2 | 24.268 | 39.152 | 42.706 | 25.4% |
+| control 2 | 24.634 | 39.593 | 42.963 | 26.4% |
+
+Both pair orders agree. A second 1,200-pump profile reduced the named VI
+restoration row from 3,235 to 2,155 samples (33%); total sampled time fell from
+34,827 to 33,510. The candidate and checked paths produced identical hashes for
+120 live frames, and the shared-filter plus 47-test scanout set passed 10/10
+consecutive runs. This is retained as fixed-cost headroom, but the acceptance
+bar remains unmet: p95 is still about 39.1 ms and roughly one quarter of drawn
+frames miss 33.333 ms.
