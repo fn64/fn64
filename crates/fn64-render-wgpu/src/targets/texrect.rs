@@ -247,6 +247,7 @@ pub struct TexrectDraw {
     t_start: i16,
     s_end: i16,
     t_end: i16,
+    flipped_axes: bool,
 }
 
 impl TexrectDraw {
@@ -293,7 +294,17 @@ impl TexrectDraw {
             t_start: recover(upper_left[1], TexrectAxis::T)?,
             s_end: recover(lower_right[0], TexrectAxis::S)?,
             t_end: recover(lower_right[1], TexrectAxis::T)?,
+            flipped_axes: false,
         })
+    }
+
+    /// Selects `TextureRectangleFlip` stepping: S advances down rows and T
+    /// advances across columns. The endpoint construction has already
+    /// swapped the rectangle width/height domains, so the rasterizer only
+    /// swaps which screen axis consumes each endpoint pair.
+    pub const fn with_flipped_axes(mut self) -> Self {
+        self.flipped_axes = true;
+        self
     }
 
     pub const fn left(self) -> u32 {
@@ -342,6 +353,19 @@ impl TexrectDraw {
     /// The S10.5 T coordinate sampled at pixel row `row` of this rectangle.
     pub fn t_at(self, row: u32) -> i16 {
         step_axis(self.t_start, self.t_end, row, self.height())
+    }
+
+    /// The S/T pair at one destination pixel, applying opcode `0x25`'s
+    /// transposed screen-axis assignment when requested.
+    pub fn coordinates_at(self, column: u32, row: u32) -> (i16, i16) {
+        if self.flipped_axes {
+            (
+                step_axis(self.s_start, self.s_end, row, self.height()),
+                step_axis(self.t_start, self.t_end, column, self.width()),
+            )
+        } else {
+            (self.s_at(column), self.t_at(row))
+        }
     }
 }
 
@@ -1836,9 +1860,8 @@ pub fn execute_texture_rectangle<S: crate::TmemByteSource + ?Sized>(
     // that an unclipped one would. Rebasing the ramp onto the clipped left
     // edge would slide the texture sideways by the clipped amount.
     for row in clipped.rows() {
-        let t = draw.t_at(row);
         for column in clipped.columns() {
-            let s = draw.s_at(column);
+            let (s, t) = draw.coordinates_at(column, row);
             // The one texel fetch. `sample_point` is `tmem/sample.rs`'s
             // existing sampler, monomorphized over the pending post-image
             // rather than over durable state -- the same shift/mask/mirror/
@@ -6018,6 +6041,28 @@ mod construction_guard_tests {
             (draw.left, draw.top, draw.right, draw.bottom),
             (4, 8, 20, 24)
         );
+    }
+
+    #[test]
+    fn flipped_axes_advance_s_by_row_and_t_by_column() {
+        let viewport = RectViewportPixels {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 2,
+        };
+        let ordinary = TexrectDraw::try_from_viewport_and_texcoords(
+            viewport,
+            [0.0, 0.0],
+            [2.0, 4.0],
+        )
+        .unwrap();
+        let flipped = ordinary.with_flipped_axes();
+
+        assert_eq!(ordinary.coordinates_at(1, 0), (16, 0));
+        assert_eq!(ordinary.coordinates_at(0, 1), (0, 64));
+        assert_eq!(flipped.coordinates_at(1, 0), (0, 32));
+        assert_eq!(flipped.coordinates_at(0, 1), (32, 0));
     }
 
     /// Kills the `viewport.left < 0` half of the `NegativeViewportOrigin`

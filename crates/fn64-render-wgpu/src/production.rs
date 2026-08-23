@@ -971,7 +971,13 @@ struct PlanCollector {
     /// originating commands, not triangles -- adjacent pairs are collapsed
     /// here. Counting triangles instead would double every texrect and
     /// reject a single legal one as two.
-    texrect_commands: Vec<(Option<fn64_render::TriangleAccessSpan>, usize, u8, u32)>,
+    texrect_commands: Vec<(
+        Option<fn64_render::TriangleAccessSpan>,
+        usize,
+        u8,
+        u32,
+        bool,
+    )>,
     /// One entry per admitted **flat raw triangle** that declared a
     /// destination write: its declared access span, its index into
     /// `triangles`, and its own stream command index.
@@ -1256,7 +1262,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     && self
                         .texrect_commands
                         .last()
-                        .is_some_and(|(_, first, _, _)| *first + 1 == triangle_index);
+                        .is_some_and(|(_, first, _, _, _)| *first + 1 == triangle_index);
                 self.triangle_commands.push(if second_half {
                     *self
                         .triangle_commands
@@ -1301,7 +1307,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                     let previous_was_first_half = self
                         .texrect_commands
                         .last()
-                        .is_some_and(|(_, first, _, _)| *first + 1 == triangle_index);
+                        .is_some_and(|(_, first, _, _, _)| *first + 1 == triangle_index);
                     if !previous_was_first_half {
                         // The tile index is wire word 1 bits 26:24, the
                         // same field `texrect_words_in_target` writes and
@@ -1317,6 +1323,9 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                             triangle_index,
                             tile_index,
                             command_index,
+                            raw_words
+                                .first()
+                                .is_some_and(|word| ((word >> 24) & 0x3f) == 0x25),
                         ));
                     }
                 }
@@ -3207,7 +3216,7 @@ fn stage_and_report(
         .plan
         .texrect_commands
         .iter()
-        .filter(|(span, _, _, _)| span.is_some())
+        .filter(|(span, _, _, _, _)| span.is_some())
         .count();
     // **A flat raw triangle that declared a write is a colour-target
     // command, and routes exactly like a texrect that declared one.**
@@ -3675,7 +3684,9 @@ fn stage_color_commands(
         .enumerate()
         .map(|(index, (command_index, ..))| (*command_index, ColorCommandKind::Fill(index)))
         .chain(collector.plan.texrect_commands.iter().enumerate().map(
-            |(index, (_, _, _, command_index))| (*command_index, ColorCommandKind::Texrect(index)),
+            |(index, (_, _, _, command_index, _))| {
+                (*command_index, ColorCommandKind::Texrect(index))
+            },
         ))
         .chain(collector.plan.raw_triangle_commands.iter().enumerate().map(
             |(index, (_, _, command_index, _))| {
@@ -4296,7 +4307,8 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     resident_bytes: &[u8],
     already_initialized: Option<TargetRectangle>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
-    let (span, triangle_index, tile_index, _) = collector.plan.texrect_commands[index];
+    let (span, triangle_index, tile_index, _, flipped_axes) =
+        collector.plan.texrect_commands[index];
     // A texrect that declared no write must not execute: it would write
     // bytes the journal never declared, which `merged_fill_and_tmem_writes`
     // would then reject as `MergedWriteUndeclared` -- a correct but less
@@ -4343,11 +4355,14 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
         .as_ref()
         .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
     let lower_right = second.vertices[0].texcoord;
-    let draw = crate::targets::TexrectDraw::try_from_viewport_and_texcoords(
+    let mut draw = crate::targets::TexrectDraw::try_from_viewport_and_texcoords(
         viewport,
         upper_left,
         lower_right,
     )?;
+    if flipped_axes {
+        draw = draw.with_flipped_axes();
+    }
 
     // Locate the declared run by the decoder's own recorded span.
     let start = span.first_access_index as usize;
@@ -11249,21 +11264,11 @@ mod tests {
         }
     }
 
-    /// `TextureRectangleFlip` declares **no** destination write, even with a
-    /// color image staged and a footprint that would otherwise be provable.
-    ///
-    /// Flip's destination footprint is the same as the unflipped rectangle's
-    /// (only the S/T pairing swaps across the diagonal), so it would be easy
-    /// to declare a write for it. This slice does not execute flip, and
-    /// declaring a write no executor fills would promise content that never
-    /// arrives -- the "declaring nothing is not a silent no-op" case in
-    /// `plan_texture_rectangle`'s contract.
-    ///
-    /// Measured, not assumed: without this test, deleting the flip gate
-    /// entirely left the whole suite green (mutant I), because no other
-    /// fixture pairs a flip texrect with a staged color image.
+    /// `TextureRectangleFlip` declares the same destination rows as the
+    /// unflipped rectangle. Opcode `0x25` changes only which screen axis
+    /// advances S and T; it does not change the destination footprint.
     #[test]
-    fn a_texture_rectangle_flip_declares_no_destination_write() {
+    fn a_texture_rectangle_flip_declares_the_unflipped_destination_rows() {
         // The identical rectangle as a plain texrect (0x24) DOES declare its
         // two rows -- the control that makes the flip assertion meaningful.
         let mut unflipped = whole_target_fill_words();
@@ -11283,14 +11288,8 @@ mod tests {
         flipped.extend(flipped_words);
         let flipped_ranges = declared_render_target_ranges(flipped);
         assert_eq!(
-            flipped_ranges.len(),
-            1,
-            "a flip texrect must declare no destination write, leaving only the fill's own \
-             range -- got {flipped_ranges:?}"
-        );
-        assert_eq!(
-            flipped_ranges[0], unflipped_ranges[0],
-            "the fill's own declared range must be identical in both streams"
+            flipped_ranges, unflipped_ranges,
+            "flip changes S/T stepping, not the destination write footprint"
         );
     }
 
@@ -11452,7 +11451,7 @@ mod tests {
             view.plan
                 .texrect_commands
                 .iter()
-                .all(|(span, _, _, _)| span.is_some()),
+                .all(|(span, _, _, _, _)| span.is_some()),
             "the texrect must DECLARE its journal write, or this is not the composed shape \
              the removed refusal named"
         );
@@ -13154,7 +13153,7 @@ mod tests {
             .chain(
                 plan.texrect_commands
                     .iter()
-                    .map(|(_, _, _, command_index)| (*command_index, "texrect")),
+                    .map(|(_, _, _, command_index, _)| (*command_index, "texrect")),
             )
             .collect();
         schedule.sort_by_key(|(command_index, _)| *command_index);
@@ -13167,7 +13166,7 @@ mod tests {
         );
         // Every texrect must declare its own journal write run, or it never
         // reaches the executor at all.
-        for (index, (span, _, _, _)) in plan.texrect_commands.iter().enumerate() {
+        for (index, (span, _, _, _, _)) in plan.texrect_commands.iter().enumerate() {
             assert!(
                 span.is_some(),
                 "texrect #{index} must declare a write run, or it is refused before executing"
