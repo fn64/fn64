@@ -20,6 +20,7 @@ XML = """\
     <tagged-backtrace><backtrace>
       <frame id="memmove" name="_platform_memmove"><binary name="libsystem" /></frame>
       <frame name="stage_color_commands"><binary id="main" name="fn64" /></frame>
+      <frame name="execute_raw_dpc"><binary ref="main" /></frame>
     </backtrace></tagged-backtrace>
   </row>
   <row>
@@ -56,6 +57,14 @@ class TimeProfileSummaryTests(unittest.TestCase):
             "execute_scheduled_raw_triangle",
         })
         self.assertTrue(all(entry["weight_ms"] == 1.0 for entry in callers))
+        paths = result["leaf_callers"]["memmove"]["call_paths"]
+        self.assertEqual(
+            {entry["symbol"] for entry in paths},
+            {
+                "_platform_memmove <- stage_color_commands <- execute_raw_dpc",
+                "_platform_memmove <- execute_scheduled_raw_triangle",
+            },
+        )
 
     def test_missing_reference_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing id"):
