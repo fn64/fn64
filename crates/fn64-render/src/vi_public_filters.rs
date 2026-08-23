@@ -66,6 +66,51 @@ pub fn restore_rgba16_rgb_bounded_v1(center: [u8; 3], neighbors: &[[u8; 3]]) -> 
     })
 }
 
+/// An RGB triplet proven to contain only RGBA16's five-bit components.
+/// Construction from expanded bytes makes the range invariant structural,
+/// so the restoration loop need not re-audit it for every neighbor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Rgba16Rgb5([u8; 3]);
+
+impl Rgba16Rgb5 {
+    pub const fn from_expanded_rgba8(rgb: [u8; 3]) -> Self {
+        Self([rgb[0] >> 3, rgb[1] >> 3, rgb[2] >> 3])
+    }
+
+    const fn components(self) -> [u8; 3] {
+        self.0
+    }
+}
+
+/// Restore typed five-bit RGB inputs without repeating their range checks.
+///
+/// This is arithmetic-identical to [`restore_rgba16_rgb_bounded_v1`]. The
+/// fixed array bounds neighborhood storage to eight entries (and slicing
+/// still traps loudly if its count disagrees), while [`Rgba16Rgb5`]'s private
+/// representation proves every component is below 32.
+pub fn restore_rgba16_rgb5_bounded_v1(
+    center: Rgba16Rgb5,
+    neighbors: &[Rgba16Rgb5; 8],
+    neighbor_count: usize,
+) -> [u8; 3] {
+    debug_assert!(neighbor_count <= neighbors.len());
+    let center = center.components();
+    let mut restored = center.map(|component| i16::from(component) << 3);
+    for neighbor in &neighbors[..neighbor_count] {
+        let neighbor = neighbor.components();
+        for channel in 0..3 {
+            restored[channel] += match neighbor[channel].cmp(&center[channel]) {
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Greater => 1,
+            };
+        }
+    }
+    // Five-bit inputs and at most eight comparisons bound every component
+    // to 0..=248; the type and fixed array make those premises structural.
+    restored.map(|component| component as u8)
+}
+
 /// One checked random bit consumed by the public gamma-dither quantizer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ViRandomBit(u8);
@@ -176,6 +221,32 @@ mod tests {
                 assert_eq!(
                     grouped[channel],
                     restore_rgba16_component_bounded_v1(center[channel], &scalar_neighbors)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_rgb_restoration_matches_checked_path_at_all_centers_and_counts() {
+        for center in 0u8..32 {
+            let center_rgb = [center, 31 - center, center / 2];
+            let mut neighbors = [[0u8; 3]; 8];
+            for (index, neighbor) in neighbors.iter_mut().enumerate() {
+                *neighbor = [
+                    (center + index as u8).min(31),
+                    (31 - center).saturating_sub(index as u8),
+                    ((center / 2) + index as u8).min(31),
+                ];
+            }
+            let typed_neighbors = neighbors
+                .map(|rgb| Rgba16Rgb5::from_expanded_rgba8(rgb.map(|component| component << 3)));
+            let typed_center =
+                Rgba16Rgb5::from_expanded_rgba8(center_rgb.map(|component| component << 3));
+            for count in 0..=8 {
+                assert_eq!(
+                    restore_rgba16_rgb5_bounded_v1(typed_center, &typed_neighbors, count),
+                    restore_rgba16_rgb_bounded_v1(center_rgb, &neighbors[..count]),
+                    "center={center_rgb:?} count={count}"
                 );
             }
         }

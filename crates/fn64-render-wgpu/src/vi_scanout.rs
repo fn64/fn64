@@ -54,7 +54,8 @@
 use fn64_render::{
     vi_public_filters::{
         gamma_dither_quantize_bounded_v1, reference_noise_bit_v1,
-        restore_rgba16_component_bounded_v1, restore_rgba16_rgb_bounded_v1,
+        restore_rgba16_component_bounded_v1, restore_rgba16_rgb5_bounded_v1,
+        restore_rgba16_rgb_bounded_v1, Rgba16Rgb5,
     },
     RenderError, ViFilterControl, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
     ViScanoutRegisters,
@@ -904,6 +905,17 @@ fn grouped_vi_dither_enabled() -> bool {
     })
 }
 
+fn typed_vi_dither_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_TYPED_VI_DITHER") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_TYPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_TYPED_VI_DITHER is not valid Unicode: {error}"),
+    })
+}
+
 fn restore_dither_row(
     row: &mut [u8],
     y: usize,
@@ -913,6 +925,9 @@ fn restore_dither_row(
     coverage: &[u8],
     grouped_rgb: bool,
 ) {
+    if grouped_rgb && typed_vi_dither_enabled() {
+        return restore_dither_row_typed(row, y, width, height, original, coverage);
+    }
     for x in 0..width {
         let pixel = y * width + x;
         if coverage[pixel] != 8 {
@@ -962,6 +977,46 @@ fn restore_dither_row(
                     restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
             }
         }
+    }
+}
+
+fn restore_dither_row_typed(
+    row: &mut [u8],
+    y: usize,
+    width: usize,
+    height: usize,
+    original: &[u8],
+    coverage: &[u8],
+) {
+    for x in 0..width {
+        let pixel = y * width + x;
+        if coverage[pixel] != 8 {
+            continue;
+        }
+        let center_offset = pixel * 4;
+        let center = Rgba16Rgb5::from_expanded_rgba8([
+            original[center_offset],
+            original[center_offset + 1],
+            original[center_offset + 2],
+        ]);
+        let mut neighbors = [Rgba16Rgb5::from_expanded_rgba8([0; 3]); 8];
+        let mut count = 0;
+        for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+            for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                if neighbor_x == x && neighbor_y == y {
+                    continue;
+                }
+                let offset = (neighbor_y * width + neighbor_x) * 4;
+                neighbors[count] = Rgba16Rgb5::from_expanded_rgba8([
+                    original[offset],
+                    original[offset + 1],
+                    original[offset + 2],
+                ]);
+                count += 1;
+            }
+        }
+        let restored = restore_rgba16_rgb5_bounded_v1(center, &neighbors, count);
+        row[x * 4..x * 4 + 3].copy_from_slice(&restored);
     }
 }
 
