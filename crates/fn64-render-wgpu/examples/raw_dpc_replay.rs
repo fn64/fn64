@@ -1,0 +1,429 @@
+//! Offline timing replay for one production raw-DPC XBUS receipt.
+//!
+//! The command stream and RDRAM image are runtime inputs and must remain
+//! outside git. The replay drives the same public plan -> execute -> guest
+//! commit -> publish lifecycle as the ABI production route. Each iteration
+//! starts from the same RDRAM bytes, and every committed payload must remain
+//! byte-identical across the run.
+//!
+//! Usage:
+//! `cargo run --release -p fn64-render-wgpu --features host-gpu-tests \
+//!     --example raw_dpc_replay -- stream.bin rdram-image.bin`
+
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
+
+use fn64_render::{
+    count_raw_rdp_full_sync_sites, ir_effect_content_digest, OwnedRawDpcCapture,
+    OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend, RenderConfig,
+};
+use fn64_render_ir::{
+    CapturedGuestRead, DeferredGuestReadCapture, DpInterruptState, FullSyncBoundary,
+    PhysicalMemoryLayout, ResourceRegion, TemporalBoundary,
+};
+use fn64_render_wgpu::WgpuBackend;
+use fn64_runtime::{
+    rom::{InMemoryRom, PiDma},
+    Cycles, DeviceFabric, DpcSubmissionSource, FixedPiTiming, RdramAddr, RdramView, RdramViewMut,
+    TvType,
+};
+
+#[derive(Clone, Copy, Default)]
+struct Timings {
+    plan: Duration,
+    reads: Duration,
+    finalize: Duration,
+    execute: Duration,
+    commit: Duration,
+    copyback: Duration,
+    publish: Duration,
+    total: Duration,
+}
+
+impl Timings {
+    fn add(&mut self, other: Self) {
+        self.plan += other.plan;
+        self.reads += other.reads;
+        self.finalize += other.finalize;
+        self.execute += other.execute;
+        self.commit += other.commit;
+        self.copyback += other.copyback;
+        self.publish += other.publish;
+        self.total += other.total;
+    }
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let stream_path = args
+        .next()
+        .expect("usage: raw_dpc_replay <stream.bin|stream-dir> <rdram-image.bin>");
+    let rdram_path = args
+        .next()
+        .expect("usage: raw_dpc_replay <stream.bin> <rdram-image.bin>");
+    assert!(
+        args.next().is_none(),
+        "unexpected third positional argument"
+    );
+
+    let mut streams = load_streams(Path::new(&stream_path));
+    let terminal_index = env_u32(
+        "FN64_RAW_DPC_REPLAY_PACKET",
+        u32::try_from(streams.len() - 1).expect("stream count exceeds u32"),
+    ) as usize;
+    assert!(
+        terminal_index < streams.len(),
+        "FN64_RAW_DPC_REPLAY_PACKET {terminal_index} is outside {} captured packets",
+        streams.len()
+    );
+    streams.truncate(terminal_index + 1);
+    let window = env_u32("FN64_RAW_DPC_REPLAY_WINDOW", 1) as usize;
+    assert!(window > 0, "FN64_RAW_DPC_REPLAY_WINDOW must be nonzero");
+    assert!(
+        window <= streams.len(),
+        "FN64_RAW_DPC_REPLAY_WINDOW {window} exceeds {} available packets",
+        streams.len()
+    );
+    let (prefix, benchmark) = streams.split_at(streams.len() - window);
+    let terminal = benchmark.last().expect("nonempty benchmark window");
+    let pristine =
+        std::fs::read(&rdram_path).unwrap_or_else(|error| panic!("reading {rdram_path}: {error}"));
+    let layout_bytes = u32::try_from(pristine.len()).expect("RDRAM image exceeds u32");
+    let start = env_u32("FN64_RAW_DPC_REPLAY_START", 0);
+    let end = start
+        .checked_add(u32::try_from(terminal.bytes.len()).expect("stream exceeds u32"))
+        .expect("XBUS stream end overflows u32");
+    assert!(
+        end <= 0x1000,
+        "XBUS stream [{start:#x}, {end:#x}) exceeds DMEM"
+    );
+    let width = env_u32("FN64_RAW_DPC_REPLAY_WIDTH", 320);
+    let height = env_u32("FN64_RAW_DPC_REPLAY_HEIGHT", 240);
+    let warmup = env_u32("FN64_RAW_DPC_REPLAY_WARMUP", 10);
+    let repeat = env_u32("FN64_RAW_DPC_REPLAY_REPEAT", 100);
+    assert!(repeat > 0, "FN64_RAW_DPC_REPLAY_REPEAT must be nonzero");
+
+    let (mut backend, mut session) = WgpuBackend::try_new().expect("construct wgpu backend");
+    backend
+        .create(&RenderConfig {
+            width,
+            height,
+            tv_type: TvType::default(),
+        })
+        .expect("create wgpu backend");
+
+    let mut postimage = pristine.clone();
+    for (index, stream) in prefix.iter().enumerate() {
+        let prefix_end = u32::try_from(stream.bytes.len()).expect("prefix stream exceeds u32");
+        replay_once(
+            &mut backend,
+            &mut session,
+            &stream.words,
+            &stream.bytes,
+            &pristine,
+            &mut postimage,
+            layout_bytes,
+            0,
+            prefix_end,
+            u64::try_from(index).expect("prefix index exceeds u64") + 1,
+        );
+    }
+    if !prefix.is_empty() {
+        println!(
+            "primed durable renderer state with {} packet(s)",
+            prefix.len()
+        );
+    }
+
+    let mut samples = Vec::with_capacity(repeat as usize);
+    let mut expected_digest = None;
+    for iteration in 0..warmup + repeat {
+        let mut timings = Timings::default();
+        let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        for (window_index, stream) in benchmark.iter().enumerate() {
+            let packet_start = if window_index + 1 == benchmark.len() {
+                start
+            } else {
+                0
+            };
+            let packet_end = packet_start
+                + u32::try_from(stream.bytes.len()).expect("benchmark stream exceeds u32");
+            let sequence = u64::try_from(prefix.len()).expect("prefix length exceeds u64")
+                + u64::from(iteration) * u64::try_from(window).expect("window exceeds u64")
+                + u64::try_from(window_index).expect("window index exceeds u64")
+                + 1;
+            let (packet_timings, packet_digest) = replay_once(
+                &mut backend,
+                &mut session,
+                &stream.words,
+                &stream.bytes,
+                &pristine,
+                &mut postimage,
+                layout_bytes,
+                packet_start,
+                packet_end,
+                sequence,
+            );
+            timings.add(packet_timings);
+            for byte in packet_digest.to_le_bytes() {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        match expected_digest {
+            None => expected_digest = Some(digest),
+            Some(expected) => assert_eq!(
+                digest, expected,
+                "committed guest bytes changed across identical replay iterations"
+            ),
+        }
+        if iteration >= warmup {
+            samples.push(timings);
+        }
+    }
+
+    println!(
+        "window_packets={} terminal_stream_bytes={} warmup={} repeat={} committed_fnv1a={:016x}",
+        benchmark.len(),
+        terminal.bytes.len(),
+        warmup,
+        repeat,
+        expected_digest.expect("at least one replay")
+    );
+    report("plan", &samples, |sample| sample.plan);
+    report("guest_reads", &samples, |sample| sample.reads);
+    report("finalize", &samples, |sample| sample.finalize);
+    report("execute", &samples, |sample| sample.execute);
+    report("commit", &samples, |sample| sample.commit);
+    report("copyback", &samples, |sample| sample.copyback);
+    report("publish", &samples, |sample| sample.publish);
+    report("total", &samples, |sample| sample.total);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_once(
+    backend: &mut WgpuBackend,
+    session: &mut RawDpcAbiSession,
+    words: &[u32],
+    stream: &[u8],
+    pristine: &[u8],
+    postimage: &mut [u8],
+    layout_bytes: u32,
+    start: u32,
+    end: u32,
+    sequence: u64,
+) -> (Timings, u64) {
+    let total_started = Instant::now();
+    let capture = capture(words, stream, layout_bytes, start, end, sequence);
+
+    let started = Instant::now();
+    let planned = backend
+        .plan_raw_dpc(session.plan_request(capture))
+        .expect("plan captured packet");
+    let plan = started.elapsed();
+
+    let started = Instant::now();
+    let reads = planned
+        .guest_read_plan()
+        .reads()
+        .iter()
+        .map(|read| {
+            let mut bytes = vec![0; read.range().len() as usize];
+            RdramView::from_storage(pristine).copy_logical_bytes(
+                RdramAddr::from_offset(read.range().start().get()),
+                &mut bytes,
+            );
+            CapturedGuestRead::try_new(*read, bytes).expect("capture declared guest read")
+        })
+        .collect();
+    let deferred = DeferredGuestReadCapture::new(reads);
+    let reads = started.elapsed();
+
+    let started = Instant::now();
+    let bound = session
+        .finalize_and_submit(planned, deferred)
+        .expect("finalize captured packet");
+    let finalize = started.elapsed();
+    let submission = bound.submission();
+
+    let started = Instant::now();
+    let prepared = backend
+        .execute_raw_dpc(bound)
+        .expect("execute captured packet");
+    let execute = started.elapsed();
+
+    let staged = backend.staged_guest_render_target_writes(submission);
+    let payloads = backend.committed_guest_render_target_bytes(submission);
+    assert_eq!(staged.len(), payloads.len(), "one payload per staged write");
+    for (write, payload) in staged.iter().zip(&payloads) {
+        assert_eq!(payload.len() as u32, write.byte_count());
+        assert_eq!(ir_effect_content_digest(payload), write.content());
+    }
+
+    let started = Instant::now();
+    let committed = session
+        .commit_guest_render_target_writes(prepared, staged.clone())
+        .expect("commit captured packet guest writes");
+    let commit = started.elapsed();
+
+    let started = Instant::now();
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (write, payload) in staged.iter().zip(&payloads) {
+        let ResourceRegion::Rdram { range, .. } = write.access().region() else {
+            panic!("guest render-target write does not name RDRAM");
+        };
+        RdramViewMut::from_storage(postimage)
+            .write_logical_bytes(RdramAddr::from_offset(range.start().get()), payload);
+        for &byte in payload {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let copyback = started.elapsed();
+
+    let started = Instant::now();
+    let mut fabric = DeviceFabric::new(
+        PiDma::new(InMemoryRom::new(Vec::new())),
+        FixedPiTiming(Cycles::new(0)),
+    );
+    fabric
+        .request_dpc_submission(DpcSubmissionSource::Dmem, start, end)
+        .expect("request replay DPC submission")
+        .expect("fresh replay fabric is not frozen");
+    let token = fabric
+        .pending_dpc_submission()
+        .expect("replay fabric has one pending submission")
+        .token;
+    let ready = fabric
+        .prepare_dpc_commit(token)
+        .expect("prepare replay commit");
+    let capsule = session
+        .seal_publication(committed, ready)
+        .expect("seal replay publication");
+    backend.publish_raw_dpc(capsule);
+    let publish = started.elapsed();
+
+    (
+        Timings {
+            plan,
+            reads,
+            finalize,
+            execute,
+            commit,
+            copyback,
+            publish,
+            total: total_started.elapsed(),
+        },
+        digest,
+    )
+}
+
+struct ReplayStream {
+    bytes: Vec<u8>,
+    words: Vec<u32>,
+}
+
+fn load_streams(path: &Path) -> Vec<ReplayStream> {
+    let paths = if path.is_dir() {
+        let mut paths: Vec<_> = std::fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+            .map(|entry| entry.expect("read stream-directory entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("raw-dpc-") && name.ends_with("-xbus.bin"))
+            })
+            .collect();
+        paths.sort();
+        paths
+    } else {
+        vec![path.to_path_buf()]
+    };
+    assert!(
+        !paths.is_empty(),
+        "no raw-dpc XBUS streams found at {}",
+        path.display()
+    );
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            assert!(
+                !bytes.is_empty() && bytes.len().is_multiple_of(8),
+                "stream {} length {:#x} must be nonzero and 8-byte aligned",
+                path.display(),
+                bytes.len()
+            );
+            let words = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().expect("four-byte word")))
+                .collect();
+            ReplayStream { bytes, words }
+        })
+        .collect()
+}
+
+fn capture(
+    words: &[u32],
+    stream: &[u8],
+    layout_bytes: u32,
+    start: u32,
+    end: u32,
+    sequence: u64,
+) -> OwnedRawDpcCapture {
+    let submission = OwnedRawDpcSubmission::from_xbus_payload(start, end, stream.to_vec())
+        .expect("construct XBUS submission");
+    let layout = PhysicalMemoryLayout::try_new(layout_bytes).expect("construct RDRAM layout");
+    let sites = count_raw_rdp_full_sync_sites(words)
+        .expect("scan replay FullSync sites")
+        .complete()
+        .expect("captured stream ends at a command boundary");
+    let cmd_end = TemporalBoundary::new(1, DpInterruptState::Clear);
+    if sites == 0 {
+        return OwnedRawDpcCapture::new(submission, layout, sequence, cmd_end);
+    }
+    let boundaries = (0..sites as u64)
+        .map(|ordinal| {
+            FullSyncBoundary::new(
+                2 + ordinal * 2,
+                3 + ordinal * 2,
+                DpInterruptState::Clear,
+                DpInterruptState::Clear,
+            )
+        })
+        .collect();
+    OwnedRawDpcCapture::with_full_sync_boundaries(submission, layout, sequence, cmd_end, boundaries)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).map_or(default, |raw| {
+        let raw = raw.trim();
+        if let Some(hex) = raw.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16)
+                .unwrap_or_else(|_| panic!("{name} must be a u32, got {raw:?}"))
+        } else {
+            raw.parse()
+                .unwrap_or_else(|_| panic!("{name} must be a u32, got {raw:?}"))
+        }
+    })
+}
+
+fn report(name: &str, samples: &[Timings], select: impl Fn(&Timings) -> Duration) {
+    let mut values: Vec<f64> = samples
+        .iter()
+        .map(|sample| select(sample).as_secs_f64() * 1_000.0)
+        .collect();
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let percentile = |fraction: f64| values[((values.len() - 1) as f64 * fraction) as usize];
+    println!(
+        "{name:>11} mean_ms={mean:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+        values[values.len() - 1]
+    );
+}
