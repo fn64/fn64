@@ -258,6 +258,20 @@ submit/wait/status-map/target-map cycles and uploads the complete target and
 TMEM for each call. Packet-local compatible batching is now the selected
 mechanism; resource reuse alone is retained but is not a production A/B.
 
+The third isolated optimization kept one builder across adjacent raw-triangle
+commands and flushed only at a non-triangle command or a typed incompatibility
+in target generation, program, TMEM identity/image, or tile binding. The replay
+receipt now reports actual GPU batch count rather than merely whether a packet
+had a receipt. The same game window reduced 50 draws to 30 batches per repeat;
+all 500 draws matched, the effect digest remained `1ac409f336397652`, and mean
+compute-probe time fell from 16.556 ms to 11.501 ms (-5.055 ms, 30.5%). Mean
+total window time fell from 33.714 ms to 27.717 ms (-5.997 ms, 17.8%), with
+p95 28.934 ms and max 29.485 ms. A mismatch still names the exact packet and
+pixel, but honestly reports the sealed command/triangle range rather than
+misattributing a batched result to its first draw. This diagnostic timing still
+includes the complete CPU raster before compute and is not a live replacement
+A/B.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
