@@ -1129,6 +1129,18 @@ impl BenchTmem {
         }
         Self { bytes }
     }
+
+    fn projection(&self) -> crate::TmemGpuProjection {
+        let mut projection = crate::TmemGpuProjection {
+            bytes: [0; fn64_render_ir::TMEM_BYTES as usize],
+            validity_words: [0; crate::tmem::TMEM_VALIDITY_WORDS],
+        };
+        projection.bytes[..self.bytes.len()].copy_from_slice(&self.bytes);
+        for address in 0..self.bytes.len() {
+            projection.validity_words[address / 32] |= 1 << (address % 32);
+        }
+        projection
+    }
 }
 
 impl crate::TmemByteSource for BenchTmem {
@@ -1209,6 +1221,127 @@ fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
         bytes.extend_from_slice(&word.to_be_bytes());
     }
     RawTriangle::decode(0x0e, &bytes).expect("a shaded+textured triangle decodes")
+}
+
+#[cfg(feature = "host-gpu-tests")]
+#[test]
+fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct ThreadWake(std::thread::Thread);
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match Future::poll(future.as_mut(), &mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    let width = 32u32;
+    let height = 24u32;
+    let triangle = bench_textured_triangle(20.0, 16);
+    let key = key_at(width, height);
+    let declared = declared_accesses(key, &triangle, None);
+    let mut resident = Vec::with_capacity((width * height * 2) as usize);
+    for pixel in 0..width * height {
+        let rgba16 = (((pixel * 13) & 0x1f) << 11)
+            | (((pixel * 7) & 0x1f) << 6)
+            | (((pixel * 3) & 0x1f) << 1)
+            | (pixel & 1);
+        resident.extend_from_slice(&(rgba16 as u16).to_be_bytes());
+    }
+    let tmem = BenchTmem::new();
+    let tile = bench_tile_binding();
+    let other_mode = OtherMode::from_wire(0x0008_acef, 0x0050_41c8);
+    let environment = Color4::from_wire(ENV_WIRE);
+    let primitive = PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE);
+    let second_environment = Color4::from_wire(0x1020_3040);
+    let second_primitive = PrimColor::from_wire(0, 0xc080_40a0);
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let mut expected = resident.clone();
+    for (draw_environment, draw_primitive) in [
+        (environment, primitive),
+        (second_environment, second_primitive),
+    ] {
+        let completed = execute_raw_triangle(
+            &candidate,
+            other_mode,
+            &triangle,
+            TexrectShading::new(
+                CombineParams::from_wire(0xfc51_96a3, 0x112c_fe7f),
+                draw_environment,
+                draw_primitive,
+            ),
+            TexrectBlendRegisters::default(),
+            &expected,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Disabled,
+            }),
+            None,
+        )
+        .expect("CPU hot-state oracle must rasterize each ordered draw");
+        expected = completed.device_bytes().device_bytes().to_vec();
+    }
+
+    let requested = block_on(
+        crate::UninitializedTrianglePipeline::new(crate::HeadlessBackend::AnyNative).request(),
+    )
+    .unwrap();
+    let mut renderer = match requested {
+        crate::TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
+        crate::TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
+            "required host GPU evidence unavailable: typed no-adapter for {:?}",
+            no_adapter.requested()
+        ),
+    };
+    let device_triangles = [
+        crate::ComputeCoverageTriangle::from_raw(triangle).with_material(environment, primitive),
+        crate::ComputeCoverageTriangle::from_raw(triangle)
+            .with_material(second_environment, second_primitive),
+    ];
+    let tile_params = crate::TileBindingParams::bound(tile.descriptor(), tile.size())
+        .with_lut_mode(crate::TextureLutMode::Disabled);
+    for run in 1..=10 {
+        let actual = renderer
+            .compute_triangle_hot_color(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &device_triangles,
+                &tmem.projection(),
+                tile_params,
+            )
+            .expect("hot compute color must complete");
+        if actual != expected {
+            let byte = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .expect("unequal buffers have a mismatching byte");
+            panic!(
+                "hot compute color differential run {run}: first mismatch at byte {byte} \
+                 (pixel {}): GPU={:#04x}, CPU={:#04x}",
+                byte / 2,
+                actual[byte],
+                expected[byte]
+            );
+        }
+    }
 }
 
 #[test]

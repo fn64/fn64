@@ -105,6 +105,21 @@ pub const COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT: &str = "round_trip_rgba1
 pub const COMPUTE_TRIANGLE_COVERAGE_WGSL: &str =
     include_str!("shaders/compute_triangle_coverage.wgsl");
 pub const COMPUTE_TRIANGLE_COVERAGE_ENTRY_POINT: &str = "compute_triangle_coverage";
+pub const COMPUTE_TRIANGLE_HOT_COLOR_ENTRY_POINT: &str = "compute_triangle_hot_color";
+
+/// Exact compute-raster module assembly. Compute-owned resources live in
+/// bind group 1; the unchanged TMEM sampler keeps its proven group-0 ABI.
+pub fn compute_triangle_color_wgsl() -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        crate::combiner::COLOR_COMBINER_WGSL,
+        TMEM_SAMPLE_WGSL,
+        crate::alpha_compare::ALPHA_COMPARE_FRAGMENT_FN_WGSL,
+        crate::coverage::COVERAGE_FRAGMENT_FN_WGSL,
+        crate::blend::BLEND_FRAGMENT_FN_WGSL,
+        COMPUTE_TRIANGLE_COVERAGE_WGSL,
+    )
+}
 
 pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
     "src-shaders-rasterpsdynamic",
