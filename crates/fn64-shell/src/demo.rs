@@ -303,16 +303,28 @@ impl ApplicationHandler for Demo {
     }
 }
 
-/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames.
+/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames;
+/// `FN64_DEMO_ZOOM_FILL=1` starts on the custom presenter so validation can
+/// exercise shader creation without UI automation.
 pub fn run() {
     let max_frames = std::env::var("FN64_DEMO_FRAMES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
+    let zoom_fill = match std::env::var("FN64_DEMO_ZOOM_FILL") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_DEMO_ZOOM_FILL must be exactly 0 or 1, got {value:?}"),
+        Err(error) => panic!("FN64_DEMO_ZOOM_FILL is not valid Unicode: {error}"),
+    };
 
     println!("[fn64-demo] content-free UI demo: synthetic framebuffer, no ROM, no recompilation.");
     println!("[fn64-demo] F1 = settings overlay, Escape = close it, window close = quit.");
     if let Some(n) = max_frames {
         println!("[fn64-demo] will exit after {n} frames (FN64_DEMO_FRAMES)");
+    }
+    if zoom_fill {
+        println!("[fn64-demo] FN64_DEMO_ZOOM_FILL=1: custom fullscreen presenter starts active");
     }
 
     let event_loop = match EventLoop::new() {
@@ -339,6 +351,7 @@ pub fn run() {
             ..InputConfig::default()
         },
         video: crate::video_config::VideoConfig {
+            zoom_fill,
             persist: false,
             ..crate::video_config::VideoConfig::default()
         },
