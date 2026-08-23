@@ -207,6 +207,13 @@ the cause here. Settling it needs angrylion, which this lane did not run.
   `Vec<(u32, u32)>` plus the RDRAM address it was read from.
 - `FN64_XBUS_STREAM_DUMP_DIR` writes big-endian `xbus-NNNN.bin` streams and
   optional full RDRAM images (`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1938`).
+- The production wgpu plan/execute/publish session does not traverse that
+  legacy XBUS hook. `FN64_RAW_DPC_STREAM_DUMP_DIR` captures its owned raw-DPC
+  submissions instead, with `FN64_RAW_DPC_STREAM_DUMP_SKIP` and
+  `FN64_RAW_DPC_STREAM_DUMP_COUNT` selecting a bounded index window and
+  `FN64_RAW_DPC_STREAM_DUMP_RDRAM` selecting the sole index allowed a full
+  RDRAM image. Each stream is canonical big-endian words plus a source/range
+  metadata sidecar. All outputs remain outside git.
 - The parity runner now reads the TSV form directly (`FN64_WM2000_PACKET_TSV`,
   `FN64_WM2000_PACKET_ENTRY`) and reports the captured packet's size, command
   count, and **its own** target extent and destination — read from the

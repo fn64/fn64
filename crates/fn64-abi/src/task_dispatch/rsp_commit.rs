@@ -12,6 +12,96 @@ struct XbusDiagnostics {
     diff_trace: bool,
 }
 
+struct SessionStreamDump {
+    directory: std::path::PathBuf,
+    skip: u64,
+    count: u64,
+    rdram_index: Option<u64>,
+}
+
+fn session_stream_dump() -> Option<&'static SessionStreamDump> {
+    static CONFIG: std::sync::OnceLock<Option<SessionStreamDump>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            std::env::var_os("FN64_RAW_DPC_STREAM_DUMP_DIR").map(|directory| {
+                let parse = |name: &str, default: Option<u64>| {
+                    std::env::var(name).ok().map_or(default, |raw| {
+                        Some(
+                            raw.parse::<u64>()
+                                .unwrap_or_else(|_| panic!("{name} must be a u64, got {raw:?}")),
+                        )
+                    })
+                };
+                SessionStreamDump {
+                    directory: directory.into(),
+                    skip: parse("FN64_RAW_DPC_STREAM_DUMP_SKIP", Some(0))
+                        .expect("raw-DPC dump skip has a default"),
+                    count: parse("FN64_RAW_DPC_STREAM_DUMP_COUNT", Some(16))
+                        .expect("raw-DPC dump count has a default"),
+                    rdram_index: parse("FN64_RAW_DPC_STREAM_DUMP_RDRAM", None),
+                }
+            })
+        })
+        .as_ref()
+}
+
+pub(crate) const fn session_stream_dump_selected(index: u64, skip: u64, count: u64) -> bool {
+    index >= skip && index - skip < count
+}
+
+pub(crate) fn raw_dpc_stream_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_be_bytes()).collect()
+}
+
+fn maybe_dump_session_raw_dpc(
+    submission: &fn64_render::OwnedRawDpcSubmission,
+    words: &[u32],
+    rdram: &[u8],
+) {
+    let Some(dump) = session_stream_dump() else {
+        return;
+    };
+    thread_local! {
+        static SESSION_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
+    }
+    let index = SESSION_DUMP_INDEX.with(|cell| {
+        let index = cell.get();
+        cell.set(index + 1);
+        index
+    });
+    if !session_stream_dump_selected(index, dump.skip, dump.count) {
+        return;
+    }
+
+    std::fs::create_dir_all(&dump.directory).unwrap_or_else(|error| {
+        panic!("FN64_RAW_DPC_STREAM_DUMP_DIR {:?}: {error}", dump.directory)
+    });
+    let source = match submission.source() {
+        fn64_render::RawDpcSource::Rdram => "rdram",
+        fn64_render::RawDpcSource::XbusDmem => "xbus",
+    };
+    let stem = format!("raw-dpc-{index:06}-{source}");
+    let stream_path = dump.directory.join(format!("{stem}.bin"));
+    std::fs::write(&stream_path, raw_dpc_stream_bytes(words))
+        .unwrap_or_else(|error| panic!("writing raw-DPC stream dump {stream_path:?}: {error}"));
+    let metadata_path = dump.directory.join(format!("{stem}.txt"));
+    let metadata = format!(
+        "index={index}\nsource={source}\nstart={:#010x}\nend={:#010x}\nbytes={}\n",
+        submission.start(),
+        submission.end(),
+        words.len() * 4
+    );
+    std::fs::write(&metadata_path, metadata)
+        .unwrap_or_else(|error| panic!("writing raw-DPC metadata {metadata_path:?}: {error}"));
+    if dump.rdram_index == Some(index) {
+        let rdram_path = dump
+            .directory
+            .join(format!("raw-dpc-{index:06}-rdram-image.bin"));
+        std::fs::write(&rdram_path, rdram)
+            .unwrap_or_else(|error| panic!("writing RDRAM dump {rdram_path:?}: {error}"));
+    }
+}
+
 fn xbus_diagnostics() -> &'static XbusDiagnostics {
     static CONFIG: std::sync::OnceLock<XbusDiagnostics> = std::sync::OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -1062,6 +1152,7 @@ fn try_dispatch_raw_dpc_via_session(
     let observation_start = source.submission.start();
     let observation_end = source.submission.end();
     let observation_words = source.submission.command_words();
+    maybe_dump_session_raw_dpc(&source.submission, &observation_words, real);
     let cmd_end =
         fn64_render::ir::TemporalBoundary::new(token, fn64_render::ir::DpInterruptState::Clear);
 

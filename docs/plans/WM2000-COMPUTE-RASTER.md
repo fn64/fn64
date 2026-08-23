@@ -68,7 +68,15 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    guest-read sources outside git. Repeated replay must compare complete target
    bytes and effect digests against the CPU path on every iteration. This is
    the fast optimization loop; full linked-shell LTO is reserved for retained
-   candidates.
+   candidates. The older XBUS-only dump hook was measured to emit zero files
+   on the production wgpu session route, so that route now has a bounded
+   owned-submission capture tap with explicit source/range sidecars and a
+   single-index RDRAM snapshot selector. A bounded live run captured 2,670
+   packets; packet 2659 is the selected private receipt (1,032 command bytes,
+   five full shaded+textured triangles, one matching 8 MiB RDRAM image). Its
+   command bytes were identical at the same index across two runs. The offline
+   wgpu repeat executor and complete-target/effect-digest comparison remain to
+   finish this unit.
 2. **Dynamic RGBA16 target.** Generalize the proven native-fill storage-buffer
    and bounded-readback mechanism to a `SetColorImage` extent. A no-op compute
    round trip must reproduce arbitrary resident bytes exactly, including odd
