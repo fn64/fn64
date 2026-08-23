@@ -2714,7 +2714,13 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   at process termination. It then clears every saved yielder/RDRAM pointer
   and changes the TLS owner from `Active(Executor)` to
   `PreparedForProcessExit`; subsequent executor access traps. This is neither
-  guest `osDestroyThread` nor an in-process reset facility. The child-process
+  guest `osDestroyThread` nor an in-process reset facility. The shell invokes
+  that seal from winit's irreversible `ApplicationHandler::exiting` boundary,
+  not only after `run_app` returns: on macOS `applicationWillTerminate:` can
+  begin Apple TLS destruction before control reaches the statement after
+  `run_app`, and an executor still live there force-unwinds guest stacks across
+  their non-unwind FFI frames. The bounded-census `process::exit` path seals
+  directly because it does not dispatch winit's exit callback. The child-process
   ABI regressions block inside the real `osRecvMesg_recomp` and stop after a
   resumable backend returns `Continue`; each seals the runtime, returns
   through ordinary Rust teardown, and requires exit status zero. Provenance:
