@@ -59,6 +59,7 @@
 
 use fn64_render_ir::ResourceAccess;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use super::texrect::{
@@ -204,17 +205,18 @@ const FULL_COVERAGE: u32 = 8;
 /// real prior content, which in the composed schedule is the previous
 /// command's own output.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
+pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     other_mode: OtherMode,
     triangle: &RawTriangle,
     shading: TexrectShading,
     blend_registers: TexrectBlendRegisters,
-    resident_bytes: &[u8],
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
     declared: &[fn64_render_ir::ResourceAccess],
     texture: Option<RawTriangleTexture<'_, S>>,
     depth: Option<RawTriangleDepth<'_>>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    let mut bytes = resident_bytes.into().into_owned();
     // Cycle, combiner-program, blender and fragment-stage admission all run
     // BEFORE any pixel is produced, so a mode this executor cannot evaluate
     // exactly refuses with an untouched target rather than a half-drawn one.
@@ -268,12 +270,12 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
             pixels: extent.pixels() as usize,
             bytes_per_pixel: format.bytes_per_pixel(),
         })?;
-    if resident_bytes.len() != full_len {
+    if bytes.len() != full_len {
         return Err(TargetError::CompletedByteLengthMismatch {
             key,
             generation: candidate.generation(),
             expected: full_len,
-            actual: resident_bytes.len(),
+            actual: bytes.len(),
         }
         .into());
     }
@@ -379,7 +381,6 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     // `texture`.
     let texture_planes = triangle.texture().map(triangle_span::texture_planes);
 
-    let mut bytes = resident_bytes.to_vec();
     raster_triangle(
         &mut bytes,
         format,
