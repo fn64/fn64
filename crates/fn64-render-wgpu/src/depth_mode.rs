@@ -61,6 +61,57 @@ pub fn decode_delta_z(encoded_delta: u8) -> u16 {
     1 << encoded_delta.min(15)
 }
 
+/// Priority-encode a 16-bit pixel DeltaZ to its four-bit stored exponent.
+/// Literal port of `depth::encode_delta_z` (`depth.rs:64-71`), Programming
+/// Manual Chapter 15 Equation 10: zero and one both encode as zero; larger
+/// values store floor(log2), saturated to the four-bit maximum.
+pub fn encode_delta_z(delta_z: u16) -> u8 {
+    if delta_z == 0 {
+        0
+    } else {
+        (u16::BITS - 1 - delta_z.leading_zeros()).min(15) as u8
+    }
+}
+
+/// The Z decode table's per-exponent mantissa shift and additive base,
+/// Programming Manual Chapter 16 "Z Image Format". Shared by
+/// [`decode_z`]/[`encode_z`] so the round trip cannot drift.
+const Z_SHIFT: [u32; 8] = [6, 5, 4, 3, 2, 1, 0, 0];
+const Z_ADD: [u32; 8] = [
+    0x00000, 0x20000, 0x30000, 0x38000, 0x3c000, 0x3e000, 0x3f000, 0x3f800,
+];
+
+/// Decode a visible 14-bit exponent/mantissa Z field to the RDP's unsigned
+/// 18-bit 15.3 working value. Literal port of `depth::decode_z`
+/// (`depth.rs:38-42`).
+pub fn decode_z(encoded_z: u16) -> u32 {
+    let exponent = usize::from((encoded_z >> 11) & 7);
+    let mantissa = u32::from(encoded_z & 0x07ff);
+    (mantissa << Z_SHIFT[exponent]) + Z_ADD[exponent]
+}
+
+/// Quantize an unsigned 18-bit working Z into exponent/mantissa form,
+/// saturating out-of-range values to `0x3ffff` first. Literal port of
+/// `depth::encode_z` (`depth.rs:46-63`). Applied when a passing fragment's
+/// depth is committed, so a later fragment compares against the SAME
+/// quantized value the hardware would have stored, not the pre-quantization
+/// float.
+pub fn encode_z(z: u32) -> u16 {
+    let z = z.min(0x3ffff);
+    let exponent = match z {
+        0x00000..=0x1ffff => 0,
+        0x20000..=0x2ffff => 1,
+        0x30000..=0x37fff => 2,
+        0x38000..=0x3bfff => 3,
+        0x3c000..=0x3dfff => 4,
+        0x3e000..=0x3efff => 5,
+        0x3f000..=0x3f7ff => 6,
+        _ => 7,
+    };
+    let mantissa = ((z - Z_ADD[exponent]) >> Z_SHIFT[exponent]) as u16;
+    ((exponent as u16) << 11) | mantissa
+}
+
 /// Compute the four Z-comparison signals for one fragment against one
 /// memory sample. Literal port of `depth::relations` (`depth.rs:94-107`).
 /// Note the deliberate asymmetry the reference itself has: `pixel_delta_z`
