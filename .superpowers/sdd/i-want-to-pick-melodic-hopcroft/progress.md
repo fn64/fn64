@@ -953,3 +953,14 @@ they never share a tree. Fan-out Pass 1 result is banked (committed 7b9d1afe,
 c013894a).
 
 Task 15: complete — TexRectFlip (0x25) axis swap, commit c8ba2cb5. gen-texrect-flip refused->byte-identical (wgpu==RT64==angrylion, 0 diff). Gate PASS 33/37. Codex authored, orchestrator verified+committed (agent never committed/reported).
+
+Phase-3 fixes dispatched (3 parallel fork agents, each self-creating an isolated worktree off HEAD c8ba2cb5):
+- Task 16fix (coverage CLR_ON_CVG+CVG_DST_WRAP drop) -> fork a81ad623, worktree fix-coverage, branch fix/coverage-clr-on-cvg
+- Task 17 (z-image binding SetZImage 0xfe/SetMaskImage 0x3e + depth test) -> fork a9733ea0, worktree fix-zbuffer, branch fix/zbuffer-binding
+- Task 18 (LoadBlock DxT row-advance RGBA16/CI8) -> fork ac58bc1b, worktree fix-loadblock, branch fix/loadblock-dxt
+Each verifies: refused->0-diff vs angrylion, gate PASS, unit test, commit (no push). Reports at task-{16fix,17,18}-report.md.
+NOTE: fork dispatch returned spurious "not available inside forked worker" on 2 of 3 calls but ListAgents confirms all 3 running. Do NOT re-dispatch.
+Branches live on their own worktrees; after each verifies, cherry-pick/merge its commit onto worktree-wm2000-playable, re-run full triage+gate, then remove the worktree.
+
+ORCHESTRATION LESSON (this session): fork subagents CANNOT create git worktrees (cwd pinned; "can't fork in a fork"). isolation:worktree on fresh agents branches from origin/main (baseRef unset=fresh), losing this branch's unpushed corpus+flip. This session's own git guard also blocks creating sibling worktrees. => Phase-3 fixes run SERIALLY in the shared wm2000-playable tree, one writer at a time, commit path-scoped between each. No collision by construction (SDD rule: never parallel implementers).
+Dispatched #17 z-buffer (fresh opus general-purpose, serial, in shared tree, agent a29030c9). #16 coverage + #18 loadblock queued after it commits. #19 ROM-relevance Explore running read-only alongside. Before-state: coverage completes but 12px wrong; all 6 zbuffer + all 6 loadblock-deep refuse.
