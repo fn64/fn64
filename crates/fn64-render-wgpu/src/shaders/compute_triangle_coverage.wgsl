@@ -3,6 +3,13 @@ struct I64 {
     hi: i32,
 }
 
+struct AttributePlane {
+    base: i32,
+    dx: i32,
+    de: i32,
+    dy: i32,
+}
+
 struct TriangleEdges {
     left_major: u32,
     yl: i32,
@@ -14,6 +21,7 @@ struct TriangleEdges {
     dxldy: i32,
     dxhdy: i32,
     dxmdy: i32,
+    planes: array<AttributePlane, 7>,
 }
 
 struct CoverageParams {
@@ -23,6 +31,19 @@ struct CoverageParams {
     triangle_count: u32,
 }
 
+struct SampleLine {
+    left: I64,
+    right: I64,
+    major: I64,
+}
+
+struct CoverageSample {
+    coverage: u32,
+    delta_y_eighth: i32,
+    delta_x_q16: I64,
+    plane_values: array<I64, 7>,
+}
+
 @group(0) @binding(0)
 var<storage, read> triangles: array<TriangleEdges>;
 
@@ -30,7 +51,7 @@ var<storage, read> triangles: array<TriangleEdges>;
 var<uniform> params: CoverageParams;
 
 @group(0) @binding(2)
-var<storage, read_write> coverage: array<u32>;
+var<storage, read_write> samples: array<CoverageSample>;
 
 fn i64_from_i32(value: i32) -> I64 {
     return I64(u32(value), select(0, -1, value < 0));
@@ -40,6 +61,10 @@ fn i64_add(a: I64, b: I64) -> I64 {
     let lo = a.lo + b.lo;
     let carry = select(0u, 1u, lo < a.lo);
     return I64(lo, bitcast<i32>(u32(a.hi) + u32(b.hi) + carry));
+}
+
+fn i64_sub(a: I64, b: I64) -> I64 {
+    return i64_add(a, i64_neg(b));
 }
 
 fn i64_neg(value: I64) -> I64 {
@@ -79,6 +104,37 @@ fn i64_floor_div_8(value: I64) -> I64 {
     return I64((value.lo >> 3u) | (u32(value.hi) << 29u), value.hi >> 3u);
 }
 
+fn i64_floor_div_65536(value: I64) -> I64 {
+    return I64((value.lo >> 16u) | (u32(value.hi) << 16u), value.hi >> 16u);
+}
+
+fn i64_shift_left_16(value: I64) -> I64 {
+    return I64(value.lo << 16u, bitcast<i32>((u32(value.hi) << 16u) | (value.lo >> 16u)));
+}
+
+fn i64_mul_i32_u32(a: i32, b: u32) -> I64 {
+    let magnitude_a = select(u32(a), ~u32(a) + 1u, a < 0);
+    let magnitude = unsigned_mul_32(magnitude_a, b);
+    if a < 0 {
+        return i64_neg(magnitude);
+    }
+    return magnitude;
+}
+
+// `b = b.hi * 2^32 + b.lo`. Splitting on that identity keeps every
+// intermediate in two words while preserving floor division for negatives.
+fn i64_mul_i32_i64_floor_q16(a: i32, b: I64) -> I64 {
+    let high_term = i64_shift_left_16(i64_mul_i32(a, b.hi));
+    let low_term = i64_floor_div_65536(i64_mul_i32_u32(a, b.lo));
+    return i64_add(high_term, low_term);
+}
+
+fn evaluate_plane(plane: AttributePlane, delta_y_eighth: i32, delta_x_q16: I64) -> I64 {
+    let edge_term = i64_floor_div_8(i64_mul_i32(plane.de, delta_y_eighth));
+    let x_term = i64_mul_i32_i64_floor_q16(plane.dx, delta_x_q16);
+    return i64_add(i64_add(i64_from_i32(plane.base), edge_term), x_term);
+}
+
 fn i64_less(a: I64, b: I64) -> bool {
     return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
 }
@@ -99,7 +155,7 @@ fn sample_columns(offset_y: i32) -> vec2<i32> {
     return select(vec2<i32>(3, 7), vec2<i32>(1, 5), offset_y == 1 || offset_y == 5);
 }
 
-fn sample_is_covered(triangle: TriangleEdges, x: u32, sample_y_eighth: i32, offset_x: i32) -> bool {
+fn sample_line(triangle: TriangleEdges, sample_y_eighth: i32) -> SampleLine {
     let high_origin_eighth = (triangle.yh & ~3) * 2;
     let middle_eighth = triangle.ym * 2;
     let major = edge_x(triangle.xh, triangle.dxhdy, sample_y_eighth - high_origin_eighth);
@@ -115,8 +171,11 @@ fn sample_is_covered(triangle: TriangleEdges, x: u32, sample_y_eighth: i32, offs
         left = major;
         right = minor;
     }
-    let sample_x = pixel_sample_x(x, offset_x);
-    return i64_greater_equal(sample_x, left) && i64_less(sample_x, right);
+    return SampleLine(left, right, major);
+}
+
+fn sample_is_covered(line: SampleLine, sample_x: I64) -> bool {
+    return i64_greater_equal(sample_x, line.left) && i64_less(sample_x, line.right);
 }
 
 @compute @workgroup_size(64)
@@ -132,9 +191,14 @@ fn compute_triangle_coverage(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = pixel_index / params.width;
     let triangle = triangles[triangle_index];
     let sample_y_offsets = array<i32, 4>(1, 3, 5, 7);
+    let high_origin_eighth = (triangle.yh & ~3) * 2;
     let yh_eighth = triangle.yh * 2;
     let yl_eighth = triangle.yl * 2;
     var count = 0u;
+    var found_sample = false;
+    var first_delta_y_eighth = 0;
+    var first_delta_x_q16 = I64(0u, 0);
+    var plane_values: array<I64, 7>;
     for (var row = 0u; row < 4u; row += 1u) {
         let offset_y = sample_y_offsets[row];
         let sample_y_eighth = i32(y) * 8 + offset_y;
@@ -142,12 +206,39 @@ fn compute_triangle_coverage(@builtin(global_invocation_id) id: vec3<u32>) {
             continue;
         }
         let columns = sample_columns(offset_y);
-        if sample_is_covered(triangle, x, sample_y_eighth, columns.x) {
+        let line = sample_line(triangle, sample_y_eighth);
+        let sample_x0 = pixel_sample_x(x, columns.x);
+        if sample_is_covered(line, sample_x0) {
+            if !found_sample {
+                found_sample = true;
+                first_delta_y_eighth = sample_y_eighth - high_origin_eighth;
+                first_delta_x_q16 = i64_sub(sample_x0, line.major);
+            }
             count += 1u;
         }
-        if sample_is_covered(triangle, x, sample_y_eighth, columns.y) {
+        let sample_x1 = pixel_sample_x(x, columns.y);
+        if sample_is_covered(line, sample_x1) {
+            if !found_sample {
+                found_sample = true;
+                first_delta_y_eighth = sample_y_eighth - high_origin_eighth;
+                first_delta_x_q16 = i64_sub(sample_x1, line.major);
+            }
             count += 1u;
         }
     }
-    coverage[output_index] = count;
+    if found_sample {
+        for (var plane = 0u; plane < 7u; plane += 1u) {
+            plane_values[plane] = evaluate_plane(
+                triangle.planes[plane],
+                first_delta_y_eighth,
+                first_delta_x_q16,
+            );
+        }
+    }
+    samples[output_index] = CoverageSample(
+        count,
+        first_delta_y_eighth,
+        first_delta_x_q16,
+        plane_values,
+    );
 }
