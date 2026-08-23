@@ -63,6 +63,9 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
+# Validate the zoom-fill WGSL against the same Naga line used by pixels/wgpu
+# before a Metal window reaches shader-module creation.
+naga = { version = "0.19", features = ["wgsl-in"] }
 
 # Audio tasks execute admitted live IMEM through the ABI's explicit LLE
 # accuracy policy. Optional translated artifacts are not shell features or
