@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    App-icon treatment of the fn64 controller-port mark published at
+    https://fn64.github.io/favicon.svg (retrieved 2026-08-23). The mark's
+    geometry is unchanged; only its scale and contrasting tile are new.
+  -->
+  <rect x="32" y="32" width="960" height="960" rx="220" fill="#0c0c0d"/>
+  <g transform="translate(192 192) scale(10)" fill="#f7f5ef">
+    <path fill-rule="evenodd" d="M32 1.333a30.667 30.667 0 1 0 0 61.334a30.667 30.667 0 1 0 0-61.334Z M12.305 41.918A2.345 2.345 0 0 1 10.116 40.414A23.446 23.446 0 1 1 53.884 40.414A2.345 2.345 0 0 1 51.695 41.918Z"/>
+    <circle cx="17.464" cy="32" r="5.627"/>
+    <circle cx="32" cy="32" r="5.627"/>
+    <circle cx="46.536" cy="32" r="5.627"/>
+  </g>
+</svg>

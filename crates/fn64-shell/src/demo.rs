@@ -126,6 +126,7 @@ impl ApplicationHandler for Demo {
         let size = LogicalSize::new((FB_WIDTH * 2) as f64, (FB_HEIGHT * 2) as f64);
         let attrs = Window::default_attributes()
             .with_title("fn64 -- UI demo (no game linked)")
+            .with_window_icon(Some(crate::app_identity::window_icon()))
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(FB_WIDTH as f64, FB_HEIGHT as f64));
         let window = match event_loop.create_window(attrs) {
@@ -136,6 +137,7 @@ impl ApplicationHandler for Demo {
                 return;
             }
         };
+        crate::app_identity::install_platform_application_icon();
         let win_size = window.inner_size();
         let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
         match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
