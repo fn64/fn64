@@ -234,9 +234,14 @@ pub fn scanout_vi_framebuffer() -> Option<u32> {
 }
 
 /// Read the live VI status/control register used by host-side presenters.
+///
+/// Cheap: a direct read of `vi_registers[0]` off the device fabric, the same
+/// value `read_live_device_mmio(0xA440_0000)` returns but WITHOUT the MMIO
+/// address-decode that read routes through. `vi_blanked` is called once per
+/// presented frame, so the decode cost (~4.6 ms observed) is not acceptable
+/// there -- see the regression that made this a direct accessor.
 pub fn vi_status() -> u32 {
-    crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0000)
-        .expect("VI_STATUS register is not mapped")
+    with_host(|host| host.device_fabric.vi_control())
 }
 
 /// Whether the live VI must present black instead of reading framebuffer bytes.
