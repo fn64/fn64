@@ -69,6 +69,7 @@ def summarize(
     process: str | None = None,
     leaf_patterns: tuple[str, ...] = (),
     limit: int = 30,
+    stack_depth: int = 8,
 ) -> dict[str, object]:
     root = ET.fromstring(xml_text)
     ids = {
@@ -78,6 +79,7 @@ def summarize(
     }
     exclusive: Counter[str] = Counter()
     caller_costs = {pattern: Counter() for pattern in leaf_patterns}
+    call_path_costs = {pattern: Counter() for pattern in leaf_patterns}
     leaf_costs: Counter[str] = Counter()
     samples = 0
     weight_ns = 0
@@ -111,6 +113,13 @@ def summarize(
                 "<no-main-image-caller>",
             )
             caller_costs[pattern][caller] += row_weight
+            main_image_path = [leaf_name]
+            main_image_path.extend(
+                _frame_name(frame, ids)
+                for frame in frames[1:]
+                if _frame_binary(frame, ids) == image
+            )
+            call_path_costs[pattern][" <- ".join(main_image_path[:stack_depth])] += row_weight
 
     return {
         "schema": "fn64.xctrace-time-profile.v1",
@@ -123,6 +132,7 @@ def summarize(
             pattern: {
                 "weight_ms": leaf_costs[pattern] / 1_000_000.0,
                 "callers": _ranked(caller_costs[pattern], limit),
+                "call_paths": _ranked(call_path_costs[pattern], limit),
             }
             for pattern in leaf_patterns
         },
@@ -136,10 +146,13 @@ def main() -> int:
     parser.add_argument("--process")
     parser.add_argument("--leaf", action="append", default=[])
     parser.add_argument("--top", type=int, default=30)
+    parser.add_argument("--stack-depth", type=int, default=8)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     if args.top <= 0:
         parser.error("--top must be positive")
+    if args.stack_depth <= 0:
+        parser.error("--stack-depth must be positive")
     try:
         result = summarize(
             args.xml.read_text(encoding="utf-8"),
@@ -147,6 +160,7 @@ def main() -> int:
             process=args.process,
             leaf_patterns=tuple(args.leaf),
             limit=args.top,
+            stack_depth=args.stack_depth,
         )
     except (ET.ParseError, OSError, ValueError) as error:
         parser.error(str(error))
