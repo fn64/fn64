@@ -93,7 +93,13 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
 3. **Typed batch admission.** Define a move-only batch containing the target
    identity/generation, ordered draw records, per-position TMEM snapshots, and
    the exact journal accesses it can publish. Admission initially accepts only
-   the census-observed textured, perspective, depth-free RGBA16 subset.
+   the census-observed textured, perspective, depth-free RGBA16 subset. The
+   first closed admission type now accepts only the leading exact census key
+   (`fc5196a3/112cfe7f`, `0008acef/005041c8`): target generation, strict
+   command order, each draw's committed/proposed TMEM identity, and every
+   render-target journal access are sealed into a non-`Clone` batch. Scheduler
+   integration and GPU consumption remain open; unsupported state still
+   reaches no compute executor.
 4. **Integer coverage and attributes.** Port this repository's
    `triangle_span` formulas into WGSL using explicit multiword signed arithmetic
    where WGSL lacks 64/128-bit integers. Exhaustively compare every covered
@@ -146,6 +152,13 @@ captured command geometry and final packet, but not a claim that historical
 prefix texel bytes equal the live run at each earlier packet. Live linked-shell
 profiling remains the performance authority; complete guest-byte stability is
 the replay's regression oracle.
+
+Per-packet detail over the same suffix shows ten triangle-bearing packets at
+roughly 0.69--0.79 ms execute each, two state-only packets at roughly 0.04 ms,
+and packet 2657 at 4.4 ms total despite only 1.13 ms execute because its
+plan/read/copy boundary dominates. This selects packet-local triangle batches
+as the compute unit and keeps resident-target transfer removal as the next,
+independently measured optimization.
 
 ## Sources and nonclaims
 

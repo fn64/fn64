@@ -103,6 +103,7 @@ fn main() {
     let height = env_u32("FN64_RAW_DPC_REPLAY_HEIGHT", 240);
     let warmup = env_u32("FN64_RAW_DPC_REPLAY_WARMUP", 10);
     let repeat = env_u32("FN64_RAW_DPC_REPLAY_REPEAT", 100);
+    let detail = std::env::var_os("FN64_RAW_DPC_REPLAY_DETAIL").is_some();
     assert!(repeat > 0, "FN64_RAW_DPC_REPLAY_REPEAT must be nonzero");
 
     let (mut backend, mut session) = WgpuBackend::try_new().expect("construct wgpu backend");
@@ -138,6 +139,7 @@ fn main() {
     }
 
     let mut samples = Vec::with_capacity(repeat as usize);
+    let mut packet_samples = vec![Vec::with_capacity(repeat as usize); benchmark.len()];
     let mut expected_digest = None;
     for iteration in 0..warmup + repeat {
         let mut timings = Timings::default();
@@ -167,6 +169,9 @@ fn main() {
                 sequence,
             );
             timings.add(packet_timings);
+            if iteration >= warmup {
+                packet_samples[window_index].push(packet_timings);
+            }
             for byte in packet_digest.to_le_bytes() {
                 digest ^= u64::from(byte);
                 digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
@@ -200,6 +205,17 @@ fn main() {
     report("copyback", &samples, |sample| sample.copyback);
     report("publish", &samples, |sample| sample.publish);
     report("total", &samples, |sample| sample.total);
+    if detail {
+        for (window_index, packet) in packet_samples.iter().enumerate() {
+            let packet_index = prefix.len() + window_index;
+            report(&format!("packet_{packet_index}_execute"), packet, |sample| {
+                sample.execute
+            });
+            report(&format!("packet_{packet_index}_total"), packet, |sample| {
+                sample.total
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
