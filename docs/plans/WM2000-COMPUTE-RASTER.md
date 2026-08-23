@@ -72,7 +72,13 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
 2. **Dynamic RGBA16 target.** Generalize the proven native-fill storage-buffer
    and bounded-readback mechanism to a `SetColorImage` extent. A no-op compute
    round trip must reproduce arbitrary resident bytes exactly, including odd
-   widths and row ends.
+   widths and row ends. The transport-only pipeline is now precreated with the
+   triangle device and its host-GPU gate covers both a 5x3 odd-word tail and a
+   full 320x240 target; production raster arithmetic and target persistence
+   remain intentionally outside this completed substrate slice. Validation on
+   the native Metal adapter passed 10 consecutive runs on 2026-08-23; the
+   closed-profile WGSL validation and all 42 focused triangle-pipeline tests
+   also passed.
 3. **Typed batch admission.** Define a move-only batch containing the target
    identity/generation, ordered draw records, per-position TMEM snapshots, and
    the exact journal accesses it can publish. Admission initially accepts only
