@@ -753,6 +753,26 @@ Every checkpoint is listed because a mid-run checkpoint has been mistaken
 for a final result more than once in this project; the 2149 above is the
 LAST line, and the run's own summary block agrees with it.
 
+### Depth-free scanlines run in parallel
+
+The guest-visible CPU rasterizer keeps command order sequential, but a single
+depth-free triangle now divides its color target into exclusive whole rows
+and runs those rows on a persistent work-stealing pool. The scalar pixel body
+is still the one implementation; each job receives one local row plus its
+guest-row base, and all jobs finish before the next triangle can observe the
+target. Depth-bearing draws and combiner census runs stay scalar because they
+retain cross-row mutable state. Triangles below 256 declared-range pixels also
+stay scalar; bounded threshold measurements include the cutoff and prevent
+thread-pool dispatch from consuming the win. `FN64_PARALLEL_RASTER=0` is the
+exact control lane, absent means enabled, and any other value traps.
+
+The release `texture_plane_raster_microbench` measured four interleaved A/B
+pairs on 2026-08-23. Scalar mean/min-of-four was 516.635/505.721 ns per covered
+pixel; parallel was 88.245/82.354 ns, a 5.85x mean speedup (6.14x by min-of-N).
+This is a headless per-pixel substrate result, not a windowed frame figure.
+The current execution sandbox exposes no Metal adapter, so the WM2000
+rs+wgpu pump-census confirmation remains pending on a GUI-capable host.
+
 ### Frame evidence: textured geometry now appears
 
 A `WM2000_FB_DUMP_DIR` run dumps guest framebuffer PNGs (only when
