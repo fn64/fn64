@@ -169,6 +169,31 @@ impl PreparedLoadBlock {
             });
         }
 
+        // The contiguous TMEM word span this block's DXT sweep passed over.
+        // For DXT >= 0x800 (the tile-row-advance cases) the sweep advances by
+        // more than one word per source word, so its scattered destination
+        // words leave gaps between them -- e.g. DXT=0x800 writes words 0, 2,
+        // 4, 6 and skips 1, 3, 5. Those skipped words are read back as their
+        // prior (zero) content on hardware and both oracles; back-fill them
+        // as valid after staging (see `mark_block_footprint_valid`) so a
+        // render tile that re-describes the block with a `line` reading a
+        // skipped word is not refused. Only Linear64 words carry a single
+        // destination word; a RGBA32 SplitBanks load never drives a tile-row
+        // DXT advance, so it contributes none.
+        let block_footprint = self
+            .words
+            .iter()
+            .filter_map(|word| match word.transfer.physical() {
+                TmemTransferPhysicalWord::Linear(_) => Some(word.transfer.destination_word()),
+                TmemTransferPhysicalWord::SplitBanks { .. } => None,
+            })
+            .fold(None, |bounds: Option<(u16, u16)>, destination| {
+                Some(match bounds {
+                    None => (destination, destination),
+                    Some((low, high)) => (low.min(destination), high.max(destination)),
+                })
+            });
+
         let mut fragments = Vec::with_capacity(self.words.len());
         #[cfg(test)]
         let mut completed_words = 0;
@@ -187,6 +212,9 @@ impl PreparedLoadBlock {
                     return Err(LoadBlockExecutionError::InjectedTestFault { completed_words });
                 }
             }
+        }
+        if let Some((low_word, high_word)) = block_footprint {
+            staged.mark_block_footprint_valid(low_word, high_word);
         }
         let packet = staged
             .finish_load()
@@ -1106,6 +1134,104 @@ mod tests {
                 "byte {address} should be valid"
             );
             assert_eq!(state.valid_byte(address), Some(8 + address as u8));
+        }
+    }
+
+    /// **The DXT row-advance for tile rows >= 1: a texel that must land on a
+    /// later TMEM row lands there, and the words the sweep skipped read back
+    /// as valid zeros.**
+    ///
+    /// `dxt = 2048` (0x800) advances the destination one TMEM word per source
+    /// word beyond the word's own +1, so the block's second source word lands
+    /// at destination word 2, not 1 -- `destination = word + ((word*dxt)>>11)
+    /// * line`, i.e. `1 + 1*1 = 2`. Destination word 1 is the gap the sweep
+    /// passed over. Hardware and both oracles (RT64, angrylion) read that gap
+    /// back as its prior zero content, so a render tile that re-describes the
+    /// block with `line = 1` (reading destination words 0, 1, 2, 3 as
+    /// consecutive rows) must find word 1 readable. Before the footprint
+    /// back-fill it was `InvalidTexelByte`, which refused all six
+    /// `gen-loadblock-deep-*` parity cases; this test fails if that back-fill
+    /// is reverted.
+    #[test]
+    fn dxt_row_advance_leaves_skipped_words_valid_as_zero() {
+        let spec = BlockFixtureSpec {
+            format: 0,
+            size: 2,
+            image_width: 8,
+            image_address: 0x200,
+            tile_line_words: 1,
+            tile_tmem: 0,
+            source_s: 0,
+            source_t: 0,
+            high_s: 7,
+            dxt: 2048,
+            source_byte_len: 16,
+        };
+        let fixture = fixture(spec);
+        let transfer = fixture
+            .decoded
+            .resource_plan()
+            .bind_tmem_transfer(load(&fixture.decoded))
+            .unwrap();
+        assert_eq!(transfer.words().len(), 2);
+        // The DXT sweep places word 0 at destination word 0 and word 1 at
+        // destination word 2 -- the row advance. Destination word 1 is the
+        // skipped gap this test pins.
+        assert_eq!(transfer.words()[0].destination_word(), 0);
+        assert_eq!(transfer.words()[1].destination_word(), 2);
+
+        let state = PhysicalTmemState::try_new().unwrap();
+        let prepared = prepare_load_block(fixture.decoded.submitted(), &transfer).unwrap();
+        let staged = state
+            .stage_transfer(fixture.decoded.submitted(), &transfer)
+            .unwrap();
+        let executed = prepared.execute(staged).unwrap();
+        let pending = executed.into_packet().into_pending().unwrap();
+        let state = publish(
+            fixture.decoded,
+            fixture.backend,
+            fixture.guest,
+            state,
+            pending,
+        );
+
+        // Destination word 0 (bytes 0..8): the first source word's real
+        // texels, byte-for-byte.
+        for address in 0_u16..8 {
+            assert!(
+                state.byte_is_valid(address),
+                "destination word 0 byte {address} must be its own loaded data"
+            );
+            assert_eq!(state.valid_byte(address), Some(address as u8));
+        }
+        // Destination word 1 (bytes 8..16): the sweep skipped it. The
+        // back-fill makes it valid, reading its zero-initialised storage --
+        // the exact byte hardware and both oracles return there. Without the
+        // fill this range is invalid and the render refuses.
+        for address in 8_u16..16 {
+            assert!(
+                state.byte_is_valid(address),
+                "skipped destination word 1 byte {address} must be valid (zero-filled)"
+            );
+            assert_eq!(
+                state.valid_byte(address),
+                Some(0),
+                "a skipped DXT gap reads back as zero"
+            );
+        }
+        // Destination word 2 (bytes 16..24): the second source word's real
+        // texels, which the row advance placed here rather than at word 1.
+        // Word 1 is tile-relative row 1, so its two 4-byte halves are
+        // exchanged (`odd_row_exchange`); source bytes [8..16] land as
+        // [12,13,14,15, 8,9,10,11].
+        let expected_word_two = [12_u8, 13, 14, 15, 8, 9, 10, 11];
+        for (offset, expected) in expected_word_two.into_iter().enumerate() {
+            let address = 16 + offset as u16;
+            assert!(
+                state.byte_is_valid(address),
+                "destination word 2 byte {address} must be the second word's data"
+            );
+            assert_eq!(state.valid_byte(address), Some(expected));
         }
     }
 
