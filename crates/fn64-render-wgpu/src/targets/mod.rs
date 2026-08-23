@@ -19,6 +19,7 @@ use fn64_render_ir::{PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, Valid
 
 use crate::{ColorImage, ImageFormat, PixelSize};
 
+mod compute_batch;
 mod fill;
 mod oracle;
 mod raster;
