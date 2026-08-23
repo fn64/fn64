@@ -1037,7 +1037,14 @@ fn z_compare_nearer_wins_and_farther_loses_over_a_committed_depth() {
     // that far depth -- establishing a non-trivial memory Z the compare
     // below actually has to beat. `prim_z = 0x4000` gives a working Z of
     // `0x4000 << 3 = 0x20000`.
-    let first = run_z(key, &sentinel_resident(key), false, true, 0x4000, &mut cells);
+    let first = run_z(
+        key,
+        &sentinel_resident(key),
+        false,
+        true,
+        0x4000,
+        &mut cells,
+    );
     assert_eq!(
         pixel_at(&first, 3, 1),
         PRIM_RGBA16,
@@ -1194,8 +1201,12 @@ fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
     let t = [0, 0, 0, 0];
     // dS/dx and dT/dx nonzero so texel coordinates actually advance per pixel
     // -- the whole point is to step them.
-    let sdx = [3 << 10, 0, 0, 0];
-    let tdx = [0, 5 << 10, 0, 0];
+    // Non-multiples of 32 are deliberate: after the perspective scale they
+    // produce fractional S10.5 coordinates. That distinguishes the CPU
+    // executor's point sampler from the three-nearest filter and prevents a
+    // filter-selection regression from hiding behind texel-aligned inputs.
+    let sdx = [(3 << 10) + 17, 0, 0, 0];
+    let tdx = [0, (5 << 10) + 11, 0, 0];
     let sde = [1 << 8, 2 << 8, 0, 0];
     let sdy = [1 << 6, 1 << 6, 0, 0];
     // texture_planes wants [S, T, W, unused] arrays; pack per-array.

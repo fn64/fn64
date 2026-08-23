@@ -759,3 +759,62 @@ fn sample_committed_rgba16_three_nearest(
 fn sample_committed_rgba16_three_nearest_bound(raw_s: i32, raw_t: i32) -> TmemSampleResult {
     return sample_committed_rgba16_three_nearest(tmem_tile_binding, raw_s, raw_t);
 }
+
+// Point-sampling sibling used by the CPU raw-triangle executor. Addressing
+// is the same `relative_axis_coordinate` -> `address_axis_texel` chain as
+// `address_point_texel` in `tmem/sample.rs`; fractional S/T bits select no
+// neighbouring corners and therefore cannot accidentally enable the
+// three-nearest filter used by the fragment-pipeline path above.
+fn sample_committed_rgba16_point_bound(raw_s: i32, raw_t: i32) -> TmemSampleResult {
+    var result: TmemSampleResult;
+    result.color = vec4<f32>(0.0);
+    if tmem_tile_binding.bound == 0u {
+        result.status = TMEM_SAMPLE_STATUS_NO_TILE_BINDING;
+        return result;
+    }
+    if tmem_tile_binding.lut_mode == TMEM_TLUT_MODE_DISABLED {
+        if tmem_tile_binding.format != TMEM_IMAGE_FORMAT_RGBA
+            || tmem_tile_binding.pixel_size != TMEM_PIXEL_SIZE_BITS16 {
+            result.status = TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT;
+            return result;
+        }
+    } else if tmem_tile_binding.pixel_size == TMEM_PIXEL_SIZE_BITS32 {
+        result.status = TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT;
+        return result;
+    }
+
+    let clamp_s = tmem_tile_binding.mask_s == 0u || tmem_tile_binding.mode_s_clamp != 0u;
+    let clamp_t = tmem_tile_binding.mask_t == 0u || tmem_tile_binding.mode_t_clamp != 0u;
+    if (clamp_s && tmem_tile_binding.high_s >> 2u < tmem_tile_binding.low_s >> 2u)
+        || (clamp_t && tmem_tile_binding.high_t >> 2u < tmem_tile_binding.low_t >> 2u) {
+        result.status = TMEM_SAMPLE_STATUS_REVERSED_EXTENT;
+        return result;
+    }
+
+    var base_s = 0i;
+    var frac_s = 0u;
+    relative_axis_coordinate(raw_s, tmem_tile_binding.shift_s, tmem_tile_binding.low_s, &base_s, &frac_s);
+    var base_t = 0i;
+    var frac_t = 0u;
+    relative_axis_coordinate(raw_t, tmem_tile_binding.shift_t, tmem_tile_binding.low_t, &base_t, &frac_t);
+    let column = address_axis_texel(
+        base_s,
+        tmem_tile_binding.low_s,
+        tmem_tile_binding.high_s,
+        tmem_tile_binding.mode_s_mirror != 0u,
+        tmem_tile_binding.mode_s_clamp != 0u,
+        tmem_tile_binding.mask_s,
+    );
+    let row = address_axis_texel(
+        base_t,
+        tmem_tile_binding.low_t,
+        tmem_tile_binding.high_t,
+        tmem_tile_binding.mode_t_mirror != 0u,
+        tmem_tile_binding.mode_t_clamp != 0u,
+        tmem_tile_binding.mask_t,
+    );
+    var ok = false;
+    result.color = tmem_sample_texel(tmem_tile_binding, column, row, &ok);
+    result.status = select(TMEM_SAMPLE_STATUS_INVALID_BYTE, TMEM_SAMPLE_STATUS_OK, ok);
+    return result;
+}
