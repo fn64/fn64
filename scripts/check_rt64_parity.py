@@ -42,13 +42,6 @@ EXPECTED_OUTCOMES = {
         rt64_matches_key=False,
         differing_pixels=38_400,
     ),
-    "textured-rect-flip-point-sampled": ExpectedOutcome(
-        Kind.FN64_CAPABILITY_GAP,
-        "one-refused",
-        "crates/fn64-render-wgpu/src/raw_dpc/mod.rs:1938-1940",
-        "TEXRECTFLIP must refuse loudly until implemented; completion requires byte identity",
-        wgpu_outcome="refused",
-    ),
     "textured-rect-yuv16": ExpectedOutcome(
         Kind.FN64_CAPABILITY_GAP,
         "one-refused",
