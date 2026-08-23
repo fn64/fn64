@@ -973,3 +973,5 @@ Task 16fix: complete — CLR_ON_CVG + CVG_DST_WRAP color-write drop. Commit 435d
 
 === ALL 3 ORIGINAL PHASE-3 FIXES LANDED + VERIFIED ===
 #17 z-buffer fcd48b7c, #18 loadblock 1d8c0d11, #16 coverage 435dbbab. Corpus fn64-defect now 0. Remaining wgpu-refused: alpha-dither (2) + yuv (accounted). Next: #20 CI-triangle S-plane (gated on licensing-admissible source), then fan-out Pass 2.
+
+Launched: fan-out Pass 2 (workflow w3p6kz2es — 6 design slices: two-cycle-combine, blend-deep, tlut-palette-deep, lod-mip, zmode-deep, formats-wider -> 1 opus integrator, serial write). Concurrently: #20 admissible-source investigation (read-only, agent aeb0bf01) to find a licensing-clean authority for the correct CI triangle S-origin before any fix — angrylion alone is clean-room-excluded, RT64 agrees with the bug. #20 fix stays GATED until this returns Y.
