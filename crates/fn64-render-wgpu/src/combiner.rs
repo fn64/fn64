@@ -869,16 +869,44 @@ fn run_cycle(
     combiner_color_in: [f32; 4],
 ) -> [f32; 4] {
     let bitfield_second_cycle = pass.bitfield_second_cycle();
-    let carries_wrap = pass.carries_wrap();
+    run_cycle_prepared(
+        inputs,
+        PreparedCombinerCycle {
+            color: [
+                params.decode_color(ColorInputSlot::A, bitfield_second_cycle),
+                params.decode_color(ColorInputSlot::B, bitfield_second_cycle),
+                params.decode_color(ColorInputSlot::C, bitfield_second_cycle),
+                params.decode_color(ColorInputSlot::D, bitfield_second_cycle),
+            ],
+            alpha: [
+                params.decode_alpha(AlphaInputSlot::A, bitfield_second_cycle),
+                params.decode_alpha(AlphaInputSlot::B, bitfield_second_cycle),
+                params.decode_alpha(AlphaInputSlot::C, bitfield_second_cycle),
+                params.decode_alpha(AlphaInputSlot::D, bitfield_second_cycle),
+            ],
+            carries_wrap: pass.carries_wrap(),
+        },
+        alpha_only,
+        combiner_color_in,
+    )
+}
 
-    let ca = params.decode_color(ColorInputSlot::A, bitfield_second_cycle);
-    let cb = params.decode_color(ColorInputSlot::B, bitfield_second_cycle);
-    let cc = params.decode_color(ColorInputSlot::C, bitfield_second_cycle);
-    let cd = params.decode_color(ColorInputSlot::D, bitfield_second_cycle);
-    let aa = params.decode_alpha(AlphaInputSlot::A, bitfield_second_cycle);
-    let ab = params.decode_alpha(AlphaInputSlot::B, bitfield_second_cycle);
-    let ac = params.decode_alpha(AlphaInputSlot::C, bitfield_second_cycle);
-    let ad = params.decode_alpha(AlphaInputSlot::D, bitfield_second_cycle);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedCombinerCycle {
+    color: [ColorInput; 4],
+    alpha: [AlphaInput; 4],
+    carries_wrap: bool,
+}
+
+fn run_cycle_prepared(
+    inputs: CombinerInputs,
+    prepared: PreparedCombinerCycle,
+    alpha_only: bool,
+    combiner_color_in: [f32; 4],
+) -> [f32; 4] {
+    let [ca, cb, cc, cd] = prepared.color;
+    let [aa, ab, ac, ad] = prepared.alpha;
+    let carries_wrap = prepared.carries_wrap;
 
     let [mut r, mut g, mut b_ch, mut a_ch] = combiner_color_in;
 
@@ -924,6 +952,57 @@ fn run_cycle(
     a_ch = (aa_v - ab_v) * ac_v + ad_v;
 
     [r, g, b_ch, a_ch]
+}
+
+/// A two-cycle combiner whose sixteen selectors are decoded once for a draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedTwoCycleCombiner {
+    first: PreparedCombinerCycle,
+    second: PreparedCombinerCycle,
+}
+
+impl PreparedTwoCycleCombiner {
+    pub(crate) const fn new(params: CombineParams) -> Self {
+        Self {
+            first: PreparedCombinerCycle {
+                color: [
+                    params.decode_color(ColorInputSlot::A, false),
+                    params.decode_color(ColorInputSlot::B, false),
+                    params.decode_color(ColorInputSlot::C, false),
+                    params.decode_color(ColorInputSlot::D, false),
+                ],
+                alpha: [
+                    params.decode_alpha(AlphaInputSlot::A, false),
+                    params.decode_alpha(AlphaInputSlot::B, false),
+                    params.decode_alpha(AlphaInputSlot::C, false),
+                    params.decode_alpha(AlphaInputSlot::D, false),
+                ],
+                carries_wrap: false,
+            },
+            second: PreparedCombinerCycle {
+                color: [
+                    params.decode_color(ColorInputSlot::A, true),
+                    params.decode_color(ColorInputSlot::B, true),
+                    params.decode_color(ColorInputSlot::C, true),
+                    params.decode_color(ColorInputSlot::D, true),
+                ],
+                alpha: [
+                    params.decode_alpha(AlphaInputSlot::A, true),
+                    params.decode_alpha(AlphaInputSlot::B, true),
+                    params.decode_alpha(AlphaInputSlot::C, true),
+                    params.decode_alpha(AlphaInputSlot::D, true),
+                ],
+                carries_wrap: true,
+            },
+        }
+    }
+
+    pub(crate) fn run(self, inputs: CombinerInputs) -> ([f32; 4], f32) {
+        let first = run_cycle_prepared(inputs, self.first, false, [0.0; 4]);
+        let alpha_compare_value = wrap_clamp(first[3]);
+        let final_color = run_cycle_prepared(inputs, self.second, false, first);
+        (final_color.map(wrap_clamp), alpha_compare_value)
+    }
 }
 
 /// Cycle-mode dispatch, mirroring RT64's `run`
@@ -1092,6 +1171,59 @@ mod tests {
         k4: 0.19,
         k5: 0.81,
     };
+
+    #[test]
+    fn prepared_two_cycle_is_bit_exact_for_measured_wm2000_programs() {
+        let programs = [
+            (0xfc15_fea3, 0xf00f_f23f),
+            (0xfcff_ffff, 0xfffd_f6fb),
+            (0xfc51_96a3, 0x112c_fe7f),
+            (0xfc45_fea3, 0xf00f_f83f),
+            (0xfcff_b3ff, 0xff64_fe7f),
+            (0xfc15_96a3, 0xf0ff_fe38),
+            (0xfc30_9661, 0x552e_ff7f),
+            (0xfc30_b261, 0xff67_ffff),
+        ];
+        let inputs = [
+            CombinerInputs {
+                tex_val0: [0.0; 4],
+                tex_val1: [0.0; 4],
+                prim_color: [0.0; 4],
+                shade_color: [0.0; 4],
+                env_color: [0.0; 4],
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            },
+            ALL_INPUTS,
+            CombinerInputs {
+                tex_val0: [1.0; 4],
+                tex_val1: [1.0; 4],
+                prim_color: [1.0; 4],
+                shade_color: [1.0; 4],
+                env_color: [1.0; 4],
+                key_center: [1.0; 3],
+                key_scale: [1.0; 3],
+                lod_fraction: 1.0,
+                prim_lod_frac: 1.0,
+                noise: 1.0,
+                k4: 1.0,
+                k5: 1.0,
+            },
+        ];
+
+        for (low, high) in programs {
+            let params = CombineParams::from_wire(low, high);
+            let prepared = PreparedTwoCycleCombiner::new(params);
+            for input in inputs {
+                assert_eq!(prepared.run(input), run_two_cycle(params, input));
+            }
+        }
+    }
 
     // -- §9a: exhaustive decode-table sweep over every wire-legal index,
     // asserting exact RT64 decode. Cross-checked directly against the
