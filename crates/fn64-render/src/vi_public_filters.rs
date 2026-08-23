@@ -33,6 +33,39 @@ pub fn restore_rgba16_component_bounded_v1(center: u8, neighbors: &[u8]) -> u8 {
     u8::try_from(restored).expect("valid RGBA16 restoration result fits eight bits")
 }
 
+/// Restore all three RGBA16 color components while sharing one neighborhood
+/// traversal. This is exactly three applications of
+/// [`restore_rgba16_component_bounded_v1`]; grouping the channels changes no
+/// comparison or arithmetic, but lets scanout gather each neighboring pixel
+/// once rather than rediscovering the same 3x3 geometry for R, G, and B.
+pub fn restore_rgba16_rgb_bounded_v1(center: [u8; 3], neighbors: &[[u8; 3]]) -> [u8; 3] {
+    assert!(
+        center.iter().all(|component| *component < 32),
+        "RGBA16 center component exceeds five bits"
+    );
+    assert!(
+        neighbors.len() <= 8,
+        "RGBA16 restoration has more than eight neighbors"
+    );
+    let mut restored = center.map(|component| i16::from(component) << 3);
+    for neighbor in neighbors {
+        assert!(
+            neighbor.iter().all(|component| *component < 32),
+            "RGBA16 neighbor component exceeds five bits"
+        );
+        for channel in 0..3 {
+            restored[channel] += match neighbor[channel].cmp(&center[channel]) {
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Greater => 1,
+            };
+        }
+    }
+    restored.map(|component| {
+        u8::try_from(component).expect("valid RGBA16 restoration result fits eight bits")
+    })
+}
+
 /// One checked random bit consumed by the public gamma-dither quantizer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ViRandomBit(u8);
@@ -120,6 +153,30 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_restoration_is_three_exact_component_restorations() {
+        for center in [[0u8, 15, 31], [10u8, 20, 30], [31u8, 0, 16]] {
+            let neighbors = [
+                [center[0].saturating_sub(1), center[1], center[2]],
+                [center[0], center[1].saturating_add(1).min(31), center[2]],
+                [center[0], center[1], center[2].saturating_sub(1)],
+                [31, 0, 31],
+                [0, 31, 0],
+                center,
+                [center[0], 0, center[2]],
+                [center[0], 31, center[2]],
+            ];
+            let grouped = restore_rgba16_rgb_bounded_v1(center, &neighbors);
+            for channel in 0..3 {
+                let scalar_neighbors = neighbors.map(|neighbor| neighbor[channel]);
+                assert_eq!(
+                    grouped[channel],
+                    restore_rgba16_component_bounded_v1(center[channel], &scalar_neighbors)
+                );
             }
         }
     }

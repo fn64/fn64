@@ -1397,14 +1397,17 @@ fn parallel_dither_restoration_is_byte_identical_to_scalar() {
         bytes_per_pixel: 2,
         pixel_type: ViPixelType::Rgba16,
     };
-    let mut scalar = SourcePlane::load(geometry, &memory);
+    let mut legacy = SourcePlane::load(geometry, &memory);
+    let mut grouped = SourcePlane::load(geometry, &memory);
     let mut parallel = SourcePlane::load(geometry, &memory);
 
-    scalar.restore_dither_with_parallelism(false);
-    parallel.restore_dither_with_parallelism(true);
+    legacy.restore_dither_with_options(false, false);
+    grouped.restore_dither_with_options(false, true);
+    parallel.restore_dither_with_options(true, true);
 
-    assert_eq!(parallel.rgba8, scalar.rgba8);
-    assert_eq!(parallel.coverage, scalar.coverage);
+    assert_eq!(grouped.rgba8, legacy.rgba8);
+    assert_eq!(parallel.rgba8, legacy.rgba8);
+    assert_eq!(parallel.coverage, legacy.coverage);
 }
 
 /// Only full-coverage pixels are restored. A clear low bit means coverage 1,
