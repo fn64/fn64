@@ -14,13 +14,16 @@ Worktree: `/Users/jer/Code/fn64/.claude/worktrees/wm2000-playable`, branch
 - **Generator built** (`FN64_GENERATE=1` mode on the parity runner). First
   batch: **24 synthetic cases** across the priority matrix, three-way compared
   against angrylion ground truth with a triage rubric.
-- **First-batch results:** 16 pass-all-match-hardware, 1 wgpu-refused
-  (TexRectFlip), 7 shared-ported-bug — all 7 (and the texrect-flip's RT64
-  divergence) traced to a **single RGBA16 texture-source root cause under
-  active investigation**, NOT yet 7 independent defects.
+- **First-batch results (after root-cause fix): 23 pass-all-match-hardware,
+  1 confirmed fn64 defect (wgpu refuses TexRectFlip), 1 intentional
+  bilerp-gap witness.** The 7 initial "shared-ported-bug" RGBA16 cases were
+  ROOT-CAUSED and RESOLVED to a missing `BI_LERP_0` mode bit in the corpus's
+  textured SetOtherModes (a fixture gap, not an fn64 defect) — proven by
+  instrumenting angrylion; setting the bit makes all three backends agree.
 - Commits (branch `worktree-wm2000-playable`, not pushed):
   - `2aea6eea` — angrylion oracle leg on the parity runner.
   - `a20e6415` — programmatic corpus generator + first batch.
+  - `1ccc15c5` — RGBA16 root cause (BI_LERP_0) + generator fix + witness.
   - External oracle (`/Users/jer/Code/angrylion-oracle`, not under git) gained a
     `--rdram` full-image mode; documented in its `BUILD-NOTES.md`.
 
@@ -55,96 +58,80 @@ wgpu+RT64).
 the RGBA16 root cause. (`two-cycle-textured` refuses in wgpu and differs in
 RT64, but it too draws an RGBA16 texrect.)
 
-## The RGBA16 texture-source root cause (under investigation)
+## RESOLVED — RGBA16 texture root cause: missing BI_LERP_0 mode bit
 
-The 4x2 RGBA16 point-sampled case is the minimal reproduction. Expected sampled
-texels (with the `^1` pair swap the sample path applies):
+**Verdict: a fixture/mode-completeness bug in the parity corpus's textured
+`SetOtherModes`, NOT an fn64 rendering defect and NOT a source-staging bug.**
+Proven by instrumenting a throwaway angrylion build (the canonical angrylion
+tree and the production oracle stay pristine; all instrumentation lives in
+`/Users/jer/Code/angrylion-oracle/scratch/`).
 
-```
-row0: 07c1 f801 7fff 003f   row1: c631 8421 fc01 4211
-```
+Localization, step by step, for the 4x2 RGBA16 point-sampled case:
+- **LOAD is correct.** Dumping TMEM after `rdp_load_tile` shows all 8 texels
+  present: low-bank words `07c1 f801 7fff 003f fc01 4211 c631 8421` (the
+  word-swapped TMEM layout angrylion uses).
+- **FETCH is correct.** Instrumenting the RGBA16 texel fetch shows every pixel
+  reads its right texel: `s=0,t=0 -> f801`, `s=1 -> 07c1`, ... all 8 correct.
+- **The collapse is in the texel pipeline, BEFORE the combiner.** The texel
+  reaching the combiner is grayscale `(v,v,v,v)` where `v` is the texel's BLUE
+  channel. `tex.c` routes a NON-bilerp texel through the color-convert/YUV
+  formula `TEX->r = t0.b + (k0*t0.g>>8)`, etc.; with SetConvert coefficients
+  zero this is `TEX->r = TEX->g = TEX->b = TEX->a = t0.b`.
+- **The gate is `other_modes.bi_lerp0 = (SetOtherModes word0 >> 11) & 1`.** The
+  corpus's `OTHER_MODES_ONE_CYCLE_TEXTURED = 0xef0000f0` leaves bit 11 clear,
+  so angrylion takes the convert path and collapses to blue.
 
-angrylion produces, from the byte-identical seeded image:
+**Confirmed fix:** setting bit 11 (`0xef0000f0 -> 0xef0008f0`) in the stream
+makes angrylion output byte-identical to the hand-derived key:
+`row0 = [07c1, f801, 7fff, 003f]`, `row1 = [c631, 8421, fc01, 4211]`.
 
-```
-row0: 0001 0001 ffff ffff   row1: c631 8421 0001 4211
-```
+**Why the pass/fail split:** IA/I textures already carry intensity in the blue
+channel, so the collapse is a no-op — that is exactly why IA8/IA16/I4/I8 passed
+while every RGBA16/CI/RGBA32 case failed. fn64's wgpu and RT64 both IGNORE the
+missing BI_LERP bit and pass the full RGBA texel through, which is why all three
+(wgpu, RT64, hand-key) agree with each other yet diverge from bit-accurate
+hardware.
 
-Probes (standalone oracle, `/tmp/probe*.py`):
-- A 40x40 texrect sampling ONLY texel(0,0) reads `0x0001` everywhere — texel 0
-  is uniformly wrong, NOT a coverage edge effect.
-- **Source byte order EMPIRICALLY RULED OUT.** Re-seeding the RGBA16 source
-  seven ways — `write_u16` LE (shipped), BE/LE halfword no-xor, u32-pack
-  hi-even/hi-odd, and `write_logical_bytes` big-endian (the exact path IA16
-  uses, which passes) — the last gives **byte-identical output to the shipped
-  seeding**, and none yields all 8 texels. The source image is not the
-  variable.
-- **Not a multi-row effect.** Reshaping the same 8 texels to an 8x1 single-row
-  texrect (like the passing IA16 case) reproduces the identical broken pattern.
-- The asymmetry is stable and word-position-dependent: texels 4,5,6 read
-  correctly, texels 0,1,3,7 read `0x0001`, and some columns aren't drawn at
-  all. IA16 (also a 2-byte 16bpp texel, via `write_logical_bytes`) loads all 8
-  correctly, so it is specific to the RGBA/CI/RGBA32 fetch path, not to 16bpp
-  width.
-- Codex's static `tex.c`/`tmem.c` trace PREDICTS all 8 texels should read
-  correctly for this exact image — but the oracle's ACTUAL output does not
-  match that prediction. So the disagreement is inside angrylion's
-  LoadTile→TMEM→fetch path (or the harness's `--rdram` DP setup), NOT the
-  staged bytes.
+**Consequence for the corpus:** the corpus's textured `SetOtherModes` is
+missing BI_LERP_0. This is a genuine finding the angrylion leg surfaced — the
+hand cases' expected keys match wgpu+RT64 but would NOT match real hardware on
+this bit. Per the brief I do not modify the existing hand cases; the fix belongs
+in the shared textured other-modes (and is applied in the generator's textured
+cases going forward). Whether wgpu/RT64 SHOULD honor BI_LERP_0 (and currently
+mask a real behavior) is a separate question worth raising with the RT64/wgpu
+owners.
 
-**Verdict pending** a Codex empirical run (its first pass was sandbox-blocked
-from a writable workspace; relaunched pointing at
-`/Users/jer/Code/angrylion-oracle/scratch/`). Two live hypotheses:
-1. Harness: the oracle's `--rdram` DP/config setup subtly mis-drives the RGBA16
-   fetch for this image — a fix in `oracle.c`, external to fn64.
-2. Genuine angrylion RGBA16-fetch behaviour that wgpu AND RT64 both diverge
-   from — which would make these 7+ cases real shared ported-from-RT64 defects,
-   a high-value find.
-
-Because wgpu==RT64==hand-key (three implementations agree) on all of them, and
-the source bytes are proven equivalent, I will NOT report these as fn64 defects
-until the fetch path is instrumented and a reproduction reads all 8 texels.
-
-## Step 2 — generator and first batch (24 cases)
+## Step 2 — generator and first batch (25 cases)
 
 `FN64_GENERATE=1` emits synthetic streams (built from the same wire encoders
 the hand corpus uses; never captured from a ROM) and three-way compares wgpu
-and RT64 against angrylion. Priority order per the brief.
+and RT64 against angrylion. Priority order per the brief. The textured cases
+carry the BI_LERP_0 correction from the root cause above; one uncorrected
+witness is kept to keep the finding reproducible.
 
-### Triage counts
+### Triage counts (final, after the BI_LERP_0 fix)
 
 | classification | count |
 |---|---|
-| pass-all-match-hardware | 16 |
-| shared-ported-bug (RGBA16 root cause) | 7 |
-| wgpu-refused (TexRectFlip) | 1 |
+| pass-all-match-hardware | 23 |
+| wgpu-refused (TexRectFlip — confirmed fn64 defect) | 1 |
+| shared-ported-bug (intentional bilerp-gap witness) | 1 |
 
-### Per-case
+Before the fix the counts were 16 pass / 7 shared-ported-bug / 1 wgpu-refused;
+the 7 were all RGBA16-texture cases and all resolved to the single BI_LERP_0
+root cause.
 
-| case | pri | classification | wgpu vs ang | rt64 vs ang |
-|---|---|---|---|---|
-| gen-loadblock-linear | 1 | shared-ported-bug* | 5 px | 5 px |
-| gen-loadblock-dxt | 1 | shared-ported-bug* | 13 px | 13 px |
-| gen-triangle-opcode-0x08 (flat) | 2 | pass ✓ | 0 | 0 |
-| gen-triangle-opcode-0x09 (flat+zbuf) | 2 | pass ✓ | 0 | 0 |
-| gen-triangle-opcode-0x0a (tex) | 2 | shared-ported-bug* | 12 px | 12 px |
-| gen-triangle-opcode-0x0b (tex+zbuf) | 2 | shared-ported-bug* | 12 px | 12 px |
-| gen-triangle-opcode-0x0c (shade) | 2 | pass ✓ | 0 | 0 |
-| gen-triangle-opcode-0x0d (shade+zbuf) | 2 | pass ✓ | 0 | 0 |
-| gen-triangle-opcode-0x0e (shade+tex) | 2 | shared-ported-bug* | 12 px | 12 px |
-| gen-triangle-opcode-0x0f (shade+tex+zbuf) | 2 | shared-ported-bug* | 12 px | 12 px |
-| gen-textured-triangle | 2 | shared-ported-bug* | 12 px | 12 px |
-| gen-sync-loadsync-in-fill | 3 | pass ✓ | 0 | 0 |
-| gen-sync-pipesync-in-fill | 3 | pass ✓ | 0 | 0 |
-| gen-sync-tilesync-in-fill | 3 | pass ✓ | 0 | 0 |
-| gen-texrect-flip | 4 | wgpu-refused | — | 13 px* |
-| gen-fill-{red,green,blue,white}-fullwidth-band | 5 | pass ✓ (x4) | 0 | 0 |
-| gen-fill-single-pixel | 5 | pass ✓ | 0 | 0 |
-| gen-fill-last-pixel | 5 | pass ✓ | 0 | 0 |
-| gen-modematrix-cycle-{fill,one,two}-red-box | 5 | pass ✓ (x3) | 0 | 0 |
+### Non-passing cases (final)
 
-`*` = confounded by the RGBA16 texture-source root cause; not an independent
-defect until that is resolved.
+| case | pri | classification | note |
+|---|---|---|---|
+| gen-texrect-flip | 4 | wgpu-refused | wgpu declines TexRectFlip (`execute_raw_dpc refused ... no journal write access`); RT64 and angrylion both render it and AGREE (0 px diff). A real fn64 wgpu gap. |
+| gen-loadblock-linear-missing-bilerp | 1 | shared-ported-bug | INTENTIONAL witness: the same LoadBlock WITHOUT BI_LERP_0. wgpu==RT64 (5 px) vs angrylion — reproduces the bilerp gap as a live row. |
+
+All other 23 cases (triangle opcode family 0x08-0x0f including the textured and
+zbuffered variants, PipeSync/TileSync/LoadSync, cycle-type mode matrix, fill
+rasteriser boundaries, LoadBlock linear + DxT, textured triangle) are
+pass-all-match-hardware.
 
 ### Clean wins (proved by the generator)
 
@@ -155,6 +142,8 @@ defect until that is resolved.
 - **Cycle-type mode matrix** (fill / 1-cycle / 2-cycle) all match hardware.
 - **Fill rasteriser boundaries** (full-width bands in 4 colours, single pixel,
   last pixel) all match hardware.
+- **LoadBlock (linear + DxT) and textured triangles** match hardware once
+  BI_LERP_0 is set — confirming both the fetch path and the root-cause fix.
 
 ### Generator construction defects found and fixed
 
@@ -168,28 +157,43 @@ exclusive `lrx=WIDTH`, which every backend correctly refused as
 
 ### fn64 (wgpu) defects — ranked
 
-1. **(pending) RGBA16/CI/RGBA32 texture sampling vs bit-accurate hardware** —
-   the largest signal in both corpora. HELD: wgpu==RT64==hand-key on all of
-   them, so the likely cause is the oracle-harness 16bpp texture-source path,
-   not fn64. Will be reclassified once the TMEM load path is traced.
-2. **TexRectFlip (0x25) refused by wgpu** — `execute_raw_dpc refused: ...
-   declared no journal write access`. wgpu declines TexRectFlip outright
-   (matches the hand corpus's `textured-rect-flip-point-sampled`, also
-   refused). A real fn64 wgpu limitation, independent of the RGBA16 issue.
+1. **TexRectFlip (0x25) refused by wgpu — CONFIRMED.**
+   `execute_raw_dpc refused: ... texture-rectangle triangle declared no journal
+   write access`. wgpu declines TexRectFlip outright, while RT64 AND angrylion
+   both render it and agree pixel-for-pixel (0 px diff, with BI_LERP_0 set).
+   This is the one clean, isolated fn64 rendering gap in the batch. It also
+   matches the hand corpus's refused `textured-rect-flip-point-sampled`.
+
+### Corpus / fixture findings (surfaced by the angrylion leg) — ranked
+
+1. **Textured `SetOtherModes` omits `BI_LERP_0` (bit 11) — corpus-wide.**
+   Every textured hand case and the textured generator builders use
+   `OTHER_MODES_ONE_CYCLE_TEXTURED = 0xef0000f0`, which leaves bit 11 clear.
+   Bit-accurate hardware then routes RGBA/CI/RGBA32 texels through the
+   colour-convert unit and collapses them to the blue channel; wgpu and RT64
+   both ignore the bit and pass full colour, so they match each other and the
+   hand key but diverge from hardware. Proven and fixed in the generator
+   (`set_bilerp0`). The hand cases are left unmodified per the brief, but their
+   keys are hardware-incorrect on this bit. **Open question worth raising with
+   the RT64/wgpu owners:** should wgpu and RT64 honour BI_LERP_0 (they currently
+   mask a real hardware behaviour)? If yes, this becomes a shared wgpu+RT64
+   defect; if the intended real-ROM streams always set the bit, it is purely a
+   fixture gap.
 
 ### RT64 HLE defects — ranked
 
-None confirmed independent of the RGBA16 root cause in this batch. The
-`gen-texrect-flip` RT64 divergence and the seven shared-ported-bug RT64
-divergences all read angrylion's `0x0001` broken texel, so they cannot be
-attributed to RT64 until the texture-source path is resolved.
+None confirmed in this batch. With BI_LERP_0 set, RT64 agrees with angrylion on
+every renderable case, including TexRectFlip (which wgpu refuses).
 
 ## What's next (expansion)
 
-1. **Resolve the RGBA16 texture-source root cause** (Codex investigating). Once
-   fixed, RE-RUN the batch: the 7 shared-ported-bug cases will either flip to
-   pass (harness bug) or become confirmed shared defects (angrylion exposes a
-   real wgpu+RT64 divergence) — a high-value outcome either way.
+1. **DONE — RGBA16 root cause resolved (BI_LERP_0).** The 7 cases flipped to
+   pass with the mode bit set. Follow-up: decide with the RT64/wgpu owners
+   whether wgpu+RT64 should honour BI_LERP_0 (they currently mask the hardware
+   collapse); if they should, add a corpus row asserting the collapse and file
+   it as a shared wgpu+RT64 defect.
+2. **Investigate the TexRectFlip wgpu refusal** — RT64 and angrylion render it
+   and agree, so wgpu is the outlier. Confirmed fn64 gap; scope a fix.
 2. Expand priority (1): LOADBLOCK DxT stride variants, larger blocks, multi-row.
 3. Expand priority (4): SetPrimDepth (0x2e) Z values, SetBlendColor (0x39)
    blend-color paths, TexRectFlip once wgpu support is assessed.
