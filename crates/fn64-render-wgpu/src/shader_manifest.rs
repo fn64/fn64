@@ -102,6 +102,9 @@ pub const THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS: [&str; 0] = [];
 pub const COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL: &str =
     include_str!("shaders/compute_raster_rgba16_round_trip.wgsl");
 pub const COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT: &str = "round_trip_rgba16";
+pub const COMPUTE_TRIANGLE_COVERAGE_WGSL: &str =
+    include_str!("shaders/compute_triangle_coverage.wgsl");
+pub const COMPUTE_TRIANGLE_COVERAGE_ENTRY_POINT: &str = "compute_triangle_coverage";
 
 pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
     "src-shaders-rasterpsdynamic",
