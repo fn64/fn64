@@ -1493,28 +1493,6 @@ pub struct ComputeRasterSample {
     pub plane_values: Option<[i64; 7]>,
 }
 
-pub(crate) struct ComputeHotColorObservation {
-    bytes: Vec<u8>,
-    trace_words: Vec<u32>,
-}
-
-impl ComputeHotColorObservation {
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub(crate) fn trace_at(&self, pixel: usize) -> [u32; 4] {
-        let start = pixel * 4;
-        self.trace_words[start..start + 4]
-            .try_into()
-            .expect("one compute trace contains four words per pixel")
-    }
-}
-
 impl ComputeCoverageTriangle {
     pub fn from_raw(triangle: crate::RawTriangle) -> Self {
         let mut result = Self {
@@ -1896,18 +1874,6 @@ impl TrianglePipelineRenderer {
         tmem: &TmemGpuProjection,
         tile: TileBindingParams,
     ) -> Result<Vec<u8>, TrianglePipelineError> {
-        self.compute_triangle_hot_color_observed(extent, resident_bytes, triangles, tmem, tile)
-            .map(ComputeHotColorObservation::into_bytes)
-    }
-
-    pub(crate) fn compute_triangle_hot_color_observed(
-        &mut self,
-        extent: TriangleTargetExtent,
-        resident_bytes: &[u8],
-        triangles: &[ComputeCoverageTriangle],
-        tmem: &TmemGpuProjection,
-        tile: TileBindingParams,
-    ) -> Result<ComputeHotColorObservation, TrianglePipelineError> {
         validate_triangle_extent(extent)?;
         if triangles.is_empty() {
             return Err(TrianglePipelineError::EmptyCoverageBatch);
@@ -1931,7 +1897,6 @@ impl TrianglePipelineRenderer {
         let triangle_bytes = u64::from(triangle_count) * 160;
         let target_bytes = u64::from(pixels.div_ceil(2)) * 4;
         let status_bytes = u64::from(pixels) * 4;
-        let trace_bytes = u64::from(pixels) * 16;
         let workgroups = pixels.div_ceil(2).div_ceil(64);
         let limits = self.device.limits();
         if workgroups > limits.max_compute_workgroups_per_dimension
@@ -1941,8 +1906,6 @@ impl TrianglePipelineRenderer {
             || target_bytes > u64::from(limits.max_storage_buffer_binding_size)
             || status_bytes > limits.max_buffer_size
             || status_bytes > u64::from(limits.max_storage_buffer_binding_size)
-            || trace_bytes > limits.max_buffer_size
-            || trace_bytes > u64::from(limits.max_storage_buffer_binding_size)
         {
             return Err(TrianglePipelineError::CoverageTooLarge);
         }
@@ -1986,11 +1949,6 @@ impl TrianglePipelineRenderer {
             status_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
-        let trace_buffer = create(
-            "fn64-compute-hot-color-trace",
-            trace_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
         let tmem_bytes = create(
             "fn64-compute-hot-color-tmem",
             TMEM_BYTE_WORDS as u64 * 4,
@@ -2014,11 +1972,6 @@ impl TrianglePipelineRenderer {
         let status_readback = create(
             "fn64-compute-hot-color-status-readback",
             status_bytes,
-            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        );
-        let trace_readback = create(
-            "fn64-compute-hot-color-trace-readback",
-            trace_bytes,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         );
         self.queue
@@ -2072,10 +2025,6 @@ impl TrianglePipelineRenderer {
                     binding: 4,
                     resource: status_buffer.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: trace_buffer.as_entire_binding(),
-                },
             ],
         });
         let mut encoder = self
@@ -2095,7 +2044,6 @@ impl TrianglePipelineRenderer {
         }
         encoder.copy_buffer_to_buffer(&target_buffer, 0, &target_readback, 0, target_bytes);
         encoder.copy_buffer_to_buffer(&status_buffer, 0, &status_readback, 0, status_bytes);
-        encoder.copy_buffer_to_buffer(&trace_buffer, 0, &trace_readback, 0, trace_bytes);
         let submission = self.queue.submit([encoder.finish()]);
         self.device
             .poll(wgpu::PollType::Wait {
@@ -2114,11 +2062,7 @@ impl TrianglePipelineRenderer {
         }
         let mut bytes = map_and_read(&self.device, &target_readback)?;
         bytes.truncate(expected_bytes);
-        let trace_words = map_and_read(&self.device, &trace_readback)?
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four trace bytes")))
-            .collect();
-        Ok(ComputeHotColorObservation { bytes, trace_words })
+        Ok(bytes)
     }
 
     /// Submits one fixed-fixture triangle draw (`draw(0..3, 0..1)`) into a
