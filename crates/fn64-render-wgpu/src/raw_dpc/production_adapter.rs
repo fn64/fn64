@@ -1100,8 +1100,8 @@ pub fn push_decoded_raw_dpc(
                 // access-for-access check exists to catch.
                 //
                 // An empty slice means this texrect declared no destination
-                // write (no staged `SetColorImage`, unsupported format,
-                // fractional/reversed rectangle, or flip -- see
+                // write (no staged `SetColorImage`, unsupported format, or
+                // fractional/reversed rectangle -- see
                 // `plan_texture_rectangle`). That is `None`, not a
                 // zero-count span: "declared nothing" and "declared zero
                 // accesses" must not be the same value.
