@@ -2699,7 +2699,33 @@ pub(super) fn blend_and_write_pixel(
     if !alpha_compare_texrect_fragment(stages, combined[3])? {
         return Ok(());
     }
-    if state.other_mode.clear_on_coverage() && !coverage.wraps {
+    // `CLR_ON_CVG` (color-on-coverage) gates the color write on the coverage
+    // *carry-out*, not on `coverage.wraps`. The two differ only when
+    // `IM_RD` is clear. With `IM_RD` set, no memory coverage is read and
+    // angrylion's `prewrap = (curpixel_memcvg + curpixel_cvg) & 8`
+    // (`angrylion-rdp-plus src/core/n64video/rdp/zbuffer.c` `z_compare`)
+    // carries out exactly when `coverage.wraps`
+    // (`image_read_enabled && pixel + memory > 8`) does for the full-pixel
+    // fragments this executor produces -- so that path is preserved
+    // verbatim, including the `gen-coverage-*-combined`/`force-blend`
+    // shared-ported-bug rows that must stay as-is.
+    //
+    // With `IM_RD` clear, angrylion's no-read `fbread` returns
+    // `memcvg = 0`, so `prewrap = curpixel_cvg & 8`: a FULL-coverage
+    // fragment (`pixel = 8`) carries out and IS written under `CLR_ON_CVG`.
+    // The reference's `wraps` short-circuits to `false` here (its
+    // `image_read_enabled &&` guard), which wrongly DROPPED the write --
+    // the `gen-coverage-color-on-cvg-one-cycle` defect (12/12 pixels left
+    // STALE, vs angrylion + RT64 both writing). `color_on_cvg` never gates
+    // the color write itself in `blender_1cycle`; it only selects the
+    // color source (`!color_on_cvg || prewrap`), and the write is gated by
+    // the coverage bit alone, which a full-coverage fragment always sets.
+    let coverage_carry = if state.other_mode.image_read_enabled() {
+        coverage.wraps
+    } else {
+        pixel_coverage.count() & 8 != 0
+    };
+    if state.other_mode.clear_on_coverage() && !coverage_carry {
         return Ok(());
     }
 
@@ -5735,6 +5761,53 @@ mod fragment_stage_tests {
         )
         .unwrap();
         assert_eq!(u16::from_be_bytes(stored), 0x0001);
+    }
+
+    /// `CLR_ON_CVG` + `CVG_DST_WRAP` with `IM_RD`/`AA_EN`/`FORCE_BL` clear:
+    /// a FULL-coverage fragment MUST be written, matching angrylion + RT64
+    /// (the `gen-coverage-color-on-cvg-one-cycle` parity case). This pins the
+    /// write decision against the pre-fix `!coverage.wraps` gate, which
+    /// short-circuited `wraps` to `false` on clear `IM_RD` and dropped the
+    /// write -- reverting to that gate re-drops this pixel and fails here.
+    ///
+    /// The hardware rule (angrylion `blender_1cycle`): `color_on_cvg` never
+    /// gates the color write itself; the write is gated by the coverage
+    /// carry-out (`prewrap = (memcvg + cvg) & 8`, `memcvg = 0` with no
+    /// `IM_RD` read), which a full-coverage fragment (`cvg = 8`) always sets.
+    #[test]
+    fn clr_on_cvg_with_wrap_writes_a_full_coverage_fragment_without_image_read() {
+        // Only CLR_ON_CVG (bit 7) + CVG_DST_WRAP (bits 9:8 == 1): no IM_RD,
+        // no AA_EN, no FORCE_BL, no alpha compare, no coverage-alpha bits.
+        let low = 0x080 | 0x100;
+        let m = mode(0, low);
+        assert!(m.clear_on_coverage(), "CLR_ON_CVG must be set");
+        assert_eq!(m.coverage_destination(), CoverageDestination::Wrap);
+        assert!(!m.image_read_enabled(), "IM_RD must be clear for this case");
+        assert!(!m.antialias_enabled(), "AA_EN must be clear for this case");
+        assert!(!m.force_blend(), "FORCE_BL must be clear for this case");
+
+        let stages = TexrectFragmentStages::try_new(m, Color4::from_wire(0)).unwrap();
+        let blend_state =
+            TexrectBlendRegisters::new(Color4::from_wire(0), Color4::from_wire(0)).mode_state(m);
+
+        // Seed STALE (0xffff); a distinct opaque combined color must land.
+        let mut stored = 0xffffu16.to_be_bytes();
+        blend_and_write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut stored,
+            [0x20, 0x40, 0x60, 0xff],
+            blend_state,
+            stages,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            u16::from_be_bytes(stored),
+            0xffff,
+            "CLR_ON_CVG + CVG_DST_WRAP must WRITE a full-coverage fragment \
+             (angrylion + RT64 both do); the pixel stayed STALE"
+        );
     }
 
     /// Every mode this card refuses, refused by name and distinguishable
