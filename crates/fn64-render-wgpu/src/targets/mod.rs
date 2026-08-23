@@ -45,9 +45,9 @@ pub use texrect::{
 };
 pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
 pub use triangle_pipeline::{
-    fixed_fixture_other_mode, ComputeCoverageTriangle, InFlightTriangleDraw, RasterVertex,
-    TriangleDrawOutput, TriangleFixture, TrianglePipelineDeviceOutcome, TrianglePipelineError,
-    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    fixed_fixture_other_mode, ComputeCoverageTriangle, ComputeRasterSample, InFlightTriangleDraw,
+    RasterVertex, TriangleDrawOutput, TriangleFixture, TrianglePipelineDeviceOutcome,
+    TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_INVALID_BYTE,
     TMEM_SAMPLE_STATUS_NO_TILE_BINDING, TMEM_SAMPLE_STATUS_OK, TMEM_SAMPLE_STATUS_REVERSED_EXTENT,
     TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT,
