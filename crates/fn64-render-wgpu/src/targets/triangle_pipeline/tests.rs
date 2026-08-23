@@ -328,6 +328,19 @@ fn combined_fragment_wgsl_parses_and_validates_under_closed_naga_profile() {
 }
 
 #[test]
+fn compute_raster_rgba16_round_trip_wgsl_parses_and_validates() {
+    let module =
+        naga::front::wgsl::parse_str(crate::shader_manifest::COMPUTE_RASTER_RGBA16_ROUND_TRIP_WGSL)
+            .unwrap();
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
 fn combined_fragment_wgsl_reuses_color_combiner_wgsl_byte_for_byte() {
     let source = crate::shader_manifest::triangle_pipeline_fragment_wgsl();
     assert!(source.starts_with(crate::combiner::COLOR_COMBINER_WGSL));
@@ -1918,6 +1931,30 @@ mod host_gpu_tests {
                 "required host GPU evidence unavailable: typed no-adapter for {:?}",
                 no_adapter.requested()
             ),
+        }
+    }
+
+    #[test]
+    fn required_host_compute_raster_rgba16_round_trip_is_byte_exact() {
+        let mut renderer = tlut_renderer();
+        for extent in [
+            TriangleTargetExtent {
+                width: 5,
+                height: 3,
+            },
+            TriangleTargetExtent {
+                width: 320,
+                height: 240,
+            },
+        ] {
+            let byte_count = extent.width as usize * extent.height as usize * 2;
+            let resident_bytes: Vec<u8> = (0..byte_count)
+                .map(|index| (index as u8).wrapping_mul(73).wrapping_add(19))
+                .collect();
+            let output = renderer
+                .round_trip_compute_raster_rgba16(extent, &resident_bytes)
+                .expect("dynamic packed-RGBA16 target must round-trip");
+            assert_eq!(output, resident_bytes, "extent {extent:?}");
         }
     }
 
