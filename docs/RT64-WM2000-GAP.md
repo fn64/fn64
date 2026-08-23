@@ -439,3 +439,24 @@ Two things should be flagged rather than glossed:
   the genre and from the reference backend's own `RenderOp` set. The census
   remains UNKNOWN until §5's prerequisites land, and any scoping decision that
   needs a count should wait for it rather than quote this document.
+
+## 7. 2026-08-23 performance-gap receipt
+
+The production-session capture and offline wgpu replay added after the older
+scope analysis above now provide WM2000 measurements. A selected recurring
+graphics burst consists of 13 raw-DPC submissions. Replaying the captured
+prefix to restore durable renderer state and then repeating that 13-packet
+suffix produced byte-stable committed output over 30 timed iterations and a
+14.132 ms mean lifecycle cost. Execute owns 7.939 ms; plan, declared guest
+reads, and copyback together own another 4.688 ms. The remaining lifecycle
+phases are small individually.
+
+Against the retained live p95 of approximately 38.8 ms, the certification
+threshold of 25 ms leaves a 13.8 ms p95 gap, not merely the 5.5 ms needed to
+avoid missing a 30 Hz deadline. Moving the exact CPU raster work represented
+by the 7.9 ms replay execute phase to one compute batch is therefore the first
+required optimization. It must be followed by submission batching and
+resident-target coherency work that removes repeated planning, full target
+seed reads, hashing, and copyback; those costs are now measured extension
+headroom, not speculative cleanup. The linked-shell ten-run gate remains the
+authority for closing the gap.
