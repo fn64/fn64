@@ -1305,15 +1305,33 @@ fn textured_triangle_words(
 /// Their union is the closed rectangle and their interiors are disjoint, so
 /// the pair covers every pixel of the box exactly once.
 fn textured_triangle_pair() -> Vec<(u32, u32)> {
+    textured_triangle_pair_of_width(TRI_RIGHT - TRI_LEFT)
+}
+
+/// Generalization of [`textured_triangle_pair`] to an arbitrary texel
+/// `width`, still anchored at `TRI_LEFT`/`TRI_TOP`/`TRI_BOTTOM` so every
+/// existing case that calls the fixed-width wrapper is unchanged.
+///
+/// **Why this exists.** [`textured_triangle_pair`]'s box is hardcoded to
+/// `[TRI_LEFT, TRI_RIGHT)`, four texels wide. A texture source staged with
+/// FEWER texels than that (RGBA32's two, CI4/CI8's eight-INDEX-but-narrower-
+/// after-redescribe strips) samples past its own staged data when drawn
+/// through the fixed-width pair -- the S plane keeps advancing one texel per
+/// pixel of X regardless of how many texels the tile actually holds, so
+/// pixels beyond the real width silently wrap/clamp onto a neighboring texel
+/// instead of failing loudly. Parameterizing the box width to the source's
+/// own texel count is what closes that gap.
+fn textured_triangle_pair_of_width(width: u32) -> Vec<(u32, u32)> {
+    let right = TRI_LEFT + width;
     // Each half's `base` is the S at its OWN H edge, per the vertex rule in
     // `textured_triangle_words`: the lower-left half's H edge is the left
     // side, the upper-right half's is the right side.
     let left_s = PLANE_HALF_TEXEL - PLANE_PER_TEXEL / 8;
-    let right_s = left_s + PLANE_PER_TEXEL * (TRI_RIGHT - TRI_LEFT) as i32;
+    let right_s = left_s + PLANE_PER_TEXEL * width as i32;
     let mut words =
-        textured_triangle_words(TRI_LEFT, TRI_RIGHT, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM, left_s);
+        textured_triangle_words(TRI_LEFT, right, TRI_TOP, TRI_BOTTOM, TRI_BOTTOM, left_s);
     words.extend(textured_triangle_words(
-        TRI_RIGHT, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP, right_s,
+        right, TRI_LEFT, TRI_TOP, TRI_BOTTOM, TRI_TOP, right_s,
     ));
     words
 }
@@ -3648,15 +3666,20 @@ fn rgba32_textured_triangle(bilerp: bool) -> Vec<(u32, u32)> {
         (0xf500_0000 | (3 << 19) | (1 << 9), 0),
         set_tile_size(width, 1),
     ]);
-    words.extend(textured_triangle_pair());
+    words.extend(textured_triangle_pair_of_width(width));
     words.push((0xe900_0000, 0));
     words
 }
 
 /// CI4+16-entry TLUT as a textured-triangle source, mirroring
-/// [`one_ci4_rect`]'s staging exactly; only the final draw differs.
+/// [`one_ci4_rect`]'s staging exactly; only the final draw differs. Sampled
+/// at the FULL `CI_INDICES` width (not the fixed 4-texel `TRI_LEFT..
+/// TRI_RIGHT` box): a narrower box would advance the S plane past its own
+/// staged indices and silently clamp/wrap onto a neighbor instead of
+/// reading what was actually loaded.
 fn ci4_textured_triangle() -> Vec<(u32, u32)> {
     let entries = PALETTE.len() as u32;
+    let width = CI_INDICES.len() as u32;
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
     words.pop();
     words.extend([
@@ -3679,18 +3702,21 @@ fn ci4_textured_triangle() -> Vec<(u32, u32)> {
         load_tile(CI_LOAD_TEXELS, 1),
         (0xe600_0000, 0),
         (0xf500_0000 | (2 << 21) | (0 << 19) | (1 << 9), 0),
-        set_tile_size(TRI_RIGHT - TRI_LEFT, 1),
+        set_tile_size(width, 1),
     ]);
-    words.extend(textured_triangle_pair());
+    words.extend(textured_triangle_pair_of_width(width));
     words.push((0xe900_0000, 0));
     words
 }
 
 /// CI8+256-entry TLUT as a textured-triangle source, mirroring
-/// [`one_ci8_rect`]'s staging exactly; only the final draw differs.
+/// [`one_ci8_rect`]'s staging exactly; only the final draw differs. Sampled
+/// at the FULL `CI8_INDICES` width for the same reason as
+/// [`ci4_textured_triangle`].
 fn ci8_textured_triangle() -> Vec<(u32, u32)> {
     let entries = 256u32;
     let load_texels_16b = CI8_INDICES.len() as u32 / 2;
+    let width = CI8_INDICES.len() as u32;
     let mut words = one_fill(STALE, 0, 0, WIDTH - 1, HEIGHT - 1);
     words.pop();
     words.extend([
@@ -3713,9 +3739,9 @@ fn ci8_textured_triangle() -> Vec<(u32, u32)> {
         load_tile(load_texels_16b, 1),
         (0xe600_0000, 0),
         (0xf500_0000 | (2 << 21) | (1 << 19) | (1 << 9), 0),
-        set_tile_size(TRI_RIGHT - TRI_LEFT, 1),
+        set_tile_size(width, 1),
     ]);
-    words.extend(textured_triangle_pair());
+    words.extend(textured_triangle_pair_of_width(width));
     words.push((0xe900_0000, 0));
     words
 }
