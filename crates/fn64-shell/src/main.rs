@@ -7,7 +7,9 @@
 //!
 //! 1. **Presents** the game's live VI framebuffer (rdram, RGBA5551 320x240 --
 //!    see `framebuffer.rs`) to a resizable `winit` window every VI swap, via
-//!    the `pixels` (wgpu) pixel-buffer presenter with correct aspect.
+//!    the `pixels` (wgpu) pixel-buffer presenter with correct aspect. A live
+//!    `osViBlack` request or VI pixel type zero presents opaque black without
+//!    reading the framebuffer, matching the renderer scanout path.
 //! 2. **Feeds live keyboard input** to the game: each frame the current
 //!    `PadState` (see `input_map.rs`) is pushed through
 //!    `fn64_abi::set_controller_state(0, ..)` so the game's next
@@ -806,7 +808,8 @@ mod game {
                 return;
             };
 
-            let blank = framebuffer::is_uniform(region);
+            let vi_blanked = fn64_abi::vi_blanked();
+            let blank = vi_blanked || framebuffer::is_uniform(region);
             // Real framebuffer line stride (VI_WIDTH); default to the presented
             // width before the first osViSetMode. Prevents non-320-wide modes
             // from presenting sheared/offset.
@@ -831,14 +834,18 @@ mod game {
                     );
                 }
             }
-            framebuffer::rgba5551_to_rgba8888(
-                fn64_runtime::RdramView::from_storage(&self.rdram),
-                fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
-                src_stride,
-                self.fb_width,
-                self.fb_height,
-                &mut self.rgba,
-            );
+            if vi_blanked {
+                framebuffer::fill_opaque_black(&mut self.rgba);
+            } else {
+                framebuffer::rgba5551_to_rgba8888(
+                    fn64_runtime::RdramView::from_storage(&self.rdram),
+                    fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
+                    src_stride,
+                    self.fb_width,
+                    self.fb_height,
+                    &mut self.rgba,
+                );
+            }
             // `rgba` now holds a real frame, so F2 may encode it. Set here and
             // not after `render()`: the bytes are what a screenshot wants, and
             // a failed present does not make them fabricated.

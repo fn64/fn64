@@ -233,6 +233,20 @@ pub fn scanout_vi_framebuffer() -> Option<u32> {
     with_host(|host| host.device_fabric.vi_origin())
 }
 
+/// Read the live VI status/control register used by host-side presenters.
+pub fn vi_status() -> u32 {
+    crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0000)
+        .expect("VI_STATUS register is not mapped")
+}
+
+/// Whether the live VI must present black instead of reading framebuffer bytes.
+///
+/// This mirrors the renderer scanout admission rule: either the latched
+/// `osViBlack` state or VI pixel type zero blanks the output.
+pub fn vi_blanked() -> bool {
+    with_executor(|exec| exec.vi().blanked) || vi_status() & 3 == 0
+}
+
 /// The total number of `osViSwapBuffer` calls observed so far -- see
 /// `current_vi_framebuffer`'s doc comment for why this crate exposes a
 /// plain function rather than requiring the harness to reach into
@@ -806,6 +820,13 @@ mod tests {
         let mut ctx = ctx_zeroed();
         unsafe { osViGetStatus_recomp(std::ptr::null_mut(), &mut ctx) };
         assert_eq!(ctx.r2, 1 << 6);
+        assert_eq!(vi_status(), 1 << 6);
+        assert!(vi_blanked(), "pixel type zero must blank host presentation");
+        assert!(crate::pi::write_live_device_mmio(
+            0xFFFF_FFFF_A440_0000,
+            (1 << 6) | 2
+        ));
+        assert!(!vi_blanked(), "RGBA16 must remain eligible for presentation");
         unsafe { osViGetCurrentField_recomp(std::ptr::null_mut(), &mut ctx) };
         assert_eq!(ctx.r2, 0);
         unsafe { osViGetCurrentLine_recomp(std::ptr::null_mut(), &mut ctx) };
@@ -966,6 +987,7 @@ mod tests {
         crate::advance_virtual_time(base + 10);
         assert_eq!(presents.load(Ordering::SeqCst), 1);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 0);
+        assert!(!vi_blanked());
         let scanout = last_scanout.lock().unwrap().unwrap();
         let registers = scanout.registers().unwrap();
         assert_eq!(
@@ -1006,12 +1028,14 @@ mod tests {
         crate::advance_virtual_time(base + 20);
         assert_eq!(presents.load(Ordering::SeqCst), 2);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 1);
+        assert!(vi_blanked());
 
         ctx.r4 = 0;
         unsafe { osViBlack_recomp(std::ptr::null_mut(), &mut ctx) };
         crate::advance_virtual_time(base + 30);
         assert_eq!(presents.load(Ordering::SeqCst), 3);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 0);
+        assert!(!vi_blanked());
 
         ctx.r4 = 1;
         ctx.r5 = 0x0200;
