@@ -226,11 +226,19 @@ impl ApplicationHandler for Demo {
                 let render_result = if self.overlay.open {
                     let window = self.window.as_ref().expect("window exists with pixels");
                     let size = window.inner_size();
+                    // Throwaway, non-persisting: the demo must not write the
+                    // user's real video.toml (same reason its InputConfig has
+                    // persist=false).
+                    let mut video = crate::video_config::VideoConfig {
+                        persist: false,
+                        ..crate::video_config::VideoConfig::default()
+                    };
                     self.overlay.render_over(
                         self.pixels.as_ref().expect("checked above"),
                         (size.width.max(1), size.height.max(1)),
                         window.scale_factor() as f32,
                         &mut self.config,
+                        &mut video,
                         &self.gamepads,
                         // The demo drives a synthetic field with no render
                         // backend and no pump, so it has no stack to report

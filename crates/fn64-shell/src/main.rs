@@ -88,6 +88,7 @@ mod screenshot;
 mod stack;
 #[allow(dead_code)]
 mod timing;
+mod video_config;
 
 #[cfg(not(fn64_game_linked))]
 fn main() {
@@ -257,6 +258,9 @@ mod game {
         /// User bindings + deadzone, loaded from ~/.config/fn64/input.toml
         /// and edited live by the settings overlay.
         config: InputConfig,
+        /// Display settings (overscan crop, zoom-fill), loaded from
+        /// ~/.config/fn64/video.toml and edited live by the Video tab.
+        video: crate::video_config::VideoConfig,
         gamepads: Gamepads,
         overlay: Overlay,
         last_swap_count: u64,
@@ -607,6 +611,7 @@ mod game {
                 rdram,
                 pad: PadState::new(),
                 config: InputConfig::load(),
+                video: crate::video_config::VideoConfig::load(),
                 gamepads: Gamepads::new(),
                 overlay: {
                     let mut overlay = Overlay::new();
@@ -814,11 +819,20 @@ mod game {
             // width before the first osViSetMode. Prevents non-320-wide modes
             // from presenting sheared/offset.
             let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
-            // Size the surface + scratch to the real framebuffer width so the
-            // WHOLE line is presented (WM2000 is 480 wide), not cropped to 320.
-            // Resize only on change -- pixels' buffer resize reallocates GPU
-            // storage. wgpu caps texture dimensions; clamp defensively.
-            let target_width = src_stride.clamp(1, 4096);
+            // Crop the overscan columns the player configured (Video tab /
+            // FN64_OVERSCAN). This is a display POLICY, not a geometry-derived
+            // width: WM2000's rightmost column IS genuinely scanned by the VI,
+            // it just holds stale RDRAM the guest never fills, which a real TV
+            // hides behind overscan. `overscan=0` presents the raw full
+            // scanout; the default (1) drops exactly that uncovered column.
+            // Guest RDRAM and the line stride are untouched -- only fewer
+            // columns are read into the surface. Never crop below 1 column.
+            let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
+            let visible_width = src_stride - overscan;
+            // Size the surface + scratch to the presented width. Resize only on
+            // change -- pixels' buffer resize reallocates GPU storage. wgpu
+            // caps texture dimensions; clamp defensively.
+            let target_width = visible_width.clamp(1, 4096);
             if target_width != self.fb_width || target_height != self.fb_height {
                 if pixels
                     .resize_buffer(target_width as u32, target_height as u32)
@@ -829,8 +843,8 @@ mod game {
                     self.rgba = vec![0u8; target_width * target_height * 4];
                     println!(
                         "[fn64-shell] resized present surface to {target_width}x{target_height} \
-                         (game VI_WIDTH x VI active output lines); window shows exactly the \
-                         scanned-out rectangle."
+                         (stride {src_stride} minus {overscan} overscan col(s) x active output \
+                         lines); window shows the scanned-out rectangle less cropped overscan."
                     );
                 }
             }
@@ -916,6 +930,7 @@ mod game {
                     (size.width.max(1), size.height.max(1)),
                     window.scale_factor() as f32,
                     &mut self.config,
+                    &mut self.video,
                     &self.gamepads,
                     hud.as_ref(),
                 )
@@ -1213,6 +1228,23 @@ mod game {
                     }
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = event.state == ElementState::Pressed;
+                        // While the settings panel is OPEN, F1/F2/F3 select
+                        // the Input/Video/Audio tabs (the panel shows the
+                        // affordance). They keep their global meanings only
+                        // when the panel is closed, below. Esc / the Done
+                        // button close the panel.
+                        if self.overlay.open && pressed {
+                            let tab = match code {
+                                KeyCode::F1 => Some(crate::overlay::Tab::Input),
+                                KeyCode::F2 => Some(crate::overlay::Tab::Video),
+                                KeyCode::F3 => Some(crate::overlay::Tab::Audio),
+                                _ => None,
+                            };
+                            if let Some(tab) = tab {
+                                self.overlay.select_tab(tab);
+                                return;
+                            }
+                        }
                         // Shell chords, never game input: F1 settings,
                         // F2 screenshot, F11 fullscreen. Checked ahead of
                         // `pad.apply` like the others, so a chord stays a
