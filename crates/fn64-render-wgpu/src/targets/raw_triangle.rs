@@ -26,6 +26,14 @@
 //! A/B lane; absent selects parallelism, and every other value traps rather
 //! than silently changing the lane.
 //!
+//! # Draw census
+//!
+//! `FN64_DRAW_CENSUS=1` times the raster call and aggregates successful draws
+//! by complete resolved combiner/other-mode state and structural flags. It
+//! reports a bounded top twelve every 25,000 draws. The switch is diagnostic
+//! only and absent by default; its disabled hot-path cost is one cached branch
+//! per draw, never a clock read, allocation, lock, or per-pixel operation.
+//!
 //! # What this executor is, and is not
 //!
 //! It executes opcodes 0x08 (flat) and 0x0c (shaded) -- no texture plane,
@@ -383,7 +391,26 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
     // `texture`.
     let texture_planes = triangle.texture().map(triangle_span::texture_planes);
 
-    raster_triangle(
+    let draw_census_start = draw_census::enabled().then(std::time::Instant::now);
+    let draw_census_key = draw_census_start.map(|_| draw_census::Key {
+        combine_low: shading.combine().low(),
+        combine_high: shading.combine().high(),
+        other_mode_high: other_mode.high(),
+        other_mode_low: other_mode.low(),
+        evaluation: match evaluation {
+            TexrectCombinerEvaluation::OneCycle => 1,
+            TexrectCombinerEvaluation::TwoCycle => 2,
+            TexrectCombinerEvaluation::BlitsTheTexel => 0,
+        },
+        format: match format {
+            ColorTargetFormat::Rgba16 => 16,
+            ColorTargetFormat::Rgba32 => 32,
+        },
+        textured,
+        perspective: other_mode.texture_perspective(),
+        depth: depth.is_some(),
+    });
+    let rasterized = raster_triangle(
         &mut bytes,
         format,
         extent.width(),
@@ -399,7 +426,15 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
         stages,
         evaluation,
         depth,
-    )?;
+    );
+    rasterized?;
+    if let (Some(start), Some(census_key)) = (draw_census_start, draw_census_key) {
+        draw_census::note(
+            census_key,
+            rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum(),
+            start.elapsed(),
+        );
+    }
 
     let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
     Ok(CompletedColorTargetWrite::new_for_fill(
@@ -919,6 +954,129 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
         }
     }
     Ok(())
+}
+
+mod draw_census {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) struct Key {
+        pub combine_low: u32,
+        pub combine_high: u32,
+        pub other_mode_high: u32,
+        pub other_mode_low: u32,
+        pub evaluation: u8,
+        pub format: u8,
+        pub textured: bool,
+        pub perspective: bool,
+        pub depth: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Stats {
+        draws: u64,
+        pixels: u64,
+        elapsed_ns: u128,
+        max_draw_ns: u128,
+    }
+
+    impl Stats {
+        fn note(&mut self, pixels: u64, elapsed: Duration) {
+            self.draws += 1;
+            self.pixels += pixels;
+            self.elapsed_ns += elapsed.as_nanos();
+            self.max_draw_ns = self.max_draw_ns.max(elapsed.as_nanos());
+        }
+    }
+
+    static CENSUS: Mutex<Option<BTreeMap<Key, Stats>>> = Mutex::new(None);
+
+    pub(super) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_DRAW_CENSUS").is_some())
+    }
+
+    pub(super) fn note(key: Key, pixels: u64, elapsed: Duration) {
+        let mut guard = CENSUS.lock().expect("draw census mutex poisoned");
+        let census = guard.get_or_insert_with(BTreeMap::new);
+        census.entry(key).or_default().note(pixels, elapsed);
+        let draws = census.values().map(|stats| stats.draws).sum::<u64>();
+        if draws % 25_000 == 0 {
+            report(draws, census);
+        }
+    }
+
+    fn report(draws: u64, census: &BTreeMap<Key, Stats>) {
+        let mut ranked = census.iter().collect::<Vec<_>>();
+        ranked.sort_by(|(key_a, stats_a), (key_b, stats_b)| {
+            stats_b
+                .elapsed_ns
+                .cmp(&stats_a.elapsed_ns)
+                .then_with(|| key_a.cmp(key_b))
+        });
+        let total_ns = census.values().map(|stats| stats.elapsed_ns).sum::<u128>();
+        let total_pixels = census.values().map(|stats| stats.pixels).sum::<u64>();
+        eprintln!(
+            "[fn64-draw-census] draws={draws} keys={} pixels={total_pixels} elapsed_ms={:.3}",
+            census.len(),
+            total_ns as f64 / 1_000_000.0,
+        );
+        for (rank, (key, stats)) in ranked.into_iter().take(12).enumerate() {
+            let ns_per_pixel = if stats.pixels == 0 {
+                0.0
+            } else {
+                stats.elapsed_ns as f64 / stats.pixels as f64
+            };
+            eprintln!(
+                "[fn64-draw-census] rank={} combine={:#010x}/{:#010x} other={:#010x}/{:#010x} eval={} fmt={} textured={} perspective={} depth={} draws={} pixels={} elapsed_ms={:.3} max_draw_ms={:.3} ns_per_pixel={:.2}",
+                rank + 1,
+                key.combine_low,
+                key.combine_high,
+                key.other_mode_high,
+                key.other_mode_low,
+                key.evaluation,
+                key.format,
+                u8::from(key.textured),
+                u8::from(key.perspective),
+                u8::from(key.depth),
+                stats.draws,
+                stats.pixels,
+                stats.elapsed_ns as f64 / 1_000_000.0,
+                stats.max_draw_ns as f64 / 1_000_000.0,
+                ns_per_pixel,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn aggregation_tracks_elapsed_pixels_draws_and_maximum() {
+            let slow = Key {
+                combine_low: 1,
+                combine_high: 2,
+                other_mode_high: 3,
+                other_mode_low: 4,
+                evaluation: 2,
+                format: 16,
+                textured: true,
+                perspective: true,
+                depth: false,
+            };
+            let mut stats = Stats::default();
+            stats.note(20, Duration::from_micros(10));
+            stats.note(30, Duration::from_micros(40));
+            assert_eq!(stats.draws, 2);
+            assert_eq!(stats.pixels, 50);
+            assert_eq!(stats.elapsed_ns, 50_000);
+            assert_eq!(stats.max_draw_ns, 40_000);
+            assert_eq!(slow.evaluation, 2);
+        }
+    }
 }
 
 /// The exact ordered accesses one rasterized triangle's rows correspond to,
