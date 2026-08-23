@@ -80,6 +80,7 @@ struct RawDpcCarryIn {
     prim_color: PrimColor,
     fog_color: Color4,
     scissor: Option<crate::targets::RdpScissorRect>,
+    prim_depth: Option<crate::state::PrimDepth>,
     color_image: Option<ColorImage>,
     tiles: [(
         Option<fn64_render::NeutralTileDescriptor>,
@@ -97,6 +98,7 @@ impl RawDpcCarryIn {
             prim_color: state.prim_color(),
             fog_color: state.fog_color(),
             scissor: state.scissor(),
+            prim_depth: state.prim_depth(),
             color_image: state.color_image(),
             tiles: durable_neutral_tiles(state),
         }
@@ -849,6 +851,11 @@ struct PlanCollector {
     /// and then submits several packets, so a per-packet reset would
     /// unscissor every packet after the first.
     current_scissor: Option<crate::targets::RdpScissorRect>,
+    /// `G_SETPRIMDEPTH` current at the walk's current stream position --
+    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
+    /// time and updated on every `SetPrimDepth` in plan order. Read by the
+    /// CPU raster path's z-compare under `G_ZS_PRIM`.
+    current_prim_depth: Option<crate::state::PrimDepth>,
     /// One entry per admitted `Triangle` command, in plan order. `Err`
     /// names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -1017,6 +1024,7 @@ impl PlanCollector {
             current_blend_color: carry_in.blend_color,
             current_env_color: carry_in.env_color,
             current_prim_color: carry_in.prim_color,
+            current_prim_depth: carry_in.prim_depth,
             current_fog_color: carry_in.fog_color,
             current_scissor: carry_in.scissor,
             current_color_image: carry_in.color_image,
@@ -1053,6 +1061,7 @@ impl PlanCollector {
             prim_color,
             fog_color,
             scissor,
+            prim_depth: None,
             color_image,
             tiles,
         })
@@ -1090,6 +1099,15 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
+                }
+                RdpStateCommand::SetPrimDepth { depth, .. } => {
+                    // Reconstruct the wire form (`z` in bits 16:31, `dz` in
+                    // bits 0:15) so `PrimDepth::from_wire` re-applies the
+                    // 15-bit z / 16-bit dz masks the decoder used -- the same
+                    // recovery `TriangleDrawStateCollector` performs.
+                    self.current_prim_depth = Some(crate::state::PrimDepth::from_wire(
+                        (u32::from(depth.z) << 16) | u32::from(depth.dz),
+                    ));
                 }
                 // Latched verbatim in wire quarter-pixels. Public libultra
                 // `include/ultra64/gbi.h:4794-4837` encodes each coordinate
@@ -1233,6 +1251,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         prim_color: self.current_prim_color,
                         fog_color: self.current_fog_color,
                         scissor: self.current_scissor,
+                        prim_depth: self.current_prim_depth,
                     })
                 })();
                 self.triangles.push(snapshot);
@@ -3723,6 +3742,27 @@ fn stage_color_commands(
         .find(|resident| resident.key() == key)
         .map(|resident| resident.device_bytes().device_bytes().to_vec());
 
+    // **The depth accumulator, one RDP depth-memory cell per target pixel,
+    // persisting across every draw in this packet's schedule.** It is the
+    // z-buffer: a later draw's fragment sees the depth an earlier draw
+    // committed, which is what makes overlapping triangles at different
+    // depths resolve. Allocated (seeded to `(0, 0)` -- the value a zeroed
+    // guest z-image decodes to) only when some raw triangle in this packet
+    // actually requests a depth compare or update; a packet with no z-wired
+    // draw keeps it `None` and every draw resolves by painter's order,
+    // exactly as before. The z-image binding (`SetZImage`/`SetMaskImage`) is
+    // what legalises those OtherMode z bits in the admitted subset -- they
+    // are only ever set in a packet that also bound a z-image -- so keying
+    // the accumulator off the z bits is equivalent here to keying it off the
+    // binding, without threading the address through the neutral IR.
+    let wants_depth = collector.plan.triangles.iter().any(|draw| {
+        draw.as_ref().is_ok_and(|draw| {
+            draw.other_mode.depth_compare_enabled() || draw.other_mode.depth_update_enabled()
+        })
+    });
+    let mut depth_accum: Option<Vec<crate::targets::DepthCell>> =
+        wants_depth.then(|| vec![(0u32, 0u8); key.extent().pixels() as usize]);
+
     // Accesses only, in schedule order. Digests are deliberately absent
     // until the loop ends -- see this function's own doc on staleness.
     let mut declared: Vec<ResourceAccess> = Vec::new();
@@ -3814,6 +3854,7 @@ fn stage_color_commands(
                                 resident,
                                 &pending.prefix_image(prefix),
                                 true,
+                                depth_accum.as_deref_mut(),
                             )?,
                             // No load precedes this triangle in its own
                             // packet, so TMEM holds exactly what an earlier
@@ -3828,11 +3869,18 @@ fn stage_color_commands(
                                 resident,
                                 collector.physical,
                                 false,
+                                depth_accum.as_deref_mut(),
                             )?,
                         }
                     }
                     TexrectTmemSource::Committed(state) => execute_scheduled_raw_triangle(
-                        collector, &candidate, index, resident, state, false,
+                        collector,
+                        &candidate,
+                        index,
+                        resident,
+                        state,
+                        false,
+                        depth_accum.as_deref_mut(),
                     )?,
                 }
             }
@@ -4156,6 +4204,7 @@ fn execute_scheduled_fill(
 /// pushed those accesses. The one number this function computes itself is
 /// the declared row COUNT, which it hands the executor so the executor can
 /// prove its own raster covers exactly those rows.
+#[allow(clippy::too_many_arguments)]
 fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
@@ -4163,6 +4212,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     resident_bytes: &[u8],
     tmem: &S,
     expect_proposed: bool,
+    depth_cells: Option<&mut [crate::targets::DepthCell]>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let (span, triangle_index, _, raw_words) = &collector.plan.raw_triangle_commands[index];
     let draw_state = collector.plan.triangles[*triangle_index]
@@ -4286,6 +4336,22 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
         resident_bytes,
         &accesses,
         texture,
+        // **The z-buffer wiring, present only when a depth accumulator was
+        // threaded (i.e. this packet bound a z-image).** The compare/update
+        // gates and the z source are read from THIS draw's own snapshotted
+        // `OtherMode`, and the primitive depth from its snapshotted
+        // `SetPrimDepth` -- both the same command-time-snapshot values every
+        // other register on `draw_state` uses. Absent depth cells means no
+        // z-image was bound, so the draw resolves by painter's order exactly
+        // as before this change.
+        depth_cells.map(|cells| crate::targets::RawTriangleDepth {
+            cells,
+            compare: draw_state.other_mode.depth_compare_enabled(),
+            update: draw_state.other_mode.depth_update_enabled(),
+            mode: draw_state.other_mode.depth_mode(),
+            source_is_primitive: draw_state.other_mode.primitive_depth_source(),
+            prim_depth: draw_state.prim_depth,
+        }),
     )?;
     Ok((completed, accesses))
 }
@@ -6858,6 +6924,7 @@ mod tests {
             // This fixture drives the GPU triangle path, which reads no
             // scissor; the texrect executor is the only consumer today.
             scissor: None,
+            prim_depth: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -6947,6 +7014,7 @@ mod tests {
             // so an unset rect is the honest value rather than a fabricated
             // full-frame one.
             scissor: None,
+            prim_depth: None,
         }
     }
 
@@ -7041,6 +7109,7 @@ mod tests {
             // This fixture drives the GPU triangle path, which reads no
             // scissor; the texrect executor is the only consumer today.
             scissor: None,
+            prim_depth: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(good_triangle)], None)
@@ -8247,6 +8316,7 @@ mod tests {
             // This fixture drives the GPU triangle path, which reads no
             // scissor; the texrect executor is the only consumer today.
             scissor: None,
+            prim_depth: None,
         };
         let error = backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)
@@ -8325,6 +8395,7 @@ mod tests {
             // This fixture drives the GPU triangle path, which reads no
             // scissor; the texrect executor is the only consumer today.
             scissor: None,
+            prim_depth: None,
         };
         backend
             .draw_admitted_triangles(vec![Ok(triangle)], None)

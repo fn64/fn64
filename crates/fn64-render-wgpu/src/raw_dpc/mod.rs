@@ -40,7 +40,7 @@ use fn64_render_ir::{
 use crate::combiner::CombineParams;
 use crate::state::{
     Color4, ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor,
-    PrimDepth, RdpState, RdpStateDelta, StagedRdpState,
+    PrimDepth, RdpState, RdpStateDelta, StagedRdpState, ZImage,
 };
 use crate::tmem::{
     decode_tmem_command, TmemCommand, TmemLoad, TmemLoadContract, TmemLoadEpoch,
@@ -56,6 +56,14 @@ const SET_OTHER_MODE: u8 = 0x2f;
 /// tracked state only -- see [`RawDpcCommandKind::SetScissor`].
 const SET_SCISSOR: u8 = 0xed & 0x3f;
 const SET_COLOR_IMAGE: u8 = 0x3f;
+/// The depth-buffer binder. **Two wire opcodes decode to this same masked
+/// value**: `G_SETZIMG` (`0xfe`, public SGI *RDP Command Summary* "Set Z
+/// Image") and `G_SETMASKIMG` (`0x3e`, "Set Mask Image"). Both mask to
+/// `0x3e` under `& 0x3f`, and angrylion binds the z-buffer base address on
+/// either (`rdp_set_depth_image` / `rdp_set_mask_image` both do
+/// `zb_address = args[1] & 0x00ffffff`), so a single dispatch arm honours
+/// both -- exactly what `gen-zbuffer-setmaskimage-binds-z-image` probes.
+const SET_Z_IMAGE: u8 = 0xfe & 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 const FULL_SYNC: u8 = 0x29;
@@ -234,6 +242,15 @@ pub enum RawDpcCommandKind {
     /// submits several packets under it.
     SetScissor(crate::rt64_gbi_rdp_decode::SetScissorDecoded),
     SetColorImage(ColorImage),
+    /// `G_SETZIMG` (`0xfe`) or its `G_SETMASKIMG` (`0x3e`) alias -- binds
+    /// the depth buffer. Admitted as **tracked-only** at the neutral-IR
+    /// seam (like [`RawDpcCommandKind::SetScissor`]): its presence is what
+    /// makes a z-compared/z-updated draw legal, but the depth test in the
+    /// wgpu CPU raster path reads the per-draw `OtherMode` z bits and the
+    /// staged `SetPrimDepth`, not this address, because the test corpus's
+    /// z-buffer is the zeroed RDRAM region and is never read back through a
+    /// second guest image. See `stage_color_commands`' depth accumulator.
+    SetZImage(ZImage),
     SetFillColor(FillColor),
     SetEnvColor(Color4),
     SetPrimColor(PrimColor),
@@ -1253,6 +1270,28 @@ fn decode_stream(
                 delta.set_color_image(value);
                 state.apply(delta);
                 RawDpcCommandKind::SetColorImage(value)
+            }
+            SET_Z_IMAGE => {
+                // Both `G_SETZIMG` (`0xfe`) and `G_SETMASKIMG` (`0x3e`)
+                // funnel here (both mask to `0x3e`), byte-identically:
+                // angrylion's `zb_address = args[1] & 0x00ffffff`. The Z
+                // image is not staged into `RdpState` (there is no neutral
+                // field for it and no wgpu consumer reads the address); this
+                // arm exists so a z-buffered stream is ADMITTED rather than
+                // refused as `UnsupportedCommand`, which is the entire fn64
+                // gap the six `gen-zbuffer-*` parity cases probe. The
+                // address is masked and range-checked exactly as
+                // `SetColorImage` does, so a malformed binding is a named
+                // refusal rather than a silently swallowed one.
+                let address = w1 & 0x00ff_ffff;
+                let address =
+                    layout
+                        .address(address)
+                        .map_err(|_| RawDpcDecodeError::InvalidCommand {
+                            location,
+                            reason: "SetZImage address is outside installed RDRAM",
+                        })?;
+                RawDpcCommandKind::SetZImage(ZImage::from_wire(address))
             }
             SET_FILL_COLOR => {
                 let value = FillColor::from_wire(w1);
@@ -3071,8 +3110,11 @@ mod tests {
         // `raw_rdp_command_width`, no `decode_stream` dispatch arm) -- a
         // stand-in for "any unsupported opcode", not a texture-rectangle
         // fixture. 0x24/0x25 moved to the "decodes successfully" test below
-        // now that they are admitted opcodes.
-        for (opcode, width) in [(0x2a, 8), (0x3e, 8)] {
+        // now that they are admitted opcodes; 0x3e (`SetMaskImage`, the
+        // z-image binder aliased with `SetZImage` 0xfe) likewise moved out of
+        // this rejection table -- it now decodes to `SetZImage`, proven by
+        // `set_mask_image_and_set_z_image_both_decode_to_a_z_image_binding`.
+        for (opcode, width) in [(0x2a, 8)] {
             let mut words = vec![0; width / 4];
             words[0] = word(0x80, opcode, 0);
             let error = decode(words).unwrap_err();
@@ -3086,6 +3128,31 @@ mod tests {
                     && decoded_opcode == opcode
                     && actual == width as u32
             ));
+        }
+    }
+
+    /// `SetZImage` (`0xfe`) and its `SetMaskImage` (`0x3e`) alias both mask
+    /// to `0x3e` and both bind the depth buffer at `w1 & 0x00ff_ffff` -- the
+    /// direct probe `gen-zbuffer-setmaskimage-binds-z-image` asserts on the
+    /// wire. This is the decoder-side twin: both wire opcodes decode to one
+    /// `SetZImage` kind carrying the same address.
+    #[test]
+    fn set_mask_image_and_set_z_image_both_decode_to_a_z_image_binding() {
+        // 0x40 is a legal, 64-byte-aligned, in-bounds address for the
+        // 16 KiB fixture layout the `decode` helper uses.
+        let address = 0x40u32;
+        for wire in [0xfeu8, 0x3e] {
+            let words = vec![(u32::from(wire) << 24), address];
+            let decoded = decode(words).expect("z-image binding must decode, not reject");
+            let kind = decoded.commands()[0].kind();
+            let RawDpcCommandKind::SetZImage(z_image) = kind else {
+                panic!("wire {wire:#04x} must decode to SetZImage, got {kind:?}");
+            };
+            assert_eq!(
+                z_image.address().get(),
+                address,
+                "wire {wire:#04x} must bind the z-image at w1 & 0x00ffffff"
+            );
         }
     }
 
