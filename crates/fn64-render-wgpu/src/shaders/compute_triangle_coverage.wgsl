@@ -64,13 +64,6 @@ var<storage, read_write> color_target_words: array<u32>;
 @group(1) @binding(4)
 var<storage, read_write> color_status: array<u32>;
 
-// Diagnostic-only stage trace used by the explicitly enabled game-derived
-// CPU/compute differential. One pixel records the exact inputs crossing the
-// texture, shade, and combiner boundaries so a byte mismatch names its first
-// divergent stage instead of inviting shader-wide guesses.
-@group(1) @binding(5)
-var<storage, read_write> color_trace: array<vec4<u32>>;
-
 fn i64_from_i32(value: i32) -> I64 {
     return I64(u32(value), select(0, -1, value < 0));
 }
@@ -319,7 +312,6 @@ fn perspective_coordinate(numerator: I64, denominator: I64) -> i32 {
 struct ColorPixelResult {
     rgba16: u32,
     status: u32,
-    trace: vec4<u32>,
 }
 
 fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelResult {
@@ -327,7 +319,6 @@ fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelR
     let y = pixel_index / params.width;
     var current = initial_rgba16;
     var status = 0u;
-    var trace = vec4<u32>(0u);
     for (var triangle_index = 0u; triangle_index < params.triangle_count; triangle_index += 1u) {
         let triangle = triangles[triangle_index];
         let raster = evaluate_coverage_sample(triangle, x, y);
@@ -367,15 +358,6 @@ fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelR
         let combined = quantize_rgba8(
             run_one_cycle(CombineParams(0xfc5196a3u, 0x112cfe7fu), inputs).combiner_color
         );
-        let texel_bytes = vec4<u32>(round(clamp(texel.color, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
-        let shade_bytes = vec4<u32>(round(clamp(inputs.shade_color, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
-        let combined_bytes = vec4<u32>(round(clamp(combined, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
-        trace = vec4<u32>(
-            (u32(raw_s) & 0xffffu) | ((u32(raw_t) & 0xffffu) << 16u),
-            texel_bytes.r | (texel_bytes.g << 8u) | (texel_bytes.b << 16u) | (texel_bytes.a << 24u),
-            shade_bytes.r | (shade_bytes.g << 8u) | (shade_bytes.b << 16u) | (shade_bytes.a << 24u),
-            combined_bytes.r | (combined_bytes.g << 8u) | (combined_bytes.b << 16u) | (combined_bytes.a << 24u),
-        );
         let shade_alpha = round(clamp(inputs.shade_color.a, 0.0, 1.0) * 255.0) / 255.0;
         let memory_count = select(1u, 8u, (current & 1u) != 0u);
         let coverage = coverage_fragment_fn(8u, memory_count, 1u, 1u, 1u, 1u, 0u, 0u, 0u);
@@ -396,7 +378,7 @@ fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelR
         );
         current = pack_rgba16(blended, (coverage.destination_count - 1u) >> 2u);
     }
-    return ColorPixelResult(current, status, trace);
+    return ColorPixelResult(current, status);
 }
 
 // One invocation owns both halfwords of a storage word. This closes the
@@ -415,7 +397,6 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     let first = execute_hot_color_pixel(first_pixel, first_logical);
     var output_word = ((first.rgba16 & 0xffu) << 8u) | (first.rgba16 >> 8u);
     color_status[first_pixel] = first.status;
-    color_trace[first_pixel] = first.trace;
     let second_pixel = first_pixel + 1u;
     if second_pixel < params.pixels_per_triangle {
         let second_device = device_word >> 16u;
@@ -424,7 +405,6 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
         let packed_device = ((second.rgba16 & 0xffu) << 8u) | (second.rgba16 >> 8u);
         output_word |= packed_device << 16u;
         color_status[second_pixel] = second.status;
-        color_trace[second_pixel] = second.trace;
     } else {
         output_word |= device_word & 0xffff0000u;
     }

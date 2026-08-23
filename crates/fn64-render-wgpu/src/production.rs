@@ -1815,7 +1815,6 @@ pub enum WgpuRawDpcExecutionError {
         y: u32,
         expected: u16,
         actual: u16,
-        gpu_trace: [u32; 4],
     },
     /// The explicitly-enabled game-derived probe returned a target of the
     /// wrong length, so no byte-for-byte comparison is possible.
@@ -2061,14 +2060,11 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 y,
                 expected,
                 actual,
-                gpu_trace,
             } => write!(
                 formatter,
                 "compute-raster probe disagreed with the CPU target in packet ordinal {ordinal}, \
                  command #{command_index}, triangle #{triangle_index}, pixel ({x}, {y}): expected \
-                 RGBA16 {expected:#06x}, got {actual:#06x}; GPU stage trace \
-                 coords={:#010x} texel={:#010x} shade={:#010x} combined={:#010x}",
-                gpu_trace[0], gpu_trace[1], gpu_trace[2], gpu_trace[3]
+                 RGBA16 {expected:#06x}, got {actual:#06x}"
             ),
             Self::ComputeRasterProbeLength { expected, actual } => write!(
                 formatter,
@@ -2616,8 +2612,8 @@ impl RenderBackend for WgpuBackend {
                 .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                 .map_err(RenderError::from)?;
             let started = Instant::now();
-            let observation = pipeline
-                .compute_triangle_hot_color_observed(
+            let actual_bytes = pipeline
+                .compute_triangle_hot_color(
                     probe.extent,
                     &probe.resident_bytes,
                     &probe.triangles,
@@ -2632,8 +2628,7 @@ impl RenderBackend for WgpuBackend {
             probe_draws += u32::try_from(probe.batch.draws().len())
                 .expect("bounded raw-DPC draw count fits u32");
             probe_pixels += probe.extent.width * probe.extent.height;
-            if let Some(byte) = observation
-                .bytes()
+            if let Some(byte) = actual_bytes
                 .iter()
                 .zip(&probe.expected_bytes)
                 .position(|(actual, expected)| actual != expected)
@@ -2644,9 +2639,7 @@ impl RenderBackend for WgpuBackend {
                     probe.expected_bytes[pair],
                     probe.expected_bytes[pair + 1],
                 ]);
-                let actual =
-                    u16::from_be_bytes([observation.bytes()[pair], observation.bytes()[pair + 1]]);
-                let gpu_trace = observation.trace_at(pixel);
+                let actual = u16::from_be_bytes([actual_bytes[pair], actual_bytes[pair + 1]]);
                 let draw = probe
                     .batch
                     .draws()
@@ -2661,15 +2654,14 @@ impl RenderBackend for WgpuBackend {
                         y: pixel as u32 / probe.extent.width,
                         expected,
                         actual,
-                        gpu_trace,
                     },
                 ));
             }
-            if observation.bytes().len() != probe.expected_bytes.len() {
+            if actual_bytes.len() != probe.expected_bytes.len() {
                 return Err(RenderError::from(
                     WgpuRawDpcExecutionError::ComputeRasterProbeLength {
                         expected: probe.expected_bytes.len(),
-                        actual: observation.bytes().len(),
+                        actual: actual_bytes.len(),
                     },
                 ));
             }
