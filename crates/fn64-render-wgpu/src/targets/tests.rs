@@ -98,6 +98,24 @@ fn exact_fixture_packs_to_m3_3a_device_domain() {
     assert_eq!(m3_3a.device_bytes(), [0xf8, 0x01].repeat(8));
 }
 
+#[test]
+fn an_intermediate_completion_transfers_its_exact_owned_device_bytes() {
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let plan = candidate.plan_rows(full_rectangle(key)).unwrap();
+    let completion = completed(&candidate, plan, &[Rgba8::new(255, 0, 0, 255); 8]);
+
+    assert_eq!(
+        completion
+            .into_device_color_bytes()
+            .into_device_bytes()
+            .as_ref(),
+        [0xf8, 0x01].repeat(8),
+        "moving an intermediate completion must retain every byte exactly"
+    );
+}
+
 /// The generic pixel oracle has no render-mode or sample-mask input, so it
 /// explicitly supplies full coverage. RGBA16 bit 0 must therefore remain one
 /// across the alpha 0x7f/0x80 boundary: it is stored coverage bit 2, not
