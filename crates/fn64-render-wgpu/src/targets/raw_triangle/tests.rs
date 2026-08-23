@@ -1295,3 +1295,114 @@ fn texture_plane_raster_microbench() {
         elapsed.as_nanos()
     );
 }
+
+/// `raster_triangle`'s per-pixel depth decision must be a no-op when depth is
+/// DISABLED: a draw with no depth wiring (`depth == None`) and a draw carrying
+/// a depth binding whose `Z_CMP` and `Z_UPD` are both clear must produce the
+/// byte-identical framebuffer -- and the second must not touch the depth cells.
+///
+/// This guards the z-buffer feature's own invariant. When depth is disabled
+/// the compare arm never runs (`passes_depth` falls to `_ => true`, no compare)
+/// and the commit is gated off (no update), so a disabled depth binding reduces
+/// to the same unconditional painter's-order write a non-z draw does. The test
+/// rasterizes the microbench's shaded+textured (0x0e) triangle both ways and
+/// asserts the colour bytes match and the seeded cells are untouched, so a
+/// future edit to the depth path cannot silently change a non-z draw's output.
+#[test]
+fn depth_free_and_depth_present_paths_agree_on_a_depth_disabled_draw() {
+    let width_px = 120.0_f64;
+    let rows: i16 = 90;
+    let target_w: u32 = 160;
+    let target_h: u32 = 120;
+
+    let triangle = bench_textured_triangle(width_px, rows);
+    assert!(
+        triangle.flags().textured() && triangle.flags().shaded(),
+        "agreement triangle must be shaded+textured (0x0e)"
+    );
+
+    let key = key_at(target_w, target_h);
+    let declared = declared_accesses(key, &triangle, None);
+    let resident = vec![0u8; (target_w * target_h * 2) as usize];
+
+    let tmem = BenchTmem::new();
+    let tile = bench_tile_binding();
+    // Perspective ON, matching the microbench (WM2000's hot path).
+    let other_mode = OtherMode::from_wire(1 << 19, 0);
+
+    let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
+    let shading = TexrectShading::new(
+        CombineParams::from_wire(clow, chigh),
+        Color4::from_wire(ENV_WIRE),
+        PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+    );
+
+    let make_texture = || RawTriangleTexture {
+        tile,
+        tmem: &tmem,
+        lut_mode: crate::TextureLutMode::Disabled,
+    };
+
+    // Depth-FREE path: `depth == None`.
+    let free = {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        execute_raw_triangle(
+            &candidate,
+            other_mode,
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(make_texture()),
+            None,
+        )
+        .expect("depth-free draw rasterizes")
+        .device_bytes()
+        .device_bytes()
+        .to_vec()
+    };
+
+    // Depth-PRESENT path: a `Some(depth)` with compare AND update both off.
+    // The cells are seeded non-zero to prove the disabled path neither reads
+    // nor writes them (identical bytes AND untouched cells).
+    let mut cells = vec![(0x1234u32, 0x5u8); key.extent().pixels() as usize];
+    let cells_before = cells.clone();
+    let present = {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        execute_raw_triangle(
+            &candidate,
+            other_mode,
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(make_texture()),
+            Some(RawTriangleDepth {
+                cells: &mut cells,
+                compare: false,
+                update: false,
+                mode: crate::state::DepthMode::Opaque,
+                source_is_primitive: true,
+                prim_depth: Some(crate::state::PrimDepth::from_wire(0x0001_0000)),
+            }),
+        )
+        .expect("depth-present (disabled) draw rasterizes")
+        .device_bytes()
+        .device_bytes()
+        .to_vec()
+    };
+
+    assert_eq!(
+        free, present,
+        "depth-free and depth-present (Z_CMP=Z_UPD=0) paths must produce \
+         byte-identical framebuffers for a depth-disabled draw"
+    );
+    assert_eq!(
+        cells, cells_before,
+        "a depth-disabled draw (Z_UPD off) must not touch the depth cells"
+    );
+}
