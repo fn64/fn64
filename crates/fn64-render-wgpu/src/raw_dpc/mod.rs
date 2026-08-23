@@ -1935,9 +1935,6 @@ fn clip_fill_rows_to_scissor(
 ///   by name (`TextureRectangleBeforeAnyOtherMode`) -- refusing it a second
 ///   time here, at a different layer and with a different error, would just
 ///   move which message a reader sees.
-/// - **`TextureRectangleFlip`**: flip's destination footprint is the same,
-///   but this slice does not execute it, and declaring a write no executor
-///   fills would promise content that never arrives.
 /// - **Fractional edges, a degenerate/empty extent, a negative origin, or a
 ///   rectangle wider than the staged image**: the exact covered range is not
 ///   provable here, and a clamped or rounded guess would declare bytes the
@@ -1955,9 +1952,6 @@ fn plan_texture_rectangle(
     planned: &mut Vec<ResourceAccess>,
     fill_spans: &mut Vec<FillAccessSpan>,
 ) -> Result<(), RawDpcDecodeError> {
-    if rectangle.flip() {
-        return Ok(());
-    }
     let Some(other_mode) = state.other_mode() else {
         return Ok(());
     };
