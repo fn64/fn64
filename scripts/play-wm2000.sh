@@ -51,6 +51,7 @@ ROM=${ROM:-$AKI/games/NWXE/wm2000.z64}
 # title's table would resolve silently and produce wrong behaviour.
 HOST_LOOKUP=${RECOMP_RS_HOST_LOOKUP:-$HOME/Code/recomps/wm2000/packages/wm2000-boot/src/host_lookup.rs}
 RENDER=${FN64_RENDER:-wgpu}
+APP_TITLE=${FN64_APP_TITLE:-WrestleMania 2000 [built with fn64]}
 
 for f in "$ROM" "$HOST_LOOKUP"; do
   [[ -f "$f" ]] || { echo "[play-wm2000] FATAL: missing $f" >&2; exit 1; }
@@ -92,6 +93,7 @@ ln -sfn "$EMIT" "$FN64/crates/fn64-shell/rs/recompiled"
 echo "[play-wm2000] building the shell (rs lane, renderer=$RENDER)"
 cd "$FN64/crates/fn64-shell/rs"
 FN64_RECOMP=rs \
+FN64_APP_TITLE="$APP_TITLE" \
 ROM="$ROM" \
 RECOMP_RS_HOST_LOOKUP="$HOST_LOOKUP" \
   cargo build --release --offline

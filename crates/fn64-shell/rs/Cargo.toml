@@ -72,6 +72,13 @@ fn64-audio = { path = "../../fn64-audio" }
 # shell a title-neutral local name without editing the emitted manifest.
 game-recompiled = { path = "recompiled", package = "oot-recompiled" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# winit has no macOS window-icon operation; AppKit owns the process-wide Dock
+# icon. These are the same objc2 versions/features winit 0.30 already builds.
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSResponder"] }
+objc2-foundation = { version = "0.2.2", features = ["NSGeometry"] }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
