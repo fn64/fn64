@@ -454,7 +454,69 @@ pub(crate) fn major_edge_x(triangle: &RawTriangle, sample_y_eighth: i32) -> i64 
 /// RDP's own scan order -- Y rows 1,3,5,7 eighths, and on each the two X
 /// columns [`COVERAGE_SAMPLES`] gives that row -- and returns `None` when
 /// the pixel has no covered subsample at all.
+#[derive(Clone, Copy)]
+struct AttributeSampleLine {
+    delta_y_eighth: i32,
+    left_x: i64,
+    right_x: i64,
+    major_x: i64,
+    sample_x_eighths: [i32; 2],
+}
+
+/// The four edge pairs and major-edge origins shared by every pixel in one
+/// scanline. Edge positions vary with subpixel Y, but never with X; resolving
+/// them once here avoids repeating the fixed-point edge divisions for every
+/// pixel while preserving [`attribute_sample`]'s exact traversal order.
+pub(crate) struct AttributeSampleRow {
+    lines: [Option<AttributeSampleLine>; 4],
+}
+
+impl AttributeSampleRow {
+    pub(crate) fn new(triangle: &RawTriangle, y: i32) -> Self {
+        let yh_eighth = i32::from(triangle.yh()) * 2;
+        let yl_eighth = i32::from(triangle.yl()) * 2;
+        let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;
+        let lines = core::array::from_fn(|index| {
+            let offset_y = SAMPLE_Y_EIGHTHS[index];
+            let sample_y_eighth = y * 8 + offset_y;
+            if sample_y_eighth < yh_eighth || sample_y_eighth >= yl_eighth {
+                return None;
+            }
+            let (left_x, right_x) = row_span(triangle, sample_y_eighth);
+            Some(AttributeSampleLine {
+                delta_y_eighth: sample_y_eighth - high_origin_eighth,
+                left_x,
+                right_x,
+                major_x: major_edge_x(triangle, sample_y_eighth),
+                sample_x_eighths: sample_x_eighths(offset_y),
+            })
+        });
+        Self { lines }
+    }
+
+    pub(crate) fn sample(&self, x: i32) -> Option<(i32, i64)> {
+        for line in self.lines.iter().flatten() {
+            for offset_x in line.sample_x_eighths {
+                let sample_x = (i64::from(x) * 8 + i64::from(offset_x)) * Q16_ONE / 8;
+                if sample_x >= line.left_x && sample_x < line.right_x {
+                    return Some((line.delta_y_eighth, sample_x - line.major_x));
+                }
+            }
+        }
+        None
+    }
+}
+
 pub(crate) fn attribute_sample(triangle: &RawTriangle, x: i32, y: i32) -> Option<(i32, i64)> {
+    AttributeSampleRow::new(triangle, y).sample(x)
+}
+
+#[cfg(test)]
+fn attribute_sample_unhoisted(
+    triangle: &RawTriangle,
+    x: i32,
+    y: i32,
+) -> Option<(i32, i64)> {
     let yh_eighth = i32::from(triangle.yh()) * 2;
     let yl_eighth = i32::from(triangle.yl()) * 2;
     let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;

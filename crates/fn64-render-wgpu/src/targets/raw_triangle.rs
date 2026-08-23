@@ -16,7 +16,7 @@
 //!
 //! # Parallel scanlines
 //!
-//! A depth-free triangle with at least 256 pixels across its declared row
+//! A depth-free triangle with at least 4,096 pixels across its declared row
 //! runs uses a persistent work-stealing pool over exclusive whole scanlines.
 //! The scalar pixel body stays the only implementation: each worker calls it
 //! with a local row and guest-row base, and completing the parallel iterator
@@ -450,7 +450,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     evaluation: TexrectCombinerEvaluation,
     depth: Option<RawTriangleDepth<'_>>,
 ) -> Result<(), TexrectExecutionError> {
-    const MIN_PARALLEL_PIXELS: u64 = 256;
+    const MIN_PARALLEL_PIXELS: u64 = 4_096;
 
     fn parallel_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -465,17 +465,22 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                 Err(error) => panic!("FN64_PARALLEL_RASTER is not valid Unicode: {error}"),
             };
             eprintln!(
-                "[fn64-render-wgpu] FN64_PARALLEL_RASTER={} (scanline threshold {MIN_PARALLEL_PIXELS} covered-range pixels)",
-                u8::from(enabled)
+                "[fn64-render-wgpu] FN64_PARALLEL_RASTER={} (scanline threshold {} covered-range pixels)",
+                u8::from(enabled),
+                MIN_PARALLEL_PIXELS,
             );
             enabled
         })
     }
 
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
+    let contiguous_rows = rows
+        .windows(2)
+        .all(|pair| pair[0].y.checked_add(1) == Some(pair[1].y));
     let census_pixels = crate::combiner::census::enabled();
     if depth.is_none()
         && !census_pixels
+        && contiguous_rows
         && declared_pixels >= MIN_PARALLEL_PIXELS
         && parallel_enabled()
     {
@@ -483,17 +488,19 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
 
         // `par_chunks_mut` is the ownership proof: each job exclusively owns
         // one whole color row, so no two jobs can address the same byte. The
-        // parallel iterator's completion is the draw-order barrier; the next
-        // triangle cannot observe or modify this target before every row of
-        // this triangle has completed.
+        // explicit contiguity check above is what makes zipping the target
+        // slice to `rows` exact even for degenerate triangles whose declared
+        // row walk may contain holes; those stay scalar. The parallel
+        // iterator's completion is the draw-order barrier before the next
+        // triangle can observe or modify the target.
+        let first_y = rows[0].y as usize;
         return bytes
             .par_chunks_mut(row_stride)
-            .enumerate()
-            .try_for_each(|(y, row_bytes)| {
-                let y = y as u32;
-                let Ok(row_index) = rows.binary_search_by_key(&y, |row| row.y) else {
-                    return Ok(());
-                };
+            .skip(first_y)
+            .take(rows.len())
+            .zip(rows.par_iter())
+            .try_for_each(|(row_bytes, covered_row)| {
+                let y = covered_row.y;
                 let texture = texture.as_ref().map(|binding| RawTriangleTexture {
                     tile: binding.tile,
                     tmem: binding.tmem,
@@ -504,7 +511,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     format,
                     width,
                     triangle,
-                    &rows[row_index..=row_index],
+                    std::slice::from_ref(covered_row),
                     shading,
                     base_inputs,
                     shade,
@@ -608,6 +615,8 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
         }
     });
     for row in rows {
+        let attribute_samples =
+            triangle_span::AttributeSampleRow::new(triangle, row.y as i32);
         // **Incremental attribute run state.** Attribute planes are exactly
         // linear in x while the selected subsample holds, so a run can be
         // stepped by `plane.dx` instead of re-evaluating the full formula
@@ -637,7 +646,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             // exactly when at least one subsample is inside, which is
             // exactly `pixel_coverage(..) > 0`. Same predicate, same
             // traversal order, same first hit.
-            let sample = triangle_span::attribute_sample(triangle, x as i32, row.y as i32);
+            let sample = attribute_samples.sample(x as i32);
             let Some((delta_y_eighth, delta_x)) = sample else {
                 // A hole in a declared row breaks the run: the next covered
                 // pixel must restart from the exact formula.
