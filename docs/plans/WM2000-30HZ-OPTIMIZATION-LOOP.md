@@ -236,3 +236,57 @@ by VI restoration (2,323), full-target copies (1,585), SHA-256 (1,212), and
 combiner arithmetic (1,091). Because over-budget frames carry roughly twice
 the RDP work of within-budget frames, the next loop must keep prioritizing
 per-fragment triangle costs and copies over fixed presentation work.
+
+## Remaining budget and post-combiner disproofs
+
+The best retained p95 is 38.8--39.1 ms. Reliable 30 Hz therefore still needs
+about 5.8 ms from the tail, while the 25 ms extension-headroom bar needs about
+14 ms. Mean is already 24.3 ms, so optimizing only average or off-critical-path
+CPU work cannot satisfy either tail requirement.
+
+The post-combiner trace accounts for the next active renderer costs as follows
+(exclusive one-millisecond samples over the same 1,200-pump capture):
+
+| Mechanism | Samples | Critical-path interpretation |
+| --- | ---: | --- |
+| blend, coverage, and target write | 2,396 | At least 1,382 samples are directly under raw-triangle traversal; the largest per-fragment target. |
+| VI restore + resample | 3,195 | Fixed presentation cost; useful headroom, but the population split disproves it as the variable tail. |
+| full-target and capture copies | 1,586 | Distributed across capture (279), command staging (240), fill (185), raw-DPC execution (174), and smaller owners; no single remaining clone explains the tail. |
+| SHA-256 | 1,212 | 398 samples are sealed-TMEM revalidation, 229 are commit-side effect verification, and 162 are color-command effects; not all are on the swap critical path. |
+| combiner arithmetic | 1,091 | Still per fragment after selector preparation; arithmetic, not decode, now dominates. |
+| scalar raw-triangle bodies | 1,487 | Per-fragment traversal outside named texture/combiner/blend leaves. |
+| TMEM address + decode + sample | 1,258 | Per textured fragment and therefore correlated with heavy RDP frames. |
+
+Two additional same-binary candidates were rejected and removed:
+
+- Skipping RGBA16 destination-color expansion when `IM_RD` is clear was flat
+  in one pair and worse in the reverse pair (candidate versus control:
+  mean -0.009/+0.139 ms, p95 -0.173/+0.235 ms).
+- Omitting the sealed proposal's second internal hash at GPU binding removed a
+  398-sample aggregate leaf but worsened both critical-path pairs (mean
+  +0.196/+0.127 ms, p95 +0.266/+0.115 ms). This is direct evidence that the
+  aggregate hash row is not a useful proxy for swap-tail latency.
+
+The remaining work list is consequently narrower:
+
+1. Add a low-overhead per-draw census keyed by resolved combiner, blender,
+   texture mode, pixel count, and elapsed fragment time. Use it to identify a
+   state-keyed specialization with a predicted multi-millisecond tail effect;
+   do not specialize on game addresses or content.
+2. Feed runtime captures kept outside git into a bounded raw-DPC packet replay
+   benchmark, so fragment candidates can be measured without a full boot and
+   2.5-minute linked-shell LTO cycle. The replay must compare the candidate's
+   completed bytes and effects to the general path on every iteration.
+3. Fuse the hottest resolved texture/combiner/blender program into one prepared
+   fragment pipeline and evaluate multiple adjacent pixels per loop. Exact
+   equivalence to the general functions remains the oracle; all admission and
+   boundary traps stay at draw construction.
+4. If that CPU specialization cannot remove at least 3 ms from p95, stop
+   micro-optimizing. The 14 ms headroom gap then requires an exact batched or
+   compute raster path using integer RGBA16/TMEM semantics and one bounded
+   readback, rather than further trimming checks from scalar fragments.
+5. Continue ownership work on the individually attributed capture/staging/fill
+   copies only where a move-only payload can eliminate both the copy and its
+   duplicate digest verification. Preserve the external effect comparison;
+   the rejected TMEM candidate shows that deleting internal work without a
+   critical-path result is not progress.
