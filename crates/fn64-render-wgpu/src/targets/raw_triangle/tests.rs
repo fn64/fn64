@@ -1056,3 +1056,242 @@ fn z_compare_against_a_zeroed_z_image_rejects_every_fragment() {
         "z-compare against a zeroed z-image must reject the fragment and keep the resident byte"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic per-pixel raster microbenchmark (Task 6 kill-evidence lever)
+// ---------------------------------------------------------------------------
+//
+// `raster_triangle` is a pure CPU function over a `TmemByteSource` -- no wgpu
+// device, no window -- so its per-pixel cost is measurable headlessly and
+// deterministically, isolated from GPU/compositor/window noise. This is the
+// lever Task 6 uses to prove (or refute) that stepping the texture S/T/W
+// planes incrementally reduces ns-per-textured-pixel.
+//
+// `#[ignore]` so it never runs in the normal suite (it is a timing loop, not
+// an assertion). Run it explicitly:
+//
+//     cargo test -p fn64-render-wgpu --lib --release \
+//       texture_plane_raster_microbench -- --ignored --nocapture
+//
+// It draws one large shaded+textured+perspective triangle (opcode 0x0e, the
+// only opcode WM2000 issues) over a fixed, known covered-pixel count, with
+// long horizontal runs so the step-vs-full branch is exercised on the common
+// (run-continues) case. Reports total ns and ns/covered-pixel.
+
+/// A trivial in-memory TMEM image: a 16x16 RGBA16 tile, every byte present.
+struct BenchTmem {
+    bytes: [u8; 512],
+}
+
+impl BenchTmem {
+    fn new() -> Self {
+        let mut bytes = [0u8; 512];
+        // A varied pattern so the sampler is not reading one constant word
+        // (which a smart cache could shortcut); irrelevant to timing but
+        // keeps the read honest.
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        Self { bytes }
+    }
+}
+
+impl crate::TmemByteSource for BenchTmem {
+    fn snapshot(&self) -> crate::TmemSnapshotIdentity {
+        crate::TmemByteSource::snapshot(&crate::PhysicalTmemState::try_new().unwrap())
+    }
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        self.bytes.get(address as usize).copied()
+    }
+}
+
+fn bench_tile_binding() -> super::TexrectTileBinding {
+    super::TexrectTileBinding::try_from_neutral(
+        fn64_render::NeutralTileDescriptor {
+            format: fn64_render::NeutralImageFormat::Rgba,
+            size: fn64_render::NeutralPixelSize::Bits16,
+            // 16 texels * 2 bytes = 32 bytes = 4 TMEM words per row.
+            line_words: 4,
+            tmem_word_address: 0,
+            palette: 0,
+            s_mode: fn64_render::NeutralTileAddressMode::default(),
+            mask_s: 0,
+            shift_s: 0,
+            t_mode: fn64_render::NeutralTileAddressMode::default(),
+            mask_t: 0,
+            shift_t: 0,
+        },
+        fn64_render::NeutralTileSize {
+            low_s: 0,
+            low_t: 0,
+            high_s: 60,
+            high_t: 60,
+        },
+    )
+    .unwrap()
+}
+
+/// The shaded+textured (0x0e) triangle the microbench rasterizes.
+///
+/// A big axis-aligned-ish box: `width` px wide, `rows` tall, left-major, with
+/// non-trivial shade planes (so the shade path runs) and non-trivial S/T/W
+/// planes (so the texture path -- the one this change touches -- runs). Small
+/// slopes are deliberately AVOIDED on the horizontal so runs stay long and
+/// the step branch dominates, matching WM2000's spans.
+fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
+    use crate::rdp_harness::Tri;
+    // Plane values chosen so S/T stay inside the 16x16 tile across the whole
+    // triangle (clamped addressing keeps them in range regardless), and W is
+    // a large positive constant so the perspective divide is well-defined.
+    let s = [0, 0, 0, 0];
+    let t = [0, 0, 0, 0];
+    // dS/dx and dT/dx nonzero so texel coordinates actually advance per pixel
+    // -- the whole point is to step them.
+    let sdx = [3 << 10, 0, 0, 0];
+    let tdx = [0, 5 << 10, 0, 0];
+    let sde = [1 << 8, 2 << 8, 0, 0];
+    let sdy = [1 << 6, 1 << 6, 0, 0];
+    // texture_planes wants [S, T, W, unused] arrays; pack per-array.
+    let tex_value = [s[0], t[0], 1 << 20, 0];
+    let tex_dx = [sdx[0], tdx[1], 0, 0];
+    let tex_de = [sde[0], sde[1], 0, 0];
+    let tex_dy = [sdy[0], sdy[1], 0, 0];
+
+    let tri = Tri::flat()
+        .left_major()
+        .edges(2.0, 2.0 + width)
+        .rows(0..rows)
+        .shade(
+            [0x20, 0x40, 0x60, 0xFF],
+            [0x1 << 16, 0x1 << 16, 0x1 << 16, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        )
+        .texture_planes(tex_value, tex_dx, tex_de, tex_dy);
+    let words = tri.words();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    RawTriangle::decode(0x0e, &bytes).expect("a shaded+textured triangle decodes")
+}
+
+#[test]
+#[ignore = "timing microbenchmark; run with --ignored --nocapture"]
+fn texture_plane_raster_microbench() {
+    // A wide, tall box: long horizontal runs, many covered pixels.
+    let width_px = 300.0_f64;
+    let rows: i16 = 220;
+    let target_w: u32 = 320;
+    let target_h: u32 = 240;
+
+    let triangle = bench_textured_triangle(width_px, rows);
+    assert!(
+        triangle.flags().textured() && triangle.flags().shaded(),
+        "microbench triangle must be shaded+textured (0x0e)"
+    );
+
+    let key = key_at(target_w, target_h);
+    let declared = declared_accesses(key, &triangle, None);
+    let resident = vec![0u8; (target_w * target_h * 2) as usize];
+
+    let tmem = BenchTmem::new();
+    let tile = bench_tile_binding();
+    // Perspective ON (G_TP_PERSP, other-mode high bit 19): matches WM2000's
+    // hot path. The perspective divide is unchanged by this optimization; it
+    // is the S/T/W plane VALUES that are now stepped.
+    let other_mode = OtherMode::from_wire(1 << 19, 0);
+
+    // Combiner reads TEXEL0 so the textured path is genuinely exercised.
+    let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
+    let shading = TexrectShading::new(
+        CombineParams::from_wire(clow, chigh),
+        Color4::from_wire(ENV_WIRE),
+        PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
+    );
+
+    // One call to measure the covered-pixel count and confirm it draws.
+    let make_texture = || RawTriangleTexture {
+        tile,
+        tmem: &tmem,
+        lut_mode: crate::TextureLutMode::Disabled,
+    };
+    let first = execute_raw_triangle(
+        &{
+            let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+            registry.begin_candidate(key).unwrap()
+        },
+        other_mode,
+        &triangle,
+        shading.clone(),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+        Some(make_texture()),
+        None,
+    )
+    .expect("microbench triangle rasterizes");
+    // Covered pixels = the number of pixels this triangle actually wrote.
+    // Derive it from the write's rectangle intersected with coverage: the
+    // simplest robust denominator is the count of pixels whose bytes changed
+    // from the zero resident. Recompute deterministically from a run.
+    let drawn = first.device_bytes().device_bytes().to_vec();
+    let covered_pixels: u64 = (0..(target_w * target_h))
+        .filter(|&p| {
+            let o = (p * 2) as usize;
+            drawn[o] != 0 || drawn[o + 1] != 0
+        })
+        .count() as u64;
+    assert!(
+        covered_pixels > 40_000,
+        "microbench must cover a large, fixed pixel count, got {covered_pixels}"
+    );
+
+    // Warm up, then time.
+    let iters = 400u64;
+    for _ in 0..40 {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let _ = execute_raw_triangle(
+            &candidate,
+            other_mode,
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(make_texture()),
+            None,
+        )
+        .unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let completed = execute_raw_triangle(
+            &candidate,
+            other_mode,
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(make_texture()),
+            None,
+        )
+        .unwrap();
+        // Consume the result so the whole call cannot be optimized away.
+        std::hint::black_box(completed.device_bytes().device_bytes().len());
+    }
+    let elapsed = start.elapsed();
+
+    let total_pixels = covered_pixels * iters;
+    let ns_per_pixel = elapsed.as_nanos() as f64 / total_pixels as f64;
+    println!(
+        "[raster-microbench] covered_pixels={covered_pixels} iters={iters} \
+         total_ns={} ns_per_covered_pixel={ns_per_pixel:.3}",
+        elapsed.as_nanos()
+    );
+}
