@@ -97,10 +97,14 @@ pub fn paint_field(rdram: &mut [u8], frame: u64) {
 struct Demo {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
+    zoom_fill_renderer: Option<crate::zoom_fill::ZoomFillRenderer>,
     overlay: Overlay,
     /// The settings the overlay edits. Real `InputConfig`, so the demo
     /// exercises the production settings UI rather than a mock panel.
     config: InputConfig,
+    /// Throwaway video settings: exercise the live checkbox without touching
+    /// the user's video.toml.
+    video: crate::video_config::VideoConfig,
     /// The overlay's rebind UI reads live pad state; empty without a
     /// controller, which is a valid state rather than a special demo case.
     gamepads: Gamepads,
@@ -228,11 +232,9 @@ impl ApplicationHandler for Demo {
                     let size = window.inner_size();
                     // Throwaway, non-persisting: the demo must not write the
                     // user's real video.toml (same reason its InputConfig has
-                    // persist=false).
-                    let mut video = crate::video_config::VideoConfig {
-                        persist: false,
-                        ..crate::video_config::VideoConfig::default()
-                    };
+                    // persist=false). The value lives on Demo so zoom-fill
+                    // remains selected after the overlay closes.
+                    let mut video = &mut self.video;
                     self.overlay.render_over(
                         self.pixels.as_ref().expect("checked above"),
                         (size.width.max(1), size.height.max(1)),
@@ -245,6 +247,14 @@ impl ApplicationHandler for Demo {
                         // and no framerate that would mean anything.
                         None,
                     )
+                } else if self.video.zoom_fill {
+                    self.zoom_fill_renderer
+                        .get_or_insert_with(|| {
+                            crate::zoom_fill::ZoomFillRenderer::new(
+                                self.pixels.as_ref().expect("checked above"),
+                            )
+                        })
+                        .render(self.pixels.as_ref().expect("checked above"))
                 } else {
                     self.pixels.as_ref().expect("checked above").render()
                 };
@@ -317,6 +327,7 @@ pub fn run() {
     let mut demo = Demo {
         window: None,
         pixels: None,
+        zoom_fill_renderer: None,
         overlay: Overlay::new(),
         // Default rather than `InputConfig::load()` so the demo does not READ
         // the user's bindings, and `persist: false` so it cannot WRITE them:
@@ -326,6 +337,10 @@ pub fn run() {
         config: InputConfig {
             persist: false,
             ..InputConfig::default()
+        },
+        video: crate::video_config::VideoConfig {
+            persist: false,
+            ..crate::video_config::VideoConfig::default()
         },
         gamepads: Gamepads::new(),
         rdram: vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE],
