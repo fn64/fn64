@@ -49,6 +49,7 @@ use fn64_render_ir::{
     DecodedTicket, ResourceAccess, ResourceJournal, ResourceJournalLimits, SubmittedTicket,
     TicketAuthoritySet, ValidationError, WorkloadAdmission, WorkloadPacket,
 };
+use std::sync::OnceLock;
 
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{
@@ -3827,7 +3828,8 @@ fn stage_color_commands(
     let mut claimed: Option<TargetRectangle> = None;
     let mut last_completed: Option<CompletedColorTargetWrite> = None;
 
-    for (_, kind) in &schedule {
+    let move_accumulator = move_color_accumulator_enabled();
+    for (schedule_index, (_, kind)) in schedule.iter().enumerate() {
         let (completed, accesses) = match *kind {
             ColorCommandKind::Fill(index) => {
                 execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
@@ -3943,23 +3945,34 @@ fn stage_color_commands(
                 }
             }
         };
-        // This command's own output becomes the next command's resident
-        // bytes. The single line that makes N compose.
-        //
-        // NOTE for anyone optimising here: this re-materialises the WHOLE
-        // colour target once per command in the schedule, and the session
-        // phase census puts 81.6% of the RDP seam inside the `execute` phase
-        // that contains this loop. That makes it a natural suspect -- but a
-        // large byte count is not a bottleneck (perf-method rule 12, earned
-        // by a 5.92 GB clone whose complete elimination measured +0.84%, the
-        // WRONG direction), so it must be COUNTED before it is restructured.
-        // It is deliberately not instrumented from here: `fn64-render-wgpu`
-        // does not depend on `fn64-abi`, and inverting that layering for a
-        // probe would be a worse change than the one being measured.
-        accumulated = Some(completed.device_bytes().device_bytes().to_vec());
         claimed = Some(union_target_rectangle(completed.rectangle(), claimed));
         declared.extend(accesses);
-        last_completed = Some(completed);
+        // This command's owned output becomes the next command's resident
+        // bytes. Intermediate completions have no consumer: only the last
+        // completion can be admitted and published. Moving their existing
+        // buffer therefore preserves the single owner instead of cloning a
+        // complete target and immediately dropping the original. The last
+        // command needs no next accumulator at all.
+        //
+        // Fresh Time Profiler attribution on the WM2000 rs+wgpu lane assigns
+        // 1,646/27,437 exclusive samples to the former clone in this
+        // function. `FN64_MOVE_COLOR_ACCUMULATOR=0` retains that exact clone
+        // path as the same-binary measurement control.
+        if move_accumulator {
+            if schedule_index + 1 == schedule.len() {
+                last_completed = Some(completed);
+            } else {
+                accumulated = Some(
+                    completed
+                        .into_device_color_bytes()
+                        .into_device_bytes()
+                        .into_vec(),
+                );
+            }
+        } else {
+            accumulated = Some(completed.device_bytes().device_bytes().to_vec());
+            last_completed = Some(completed);
+        }
     }
 
     let completed = last_completed.expect("a non-empty schedule ran at least one command");
@@ -3985,6 +3998,17 @@ fn stage_color_commands(
         initialized,
         guest_writes,
     }))
+}
+
+fn move_color_accumulator_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_MOVE_COLOR_ACCUMULATOR") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_MOVE_COLOR_ACCUMULATOR must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
+    })
 }
 
 /// The TMEM prefix a command at `command_index` observes: the one taken
@@ -8862,6 +8886,18 @@ mod tests {
         words
     }
 
+    /// Three fills of one target in one packet. The first establishes every
+    /// byte; the next two patch disjoint rectangles, leaving observable
+    /// pixels from all three commands in the final resident image.
+    fn three_fill_words() -> Vec<u32> {
+        let mut words = whole_target_fill_words();
+        words.extend(set_fill_color(0x213c_4d59));
+        words.extend(fill_rectangle(2, 2, 5, 5));
+        words.extend(set_fill_color(0x6319_7bdf));
+        words.extend(fill_rectangle(10, 1, 13, 6));
+        words
+    }
+
     /// `finalize_and_submit`, with the declared-read capture built before
     /// the plan is moved.
     ///
@@ -9562,6 +9598,42 @@ mod tests {
             backend.has_pending_fill_publication(),
             "a fill-only packet must still stage its deferred publication token"
         );
+    }
+
+    /// Intermediate command completions are consumed to seed their successor,
+    /// while the final completion is retained for admission and publication.
+    /// This adapterless fixture observes bytes owned by every command, so
+    /// dropping, reordering, or failing to transfer either intermediate
+    /// completion changes the published image.
+    #[test]
+    fn three_fills_transfer_intermediate_ownership_and_publish_in_order() {
+        const BASE: u32 = 0x0842_1085;
+        const LEFT: u32 = 0x213c_4d59;
+        const RIGHT: u32 = 0x6319_7bdf;
+
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, three_fill_words());
+
+        let resident = published_target_bytes(&backend);
+        for y in 0..FILL_TARGET_HEIGHT {
+            for x in 0..FILL_TARGET_WIDTH {
+                let offset = ((y * FILL_TARGET_WIDTH + x) * 2) as usize;
+                let actual = u16::from_be_bytes([resident[offset], resident[offset + 1]]);
+                let color = if (2..=5).contains(&x) && (2..=5).contains(&y) {
+                    LEFT
+                } else if (10..=13).contains(&x) && (1..=6).contains(&y) {
+                    RIGHT
+                } else {
+                    BASE
+                };
+                assert_eq!(
+                    actual,
+                    expected_fill_halfword(color, x),
+                    "pixel ({x}, {y}) must retain its latest command owner"
+                );
+            }
+        }
     }
 
     /// A triangle-only packet reaches `draw_admitted_triangles` rather

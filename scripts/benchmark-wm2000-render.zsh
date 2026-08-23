@@ -148,7 +148,7 @@ while (( run_index <= runs )); do
     python3 "$fn64_root/tools/summarize_wm2000_pump_census.py" \
         "$log_path" --output "$summary_path"
     python3 -c \
-        'import json,sys; r=json.load(open(sys.argv[1])); d=r["drawn_frame_ms"]; print(f"benchmark-wm2000: {sys.argv[2]} mean={d['"'"'mean'"'"']:.3f} p95={d['"'"'p95'"'"']:.3f} max={d['"'"'max'"'"']:.3f} ms gap2={100*r['"'"'gap_two_fraction'"'"']:.1f}% over={100*r['"'"'over_budget'"'"']['"'"'fraction'"'"']:.1f}%")' \
+        'import json,sys; r=json.load(open(sys.argv[1])); d=r["drawn_frame_ms"]; print(f"benchmark-wm2000: {sys.argv[2]} mean={d['"'"'mean'"'"']:.3f} p95={d['"'"'p95'"'"']:.3f} p99={d['"'"'p99'"'"']:.3f} max={d['"'"'max'"'"']:.3f} ms gap2={100*r['"'"'gap_two_fraction'"'"']:.1f}% over={100*r['"'"'over_budget'"'"']['"'"'fraction'"'"']:.1f}%")' \
         "$summary_path" "$run_name"
     (( run_index += 1 ))
 done

@@ -11,14 +11,18 @@ it is not inferred from a pump population or from the game's nominal cadence.
 A candidate reaches the performance bar only when all of the following hold:
 
 1. the post-warmup swap-gap histogram is at least 97% gap two;
-2. drawn-frame p95 is at most 33.333 ms;
-3. the over-budget fraction is zero in each certification window;
+2. drawn-frame p95 is at most 25 ms and p99 is at most 28 ms, reserving
+   roughly 5--8 ms for later rendering extensions rather than landing on the
+   deadline;
+3. no drawn frame exceeds the hard 33.333 ms budget in any certification
+   window;
 4. the result repeats for ten consecutive clean runs on a quiet machine;
 5. the required framebuffer/differential gates remain unchanged.
 
-The p95 and zero-over-budget requirements intentionally make “reliable 30 Hz”
-stricter than a mean below 33.333 ms. Until all five conditions hold, the
-status is “not verified.”
+The percentile headroom and zero-over-budget requirements intentionally make
+“reliable 30 Hz” stricter than a mean below 33.333 ms. A barely compliant
+renderer leaves no room for extensions and does not satisfy this goal. Until
+all five conditions hold, the status is “not verified.”
 
 `tools/summarize_wm2000_pump_census.py` consumes the existing pump-census
 sequence and emits a path-free JSON receipt containing the exact swap-gap and
@@ -47,9 +51,11 @@ Every optimization is handled as one transaction:
 
 1. **Baseline.** Build once, verify the resolved renderer is `wgpu`, check the
    machine is quiet, warm up for 300 pumps, then retain an 800-pump sequence.
-2. **Profile.** Capture a CPU profile from that exact build and window. Use the
-   `cpu-profile` table and its recorded image load address; do not use `sample`,
-   shared kdebug stack fragments, or inferred ASLR slides.
+2. **Profile.** Capture a Time Profiler trace from that exact build and window.
+   Export only its `time-profile` table; do not use `sample`, shared kdebug
+   stack fragments, or inferred ASLR slides. Summarize it with
+   `tools/summarize_xctrace_time_profile.py` so exclusive rows and selected
+   main-image callers are repeatable and path-free.
 3. **Choose one hotspot.** State its measured exclusive cost and a falsifiable
    mechanism. Prefer work repeated per pixel or per scanline over command-level
    checks unless the profile says otherwise.
@@ -78,20 +84,24 @@ full differential suites and ten-run certification series.
 
 ## Current ordered queue
 
-1. Finish and validate omission of diagnostic-only GPU TMEM projections on the
-   CPU presentation lane.
-2. Finish and validate parallel row execution for byte-identical VI dither
-   restoration.
-3. Capture a fresh combined-build profile; prior profiles are selection history,
-   not authority for the new binary.
-4. Attack the largest remaining exclusive cost, currently expected among VI
-   restoration, blend/combiner work, texture sampling, and raster traversal.
+1. Move intermediate color-target ownership between scheduled commands instead
+   of cloning and immediately dropping the same full-target bytes. **Measured
+   and retained; evidence below.**
+2. Remove the next measured copy at the command executor boundary by passing
+   the owned accumulator into raw-triangle/texrect execution. Preserve the old
+   borrowed path as the same-binary control.
+3. Re-profile and use the drawn-frame population receipt to select the next
+   RDP mechanism. Current likely candidates are texrect blend/write, combiner
+   evaluation, texture sampling, and raw-triangle raster traversal.
+4. Optimize fixed VI restoration only when the variable RDP population is
+   safely below the headroom bar; VI presentation is flat across the current
+   within/over-budget populations and does not explain the tail.
 5. Reconsider command-level validation only when the fresh profile attributes a
    material cost to it. Move stable invariants into types or once-per-command
    validation; never delete guest-visible RDP semantics to meet the budget.
 
-The queue is deliberately provisional after item 2: each fresh profile, not
-this document, chooses the next optimization.
+The queue is deliberately provisional after item 2: each fresh profile and
+drawn-frame population split, not this document, chooses the next optimization.
 
 ## First combined result
 
@@ -121,3 +131,33 @@ its immediate caller attributes 1,646 samples to `stage_color_commands` and
 472 to `execute_scheduled_raw_triangle`. The next candidate therefore targets
 the redundant full-target ownership copy in `stage_color_commands`; the profile
 does not justify deleting command-boundary correctness checks.
+
+## Accumulator ownership result
+
+The next release binary moves each intermediate completion's owned device-byte
+buffer into the schedule accumulator and retains only the final completion.
+`FN64_MOVE_COLOR_ACCUMULATOR=0` preserves the former clone in the same binary.
+The adapterless three-fill composition fixture observes pixels owned by all
+three commands and passed 10/10 consecutive runs on both candidate and control.
+
+| Order | Mean ms/drawn | p95 ms/drawn | Gap two | Over 33.333 ms |
+| --- | ---: | ---: | ---: | ---: |
+| candidate 1 | 30.729 | 46.337 | 100% | 50.1% |
+| control 1 | 33.657 | 54.840 | 100% | 58.6% |
+| control 2 | 33.839 | 53.864 | 100% | 59.1% |
+| candidate 2 | 30.825 | 46.875 | 100% | 51.9% |
+
+Both pair orders agree: the ownership move removes 2.93--3.01 ms from mean
+drawn-frame time and 6.99--8.50 ms from p95. A fresh 26,676-sample Time
+Profiler capture attributes 432 `_platform_memmove` samples to
+`stage_color_commands`, down from 1,646 (74% lower), while total memmove falls
+from 3,171 to 2,016 samples. The named cost fell rather than moving elsewhere.
+
+The phase-armed drawn-frame receipt then separates the remaining mechanism.
+Over-budget frames average 2.99 graphics tasks and 30.85 ms of RDP work;
+within-budget frames average 1.59 graphics tasks and 15.47 ms of RDP work.
+Their 19.04 ms wall-time delta contains a 15.38 ms RDP delta, while VI
+presentation is 0.09 ms lower in the over-budget population. The tail is
+variable RDP workload, not VI presentation or command-boundary checks. The
+post-change profile's next full-target copy is 531 memmove samples attributed
+to `execute_scheduled_raw_triangle`, which selects queue item 2.
