@@ -36,6 +36,10 @@ struct Timings {
     reads: Duration,
     finalize: Duration,
     execute: Duration,
+    compute_probe: Duration,
+    compute_probe_batches: u32,
+    compute_probe_draws: u32,
+    compute_probe_pixels: u32,
     commit: Duration,
     copyback: Duration,
     publish: Duration,
@@ -48,6 +52,10 @@ impl Timings {
         self.reads += other.reads;
         self.finalize += other.finalize;
         self.execute += other.execute;
+        self.compute_probe += other.compute_probe;
+        self.compute_probe_batches += other.compute_probe_batches;
+        self.compute_probe_draws += other.compute_probe_draws;
+        self.compute_probe_pixels += other.compute_probe_pixels;
         self.commit += other.commit;
         self.copyback += other.copyback;
         self.publish += other.publish;
@@ -104,6 +112,8 @@ fn main() {
     let warmup = env_u32("FN64_RAW_DPC_REPLAY_WARMUP", 10);
     let repeat = env_u32("FN64_RAW_DPC_REPLAY_REPEAT", 100);
     let detail = std::env::var_os("FN64_RAW_DPC_REPLAY_DETAIL").is_some();
+    let compute_probe_requested =
+        std::env::var_os("FN64_COMPUTE_RASTER_PROBE").is_some_and(|value| value == "1");
     assert!(repeat > 0, "FN64_RAW_DPC_REPLAY_REPEAT must be nonzero");
 
     let (mut backend, mut session) = WgpuBackend::try_new().expect("construct wgpu backend");
@@ -114,6 +124,7 @@ fn main() {
             tv_type: TvType::default(),
         })
         .expect("create wgpu backend");
+    backend.set_compute_raster_probe_enabled(false);
 
     let mut postimage = pristine.clone();
     for (index, stream) in prefix.iter().enumerate() {
@@ -137,6 +148,7 @@ fn main() {
             prefix.len()
         );
     }
+    backend.set_compute_raster_probe_enabled(compute_probe_requested);
 
     let mut samples = Vec::with_capacity(repeat as usize);
     let mut packet_samples = vec![Vec::with_capacity(repeat as usize); benchmark.len()];
@@ -201,19 +213,43 @@ fn main() {
     report("guest_reads", &samples, |sample| sample.reads);
     report("finalize", &samples, |sample| sample.finalize);
     report("execute", &samples, |sample| sample.execute);
+    report("compute_probe", &samples, |sample| sample.compute_probe);
     report("commit", &samples, |sample| sample.commit);
     report("copyback", &samples, |sample| sample.copyback);
     report("publish", &samples, |sample| sample.publish);
     report("total", &samples, |sample| sample.total);
+    let probe_batches: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_probe_batches)
+        .sum();
+    let probe_draws: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_probe_draws)
+        .sum();
+    let probe_pixels: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_probe_pixels)
+        .sum();
+    println!(
+        "compute_probe_receipts={} draws={} target_pixels={} across_repeats={}",
+        probe_batches, probe_draws, probe_pixels, repeat
+    );
     if detail {
         for (window_index, packet) in packet_samples.iter().enumerate() {
             let packet_index = prefix.len() + window_index;
-            report(&format!("packet_{packet_index}_execute"), packet, |sample| {
-                sample.execute
-            });
+            report(
+                &format!("packet_{packet_index}_execute"),
+                packet,
+                |sample| sample.execute,
+            );
             report(&format!("packet_{packet_index}_total"), packet, |sample| {
                 sample.total
             });
+            report(
+                &format!("packet_{packet_index}_compute_probe"),
+                packet,
+                |sample| sample.compute_probe,
+            );
         }
     }
 }
@@ -269,6 +305,7 @@ fn replay_once(
         .execute_raw_dpc(bound)
         .expect("execute captured packet");
     let execute = started.elapsed();
+    let compute_probe = backend.take_compute_raster_probe_receipt();
 
     let staged = backend.staged_guest_render_target_writes(submission);
     let payloads = backend.committed_guest_render_target_bytes(submission);
@@ -327,6 +364,16 @@ fn replay_once(
             reads,
             finalize,
             execute,
+            compute_probe: compute_probe
+                .map(|receipt| receipt.elapsed())
+                .unwrap_or_default(),
+            compute_probe_batches: u32::from(compute_probe.is_some()),
+            compute_probe_draws: compute_probe
+                .map(|receipt| receipt.draw_count())
+                .unwrap_or_default(),
+            compute_probe_pixels: compute_probe
+                .map(|receipt| receipt.target_pixels())
+                .unwrap_or_default(),
             commit,
             copyback,
             publish,

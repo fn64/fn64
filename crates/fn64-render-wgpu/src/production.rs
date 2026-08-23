@@ -51,11 +51,14 @@ use fn64_render_ir::{
 };
 use std::borrow::Cow;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, CandidateColorTarget, CompletedColorTargetWrite,
-    ResolvedFragmentBlendParams, TargetRectangle,
+    ComputeCoverageTriangle, ComputeRasterBatch, ComputeRasterBatchBuilder,
+    ComputeRasterDrawAdmission, ComputeRasterProgramKey, ResolvedFragmentBlendParams,
+    TargetRectangle,
 };
 use crate::tmem::{project_committed_tmem, TileBindingParams, TmemGpuProjection};
 use crate::{
@@ -160,6 +163,13 @@ pub struct WgpuBackend {
     /// restore the former CPU preparation work without also submitting to
     /// the GPU, giving performance measurements an exact in-process control.
     project_gpu_tmem: bool,
+    /// Explicit game-derived CPU/compute differential. Disabled by default;
+    /// `FN64_COMPUTE_RASTER_PROBE=1` admits only the closed hottest-state
+    /// batch and rejects any complete-target byte mismatch.
+    compute_raster_probe_enabled: bool,
+    /// Most recent successful probe execution, consumed by the offline
+    /// replay's phase accounting. An ineligible packet leaves this `None`.
+    compute_raster_probe_receipt: Option<ComputeRasterProbeReceipt>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -205,6 +215,158 @@ pub struct WgpuBackend {
     /// black frame the VI never scanned out. A *successful* present always
     /// replaces it, so this is never an accumulated history.
     presented_field: Option<crate::PresentedField>,
+}
+
+/// One completed game-derived hottest-state compute differential. The time
+/// includes the prototype's uploads, dispatch, waits, and two readbacks; it
+/// intentionally does not pretend those costs are shader-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeRasterProbeReceipt {
+    draw_count: u32,
+    target_pixels: u32,
+    elapsed: Duration,
+}
+
+impl ComputeRasterProbeReceipt {
+    pub const fn draw_count(self) -> u32 {
+        self.draw_count
+    }
+
+    pub const fn target_pixels(self) -> u32 {
+        self.target_pixels
+    }
+
+    pub const fn elapsed(self) -> Duration {
+        self.elapsed
+    }
+}
+
+struct ComputeRasterProbe {
+    ordinal: u64,
+    batch: ComputeRasterBatch,
+    extent: TriangleTargetExtent,
+    resident_bytes: Vec<u8>,
+    triangles: Box<[ComputeCoverageTriangle]>,
+    tmem: TmemGpuProjection,
+    tile: TileBindingParams,
+    expected_bytes: Vec<u8>,
+}
+
+struct ComputeRasterProbeBuilder {
+    batch: ComputeRasterBatchBuilder,
+    extent: TriangleTargetExtent,
+    resident_bytes: Vec<u8>,
+    triangles: Vec<ComputeCoverageTriangle>,
+    shared_tmem_identity: Option<crate::TmemSnapshotIdentity>,
+    shared_tmem: Option<TmemGpuProjection>,
+    shared_tile: Option<TileBindingParams>,
+}
+
+impl ComputeRasterProbeBuilder {
+    fn new(candidate: &CandidateColorTarget, resident_bytes: Vec<u8>) -> Self {
+        let key = candidate.key();
+        Self {
+            batch: ComputeRasterBatchBuilder::new(key, candidate.generation()),
+            extent: TriangleTargetExtent {
+                width: key.extent().width(),
+                height: key.extent().height(),
+            },
+            resident_bytes,
+            triangles: Vec::new(),
+            shared_tmem_identity: None,
+            shared_tmem: None,
+            shared_tile: None,
+        }
+    }
+
+    fn push<S: crate::TmemByteSource + ?Sized>(
+        &mut self,
+        collector: &ExecutionCollector<'_>,
+        candidate: &CandidateColorTarget,
+        index: usize,
+        tmem: &S,
+    ) -> Result<bool, WgpuRawDpcExecutionError> {
+        let (_, triangle_index, command_index, _) = &collector.plan.raw_triangle_commands[index];
+        let draw = collector.plan.triangles[*triangle_index]
+            .as_ref()
+            .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
+        let triangle = decode_scheduled_raw_triangle(collector, index)?;
+        let program = match ComputeRasterProgramKey::try_admit(
+            candidate.key(),
+            draw.combine_params,
+            draw.other_mode,
+            triangle.flags().textured(),
+        ) {
+            Ok(program) => program,
+            Err(_) => return Ok(false),
+        };
+        let accesses = scheduled_raw_triangle_accesses(collector, candidate, index)?;
+        let identity = crate::TmemByteSource::snapshot(tmem);
+        let projection = crate::project_tmem(tmem);
+        let tile = draw
+            .tile_binding
+            .with_lut_mode(draw.other_mode.texture_lut_mode());
+        if self
+            .shared_tmem_identity
+            .is_some_and(|shared| shared != identity)
+            || self.shared_tmem.is_some_and(|shared| shared != projection)
+            || self.shared_tile.is_some_and(|shared| shared != tile)
+        {
+            return Ok(false);
+        }
+        let admission = match ComputeRasterDrawAdmission::try_new(
+            candidate.key(),
+            *command_index,
+            *triangle_index,
+            program,
+            identity,
+            accesses,
+        ) {
+            Ok(admission) => admission,
+            Err(_) => return Ok(false),
+        };
+        if self.batch.push(admission).is_err() {
+            return Ok(false);
+        }
+        self.shared_tmem_identity = Some(identity);
+        self.shared_tmem = Some(projection);
+        self.shared_tile = Some(tile);
+        self.triangles.push(
+            ComputeCoverageTriangle::from_raw(triangle)
+                .with_material(draw.env_color, draw.prim_color),
+        );
+        Ok(true)
+    }
+
+    fn finish(self, ordinal: u64, expected_bytes: Vec<u8>) -> Option<ComputeRasterProbe> {
+        Some(ComputeRasterProbe {
+            ordinal,
+            batch: self.batch.finish().ok()?,
+            extent: self.extent,
+            resident_bytes: self.resident_bytes,
+            triangles: self.triangles.into_boxed_slice(),
+            tmem: self.shared_tmem?,
+            tile: self.shared_tile?,
+            expected_bytes,
+        })
+    }
+}
+
+fn retain_compute_probe_draw<S: crate::TmemByteSource + ?Sized>(
+    builder: &mut Option<ComputeRasterProbeBuilder>,
+    collector: &ExecutionCollector<'_>,
+    candidate: &CandidateColorTarget,
+    index: usize,
+    tmem: &S,
+) -> Result<(), WgpuRawDpcExecutionError> {
+    let keep = match builder.as_mut() {
+        Some(builder) => builder.push(collector, candidate, index, tmem)?,
+        None => return Ok(()),
+    };
+    if !keep {
+        *builder = None;
+    }
+    Ok(())
 }
 
 /// Capacity rationale: 4 is the fixed bounded ceiling for concurrently
@@ -290,6 +452,8 @@ impl WgpuBackend {
                 triangle_draw_output: None,
                 gpu_triangle_draw_enabled,
                 project_gpu_tmem,
+                compute_raster_probe_enabled: env_exact_one("FN64_COMPUTE_RASTER_PROBE"),
+                compute_raster_probe_receipt: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -308,6 +472,21 @@ impl WgpuBackend {
     /// backend ("finalize it as retrievable").
     pub fn presented_field(&self) -> Option<&crate::PresentedField> {
         self.presented_field.as_ref()
+    }
+
+    /// Consume the most recent game-derived compute-raster probe timing.
+    /// `None` means either probing is disabled or the last packet was not
+    /// one closed hottest-state batch.
+    pub fn take_compute_raster_probe_receipt(&mut self) -> Option<ComputeRasterProbeReceipt> {
+        self.compute_raster_probe_receipt.take()
+    }
+
+    /// Diagnostic replay control. It changes only whether an additional
+    /// CPU/compute differential is collected; production pixels and the CPU
+    /// execution path are unchanged.
+    pub fn set_compute_raster_probe_enabled(&mut self, enabled: bool) {
+        self.compute_raster_probe_enabled = enabled;
+        self.compute_raster_probe_receipt = None;
     }
 
     /// The currently-published physical TMEM state. Exposed for diagnostics
@@ -729,6 +908,16 @@ impl WgpuBackend {
         }
         self.triangle_draw_output = Some(output);
         Ok(())
+    }
+}
+
+fn env_exact_one(name: &'static str) -> bool {
+    match std::env::var(name) {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Ok(value) => panic!("{name} must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("{name} is not valid Unicode: {error}"),
     }
 }
 
@@ -1474,6 +1663,12 @@ struct ExecutionCollector<'coord> {
     /// The measurement control can request them without submitting a draw;
     /// the guest-visible CPU raster path never consumes them.
     project_gpu_tmem: bool,
+    /// Whether to collect one strict hottest-state CPU/compute differential
+    /// from this packet's already-resolved production schedule.
+    collect_compute_probe: bool,
+    /// Filled only when the complete color-command schedule is one closed
+    /// probe batch. Any boundary or unadmitted state leaves it absent.
+    compute_probes: Vec<ComputeRasterProbe>,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -1610,6 +1805,24 @@ pub enum WgpuRawDpcExecutionError {
     /// The real GPU triangle-draw pipeline rejected a draw (device
     /// poisoned, submission/readback failure) -- never silently skipped.
     TriangleDraw(TrianglePipelineError),
+    /// The explicitly-enabled game-derived probe produced a different byte
+    /// from the existing CPU executor's complete target.
+    ComputeRasterProbeMismatch {
+        ordinal: u64,
+        command_index: u32,
+        triangle_index: usize,
+        x: u32,
+        y: u32,
+        expected: u16,
+        actual: u16,
+        gpu_trace: [u32; 4],
+    },
+    /// The explicitly-enabled game-derived probe returned a target of the
+    /// wrong length, so no byte-for-byte comparison is possible.
+    ComputeRasterProbeLength {
+        expected: usize,
+        actual: usize,
+    },
     /// A triangle-bearing plan reached execution with no successful prior
     /// `RenderBackend::create` call -- `triangle_pipeline`/
     /// `triangle_target_extent` are always `Some` together (§1a/§1e) or
@@ -1840,6 +2053,27 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 write!(formatter, "triangle draw state missing: {error}")
             }
             Self::TriangleDraw(error) => write!(formatter, "triangle draw failed: {error}"),
+            Self::ComputeRasterProbeMismatch {
+                ordinal,
+                command_index,
+                triangle_index,
+                x,
+                y,
+                expected,
+                actual,
+                gpu_trace,
+            } => write!(
+                formatter,
+                "compute-raster probe disagreed with the CPU target in packet ordinal {ordinal}, \
+                 command #{command_index}, triangle #{triangle_index}, pixel ({x}, {y}): expected \
+                 RGBA16 {expected:#06x}, got {actual:#06x}; GPU stage trace \
+                 coords={:#010x} texel={:#010x} shade={:#010x} combined={:#010x}",
+                gpu_trace[0], gpu_trace[1], gpu_trace[2], gpu_trace[3]
+            ),
+            Self::ComputeRasterProbeLength { expected, actual } => write!(
+                formatter,
+                "compute-raster probe returned {actual} target bytes; CPU produced {expected}"
+            ),
             Self::TriangleDrawBeforeCreate => formatter.write_str(
                 "a triangle-bearing plan reached execution with no successful prior \
                  RenderBackend::create call",
@@ -2358,7 +2592,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        let (prepared, triangles, pending, draw_tmem) = execute_raw_dpc_inner(
+        let (prepared, triangles, pending, draw_tmem, compute_probes) = execute_raw_dpc_inner(
             &mut self.coordinator,
             bound,
             self.raw_dpc_carry_in_before_last_plan
@@ -2366,8 +2600,87 @@ impl RenderBackend for WgpuBackend {
             &mut self.color_targets,
             self.configured_target_extent,
             self.project_gpu_tmem,
+            self.compute_raster_probe_enabled,
         )
         .map_err(RenderError::from)?;
+
+        self.compute_raster_probe_receipt = None;
+        let mut probe_elapsed = Duration::ZERO;
+        let mut probe_draws = 0u32;
+        let mut probe_pixels = 0u32;
+        let mut probe_batches = 0u32;
+        for probe in compute_probes {
+            let pipeline = self
+                .triangle_pipeline
+                .as_mut()
+                .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
+                .map_err(RenderError::from)?;
+            let started = Instant::now();
+            let observation = pipeline
+                .compute_triangle_hot_color_observed(
+                    probe.extent,
+                    &probe.resident_bytes,
+                    &probe.triangles,
+                    &probe.tmem,
+                    probe.tile,
+                )
+                .map_err(WgpuRawDpcExecutionError::TriangleDraw)
+                .map_err(RenderError::from)?;
+            let elapsed = started.elapsed();
+            probe_elapsed += elapsed;
+            probe_batches += 1;
+            probe_draws += u32::try_from(probe.batch.draws().len())
+                .expect("bounded raw-DPC draw count fits u32");
+            probe_pixels += probe.extent.width * probe.extent.height;
+            if let Some(byte) = observation
+                .bytes()
+                .iter()
+                .zip(&probe.expected_bytes)
+                .position(|(actual, expected)| actual != expected)
+            {
+                let pixel = byte / 2;
+                let pair = pixel * 2;
+                let expected = u16::from_be_bytes([
+                    probe.expected_bytes[pair],
+                    probe.expected_bytes[pair + 1],
+                ]);
+                let actual =
+                    u16::from_be_bytes([observation.bytes()[pair], observation.bytes()[pair + 1]]);
+                let gpu_trace = observation.trace_at(pixel);
+                let draw = probe
+                    .batch
+                    .draws()
+                    .first()
+                    .expect("a sealed compute batch contains at least one draw");
+                return Err(RenderError::from(
+                    WgpuRawDpcExecutionError::ComputeRasterProbeMismatch {
+                        ordinal: probe.ordinal,
+                        command_index: draw.command_index(),
+                        triangle_index: draw.triangle_index(),
+                        x: pixel as u32 % probe.extent.width,
+                        y: pixel as u32 / probe.extent.width,
+                        expected,
+                        actual,
+                        gpu_trace,
+                    },
+                ));
+            }
+            if observation.bytes().len() != probe.expected_bytes.len() {
+                return Err(RenderError::from(
+                    WgpuRawDpcExecutionError::ComputeRasterProbeLength {
+                        expected: probe.expected_bytes.len(),
+                        actual: observation.bytes().len(),
+                    },
+                ));
+            }
+        }
+        if probe_batches != 0 {
+            self.compute_raster_probe_receipt = Some(ComputeRasterProbeReceipt {
+                draw_count: probe_draws,
+                target_pixels: probe_pixels,
+                elapsed: probe_elapsed,
+            });
+        }
 
         // **The GPU triangle draw is diagnostic, and it is 65% of this
         // backend's frame time.**
@@ -2833,12 +3146,14 @@ fn execute_raw_dpc_inner(
     color_targets: &mut Option<ColorTargetRegistry>,
     configured_target_extent: Option<TriangleTargetExtent>,
     project_gpu_tmem: bool,
+    collect_compute_probe: bool,
 ) -> Result<
     (
         BackendPreparedRawDpc,
         Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
         Option<PendingFillPublication>,
         Option<Vec<TmemGpuProjection>>,
+        Vec<ComputeRasterProbe>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -2855,6 +3170,8 @@ fn execute_raw_dpc_inner(
         configured_target_extent,
         draw_tmem: None,
         project_gpu_tmem,
+        collect_compute_probe,
+        compute_probes: Vec::new(),
     };
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
@@ -2868,6 +3185,7 @@ fn execute_raw_dpc_inner(
     // about what this packet's TMEM half staged, independent of which
     // coordinator completion the outcome routes to.
     let draw_tmem = view.draw_tmem;
+    let compute_probes = view.compute_probes;
     let mut pending = None;
 
     let prepared = match outcome {
@@ -2939,7 +3257,7 @@ fn execute_raw_dpc_inner(
         }
     };
 
-    Ok((prepared, triangles, pending, draw_tmem))
+    Ok((prepared, triangles, pending, draw_tmem, compute_probes))
 }
 
 /// The pipeline `submitted_packet` runs once `&WorkloadPacket` is in scope:
@@ -3833,6 +4151,7 @@ fn stage_color_commands(
     let move_accumulator = move_color_accumulator_enabled();
     let own_command_input = own_color_command_input_enabled();
     for (schedule_index, (_, kind)) in schedule.iter().enumerate() {
+        let mut compute_probe_builder = None;
         let (completed, accesses) = match *kind {
             ColorCommandKind::Fill(index) => {
                 execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
@@ -3890,6 +4209,14 @@ fn stage_color_commands(
                 // Same resident-bytes requirement as a texrect and for the
                 // same reason: a triangle writes a sub-region, so every
                 // pixel outside it must come from real prior content.
+                compute_probe_builder = collector
+                    .collect_compute_probe
+                    .then(|| {
+                        accumulated.as_ref().map(|resident| {
+                            ComputeRasterProbeBuilder::new(&candidate, resident.clone())
+                        })
+                    })
+                    .flatten();
                 let resident = color_command_input(&mut accumulated, own_command_input, key)?;
                 // **A raw triangle samples TMEM at its OWN stream position,
                 // by the SAME rule a texrect does.**
@@ -3906,44 +4233,80 @@ fn stage_color_commands(
                 match tmem {
                     TexrectTmemSource::Pending { pending, prefixes } => {
                         match prefix_before(prefixes, command_index) {
-                            Some(prefix) => execute_scheduled_raw_triangle(
-                                collector,
-                                &candidate,
-                                index,
-                                resident,
-                                &pending.prefix_image(prefix),
-                                true,
-                                depth_accum.as_deref_mut(),
-                            )?,
+                            Some(prefix) => {
+                                let image = pending.prefix_image(prefix);
+                                retain_compute_probe_draw(
+                                    &mut compute_probe_builder,
+                                    collector,
+                                    &candidate,
+                                    index,
+                                    &image,
+                                )?;
+                                execute_scheduled_raw_triangle(
+                                    collector,
+                                    &candidate,
+                                    index,
+                                    resident,
+                                    &image,
+                                    true,
+                                    depth_accum.as_deref_mut(),
+                                )?
+                            }
                             // No load precedes this triangle in its own
                             // packet, so TMEM holds exactly what an earlier
                             // packet published -- durable committed state,
                             // read through the same one sampler. The absence
                             // of a preceding load IS the stream fact that
                             // makes committed correct; it is not a fallback.
-                            None => execute_scheduled_raw_triangle(
-                                collector,
-                                &candidate,
-                                index,
-                                resident,
-                                collector.physical,
-                                false,
-                                depth_accum.as_deref_mut(),
-                            )?,
+                            None => {
+                                retain_compute_probe_draw(
+                                    &mut compute_probe_builder,
+                                    collector,
+                                    &candidate,
+                                    index,
+                                    collector.physical,
+                                )?;
+                                execute_scheduled_raw_triangle(
+                                    collector,
+                                    &candidate,
+                                    index,
+                                    resident,
+                                    collector.physical,
+                                    false,
+                                    depth_accum.as_deref_mut(),
+                                )?
+                            }
                         }
                     }
-                    TexrectTmemSource::Committed(state) => execute_scheduled_raw_triangle(
-                        collector,
-                        &candidate,
-                        index,
-                        resident,
-                        state,
-                        false,
-                        depth_accum.as_deref_mut(),
-                    )?,
+                    TexrectTmemSource::Committed(state) => {
+                        retain_compute_probe_draw(
+                            &mut compute_probe_builder,
+                            collector,
+                            &candidate,
+                            index,
+                            state,
+                        )?;
+                        execute_scheduled_raw_triangle(
+                            collector,
+                            &candidate,
+                            index,
+                            resident,
+                            state,
+                            false,
+                            depth_accum.as_deref_mut(),
+                        )?
+                    }
                 }
             }
         };
+        if let Some(builder) = compute_probe_builder {
+            if let Some(probe) = builder.finish(
+                collector.ordinal,
+                completed.device_bytes().device_bytes().to_vec(),
+            ) {
+                collector.compute_probes.push(probe);
+            }
+        }
         claimed = Some(union_target_rectangle(completed.rectangle(), claimed));
         declared.extend(accesses);
         // This command's owned output becomes the next command's resident
@@ -4304,6 +4667,53 @@ fn execute_scheduled_fill(
     Ok((completed, accesses))
 }
 
+fn decode_scheduled_raw_triangle(
+    collector: &ExecutionCollector<'_>,
+    index: usize,
+) -> Result<crate::raw_dpc::RawTriangle, WgpuRawDpcExecutionError> {
+    let (_, triangle_index, _, raw_words) = &collector.plan.raw_triangle_commands[index];
+    let mut bytes = Vec::with_capacity(raw_words.len() * 4);
+    for word in raw_words.iter() {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    let opcode = raw_words
+        .first()
+        .map(|word| ((word >> 24) & 0x3f) as u8)
+        .ok_or(WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
+            triangle_index: *triangle_index,
+        })?;
+    crate::raw_dpc::RawTriangle::decode(opcode, &bytes).map_err(|_| {
+        WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
+            triangle_index: *triangle_index,
+        }
+    })
+}
+
+fn scheduled_raw_triangle_accesses(
+    collector: &ExecutionCollector<'_>,
+    candidate: &CandidateColorTarget,
+    index: usize,
+) -> Result<Vec<ResourceAccess>, WgpuRawDpcExecutionError> {
+    let (span, triangle_index, _, _) = &collector.plan.raw_triangle_commands[index];
+    let start = span.first_access_index as usize;
+    let end = start.checked_add(span.access_count as usize).ok_or(
+        WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
+            triangle_index: *triangle_index,
+        },
+    )?;
+    let accesses = collector
+        .plan
+        .accesses
+        .get(start..end)
+        .filter(|slice| !slice.is_empty())
+        .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
+            triangle_index: *triangle_index,
+        })?
+        .to_vec();
+    verify_accesses_inside(&accesses, candidate.key())?;
+    Ok(accesses)
+}
+
 /// Executes the flat raw triangle at `index` of the plan's own
 /// `raw_triangle_commands` list against the accumulated buffer, returning
 /// its completion and its declared accesses.
@@ -4324,7 +4734,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     expect_proposed: bool,
     depth_cells: Option<&mut [crate::targets::DepthCell]>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
-    let (span, triangle_index, _, raw_words) = &collector.plan.raw_triangle_commands[index];
+    let (_, triangle_index, _, _) = &collector.plan.raw_triangle_commands[index];
     let draw_state = collector.plan.triangles[*triangle_index]
         .as_ref()
         .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
@@ -4335,50 +4745,8 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     // dxldy at all, and the rasterizer needs exactly those. Re-decoding the
     // same bytes through the same `RawTriangle::decode` is not a second
     // derivation -- it is the identical function over the identical input.
-    let mut bytes = Vec::with_capacity(raw_words.len() * 4);
-    for word in raw_words.iter() {
-        bytes.extend_from_slice(&word.to_be_bytes());
-    }
-    // **The opcode comes from the command's own first wire byte**, not a
-    // frozen 0x08. `RawTriangle::decode` sizes every optional coefficient
-    // block from the opcode's flag bits, so decoding a shaded-and-textured
-    // 0x0e as 0x08 would reject it on length -- which is exactly what the
-    // frozen constant did before the texture rung, harmlessly, because no
-    // textured triangle was ever admitted this far.
-    let opcode = raw_words
-        .first()
-        .map(|word| ((word >> 24) & 0x3f) as u8)
-        .ok_or(WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
-            triangle_index: *triangle_index,
-        })?;
-    let triangle = crate::raw_dpc::RawTriangle::decode(opcode, &bytes).map_err(|_| {
-        WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
-            triangle_index: *triangle_index,
-        }
-    })?;
-
-    // Locate the declared run by the decoder's own recorded span.
-    let start = span.first_access_index as usize;
-    let end = start.checked_add(span.access_count as usize).ok_or(
-        WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
-            triangle_index: *triangle_index,
-        },
-    )?;
-    let accesses = collector
-        .plan
-        .accesses
-        .get(start..end)
-        .filter(|slice| !slice.is_empty())
-        .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
-            triangle_index: *triangle_index,
-        })?
-        .to_vec();
-
-    // Cross-check, not an assumption: every declared access must fall inside
-    // the candidate key's own range, which was derived from the packet's
-    // `SetColorImage` by a path independent of the decoder's row planner.
-    let key = candidate.key();
-    verify_accesses_inside(&accesses, key)?;
+    let triangle = decode_scheduled_raw_triangle(collector, index)?;
+    let accesses = scheduled_raw_triangle_accesses(collector, candidate, index)?;
 
     // **The tile binding, for a TEXTURED triangle only, resolved from the
     // triangle's OWN wire tile field.**
@@ -9970,7 +10338,7 @@ mod tests {
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
         let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
-        let (_prepared, _triangles, pending, _draw_tmem) = execute_raw_dpc_inner(
+        let (_prepared, _triangles, pending, _draw_tmem, _probe) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -9979,6 +10347,7 @@ mod tests {
             &mut backend.color_targets,
             backend.configured_target_extent,
             true,
+            false,
         )
         .expect("the fill half must stage a real token");
         assert!(
@@ -11399,6 +11768,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -11713,6 +12084,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -12731,7 +13104,7 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+        let (_prepared, _triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -12740,6 +13113,7 @@ mod tests {
             &mut backend.color_targets,
             backend.configured_target_extent,
             true,
+            false,
         )
         .expect("the sprite strip must execute");
 
@@ -12807,7 +13181,7 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+        let (_prepared, triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -12815,6 +13189,7 @@ mod tests {
                 .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
             &mut backend.color_targets,
             backend.configured_target_extent,
+            false,
             false,
         )
         .expect("the CPU-raster sprite strip must execute");
@@ -12924,6 +13299,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan.triangle_commands
@@ -13092,7 +13469,7 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &distinct);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, _triangles, _pending, draw_tmem) = execute_raw_dpc_inner(
+        let (_prepared, _triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -13101,6 +13478,7 @@ mod tests {
             &mut backend.color_targets,
             backend.configured_target_extent,
             true,
+            false,
         )
         .expect("a texrect before the packet's own load reads durable TMEM and executes");
 
@@ -13579,6 +13957,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -13628,6 +14008,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -13805,10 +14187,7 @@ mod tests {
              Proposed the oracle is not independent of the executor"
         );
         let [red, green, blue, _alpha] = texel.texel().rgba8888();
-        (u16::from(red >> 3) << 11)
-            | (u16::from(green >> 3) << 6)
-            | (u16::from(blue >> 3) << 1)
-            | 1
+        (u16::from(red >> 3) << 11) | (u16::from(green >> 3) << 6) | (u16::from(blue >> 3) << 1) | 1
     }
 
     /// **The overlap semantics, proven: two texrects whose rectangles
@@ -14295,12 +14674,8 @@ mod tests {
             crate::state::PrimColor::from_wire(0x05 << 8 | 0x40, prim_wire),
         );
         let (combined, _alpha_compare) = crate::combiner::run_one_cycle(params, inputs);
-        let [red, green, blue, _alpha] =
-            combined.map(|channel| (channel * 255.0).round() as u8);
-        (u16::from(red >> 3) << 11)
-            | (u16::from(green >> 3) << 6)
-            | (u16::from(blue >> 3) << 1)
-            | 1
+        let [red, green, blue, _alpha] = combined.map(|channel| (channel * 255.0).round() as u8);
+        (u16::from(red >> 3) << 11) | (u16::from(green >> 3) << 6) | (u16::from(blue >> 3) << 1) | 1
     }
 
     /// **The inversion: a texrect whose latched `SetCombine` references
@@ -14920,8 +15295,7 @@ mod tests {
                          whole-target fill's own value"
                     ),
                     Some(index) => {
-                        let [red, green, blue, _alpha] =
-                            MULTI_ONE_CYCLE_PRIM[index].to_be_bytes();
+                        let [red, green, blue, _alpha] = MULTI_ONE_CYCLE_PRIM[index].to_be_bytes();
                         let literal = (u16::from(red >> 3) << 11)
                             | (u16::from(green >> 3) << 6)
                             | (u16::from(blue >> 3) << 1)
@@ -14953,10 +15327,7 @@ mod tests {
             .iter()
             .map(|wire| {
                 let [r, g, b, _a] = wire.to_be_bytes();
-                (u16::from(r >> 3) << 11)
-                    | (u16::from(g >> 3) << 6)
-                    | (u16::from(b >> 3) << 1)
-                    | 1
+                (u16::from(r >> 3) << 11) | (u16::from(g >> 3) << 6) | (u16::from(b >> 3) << 1) | 1
             })
             .collect();
         assert_eq!(
@@ -14980,10 +15351,7 @@ mod tests {
         let [r1, g1, b1, _a1] = MULTI_ONE_CYCLE_PRIM[1].to_be_bytes();
         assert_eq!(
             probe,
-            (u16::from(r1 >> 3) << 11)
-                | (u16::from(g1 >> 3) << 6)
-                | (u16::from(b1 >> 3) << 1)
-                | 1,
+            (u16::from(r1 >> 3) << 11) | (u16::from(g1 >> 3) << 6) | (u16::from(b1 >> 3) << 1) | 1,
             "the real combiner over texrect 1's own primitive register must reconcile with the \
              packed literal this test asserted against the published buffer"
         );
@@ -15670,6 +16038,8 @@ mod tests {
             configured_target_extent: backend.configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         backend
             .coordinator
@@ -16003,6 +16373,8 @@ mod tests {
             configured_target_extent,
             draw_tmem: None,
             project_gpu_tmem: true,
+            collect_compute_probe: false,
+            compute_probes: Vec::new(),
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -16207,7 +16579,7 @@ mod tests {
         // sibling documents at
         // `execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot`.
         let mut color_targets = None;
-        let (_, triangles, _, _) = execute_raw_dpc_inner(
+        let (_, triangles, _, _, _) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -16216,6 +16588,7 @@ mod tests {
             &mut color_targets,
             backend.configured_target_extent,
             true,
+            false,
         )
         .expect("the triangle-then-SetOtherMode submission executes cleanly");
 
