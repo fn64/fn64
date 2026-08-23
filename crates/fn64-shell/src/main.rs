@@ -89,6 +89,8 @@ mod stack;
 #[allow(dead_code)]
 mod timing;
 mod video_config;
+#[allow(dead_code)]
+mod zoom_fill;
 
 #[cfg(not(fn64_game_linked))]
 fn main() {
@@ -283,6 +285,8 @@ mod game {
         /// and the self-referential lifetime can't live in one struct.
         window: Option<Arc<Window>>,
         pixels: Option<Pixels<'static>>,
+        /// Cached fullscreen blit, constructed only if zoom-to-fill is used.
+        zoom_fill_renderer: Option<crate::zoom_fill::ZoomFillRenderer>,
         /// True once `present()` has unpacked a VI framebuffer into `rgba`.
         /// Distinct from `reported_first_frame` (a logging latch): a capture
         /// needs to know the buffer holds a real frame, because a freshly
@@ -626,6 +630,7 @@ mod game {
                 fb_height: FB_HEIGHT,
                 window: None,
                 pixels: None,
+                zoom_fill_renderer: None,
                 rgba_holds_a_frame: false,
                 screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
@@ -934,6 +939,14 @@ mod game {
                     &self.gamepads,
                     hud.as_ref(),
                 )
+            } else if self.video.zoom_fill {
+                self.zoom_fill_renderer
+                    .get_or_insert_with(|| {
+                        crate::zoom_fill::ZoomFillRenderer::new(
+                            self.pixels.as_ref().expect("checked above"),
+                        )
+                    })
+                    .render(self.pixels.as_ref().expect("checked above"))
             } else {
                 self.pixels.as_ref().expect("checked above").render()
             };
