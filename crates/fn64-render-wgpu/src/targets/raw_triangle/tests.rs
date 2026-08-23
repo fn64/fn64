@@ -201,6 +201,7 @@ fn run_with(
         resident,
         declared,
         NO_TEXTURE,
+        None,
     )?;
     Ok(completed.device_bytes().device_bytes().to_vec())
 }
@@ -270,6 +271,7 @@ fn the_written_colour_comes_from_the_latched_program_not_a_constant() {
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
         NO_TEXTURE,
+        None,
     )
     .expect("a flat triangle rasterizes");
     let bytes = completed.device_bytes().device_bytes();
@@ -496,6 +498,7 @@ fn fill_and_copy_cycle_are_both_refused_by_name() {
             &resident,
             &declared_accesses(key, &box_triangle(), Some(3)),
             NO_TEXTURE,
+            None,
         );
         assert!(
             matches!(
@@ -534,6 +537,7 @@ fn a_program_reading_shade_is_refused_rather_than_combined_against_zero() {
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
         NO_TEXTURE,
+        None,
     );
     assert!(
         matches!(
@@ -588,6 +592,7 @@ fn the_claimed_rectangle_is_the_bounding_box_of_the_covered_rows() {
         &resident,
         &declared_accesses(key, &box_triangle(), Some(3)),
         NO_TEXTURE,
+        None,
     )
     .unwrap();
     let rectangle = completed.rectangle();
@@ -692,6 +697,7 @@ fn run_shaded(
         resident,
         &declared,
         NO_TEXTURE,
+        None,
     )?;
     Ok(completed.device_bytes().device_bytes().to_vec())
 }
@@ -800,6 +806,7 @@ fn an_unshaded_triangle_reading_shade_is_still_refused() {
         &resident,
         &declared,
         NO_TEXTURE,
+        None,
     );
     assert!(
         matches!(
@@ -845,6 +852,7 @@ fn an_untextured_triangle_reading_texel0_is_refused() {
         &resident,
         &declared,
         NO_TEXTURE,
+        None,
     );
     assert!(
         matches!(
@@ -903,6 +911,7 @@ fn a_textured_triangle_without_a_tmem_binding_is_refused_by_name() {
         &vec![0u8; (8 * 4 * 2) as usize],
         &declared,
         NO_TEXTURE,
+        None,
     );
     assert!(
         matches!(
@@ -915,5 +924,135 @@ fn a_textured_triangle_without_a_tmem_binding_is_refused_by_name() {
             )
         ),
         "a textured triangle with no TMEM binding must refuse by name, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Z-buffer: the depth compare decides which of two overlapping draws survives
+// ---------------------------------------------------------------------------
+
+/// A one-cycle `OtherMode` carrying the three Z fields: `G_ZS_PRIM`
+/// (`primitive_depth_source`, low bit 2), `Z_CMP` (low bit 4), `Z_UPD`
+/// (low bit 5). Every other post-combiner stage stays at identity, exactly
+/// like [`one_cycle_other_mode`].
+fn z_prim_other_mode(compare: bool, update: bool) -> OtherMode {
+    let mut low = 1 << 2; // G_MDSFT_ZSRCSEL = G_ZS_PRIM
+    if compare {
+        low |= 1 << 4;
+    }
+    if update {
+        low |= 1 << 5;
+    }
+    OtherMode::from_wire(0, low)
+}
+
+/// Run one z-wired flat box triangle against a shared depth accumulator,
+/// returning the produced colour bytes. `prim_z` is the 15-bit primitive
+/// depth (`G_ZS_PRIM`); the depth cells persist across calls, so a sequence
+/// of calls composes exactly as `stage_color_commands` composes a packet.
+fn run_z(
+    key: ColorTargetKey,
+    resident: &[u8],
+    compare: bool,
+    update: bool,
+    prim_z: u16,
+    cells: &mut [DepthCell],
+) -> Vec<u8> {
+    let triangle = box_triangle();
+    let declared = declared_accesses(key, &triangle, Some(3));
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let other_mode = z_prim_other_mode(compare, update);
+    let completed = execute_raw_triangle(
+        &candidate,
+        other_mode,
+        &triangle,
+        flat_shading(),
+        TexrectBlendRegisters::default(),
+        resident,
+        &declared,
+        NO_TEXTURE,
+        Some(RawTriangleDepth {
+            cells,
+            compare: other_mode.depth_compare_enabled(),
+            update: other_mode.depth_update_enabled(),
+            mode: other_mode.depth_mode(),
+            source_is_primitive: other_mode.primitive_depth_source(),
+            prim_depth: Some(crate::state::PrimDepth::from_wire(u32::from(prim_z) << 16)),
+        }),
+    )
+    .expect("a z-wired flat triangle rasterizes");
+    completed.device_bytes().device_bytes().to_vec()
+}
+
+/// The RGBA16 byte pair at pixel (x, y) of an 8-wide target.
+fn pixel_at(bytes: &[u8], x: u32, y: u32) -> [u8; 2] {
+    let index = (y as usize * 8 + x as usize) * 2;
+    [bytes[index], bytes[index + 1]]
+}
+
+#[test]
+fn z_compare_nearer_wins_and_farther_loses_over_a_committed_depth() {
+    // 8x4 RGBA16; the box triangle covers x 2..6 on rows 0..3.
+    let key = key_at(8, 4);
+    let mut cells = vec![(0u32, 0u8); key.extent().pixels() as usize];
+
+    // Seed the covered pixels' depth to a FAR value with Z_CMP OFF on the
+    // first draw so it unconditionally paints and, with Z_UPD ON, commits
+    // that far depth -- establishing a non-trivial memory Z the compare
+    // below actually has to beat. `prim_z = 0x4000` gives a working Z of
+    // `0x4000 << 3 = 0x20000`.
+    let first = run_z(key, &sentinel_resident(key), false, true, 0x4000, &mut cells);
+    assert_eq!(
+        pixel_at(&first, 3, 1),
+        PRIM_RGBA16,
+        "the compare-disabled first draw must paint the box"
+    );
+
+    // A strictly NEARER second draw (smaller Z) under Z_CMP must WIN: it is
+    // in front of the committed far depth, so its colour is written this
+    // pass. Compose against the first draw's own output, exactly as the
+    // schedule threads the accumulator.
+    let nearer = run_z(key, &first, true, true, 0x0800, &mut cells);
+    assert_eq!(
+        pixel_at(&nearer, 3, 1),
+        PRIM_RGBA16,
+        "a strictly nearer z-compared draw must pass and paint the box"
+    );
+
+    // A FARTHER (larger Z) draw under Z_CMP over the now-nearer committed
+    // depth must LOSE at every covered pixel: the fragment is not strictly in
+    // front, so the pixel keeps whatever colour it already had. A fresh
+    // sentinel resident makes "kept the resident" distinguishable from
+    // "painted the primitive".
+    let farther_resident = vec![0x5Au8; key.extent().pixels() as usize * 2];
+    let farther = run_z(key, &farther_resident, true, true, 0x7000, &mut cells);
+    assert_eq!(
+        pixel_at(&farther, 3, 1),
+        [0x5A, 0x5A],
+        "a farther z-compared draw must be rejected, leaving the resident byte"
+    );
+    assert_ne!(
+        pixel_at(&farther, 3, 1),
+        PRIM_RGBA16,
+        "the farther draw must NOT have painted the primitive colour"
+    );
+}
+
+#[test]
+fn z_compare_against_a_zeroed_z_image_rejects_every_fragment() {
+    // The angrylion-matching corpus behaviour: a z-compared draw over a
+    // freshly-bound (zeroed) z-image draws nothing, because a zeroed cell
+    // decodes to working Z 0 -- the nearest representable -- and no fragment
+    // is strictly nearer. `prim_z = 0` is itself the nearest; `0 < 0` is
+    // false, so even it is rejected.
+    let key = key_at(8, 4);
+    let mut cells = vec![(0u32, 0u8); key.extent().pixels() as usize];
+    let resident = sentinel_resident(key);
+    let drawn = run_z(key, &resident, true, true, 0x0000, &mut cells);
+    assert_eq!(
+        pixel_at(&drawn, 3, 1),
+        [0x5A, 0x5A],
+        "z-compare against a zeroed z-image must reject the fragment and keep the resident byte"
     );
 }

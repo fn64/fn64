@@ -252,6 +252,7 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
         RawDpcCommandKind::SetOtherMode(_)
         | RawDpcCommandKind::SetScissor(_)
+        | RawDpcCommandKind::SetZImage(_)
         | RawDpcCommandKind::SetColorImage(_)
         | RawDpcCommandKind::SetFillColor(_)
         | RawDpcCommandKind::SetEnvColor(_)
@@ -1133,6 +1134,18 @@ pub fn push_decoded_raw_dpc(
                     viewport: Some(vertices.viewport),
                     texrect_accesses: texrect_span,
                 });
+            }
+            RawDpcCommandKind::SetZImage(_) => {
+                // Admitted, and deliberately NOT pushed to the neutral
+                // writer. The neutral `RdpStateCommand` has no `SetZImage`
+                // variant, and adding one would ripple through every
+                // exhaustive match in `fn64-render-reference` for a value
+                // the wgpu depth path does not consult (it reads the z bits
+                // off each draw's `OtherMode` and the staged `SetPrimDepth`;
+                // see `RawDpcCommandKind::SetZImage`'s own doc). Swallowing
+                // it here is what turns the six `gen-zbuffer-*` cases from
+                // `UnsupportedCommand` refusals into admitted, depth-tested
+                // draws, without inventing a channel nothing reads.
             }
             RawDpcCommandKind::NoOp { .. } => {}
             RawDpcCommandKind::FillRectangle(rectangle) => {

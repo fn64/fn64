@@ -461,6 +461,27 @@ pub struct ColorImage {
     address: PhysicalAddress,
 }
 
+/// The depth-buffer binding from `G_SETZIMG` (`0xfe`) or its `G_SETMASKIMG`
+/// (`0x3e`) alias. The RDP's Z image carries only a base address -- no
+/// format, size, or width field, unlike `SetColorImage` -- because its
+/// pixel format is fixed (the 18-bit exponent/mantissa depth-memory
+/// encoding, N64 Programming Manual Ch. 16). angrylion binds both opcodes
+/// identically as `zb_address = args[1] & 0x00ffffff`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZImage {
+    address: PhysicalAddress,
+}
+
+impl ZImage {
+    pub(crate) const fn from_wire(address: PhysicalAddress) -> Self {
+        Self { address }
+    }
+
+    pub const fn address(self) -> PhysicalAddress {
+        self.address
+    }
+}
+
 impl ColorImage {
     pub(crate) const fn from_wire(
         format: ImageFormat,

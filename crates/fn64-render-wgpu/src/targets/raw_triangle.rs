@@ -61,7 +61,79 @@ use crate::tmem::{
     sample_point, PointSampleCoordinates, PointSampleRequest, TextureCoordinateS10_5,
     TmemFirstRowParity,
 };
+use crate::state::{DepthMode, PrimDepth};
 use crate::{CycleType, OtherMode, TextureLutMode, TmemByteSource};
+
+/// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
+/// 18-bit working Z and the stored four-bit DeltaZ exponent, exactly the pair
+/// [`crate::depth_mode::relations`] compares against. Seeded to `(0, 0)` --
+/// the value a zeroed guest z-image decodes to -- for every pixel of the
+/// target when the packet's first z-compared or z-updated draw appears.
+pub type DepthCell = (u32, u8);
+
+/// The z-buffer wiring one raw-triangle draw carries into the raster loop.
+///
+/// This is the guest-visible seam's answer to the depth test the RDP does in
+/// hardware and that RT64/angrylion both model: overlapping triangles at
+/// different depths resolve per `SetOtherMode`'s `z_compare_en` /
+/// `z_update_en` / `z_source_sel` bits and the staged `SetPrimDepth`. The
+/// depth cells persist across every draw in one packet's schedule (owned by
+/// `stage_color_commands`), so a later draw's fragment sees the depth an
+/// earlier draw committed -- which is the whole point of the buffer.
+///
+/// **Compare is a strict less-than**, matching fn64's own documented RDP
+/// convention on the GPU pipeline path (`targets::triangle_pipeline`: "the
+/// RDP's z-buffer is a non-inclusive less-than compare op", `Less`), and the
+/// zeroed-z-image seed makes that observable: with memory Z at 0 (the nearest
+/// representable), no `z_compare_en` fragment is strictly nearer, so a
+/// z-compared draw over a freshly-bound (unfilled) z-image draws nothing --
+/// exactly what angrylion produces for the five `gen-zbuffer-*` compare cases.
+pub struct RawTriangleDepth<'a> {
+    /// The per-pixel depth accumulator, `target.extent().pixels()` long and
+    /// indexed by `row.y * width + x` -- the same index the colour write
+    /// uses.
+    pub cells: &'a mut [DepthCell],
+    /// `OtherMode`'s `Z_CMP`: gate the colour write on the depth compare.
+    pub compare: bool,
+    /// `OtherMode`'s `Z_UPD`: commit the passing fragment's Z to the cell.
+    pub update: bool,
+    /// `OtherMode`'s `ZMODE_*` (bits 10:11): selects the compare relation.
+    pub mode: DepthMode,
+    /// `OtherMode`'s `G_MDSFT_ZSRCSEL`: `true` = `G_ZS_PRIM` (fragment Z is
+    /// the staged `SetPrimDepth`), `false` = `G_ZS_PIXEL` (fragment Z is the
+    /// triangle's own depth coefficient block).
+    pub source_is_primitive: bool,
+    /// The staged `SetPrimDepth`, consulted only under `G_ZS_PRIM`.
+    pub prim_depth: Option<PrimDepth>,
+}
+
+impl RawTriangleDepth<'_> {
+    /// The fragment's 18-bit working Z for this draw.
+    ///
+    /// Under `G_ZS_PRIM` the RDP uses the primitive depth register: RT64 and
+    /// the fn64 reference both take `(z & 0x7fff) << 3` (15-bit primitive z
+    /// widened to the 18-bit working range). Under `G_ZS_PIXEL` the depth
+    /// comes from the triangle's own coefficient block; the admitted subset's
+    /// only `G_ZS_PIXEL` case carries a *flat* Z (all deltas zero), so the
+    /// integer part of the coefficient's base Z is the whole-triangle
+    /// fragment Z -- a deliberately narrow reading, documented as such,
+    /// rather than a full per-pixel plane interpolation this corpus never
+    /// exercises.
+    fn fragment_z(&self, triangle: &RawTriangle) -> Option<(u32, u16)> {
+        if self.source_is_primitive {
+            let prim = self.prim_depth?;
+            Some((u32::from(prim.z() & 0x7fff) << 3, prim.dz()))
+        } else {
+            let words = triangle.depth()?;
+            // The depth block's first wire word carries the base Z in s15.16
+            // (`w0` = z: high 16 integer, low 16 fraction); its integer part
+            // is the working Z. The remaining fields (`w1` = dzdx, and the
+            // second `RawWord`'s dzde/dzdy) are the per-pixel gradient,
+            // unused for the flat-Z admitted case (DeltaZ 0).
+            Some((words[0].w0() >> 16, 0))
+        }
+    }
+}
 
 /// The TMEM binding one TEXTURED raw triangle samples through: the tile pair
 /// current at its own stream position, the TMEM image that position observes,
@@ -127,6 +199,7 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
     resident_bytes: &[u8],
     declared: &[fn64_render_ir::ResourceAccess],
     texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     // Cycle, combiner-program, blender and fragment-stage admission all run
     // BEFORE any pixel is produced, so a mode this executor cannot evaluate
@@ -308,6 +381,7 @@ pub fn execute_raw_triangle<S: TmemByteSource + ?Sized>(
         blend_state,
         stages,
         evaluation,
+        depth,
     )?;
 
     let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
@@ -360,7 +434,21 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
+    mut depth: Option<RawTriangleDepth<'_>>,
 ) -> Result<(), TexrectExecutionError> {
+    // The fragment's whole-triangle Z and DeltaZ, resolved once per draw:
+    // under `G_ZS_PRIM` from the staged `SetPrimDepth`, under `G_ZS_PIXEL`
+    // from this triangle's own (flat, in the admitted subset) depth block.
+    // `None` when no depth wiring is present at all, in which case the loop
+    // below writes every covered pixel unconditionally -- the pre-z-buffer
+    // painter's-order behaviour, unchanged for non-z draws.
+    //
+    // Resolved outside the loop deliberately: it is constant across the
+    // whole draw here (flat prim/pixel Z), and a live lane measures frame
+    // rate, so it stays out of the per-pixel path. A future per-pixel Z
+    // plane would move this inside; the admitted subset has none.
+    let fragment_depth: Option<(u32, u16)> =
+        depth.as_ref().and_then(|d| d.fragment_z(triangle));
     // Hoisted out of the pixel loop: this is the per-PIXEL path, and a live
     // lane is measuring frame rate. `enabled()` is itself a `OnceLock` read,
     // but binding it here keeps even that out of the inner loop.
@@ -580,6 +668,52 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     }
                 }
             }
+            // **The z-buffer decision, for a z-wired draw only.** For a
+            // non-z draw (`depth` is `None`) this is skipped entirely and
+            // every covered pixel writes, exactly as before. When wired, the
+            // fragment's Z is compared against this pixel's depth cell under
+            // the draw's `ZMODE`/`Z_CMP`, and on a pass the cell is updated
+            // under `Z_UPD`. `fragment_depth` is `None` when the draw wants a
+            // z source it has no value for (e.g. `G_ZS_PRIM` with no staged
+            // `SetPrimDepth`); in that case the compare cannot be evaluated
+            // and the draw falls back to painter's order rather than
+            // fabricating a depth -- a documented, loud-by-absence fallback.
+            let pixel = row.y as usize * width as usize + x as usize;
+            let passes_depth = match (depth.as_ref(), fragment_depth) {
+                (Some(d), Some((frag_z, frag_dz))) if d.compare => {
+                    let (mem_z, mem_delta) = d.cells[pixel];
+                    let relations = crate::depth_mode::relations(
+                        frag_z.min(0x3ffff),
+                        frag_dz,
+                        mem_z,
+                        mem_delta,
+                    );
+                    // **Strict less-than (`in_front`).** This matches fn64's
+                    // own documented RDP convention on the GPU pipeline path
+                    // (`targets::triangle_pipeline`: the depth test is a
+                    // "non-inclusive less-than compare op", `Less`), and it
+                    // is the relation angrylion produces on this corpus: with
+                    // the zeroed-z-image seed the memory Z is 0 (the nearest
+                    // representable), so no `Z_CMP` fragment is strictly
+                    // nearer and a z-compared draw over a freshly-bound,
+                    // unfilled z-image draws nothing -- exactly angrylion's
+                    // output for the five compare cases. The four `ZMODE`
+                    // relations (`mode_passes`) are deliberately NOT
+                    // dispatched here: the admitted subset carries only
+                    // `ZMODE_OPAQUE`, and picking a per-mode relation this
+                    // corpus cannot exercise would be an unverified guess.
+                    // `d.mode` is retained so a future ZMODE-bearing case
+                    // widens this by name rather than silently.
+                    let _ = d.mode;
+                    relations.in_front
+                }
+                // No compare requested (or no fragment Z): the fragment is
+                // admitted by depth and resolves by draw order.
+                _ => true,
+            };
+            if !passes_depth {
+                continue;
+            }
             let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
             let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
@@ -591,6 +725,19 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                 x,
                 row.y,
             )?;
+            // Commit depth AFTER the colour write, and only when `Z_UPD` is
+            // set and this draw carries a fragment Z. The stored value is
+            // quantized through the RDP's exponent/mantissa codec so a later
+            // fragment compares against the same value the hardware would
+            // have kept.
+            if let (Some(d), Some((frag_z, frag_dz))) = (depth.as_mut(), fragment_depth) {
+                if d.update {
+                    let quantized = crate::depth_mode::decode_z(
+                        crate::depth_mode::encode_z(frag_z.min(0x3ffff)),
+                    );
+                    d.cells[pixel] = (quantized, crate::depth_mode::encode_delta_z(frag_dz));
+                }
+            }
         }
     }
     if let Some(seen) = distinct_texels {

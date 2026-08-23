@@ -43,7 +43,7 @@ use fn64_render::{
     TriangleSource,
 };
 
-use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor};
+use crate::state::{AlphaCompare, Color4, OtherMode, PrimColor, PrimDepth};
 use crate::targets::RdpScissorRect;
 use crate::tmem::TileBindingParams;
 use crate::{CombineParams, RasterVertex};
@@ -151,6 +151,14 @@ pub struct RetrievedTriangleDraw {
     /// consumer knows the target extent that fallback has to be. See
     /// `production.rs`'s texrect submission for where it is supplied.
     pub scissor: Option<RdpScissorRect>,
+    /// `G_SETPRIMDEPTH` current at this triangle's own stream position --
+    /// the same command-time-snapshot pattern as the color registers. The
+    /// CPU raster path's z-compare reads this as the fragment depth under
+    /// `G_ZS_PRIM` (`OtherMode::primitive_depth_source()`); `None` means no
+    /// `SetPrimDepth` preceded this triangle, in which case a G_ZS_PRIM
+    /// z-compared draw has no primitive depth to compare and the consumer
+    /// falls back to painter's order (documented at the depth-test site).
+    pub prim_depth: Option<PrimDepth>,
 }
 
 /// [`ExactRawDpcPlanVisitor`] implementation collecting one
@@ -212,6 +220,10 @@ pub struct TriangleDrawStateCollector {
     /// until this plan issues one (see [`RetrievedTriangleDraw::scissor`]
     /// for why the fallback is the consumer's and not this collector's).
     current_scissor: Option<RdpScissorRect>,
+    /// `G_SETPRIMDEPTH` current at the walk's current stream position --
+    /// mirrors `current_scissor`'s `None`-until-issued pattern. Read by the
+    /// CPU raster path's z-compare under `G_ZS_PRIM`.
+    current_prim_depth: Option<PrimDepth>,
 }
 
 /// The tile index a draw names in its OWN wire word.
@@ -323,6 +335,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                         prim_color: self.current_prim_color,
                         fog_color: self.current_fog_color,
                         scissor: self.current_scissor,
+                        prim_depth: self.current_prim_depth,
                     })
                 })();
                 self.draws.push(snapshot);
@@ -350,6 +363,16 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                 }
                 RdpStateCommand::SetFogColor { color, .. } => {
                     self.current_fog_color = Color4::from_wire(color.value);
+                }
+                RdpStateCommand::SetPrimDepth { depth, .. } => {
+                    // Reconstruct the wire form the neutral DTO was minted
+                    // from (`z` in bits 16:31, `dz` in bits 0:15) so this
+                    // collector reads the exact same masked z/dz the decoder
+                    // produced -- `PrimDepth::from_wire` re-applies the 15-bit
+                    // z mask and full 16-bit dz mask.
+                    self.current_prim_depth = Some(PrimDepth::from_wire(
+                        (u32::from(depth.z) << 16) | u32::from(depth.dz),
+                    ));
                 }
                 // Latched verbatim in wire quarter-pixels. Public libultra
                 // `include/ultra64/gbi.h:4794-4837` encodes the four
