@@ -290,3 +290,53 @@ The remaining work list is consequently narrower:
    duplicate digest verification. Preserve the external effect comparison;
    the rejected TMEM candidate shows that deleting internal work without a
    critical-path result is not progress.
+
+## Draw census and architecture pivot
+
+A 600-pump diagnostic run with `FN64_DRAW_CENSUS=1` timed only each raw
+triangle's raster call and grouped the first 75,000 draws by the complete
+resolved combine/other-mode program, cycle count, target format, texture and
+perspective flags, and depth wiring. All eight observed keys were textured,
+perspective RGBA16 draws without depth. The last complete census prefix spent
+2,117.667 ms in raster calls; the five leading exact keys accounted for
+2,083.674 ms (98.4%). The distribution is broad enough to rule out the earlier
+two-cycle fog state as a closure candidate:
+
+| Rank | Combine low/high | Evaluation | Draws | Pixels | Raster ms | Share |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | `fc5196a3/112cfe7f` | 1 | 14,180 | 30,093,140 | 1,021.666 | 48.2% |
+| 2 | `fc309661/552eff7f` | 1 | 5,724 | 14,812,277 | 484.401 | 22.9% |
+| 3 | `fc1596a3/f0fffe38` | 2 | 2,060 | 6,689,362 | 213.916 | 10.1% |
+| 4 | `fc15fea3/f00ff23f` | 2 | 49,536 | 4,153,325 | 209.099 | 9.9% |
+| 5 | `fc1596a3/f0fffe38` | 2 | 2,322 | 4,169,956 | 154.592 | 7.3% |
+
+A fresh 1,200-pump phase profile independently keeps the variable tail on the
+RDP path. Slow pumps averaged 23.147 ms of RDP work versus 1.631 ms for fast
+pumps, accounting for 83.4% of slow-population excess. Across drawn frames,
+over-budget frames averaged 26.862 ms of RDP versus 17.135 ms within budget, a
+9.727 ms difference; presentation differed by only 0.023 ms. The same build's
+Time Profiler trace retains the scalar fragment stack as its largest active
+renderer cluster: blend/write 2,339 samples, combiner-cycle arithmetic 1,080,
+the two raw-triangle scalar bodies 1,577, and TMEM address/decode/sample 1,403.
+
+Two CPU follow-ups were rejected:
+
+- Incrementally stepping S/T/W over a proven adjacent-pixel run measured
+  559.607 ns per covered pixel in the headless release raster replay versus
+  547.025 ns for exact per-pixel plane evaluation. The extra state and branch
+  cost more than the avoided wide arithmetic, so the candidate was removed.
+- Lowering the parallel-scanline cutoff from 4,096 to 1,024 pixels was worse
+  in both orders of a same-binary `A/B, B/A` run. Candidate versus control was
+  27.184/26.266 and 26.772/26.120 ms mean, and 40.156/39.359 and
+  39.955/38.868 ms p95. Rayon scheduling smaller draws adds 0.65--0.92 ms mean
+  and 0.80--1.09 ms p95, so the retained threshold remains 4,096.
+
+These results trigger item 4's stop condition. The CPU raster specialization
+budget is smaller than the roughly 5.8 ms reliability gap and far smaller than
+the roughly 14 ms extension-headroom gap. The next implementation unit is an
+exact integer compute raster path for the census-defined textured RGBA16
+subset, with CPU raster as the byte-for-byte oracle and fallback. It must batch
+ordered draws against one device-resident target, preserve command-order
+barriers where target reads make them observable, and perform one bounded
+readback at the existing guest-effect publication boundary. Program admission
+is keyed only by typed RDP state; unsupported state remains on the CPU path.
