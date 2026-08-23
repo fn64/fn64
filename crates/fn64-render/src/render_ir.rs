@@ -1533,8 +1533,8 @@ mod production {
         /// pushes zero accesses, as this type's own doc states -- and also
         /// `None` for a `TextureRectangle` whose destination was not
         /// provable at decode time (no staged `SetColorImage`, an
-        /// unsupported color format, a fractional or reversed rectangle, or
-        /// flip; see the wgpu decoder's `plan_texture_rectangle`). A texrect
+        /// unsupported color format, or a fractional or reversed rectangle;
+        /// see the wgpu decoder's `plan_texture_rectangle`). A texrect
         /// that declared no write is not a silent no-op: it still rasters
         /// through the triangle path, it simply has no `ColorFramebuffer`
         /// range for a CPU-side executor to compose into.
