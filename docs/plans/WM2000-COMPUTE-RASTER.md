@@ -74,9 +74,12 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    single-index RDRAM snapshot selector. A bounded live run captured 2,670
    packets; packet 2659 is the selected private receipt (1,032 command bytes,
    five full shaded+textured triangles, one matching 8 MiB RDRAM image). Its
-   command bytes were identical at the same index across two runs. The offline
-   wgpu repeat executor and complete-target/effect-digest comparison remain to
-   finish this unit.
+   command bytes were identical at the same index across two runs. The
+   `raw_dpc_replay` example now drives that receipt through the production
+   XBUS plan/execute/guest-commit/publish seam, primes durable state from a
+   captured prefix, supports suffix-window bisection, reports every lifecycle
+   phase, and requires committed guest bytes to stay identical across every
+   repeat. No captured command or RDRAM byte enters git.
 2. **Dynamic RGBA16 target.** Generalize the proven native-fill storage-buffer
    and bounded-readback mechanism to a `SetColorImage` extent. A no-op compute
    round trip must reproduce arbitrary resident bytes exactly, including odd
@@ -125,6 +128,24 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
 - Any byte mismatch, effect-digest mismatch, untyped fallback, per-draw
   readback, or command-order race kills the candidate rather than weakening
   the oracle.
+
+## Replay baseline (2026-08-23)
+
+On the host Metal adapter, after priming packets 0 through 2646, a 30-repeat
+replay of the 13-packet suffix ending at private receipt 2659 was byte-stable
+and measured 14.132 ms mean total: 7.939 ms execute, 2.232 ms plan, 1.397 ms
+declared guest reads, 1.059 ms copyback, 0.266 ms commit, and 0.239 ms for the
+remaining measured phases and loop arithmetic. Suffix bisection measured
+1.098 ms for two packets, 5.571 ms for four, and 9.387 ms for eight. The cost
+is therefore distributed across the graphics burst rather than owned by the
+last five-triangle packet alone (0.953 ms total, 0.661 ms execute).
+
+This receipt uses the final packet's matching RDRAM snapshot to satisfy every
+prefix read. It is an exact deterministic optimization benchmark for the
+captured command geometry and final packet, but not a claim that historical
+prefix texel bytes equal the live run at each earlier packet. Live linked-shell
+profiling remains the performance authority; complete guest-byte stability is
+the replay's regression oracle.
 
 ## Sources and nonclaims
 
