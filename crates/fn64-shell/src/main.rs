@@ -314,6 +314,10 @@ mod game {
         /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
         /// unarmed it is one `bool` load per pump and nothing else.
         pump_census: crate::pump_census::PumpCensus,
+        /// The event-loop path that requested irreversible process teardown.
+        exit_path: &'static str,
+        /// Prevents the pre-exit callback and `run_app` return from sealing twice.
+        process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
         /// can name it on its first line. A graphics figure without its
         /// renderer beside it is not a result, and reading it back from
@@ -635,6 +639,8 @@ mod game {
                 last_audio_underrun_sample_slots: 0,
                 last_audio_late_callbacks: 0,
                 pump_census: crate::pump_census::PumpCensus::new(),
+                exit_path: "platform-loop-exiting",
+                process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
             }
@@ -1125,6 +1131,7 @@ mod game {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
                     eprintln!("[fn64-shell] failed to create window: {e}");
+                    self.exit_path = "window-create-failed";
                     event_loop.exit();
                     return;
                 }
@@ -1146,6 +1153,7 @@ mod game {
                 }
                 Err(e) => {
                     eprintln!("[fn64-shell] failed to create pixels surface: {e}");
+                    self.exit_path = "pixels-create-failed";
                     event_loop.exit();
                 }
             }
@@ -1178,6 +1186,7 @@ mod game {
                         return;
                     }
                     println!("[fn64-shell] window close requested -- exiting");
+                    self.exit_path = "window-close";
                     event_loop.exit();
                 }
                 WindowEvent::Resized(new_size) => {
@@ -1271,6 +1280,7 @@ mod game {
                                 return;
                             }
                             println!("[fn64-shell] Esc pressed -- exiting");
+                            self.exit_path = "escape-key";
                             event_loop.exit();
                             return;
                         }
@@ -1355,6 +1365,7 @@ mod game {
                 // message had already printed). Winit's own exit returns
                 // through the loop, and `run_app` then propagates this code.
                 self.frame_trip_exit_code = Some(code);
+                self.exit_path = "frame-trip-verdict";
                 event_loop.exit();
                 return;
             }
@@ -1447,7 +1458,7 @@ mod game {
                     // good measurement into a failed run. `prepare_clean_exit`
                     // detaches the coroutines so that drop has nothing to
                     // unwind.
-                    prepare_clean_exit();
+                    prepare_clean_exit(self, "pump-census-window-complete");
                     use std::io::Write as _;
                     let _ = std::io::stdout().flush();
                     let _ = std::io::stderr().flush();
@@ -1473,6 +1484,16 @@ mod game {
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
         }
+
+        fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+            // On macOS `applicationWillTerminate:` reaches this irreversible
+            // callback while `run_app` is still on the stack. Waiting for
+            // `run_app` to return lets Apple TLS teardown drop the executor
+            // first, force-unwinding guest coroutines across extern-C frames.
+            self.pump_census.report_once(self.active_renderer);
+            fn64_abi::dpc_copy_census::report_now();
+            prepare_clean_exit(self, self.exit_path);
+        }
     }
 
     pub fn run() {
@@ -1486,7 +1507,7 @@ mod game {
         // controller wiring reaches fn64_abi, then exits.
         if let Some(key) = std::env::var_os("FN64_INPUT_PROBE") {
             input_probe(&mut shell, &key.to_string_lossy());
-            prepare_clean_exit();
+            prepare_clean_exit(&mut shell, "input-probe");
             return;
         }
 
@@ -1522,7 +1543,7 @@ mod game {
         // an exit status. Taken after `prepare_clean_exit` so the teardown
         // this path exists to perform still happens on a FAIL.
         let trip_code = shell.frame_trip_exit_code;
-        prepare_clean_exit();
+        prepare_clean_exit(&mut shell, "run-app-return");
         if let Some(code) = trip_code {
             std::process::exit(code);
         }
@@ -1535,13 +1556,18 @@ mod game {
     /// non-unwind ABI frames. The terminal ABI operation detaches only the
     /// unfinished stacks that cannot be force-unwound, then ordinary Rust/TLS
     /// teardown remains available to window, audio, and renderer owners.
-    fn prepare_clean_exit() {
+    fn prepare_clean_exit(shell: &mut Shell, path: &'static str) {
+        if shell.process_exit_prepared {
+            return;
+        }
         use std::io::Write as _;
         let exit = fn64_abi::prepare_process_exit();
+        let left_un_detached = exit.threads - exit.detached_coroutines;
         println!(
-            "[fn64-shell] process exit prepared: threads={} detached_coroutines={}",
-            exit.threads, exit.detached_coroutines
+            "[fn64-exit-diagnostic] path={path} threads={} detached={} left_un_detached={left_un_detached}",
+            exit.threads, exit.detached_coroutines,
         );
+        shell.process_exit_prepared = true;
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
     }
