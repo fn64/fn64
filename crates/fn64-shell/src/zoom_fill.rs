@@ -16,13 +16,16 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    let positions = array(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0),
-    );
+    // Naga 0.19 rejects runtime indexing into a function-local array. Keep
+    // the three fullscreen-triangle vertices explicit so the shader is valid
+    // on the wgpu version pinned by pixels 0.15.
+    var position: vec2<f32>;
+    switch index {
+        case 0u: { position = vec2<f32>(-1.0, -1.0); }
+        case 1u: { position = vec2<f32>( 3.0, -1.0); }
+        default: { position = vec2<f32>(-1.0,  3.0); }
+    }
     var output: VertexOutput;
-    let position = positions[index];
     output.position = vec4<f32>(position, 0.0, 1.0);
     output.uv = position * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     return output;
@@ -36,6 +39,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(frame, frame_sampler, input.uv);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::SHADER;
+
+    #[test]
+    fn zoom_fill_shader_validates_with_pixels_naga_line() {
+        let module = naga::front::wgsl::parse_str(SHADER).expect("zoom-fill WGSL parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("zoom-fill WGSL validates under Naga 0.19");
+    }
+}
 
 pub struct ZoomFillRenderer {
     pipeline: wgpu::RenderPipeline,
