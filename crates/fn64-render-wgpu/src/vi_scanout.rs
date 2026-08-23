@@ -54,7 +54,7 @@
 use fn64_render::{
     vi_public_filters::{
         gamma_dither_quantize_bounded_v1, reference_noise_bit_v1,
-        restore_rgba16_component_bounded_v1,
+        restore_rgba16_component_bounded_v1, restore_rgba16_rgb_bounded_v1,
     },
     RenderError, ViFilterControl, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
     ViScanoutRegisters,
@@ -841,6 +841,10 @@ impl SourcePlane {
     }
 
     fn restore_dither_with_parallelism(&mut self, parallel: bool) {
+        self.restore_dither_with_options(parallel, grouped_vi_dither_enabled());
+    }
+
+    fn restore_dither_with_options(&mut self, parallel: bool, grouped_rgb: bool) {
         let original = self.rgba8.clone();
         let row_bytes = self.width * 4;
         if parallel {
@@ -848,11 +852,27 @@ impl SourcePlane {
                 .par_chunks_mut(row_bytes)
                 .enumerate()
                 .for_each(|(y, row)| {
-                    restore_dither_row(row, y, self.width, self.height, &original, &self.coverage);
+                    restore_dither_row(
+                        row,
+                        y,
+                        self.width,
+                        self.height,
+                        &original,
+                        &self.coverage,
+                        grouped_rgb,
+                    );
                 });
         } else {
             for (y, row) in self.rgba8.chunks_mut(row_bytes).enumerate() {
-                restore_dither_row(row, y, self.width, self.height, &original, &self.coverage);
+                restore_dither_row(
+                    row,
+                    y,
+                    self.width,
+                    self.height,
+                    &original,
+                    &self.coverage,
+                    grouped_rgb,
+                );
             }
         }
     }
@@ -873,6 +893,17 @@ fn parallel_vi_dither_enabled() -> bool {
     })
 }
 
+fn grouped_vi_dither_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_GROUPED_VI_DITHER") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_GROUPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_GROUPED_VI_DITHER is not valid Unicode: {error}"),
+    })
+}
+
 fn restore_dither_row(
     row: &mut [u8],
     y: usize,
@@ -880,27 +911,56 @@ fn restore_dither_row(
     height: usize,
     original: &[u8],
     coverage: &[u8],
+    grouped_rgb: bool,
 ) {
     for x in 0..width {
         let pixel = y * width + x;
         if coverage[pixel] != 8 {
             continue;
         }
-        for channel in 0..3 {
-            let center = original[pixel * 4 + channel] >> 3;
-            let mut neighbors = [0u8; 8];
+        if grouped_rgb {
+            let center_offset = pixel * 4;
+            let center = [
+                original[center_offset] >> 3,
+                original[center_offset + 1] >> 3,
+                original[center_offset + 2] >> 3,
+            ];
+            let mut neighbors = [[0u8; 3]; 8];
             let mut count = 0;
             for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
                 for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
                     if neighbor_x == x && neighbor_y == y {
                         continue;
                     }
-                    neighbors[count] =
-                        original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
+                    let offset = (neighbor_y * width + neighbor_x) * 4;
+                    neighbors[count] = [
+                        original[offset] >> 3,
+                        original[offset + 1] >> 3,
+                        original[offset + 2] >> 3,
+                    ];
                     count += 1;
                 }
             }
-            row[x * 4 + channel] = restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
+            let restored = restore_rgba16_rgb_bounded_v1(center, &neighbors[..count]);
+            row[x * 4..x * 4 + 3].copy_from_slice(&restored);
+        } else {
+            for channel in 0..3 {
+                let center = original[pixel * 4 + channel] >> 3;
+                let mut neighbors = [0u8; 8];
+                let mut count = 0;
+                for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                    for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                        if neighbor_x == x && neighbor_y == y {
+                            continue;
+                        }
+                        neighbors[count] =
+                            original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
+                        count += 1;
+                    }
+                }
+                row[x * 4 + channel] =
+                    restore_rgba16_component_bounded_v1(center, &neighbors[..count]);
+            }
         }
     }
 }
