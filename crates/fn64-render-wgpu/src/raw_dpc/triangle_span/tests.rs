@@ -153,6 +153,23 @@ fn the_wm2000_title_triangle_covers_its_hand_derived_rows() {
     assert_eq!(pixel_coverage(&triangle, 5, 15), 0);
 }
 
+#[test]
+fn row_hoisted_attribute_samples_match_the_unhoisted_edge_walk() {
+    let triangle = decode(&wire(
+        true, 106, 106, 17, 6832128, -16842729, 770048, 0, 701940, 272435,
+    ));
+    for y in 0..32 {
+        let row = AttributeSampleRow::new(&triangle, y);
+        for x in 0..96 {
+            assert_eq!(
+                row.sample(x),
+                attribute_sample_unhoisted(&triangle, x, y),
+                "sample mismatch at ({x}, {y})"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry, on hand-built triangles whose answer is arithmetic
 // ---------------------------------------------------------------------------
