@@ -250,7 +250,7 @@ pub(crate) fn proposed_identity_for_test() -> TmemSnapshotIdentity {
 /// `valid_byte` from the same `bytes`/`valid` arrays a publication would
 /// install, so the two agree byte-for-byte by construction, and differ only
 /// in what they claim about *durability*.
-pub trait TmemByteSource {
+pub trait TmemByteSource: Sync {
     /// This image's identity. Committed for durable state, proposed for a
     /// sealed-but-unpublished transaction post-image.
     fn snapshot(&self) -> TmemSnapshotIdentity;

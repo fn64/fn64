@@ -14,6 +14,18 @@
 //! guest-visible claim adapter-conditional. So a raw triangle gets the same
 //! CPU seam the texrect already has.
 //!
+//! # Parallel scanlines
+//!
+//! A depth-free triangle with at least 256 pixels across its declared row
+//! runs uses a persistent work-stealing pool over exclusive whole scanlines.
+//! The scalar pixel body stays the only implementation: each worker calls it
+//! with a local row and guest-row base, and completing the parallel iterator
+//! is the draw-order barrier before the next command can observe the target.
+//! Depth-bearing draws and combiner census runs remain scalar because they
+//! carry cross-row mutable state. `FN64_PARALLEL_RASTER=0` selects the scalar
+//! A/B lane; absent selects parallelism, and every other value traps rather
+//! than silently changing the lane.
+//!
 //! # What this executor is, and is not
 //!
 //! It executes opcodes 0x08 (flat) and 0x0c (shaded) -- no texture plane,
@@ -46,6 +58,8 @@
 //! `a_declared_pixel_with_no_subpixel_coverage_is_not_painted`.
 
 use fn64_render_ir::ResourceAccess;
+use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use super::texrect::{
     admitted_cycle_evaluation, blend_and_write_pixel, combine_one_texel, require_blendable_mode,
@@ -434,7 +448,116 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
+    depth: Option<RawTriangleDepth<'_>>,
+) -> Result<(), TexrectExecutionError> {
+    const MIN_PARALLEL_PIXELS: u64 = 256;
+
+    fn parallel_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let enabled = match std::env::var("FN64_PARALLEL_RASTER") {
+                Ok(value) if value == "0" => false,
+                Ok(value) if value == "1" => true,
+                Ok(value) => panic!(
+                    "FN64_PARALLEL_RASTER must be exactly 0 or 1, got {value:?}"
+                ),
+                Err(std::env::VarError::NotPresent) => true,
+                Err(error) => panic!("FN64_PARALLEL_RASTER is not valid Unicode: {error}"),
+            };
+            eprintln!(
+                "[fn64-render-wgpu] FN64_PARALLEL_RASTER={} (scanline threshold {MIN_PARALLEL_PIXELS} covered-range pixels)",
+                u8::from(enabled)
+            );
+            enabled
+        })
+    }
+
+    let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
+    let census_pixels = crate::combiner::census::enabled();
+    if depth.is_none()
+        && !census_pixels
+        && declared_pixels >= MIN_PARALLEL_PIXELS
+        && parallel_enabled()
+    {
+        let row_stride = width as usize * format.bytes_per_pixel() as usize;
+
+        // `par_chunks_mut` is the ownership proof: each job exclusively owns
+        // one whole color row, so no two jobs can address the same byte. The
+        // parallel iterator's completion is the draw-order barrier; the next
+        // triangle cannot observe or modify this target before every row of
+        // this triangle has completed.
+        return bytes
+            .par_chunks_mut(row_stride)
+            .enumerate()
+            .try_for_each(|(y, row_bytes)| {
+                let y = y as u32;
+                let Ok(row_index) = rows.binary_search_by_key(&y, |row| row.y) else {
+                    return Ok(());
+                };
+                let texture = texture.as_ref().map(|binding| RawTriangleTexture {
+                    tile: binding.tile,
+                    tmem: binding.tmem,
+                    lut_mode: binding.lut_mode,
+                });
+                raster_triangle_scalar(
+                    row_bytes,
+                    format,
+                    width,
+                    triangle,
+                    &rows[row_index..=row_index],
+                    shading,
+                    base_inputs,
+                    shade,
+                    texture_planes,
+                    texture,
+                    perspective,
+                    blend_state,
+                    stages,
+                    evaluation,
+                    None,
+                    y,
+                )
+            });
+    }
+
+    raster_triangle_scalar(
+        bytes,
+        format,
+        width,
+        triangle,
+        rows,
+        shading,
+        base_inputs,
+        shade,
+        texture_planes,
+        texture,
+        perspective,
+        blend_state,
+        stages,
+        evaluation,
+        depth,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
+    bytes: &mut [u8],
+    format: ColorTargetFormat,
+    width: u32,
+    triangle: &RawTriangle,
+    rows: &[triangle_span::CoveredRow],
+    shading: TexrectShading,
+    base_inputs: crate::CombinerInputs,
+    shade: Option<[triangle_span::AttributePlane; 4]>,
+    texture_planes: Option<[triangle_span::AttributePlane; 3]>,
+    texture: Option<RawTriangleTexture<'_, S>>,
+    perspective: bool,
+    blend_state: crate::BlendModeState,
+    stages: TexrectFragmentStages,
+    evaluation: TexrectCombinerEvaluation,
     mut depth: Option<RawTriangleDepth<'_>>,
+    base_y: u32,
 ) -> Result<(), TexrectExecutionError> {
     // The fragment's whole-triangle Z and DeltaZ, resolved once per draw:
     // under `G_ZS_PRIM` from the staged `SetPrimDepth`, under `G_ZS_PIXEL`
@@ -678,7 +801,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             // `SetPrimDepth`); in that case the compare cannot be evaluated
             // and the draw falls back to painter's order rather than
             // fabricating a depth -- a documented, loud-by-absence fallback.
-            let pixel = row.y as usize * width as usize + x as usize;
+            let pixel = (row.y - base_y) as usize * width as usize + x as usize;
             let passes_depth = match (depth.as_ref(), fragment_depth) {
                 (Some(d), Some((frag_z, frag_dz))) if d.compare => {
                     let (mem_z, mem_delta) = d.cells[pixel];
@@ -715,7 +838,8 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                 continue;
             }
             let combined = combine_one_texel(shading.combine(), inputs, texel, evaluation);
-            let offset = (row.y as usize * width as usize + x as usize) * bytes_per_pixel;
+            let offset =
+                ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
             blend_and_write_pixel(
                 format,
                 &mut bytes[offset..offset + bytes_per_pixel],
