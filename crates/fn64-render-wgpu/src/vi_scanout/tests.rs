@@ -1365,6 +1365,48 @@ fn dither_restoration_reads_unrestored_neighbors_only() {
     );
 }
 
+/// Row parallelism changes only ownership and scheduling: every output byte
+/// must remain the scalar filter's result, including edges and pixels whose
+/// reconstructed coverage makes restoration skip them.
+#[test]
+fn parallel_dither_restoration_is_byte_identical_to_scalar() {
+    const ORIGIN: u32 = 0x400;
+    const WIDTH: u32 = 32;
+    const HEIGHT: u64 = 12;
+    let mut rdram = fresh_rdram();
+    for y in 0..HEIGHT as u32 {
+        for x in 0..WIDTH {
+            let alpha = u8::from((x + y) % 5 != 0);
+            write_rgba16(
+                &mut rdram,
+                ORIGIN + (y * WIDTH + x) * 2,
+                pack_rgba5551(
+                    ((x * 7 + y * 3) & 31) as u8,
+                    ((x * 5 + y * 11) & 31) as u8,
+                    ((x * 13 + y * 2) & 31) as u8,
+                    alpha,
+                ),
+            );
+        }
+    }
+    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
+    let geometry = SourceGeometry {
+        origin: ORIGIN,
+        stride_pixels: WIDTH,
+        rows: HEIGHT,
+        bytes_per_pixel: 2,
+        pixel_type: ViPixelType::Rgba16,
+    };
+    let mut scalar = SourcePlane::load(geometry, &memory);
+    let mut parallel = SourcePlane::load(geometry, &memory);
+
+    scalar.restore_dither_with_parallelism(false);
+    parallel.restore_dither_with_parallelism(true);
+
+    assert_eq!(parallel.rgba8, scalar.rgba8);
+    assert_eq!(parallel.coverage, scalar.coverage);
+}
+
 /// Only full-coverage pixels are restored. A clear low bit means coverage 1,
 /// which this backend passes through untouched -- the same `continue` the
 /// reference takes when silhouette AA is off.
