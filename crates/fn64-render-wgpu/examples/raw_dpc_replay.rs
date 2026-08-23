@@ -231,7 +231,7 @@ fn main() {
         .map(|sample| sample.compute_probe_pixels)
         .sum();
     println!(
-        "compute_probe_receipts={} draws={} target_pixels={} across_repeats={}",
+        "compute_probe_batches={} draws={} target_pixels={} across_repeats={}",
         probe_batches, probe_draws, probe_pixels, repeat
     );
     if detail {
@@ -367,7 +367,9 @@ fn replay_once(
             compute_probe: compute_probe
                 .map(|receipt| receipt.elapsed())
                 .unwrap_or_default(),
-            compute_probe_batches: u32::from(compute_probe.is_some()),
+            compute_probe_batches: compute_probe
+                .map(|receipt| receipt.batch_count())
+                .unwrap_or_default(),
             compute_probe_draws: compute_probe
                 .map(|receipt| receipt.draw_count())
                 .unwrap_or_default(),
