@@ -23,6 +23,34 @@ class Pump:
     index: int
     wall_ms: float
     swapped: bool
+    steps: int
+    gfx_tasks: int
+    audio_tasks: int
+    executor_ms: float
+    gfx_ms: float
+    gfx_lle_rsp_ms: float
+    gfx_lle_rdp_ms: float
+    audio_lle_ms: float
+    vi_present_ms: float
+    resume_dispatch_ms: float
+    rsp_steps_gfx: int
+    rsp_steps_audio: int
+
+
+METRICS = (
+    "steps",
+    "gfx_tasks",
+    "audio_tasks",
+    "executor_ms",
+    "gfx_ms",
+    "gfx_lle_rsp_ms",
+    "gfx_lle_rdp_ms",
+    "audio_lle_ms",
+    "vi_present_ms",
+    "resume_dispatch_ms",
+    "rsp_steps_gfx",
+    "rsp_steps_audio",
+)
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -41,7 +69,23 @@ def parse_pumps(text: str) -> list[Pump]:
         fields = line[len(SEQUENCE_PREFIX) :].split(",")
         if len(fields) != 15:
             raise ValueError(f"pump sequence row has {len(fields)} fields, expected 15")
-        pump = Pump(index=int(fields[0]), wall_ms=float(fields[1]), swapped=fields[3] == "1")
+        pump = Pump(
+            index=int(fields[0]),
+            wall_ms=float(fields[1]),
+            swapped=fields[3] == "1",
+            steps=int(fields[2]),
+            gfx_tasks=int(fields[4]),
+            audio_tasks=int(fields[5]),
+            executor_ms=float(fields[6]),
+            gfx_ms=float(fields[7]),
+            gfx_lle_rsp_ms=float(fields[8]),
+            gfx_lle_rdp_ms=float(fields[9]),
+            audio_lle_ms=float(fields[10]),
+            vi_present_ms=float(fields[11]),
+            resume_dispatch_ms=float(fields[12]),
+            rsp_steps_gfx=int(fields[13]),
+            rsp_steps_audio=int(fields[14]),
+        )
         if pump.index != len(pumps):
             raise ValueError(
                 f"pump sequence is not contiguous: expected index {len(pumps)}, got {pump.index}"
@@ -55,6 +99,19 @@ def parse_pumps(text: str) -> list[Pump]:
     return pumps
 
 
+def population_means(frames: list[dict[str, float]]) -> dict[str, float]:
+    if not frames:
+        return {"count": 0}
+    return {
+        "count": len(frames),
+        "drawn_frame_ms": sum(frame["drawn_frame_ms"] for frame in frames) / len(frames),
+        **{
+            metric: sum(frame[metric] for frame in frames) / len(frames)
+            for metric in METRICS
+        },
+    }
+
+
 def summarize(text: str) -> dict[str, object]:
     renderer_match = RENDERER_RE.search(text)
     if renderer_match is None:
@@ -66,15 +123,28 @@ def summarize(text: str) -> dict[str, object]:
         raise ValueError("at least two post-warmup VI swaps are required")
 
     gaps = [current - previous for previous, current in zip(swap_indices, swap_indices[1:])]
-    drawn_ms = [
-        sum(pump.wall_ms for pump in pumps[previous + 1 : current + 1])
-        for previous, current in zip(swap_indices, swap_indices[1:])
-    ]
+    frames = []
+    for previous, current in zip(swap_indices, swap_indices[1:]):
+        span = pumps[previous + 1 : current + 1]
+        frames.append(
+            {
+                "drawn_frame_ms": sum(pump.wall_ms for pump in span),
+                **{
+                    metric: sum(getattr(pump, metric) for pump in span)
+                    for metric in METRICS
+                },
+            }
+        )
+    drawn_ms = [frame["drawn_frame_ms"] for frame in frames]
     gap_counts = Counter(gaps)
     over_budget = sum(value > BUDGET_MS for value in drawn_ms)
+    within = [frame for frame in frames if frame["drawn_frame_ms"] <= BUDGET_MS]
+    over = [frame for frame in frames if frame["drawn_frame_ms"] > BUDGET_MS]
+    within_means = population_means(within)
+    over_means = population_means(over)
 
     return {
-        "schema": "fn64.wm2000-swap-latency.v1",
+        "schema": "fn64.wm2000-swap-latency.v2",
         "renderer": renderer,
         "pumps": len(pumps),
         "swaps": len(swap_indices),
@@ -86,11 +156,21 @@ def summarize(text: str) -> dict[str, object]:
             "mean": sum(drawn_ms) / len(drawn_ms),
             "p50": percentile(drawn_ms, 0.50),
             "p95": percentile(drawn_ms, 0.95),
+            "p99": percentile(drawn_ms, 0.99),
             "max": max(drawn_ms),
         },
         "over_budget": {
             "count": over_budget,
             "fraction": over_budget / len(drawn_ms),
+        },
+        "drawn_frame_populations": {
+            "within_budget_mean": within_means,
+            "over_budget_mean": over_means,
+            "over_minus_within": {
+                metric: over_means[metric] - within_means[metric]
+                for metric in ("drawn_frame_ms", *METRICS)
+                if within and over
+            },
         },
     }
 
