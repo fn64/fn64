@@ -4579,6 +4579,13 @@ fn diff_count(a: &Result<Vec<u8>, String>, b: &Result<Vec<u8>, String>) -> Value
 fn run_generated() -> Value {
     let mut cases = generated_cases();
     cases.sort_by_key(|c| (c.priority, c.name.clone()));
+    // Optional substring filter for fast, targeted triage of a single slice
+    // (e.g. FN64_ONLY=loadblock-deep). Absent, the whole corpus runs.
+    if let Ok(filter) = std::env::var("FN64_ONLY") {
+        if !filter.is_empty() {
+            cases.retain(|c| c.name.contains(&filter));
+        }
+    }
 
     let mut rows = Vec::new();
     let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();

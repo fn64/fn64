@@ -660,6 +660,41 @@ impl StagedTmemTransaction {
         Ok(())
     }
 
+    /// Marks the whole contiguous TMEM word span a LoadBlock's DXT sweep
+    /// passed over as valid, filling the words the sweep skipped with their
+    /// underlying (zero-initialised) storage byte.
+    ///
+    /// A LoadBlock with DXT >= 0x800 advances the destination by more than
+    /// one word per source word (the "row advance" for tile rows >= 1), so
+    /// its scattered destination words leave gaps between them -- e.g.
+    /// DXT=0x800 writes TMEM words 0, 2, 4, 6 and skips 1, 3, 5. Hardware
+    /// (and the RT64 / angrylion oracles) read those skipped words back as
+    /// their prior content, which in a fresh packet is zero; only fn64's own
+    /// validity tracking would otherwise refuse a render tile that
+    /// re-describes the load with a `line` that reads a skipped word. The
+    /// swept span is contiguous, so marking every word in
+    /// `[low_word, high_word]` valid keeps that reader hardware-faithful
+    /// without weakening the refusal for bytes NO load ever touched (a
+    /// LoadTile whose reader addresses outside its own footprint still
+    /// refuses; only LoadBlock's own interior gaps become readable zeros).
+    ///
+    /// Bytes an actual transfer word already defined keep their value and
+    /// touch generation; only genuinely-skipped words are back-filled. The
+    /// fill is invisible to the sealed load's effects and proposal digest,
+    /// which are keyed on the destination access ranges alone
+    /// (`project_load` / `proposal_identity`), so this is purely a widening
+    /// of what the in-packet reader may sample.
+    pub(crate) fn mark_block_footprint_valid(&mut self, low_word: u16, high_word: u16) {
+        for word in low_word..=high_word {
+            let base = usize::from(word) * 8;
+            for address in base..base + 8 {
+                if address < TMEM_LEN && !self.packet.valid[address] {
+                    self.packet.valid[address] = true;
+                }
+            }
+        }
+    }
+
     /// Completes this load, snapshots its canonical postimage effects, and
     /// returns ownership ready for the next load or final sealing.
     pub fn finish_load(mut self) -> Result<PhysicalTmemPacketTransaction, PhysicalTmemError> {
