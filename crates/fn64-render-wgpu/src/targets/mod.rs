@@ -36,7 +36,7 @@ pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
-pub use raw_triangle::{execute_raw_triangle, RawTriangleTexture};
+pub use raw_triangle::{execute_raw_triangle, DepthCell, RawTriangleDepth, RawTriangleTexture};
 pub use texrect::{
     execute_texture_rectangle, ClippedTexrectExtent, RdpScissorRect, TexrectAxis,
     TexrectBlendRegisters, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
