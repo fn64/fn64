@@ -12,9 +12,17 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
-def row(index: int, wall_ms: float, swapped: bool) -> str:
+def row(
+    index: int,
+    wall_ms: float,
+    swapped: bool,
+    *,
+    gfx_tasks: int = 0,
+    gfx_lle_rdp_ms: float = 0.0,
+) -> str:
     return (
-        f"[pump-seq] {index},{wall_ms:.4f},1,{int(swapped)},0,0,0,0,0,0,0,0,0,0,0"
+        f"[pump-seq] {index},{wall_ms:.4f},1,{int(swapped)},{gfx_tasks},0,0,0,0,"
+        f"{gfx_lle_rdp_ms:.4f},0,0,0,0,0"
     )
 
 
@@ -56,6 +64,22 @@ class PumpCensusSummaryTests(unittest.TestCase):
     def test_missing_sequence_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "no \\[pump-seq\\] rows"):
             MODULE.summarize("[pump-census] RENDERER: wgpu\n")
+
+    def test_drawn_frame_populations_attribute_the_over_budget_tail(self) -> None:
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 4.0, False),
+                row(2, 20.0, True, gfx_tasks=2, gfx_lle_rdp_ms=18.0),
+                row(3, 5.0, False),
+                row(4, 40.0, True, gfx_tasks=3, gfx_lle_rdp_ms=38.0),
+            ]
+        )
+        populations = MODULE.summarize(text)["drawn_frame_populations"]
+        self.assertEqual(populations["within_budget_mean"]["gfx_tasks"], 2.0)
+        self.assertEqual(populations["over_budget_mean"]["gfx_tasks"], 3.0)
+        self.assertEqual(populations["over_minus_within"]["gfx_lle_rdp_ms"], 20.0)
 
 
 if __name__ == "__main__":
