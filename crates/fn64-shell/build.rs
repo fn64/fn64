@@ -41,6 +41,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ROM");
     println!("cargo:rerun-if-env-changed=FN64_RECOMP");
     println!("cargo:rerun-if-env-changed=RECOMP_RS_HOST_LOOKUP");
+    println!("cargo:rerun-if-env-changed=FN64_APP_TITLE");
+    emit_app_title();
     // Declared so a clean `#[cfg(fn64_game_linked)]` doesn't warn as an
     // unexpected cfg under `-Wunexpected_cfgs` (Rust 1.80+ lint).
     println!("cargo:rustc-check-cfg=cfg(fn64_game_linked)");
@@ -247,6 +249,23 @@ fn main() {
         bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
+}
+
+/// Bake the title profile into the binary. This is build identity, just like
+/// the linked bodies: a later process-environment change must not relabel an
+/// already-built executable.
+fn emit_app_title() {
+    if let Ok(title) = env::var("FN64_APP_TITLE") {
+        assert!(
+            !title.trim().is_empty(),
+            "fn64-shell build.rs: FN64_APP_TITLE is set but empty"
+        );
+        assert!(
+            !title.contains(['\n', '\r']),
+            "fn64-shell build.rs: FN64_APP_TITLE must be a single line"
+        );
+        println!("cargo:rustc-env=FN64_APP_TITLE={title}");
+    }
 }
 
 /// Bake the build's game provenance into the binary for `src/stack.rs`'s
