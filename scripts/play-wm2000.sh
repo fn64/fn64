@@ -10,6 +10,7 @@
 #
 #   FN64_RENDER=reference ./scripts/play-wm2000.sh   # the software oracle
 #   FN64_SKIP_EMIT=1      ./scripts/play-wm2000.sh   # reuse the emitted crate
+#   FN64_SKIP_SHELL_BUILD=1 ./scripts/play-wm2000.sh # reuse the linked shell
 #   SCRATCH=/tmp/mine     ./scripts/play-wm2000.sh   # your own scratch root
 #
 # In the window: F1 settings (incl. gamepad rebinding) - F2 screenshot PNG -
@@ -90,13 +91,22 @@ ln -sfn "$EMIT" "$FN64/crates/fn64-shell/rs/recompiled"
 # 3. Build the windowed shell on the rs lane. No `--features rt64`.
 #    FN64_RENDER=wgpu needs no Cargo feature: WgpuBackend::try_new is
 #    unconditionally available.
-echo "[play-wm2000] building the shell (rs lane, renderer=$RENDER)"
 cd "$FN64/crates/fn64-shell/rs"
-FN64_RECOMP=rs \
-FN64_APP_TITLE="$APP_TITLE" \
-ROM="$ROM" \
-RECOMP_RS_HOST_LOOKUP="$HOST_LOOKUP" \
-  cargo build --release --offline
+SHELL_BIN="$FN64/crates/fn64-shell/rs/target/release/fn64"
+if [[ -z "${FN64_SKIP_SHELL_BUILD:-}" ]]; then
+  echo "[play-wm2000] building the shell (rs lane, renderer=$RENDER)"
+  FN64_RECOMP=rs \
+  FN64_APP_TITLE="$APP_TITLE" \
+  ROM="$ROM" \
+  RECOMP_RS_HOST_LOOKUP="$HOST_LOOKUP" \
+    cargo build --release --offline
+else
+  [[ -x "$SHELL_BIN" ]] || {
+    echo "[play-wm2000] FATAL: FN64_SKIP_SHELL_BUILD=1 but $SHELL_BIN is absent" >&2
+    exit 1
+  }
+  echo "[play-wm2000] reusing linked shell at $SHELL_BIN"
+fi
 
 # 4. Play. The startup banner names the lane and the RESOLVED renderer -- if
 #    it says `reference-fallback`, wgpu failed to construct and the reason is
@@ -105,4 +115,4 @@ exec env \
   ROM="$ROM" \
   FN64_ABSENT_N64DD=1 \
   FN64_RENDER="$RENDER" \
-  "$FN64/crates/fn64-shell/rs/target/release/fn64" "$@"
+  "$SHELL_BIN" "$@"

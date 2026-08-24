@@ -11,10 +11,10 @@ use crate::{CombineParams, CycleType, OtherMode, TmemSnapshotIdentity};
 
 use super::{ColorTargetFormat, ColorTargetKey, TargetGeneration};
 
-const HOT_COMBINE_LOW: u32 = 0xfc51_96a3;
-const HOT_COMBINE_HIGH: u32 = 0x112c_fe7f;
-const HOT_OTHER_MODE_HIGH: u32 = 0x0008_acef;
-const HOT_OTHER_MODE_LOW: u32 = 0x0050_41c8;
+pub(crate) const HOT_COMBINE_LOW: u32 = 0xfc51_96a3;
+pub(crate) const HOT_COMBINE_HIGH: u32 = 0x112c_fe7f;
+pub(crate) const HOT_OTHER_MODE_HIGH: u32 = 0x0008_acef;
+pub(crate) const HOT_OTHER_MODE_LOW: u32 = 0x0050_41c8;
 
 /// The one complete RDP program admitted by the first compute prototype.
 /// Raw halves are retained because a shader pipeline key must distinguish

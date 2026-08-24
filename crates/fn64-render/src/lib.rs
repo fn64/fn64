@@ -80,12 +80,12 @@ pub use render_ir::{
     NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
     NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
-    RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
-    RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
-    RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
-    StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
-    TmemTransferLayout, TriangleAccessSpan, TriangleSource,
+    RawDpcCoordinator, RawDpcExecutionBatch, RawDpcExecutionView, RawDpcIrCapability,
+    RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef,
+    RawDpcTerminalOutcome, RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand,
+    RdpStateIdentity, RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule,
+    RectViewportPixels, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
+    TmemLoadShape, TmemTransferLayout, TriangleAccessSpan, TriangleSource,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
@@ -1292,6 +1292,18 @@ pub enum RawDpcProgression {
     Acknowledged,
 }
 
+/// Whether the production raw-DPC backend can retain an ordered task's
+/// physical successors privately and complete all members through one
+/// task-scoped execution call. This is distinct from the older diagnostic
+/// [`RawDpcBatchCapability`]: `Transactional` preserves every member's
+/// ticket, journal, guest-write commit, fabric transition, and publication.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RawDpcTaskBatchCapability {
+    #[default]
+    Unsupported,
+    Transactional,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderRawDpcContinuation(NonZeroU64);
 
@@ -1814,9 +1826,10 @@ pub trait RenderBackend {
 
     // --- Production raw-DPC seam (v11 interface freeze) -------------------
     //
-    // `raw_dpc_ir_capability`, `plan_raw_dpc`, `execute_raw_dpc`, and
-    // `publish_raw_dpc` are the four object-safe raw-DPC methods this trait
-    // exposes (v11 §134-153). `publish_raw_dpc`'s signature has no `Result`
+    // The four original object-safe raw-DPC methods remain the ordinary
+    // one-submission seam. The task-batch methods below add an explicitly
+    // capability-gated transport without changing their semantics.
+    // `publish_raw_dpc`'s signature has no `Result`
     // (`-> CommittedRawDpcOutcome`, not `Result<_, RenderError>`), unlike its
     // three siblings, so its default body cannot report "unsupported" the
     // way theirs do. It panics instead -- deliberately, not as a workaround:
@@ -1882,6 +1895,11 @@ pub trait RenderBackend {
         RawDpcIrCapability::Unsupported
     }
 
+    /// Whether this backend implements the production task-batch methods.
+    fn raw_dpc_task_batch_capability(&self) -> RawDpcTaskBatchCapability {
+        RawDpcTaskBatchCapability::Unsupported
+    }
+
     /// Finish one [`RawDpcPlanRequest`] into the neutral, sealed
     /// [`PlannedRawDpcSubmission`] described by card v10 section 3: decode every
     /// command through the one real decoder into
@@ -1910,6 +1928,22 @@ pub trait RenderBackend {
         })
     }
 
+    /// Plan an ordered task's captures while retaining the exact pre-delta
+    /// state associated with each member. The default rejects the complete
+    /// vector; it never falls back to independently planned packets because
+    /// that would lose the batch's state-binding guarantee.
+    fn plan_raw_dpc_task_batch(
+        &mut self,
+        requests: Vec<RawDpcPlanRequest>,
+    ) -> Result<Vec<PlannedRawDpcSubmission>, RenderError> {
+        drop(requests);
+        Err(RenderError::Backend {
+            backend: "render/raw-dpc-task-batch-plan",
+            reason: "registered backend does not implement production raw-DPC task-batch planning"
+                .to_string(),
+        })
+    }
+
     /// Execute one sealed, bound raw-DPC submission's declared TMEM loads and
     /// advance it into [`BackendPreparedRawDpc`], retaining every GPU/
     /// physical readiness fact backend-side. The default is a loud rejection
@@ -1924,6 +1958,21 @@ pub trait RenderBackend {
         Err(RenderError::Backend {
             backend: "render/raw-dpc-execute",
             reason: "registered backend does not implement raw-DPC execution".to_string(),
+        })
+    }
+
+    /// Execute every bound member of one ordered task against private TMEM
+    /// and color-target successor chains. Returned preparations retain their
+    /// original order and are still committed and published individually.
+    fn execute_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<BoundSubmittedRawDpc>,
+    ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
+        drop(bounds);
+        Err(RenderError::Backend {
+            backend: "render/raw-dpc-task-batch-execute",
+            reason: "registered backend does not implement production raw-DPC task-batch execution"
+                .to_string(),
         })
     }
 

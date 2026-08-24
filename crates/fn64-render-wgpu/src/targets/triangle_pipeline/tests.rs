@@ -14,6 +14,27 @@ const EXTENT: TriangleTargetExtent = TriangleTargetExtent {
     height: 8,
 };
 
+#[test]
+fn compute_color_checkpoints_are_strict_and_end_at_the_chain_boundary() {
+    assert_eq!(validate_compute_color_checkpoints(5, &[2, 5]), Ok(()));
+    assert_eq!(
+        validate_compute_color_checkpoints(5, &[2, 2, 5]),
+        Err(TrianglePipelineError::ComputeColorCheckpointOrder {
+            checkpoint: 1,
+            previous: 2,
+            dispatch_limit: 2,
+            dispatches: 5,
+        })
+    );
+    assert_eq!(
+        validate_compute_color_checkpoints(5, &[2, 4]),
+        Err(TrianglePipelineError::ComputeColorCheckpointMissingFinal {
+            final_checkpoint: 4,
+            dispatches: 5,
+        })
+    );
+}
+
 fn identity_raster_params() -> TriangleRasterParams {
     TriangleRasterParams {
         resolution: [EXTENT.width as f32, EXTENT.height as f32],
