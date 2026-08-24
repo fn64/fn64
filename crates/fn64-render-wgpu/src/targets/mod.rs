@@ -47,7 +47,9 @@ pub use texrect::{
     TexrectBlendRegisters, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
     TexrectShading, TexrectTileBinding,
 };
-pub(crate) use triangle_pipeline::{admitted_triangle_fixture, ResolvedFragmentBlendParams};
+pub(crate) use triangle_pipeline::{
+    admitted_triangle_fixture, ComputeHotColorBatch, ResolvedFragmentBlendParams,
+};
 pub use triangle_pipeline::{
     fixed_fixture_other_mode, ComputeCoverageTriangle, ComputeRasterSample, InFlightTriangleDraw,
     RasterVertex, TriangleDrawOutput, TriangleFixture, TrianglePipelineDeviceOutcome,
