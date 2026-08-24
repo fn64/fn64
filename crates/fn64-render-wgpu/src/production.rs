@@ -9962,8 +9962,16 @@ mod tests {
         assert_eq!(
             executable_before,
             vec![
-                "let pending = self.pending_fill_publication.take();",
                 "let submission = publication.submission();",
+                "let pending = if self",
+                ".task_batch_pending_fill_publications",
+                ".front()",
+                ".is_some_and(|pending| pending.submission == submission)",
+                "{",
+                "self.task_batch_pending_fill_publications.pop_front()",
+                "} else {",
+                "self.pending_fill_publication.take()",
+                "};",
                 "let outcome =",
             ],
             "no step other than the submission-keyed fill token take and the capsule's own \
