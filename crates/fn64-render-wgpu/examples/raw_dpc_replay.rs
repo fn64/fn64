@@ -37,6 +37,7 @@ struct Timings {
     finalize: Duration,
     execute: Duration,
     compute_probe: Duration,
+    compute_probe_submissions: u32,
     compute_probe_batches: u32,
     compute_probe_draws: u32,
     compute_probe_pixels: u32,
@@ -53,6 +54,7 @@ impl Timings {
         self.finalize += other.finalize;
         self.execute += other.execute;
         self.compute_probe += other.compute_probe;
+        self.compute_probe_submissions += other.compute_probe_submissions;
         self.compute_probe_batches += other.compute_probe_batches;
         self.compute_probe_draws += other.compute_probe_draws;
         self.compute_probe_pixels += other.compute_probe_pixels;
@@ -222,6 +224,10 @@ fn main() {
         .iter()
         .map(|sample| sample.compute_probe_batches)
         .sum();
+    let probe_submissions: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_probe_submissions)
+        .sum();
     let probe_draws: u32 = samples
         .iter()
         .map(|sample| sample.compute_probe_draws)
@@ -231,8 +237,8 @@ fn main() {
         .map(|sample| sample.compute_probe_pixels)
         .sum();
     println!(
-        "compute_probe_batches={} draws={} target_pixels={} across_repeats={}",
-        probe_batches, probe_draws, probe_pixels, repeat
+        "compute_probe_submissions={} batches={} draws={} target_pixels={} across_repeats={}",
+        probe_submissions, probe_batches, probe_draws, probe_pixels, repeat
     );
     if detail {
         for (window_index, packet) in packet_samples.iter().enumerate() {
@@ -366,6 +372,9 @@ fn replay_once(
             execute,
             compute_probe: compute_probe
                 .map(|receipt| receipt.elapsed())
+                .unwrap_or_default(),
+            compute_probe_submissions: compute_probe
+                .map(|receipt| receipt.submission_count())
                 .unwrap_or_default(),
             compute_probe_batches: compute_probe
                 .map(|receipt| receipt.batch_count())
