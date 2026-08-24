@@ -361,12 +361,10 @@
 //! expected and correct, matching every other characterization-first module
 //! in this crate). No parity or performance claim against RT64's actual
 //! runtime behavior; only the arithmetic and branch structure of the four
-//! `RigidBody` methods (plus its constructor) named above are ported. The
+//! `RigidBody` methods (plus its constructor) named above are ported. Their
 //! surrounding object graph -- `RigidBody`'s owning `GameFrame`/mesh/scene
-//! objects, the call sites that decide `componentInterpolation`/
-//! `rotInterpolation`/etc. from parsed extended-GBI commands, and any
-//! frame-to-frame scheduling of `updateLinear`/`updateAngular`/
-//! `updatePerspective`/`updateDecomposition`/`lerp` -- is not ported. These
+//! objects -- is absent. No ported call sites decide interpolation modes from
+//! parsed extended-GBI commands or schedule those methods frame-to-frame. These
 //! are RT64's own heuristic interpolation-mode-selection logic (explicitly
 //! marked `TODO`/`FIXME` by the source itself in three places -- configurable
 //! velocity/magnitude thresholds, independent scale/skew auto-detection, and
