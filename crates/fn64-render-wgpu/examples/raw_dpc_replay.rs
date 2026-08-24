@@ -41,6 +41,13 @@ struct Timings {
     compute_probe_batches: u32,
     compute_probe_draws: u32,
     compute_probe_pixels: u32,
+    compute_replace: Duration,
+    compute_replace_admission: Duration,
+    compute_replace_effects: Duration,
+    compute_replace_submissions: u32,
+    compute_replace_batches: u32,
+    compute_replace_draws: u32,
+    compute_replace_pixels: u32,
     commit: Duration,
     copyback: Duration,
     publish: Duration,
@@ -58,6 +65,13 @@ impl Timings {
         self.compute_probe_batches += other.compute_probe_batches;
         self.compute_probe_draws += other.compute_probe_draws;
         self.compute_probe_pixels += other.compute_probe_pixels;
+        self.compute_replace += other.compute_replace;
+        self.compute_replace_admission += other.compute_replace_admission;
+        self.compute_replace_effects += other.compute_replace_effects;
+        self.compute_replace_submissions += other.compute_replace_submissions;
+        self.compute_replace_batches += other.compute_replace_batches;
+        self.compute_replace_draws += other.compute_replace_draws;
+        self.compute_replace_pixels += other.compute_replace_pixels;
         self.commit += other.commit;
         self.copyback += other.copyback;
         self.publish += other.publish;
@@ -118,7 +132,17 @@ fn main() {
         std::env::var_os("FN64_COMPUTE_RASTER_PROBE").is_some_and(|value| value == "1");
     let compute_chain_probe_requested =
         std::env::var_os("FN64_COMPUTE_RASTER_CHAIN_PROBE").is_some_and(|value| value == "1");
+    let compute_replace_requested =
+        std::env::var_os("FN64_COMPUTE_RASTER_REPLACE").is_some_and(|value| value == "1");
+    let compute_replace_ab =
+        std::env::var_os("FN64_COMPUTE_RASTER_REPLACE_AB").is_some_and(|value| value == "1");
+    let compute_first = std::env::var_os("FN64_COMPUTE_RASTER_REPLACE_AB_COMPUTE_FIRST")
+        .is_some_and(|value| value == "1");
     assert!(repeat > 0, "FN64_RAW_DPC_REPLAY_REPEAT must be nonzero");
+    assert!(
+        !compute_replace_ab || (!compute_replace_requested && repeat % 2 == 0),
+        "replacement A/B requires an even repeat and must not be combined with fixed replacement"
+    );
 
     let (mut backend, mut session) = WgpuBackend::try_new().expect("construct wgpu backend");
     backend
@@ -129,6 +153,7 @@ fn main() {
         })
         .expect("create wgpu backend");
     backend.set_compute_raster_probe_enabled(false);
+    backend.set_compute_raster_replace_enabled(false);
 
     let mut postimage = pristine.clone();
     for (index, stream) in prefix.iter().enumerate() {
@@ -154,13 +179,24 @@ fn main() {
     }
     backend.set_compute_raster_probe_enabled(compute_probe_requested);
     backend.set_compute_raster_chain_probe_enabled(compute_chain_probe_requested);
+    backend.set_compute_raster_replace_enabled(compute_replace_requested);
 
     let mut samples = Vec::with_capacity(repeat as usize);
+    let mut cpu_samples = Vec::with_capacity((repeat / 2) as usize);
+    let mut replacement_samples = Vec::with_capacity((repeat / 2) as usize);
     let mut packet_samples = vec![Vec::with_capacity(repeat as usize); benchmark.len()];
     let mut expected_digest = None;
+    let mut expected_committed_bytes = None;
     for iteration in 0..warmup + repeat {
+        let replacement_iteration = if compute_replace_ab {
+            (iteration % 2 == 0) == compute_first
+        } else {
+            compute_replace_requested
+        };
+        backend.set_compute_raster_replace_enabled(replacement_iteration);
         let mut timings = Timings::default();
         let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        let mut committed_bytes = Vec::new();
         for (window_index, stream) in benchmark.iter().enumerate() {
             let packet_start = if window_index + 1 == benchmark.len() {
                 start
@@ -173,7 +209,7 @@ fn main() {
                 + u64::from(iteration) * u64::try_from(window).expect("window exceeds u64")
                 + u64::try_from(window_index).expect("window index exceeds u64")
                 + 1;
-            let (packet_timings, packet_digest) = replay_once(
+            let (packet_timings, packet_digest, packet_bytes) = replay_once(
                 &mut backend,
                 &mut session,
                 &stream.words,
@@ -186,6 +222,7 @@ fn main() {
                 sequence,
             );
             timings.add(packet_timings);
+            committed_bytes.extend_from_slice(&packet_bytes);
             if iteration >= warmup {
                 packet_samples[window_index].push(packet_timings);
             }
@@ -201,8 +238,22 @@ fn main() {
                 "committed guest bytes changed across identical replay iterations"
             ),
         }
+        match &expected_committed_bytes {
+            None => expected_committed_bytes = Some(committed_bytes),
+            Some(expected) => assert_eq!(
+                committed_bytes, *expected,
+                "committed guest bytes changed across identical replay iterations"
+            ),
+        }
         if iteration >= warmup {
             samples.push(timings);
+            if compute_replace_ab {
+                if replacement_iteration {
+                    replacement_samples.push(timings);
+                } else {
+                    cpu_samples.push(timings);
+                }
+            }
         }
     }
 
@@ -219,10 +270,28 @@ fn main() {
     report("finalize", &samples, |sample| sample.finalize);
     report("execute", &samples, |sample| sample.execute);
     report("compute_probe", &samples, |sample| sample.compute_probe);
+    report("compute_replace", &samples, |sample| sample.compute_replace);
+    report("replace_admit", &samples, |sample| {
+        sample.compute_replace_admission
+    });
+    report("replace_effects", &samples, |sample| {
+        sample.compute_replace_effects
+    });
     report("commit", &samples, |sample| sample.commit);
     report("copyback", &samples, |sample| sample.copyback);
     report("publish", &samples, |sample| sample.publish);
     report("total", &samples, |sample| sample.total);
+    if compute_replace_ab {
+        report("ab_cpu_execute", &cpu_samples, |sample| sample.execute);
+        report("ab_cpu_total", &cpu_samples, |sample| sample.total);
+        report("ab_gpu_execute", &replacement_samples, |sample| {
+            sample.execute
+        });
+        report("ab_gpu_work", &replacement_samples, |sample| {
+            sample.compute_replace
+        });
+        report("ab_gpu_total", &replacement_samples, |sample| sample.total);
+    }
     let probe_batches: u32 = samples
         .iter()
         .map(|sample| sample.compute_probe_batches)
@@ -243,6 +312,26 @@ fn main() {
         "compute_probe_submissions={} batches={} draws={} target_pixels={} across_repeats={}",
         probe_submissions, probe_batches, probe_draws, probe_pixels, repeat
     );
+    let replace_batches: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_replace_batches)
+        .sum();
+    let replace_submissions: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_replace_submissions)
+        .sum();
+    let replace_draws: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_replace_draws)
+        .sum();
+    let replace_pixels: u32 = samples
+        .iter()
+        .map(|sample| sample.compute_replace_pixels)
+        .sum();
+    println!(
+        "compute_replace_submissions={} batches={} draws={} target_pixels={} across_repeats={}",
+        replace_submissions, replace_batches, replace_draws, replace_pixels, repeat
+    );
     if detail {
         for (window_index, packet) in packet_samples.iter().enumerate() {
             let packet_index = prefix.len() + window_index;
@@ -258,6 +347,11 @@ fn main() {
                 &format!("packet_{packet_index}_compute_probe"),
                 packet,
                 |sample| sample.compute_probe,
+            );
+            report(
+                &format!("packet_{packet_index}_compute_replace"),
+                packet,
+                |sample| sample.compute_replace,
             );
         }
     }
@@ -275,7 +369,7 @@ fn replay_once(
     start: u32,
     end: u32,
     sequence: u64,
-) -> (Timings, u64) {
+) -> (Timings, u64, Vec<u8>) {
     let total_started = Instant::now();
     let capture = capture(words, stream, layout_bytes, start, end, sequence);
 
@@ -315,6 +409,7 @@ fn replay_once(
         .expect("execute captured packet");
     let execute = started.elapsed();
     let compute_probe = backend.take_compute_raster_probe_receipt();
+    let compute_replace = backend.take_compute_raster_replace_receipt();
 
     let staged = backend.staged_guest_render_target_writes(submission);
     let payloads = backend.committed_guest_render_target_bytes(submission);
@@ -332,6 +427,7 @@ fn replay_once(
 
     let started = Instant::now();
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut committed_bytes = Vec::new();
     for (write, payload) in staged.iter().zip(&payloads) {
         let ResourceRegion::Rdram { range, .. } = write.access().region() else {
             panic!("guest render-target write does not name RDRAM");
@@ -339,6 +435,7 @@ fn replay_once(
         RdramViewMut::from_storage(postimage)
             .write_logical_bytes(RdramAddr::from_offset(range.start().get()), payload);
         for &byte in payload {
+            committed_bytes.push(byte);
             digest ^= u64::from(byte);
             digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -388,12 +485,34 @@ fn replay_once(
             compute_probe_pixels: compute_probe
                 .map(|receipt| receipt.target_pixels())
                 .unwrap_or_default(),
+            compute_replace: compute_replace
+                .map(|receipt| receipt.elapsed())
+                .unwrap_or_default(),
+            compute_replace_admission: compute_replace
+                .map(|receipt| receipt.admission_elapsed())
+                .unwrap_or_default(),
+            compute_replace_effects: compute_replace
+                .map(|receipt| receipt.effects_elapsed())
+                .unwrap_or_default(),
+            compute_replace_submissions: compute_replace
+                .map(|receipt| receipt.submission_count())
+                .unwrap_or_default(),
+            compute_replace_batches: compute_replace
+                .map(|receipt| receipt.batch_count())
+                .unwrap_or_default(),
+            compute_replace_draws: compute_replace
+                .map(|receipt| receipt.draw_count())
+                .unwrap_or_default(),
+            compute_replace_pixels: compute_replace
+                .map(|receipt| receipt.target_pixels())
+                .unwrap_or_default(),
             commit,
             copyback,
             publish,
             total: total_started.elapsed(),
         },
         digest,
+        committed_bytes,
     )
 }
 

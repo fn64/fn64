@@ -143,9 +143,12 @@ same representation proven by `targets/native_fill_rgba16.wgsl`.
    passed 10 consecutive complete-target runs (500 admitted draws). Additional
    state keys and replacement of per-draw prototype resources/readbacks remain
    open.
-6. **Production A/B seam.** Add a strict same-binary CPU-versus-compute control.
-   Run counterbalanced `A/B, B/A`, then re-profile. Retain only if both orders
-   improve p95 and the named RDP cost falls.
+6. **Production A/B seam.** The strict same-binary CPU-versus-compute control
+   is implemented and runs counterbalanced `A/B, B/A` with exact committed
+   guest-byte comparison. Packet-local replacement failed its performance
+   gate: CPU averaged 14.221 ms total and compute averaged 17.844 ms, so the
+   replacement remains opt-in. The next A/B must move the synchronization
+   boundary across packets rather than add more work inside this boundary.
 7. **Batch-boundary widening.** Add exact GPU fill and texrect execution so a
    whole raw-DPC packet normally incurs one upload/readback pair rather than a
    pair around every triangle run. Only measured boundary frequency decides
@@ -187,10 +190,10 @@ forecast. They do show why a triangle-only shader with per-draw transfers is
 insufficient: even eliminating all measured scalar execution would leave the
 live 13.8 ms p95 gap underfunded. The retained order is therefore:
 
-1. finish one complete color-producing state and require a >=3 ms live p95
-   win;
-2. make target residency span packet-local triangle batches, measuring the
-   transfer terms separately;
+1. keep the exact packet-local replacement as the counterfactual oracle, but
+   do not enable it: its counterbalanced A/B loses 3.623 ms;
+2. prove the first real guest or VI consumer after each graphics burst and
+   keep the typed packed target device-resident until that boundary;
 3. widen exact color execution through the five keys covering 98.4% of live
    raster time;
 4. absorb fill and texrect boundaries, starting with packet 2657's measured
@@ -300,6 +303,37 @@ chained means were 8.533 and 8.436 ms, a paired-order average reduction from
 23.337 ms (-1.077 ms, 4.4%). This proves intermediate target transport is a
 real cost class and supplies the ordered device mechanism production needs;
 it remains diagnostic double execution and earns no CPU-raster savings yet.
+
+The transaction-integrated replacement gate then made compute bytes, rather
+than the CPU oracle, supply the typed completion, declared guest writes,
+effect digests, copyback, and publication. Ten repeated fixed-mode executions
+were byte-exact. Three additional transport changes were retained in order:
+dispatching only journal-proven rows reduced target-pixel work from 3,456,000
+to 691,200 per burst; consolidating all batch statuses into one mapped
+high-water readback reduced fixed-mode GPU work from 6.102 to 5.622 ms; and
+mutating one shared device target across ordered passes removed intermediate
+full-target copies and reduced it again to 5.133 ms. A bind-group cache
+regressed that result to 5.316 ms and was removed; reusing an existing TMEM
+projection did not improve the measured result and was also removed.
+
+The stricter same-process alternating replacement A/B exposed the remaining
+boundary cost that a continuously hot GPU loop concealed. CPU-first measured
+CPU execute/total means of 8.039/14.231 ms and compute means of
+11.813/17.979 ms. Reversing the order measured 8.019/14.211 ms and
+11.567/17.708 ms. Every CPU and compute completion had identical committed
+guest bytes, but the paired-order total averages were 14.221 ms for CPU and
+17.844 ms for compute: packet-local replacement is 3.623 ms slower and fails
+the kill gate. Fixed-mode compute's 5.133 ms was not representative of the
+live-like alternating idle cadence, where compute work averaged about
+7.67 ms.
+
+This negative result changes the next execution boundary. Ten packet-level
+upload/submit/wait/readback/copyback transactions per burst overwhelm the
+shader saving; optimizing another packet-local setup term cannot fund the
+remaining gap. The next mechanism must keep the target device-resident across
+packets and synchronize once at the first access-journal-proven guest or VI
+consumer. Correctness requires that consumer boundary to be represented in
+the transaction types; timing alone cannot authorize delayed guest writes.
 
 ## Sources and nonclaims
 

@@ -31,6 +31,10 @@ struct CoverageParams {
     height: u32,
     pixels_per_triangle: u32,
     triangle_count: u32,
+    first_word: u32,
+    word_count: u32,
+    _padding0: u32,
+    _padding1: u32,
 }
 
 struct SampleLine {
@@ -386,7 +390,11 @@ fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelR
 // packed RGBA16 target.
 @compute @workgroup_size(64)
 fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
-    let word_index = id.x;
+    let local_word_index = id.x;
+    if local_word_index >= params.word_count {
+        return;
+    }
+    let word_index = params.first_word + local_word_index;
     if word_index >= arrayLength(&color_target_words) {
         return;
     }
@@ -396,7 +404,8 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     let first_logical = ((first_device & 0xffu) << 8u) | (first_device >> 8u);
     let first = execute_hot_color_pixel(first_pixel, first_logical);
     var output_word = ((first.rgba16 & 0xffu) << 8u) | (first.rgba16 >> 8u);
-    color_status[first_pixel] = first.status;
+    let first_status = local_word_index * 2u;
+    color_status[first_status] = first.status;
     let second_pixel = first_pixel + 1u;
     if second_pixel < params.pixels_per_triangle {
         let second_device = device_word >> 16u;
@@ -404,7 +413,7 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
         let second = execute_hot_color_pixel(second_pixel, second_logical);
         let packed_device = ((second.rgba16 & 0xffu) << 8u) | (second.rgba16 >> 8u);
         output_word |= packed_device << 16u;
-        color_status[second_pixel] = second.status;
+        color_status[first_status + 1u] = second.status;
     } else {
         output_word |= device_word & 0xffff0000u;
     }

@@ -1241,6 +1241,7 @@ impl UninitializedTrianglePipeline {
                 framebuffer_color_dummy_buffer,
                 fixture_buffers: Vec::new(),
                 compute_hot_color_buffers: Vec::new(),
+                compute_hot_color_chain_status_readback: None,
                 compute_hot_color_resource_generations: 0,
                 errors,
             },
@@ -1371,6 +1372,10 @@ pub struct TrianglePipelineRenderer {
     /// only when a later batch exceeds one of the three variable capacities;
     /// identical steady-state draws rewrite and reuse every GPU allocation.
     compute_hot_color_buffers: Vec<ComputeHotColorBuffers>,
+    /// One high-water readback for every status range in an ordered chain.
+    /// Distinct offsets retain per-batch failure attribution while one map
+    /// replaces a map/poll callback cycle per semantic batch.
+    compute_hot_color_chain_status_readback: Option<ChainStatusReadback>,
     compute_hot_color_resource_generations: u64,
     errors: Arc<BoundedErrorSink>,
 }
@@ -1390,6 +1395,11 @@ struct ComputeHotColorBuffers {
     status_readback: wgpu::Buffer,
     tmem_group: wgpu::BindGroup,
     compute_group: wgpu::BindGroup,
+}
+
+struct ChainStatusReadback {
+    capacity: u64,
+    buffer: wgpu::Buffer,
 }
 
 impl ComputeHotColorBuffers {
@@ -1415,7 +1425,7 @@ impl ComputeHotColorBuffers {
         );
         let params = create(
             "fn64-compute-hot-color-params",
-            16,
+            32,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
         let target = create(
@@ -1660,6 +1670,10 @@ pub(crate) struct ComputeHotColorDispatch<'a> {
     pub(crate) triangles: &'a [ComputeCoverageTriangle],
     pub(crate) tmem: &'a TmemGpuProjection,
     pub(crate) tile: TileBindingParams,
+    /// Exact contiguous target-row band containing every declared write in
+    /// this state-compatible batch.
+    pub(crate) first_row: u32,
+    pub(crate) row_count: u32,
 }
 
 struct PreparedComputeHotColorBatch {
@@ -1667,6 +1681,7 @@ struct PreparedComputeHotColorBatch {
     triangle_bytes: u64,
     target_bytes: u64,
     status_bytes: u64,
+    first_word: u32,
     workgroups: u32,
     packed_triangles: Vec<u8>,
     params: Vec<u8>,
@@ -1940,8 +1955,18 @@ impl TrianglePipelineRenderer {
         for triangle in triangles {
             packed_triangles.extend_from_slice(&triangle.storage_bytes());
         }
-        let mut params = Vec::with_capacity(16);
-        for word in [extent.width, extent.height, pixels, triangle_count] {
+        let word_count = pixels.div_ceil(2);
+        let mut params = Vec::with_capacity(32);
+        for word in [
+            extent.width,
+            extent.height,
+            pixels,
+            triangle_count,
+            0,
+            word_count,
+            0,
+            0,
+        ] {
             params.extend_from_slice(&word.to_le_bytes());
         }
         let triangle_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1952,7 +1977,7 @@ impl TrianglePipelineRenderer {
         });
         let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fn64-compute-triangle-coverage-params"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2103,9 +2128,10 @@ impl TrianglePipelineRenderer {
             let triangle_count = u32::try_from(batch.triangles.len())
                 .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
             let triangle_bytes = u64::from(triangle_count) * 160;
-            let target_bytes = u64::from(pixels.div_ceil(2)) * 4;
+            let word_count = pixels.div_ceil(2);
+            let target_bytes = u64::from(word_count) * 4;
             let status_bytes = u64::from(pixels) * 4;
-            let workgroups = pixels.div_ceil(2).div_ceil(64);
+            let workgroups = word_count.div_ceil(64);
             if workgroups > limits.max_compute_workgroups_per_dimension
                 || triangle_bytes > limits.max_buffer_size
                 || triangle_bytes > u64::from(limits.max_storage_buffer_binding_size)
@@ -2120,12 +2146,16 @@ impl TrianglePipelineRenderer {
             for triangle in batch.triangles {
                 packed_triangles.extend_from_slice(&triangle.storage_bytes());
             }
-            let mut params = Vec::with_capacity(16);
+            let mut params = Vec::with_capacity(32);
             for word in [
                 batch.extent.width,
                 batch.extent.height,
                 pixels,
                 triangle_count,
+                0,
+                word_count,
+                0,
+                0,
             ] {
                 params.extend_from_slice(&word.to_le_bytes());
             }
@@ -2136,6 +2166,7 @@ impl TrianglePipelineRenderer {
                 triangle_bytes,
                 target_bytes,
                 status_bytes,
+                first_word: 0,
                 workgroups,
                 packed_triangles,
                 params,
@@ -2240,7 +2271,7 @@ impl TrianglePipelineRenderer {
             {
                 return Err(TrianglePipelineError::ComputeColorBatchTmemStatus {
                     batch: index,
-                    pixel,
+                    pixel: batch.first_word as usize * 2 + pixel,
                     status,
                 });
             }
@@ -2286,14 +2317,10 @@ impl TrianglePipelineRenderer {
                 actual: resident_bytes.len(),
             });
         }
-        let target_bytes = u64::from(pixels.div_ceil(2)) * 4;
-        let status_bytes = u64::from(pixels) * 4;
-        let workgroups = pixels.div_ceil(2).div_ceil(64);
-        if workgroups > limits.max_compute_workgroups_per_dimension
-            || target_bytes > limits.max_buffer_size
+        let target_words = pixels.div_ceil(2);
+        let target_bytes = u64::from(target_words) * 4;
+        if target_bytes > limits.max_buffer_size
             || target_bytes > u64::from(limits.max_storage_buffer_binding_size)
-            || status_bytes > limits.max_buffer_size
-            || status_bytes > u64::from(limits.max_storage_buffer_binding_size)
         {
             return Err(TrianglePipelineError::CoverageTooLarge);
         }
@@ -2306,8 +2333,50 @@ impl TrianglePipelineRenderer {
             let triangle_count = u32::try_from(dispatch.triangles.len())
                 .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
             let triangle_bytes = u64::from(triangle_count) * 160;
+            let row_limit = dispatch.first_row.checked_add(dispatch.row_count).ok_or(
+                TrianglePipelineError::ComputeColorDispatchRows {
+                    first_row: dispatch.first_row,
+                    row_count: dispatch.row_count,
+                    height: extent.height,
+                },
+            )?;
+            if dispatch.row_count == 0 || row_limit > extent.height {
+                return Err(TrianglePipelineError::ComputeColorDispatchRows {
+                    first_row: dispatch.first_row,
+                    row_count: dispatch.row_count,
+                    height: extent.height,
+                });
+            }
+            let first_pixel = dispatch
+                .first_row
+                .checked_mul(extent.width)
+                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            let pixel_limit = row_limit
+                .checked_mul(extent.width)
+                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            let first_word = first_pixel / 2;
+            let word_limit = pixel_limit.div_ceil(2);
+            let word_count = word_limit
+                .checked_sub(first_word)
+                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            let status_limit = pixels
+                .checked_sub(
+                    first_word
+                        .checked_mul(2)
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?,
+                )
+                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            let status_values = word_count
+                .checked_mul(2)
+                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?
+                .min(status_limit);
+            let status_bytes = u64::from(status_values) * 4;
+            let workgroups = word_count.div_ceil(64);
             if triangle_bytes > limits.max_buffer_size
                 || triangle_bytes > u64::from(limits.max_storage_buffer_binding_size)
+                || status_bytes > limits.max_buffer_size
+                || status_bytes > u64::from(limits.max_storage_buffer_binding_size)
+                || workgroups > limits.max_compute_workgroups_per_dimension
             {
                 return Err(TrianglePipelineError::CoverageTooLarge);
             }
@@ -2315,8 +2384,17 @@ impl TrianglePipelineRenderer {
             for triangle in dispatch.triangles {
                 packed_triangles.extend_from_slice(&triangle.storage_bytes());
             }
-            let mut params = Vec::with_capacity(16);
-            for word in [extent.width, extent.height, pixels, triangle_count] {
+            let mut params = Vec::with_capacity(32);
+            for word in [
+                extent.width,
+                extent.height,
+                pixels,
+                triangle_count,
+                first_word,
+                word_count,
+                0,
+                0,
+            ] {
                 params.extend_from_slice(&word.to_le_bytes());
             }
             prepared.push(PreparedComputeHotColorBatch {
@@ -2324,6 +2402,7 @@ impl TrianglePipelineRenderer {
                 triangle_bytes,
                 target_bytes,
                 status_bytes,
+                first_word,
                 workgroups,
                 packed_triangles,
                 params,
@@ -2358,6 +2437,27 @@ impl TrianglePipelineRenderer {
             }
         }
 
+        let chain_status_bytes = prepared
+            .iter()
+            .try_fold(0u64, |total, batch| total.checked_add(batch.status_bytes));
+        let chain_status_bytes =
+            chain_status_bytes.ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        if self
+            .compute_hot_color_chain_status_readback
+            .as_ref()
+            .is_none_or(|readback| readback.capacity < chain_status_bytes)
+        {
+            self.compute_hot_color_chain_status_readback = Some(ChainStatusReadback {
+                capacity: chain_status_bytes,
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fn64-compute-hot-color-chain-status-readback"),
+                    size: chain_status_bytes,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+            });
+        }
+
         let mut padded_target = resident_bytes.to_vec();
         padded_target.resize(target_bytes as usize, 0);
         self.queue
@@ -2378,6 +2478,40 @@ impl TrianglePipelineRenderer {
                 .write_buffer(&buffers.tile, 0, &input.tile.to_bytes());
         }
 
+        // Every pass in the chain mutates the same packed target. Pass
+        // boundaries order storage writes, while each invocation retains
+        // exclusive ownership of its packed word. Binding one target avoids
+        // a full-target device copy at every semantic state boundary.
+        let shared_target = &self.compute_hot_color_buffers[0].target;
+        let layout = self
+            .compute_triangle_color_pipeline
+            .get_bind_group_layout(1);
+        let mut chain_groups = Vec::with_capacity(prepared.len());
+        for buffers in &self.compute_hot_color_buffers[..prepared.len()] {
+            chain_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fn64-compute-hot-color-chain-state-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffers.triangle.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffers.params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: shared_target.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: buffers.status.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2392,30 +2526,28 @@ impl TrianglePipelineRenderer {
                 let buffers = &self.compute_hot_color_buffers[index];
                 pass.set_pipeline(&self.compute_triangle_color_pipeline);
                 pass.set_bind_group(0, &buffers.tmem_group, &[]);
-                pass.set_bind_group(1, &buffers.compute_group, &[]);
+                pass.set_bind_group(1, &chain_groups[index], &[]);
                 pass.dispatch_workgroups(batch.workgroups, 1, 1);
             }
-            if let Some(next) = self.compute_hot_color_buffers.get(index + 1) {
-                encoder.copy_buffer_to_buffer(
-                    &self.compute_hot_color_buffers[index].target,
-                    0,
-                    &next.target,
-                    0,
-                    target_bytes,
-                );
-            }
         }
+        let chain_status_readback = &self
+            .compute_hot_color_chain_status_readback
+            .as_ref()
+            .expect("non-empty chain has a status readback")
+            .buffer;
+        let mut status_offset = 0u64;
         for (index, batch) in prepared.iter().enumerate() {
             let buffers = &self.compute_hot_color_buffers[index];
             encoder.copy_buffer_to_buffer(
                 &buffers.status,
                 0,
-                &buffers.status_readback,
-                0,
+                chain_status_readback,
+                status_offset,
                 batch.status_bytes,
             );
+            status_offset += batch.status_bytes;
         }
-        let final_buffers = &self.compute_hot_color_buffers[prepared.len() - 1];
+        let final_buffers = &self.compute_hot_color_buffers[0];
         encoder.copy_buffer_to_buffer(
             &final_buffers.target,
             0,
@@ -2431,13 +2563,12 @@ impl TrianglePipelineRenderer {
                 timeout: Some(POLL_TIMEOUT),
             })
             .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
+        let statuses =
+            map_and_read_prefix(&self.device, chain_status_readback, chain_status_bytes)?;
+        let mut status_offset = 0usize;
         for (index, batch) in prepared.iter().enumerate() {
-            let statuses = map_and_read_prefix(
-                &self.device,
-                &self.compute_hot_color_buffers[index].status_readback,
-                batch.status_bytes,
-            )?;
-            if let Some((pixel, status)) = statuses
+            let status_end = status_offset + batch.status_bytes as usize;
+            if let Some((pixel, status)) = statuses[status_offset..status_end]
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes(word.try_into().expect("four status bytes")))
                 .enumerate()
@@ -2445,10 +2576,11 @@ impl TrianglePipelineRenderer {
             {
                 return Err(TrianglePipelineError::ComputeColorBatchTmemStatus {
                     batch: index,
-                    pixel,
+                    pixel: batch.first_word as usize * 2 + pixel,
                     status,
                 });
             }
+            status_offset = status_end;
         }
         let mut output =
             map_and_read_prefix(&self.device, &final_buffers.target_readback, target_bytes)?;
@@ -3251,6 +3383,11 @@ pub enum TrianglePipelineError {
         expected: usize,
         actual: usize,
     },
+    ComputeColorDispatchRows {
+        first_row: u32,
+        row_count: u32,
+        height: u32,
+    },
     ComputeColorBatchTmemStatus {
         batch: usize,
         pixel: usize,
@@ -3309,6 +3446,14 @@ impl fmt::Display for TrianglePipelineError {
             Self::ComputeColorTargetLength { expected, actual } => write!(
                 formatter,
                 "compute color target byte length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ComputeColorDispatchRows {
+                first_row,
+                row_count,
+                height,
+            } => write!(
+                formatter,
+                "compute color dispatch row band {first_row}+{row_count} exceeds target height {height}"
             ),
             Self::ComputeColorBatchTmemStatus {
                 batch,
