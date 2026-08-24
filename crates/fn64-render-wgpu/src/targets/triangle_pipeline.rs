@@ -154,6 +154,17 @@ fn compute_chain_timing_enabled() -> bool {
     })
 }
 
+fn compute_gpu_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_COMPUTE_GPU_TIMING") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_COMPUTE_GPU_TIMING must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("FN64_COMPUTE_GPU_TIMING is not valid Unicode: {error}"),
+    })
+}
+
 fn compute_chain_timing_lap(mark: &mut Option<Instant>) -> Duration {
     let Some(previous) = *mark else {
         return Duration::ZERO;
@@ -853,10 +864,21 @@ impl UninitializedTrianglePipeline {
             Err(error) => return Err(TrianglePipelineError::RequestAdapter(error.to_string())),
         };
         crate::device::adapter_selection::assert_expected_adapter(&adapter);
+        let required_features = if compute_gpu_timing_enabled() {
+            let feature = wgpu::Features::TIMESTAMP_QUERY;
+            if !adapter.features().contains(feature) {
+                return Err(TrianglePipelineError::TimestampQueryUnsupported {
+                    adapter: adapter.get_info().name,
+                });
+            }
+            feature
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fn64-triangle-pipeline"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -2594,6 +2616,35 @@ impl TrianglePipelineRenderer {
         }
         let timing_bind_groups = compute_chain_timing_lap(&mut timing_mark);
 
+        let gpu_query_count = u32::try_from(prepared.len())
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        let gpu_allocated_query_count = gpu_query_count
+            .checked_add(2)
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        let gpu_query_bytes = u64::from(gpu_allocated_query_count) * u64::from(wgpu::QUERY_SIZE);
+        let gpu_queries = compute_gpu_timing_enabled().then(|| {
+            let set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("fn64-compute-hot-color-chain-timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: gpu_allocated_query_count,
+            });
+            let resolve = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-compute-hot-color-chain-timestamp-resolve"),
+                size: gpu_query_bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fn64-compute-hot-color-chain-timestamp-readback"),
+                size: gpu_query_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            (set, resolve, readback)
+        });
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2601,9 +2652,17 @@ impl TrianglePipelineRenderer {
             });
         for (index, batch) in prepared.iter().enumerate() {
             {
+                let timestamp_writes =
+                    gpu_queries
+                        .as_ref()
+                        .map(|(set, _, _)| wgpu::ComputePassTimestampWrites {
+                            query_set: set,
+                            beginning_of_pass_write_index: Some(index as u32 * 2 + 1),
+                            end_of_pass_write_index: Some(index as u32 * 2 + 2),
+                        });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("fn64-compute-hot-color-chain-dispatch"),
-                    timestamp_writes: None,
+                    timestamp_writes,
                 });
                 let buffers = &self.compute_hot_color_buffers[index];
                 pass.set_pipeline(&self.compute_triangle_color_pipeline);
@@ -2637,6 +2696,10 @@ impl TrianglePipelineRenderer {
             0,
             target_bytes,
         );
+        if let Some((set, resolve, readback)) = &gpu_queries {
+            encoder.resolve_query_set(set, 0..gpu_allocated_query_count, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, gpu_query_bytes);
+        }
         let command_buffer = encoder.finish();
         let timing_encode = compute_chain_timing_lap(&mut timing_mark);
         let submission = self.queue.submit([command_buffer]);
@@ -2648,6 +2711,50 @@ impl TrianglePipelineRenderer {
             })
             .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
         let timing_wait = compute_chain_timing_lap(&mut timing_mark);
+        if let Some((_, _, readback)) = &gpu_queries {
+            let bytes = map_and_read_prefix(&self.device, readback, gpu_query_bytes)?;
+            let resolved_timestamps = bytes
+                .chunks_exact(wgpu::QUERY_SIZE as usize)
+                .map(|word| u64::from_le_bytes(word.try_into().expect("eight timestamp bytes")))
+                .collect::<Vec<_>>();
+            let timestamps = &resolved_timestamps[1..gpu_query_count as usize + 1];
+            let period_ns = f64::from(self.queue.get_timestamp_period());
+            let dispatch_ms = timestamps
+                .chunks_exact(2)
+                .map(|pair| {
+                    (pair[0] != 0 && pair[1] >= pair[0])
+                        .then(|| (pair[1] - pair[0]) as f64 * period_ns / 1_000_000.0)
+                })
+                .collect::<Vec<_>>();
+            let final_timestamp = *timestamps
+                .last()
+                .expect("non-empty timestamp query has a final value");
+            let span_ms = (timestamps[0] != 0 && final_timestamp >= timestamps[0])
+                .then(|| (final_timestamp - timestamps[0]) as f64 * period_ns / 1_000_000.0);
+            let rows = dispatches
+                .iter()
+                .zip(&prepared)
+                .zip(&dispatch_ms)
+                .map(|((dispatch, batch), elapsed_ms)| {
+                    (
+                        dispatch.triangles.len(),
+                        u64::from(batch.word_count) * 2,
+                        *elapsed_ms,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let valid_sum_ms = dispatch_ms.iter().flatten().sum::<f64>();
+            let invalid_dispatches = dispatch_ms
+                .iter()
+                .filter(|elapsed| elapsed.is_none())
+                .count();
+            eprintln!(
+                "[compute-gpu-timing] period_ns={period_ns:.6} span_ms={span_ms:?} \
+                 valid_sum_ms={valid_sum_ms:.3} invalid_dispatches={invalid_dispatches} \
+                 dispatches(draws,pixels,ms)={rows:?}",
+            );
+        }
+        let timing_gpu_map = compute_chain_timing_lap(&mut timing_mark);
         let statuses =
             map_and_read_prefix(&self.device, chain_status_readback, chain_status_bytes)?;
         let mut status_offset = 0usize;
@@ -2688,7 +2795,7 @@ impl TrianglePipelineRenderer {
             eprintln!(
                 "[compute-chain-timing] dispatches={} draws={} pixels={} \
                  prepare_ms={:.3} resources_ms={:.3} uploads_ms={:.3} bind_groups_ms={:.3} \
-                 encode_ms={:.3} submit_ms={:.3} wait_ms={:.3} status_map_ms={:.3} \
+                 encode_ms={:.3} submit_ms={:.3} wait_ms={:.3} gpu_map_ms={:.3} status_map_ms={:.3} \
                  target_map_ms={:.3} total_ms={:.3}",
                 dispatches.len(),
                 dispatches
@@ -2706,6 +2813,7 @@ impl TrianglePipelineRenderer {
                 timing_encode.as_secs_f64() * 1_000.0,
                 timing_submit.as_secs_f64() * 1_000.0,
                 timing_wait.as_secs_f64() * 1_000.0,
+                timing_gpu_map.as_secs_f64() * 1_000.0,
                 timing_status_map.as_secs_f64() * 1_000.0,
                 timing_target_map.as_secs_f64() * 1_000.0,
                 started.elapsed().as_secs_f64() * 1_000.0,
@@ -3509,6 +3617,9 @@ pub enum TrianglePipelineError {
         expected: usize,
         actual: usize,
     },
+    TimestampQueryUnsupported {
+        adapter: String,
+    },
     ComputeColorDispatchRows {
         first_row: u32,
         row_count: u32,
@@ -3577,6 +3688,10 @@ impl fmt::Display for TrianglePipelineError {
             Self::ComputeColorTargetLength { expected, actual } => write!(
                 formatter,
                 "compute color target byte length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::TimestampQueryUnsupported { adapter } => write!(
+                formatter,
+                "compute GPU timing requested but adapter {adapter:?} lacks timestamp queries"
             ),
             Self::ComputeColorDispatchRows {
                 first_row,
