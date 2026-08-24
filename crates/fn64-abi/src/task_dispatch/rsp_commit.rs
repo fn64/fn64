@@ -138,6 +138,75 @@ fn rsp_trace_dpc_words_limit() -> Option<usize> {
     })
 }
 
+fn rsp_dpc_task_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FN64_RSP_DPC_TASK_CENSUS").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+/// Report the natural transaction boundaries of one completed RSP task.
+///
+/// This is deliberately outside the per-run dispatch loop: the question the
+/// census answers is whether physical DMEM-ring runs can share one renderer
+/// lifetime ending at FullSync, so observing each run after it has already
+/// become an independent transaction would lose the task-level grouping.
+fn maybe_report_rsp_dpc_task_shape(
+    task_addr: Option<RdramAddr>,
+    raw_submissions: usize,
+    runs: &[CoalescedDpRun],
+) {
+    if !rsp_dpc_task_census_enabled() {
+        return;
+    }
+    thread_local! {
+        static TASK_INDEX: Cell<u64> = const { Cell::new(0) };
+    }
+    let task_index = TASK_INDEX.with(|cell| {
+        let index = cell.get();
+        cell.set(index.saturating_add(1));
+        index
+    });
+    let bytes = runs
+        .iter()
+        .map(|run| run.words.len().saturating_mul(4))
+        .sum::<usize>();
+    let xbus_runs = runs.iter().filter(|run| run.xbus).count();
+    let scans = runs
+        .iter()
+        .map(|run| {
+            fn64_render::count_raw_rdp_full_sync_sites(&run.words)
+                .unwrap_or_else(|error| panic!("RSP DPC task census scan rejected: {error:?}"))
+        })
+        .collect::<Vec<_>>();
+    let full_sync_sites = scans
+        .iter()
+        .map(|scan| match scan {
+            fn64_render::RawRdpScan::Complete(sites)
+            | fn64_render::RawRdpScan::Incomplete {
+                complete_prefix: sites,
+                ..
+            } => *sites,
+        })
+        .collect::<Vec<_>>();
+    let incomplete_runs = scans.iter().filter(|scan| scan.is_incomplete()).count();
+    let full_sync_total = full_sync_sites.iter().copied().sum::<usize>();
+    let full_sync_runs = full_sync_sites.iter().filter(|sites| **sites != 0).count();
+    let final_run_full_sync = full_sync_sites.last().is_some_and(|sites| *sites != 0);
+    eprintln!(
+        "[rsp-dpc-task-census] task={task_index} addr={task_addr:?} raw_submissions={raw_submissions} \
+         runs={} xbus_runs={xbus_runs} bytes={bytes} full_sync_total={full_sync_total} \
+         full_sync_runs={full_sync_runs} final_run_full_sync={final_run_full_sync} \
+         incomplete_runs={incomplete_runs} \
+         run_words={:?} run_full_sync_sites={full_sync_sites:?}",
+        runs.len(),
+        runs.iter().map(|run| run.words.len()).collect::<Vec<_>>(),
+    );
+}
+
 pub(crate) fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -453,6 +522,7 @@ pub(crate) unsafe fn dispatch_lle_task(
 
     dmem = machine.dmem_logical();
     let dp_submissions = machine.take_dp_submissions();
+    let raw_dp_submission_count = dp_submissions.len();
     let final_architectural_state = machine.snapshot_architectural_state();
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
@@ -478,15 +548,17 @@ pub(crate) unsafe fn dispatch_lle_task(
         "RSP transactional IMEM replacement count diverged from the committed fabric generation"
     );
 
+    let coalesced_dp_runs = coalesce_dp_submissions(dp_submissions);
+    maybe_report_rsp_dpc_task_shape(task_addr, raw_dp_submission_count, &coalesced_dp_runs);
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
-    let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
+    let mut dpc_observations = Vec::with_capacity(coalesced_dp_runs.len());
     let trace_limit = rsp_trace_dpc_words_limit();
     for CoalescedDpRun {
         start,
         end,
         xbus,
         words,
-    } in coalesce_dp_submissions(dp_submissions)
+    } in coalesced_dp_runs
     {
         if let Some(limit) = trace_limit {
             let traced = &words[..words.len().min(limit)];

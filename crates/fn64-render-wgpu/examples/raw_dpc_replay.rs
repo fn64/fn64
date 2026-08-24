@@ -29,6 +29,7 @@ use fn64_runtime::{
     Cycles, DeviceFabric, DpcSubmissionSource, FixedPiTiming, RdramAddr, RdramView, RdramViewMut,
     TvType,
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Default)]
 struct Timings {
@@ -110,7 +111,26 @@ fn main() {
         "FN64_RAW_DPC_REPLAY_WINDOW {window} exceeds {} available packets",
         streams.len()
     );
-    let (prefix, benchmark) = streams.split_at(streams.len() - window);
+    let benchmark_start = streams.len() - window;
+    let selected_window_packets = window;
+    let combine_window = std::env::var_os("FN64_RAW_DPC_REPLAY_COMBINE_WINDOW")
+        .is_some_and(|value| value == "1");
+    if combine_window {
+        // This is a diagnostic control, not a candidate transport contract:
+        // concatenation asks whether execution can tolerate a larger lifetime.
+        // Production grouping must retain each submission's journal and
+        // architectural publication boundary.
+        let combined = ReplayStream::from_bytes(
+            streams[benchmark_start..]
+                .iter()
+                .flat_map(|stream| stream.bytes.iter().copied())
+                .collect(),
+            ReplaySource::Rdram,
+        );
+        streams.truncate(benchmark_start);
+        streams.push(combined);
+    }
+    let (prefix, benchmark) = streams.split_at(benchmark_start);
     let terminal = benchmark.last().expect("nonempty benchmark window");
     let pristine =
         std::fs::read(&rdram_path).unwrap_or_else(|error| panic!("reading {rdram_path}: {error}"));
@@ -119,10 +139,12 @@ fn main() {
     let end = start
         .checked_add(u32::try_from(terminal.bytes.len()).expect("stream exceeds u32"))
         .expect("XBUS stream end overflows u32");
-    assert!(
-        end <= 0x1000,
-        "XBUS stream [{start:#x}, {end:#x}) exceeds DMEM"
-    );
+    if terminal.source == ReplaySource::Xbus {
+        assert!(
+            end <= 0x1000,
+            "XBUS stream [{start:#x}, {end:#x}) exceeds DMEM"
+        );
+    }
     let width = env_u32("FN64_RAW_DPC_REPLAY_WIDTH", 320);
     let height = env_u32("FN64_RAW_DPC_REPLAY_HEIGHT", 240);
     let warmup = env_u32("FN64_RAW_DPC_REPLAY_WARMUP", 10);
@@ -163,6 +185,7 @@ fn main() {
             &mut session,
             &stream.words,
             &stream.bytes,
+            stream.source,
             &pristine,
             &mut postimage,
             layout_bytes,
@@ -206,7 +229,8 @@ fn main() {
             let packet_end = packet_start
                 + u32::try_from(stream.bytes.len()).expect("benchmark stream exceeds u32");
             let sequence = u64::try_from(prefix.len()).expect("prefix length exceeds u64")
-                + u64::from(iteration) * u64::try_from(window).expect("window exceeds u64")
+                + u64::from(iteration)
+                    * u64::try_from(benchmark.len()).expect("window exceeds u64")
                 + u64::try_from(window_index).expect("window index exceeds u64")
                 + 1;
             let (packet_timings, packet_digest, packet_bytes) = replay_once(
@@ -214,6 +238,7 @@ fn main() {
                 &mut session,
                 &stream.words,
                 &stream.bytes,
+                stream.source,
                 &pristine,
                 &mut postimage,
                 layout_bytes,
@@ -258,12 +283,17 @@ fn main() {
     }
 
     println!(
-        "window_packets={} terminal_stream_bytes={} warmup={} repeat={} committed_fnv1a={:016x}",
+        "selected_window_packets={} replay_packets={} combined_window={} \
+         terminal_stream_bytes={} warmup={} repeat={} \
+         committed_fnv1a={:016x} postimage_sha256={:x}",
+        selected_window_packets,
         benchmark.len(),
+        combine_window,
         terminal.bytes.len(),
         warmup,
         repeat,
-        expected_digest.expect("at least one replay")
+        expected_digest.expect("at least one replay"),
+        Sha256::digest(&postimage),
     );
     report("plan", &samples, |sample| sample.plan);
     report("guest_reads", &samples, |sample| sample.reads);
@@ -363,6 +393,7 @@ fn replay_once(
     session: &mut RawDpcAbiSession,
     words: &[u32],
     stream: &[u8],
+    source: ReplaySource,
     pristine: &[u8],
     postimage: &mut [u8],
     layout_bytes: u32,
@@ -371,7 +402,7 @@ fn replay_once(
     sequence: u64,
 ) -> (Timings, u64, Vec<u8>) {
     let total_started = Instant::now();
-    let capture = capture(words, stream, layout_bytes, start, end, sequence);
+    let capture = capture(words, stream, source, layout_bytes, start, end, sequence);
 
     let started = Instant::now();
     let planned = backend
@@ -448,7 +479,7 @@ fn replay_once(
         FixedPiTiming(Cycles::new(0)),
     );
     fabric
-        .request_dpc_submission(DpcSubmissionSource::Dmem, start, end)
+        .request_dpc_submission(source.fabric_source(), start, end)
         .expect("request replay DPC submission")
         .expect("fresh replay fabric is not frozen");
     let token = fabric
@@ -516,9 +547,44 @@ fn replay_once(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaySource {
+    Xbus,
+    Rdram,
+}
+
+impl ReplaySource {
+    const fn fabric_source(self) -> DpcSubmissionSource {
+        match self {
+            Self::Xbus => DpcSubmissionSource::Dmem,
+            Self::Rdram => DpcSubmissionSource::Rdram,
+        }
+    }
+}
+
 struct ReplayStream {
     bytes: Vec<u8>,
     words: Vec<u32>,
+    source: ReplaySource,
+}
+
+impl ReplayStream {
+    fn from_bytes(bytes: Vec<u8>, source: ReplaySource) -> Self {
+        assert!(
+            !bytes.is_empty() && bytes.len().is_multiple_of(8),
+            "replay stream length {:#x} must be nonzero and 8-byte aligned",
+            bytes.len()
+        );
+        let words = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_be_bytes(word.try_into().expect("four-byte word")))
+            .collect();
+        Self {
+            bytes,
+            words,
+            source,
+        }
+    }
 }
 
 fn load_streams(path: &Path) -> Vec<ReplayStream> {
@@ -553,11 +619,7 @@ fn load_streams(path: &Path) -> Vec<ReplayStream> {
                 path.display(),
                 bytes.len()
             );
-            let words = bytes
-                .chunks_exact(4)
-                .map(|word| u32::from_be_bytes(word.try_into().expect("four-byte word")))
-                .collect();
-            ReplayStream { bytes, words }
+            ReplayStream::from_bytes(bytes, ReplaySource::Xbus)
         })
         .collect()
 }
@@ -565,13 +627,21 @@ fn load_streams(path: &Path) -> Vec<ReplayStream> {
 fn capture(
     words: &[u32],
     stream: &[u8],
+    source: ReplaySource,
     layout_bytes: u32,
     start: u32,
     end: u32,
     sequence: u64,
 ) -> OwnedRawDpcCapture {
-    let submission = OwnedRawDpcSubmission::from_xbus_payload(start, end, stream.to_vec())
-        .expect("construct XBUS submission");
+    let submission = match source {
+        ReplaySource::Xbus => {
+            OwnedRawDpcSubmission::from_xbus_payload(start, end, stream.to_vec())
+        }
+        ReplaySource::Rdram => {
+            OwnedRawDpcSubmission::from_rdram_words(start, end, words.to_vec())
+        }
+    }
+    .expect("construct replay submission");
     let layout = PhysicalMemoryLayout::try_new(layout_bytes).expect("construct RDRAM layout");
     let sites = count_raw_rdp_full_sync_sites(words)
         .expect("scan replay FullSync sites")

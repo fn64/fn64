@@ -45,6 +45,14 @@ ordinary before/after timing leaves them explicitly off. Environment switches
 for a candidate are inherited, so the same binary can be run in `A/B, B/A`
 order without changing this runner.
 
+`FN64_RSP_DPC_TASK_CENSUS=1` reports the physical DPC runs captured by each
+completed RSP task, including the original END-write count, coalesced run
+sizes, incomplete-command stalls, and the run containing each FullSync. This
+distinguishes unavoidable DMEM-ring wrap boundaries from renderer transaction
+boundaries before any batching change is attempted. The disabled path is one
+cached boolean check per RSP task; command scanning and allocation occur only
+while armed.
+
 ## One-variable loop
 
 Every optimization is handled as one transaction:
@@ -398,3 +406,32 @@ typed CPU/DMA/VI observation boundary performs bounded synchronization and
 readback. Either candidate must preserve command order, FullSync/fabric
 publication, exact guest bytes, and the M9 visibility invariants; performance
 alone cannot choose a weaker ownership model.
+
+## RSP-task batching control
+
+The task-level DPC census observed 169 graphics tasks, 109,255 raw END writes,
+and 2,345 address-coalesced runs (13.88 runs per task, maximum 26). Every task
+contained exactly one FullSync, always in its final run, and no run ended with
+an incomplete command. An RSP task is therefore a real renderer-lifetime
+opportunity, but not necessarily a single-target execution unit.
+
+`FN64_RAW_DPC_REPLAY_COMBINE_WINDOW=1` provides a non-certifying control that
+concatenates the selected replay window into one synthetic RDRAM command
+stream. It does not model the production fabric journal or publication
+boundaries. In the captured suffix ending at packet 2,659, four adjacent
+submissions executed successfully and produced the same final RDRAM SHA-256 as
+the ordinary four-packet replay. Five submissions trapped because a fill named
+a range outside the packet's selected color target; six and larger windows
+also trapped. This falsifies whole-task concatenation and identifies target
+compatibility as a required split condition.
+
+The passing four-submission control did not close meaningful time. In an
+`A/B, B/A` native-GPU run with 5 warmups and 50 measured repeats per leg,
+ordinary replay measured 5.702/5.694 ms mean total and combined replay measured
+5.655/5.650 ms. Execute changed from 2.021/2.013 ms to 1.983/1.979 ms. An exact
+compute chain probe resolved both forms to the same three batches and five
+draws per repeat; probe time was 1.265 ms ordinary versus 1.285 ms combined.
+Transport-call removal is consequently a sub-1% CPU-path optimization in this
+control, not the missing 25--33%. Compatibility grouping remains necessary for
+device residency, but the next performance variable is lower-level raster
+execution and the target upload/readback lifetime it currently imposes.
