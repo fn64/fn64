@@ -113,8 +113,8 @@ fn main() {
     );
     let benchmark_start = streams.len() - window;
     let selected_window_packets = window;
-    let combine_window = std::env::var_os("FN64_RAW_DPC_REPLAY_COMBINE_WINDOW")
-        .is_some_and(|value| value == "1");
+    let combine_window =
+        std::env::var_os("FN64_RAW_DPC_REPLAY_COMBINE_WINDOW").is_some_and(|value| value == "1");
     if combine_window {
         // This is a diagnostic control, not a candidate transport contract:
         // concatenation asks whether execution can tolerate a larger lifetime.
@@ -154,6 +154,20 @@ fn main() {
         std::env::var_os("FN64_COMPUTE_RASTER_PROBE").is_some_and(|value| value == "1");
     let compute_chain_probe_requested =
         std::env::var_os("FN64_COMPUTE_RASTER_CHAIN_PROBE").is_some_and(|value| value == "1");
+    let compute_checkpoint_probe_requested =
+        std::env::var_os("FN64_COMPUTE_RASTER_CHECKPOINT_PROBE").is_some_and(|value| value == "1");
+    let checkpoint_first = env_u32("FN64_COMPUTE_RASTER_CHECKPOINT_FIRST", 0) as usize;
+    let checkpoint_limit = env_u32(
+        "FN64_COMPUTE_RASTER_CHECKPOINT_LIMIT",
+        u32::try_from(benchmark.len()).expect("benchmark window exceeds u32"),
+    ) as usize;
+    assert!(
+        !compute_checkpoint_probe_requested
+            || checkpoint_first < checkpoint_limit && checkpoint_limit <= benchmark.len(),
+        "compute checkpoint range [{checkpoint_first}, {checkpoint_limit}) is outside the \
+         {}-packet benchmark window",
+        benchmark.len()
+    );
     let compute_replace_requested =
         std::env::var_os("FN64_COMPUTE_RASTER_REPLACE").is_some_and(|value| value == "1");
     let compute_replace_ab =
@@ -220,7 +234,11 @@ fn main() {
         let mut timings = Timings::default();
         let mut digest = 0xcbf2_9ce4_8422_2325_u64;
         let mut committed_bytes = Vec::new();
+        let mut checkpoint_receipt = None;
         for (window_index, stream) in benchmark.iter().enumerate() {
+            if compute_checkpoint_probe_requested && window_index == checkpoint_first {
+                backend.begin_compute_raster_checkpoint_probe();
+            }
             let packet_start = if window_index + 1 == benchmark.len() {
                 start
             } else {
@@ -255,6 +273,20 @@ fn main() {
                 digest ^= u64::from(byte);
                 digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
             }
+            if compute_checkpoint_probe_requested && window_index + 1 == checkpoint_limit {
+                checkpoint_receipt = Some(
+                    backend
+                        .finish_compute_raster_checkpoint_probe()
+                        .expect("finish task-window compute checkpoint probe"),
+                );
+            }
+        }
+        if let Some(receipt) = checkpoint_receipt {
+            timings.compute_probe += receipt.elapsed();
+            timings.compute_probe_submissions += receipt.submission_count();
+            timings.compute_probe_batches += receipt.batch_count();
+            timings.compute_probe_draws += receipt.draw_count();
+            timings.compute_probe_pixels += receipt.target_pixels();
         }
         match expected_digest {
             None => expected_digest = Some(digest),
@@ -634,12 +666,8 @@ fn capture(
     sequence: u64,
 ) -> OwnedRawDpcCapture {
     let submission = match source {
-        ReplaySource::Xbus => {
-            OwnedRawDpcSubmission::from_xbus_payload(start, end, stream.to_vec())
-        }
-        ReplaySource::Rdram => {
-            OwnedRawDpcSubmission::from_rdram_words(start, end, words.to_vec())
-        }
+        ReplaySource::Xbus => OwnedRawDpcSubmission::from_xbus_payload(start, end, stream.to_vec()),
+        ReplaySource::Rdram => OwnedRawDpcSubmission::from_rdram_words(start, end, words.to_vec()),
     }
     .expect("construct replay submission");
     let layout = PhysicalMemoryLayout::try_new(layout_bytes).expect("construct RDRAM layout");

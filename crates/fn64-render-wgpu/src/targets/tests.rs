@@ -438,6 +438,94 @@ fn candidate_generation_promotes_once_and_stale_peer_is_rejected() {
 }
 
 #[test]
+fn execution_batch_reserves_successors_without_publishing_placeholder_bytes() {
+    let mut registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let (first, second) = {
+        let mut batch = ColorTargetExecutionBatch::new();
+        let (first, first_input) = batch.begin_candidate(&registry, key).unwrap();
+        let (second, second_input) = batch.begin_candidate(&registry, key).unwrap();
+        assert_eq!(first_input, TaskColorInput::DurableRegistry);
+        assert_eq!(second_input, TaskColorInput::PriorTaskCheckpoint);
+        assert_eq!(first.generation().get(), 1);
+        assert_eq!(first.predecessor(), None);
+        assert_eq!(second.generation().get(), 2);
+        assert_eq!(second.predecessor(), Some(first.generation()));
+        assert!(registry.residents().is_empty());
+        (first, second)
+    };
+
+    let first_plan = first.plan_rows(full_rectangle(key)).unwrap();
+    let first_completed = completed(&first, first_plan, &[Rgba8::new(255, 0, 0, 255); 8]);
+    registry
+        .commit_initialized(
+            first
+                .admit_completed_initialization(first_completed)
+                .unwrap(),
+        )
+        .unwrap();
+
+    let second_plan = second.plan_rows(full_rectangle(key)).unwrap();
+    let second_completed = completed(&second, second_plan, &[Rgba8::new(0, 255, 0, 255); 8]);
+    registry
+        .commit_initialized(
+            second
+                .admit_completed_initialization(second_completed)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(registry.residents()[0].generation().get(), 2);
+}
+
+#[test]
+fn task_color_segment_installs_only_its_chain_final_checkpoint() {
+    let mut registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let (first, second) = {
+        let mut batch = ColorTargetExecutionBatch::new();
+        let (first, _) = batch.begin_candidate(&registry, key).unwrap();
+        let (second, _) = batch.begin_candidate(&registry, key).unwrap();
+        (first, second)
+    };
+    let first_plan = first.plan_rows(full_rectangle(key)).unwrap();
+    let first_completion = completed(&first, first_plan, &[Rgba8::new(255, 0, 0, 255); 8]);
+    let first = first
+        .admit_completed_initialization(first_completion)
+        .unwrap();
+    let second_plan = second.plan_rows(full_rectangle(key)).unwrap();
+    let second_completion = completed(&second, second_plan, &[Rgba8::new(0, 255, 0, 255); 8]);
+    let second = second
+        .admit_completed_initialization(second_completion)
+        .unwrap();
+
+    let expected_final_bytes = second.device_bytes().device_bytes().to_vec();
+    let mut segment = CompletedTaskColorSegment::new(&first);
+    segment.append(&second).unwrap();
+    let resident = registry.commit_task_shadow_segment(segment).unwrap();
+
+    assert_eq!(resident.generation().get(), 2);
+    assert_eq!(resident.device_bytes().device_bytes(), expected_final_bytes);
+}
+
+#[test]
+fn task_color_segment_rejects_a_missing_generation_edge() {
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let first = initialized(&registry, key);
+    let independently_planned = initialized(&registry, key);
+    let mut segment = CompletedTaskColorSegment::new(&first);
+
+    assert!(matches!(
+        segment.append(&independently_planned),
+        Err(TargetError::DiscontinuousTaskColorSegment {
+            expected_predecessor: Some(TargetGeneration(1)),
+            actual_predecessor: None,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn exhausted_generation_rejects_a_successor_candidate() {
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     let proof = InitializedRegionProof {

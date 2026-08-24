@@ -29,13 +29,15 @@ mod triangle_pipeline;
 
 pub(crate) use compute_batch::{
     ComputeRasterBatch, ComputeRasterBatchBuilder, ComputeRasterDrawAdmission,
-    ComputeRasterProgramKey,
+    ComputeRasterProgramKey, HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH,
+    HOT_OTHER_MODE_LOW,
 };
 pub use fill::{
     decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
     resolve_fill_pixel_rectangle, FillCoordinateError, FillCycleBypassHazards, FillExecutionError,
     FillPixelRectangle,
 };
+pub(crate) use fill::{execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned};
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
@@ -703,7 +705,7 @@ impl InitializedCandidateColorTarget {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentColorTarget {
     key: ColorTargetKey,
     generation: TargetGeneration,
@@ -729,11 +731,137 @@ impl ResidentColorTarget {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ColorTargetRegistry {
     layout: PhysicalMemoryLayout,
     capacity: NonZeroUsize,
     residents: Vec<ResidentColorTarget>,
+}
+
+/// Private generation planner for one ordered renderer transaction.
+///
+/// Reserving a candidate does not initialize bytes and does not mutate the
+/// durable registry. It only establishes the predecessor chain that later
+/// completed GPU checkpoints must redeem in the same order. This is the
+/// color-target counterpart of `RawDpcExecutionBatch`: later task members
+/// can be planned before an earlier member's device result has been read
+/// back, without publishing a placeholder resident.
+pub(crate) struct ColorTargetExecutionBatch {
+    reserved: Vec<ReservedColorTargetGeneration>,
+}
+
+#[derive(Clone, Copy)]
+struct ReservedColorTargetGeneration {
+    key: ColorTargetKey,
+    generation: TargetGeneration,
+    predecessor: Option<TargetGeneration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskColorInput {
+    DurableRegistry,
+    PriorTaskCheckpoint,
+}
+
+/// Non-empty proof that a task's completed color checkpoints form one exact
+/// generation chain. The proof retains only the chain head's predecessor and
+/// the final checkpoint: intermediate framebuffer bytes have no remaining
+/// consumer once their successor has completed.
+pub(crate) struct CompletedTaskColorSegment<'a> {
+    key: ColorTargetKey,
+    first_predecessor: Option<TargetGeneration>,
+    final_checkpoint: &'a InitializedCandidateColorTarget,
+}
+
+impl<'a> CompletedTaskColorSegment<'a> {
+    pub(crate) fn new(first: &'a InitializedCandidateColorTarget) -> Self {
+        Self {
+            key: first.candidate.key,
+            first_predecessor: first.candidate.predecessor,
+            final_checkpoint: first,
+        }
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        next: &'a InitializedCandidateColorTarget,
+    ) -> Result<(), TargetError> {
+        let expected_predecessor = Some(self.final_checkpoint.candidate.generation);
+        if next.candidate.key != self.key || next.candidate.predecessor != expected_predecessor {
+            return Err(TargetError::DiscontinuousTaskColorSegment {
+                expected_key: self.key,
+                actual_key: next.candidate.key,
+                expected_predecessor,
+                actual_predecessor: next.candidate.predecessor,
+            });
+        }
+        self.final_checkpoint = next;
+        Ok(())
+    }
+}
+
+impl ColorTargetExecutionBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            reserved: Vec::new(),
+        }
+    }
+
+    pub(crate) fn begin_candidate(
+        &mut self,
+        registry: &ColorTargetRegistry,
+        key: ColorTargetKey,
+    ) -> Result<(CandidateColorTarget, TaskColorInput), TargetError> {
+        if let Some(previous) = self
+            .reserved
+            .iter()
+            .rev()
+            .find(|candidate| candidate.key == key)
+        {
+            let candidate = CandidateColorTarget {
+                key,
+                generation: previous.generation.successor(key)?,
+                predecessor: Some(previous.generation),
+            };
+            self.reserved.push(ReservedColorTargetGeneration {
+                key: candidate.key,
+                generation: candidate.generation,
+                predecessor: candidate.predecessor,
+            });
+            return Ok((candidate, TaskColorInput::PriorTaskCheckpoint));
+        }
+
+        if let Some(previous) = self.reserved.iter().find(|candidate| {
+            candidate.key != key && ranges_overlap(candidate.key.range, key.range)
+        }) {
+            return Err(TargetError::AliasedResidentTarget {
+                candidate: key,
+                resident: previous.key,
+            });
+        }
+
+        let candidate = registry.begin_candidate(key)?;
+        if candidate.predecessor.is_none() {
+            let mut new_keys = Vec::new();
+            for reserved in &self.reserved {
+                if reserved.predecessor.is_none() && !new_keys.contains(&reserved.key) {
+                    new_keys.push(reserved.key);
+                }
+            }
+            if registry.residents.len() + new_keys.len() == registry.capacity.get() {
+                return Err(TargetError::RegistryFull {
+                    capacity: registry.capacity.get(),
+                    candidate: key,
+                });
+            }
+        }
+        self.reserved.push(ReservedColorTargetGeneration {
+            key: candidate.key,
+            generation: candidate.generation,
+            predecessor: candidate.predecessor,
+        });
+        Ok((candidate, TaskColorInput::DurableRegistry))
+    }
 }
 
 impl ColorTargetRegistry {
@@ -802,6 +930,65 @@ impl ColorTargetRegistry {
         initialized: InitializedCandidateColorTarget,
     ) -> Result<&ResidentColorTarget, TargetError> {
         Ok(self.prepare_publication(initialized)?.publish())
+    }
+
+    /// Installs the final task-private view of a completed compute segment
+    /// without duplicating any intermediate framebuffer. The segment proof
+    /// validates every generation edge before this method validates its head
+    /// against the registry. Publication authority remains move-only in each
+    /// member's pending token.
+    pub(crate) fn commit_task_shadow_segment(
+        &mut self,
+        segment: CompletedTaskColorSegment<'_>,
+    ) -> Result<&ResidentColorTarget, TargetError> {
+        let key = segment.key;
+        let predecessor = segment.first_predecessor;
+        let actual = self
+            .residents
+            .iter()
+            .find(|resident| resident.key == key)
+            .map(|resident| resident.generation);
+        if actual != predecessor {
+            return Err(TargetError::StaleCandidateGeneration {
+                key,
+                expected_predecessor: predecessor,
+                actual_resident: actual,
+            });
+        }
+        let initialized = segment.final_checkpoint;
+        let next = ResidentColorTarget {
+            key,
+            generation: initialized.candidate.generation,
+            initialized: initialized.proof,
+            device_bytes: initialized.device_bytes.clone(),
+        };
+        if let Some(index) = self
+            .residents
+            .iter()
+            .position(|resident| resident.key == key)
+        {
+            self.residents[index] = next;
+            return Ok(&self.residents[index]);
+        }
+        if let Some(resident) = self
+            .residents
+            .iter()
+            .find(|resident| ranges_overlap(resident.key.range, key.range))
+        {
+            return Err(TargetError::AliasedResidentTarget {
+                candidate: key,
+                resident: resident.key,
+            });
+        }
+        if self.residents.len() == self.capacity.get() {
+            return Err(TargetError::RegistryFull {
+                capacity: self.capacity.get(),
+                candidate: key,
+            });
+        }
+        self.residents.push(next);
+        let index = self.residents.len() - 1;
+        Ok(&self.residents[index])
     }
 
     pub(crate) fn prepare_publication(
@@ -943,6 +1130,12 @@ pub enum TargetError {
         expected_predecessor: Option<TargetGeneration>,
         actual_resident: Option<TargetGeneration>,
     },
+    DiscontinuousTaskColorSegment {
+        expected_key: ColorTargetKey,
+        actual_key: ColorTargetKey,
+        expected_predecessor: Option<TargetGeneration>,
+        actual_predecessor: Option<TargetGeneration>,
+    },
     PixelBufferLengthOverflow {
         pixels: usize,
         bytes_per_pixel: u32,
@@ -1049,6 +1242,10 @@ impl fmt::Display for TargetError {
             Self::StaleCandidateGeneration { key, expected_predecessor, actual_resident } => write!(
                 formatter,
                 "stale color-target candidate for {key:?}: expected predecessor {expected_predecessor:?}, resident is {actual_resident:?}"
+            ),
+            Self::DiscontinuousTaskColorSegment { expected_key, actual_key, expected_predecessor, actual_predecessor } => write!(
+                formatter,
+                "discontinuous task color segment: expected {expected_key:?} after {expected_predecessor:?}, got {actual_key:?} after {actual_predecessor:?}"
             ),
             Self::PixelBufferLengthOverflow { pixels, bytes_per_pixel } => write!(
                 formatter,

@@ -501,13 +501,111 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             start,
             end,
         };
+        self.install_dpc_submission(submission, rollback);
+        Ok(submission)
+    }
+
+    fn install_dpc_submission(&mut self, submission: DpcSubmission, rollback: DpcRegisters) {
         self.dpc.status &= !DPC_STATUS_START_VALID;
         self.dpc.status |= DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY;
         self.pending_dpc = Some(PendingDpc {
             submission,
             rollback,
         });
-        Ok(submission)
+    }
+
+    /// Reserve exact, monotonically ordered tokens for an RSP task's DPC
+    /// runs without exposing any pending transaction or mutating DPC
+    /// registers. All ranges are validated and ordinal capacity is proven
+    /// before `next_event_sequence` advances.
+    pub fn reserve_dpc_submission_batch(
+        &mut self,
+        requests: &[(DpcSubmissionSource, u32, u32)],
+    ) -> Result<ReservedDpcSubmissionBatch, DeviceFault> {
+        let requests: Vec<_> = requests
+            .iter()
+            .map(|&(source, start, end)| (source, start, end, 1u64))
+            .collect();
+        self.reserve_dpc_submission_batch_with_temporal_spans(&requests)
+    }
+
+    /// The temporal-span form used when a capture binds additional ordered
+    /// observations after a member's DPC token. `span` includes the DPC token
+    /// itself, so the following member is guaranteed to sort after every
+    /// boundary reserved within the preceding member's span.
+    pub fn reserve_dpc_submission_batch_with_temporal_spans(
+        &mut self,
+        requests: &[(DpcSubmissionSource, u32, u32, u64)],
+    ) -> Result<ReservedDpcSubmissionBatch, DeviceFault> {
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        for &(source, start, end, span) in requests {
+            Self::validate_dpc_range(source, start, end)?;
+            assert!(span != 0, "a reserved DPC temporal span cannot be zero");
+        }
+        let first = self.next_event_sequence;
+        let total_span = requests
+            .iter()
+            .try_fold(0u64, |total, request| total.checked_add(request.3))
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let next = first
+            .checked_add(total_span)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let mut cursor = first;
+        let submissions = requests
+            .iter()
+            .map(|&(source, start, end, span)| {
+                let submission = DpcSubmission {
+                    token: cursor,
+                    source,
+                    start,
+                    end,
+                };
+                cursor = cursor
+                    .checked_add(span)
+                    .expect("the temporal-span sum was preflighted below");
+                submission
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.next_event_sequence = next;
+        Ok(ReservedDpcSubmissionBatch {
+            submissions,
+            next: 0,
+        })
+    }
+
+    /// Activate the next member of one ordered reservation through the same
+    /// architectural register transition as [`Self::request_dpc_submission`].
+    /// The reservation advances only after every fallible admission check.
+    pub fn activate_reserved_dpc_submission(
+        &mut self,
+        batch: &mut ReservedDpcSubmissionBatch,
+    ) -> Result<Option<DpcSubmission>, DeviceFault> {
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        let submission = *batch
+            .submissions
+            .get(batch.next)
+            .expect("reserved DPC submission batch is exhausted");
+        Self::validate_dpc_range(submission.source, submission.start, submission.end)?;
+        let rollback = self.dpc;
+        self.dpc.start = submission.start;
+        self.dpc.end = submission.end;
+        self.dpc.current = submission.start;
+        match submission.source {
+            DpcSubmissionSource::Rdram => self.dpc.status &= !DPC_STATUS_XBUS_DMEM_DMA,
+            DpcSubmissionSource::Dmem => self.dpc.status |= DPC_STATUS_XBUS_DMEM_DMA,
+        }
+        self.dpc.status &= !DPC_STATUS_START_VALID;
+        batch.next += 1;
+        if self.dpc.status & DPC_STATUS_FREEZE != 0 {
+            return Ok(None);
+        }
+        self.install_dpc_submission(submission, rollback);
+        Ok(Some(submission))
     }
 
     /// Begin one renderer transaction through the same state used by raw
@@ -914,13 +1012,19 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok(())
     }
 
-    pub(crate) fn start_latched_pi_dma(&mut self, request: PiDmaRequest) -> Result<(), DeviceFault> {
+    pub(crate) fn start_latched_pi_dma(
+        &mut self,
+        request: PiDmaRequest,
+    ) -> Result<(), DeviceFault> {
         let (_, deadline) = self.preflight_pi_dma(request)?;
         self.admit_pi_dma(request, deadline);
         Ok(())
     }
 
-    pub(crate) fn preflight_pi_dma(&self, request: PiDmaRequest) -> Result<(u32, Cycles), DeviceFault> {
+    pub(crate) fn preflight_pi_dma(
+        &self,
+        request: PiDmaRequest,
+    ) -> Result<(u32, Cycles), DeviceFault> {
         if self.pending_pi.is_some() {
             return Err(DeviceFault::PiBusy);
         }

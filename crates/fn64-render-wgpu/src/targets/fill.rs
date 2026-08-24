@@ -475,6 +475,33 @@ pub fn execute_combined_fill_rectangle(
     scissor: RdpScissorRect,
     resident_bytes: Option<&[u8]>,
 ) -> Result<CompletedColorTargetWrite, FillExecutionError> {
+    execute_combined_fill_rectangle_owned(
+        candidate,
+        other_mode,
+        combine,
+        env_color,
+        prim_color,
+        blend_color,
+        fog_color,
+        rectangle,
+        scissor,
+        resident_bytes.map(<[u8]>::to_vec),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_combined_fill_rectangle_owned(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    combine: crate::CombineParams,
+    env_color: crate::Color4,
+    prim_color: crate::PrimColor,
+    blend_color: crate::Color4,
+    fog_color: crate::Color4,
+    rectangle: crate::FillRectangle,
+    scissor: RdpScissorRect,
+    resident_bytes: Option<Vec<u8>>,
+) -> Result<CompletedColorTargetWrite, FillExecutionError> {
     let evaluation = match other_mode.cycle_type() {
         CycleType::OneCycle | CycleType::TwoCycle => {
             admitted_cycle_evaluation(other_mode.cycle_type())?
@@ -532,7 +559,7 @@ pub fn execute_combined_fill_rectangle(
             bytes_per_pixel: format.bytes_per_pixel(),
         })?;
     let mut bytes = match resident_bytes {
-        Some(existing) if existing.len() == full_len => existing.to_vec(),
+        Some(existing) if existing.len() == full_len => existing,
         Some(existing) => {
             return Err(TargetError::CompletedByteLengthMismatch {
                 key,
@@ -615,6 +642,27 @@ pub fn execute_fill_rectangle(
     scissor: RdpScissorRect,
     resident_bytes: Option<&[u8]>,
 ) -> Result<CompletedColorTargetWrite, FillExecutionError> {
+    execute_fill_rectangle_owned(
+        candidate,
+        other_mode,
+        fill_color,
+        rectangle,
+        scissor,
+        resident_bytes.map(<[u8]>::to_vec),
+    )
+}
+
+/// Ownership-preserving production form of [`execute_fill_rectangle`].
+/// Intermediate commands already own the complete target, so consuming that
+/// allocation avoids a full-target clone for every rectangle in a packet.
+pub(crate) fn execute_fill_rectangle_owned(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    fill_color: FillColor,
+    rectangle: crate::FillRectangle,
+    scissor: RdpScissorRect,
+    resident_bytes: Option<Vec<u8>>,
+) -> Result<CompletedColorTargetWrite, FillExecutionError> {
     if !matches!(other_mode.cycle_type(), CycleType::Fill) {
         return Err(FillExecutionError::NotFillCycle);
     }
@@ -657,7 +705,7 @@ pub fn execute_fill_rectangle(
                 }
                 .into());
             }
-            existing.to_vec()
+            existing
         }
         None if candidate.predecessor().is_some() => {
             // A resident candidate's untouched rows must come from its prior

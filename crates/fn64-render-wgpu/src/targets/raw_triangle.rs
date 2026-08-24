@@ -82,11 +82,11 @@ use super::{
 };
 use crate::combiner::PreparedTwoCycleCombiner;
 use crate::raw_dpc::{triangle_span, RawTriangle};
+use crate::state::{DepthMode, PrimDepth};
 use crate::tmem::{
     sample_point, PointSampleCoordinates, PointSampleRequest, TextureCoordinateS10_5,
     TmemFirstRowParity,
 };
-use crate::state::{DepthMode, PrimDepth};
 use crate::{CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
@@ -526,12 +526,28 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         })
     }
 
+    fn incremental_texture_planes_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("FN64_INCREMENTAL_TEXTURE_PLANES") {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => {
+                panic!("FN64_INCREMENTAL_TEXTURE_PLANES must be exactly 0 or 1, got {value:?}")
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(error) => {
+                panic!("FN64_INCREMENTAL_TEXTURE_PLANES is not valid Unicode: {error}")
+            }
+        })
+    }
+
     let prepared_two_cycle = match evaluation {
         TexrectCombinerEvaluation::TwoCycle if prepared_combiner_enabled() => {
             Some(PreparedTwoCycleCombiner::new(shading.combine()))
         }
         _ => None,
     };
+    let incremental_texture_planes = incremental_texture_planes_enabled();
 
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
     let contiguous_rows = rows
@@ -582,6 +598,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     stages,
                     evaluation,
                     prepared_two_cycle,
+                    incremental_texture_planes,
                     None,
                     y,
                 )
@@ -604,6 +621,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         stages,
         evaluation,
         prepared_two_cycle,
+        incremental_texture_planes,
         depth,
         0,
     )
@@ -626,6 +644,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
     prepared_two_cycle: Option<PreparedTwoCycleCombiner>,
+    incremental_texture_planes: bool,
     mut depth: Option<RawTriangleDepth<'_>>,
     base_y: u32,
 ) -> Result<(), TexrectExecutionError> {
@@ -640,8 +659,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     // whole draw here (flat prim/pixel Z), and a live lane measures frame
     // rate, so it stays out of the per-pixel path. A future per-pixel Z
     // plane would move this inside; the admitted subset has none.
-    let fragment_depth: Option<(u32, u16)> =
-        depth.as_ref().and_then(|d| d.fragment_z(triangle));
+    let fragment_depth: Option<(u32, u16)> = depth.as_ref().and_then(|d| d.fragment_z(triangle));
     // Hoisted out of the pixel loop: this is the per-PIXEL path, and a live
     // lane is measuring frame rate. `enabled()` is itself a `OnceLock` read,
     // but binding it here keeps even that out of the inner loop.
@@ -678,8 +696,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
         }
     });
     for row in rows {
-        let attribute_samples =
-            triangle_span::AttributeSampleRow::new(triangle, row.y as i32);
+        let attribute_samples = triangle_span::AttributeSampleRow::new(triangle, row.y as i32);
         // **Incremental attribute run state.** Attribute planes are exactly
         // linear in x while the selected subsample holds, so a run can be
         // stepped by `plane.dx` instead of re-evaluating the full formula
@@ -688,6 +705,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
         // restart from the exact formula.
         let mut previous_sample: Option<(i32, i64)> = None;
         let mut shade_values: Option<[i64; 4]> = None;
+        let mut texture_values: Option<[i64; 3]> = None;
         for x in row.x0..row.x1 {
             // **One subsample scan, not two.**
             //
@@ -715,6 +733,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                 // pixel must restart from the exact formula.
                 previous_sample = None;
                 shade_values = None;
+                texture_values = None;
                 continue;
             };
             // Step only when the SAME subsample advanced exactly one pixel.
@@ -733,6 +752,19 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                     triangle_span::attribute_plane(planes[c], delta_y_eighth, delta_x)
                 })),
                 (None, _, _) => None,
+            };
+            texture_values = if incremental_texture_planes {
+                match (texture_planes, texture_values, continues_run) {
+                    (Some(planes), Some(values), true) => Some(std::array::from_fn(|component| {
+                        triangle_span::attribute_plane_step(planes[component], values[component])
+                    })),
+                    (Some(planes), _, _) => Some(std::array::from_fn(|component| {
+                        triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
+                    })),
+                    (None, _, _) => None,
+                }
+            } else {
+                None
             };
             previous_sample = Some((delta_y_eighth, delta_x));
             // **The shade colour is interpolated per pixel, at the pixel's
@@ -792,12 +824,23 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             // one, so nothing reads it.
             let texel = match (&texture, texture_planes, sample) {
                 (Some(binding), Some(planes), Some((delta_y_eighth, delta_x))) => {
-                    // The three planes at the pixel's own covered subsample,
-                    // in Q16.16 -- the identical `attribute_plane` call the
-                    // shade components go through.
-                    let stw: [i64; 3] = core::array::from_fn(|component| {
-                        triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
-                    });
+                    // Texture planes obey the same exact linear run as shade:
+                    // restart from the full formula when the covered subsample
+                    // changes, then advance by `dx` while it remains fixed.
+                    // Keeping S/T/W beside `shade_values` avoids three wide
+                    // multiply/divide evaluations per continuing pixel.
+                    let stw = if incremental_texture_planes {
+                        texture_values
+                            .expect("a textured triangle carries incremental S/T/W values")
+                    } else {
+                        core::array::from_fn(|component| {
+                            triangle_span::attribute_plane(
+                                planes[component],
+                                delta_y_eighth,
+                                delta_x,
+                            )
+                        })
+                    };
                     let (s, t) = triangle_span::texture_coordinates_s10_5(stw, perspective);
                     if census_pixels {
                         coordinate_range = Some(match coordinate_range {
@@ -931,9 +974,9 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             // have kept.
             if let (Some(d), Some((frag_z, frag_dz))) = (depth.as_mut(), fragment_depth) {
                 if d.update {
-                    let quantized = crate::depth_mode::decode_z(
-                        crate::depth_mode::encode_z(frag_z.min(0x3ffff)),
-                    );
+                    let quantized = crate::depth_mode::decode_z(crate::depth_mode::encode_z(
+                        frag_z.min(0x3ffff),
+                    ));
                     d.cells[pixel] = (quantized, crate::depth_mode::encode_delta_z(frag_dz));
                 }
             }

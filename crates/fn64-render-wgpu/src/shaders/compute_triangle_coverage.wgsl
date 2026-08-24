@@ -342,7 +342,10 @@ fn execute_hot_color_pixel(
     var current = initial_rgba16;
     var status = 0u;
     for (var work_index = 0u; work_index < work_triangle_count; work_index += 1u) {
-        let triangle_index = color_work_triangle_indices[first_triangle_index + work_index];
+        var triangle_index = first_triangle_index + work_index;
+        if params.dispatch_words_per_row != 0xffffffffu {
+            triangle_index = color_work_triangle_indices[triangle_index];
+        }
         let triangle = triangles[triangle_index];
         let raster = evaluate_coverage_sample(triangle, x, y);
         if raster.coverage == 0u {
@@ -416,7 +419,10 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     if local_word_index >= params.word_count {
         return;
     }
-    let work_item = color_work_items[local_word_index];
+    var work_item = ColorWorkItem(local_word_index, 0u, params.triangle_count);
+    if params.dispatch_words_per_row != 0xffffffffu {
+        work_item = color_work_items[local_word_index];
+    }
     let word_index = work_item.target_word;
     if word_index >= arrayLength(&color_target_words) {
         return;

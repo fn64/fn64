@@ -140,6 +140,52 @@ pub struct CapturedGuestRead {
     bytes: Arc<[u8]>,
 }
 
+/// One immutable logical-byte payload captured for an exact physical range.
+///
+/// A task may bind the same physical bytes to several ordered read
+/// descriptors. This value computes the content identity once and shares the
+/// owned bytes without weakening each descriptor's separate validation.
+pub struct CapturedGuestReadPayload {
+    range: PhysicalRange,
+    fast_content: FastContentDigest,
+    bytes: Arc<[u8]>,
+}
+
+impl core::fmt::Debug for CapturedGuestReadPayload {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CapturedGuestReadPayload")
+            .field("range", &self.range)
+            .field("fast_content", &self.fast_content)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl CapturedGuestReadPayload {
+    pub fn try_new(read: DeferredGuestRead, bytes: Vec<u8>) -> Result<Self, ValidationError> {
+        let actual = captured_byte_count(bytes.len())?;
+        if actual != read.range.len() {
+            return Err(ValidationError::GuestReadByteCountMismatch {
+                index: usize::try_from(read.access_index)
+                    .expect("guest-read access index exceeds host indexing"),
+                expected: read.range.len(),
+                actual,
+            });
+        }
+        let fast_content = guest_read_fast_content_digest(&bytes);
+        Ok(Self {
+            range: read.range,
+            fast_content,
+            bytes: bytes.into(),
+        })
+    }
+
+    pub const fn range(&self) -> PhysicalRange {
+        self.range
+    }
+}
+
 impl core::fmt::Debug for CapturedGuestRead {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -164,21 +210,24 @@ impl CapturedGuestRead {
     /// The length check below is the part of `try_new_with_digest` that is
     /// NOT vacuous here, so it is kept.
     pub fn try_new(read: DeferredGuestRead, bytes: Vec<u8>) -> Result<Self, ValidationError> {
-        let actual = u32::try_from(bytes.len()).map_err(|_| ValidationError::NumericOverflow {
-            field: "captured guest-read byte length",
-        })?;
-        if actual != read.range.len() {
-            return Err(ValidationError::GuestReadByteCountMismatch {
-                index: read.access_index as usize,
-                expected: read.range.len(),
-                actual,
+        let payload = CapturedGuestReadPayload::try_new(read, bytes)?;
+        Self::try_from_payload(read, &payload)
+    }
+
+    pub fn try_from_payload(
+        read: DeferredGuestRead,
+        payload: &CapturedGuestReadPayload,
+    ) -> Result<Self, ValidationError> {
+        if read.range != payload.range {
+            return Err(ValidationError::GuestReadDescriptorMismatch {
+                index: usize::try_from(read.access_index)
+                    .expect("guest-read access index exceeds host indexing"),
             });
         }
-        let fast_content = guest_read_fast_content_digest(&bytes);
         Ok(Self {
             read,
-            bytes: bytes.into(),
-            fast_content,
+            bytes: Arc::clone(&payload.bytes),
+            fast_content: payload.fast_content,
         })
     }
 
@@ -192,7 +241,8 @@ impl CapturedGuestRead {
         })?;
         if actual != read.range.len() {
             return Err(ValidationError::GuestReadByteCountMismatch {
-                index: read.access_index as usize,
+                index: usize::try_from(read.access_index)
+                    .expect("guest-read access index exceeds host indexing"),
                 expected: read.range.len(),
                 actual,
             });
@@ -200,7 +250,8 @@ impl CapturedGuestRead {
         let actual_content = guest_read_content_digest(&bytes);
         if claimed_content != actual_content {
             return Err(ValidationError::GuestReadDigestMismatch {
-                index: read.access_index as usize,
+                index: usize::try_from(read.access_index)
+                    .expect("guest-read access index exceeds host indexing"),
             });
         }
         Ok(Self {
@@ -233,6 +284,12 @@ impl CapturedGuestRead {
             bytes: Arc::clone(&self.bytes),
         }
     }
+}
+
+fn captured_byte_count(len: usize) -> Result<u32, ValidationError> {
+    u32::try_from(len).map_err(|_| ValidationError::NumericOverflow {
+        field: "captured guest-read byte length",
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -500,6 +557,37 @@ mod tests {
         assert_eq!(plan.reads()[1].access_index(), 2);
         assert_eq!(plan.reads()[1].operation(), OperationId::new(9));
         assert_eq!(plan.journal_identity(), journal.identity());
+    }
+
+    #[test]
+    fn one_range_bound_payload_can_back_distinct_read_descriptors() {
+        let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+        let plan = DeferredGuestReadPlan::try_from_journal(layout, &journal(layout)).unwrap();
+        let first = plan.reads()[0];
+        let later = DeferredGuestRead::new(
+            5,
+            OperationId::new(11),
+            RdramResource::ColorFramebuffer,
+            first.range(),
+        );
+        let payload = CapturedGuestReadPayload::try_new(first, vec![0x5a; 8]).unwrap();
+        let first_capture = CapturedGuestRead::try_from_payload(first, &payload).unwrap();
+        let later_capture = CapturedGuestRead::try_from_payload(later, &payload).unwrap();
+
+        assert_ne!(first_capture.read(), later_capture.read());
+        assert_eq!(first_capture.fast_content(), later_capture.fast_content());
+        assert!(Arc::ptr_eq(&first_capture.bytes, &later_capture.bytes));
+
+        let other_range = DeferredGuestRead::new(
+            6,
+            OperationId::new(12),
+            RdramResource::Buffer,
+            layout.range(0x300, 0x308).unwrap(),
+        );
+        assert_eq!(
+            CapturedGuestRead::try_from_payload(other_range, &payload).unwrap_err(),
+            ValidationError::GuestReadDescriptorMismatch { index: 6 }
+        );
     }
 
     #[test]
