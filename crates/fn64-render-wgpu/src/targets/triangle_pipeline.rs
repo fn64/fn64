@@ -122,8 +122,8 @@
 
 use core::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::device::{HeadlessBackend, NoAdapter};
 use crate::shader_manifest::{
@@ -142,6 +142,26 @@ use fn64_render::NeutralTriangleVertex;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn compute_chain_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_COMPUTE_CHAIN_TIMING") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_COMPUTE_CHAIN_TIMING must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("FN64_COMPUTE_CHAIN_TIMING is not valid Unicode: {error}"),
+    })
+}
+
+fn compute_chain_timing_lap(mark: &mut Option<Instant>) -> Duration {
+    let Some(previous) = *mark else {
+        return Duration::ZERO;
+    };
+    let now = Instant::now();
+    *mark = Some(now);
+    now.duration_since(previous)
+}
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const STATUS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
@@ -1689,6 +1709,7 @@ struct PreparedComputeHotColorBatch {
     first_word: u32,
     dispatch_words_per_row: u32,
     target_words_per_row: u32,
+    word_count: u32,
     workgroups: u32,
     packed_triangles: Vec<u8>,
     params: Vec<u8>,
@@ -2176,6 +2197,7 @@ impl TrianglePipelineRenderer {
                 first_word: 0,
                 dispatch_words_per_row: 0,
                 target_words_per_row: 0,
+                word_count,
                 workgroups,
                 packed_triangles,
                 params,
@@ -2307,6 +2329,8 @@ impl TrianglePipelineRenderer {
         resident_bytes: &[u8],
         dispatches: &[ComputeHotColorDispatch<'_>],
     ) -> Result<Vec<u8>, TrianglePipelineError> {
+        let timing_total = compute_chain_timing_enabled().then(Instant::now);
+        let mut timing_mark = timing_total;
         if dispatches.is_empty() {
             return Err(TrianglePipelineError::EmptyCoverageBatch);
         }
@@ -2456,12 +2480,14 @@ impl TrianglePipelineRenderer {
                 first_word,
                 dispatch_words_per_row,
                 target_words_per_row,
+                word_count,
                 workgroups,
                 packed_triangles,
                 params,
                 padded_target: Vec::new(),
             });
         }
+        let timing_prepare = compute_chain_timing_lap(&mut timing_mark);
 
         for (index, batch) in prepared.iter().enumerate() {
             let replacement = self
@@ -2510,6 +2536,7 @@ impl TrianglePipelineRenderer {
                 }),
             });
         }
+        let timing_resources = compute_chain_timing_lap(&mut timing_mark);
 
         let mut padded_target = resident_bytes.to_vec();
         padded_target.resize(target_bytes as usize, 0);
@@ -2530,6 +2557,7 @@ impl TrianglePipelineRenderer {
             self.queue
                 .write_buffer(&buffers.tile, 0, &input.tile.to_bytes());
         }
+        let timing_uploads = compute_chain_timing_lap(&mut timing_mark);
 
         // Every pass in the chain mutates the same packed target. Pass
         // boundaries order storage writes, while each invocation retains
@@ -2564,6 +2592,7 @@ impl TrianglePipelineRenderer {
                 ],
             }));
         }
+        let timing_bind_groups = compute_chain_timing_lap(&mut timing_mark);
 
         let mut encoder = self
             .device
@@ -2608,14 +2637,17 @@ impl TrianglePipelineRenderer {
             0,
             target_bytes,
         );
-
-        let submission = self.queue.submit([encoder.finish()]);
+        let command_buffer = encoder.finish();
+        let timing_encode = compute_chain_timing_lap(&mut timing_mark);
+        let submission = self.queue.submit([command_buffer]);
+        let timing_submit = compute_chain_timing_lap(&mut timing_mark);
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
                 timeout: Some(POLL_TIMEOUT),
             })
             .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
+        let timing_wait = compute_chain_timing_lap(&mut timing_mark);
         let statuses =
             map_and_read_prefix(&self.device, chain_status_readback, chain_status_bytes)?;
         let mut status_offset = 0usize;
@@ -2647,9 +2679,38 @@ impl TrianglePipelineRenderer {
             }
             status_offset = status_end;
         }
+        let timing_status_map = compute_chain_timing_lap(&mut timing_mark);
         let mut output =
             map_and_read_prefix(&self.device, &final_buffers.target_readback, target_bytes)?;
         output.truncate(expected_bytes);
+        let timing_target_map = compute_chain_timing_lap(&mut timing_mark);
+        if let Some(started) = timing_total {
+            eprintln!(
+                "[compute-chain-timing] dispatches={} draws={} pixels={} \
+                 prepare_ms={:.3} resources_ms={:.3} uploads_ms={:.3} bind_groups_ms={:.3} \
+                 encode_ms={:.3} submit_ms={:.3} wait_ms={:.3} status_map_ms={:.3} \
+                 target_map_ms={:.3} total_ms={:.3}",
+                dispatches.len(),
+                dispatches
+                    .iter()
+                    .map(|dispatch| dispatch.triangles.len())
+                    .sum::<usize>(),
+                prepared
+                    .iter()
+                    .map(|batch| u64::from(batch.word_count) * 2)
+                    .sum::<u64>(),
+                timing_prepare.as_secs_f64() * 1_000.0,
+                timing_resources.as_secs_f64() * 1_000.0,
+                timing_uploads.as_secs_f64() * 1_000.0,
+                timing_bind_groups.as_secs_f64() * 1_000.0,
+                timing_encode.as_secs_f64() * 1_000.0,
+                timing_submit.as_secs_f64() * 1_000.0,
+                timing_wait.as_secs_f64() * 1_000.0,
+                timing_status_map.as_secs_f64() * 1_000.0,
+                timing_target_map.as_secs_f64() * 1_000.0,
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         Ok(output)
     }
 
