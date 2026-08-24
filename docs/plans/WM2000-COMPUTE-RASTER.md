@@ -272,6 +272,18 @@ misattributing a batched result to its first draw. This diagnostic timing still
 includes the complete CPU raster before compute and is not a live replacement
 A/B.
 
+The fourth isolated optimization allocates one persistent resource slot per
+typed batch but encodes all of a packet's independent seeded dispatches and
+readback copies into one command buffer and waits once. The receipt now
+distinguishes submissions from typed batches. Across the same ten repeats this
+was 100 submissions for 300 batches and 500 draws; every complete target
+matched and the effect digest remained `1ac409f336397652`. Mean compute-probe
+time fell from 11.501 ms to 8.339 ms (-3.162 ms, 27.5%), and mean total window
+time fell from 27.717 ms to 24.652 ms (-3.065 ms, 11.1%), with p95 25.722 ms
+and max 26.676 ms. This is still a diagnostic double execution. Its next gate
+is a same-binary replacement A/B that removes the 7.939 ms CPU raster cost
+rather than adding more prototype work around it.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
