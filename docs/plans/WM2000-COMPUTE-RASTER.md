@@ -397,12 +397,49 @@ also reduced every pass together and is consistent with device clock changes,
 not a different workload. In the dominant mode, the first one-triangle pass
 cost about 0.056--0.065 ms and each following two-triangle pass clustered
 around 0.079--0.085 ms despite the different draw state. The pass-local sum
-accounted for almost the complete device span. The same run retained final
-RDRAM SHA-256 `4af275f0aa78f5453eeb82ebc7b821b14fd994c0b8e32c041bd3f719acf954c6`.
+accounted for almost the complete device span. No repository test can rederive
+the private capture, but this run checked final RDRAM SHA-256 on every
+iteration; no test owns `4af275f0aa78f5453eeb82ebc7b821b14fd994c0b8e32c041bd3f719acf954c6`.
 This rules out one pathological dispatch and selects exact state-preserving
 pass fusion: upload the immutable TMEM/tile state visible to each draw, retain
 draw order, and scan the bounded target once. Per-pass shader arithmetic
 tuning comes after that architectural candidate is byte-proven.
+
+The state-boundary census then found 23 TMEM/tile runs across 23 dispatches,
+so adjacent-state coalescing cannot reduce this receipt. The retained fusion
+instead uploads all 23 immutable states and tags each triangle with its state
+index. A sparse host-built worklist gives each packed RGBA16 target word one
+GPU owner and lists only the triangles whose journal-proven rectangle reaches
+that word, in original painter order. The shader selects the tagged state
+immediately before sampling and packs the first TMEM error's state index with
+its status, preserving loud per-dispatch attribution through the single pass.
+
+A full-target one-pass prototype was byte-exact but regressed GPU execution to
+2.536 ms because it evaluated every draw across all 115,200 pixels; it was
+removed. The sparse form retained 105,984 pixel visits and reduced 23 passes
+to one. In a same-binary counterbalanced `A/B, B/A` run with five warmups and
+50 measured repetitions per leg, all 200 measured completions retained the
+same private-capture identity. No test can rederive final RDRAM SHA-256
+`4af275f0aa78f5453eeb82ebc7b821b14fd994c0b8e32c041bd3f719acf954c6`; no test owns that private artifact.
+Paired means fell from 3.362 to 2.324 ms for compute work (-1.038 ms, 30.9%)
+and from 8.794 to 7.740 ms total (-1.054 ms, 12.0%); paired p95 fell from
+9.573 to 7.913 ms. `FN64_COMPUTE_STATE_TABLE_FUSION=0` retains the same-binary
+multi-pass measurement control; absent or `1` enables fusion.
+
+The focused native differential retains three independent contracts. The
+ordinary two-draw compute batch matches the CPU raster's complete target
+bytes. A forced typed boundary with an observably different second TMEM state
+matches the pre-fusion sequential GPU result, proving state selection and
+painter order rather than merely repeating one texture. A first state with no
+valid TMEM bytes followed by a successful state still reports the first
+state's invalid-byte refusal and target pixel. Ten consecutive native test
+processes passed; each process repeats all three GPU contracts ten times.
+Splitting the valid synthetic draws into separate GPU submissions does not
+match the CPU oracle even without fusion; that pre-existing sequential-
+submission discrepancy is therefore not attributed to this optimization.
+Game-derived replay bytes remain exact, but production task residency and a
+fresh live linked-shell certification are still required before this work can
+claim the 30 Hz goal.
 
 ## Sources and nonclaims
 

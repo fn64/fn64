@@ -24,6 +24,7 @@ struct TriangleEdges {
     planes: array<AttributePlane, 7>,
     env_rgba8: u32,
     prim_rgba8: u32,
+    tmem_state_index: u32,
 }
 
 struct CoverageParams {
@@ -50,9 +51,15 @@ struct CoverageSample {
     plane_values: array<I64, 7>,
 }
 
-// Group 1 is reserved for compute-raster state. Group 0 remains compatible
-// with `tmem_sample.wgsl` so the color-producing entry point can reuse its
-// already-proven committed-TMEM bindings without renumbering either module.
+struct ColorWorkItem {
+    target_word: u32,
+    first_triangle_index: u32,
+    triangle_count: u32,
+}
+
+// Group 1 is reserved for compute-raster state. Group 0 retains the proven
+// `tmem_sample.wgsl` binding numbers while widening its resources into
+// immutable per-dispatch state tables.
 @group(1) @binding(0)
 var<storage, read> triangles: array<TriangleEdges>;
 
@@ -67,6 +74,12 @@ var<storage, read_write> color_target_words: array<u32>;
 
 @group(1) @binding(4)
 var<storage, read_write> color_status: array<u32>;
+
+@group(1) @binding(5)
+var<storage, read> color_work_items: array<ColorWorkItem>;
+
+@group(1) @binding(6)
+var<storage, read> color_work_triangle_indices: array<u32>;
 
 fn i64_from_i32(value: i32) -> I64 {
     return I64(u32(value), select(0, -1, value < 0));
@@ -318,12 +331,18 @@ struct ColorPixelResult {
     status: u32,
 }
 
-fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelResult {
+fn execute_hot_color_pixel(
+    pixel_index: u32,
+    initial_rgba16: u32,
+    first_triangle_index: u32,
+    work_triangle_count: u32,
+) -> ColorPixelResult {
     let x = pixel_index % params.width;
     let y = pixel_index / params.width;
     var current = initial_rgba16;
     var status = 0u;
-    for (var triangle_index = 0u; triangle_index < params.triangle_count; triangle_index += 1u) {
+    for (var work_index = 0u; work_index < work_triangle_count; work_index += 1u) {
+        let triangle_index = color_work_triangle_indices[first_triangle_index + work_index];
         let triangle = triangles[triangle_index];
         let raster = evaluate_coverage_sample(triangle, x, y);
         if raster.coverage == 0u {
@@ -331,9 +350,12 @@ fn execute_hot_color_pixel(pixel_index: u32, initial_rgba16: u32) -> ColorPixelR
         }
         let raw_s = perspective_coordinate(raster.plane_values[4], raster.plane_values[6]);
         let raw_t = perspective_coordinate(raster.plane_values[5], raster.plane_values[6]);
+        tmem_state_index = triangle.tmem_state_index;
         let texel = sample_committed_rgba16_point_bound(raw_s, raw_t);
         if texel.status != TMEM_SAMPLE_STATUS_OK {
-            status = texel.status;
+            if status == TMEM_SAMPLE_STATUS_OK {
+                status = (triangle.tmem_state_index << 8u) | texel.status;
+            }
             continue;
         }
         var inputs: CombinerInputs;
@@ -394,14 +416,8 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     if local_word_index >= params.word_count {
         return;
     }
-    var word_index = params.first_word + local_word_index;
-    if params.dispatch_words_per_row != 0u {
-        let local_row = local_word_index / params.dispatch_words_per_row;
-        let local_column = local_word_index % params.dispatch_words_per_row;
-        word_index = params.first_word
-            + local_row * params.target_words_per_row
-            + local_column;
-    }
+    let work_item = color_work_items[local_word_index];
+    let word_index = work_item.target_word;
     if word_index >= arrayLength(&color_target_words) {
         return;
     }
@@ -409,7 +425,12 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     let first_pixel = word_index * 2u;
     let first_device = device_word & 0xffffu;
     let first_logical = ((first_device & 0xffu) << 8u) | (first_device >> 8u);
-    let first = execute_hot_color_pixel(first_pixel, first_logical);
+    let first = execute_hot_color_pixel(
+        first_pixel,
+        first_logical,
+        work_item.first_triangle_index,
+        work_item.triangle_count,
+    );
     var output_word = ((first.rgba16 & 0xffu) << 8u) | (first.rgba16 >> 8u);
     let first_status = local_word_index * 2u;
     color_status[first_status] = first.status;
@@ -417,7 +438,12 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     if second_pixel < params.pixels_per_triangle {
         let second_device = device_word >> 16u;
         let second_logical = ((second_device & 0xffu) << 8u) | (second_device >> 8u);
-        let second = execute_hot_color_pixel(second_pixel, second_logical);
+        let second = execute_hot_color_pixel(
+            second_pixel,
+            second_logical,
+            work_item.first_triangle_index,
+            work_item.triangle_count,
+        );
         let packed_device = ((second.rgba16 & 0xffu) << 8u) | (second.rgba16 >> 8u);
         output_word |= packed_device << 16u;
         color_status[first_status + 1u] = second.status;

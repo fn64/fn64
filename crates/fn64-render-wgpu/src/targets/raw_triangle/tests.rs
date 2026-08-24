@@ -1354,16 +1354,44 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
             );
         }
     }
+
     assert_eq!(
         renderer.compute_hot_color_resource_generations(),
         1,
         "ten identical submissions must allocate one high-water resource generation"
     );
 
+    let mut second_tmem = BenchTmem::new();
+    for texel in second_tmem.bytes.chunks_exact_mut(2) {
+        texel.copy_from_slice(&0xf801u16.to_be_bytes());
+    }
+    let second_projection = second_tmem.projection();
+    let first_gpu = renderer
+        .compute_triangle_hot_color(
+            crate::TriangleTargetExtent { width, height },
+            &resident,
+            &device_triangles[..1],
+            &projection,
+            tile_params,
+        )
+        .expect("first single-state GPU draw must complete");
+    let sequential_gpu = renderer
+        .compute_triangle_hot_color(
+            crate::TriangleTargetExtent { width, height },
+            &first_gpu,
+            &device_triangles[1..],
+            &second_projection,
+            tile_params,
+        )
+        .expect("second distinct single-state GPU draw must complete");
+    assert_ne!(
+        sequential_gpu, expected,
+        "the distinct second TMEM fixture must observably change the result"
+    );
+
     // Force a typed boundary between the two draws. The chain must preserve
-    // painter's order without uploading or reading back the intermediate
-    // target; this is the production shape when TMEM/tile/program identity
-    // changes between adjacent admitted draws.
+    // painter's order and select each draw's distinct TMEM state without
+    // uploading or reading back the intermediate target.
     let chained = [
         crate::targets::ComputeHotColorDispatch {
             triangles: &device_triangles[..1],
@@ -1376,7 +1404,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         },
         crate::targets::ComputeHotColorDispatch {
             triangles: &device_triangles[1..],
-            tmem: &projection,
+            tmem: &second_projection,
             tile: tile_params,
             first_row: 0,
             row_count: height,
@@ -1392,10 +1420,72 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
                 &chained,
             )
             .expect("ordered compute-color chain must complete");
-        assert_eq!(
-            actual, expected,
-            "ordered compute-color chain differential failed on run {run}"
-        );
+        if actual != sequential_gpu {
+            let byte = actual
+                .iter()
+                .zip(&sequential_gpu)
+                .position(|(actual, expected)| actual != expected)
+                .expect("unequal buffers have a mismatching byte");
+            panic!(
+                "distinct-TMEM chain differential run {run}: first mismatch at byte {byte} \
+                 (pixel {}): chain={:#04x}, sequential={:#04x}, matches_shared_state={}",
+                byte / 2,
+                actual[byte],
+                sequential_gpu[byte],
+                actual == expected,
+            );
+        }
+    }
+
+    let mut invalid_projection = projection;
+    invalid_projection.validity_words.fill(0);
+    let refusal_chain = [
+        crate::targets::ComputeHotColorDispatch {
+            triangles: &device_triangles[..1],
+            tmem: &invalid_projection,
+            tile: tile_params,
+            first_row: 0,
+            row_count: height,
+            first_column: 2,
+            column_count: 20,
+        },
+        crate::targets::ComputeHotColorDispatch {
+            triangles: &device_triangles[1..],
+            tmem: &second_projection,
+            tile: tile_params,
+            first_row: 0,
+            row_count: height,
+            first_column: 2,
+            column_count: 20,
+        },
+    ];
+    for run in 1..=10 {
+        let error = renderer
+            .compute_triangle_hot_color_chain(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &refusal_chain,
+            )
+            .expect_err("a later successful state must not hide the first TMEM refusal");
+        match error {
+            crate::TrianglePipelineError::ComputeColorBatchTmemStatus {
+                batch,
+                pixel,
+                status,
+            } => {
+                assert_eq!(batch, 0, "refusal run {run} must name the first state");
+                assert!(
+                    pixel < (width * height) as usize,
+                    "refusal run {run} must name a target pixel"
+                );
+                assert_eq!(
+                    status,
+                    crate::TMEM_SAMPLE_STATUS_INVALID_BYTE,
+                    "refusal run {run} must retain the invalid-byte status"
+                );
+            }
+            other => panic!("refusal run {run} returned the wrong error: {other}"),
+        }
     }
     assert_eq!(
         renderer.compute_hot_color_resource_generations(),
