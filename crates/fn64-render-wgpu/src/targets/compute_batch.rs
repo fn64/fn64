@@ -19,7 +19,7 @@ pub(crate) const HOT_OTHER_MODE_LOW: u32 = 0x0050_41c8;
 /// The one complete RDP program admitted by the first compute prototype.
 /// Raw halves are retained because a shader pipeline key must distinguish
 /// every bit, including bits that happen to be dead for this program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ComputeRasterProgramKey {
     combine_low: u32,
     combine_high: u32,
@@ -54,7 +54,12 @@ impl ComputeRasterProgramKey {
             || other_mode.high() != HOT_OTHER_MODE_HIGH
             || other_mode.low() != HOT_OTHER_MODE_LOW
         {
-            return Err(ComputeRasterAdmissionRefusal::ProgramBits);
+            return Err(ComputeRasterAdmissionRefusal::ProgramBits([
+                combine.low(),
+                combine.high(),
+                other_mode.high(),
+                other_mode.low(),
+            ]));
         }
         Ok(Self {
             combine_low: combine.low(),
@@ -74,14 +79,14 @@ impl ComputeRasterProgramKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ComputeRasterAdmissionRefusal {
     TargetFormat,
     Untextured,
     AffineTexture,
     Depth,
     CycleType,
-    ProgramBits,
+    ProgramBits([u32; 4]),
     EmptyAccesses,
     AccessMode,
     AccessPurpose,
@@ -307,7 +312,12 @@ mod tests {
                 OtherMode::from_wire(HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW),
                 true,
             ),
-            Err(ComputeRasterAdmissionRefusal::ProgramBits)
+            Err(ComputeRasterAdmissionRefusal::ProgramBits([
+                HOT_COMBINE_LOW ^ 1,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW,
+            ]))
         );
         assert_eq!(
             ComputeRasterProgramKey::try_admit(

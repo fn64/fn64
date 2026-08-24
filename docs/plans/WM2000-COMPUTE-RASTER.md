@@ -621,6 +621,26 @@ task combined. Removing broad `Clone` authority remains a worthwhile type-
 system cleanup, but the census disproves it as material performance headroom.
 `FN64_TASK_COMPUTE_CENSUS=1` retains these clocks for future ownership work.
 
+The longer 800-pump route exposed a second admission boundary that the
+180-pump gate did not reach. A packet containing raw triangles was previously
+marked by a boolean as compute-shaped before the exact program, draw, access,
+and ordering checks ran. Later rejection was therefore indistinguishable from
+executor corruption. Task planning now carries a move-only execution
+disposition. Exact admission produces the compute capability; an expected
+refusal carries a stable reason into the ordered CPU member; executor errors
+remain loud. The census reports member count and elapsed CPU time for every
+reason. Program rejection additionally reports the exact four RDP program
+words, so widening decisions can be ranked from the sustained route rather
+than inferred from an earlier draw corpus.
+
+The reporting-only taxonomy separates packets with no raw triangle, packets
+mixing triangles with fill or texrect commands, disabled compute, completion
+shapes that cannot be deferred, structural admission failures, and exact
+program-bit failures. It does not catch a generic task error and fall back.
+TMEM or tile changes that only require another dispatch are also distinct from
+admission refusal. This keeps the diagnostic denominator closed without
+weakening the task transaction or its command ordering.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed

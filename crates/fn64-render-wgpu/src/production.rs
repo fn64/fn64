@@ -60,9 +60,9 @@ use crate::targets::{
     admitted_triangle_fixture, execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned,
     CandidateColorTarget, ColorTargetExecutionBatch, CompletedColorTargetWrite,
     CompletedTaskColorSegment, ComputeCoverageTriangle, ComputeHotColorBatch,
-    ComputeHotColorDispatch, ComputeRasterBatch, ComputeRasterBatchBuilder,
-    ComputeRasterDrawAdmission, ComputeRasterProgramKey, ResolvedFragmentBlendParams,
-    TargetRectangle, TaskColorInput,
+    ComputeHotColorDispatch, ComputeRasterAdmissionRefusal, ComputeRasterBatch,
+    ComputeRasterBatchBuilder, ComputeRasterDrawAdmission, ComputeRasterProgramKey,
+    ResolvedFragmentBlendParams, TargetRectangle, TaskColorInput,
 };
 use crate::tmem::{
     project_committed_tmem, DeferredPhysicalTmemSuccessor, TileBindingParams, TmemGpuProjection,
@@ -233,6 +233,8 @@ mod raw_dpc_execute_census {
 /// live A/B runs answer whether the kernel was actually reached and how much
 /// of the task remained on the CPU path.
 mod task_compute_census {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
         OnceLock,
@@ -244,14 +246,19 @@ mod task_compute_census {
     static COMPUTE_MEMBERS: AtomicU64 = AtomicU64::new(0);
     static CPU_MEMBERS: AtomicU64 = AtomicU64::new(0);
     static COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
-    static SHAPE_CPU_MEMBERS: AtomicU64 = AtomicU64::new(0);
-    static SHAPE_CPU_NS: AtomicU64 = AtomicU64::new(0);
+    static TIMED_CPU_MEMBERS: AtomicU64 = AtomicU64::new(0);
+    static TIMED_CPU_NS: AtomicU64 = AtomicU64::new(0);
     static REGISTRY_CLONE_CALLS: AtomicU64 = AtomicU64::new(0);
     static REGISTRY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
     static REGISTRY_CLONE_NS: AtomicU64 = AtomicU64::new(0);
     static SHADOW_CLONE_CALLS: AtomicU64 = AtomicU64::new(0);
     static SHADOW_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
     static SHADOW_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static CPU_REASONS: RefCell<BTreeMap<super::TaskComputeCpuReason, (u64, u64)>> =
+            RefCell::new(BTreeMap::new());
+    }
 
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -262,6 +269,10 @@ mod task_compute_census {
     }
 
     pub(super) fn segment_started() -> Option<std::time::Instant> {
+        enabled().then(std::time::Instant::now)
+    }
+
+    pub(super) fn cpu_started() -> Option<std::time::Instant> {
         enabled().then(std::time::Instant::now)
     }
 
@@ -307,15 +318,39 @@ mod task_compute_census {
         COMPUTE_NS.fetch_add(elapsed, Relaxed);
     }
 
-    pub(super) fn record_cpu_shape(started: Option<std::time::Instant>) {
+    pub(super) fn record_cpu(
+        reason: super::TaskComputeCpuReason,
+        started: Option<std::time::Instant>,
+    ) {
         let Some(started) = started else {
             return;
         };
-        SHAPE_CPU_MEMBERS.fetch_add(1, Relaxed);
-        SHAPE_CPU_NS.fetch_add(
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Relaxed,
-        );
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        TIMED_CPU_MEMBERS.fetch_add(1, Relaxed);
+        TIMED_CPU_NS.fetch_add(elapsed, Relaxed);
+        CPU_REASONS.with(|reasons| {
+            let mut reasons = reasons.borrow_mut();
+            accumulate_reason(&mut reasons, reason, elapsed);
+        });
+    }
+
+    fn accumulate_reason(
+        reasons: &mut BTreeMap<super::TaskComputeCpuReason, (u64, u64)>,
+        reason: super::TaskComputeCpuReason,
+        elapsed_ns: u64,
+    ) {
+        let entry = reasons.entry(reason).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(elapsed_ns);
+    }
+
+    fn reason_name(reason: super::TaskComputeCpuReason) -> String {
+        match reason {
+            super::TaskComputeCpuReason::ExactAdmissionRejected(
+                super::TaskComputeAdmissionRefusal::ProgramBits([lo, hi, omh, oml]),
+            ) => format!("program_bits:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}"),
+            _ => format!("{reason:?}"),
+        }
     }
 
     pub(super) fn record_task(members: usize, cpu_members: usize) {
@@ -328,15 +363,15 @@ mod task_compute_census {
         if tasks % 30 == 0 {
             let compute_members = COMPUTE_MEMBERS.load(Relaxed);
             let compute_ns = COMPUTE_NS.load(Relaxed);
-            let shape_cpu_members = SHAPE_CPU_MEMBERS.load(Relaxed);
-            let shape_cpu_ns = SHAPE_CPU_NS.load(Relaxed);
+            let timed_cpu_members = TIMED_CPU_MEMBERS.load(Relaxed);
+            let timed_cpu_ns = TIMED_CPU_NS.load(Relaxed);
             let registry_clone_ns = REGISTRY_CLONE_NS.load(Relaxed);
             let shadow_clone_ns = SHADOW_CLONE_NS.load(Relaxed);
             eprintln!(
                 "[task-compute-census] tasks={tasks} members={} compute_segments={} \
                  compute_members={} cpu_members={} compute_total_ms={:.3} \
-                 compute_ms/member={:.3} shape_cpu_members={} shape_cpu_total_ms={:.3} \
-                 shape_cpu_ms/member={:.3} registry_clone_calls={} registry_clone_bytes={} \
+                 compute_ms/member={:.3} timed_cpu_members={} timed_cpu_total_ms={:.3} \
+                 timed_cpu_ms/member={:.3} registry_clone_calls={} registry_clone_bytes={} \
                  registry_clone_total_ms={:.3} shadow_clone_calls={} shadow_clone_bytes={} \
                  shadow_clone_total_ms={:.3}",
                 MEMBERS.load(Relaxed),
@@ -345,9 +380,9 @@ mod task_compute_census {
                 CPU_MEMBERS.load(Relaxed),
                 compute_ns as f64 / 1_000_000.0,
                 compute_ns as f64 / 1_000_000.0 / compute_members.max(1) as f64,
-                shape_cpu_members,
-                shape_cpu_ns as f64 / 1_000_000.0,
-                shape_cpu_ns as f64 / 1_000_000.0 / shape_cpu_members.max(1) as f64,
+                timed_cpu_members,
+                timed_cpu_ns as f64 / 1_000_000.0,
+                timed_cpu_ns as f64 / 1_000_000.0 / timed_cpu_members.max(1) as f64,
                 REGISTRY_CLONE_CALLS.load(Relaxed),
                 REGISTRY_CLONE_BYTES.load(Relaxed),
                 registry_clone_ns as f64 / 1_000_000.0,
@@ -355,6 +390,40 @@ mod task_compute_census {
                 SHADOW_CLONE_BYTES.load(Relaxed),
                 shadow_clone_ns as f64 / 1_000_000.0,
             );
+            CPU_REASONS.with(|reasons| {
+                for (reason, (members, elapsed_ns)) in reasons.borrow().iter() {
+                    eprintln!(
+                        "[task-compute-reason] reason={} members={} total_ms={:.3} ms/member={:.3}",
+                        reason_name(*reason),
+                        members,
+                        *elapsed_ns as f64 / 1_000_000.0,
+                        *elapsed_ns as f64 / 1_000_000.0 / (*members).max(1) as f64,
+                    );
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reason_totals_keep_distinct_program_keys_and_close() {
+            let first = super::super::TaskComputeCpuReason::ExactAdmissionRejected(
+                super::super::TaskComputeAdmissionRefusal::ProgramBits([1, 2, 3, 4]),
+            );
+            let second = super::super::TaskComputeCpuReason::ExactAdmissionRejected(
+                super::super::TaskComputeAdmissionRefusal::ProgramBits([5, 6, 7, 8]),
+            );
+            let mut totals = BTreeMap::new();
+            accumulate_reason(&mut totals, first, 11);
+            accumulate_reason(&mut totals, first, 13);
+            accumulate_reason(&mut totals, second, 17);
+            assert_eq!(totals.get(&first), Some(&(2, 24)));
+            assert_eq!(totals.get(&second), Some(&(1, 17)));
+            assert_eq!(totals.values().map(|(members, _)| members).sum::<u64>(), 3);
+            assert_eq!(totals.values().map(|(_, ns)| ns).sum::<u64>(), 41);
         }
     }
 }
@@ -494,9 +563,15 @@ impl Default for RawDpcCarryIn {
 /// a compute segment. `ComputeCandidate` is deliberately not an execution
 /// capability: exact program/TMEM/tile admission happens against captured
 /// execution state and yields a separate move-only `ComputeEligibleTaskMember`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PlannedTaskCpuReason {
+    NoRawTriangle,
+    MixedFillOrTexrect,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlannedTaskExecution {
-    Cpu,
+    Cpu(PlannedTaskCpuReason),
     ComputeCandidate,
 }
 
@@ -774,6 +849,13 @@ struct ComputeRasterProbeBuilder {
     shared_tile: Option<TileBindingParams>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputeRasterProbePush {
+    Admitted,
+    SplitDispatch,
+    Refused(ComputeRasterAdmissionRefusal),
+}
+
 impl ComputeRasterProbeBuilder {
     fn new(candidate: &CandidateColorTarget, resident_bytes: Vec<u8>) -> Self {
         let key = candidate.key();
@@ -797,7 +879,7 @@ impl ComputeRasterProbeBuilder {
         candidate: &CandidateColorTarget,
         index: usize,
         tmem: &S,
-    ) -> Result<bool, WgpuRawDpcExecutionError> {
+    ) -> Result<ComputeRasterProbePush, WgpuRawDpcExecutionError> {
         let (_, triangle_index, command_index, _) = &collector.plan.raw_triangle_commands[index];
         let draw = collector.plan.triangles[*triangle_index]
             .as_ref()
@@ -810,7 +892,7 @@ impl ComputeRasterProbeBuilder {
             triangle.flags().textured(),
         ) {
             Ok(program) => program,
-            Err(_) => return Ok(false),
+            Err(reason) => return Ok(ComputeRasterProbePush::Refused(reason)),
         };
         let accesses = scheduled_raw_triangle_accesses(collector, candidate, index)?;
         let identity = crate::TmemByteSource::snapshot(tmem);
@@ -824,7 +906,7 @@ impl ComputeRasterProbeBuilder {
             || self.shared_tmem.is_some_and(|shared| shared != projection)
             || self.shared_tile.is_some_and(|shared| shared != tile)
         {
-            return Ok(false);
+            return Ok(ComputeRasterProbePush::SplitDispatch);
         }
         let admission = match ComputeRasterDrawAdmission::try_new(
             candidate.key(),
@@ -835,10 +917,10 @@ impl ComputeRasterProbeBuilder {
             accesses,
         ) {
             Ok(admission) => admission,
-            Err(_) => return Ok(false),
+            Err(reason) => return Ok(ComputeRasterProbePush::Refused(reason)),
         };
-        if self.batch.push(admission).is_err() {
-            return Ok(false);
+        if let Err(reason) = self.batch.push(admission) {
+            return Ok(ComputeRasterProbePush::Refused(reason));
         }
         self.shared_tmem_identity = Some(identity);
         self.shared_tmem = Some(projection);
@@ -847,7 +929,7 @@ impl ComputeRasterProbeBuilder {
             ComputeCoverageTriangle::from_raw(triangle)
                 .with_material(draw.env_color, draw.prim_color),
         );
-        Ok(true)
+        Ok(ComputeRasterProbePush::Admitted)
     }
 
     fn finish_dispatch(self) -> Option<(ComputeRasterDispatch, Vec<u8>)> {
@@ -887,13 +969,13 @@ fn retain_compute_probe_draw<S: crate::TmemByteSource + ?Sized>(
     resident_before: &[u8],
 ) -> Result<Option<ComputeRasterProbeBuilder>, WgpuRawDpcExecutionError> {
     if let Some(active) = builder.as_mut() {
-        if active.push(collector, candidate, index, tmem)? {
+        if active.push(collector, candidate, index, tmem)? == ComputeRasterProbePush::Admitted {
             return Ok(None);
         }
     }
     let previous = builder.take();
     let mut next = ComputeRasterProbeBuilder::new(candidate, resident_before.to_vec());
-    if next.push(collector, candidate, index, tmem)? {
+    if next.push(collector, candidate, index, tmem)? == ComputeRasterProbePush::Admitted {
         *builder = Some(next);
     }
     Ok(previous)
@@ -2604,6 +2686,7 @@ pub enum WgpuRawDpcExecutionError {
     /// dispatcher consumes it. Every other caller treats it as an error.
     TaskBatchComputeNotAdmitted {
         ordinal: u64,
+        reason: TaskComputeAdmissionRefusal,
     },
     /// A triangle-bearing plan reached execution with no successful prior
     /// `RenderBackend::create` call -- `triangle_pipeline`/
@@ -2873,9 +2956,9 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "compute-raster checkpoint target history is discontinuous between packet \
                 ordinals {previous_ordinal} and {ordinal}"
             ),
-            Self::TaskBatchComputeNotAdmitted { ordinal } => write!(
+            Self::TaskBatchComputeNotAdmitted { ordinal, reason } => write!(
                 formatter,
-                "raw-DPC task member ordinal {ordinal} was explicitly not admitted by the typed compute executor"
+                "raw-DPC task member ordinal {ordinal} was explicitly not admitted by the typed compute executor: {reason:?}"
             ),
             Self::TriangleDrawBeforeCreate => formatter.write_str(
                 "a triangle-bearing plan reached execution with no successful prior \
@@ -3787,10 +3870,16 @@ impl RenderBackend for WgpuBackend {
                     }
                 } else {
                     cpu_members += 1;
-                    let shape_started = (dispatch
-                        != TaskMemberDispatch::Planned(PlannedTaskExecution::Cpu))
-                    .then(task_compute_census::segment_started)
-                    .flatten();
+                    let reason = match dispatch {
+                        TaskMemberDispatch::Planned(PlannedTaskExecution::Cpu(reason)) => {
+                            TaskComputeCpuReason::Planned(reason)
+                        }
+                        TaskMemberDispatch::Planned(PlannedTaskExecution::ComputeCandidate) => {
+                            TaskComputeCpuReason::ComputeDisabled
+                        }
+                        TaskMemberDispatch::Cpu(reason) => reason,
+                    };
+                    let cpu_started = task_compute_census::cpu_started();
                     let (member, triangles, pending, draw_tmem, _, _) = execute_raw_dpc_inner(
                         &mut batch,
                         bound,
@@ -3803,7 +3892,7 @@ impl RenderBackend for WgpuBackend {
                         None,
                     )
                     .map_err(RenderError::from)?;
-                    task_compute_census::record_cpu_shape(shape_started);
+                    task_compute_census::record_cpu(reason, cpu_started);
                     if let Some(pending) = pending {
                         let shadow_byte_count =
                             pending.initialized.device_bytes().device_bytes().len();
@@ -4106,20 +4195,23 @@ fn plan_raw_dpc_inner(
     })
     .map_err(|error| format!("raw-DPC plan decode failed: {error}"))?;
     let delta = decoded.state_delta().clone();
-    let execution = if decoded
+    let has_raw_triangle = decoded
         .commands()
         .iter()
-        .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)))
-        && decoded.commands().iter().all(|command| {
-            !matches!(
-                command.kind(),
-                crate::RawDpcCommandKind::FillRectangle(_)
-                    | crate::RawDpcCommandKind::TextureRectangle(_)
-            )
-        }) {
+        .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)));
+    let has_mixed_color_command = decoded.commands().iter().any(|command| {
+        matches!(
+            command.kind(),
+            crate::RawDpcCommandKind::FillRectangle(_)
+                | crate::RawDpcCommandKind::TextureRectangle(_)
+        )
+    });
+    let execution = if has_raw_triangle && !has_mixed_color_command {
         PlannedTaskExecution::ComputeCandidate
+    } else if has_raw_triangle {
+        PlannedTaskExecution::Cpu(PlannedTaskCpuReason::MixedFillOrTexrect)
     } else {
-        PlannedTaskExecution::Cpu
+        PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle)
     };
 
     let planned = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::AdmitAndSeal, || {
@@ -4426,9 +4518,11 @@ struct StagedRawDpcFailure {
     error: WgpuRawDpcExecutionError,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TaskComputeCpuReason {
-    ExactAdmissionRejected,
+    Planned(PlannedTaskCpuReason),
+    ComputeDisabled,
+    ExactAdmissionRejected(TaskComputeAdmissionRefusal),
     CompletionShapeNotDeferred,
 }
 
@@ -4539,19 +4633,22 @@ fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
                 staged.outcome,
                 StagedOutcome::DeferredGuestWritesOnly(..)
                     | StagedOutcome::DeferredMixedColorAndTmem { .. }
-            ) => Ok(TaskComputeDisposition::Compute(ComputeEligibleTaskMember(
+            ) =>
+        {
+            Ok(TaskComputeDisposition::Compute(ComputeEligibleTaskMember(
                 staged,
-            ))),
+            )))
+        }
         Ok(staged) => Ok(TaskComputeDisposition::Cpu {
             bound: staged.bound,
             reason: TaskComputeCpuReason::CompletionShapeNotDeferred,
         }),
         Err(StagedRawDpcFailure {
             bound,
-            error: WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted { .. },
+            error: WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted { reason, .. },
         }) => Ok(TaskComputeDisposition::Cpu {
             bound,
-            reason: TaskComputeCpuReason::ExactAdmissionRejected,
+            reason: TaskComputeCpuReason::ExactAdmissionRejected(reason),
         }),
         Err(failure) => Err(failure.error),
     }
@@ -5703,6 +5800,49 @@ struct ComputeRasterReplacementPlan {
     claimed: TargetRectangle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskComputeAdmissionRefusal {
+    MixedColorCommands,
+    TargetFormat,
+    Untextured,
+    AffineTexture,
+    Depth,
+    CycleType,
+    ProgramBits([u32; 4]),
+    EmptyAccesses,
+    AccessMode,
+    AccessPurpose,
+    AccessRegion,
+    AccessOutsideTarget,
+    CommandOrder,
+    EmptyDispatch,
+    NoDispatches,
+}
+
+impl From<ComputeRasterAdmissionRefusal> for TaskComputeAdmissionRefusal {
+    fn from(reason: ComputeRasterAdmissionRefusal) -> Self {
+        match reason {
+            ComputeRasterAdmissionRefusal::TargetFormat => Self::TargetFormat,
+            ComputeRasterAdmissionRefusal::Untextured => Self::Untextured,
+            ComputeRasterAdmissionRefusal::AffineTexture => Self::AffineTexture,
+            ComputeRasterAdmissionRefusal::Depth => Self::Depth,
+            ComputeRasterAdmissionRefusal::CycleType => Self::CycleType,
+            ComputeRasterAdmissionRefusal::ProgramBits(words) => Self::ProgramBits(words),
+            ComputeRasterAdmissionRefusal::EmptyAccesses => Self::EmptyAccesses,
+            ComputeRasterAdmissionRefusal::AccessMode => Self::AccessMode,
+            ComputeRasterAdmissionRefusal::AccessPurpose => Self::AccessPurpose,
+            ComputeRasterAdmissionRefusal::AccessRegion => Self::AccessRegion,
+            ComputeRasterAdmissionRefusal::AccessOutsideTarget => Self::AccessOutsideTarget,
+            ComputeRasterAdmissionRefusal::CommandOrder => Self::CommandOrder,
+        }
+    }
+}
+
+enum ComputeRasterReplacementAdmission {
+    Admitted(ComputeRasterReplacementPlan),
+    Refused(TaskComputeAdmissionRefusal),
+}
+
 fn compute_replacement_target_pixels(
     plan: &ComputeRasterReplacementPlan,
     key: ColorTargetKey,
@@ -5753,24 +5893,30 @@ fn retain_compute_replacement_draw<S: crate::TmemByteSource + ?Sized>(
     candidate: &CandidateColorTarget,
     index: usize,
     tmem: &S,
-) -> Result<bool, WgpuRawDpcExecutionError> {
+) -> Result<Option<TaskComputeAdmissionRefusal>, WgpuRawDpcExecutionError> {
     if let Some(active) = builder.as_mut() {
-        if active.push(collector, candidate, index, tmem)? {
-            return Ok(true);
+        match active.push(collector, candidate, index, tmem)? {
+            ComputeRasterProbePush::Admitted => return Ok(None),
+            ComputeRasterProbePush::SplitDispatch => {}
+            ComputeRasterProbePush::Refused(reason) => return Ok(Some(reason.into())),
         }
     }
     if let Some(previous) = builder.take() {
         let Some((dispatch, _)) = previous.finish_dispatch() else {
-            return Ok(false);
+            return Ok(Some(TaskComputeAdmissionRefusal::EmptyDispatch));
         };
         dispatches.push(dispatch);
     }
     let mut next = ComputeRasterProbeBuilder::new(candidate, Vec::new());
-    if !next.push(collector, candidate, index, tmem)? {
-        return Ok(false);
+    match next.push(collector, candidate, index, tmem)? {
+        ComputeRasterProbePush::Admitted => {}
+        ComputeRasterProbePush::SplitDispatch => {
+            return Ok(Some(TaskComputeAdmissionRefusal::EmptyDispatch));
+        }
+        ComputeRasterProbePush::Refused(reason) => return Ok(Some(reason.into())),
     }
     *builder = Some(next);
-    Ok(true)
+    Ok(None)
 }
 
 fn claimed_rectangle_from_accesses(
@@ -5823,12 +5969,14 @@ fn plan_compute_raster_replacement(
     candidate: &CandidateColorTarget,
     schedule: &[(u32, ColorCommandKind)],
     tmem: &TexrectTmemSource<'_>,
-) -> Result<Option<ComputeRasterReplacementPlan>, WgpuRawDpcExecutionError> {
+) -> Result<ComputeRasterReplacementAdmission, WgpuRawDpcExecutionError> {
     if schedule
         .iter()
         .any(|(_, kind)| !matches!(kind, ColorCommandKind::RawTriangle(_)))
     {
-        return Ok(None);
+        return Ok(ComputeRasterReplacementAdmission::Refused(
+            TaskComputeAdmissionRefusal::MixedColorCommands,
+        ));
     }
     let mut builder = None;
     let mut dispatches = Vec::new();
@@ -5837,7 +5985,7 @@ fn plan_compute_raster_replacement(
             unreachable!("the all-raw-triangle preflight rejected every other command kind")
         };
         let command_index = collector.plan.raw_triangle_commands[index].2;
-        let admitted = match tmem {
+        let refusal = match tmem {
             TexrectTmemSource::Pending { pending, prefixes } => {
                 match prefix_before(prefixes, command_index) {
                     Some(prefix) => retain_compute_replacement_draw(
@@ -5867,18 +6015,22 @@ fn plan_compute_raster_replacement(
                 *state,
             )?,
         };
-        if !admitted {
-            return Ok(None);
+        if let Some(reason) = refusal {
+            return Ok(ComputeRasterReplacementAdmission::Refused(reason));
         }
     }
     if let Some(builder) = builder {
         let Some((dispatch, _)) = builder.finish_dispatch() else {
-            return Ok(None);
+            return Ok(ComputeRasterReplacementAdmission::Refused(
+                TaskComputeAdmissionRefusal::EmptyDispatch,
+            ));
         };
         dispatches.push(dispatch);
     }
     if dispatches.is_empty() {
-        return Ok(None);
+        return Ok(ComputeRasterReplacementAdmission::Refused(
+            TaskComputeAdmissionRefusal::NoDispatches,
+        ));
     }
     let declared: Vec<_> = dispatches
         .iter()
@@ -5894,11 +6046,13 @@ fn plan_compute_raster_replacement(
         .triangle_index();
     let claimed =
         claimed_rectangle_from_accesses(candidate.key(), &declared, first_triangle_index)?;
-    Ok(Some(ComputeRasterReplacementPlan {
-        dispatches,
-        declared,
-        claimed,
-    }))
+    Ok(ComputeRasterReplacementAdmission::Admitted(
+        ComputeRasterReplacementPlan {
+            dispatches,
+            declared,
+            claimed,
+        },
+    ))
 }
 
 /// **The N-command accumulation seam.**
@@ -6008,11 +6162,14 @@ fn stage_color_commands(
             .as_deref()
             .expect("deferred compute execution requires a task color planner");
         let (preview, task_input) = batch.preview_candidate(registry, key)?;
-        let Some(plan) = plan_compute_raster_replacement(collector, &preview, &schedule, &tmem)?
-        else {
-            return Err(WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted {
-                ordinal: collector.ordinal,
-            });
+        let plan = match plan_compute_raster_replacement(collector, &preview, &schedule, &tmem)? {
+            ComputeRasterReplacementAdmission::Admitted(plan) => plan,
+            ComputeRasterReplacementAdmission::Refused(reason) => {
+                return Err(WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted {
+                    ordinal: collector.ordinal,
+                    reason,
+                });
+            }
         };
 
         // Exact admission completed without mutating the generation planner.
@@ -6093,7 +6250,11 @@ fn stage_color_commands(
 
     if collector.compute_replacement_enabled {
         let admission_started = Instant::now();
-        let replacement = plan_compute_raster_replacement(collector, &candidate, &schedule, &tmem)?
+        let replacement =
+            match plan_compute_raster_replacement(collector, &candidate, &schedule, &tmem)? {
+                ComputeRasterReplacementAdmission::Admitted(plan) => Some(plan),
+                ComputeRasterReplacementAdmission::Refused(_) => None,
+            }
             .map(|plan| -> Result<_, WgpuRawDpcExecutionError> {
                 let target_pixels = compute_replacement_target_pixels(
                     &plan,
@@ -11836,6 +11997,27 @@ mod tests {
         assert!(backend.plan_raw_dpc_task_batch(requests).is_err());
         assert_eq!(backend.rdp_state, before);
         assert!(backend.pending_raw_dpc_task_batch.is_none());
+    }
+
+    #[test]
+    fn task_planning_reason_codes_non_triangle_and_mixed_color_cpu_members() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let planned = backend
+            .plan_raw_dpc_task_batch(vec![
+                session.plan_request(capture(whole_target_fill_words())),
+                session.plan_request(capture(fill_then_triangle_words())),
+            ])
+            .unwrap();
+        assert_eq!(planned.len(), 2);
+        let pending = backend.pending_raw_dpc_task_batch.as_ref().unwrap();
+        assert_eq!(
+            pending.members[0].execution,
+            PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle)
+        );
+        assert_eq!(
+            pending.members[1].execution,
+            PlannedTaskExecution::Cpu(PlannedTaskCpuReason::MixedFillOrTexrect)
+        );
     }
 
     #[test]

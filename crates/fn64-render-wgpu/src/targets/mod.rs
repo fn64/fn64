@@ -28,9 +28,9 @@ mod texrect;
 mod triangle_pipeline;
 
 pub(crate) use compute_batch::{
-    ComputeRasterBatch, ComputeRasterBatchBuilder, ComputeRasterDrawAdmission,
-    ComputeRasterProgramKey, HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH,
-    HOT_OTHER_MODE_LOW,
+    ComputeRasterAdmissionRefusal, ComputeRasterBatch, ComputeRasterBatchBuilder,
+    ComputeRasterDrawAdmission, ComputeRasterProgramKey, HOT_COMBINE_HIGH, HOT_COMBINE_LOW,
+    HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
 };
 pub use fill::{
     decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
