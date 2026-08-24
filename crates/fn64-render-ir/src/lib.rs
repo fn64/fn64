@@ -37,8 +37,8 @@ pub use digest::{
 };
 pub use error::ValidationError;
 pub use guest_read::{
-    CapturedGuestRead, DeferredGuestRead, DeferredGuestReadCapture, DeferredGuestReadPlan,
-    OwnedGuestReadSet,
+    CapturedGuestRead, CapturedGuestReadPayload, DeferredGuestRead, DeferredGuestReadCapture,
+    DeferredGuestReadPlan, OwnedGuestReadSet,
 };
 pub use journal::{
     AccessMode, AccessPurpose, HostResource, OperationId, RdramResource, ResourceAccess,
@@ -55,9 +55,10 @@ pub use rsp_math::{
 };
 pub use ticket::{
     effect_content_digest, BackendCompletionAuthority, BackendEffectReport, CompletedWrite,
-    DecodedTicket, GpuCompleteTicket, GpuCompletionReceipt, GuestCommitAuthority,
-    GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, QueueIdentity,
-    ReadySubmissionQueue, SubmissionIdentity, SubmissionQueue, SubmittedTicket, TicketAuthoritySet,
+    DecodedTicket, DeferredBackendEffectReport, GpuCompleteTicket, GpuCompletionReceipt,
+    GuestCommitAuthority, GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket,
+    QueueIdentity, ReadySubmissionQueue, SubmissionIdentity, SubmissionQueue, SubmittedTicket,
+    TicketAuthoritySet,
 };
 pub use workload::{
     MicrocodeAdmissionIdentity, WorkloadAdmission, WorkloadPacket, WorkloadPacketPreflight,

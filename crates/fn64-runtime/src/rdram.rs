@@ -400,7 +400,9 @@ impl<'a> RdramView<'a> {
             .offset()
             .checked_add(len)
             .expect("logical RDRAM copy overflow");
-        if (end as usize) > self.storage.len() {
+        if usize::try_from(end).expect("logical RDRAM end exceeds host indexing")
+            > self.storage.len()
+        {
             // Slow path only on the way to a panic: re-walk per byte so the
             // message names the FIRST unmapped byte, which is what the
             // per-byte implementation reported and what a caller diagnosing a
@@ -428,8 +430,13 @@ impl<'a> RdramView<'a> {
                     .expect("logical RDRAM copy address overflow"),
             );
         };
-        for (index, byte) in out.iter_mut().enumerate().take(head as usize) {
-            copy_byte(index as u32, byte);
+        let head_index =
+            usize::try_from(head).expect("logical RDRAM head length exceeds host indexing");
+        for (index, byte) in out.iter_mut().enumerate().take(head_index) {
+            copy_byte(
+                u32::try_from(index).expect("logical RDRAM head index exceeds u32"),
+                byte,
+            );
         }
         // Bulk-copy the word-aligned body, then reverse each word in place.
         //
@@ -444,19 +451,32 @@ impl<'a> RdramView<'a> {
         // swapping each word gives byte-for-byte identical output, because
         // `native[3], native[2], native[1], native[0]` IS a 4-byte reverse.
         if body > 0 {
-            let body_start = (start + head) as usize;
-            let at = head as usize;
-            let bytes = body as usize;
-            out[at..at + bytes]
-                .copy_from_slice(&self.storage[body_start..body_start + bytes]);
+            let body_start = usize::try_from(start + head)
+                .expect("logical RDRAM body start exceeds host indexing");
+            let at = head_index;
+            let bytes =
+                usize::try_from(body).expect("logical RDRAM body length exceeds host indexing");
+            out[at..at + bytes].copy_from_slice(&self.storage[body_start..body_start + bytes]);
             for word in out[at..at + bytes].chunks_exact_mut(4) {
                 word.reverse();
             }
         }
         for index in (head + body)..len {
-            let byte = &mut out[index as usize];
+            let byte = &mut out
+                [usize::try_from(index).expect("logical RDRAM tail index exceeds host indexing")];
             copy_byte(index, byte);
         }
+    }
+
+    /// Allocate and copy one guest-sized logical byte range.
+    ///
+    /// Guest address arithmetic stays in `u32`; the conversion required by
+    /// the host allocator is confined to this memory-boundary method.
+    pub fn read_logical_bytes(self, addr: RdramAddr, len: u32) -> Vec<u8> {
+        let mut bytes =
+            vec![0; usize::try_from(len).expect("logical RDRAM copy length exceeds host indexing")];
+        self.copy_logical_bytes(addr, &mut bytes);
+        bytes
     }
 }
 
@@ -628,14 +648,60 @@ impl<'a> RdramViewMut<'a> {
 
     /// Copy flat device/host bytes into storage in logical guest order.
     pub fn write_logical_bytes(&mut self, addr: RdramAddr, data: &[u8]) {
-        watch_raw_write(addr, data.len() as u32, "write_logical_bytes");
-        for (index, &byte) in data.iter().enumerate() {
-            let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
-            self.write_u8(
-                addr.checked_add(offset)
-                    .expect("logical RDRAM copy address overflow"),
-                byte,
-            );
+        let len = u32::try_from(data.len()).expect("logical RDRAM copy length exceeds u32");
+        watch_raw_write(addr, len, "write_logical_bytes");
+        if len == 0 {
+            return;
+        }
+
+        // Prove the complete logical range before the first store, so an
+        // invalid tail cannot leave a valid prefix already written.
+        let end = addr
+            .offset()
+            .checked_add(len)
+            .expect("logical RDRAM copy overflow");
+        if usize::try_from(end).expect("logical RDRAM end exceeds host indexing")
+            > self.storage.len()
+        {
+            for offset in 0..len {
+                let at = addr
+                    .checked_add(offset)
+                    .expect("logical RDRAM copy address overflow");
+                let _ = self.as_view().range(at, 1, 3, "write_u8");
+            }
+        }
+
+        let start = addr.offset();
+        let head = ((4 - (start % 4)) % 4).min(len);
+        let body = (len - head) & !3;
+
+        for (offset, &byte) in (0..head).zip(data) {
+            let logical = addr
+                .checked_add(offset)
+                .expect("logical RDRAM copy address overflow");
+            let index = self.as_view().range(logical, 1, 3, "write_u8").start;
+            self.storage[index] = byte;
+        }
+        if body > 0 {
+            let body_start = usize::try_from(start + head)
+                .expect("logical RDRAM body start exceeds host indexing");
+            let data_start =
+                usize::try_from(head).expect("logical RDRAM head length exceeds host indexing");
+            let byte_count =
+                usize::try_from(body).expect("logical RDRAM body length exceeds host indexing");
+            let storage = &mut self.storage[body_start..body_start + byte_count];
+            storage.copy_from_slice(&data[data_start..data_start + byte_count]);
+            for word in storage.chunks_exact_mut(4) {
+                word.reverse();
+            }
+        }
+        for offset in (head + body)..len {
+            let logical = addr
+                .checked_add(offset)
+                .expect("logical RDRAM copy address overflow");
+            let index = self.as_view().range(logical, 1, 3, "write_u8").start;
+            self.storage[index] =
+                data[usize::try_from(offset).expect("logical RDRAM offset exceeds host indexing")];
         }
     }
 
@@ -1024,6 +1090,18 @@ mod tests {
     }
 
     #[test]
+    fn invalid_logical_bulk_write_rejects_before_mutating_a_valid_prefix() {
+        let mut storage = [0x5au8; 8];
+        let before = storage;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            RdramViewMut::from_storage(&mut storage)
+                .write_logical_bytes(RdramAddr::from_offset(6), &[1, 2, 3]);
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(storage, before);
+    }
+
+    #[test]
     fn raw_abi_pointer_agrees_with_bounded_views() {
         let mut storage = [0u8; 8];
         let raw = unsafe { RdramPtr::from_storage_ptr(storage.as_mut_ptr()) };
@@ -1079,4 +1157,3 @@ mod tests {
         }
     }
 }
-

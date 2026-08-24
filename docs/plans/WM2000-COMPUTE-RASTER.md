@@ -441,6 +441,187 @@ Game-derived replay bytes remain exact, but production task residency and a
 fresh live linked-shell certification are still required before this work can
 claim the 30 Hz goal.
 
+The fresh linked-shell census explains why packet-local replacement cannot be
+the shipping policy. With replacement forced for every eligible packet, 800
+measured pumps averaged 13.885 ms and p95 was 36.314 ms. The same-binary CPU
+control averaged 13.140 ms with a 36.388 ms p95. Phase counters attributed
+7.029 s of 8.512 s raw-DPC session time to 30,745 tiny execute calls (0.229
+ms/submission); the fixed synchronous GPU boundary exceeded the raster work.
+The CPU draw census measured the dominant fragment classes at 31--50
+ns/pixel, so removing correctness checks or tuning shader arithmetic is not
+the closure mechanism for these packets.
+
+Production replacement now admits a chain only when its exact sum of
+journal-derived, column-bounded dispatch rectangles reaches 16,384 target
+pixels. `FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS` accepts a decimal `u32` for
+same-binary crossover sweeps; absent selects 16,384. A 4,096-pixel live run
+still behaved like all-GPU replacement (13.733 ms mean, 35.654 ms p95), while
+16,384 returned to the CPU control population (13.177 ms mean, 35.576 ms
+p95). Thus small packets retain the exact CPU path while the larger replay
+chain retains access to the fused GPU mechanism. This prevents a measured
+regression; it does not by itself establish 30 Hz headroom.
+
+A decoder-journal cache was also tested and removed. Although a cache hit
+still ran the authoritative decode and journal comparison, WM2000's command
+payload identities include changing triangle parameters and rarely repeated.
+In identical phase-counted 800-pump runs, cache-off versus cache-on plan time
+was 1.379 versus 1.402 s and p95 was 35.661 versus 35.734 ms. The rejected
+candidate narrows the remaining work to transaction-level residence/batching
+or another measured CPU-path mechanism; content-key caching is not retained.
+
+The texture-plane microbenchmark itself then exposed a harness defect. Its
+`BenchTmem::snapshot` constructed a fresh `PhysicalTmemState` on every sampled
+pixel, so the earlier roughly 500 ns/pixel result primarily measured a heap
+allocation that production never performs. Giving the fixture one stable,
+draw-constant snapshot identity reduced the corrected control to 5.277--5.460
+ns/pixel. Exact incremental S/T/W stepping measured 5.057--5.080 ns/pixel,
+confirming a small 4--7.5% isolated win rather than the prior null result. The
+production toggle remains `FN64_INCREMENTAL_TEXTURE_PLANES`; live linked-shell
+controls found only a modest roughly 0.34 ms all-pump p95 and 0.73 ms slow-pump
+p95 improvement, so it is retained but cannot close the architectural gap.
+
+An opt-in planning census (`FN64_RAW_DPC_PLAN_CENSUS=1`) next split the two
+decoder passes from journal/ticket construction and final plan admission. In
+the same audio-enabled linked-shell run as the execution census, 20,000 plans
+accounted for 957.442 ms: probe prepare 31.115 ms, probe decode 142.926 ms,
+real prepare 497.609 ms, real decode 167.310 ms, and admission/seal 118.483
+ms. The complete 24,873-submission session attributed 1,171.6 ms to planning
+and 5,511.8 ms to execution. Removing the probe decode could therefore save
+only about 0.24 ms per measured pump, while the slow population spent 22.692
+ms/pump in raw-DPC work. Double decode is real redundant work, but it is not
+the render-starvation root cause.
+
+Audio telemetry closes the integration diagnosis independently. The host
+callback reported zero late callbacks and a maximum callback gap of 10.736
+ms, yet the 250 ms output ring reached zero as the heavy scene began and
+underrun sample slots rose from 2,334 to 165,224. Synthesis and resampling are
+therefore not blocking the device callback; synchronous per-submission render
+execution prevents the emulation producer from replenishing it. A larger ring
+would postpone that sustained deficit. Closure requires task-scoped render
+residency/batching that keeps every source run's journal, fabric token, guest
+commit, and final FullSync identity authoritative while amortizing raster
+submission and target synchronization at the task consumer boundary.
+
+The first task-transport proof now retains the nine color-producing packet
+boundaries before private packet 2657. It collects the already-typed compute
+fixtures while ordinary CPU execution, guest commits, copyback, and
+publication remain packet-local, encodes every packet pass and target
+checkpoint copy into one command buffer, waits once, and rejects any missing
+color executor or discontinuous resident postimage. Packet 2657 is rejected
+loudly because its real fill/texture work is not representable by the current
+triangle executor; it is the next widening boundary, not an implicit fallback.
+
+The first correct checkpoint implementation exposed another host-side
+algorithmic cost. Building and stable-sorting roughly five million
+`(target-word, triangle)` pairs took 14.924 ms while timestamped GPU work took
+3.225 ms. A direct word-major construction preserved painter order by
+construction and reduced ten-run mean checkpoint time from 21.571 to 11.342
+ms. The observed task rectangles cover the full target, so a further typed
+dense mode now dispatches target words directly and indexes the five ordered
+triangles without materializing any worklist. Across ten consecutive native
+Metal replays, all 450 draws retained committed digest `1ac409f336397652` and
+postimage SHA-256
+`a1b7712dff9a3fc605aa2112849a1e7ace2d3baa7124771f3a5b12cc5d72f2a8`.
+Mean checkpoint time fell again to 5.175 ms (p95 5.668 ms), versus 8.478 ms
+mean CPU execution for the complete 13-packet replay. This proves a measured
+approximately 3.3 ms execution advantage for the task-scoped triangle
+segment even while retaining nine intermediate target images.
+
+Packet-local replacement remains rejected. With its replay threshold lowered
+to zero so the A/B actually exercised compute, ten counterbalanced GPU legs
+averaged 17.926 ms total versus 14.046 ms for CPU; compute submitted ten times
+per leg and averaged 7.809 ms before admission/effect overhead. A 16,384-pixel
+threshold run produced zero replacement receipts and therefore was not a GPU
+A/B. The evidence selects task-scoped execution and exact fill/texture
+widening; it does not authorize enabling packet-local replacement.
+
+Packet 2657's command stream also exposed the same full-buffer ownership bug
+class on the CPU boundary: its long `FillRectangle` run moved the accumulated
+target between commands, but `execute_fill_rectangle` immediately cloned the
+entire buffer again. The production-only owned form now consumes and mutates
+that allocation; the public borrowed executor remains unchanged. A pointer-
+identity unit test proves allocation reuse. Ten exact replay runs with the
+ownership-disabled control averaged 14.260 ms total and 8.114 ms execute;
+the owned path averaged 13.638 ms total and 7.481 ms execute, retaining the
+same committed digest and postimage SHA. The 0.622 ms total gain is retained,
+but packet 2657 still blocks a triangle-only task chain and still needs an
+exact device fill/texture executor.
+
+The fresh linked rs+wgpu authority run retained the replay direction but
+confirms that this is not closure by itself. Over 700 measured audio-enabled
+pumps, mean drawn-frame time improved from 25.785 to 25.338 ms, p95 from
+39.214 to 38.423 ms, and the over-33.333 ms share from 24.1% to 22.1%.
+Slow pumps still averaged 22.329 ms in raw-DPC work, accounting for 84.2% of
+their excess. The audio callback again had zero late callbacks and a 10.739 ms
+maximum gap, while the ring reached zero and underrun sample slots climbed to
+146,792. The remaining failure is still producer starvation under synchronous
+render execution; the local ownership win merely narrows it.
+
+## Task-transport closure and live gate (2026-08-24)
+
+The production task path now batches every coalesced raw-DPC member under one
+transaction and enables the task-scoped compute replacement by default.
+`FN64_RAW_DPC_TASK_BATCH=0` and `FN64_RAW_DPC_TASK_COMPUTE=0` retain explicit
+same-binary controls. Two host-side mechanisms closed the remaining transport
+gap without weakening guest-memory authority:
+
+- An exact-range task arena captures one immutable RDRAM payload and digest
+  once, then binds it to each independently ordered read descriptor. A phase
+  census found 1,666,802,336 requested bytes but only 35,204,064 exact-unique
+  bytes within tasks (97.9% duplicate). Guest capture fell from 178.1 ms to
+  16.2 ms over 120 tasks, a 91% reduction; total task-batch time fell from
+  1,287.6 ms to 1,133.9 ms.
+- Bulk logical copyback validates the complete guest range before its first
+  store, copies aligned native-word bodies in one slice operation, reverses
+  each word to the canonical guest byte order, and leaves only the at-most
+  three-byte head and tail on the scalar path. Copyback fell from 127.6 ms to
+  39.0 ms over the same 120-task window, a 69% reduction.
+
+The ABI no longer converts a `PhysicalRange` length into a host index merely
+to allocate capture storage. `RdramView::read_logical_bytes` owns the one
+checked guest-length-to-allocator conversion; task transport retains
+`PhysicalRange`, `RdramAddr`, and `u32` byte lengths until that boundary.
+`ValidatedGuestCopyback` likewise carries an `RdramAddr` and borrowed bytes,
+not precomputed host slice endpoints.
+
+The ordinary no-opt-in launcher path resolved wgpu, reached 68 compute
+segments (1,012 compute and 514 CPU members across 120 tasks), retained swap
+hashes `3686c6ccce4d3853` at swap 60 and `9f23f803b308b6b4` at swap 120, and
+measured 15.521 ms p95 / 18.793 ms max. The final rebuilt-binary gate then
+passed ten consecutive native Metal/CoreAudio runs. Across that streak,
+180-pump p95 was 15.447--15.965 ms and max was 18.699--19.465 ms; both hashes
+were identical in every run, each swap-120 audio window added zero underrun
+sample slots, late callbacks remained zero, and every run reached the bounded
+clean-exit path. The max remains far inside the 33.333 ms 30 Hz drawn-frame
+budget.
+
+Hash stability is repeatability evidence, not a semantic oracle. The native
+Metal `required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times`
+test independently compared complete compute output with the ordered CPU
+raster bytes ten times, and
+`task_compute_batches_two_raw_triangle_packets_and_publishes_each_generation`
+proved that both private checkpoints publish in task order; both passed after
+the live gate.
+
+The broad ABI gate exposed one validation-boundary regression: optional GPU
+diagnostic-draw extent and pipeline checks were running even when the backend
+used the authoritative CPU raster without a prior window/device `create()`.
+Renderer-neutral packet, TMEM-projection, draw-state, and blend validation
+still runs unconditionally; only GPU fixture construction and
+`TriangleDrawBeforeCreate` are conditional on enabling that diagnostic draw.
+All 51 raw-DPC integration tests and ten consecutive direct repetitions of
+the formerly failing fill+TMEM+triangle case pass. The combined ABI,
+render-IR, and runtime nextest gate is 843/844; its sole failure is the
+pre-existing generated `docs/COMPLETENESS.md` NMR-surface drift, while the
+real C ABI smoke test passes.
+
+The typing audit's framebuffer-clone hypothesis was measured rather than
+assumed. Across 120 tasks, registry clones copied 54.6 MB in 0.991 ms total
+and task-shadow commits copied 91.5 MB in 1.565 ms total, about 0.021 ms per
+task combined. Removing broad `Clone` authority remains a worthwhile type-
+system cleanup, but the census disproves it as material performance headroom.
+`FN64_TASK_COMPUTE_CENSUS=1` retains these clocks for future ownership work.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed

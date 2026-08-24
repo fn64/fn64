@@ -23,7 +23,7 @@ impl Rgba8 {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceColorBytes {
     pub(super) key: ColorTargetKey,
     pub(super) generation: TargetGeneration,

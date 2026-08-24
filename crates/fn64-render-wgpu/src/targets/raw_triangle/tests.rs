@@ -1123,6 +1123,7 @@ fn z_compare_against_a_zeroed_z_image_rejects_every_fragment() {
 /// A trivial in-memory TMEM image: a 16x16 RGBA16 tile, every byte present.
 struct BenchTmem {
     bytes: [u8; 512],
+    snapshot: crate::TmemSnapshotIdentity,
 }
 
 impl BenchTmem {
@@ -1134,7 +1135,15 @@ impl BenchTmem {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
-        Self { bytes }
+        Self {
+            bytes,
+            // Snapshot identity is draw-constant in production. Constructing
+            // a fresh PhysicalTmemState here made the timing harness measure
+            // one heap allocation per sampled pixel instead of the renderer.
+            snapshot: crate::TmemByteSource::snapshot(
+                &crate::PhysicalTmemState::try_new().unwrap(),
+            ),
+        }
     }
 
     fn projection(&self) -> crate::TmemGpuProjection {
@@ -1152,7 +1161,7 @@ impl BenchTmem {
 
 impl crate::TmemByteSource for BenchTmem {
     fn snapshot(&self) -> crate::TmemSnapshotIdentity {
-        crate::TmemByteSource::snapshot(&crate::PhysicalTmemState::try_new().unwrap())
+        self.snapshot
     }
     fn valid_byte(&self, address: u16) -> Option<u8> {
         self.bytes.get(address as usize).copied()
