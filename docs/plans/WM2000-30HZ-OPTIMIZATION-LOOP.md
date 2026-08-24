@@ -346,3 +346,55 @@ readback at the existing guest-effect publication boundary. Program admission
 is keyed only by typed RDP state; unsupported state remains on the CPU path.
 The [compute-raster execution plan](WM2000-COMPUTE-RASTER.md) defines the
 ordered implementation and kill gates.
+
+## Production execute closure and the packet-boundary frontier
+
+A fresh linked `rs + wgpu` build at `72293b35` adds
+`FN64_RAW_DPC_EXEC_CENSUS=1`, a diagnostic-only nested timer at raw-DPC
+submission boundaries. Its disabled path performs no clock reads or atomic
+updates. The armed path reports every 10,000 execution views and distinguishes
+the plan view, staging, color staging, coordinator completion, and the retained
+GPU-draw validation seam. Color staging is further divided by command kind and
+final effect construction. Nested children are printed as residuals rather
+than added to their parent twice.
+
+The first 800-pump run measured 399 drawn frames at 27.261 ms mean, 39.959 ms
+p95, and 31.1% over 33.333 ms. Its session census observed 30,745 submissions:
+plan was 1,355.0 ms, execute 6,442.4 ms, commit 117.3 ms, and finalize 15.6 ms.
+At the comparable 30,000-submission prefix, the execute census accounted for
+6,279.1 ms. Of that, 4,835.0 ms was color staging and 1,264.5 ms was non-color
+staging; view residual, coordinator completion, and diagnostic draw validation
+together were only 179.6 ms. The independent timers therefore close closely
+enough to select a mechanism, and reject completion bookkeeping or diagnostic
+validation as the remaining wall.
+
+A second 800-pump run split the 4,897.5 ms color-staging prefix:
+
+| Color-stage mechanism | Time | Share |
+| --- | ---: | ---: |
+| raw triangles (161,660 calls) | 3,263.1 ms | 66.6% |
+| texrects (18,645 calls) | 896.8 ms | 18.3% |
+| final digests and target admission | 291.5 ms | 6.0% |
+| fills (32,280 calls) | 288.5 ms | 5.9% |
+| schedule, target seed, and loop residual | 157.5 ms | 3.2% |
+
+The finer timers raised this diagnostic run to 27.523 ms mean and 40.551 ms
+p95, so its latency distribution is attribution evidence, not an ordinary
+performance verdict. A combined draw/execute census then measured 2,219.3 ms
+inside the raster call itself for the first 75,000 successful triangles over
+60,859,295 declared pixels. The five established state keys still account for
+nearly all of that work. This corroborates the command-kind split: raw-triangle
+fragment evaluation, rather than its boundary validation, is the dominant
+color cost.
+
+The next closure candidate must therefore amortize raster work across a larger
+ordered unit. Packet-local compute replacement is already negative because it
+uploads, submits, waits, and reads back at each packet boundary. Deleting
+effect or transport checks cannot supply the required 5.8 ms reliability gap,
+and would weaken the loud-corruption boundary. The remaining architectural
+frontier is either an ordered row-parallel batch spanning enough commands to
+make small triangles worthwhile, or a device-resident color target whose
+typed CPU/DMA/VI observation boundary performs bounded synchronization and
+readback. Either candidate must preserve command order, FullSync/fabric
+publication, exact guest bytes, and the M9 visibility invariants; performance
+alone cannot choose a weaker ownership model.
