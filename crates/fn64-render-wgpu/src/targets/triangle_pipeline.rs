@@ -1674,6 +1674,11 @@ pub(crate) struct ComputeHotColorDispatch<'a> {
     /// this state-compatible batch.
     pub(crate) first_row: u32,
     pub(crate) row_count: u32,
+    /// Even-aligned target-column band containing every declared write.
+    /// Pair alignment preserves one invocation's exclusive ownership of both
+    /// RGBA16 pixels in a packed storage word.
+    pub(crate) first_column: u32,
+    pub(crate) column_count: u32,
 }
 
 struct PreparedComputeHotColorBatch {
@@ -1682,6 +1687,8 @@ struct PreparedComputeHotColorBatch {
     target_bytes: u64,
     status_bytes: u64,
     first_word: u32,
+    dispatch_words_per_row: u32,
+    target_words_per_row: u32,
     workgroups: u32,
     packed_triangles: Vec<u8>,
     params: Vec<u8>,
@@ -2167,6 +2174,8 @@ impl TrianglePipelineRenderer {
                 target_bytes,
                 status_bytes,
                 first_word: 0,
+                dispatch_words_per_row: 0,
+                target_words_per_row: 0,
                 workgroups,
                 packed_triangles,
                 params,
@@ -2347,18 +2356,60 @@ impl TrianglePipelineRenderer {
                     height: extent.height,
                 });
             }
-            let first_pixel = dispatch
-                .first_row
-                .checked_mul(extent.width)
-                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-            let pixel_limit = row_limit
-                .checked_mul(extent.width)
-                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-            let first_word = first_pixel / 2;
-            let word_limit = pixel_limit.div_ceil(2);
-            let word_count = word_limit
-                .checked_sub(first_word)
-                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            let column_limit = dispatch
+                .first_column
+                .checked_add(dispatch.column_count)
+                .ok_or(TrianglePipelineError::ComputeColorDispatchColumns {
+                    first_column: dispatch.first_column,
+                    column_count: dispatch.column_count,
+                    width: extent.width,
+                })?;
+            if dispatch.column_count == 0 || column_limit > extent.width {
+                return Err(TrianglePipelineError::ComputeColorDispatchColumns {
+                    first_column: dispatch.first_column,
+                    column_count: dispatch.column_count,
+                    width: extent.width,
+                });
+            }
+            let (first_word, word_count, dispatch_words_per_row, target_words_per_row) =
+                if extent.width.is_multiple_of(2)
+                    && dispatch.first_column.is_multiple_of(2)
+                    && dispatch.column_count.is_multiple_of(2)
+                {
+                    let target_words_per_row = extent.width / 2;
+                    let dispatch_words_per_row = dispatch.column_count / 2;
+                    let first_word = dispatch
+                        .first_row
+                        .checked_mul(target_words_per_row)
+                        .and_then(|word| word.checked_add(dispatch.first_column / 2))
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                    let word_count = dispatch_words_per_row
+                        .checked_mul(dispatch.row_count)
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                    (
+                        first_word,
+                        word_count,
+                        dispatch_words_per_row,
+                        target_words_per_row,
+                    )
+                } else {
+                    // Odd-width targets pack a word across some row boundaries.
+                    // Retain the proven contiguous row-band mapping rather than
+                    // dispatch two invocations that could race on that word.
+                    let first_pixel = dispatch
+                        .first_row
+                        .checked_mul(extent.width)
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                    let pixel_limit = row_limit
+                        .checked_mul(extent.width)
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                    let first_word = first_pixel / 2;
+                    let word_limit = pixel_limit.div_ceil(2);
+                    let word_count = word_limit
+                        .checked_sub(first_word)
+                        .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                    (first_word, word_count, 0, 0)
+                };
             let status_limit = pixels
                 .checked_sub(
                     first_word
@@ -2392,8 +2443,8 @@ impl TrianglePipelineRenderer {
                 triangle_count,
                 first_word,
                 word_count,
-                0,
-                0,
+                dispatch_words_per_row,
+                target_words_per_row,
             ] {
                 params.extend_from_slice(&word.to_le_bytes());
             }
@@ -2403,6 +2454,8 @@ impl TrianglePipelineRenderer {
                 target_bytes,
                 status_bytes,
                 first_word,
+                dispatch_words_per_row,
+                target_words_per_row,
                 workgroups,
                 packed_triangles,
                 params,
@@ -2576,7 +2629,19 @@ impl TrianglePipelineRenderer {
             {
                 return Err(TrianglePipelineError::ComputeColorBatchTmemStatus {
                     batch: index,
-                    pixel: batch.first_word as usize * 2 + pixel,
+                    pixel: if batch.dispatch_words_per_row == 0 {
+                        batch.first_word as usize * 2 + pixel
+                    } else {
+                        let local_word = pixel / 2;
+                        let half = pixel % 2;
+                        let row = local_word / batch.dispatch_words_per_row as usize;
+                        let column_word = local_word % batch.dispatch_words_per_row as usize;
+                        (batch.first_word as usize
+                            + row * batch.target_words_per_row as usize
+                            + column_word)
+                            * 2
+                            + half
+                    },
                     status,
                 });
             }
@@ -3388,6 +3453,11 @@ pub enum TrianglePipelineError {
         row_count: u32,
         height: u32,
     },
+    ComputeColorDispatchColumns {
+        first_column: u32,
+        column_count: u32,
+        width: u32,
+    },
     ComputeColorBatchTmemStatus {
         batch: usize,
         pixel: usize,
@@ -3454,6 +3524,14 @@ impl fmt::Display for TrianglePipelineError {
             } => write!(
                 formatter,
                 "compute color dispatch row band {first_row}+{row_count} exceeds target height {height}"
+            ),
+            Self::ComputeColorDispatchColumns {
+                first_column,
+                column_count,
+                width,
+            } => write!(
+                formatter,
+                "compute color dispatch column band {first_column}+{column_count} exceeds target width {width}"
             ),
             Self::ComputeColorBatchTmemStatus {
                 batch,

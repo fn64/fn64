@@ -2980,6 +2980,8 @@ impl RenderBackend for WgpuBackend {
                         tile: probe.tile,
                         first_row: 0,
                         row_count: probe.extent.height,
+                        first_column: 0,
+                        column_count: probe.extent.width,
                     })
                     .collect();
                 let actual = pipeline
@@ -4710,18 +4712,35 @@ fn stage_color_commands(
                         .triangle_index();
                     let claimed =
                         claimed_rectangle_from_accesses(key, &accesses, first_triangle_index)?;
+                    let target_width = candidate.key().extent().width();
+                    let (first_column, column_count) = if compute_column_bounds_enabled() {
+                        let first = claimed.x() & !1;
+                        let limit = claimed
+                            .x()
+                            .checked_add(claimed.width())
+                            .expect("claimed rectangle was checked when constructed")
+                            .checked_add(1)
+                            .map(|limit| limit & !1)
+                            .unwrap_or(target_width)
+                            .min(target_width);
+                        (first, limit - first)
+                    } else {
+                        (0, target_width)
+                    };
                     Ok(ComputeHotColorDispatch {
                         triangles: &dispatch.triangles,
                         tmem: &dispatch.tmem,
                         tile: dispatch.tile,
                         first_row: claimed.y(),
                         row_count: claimed.height(),
+                        first_column,
+                        column_count,
                     })
                 })
                 .collect::<Result<_, WgpuRawDpcExecutionError>>()?;
             let extent = plan.dispatches[0].extent;
             let target_pixels = dispatches.iter().try_fold(0u32, |count, dispatch| {
-                count.checked_add(extent.width.checked_mul(dispatch.row_count)?)
+                count.checked_add(dispatch.column_count.checked_mul(dispatch.row_count)?)
             });
             let target_pixels =
                 target_pixels.expect("bounded replacement target-pixel count fits u32");
@@ -5052,6 +5071,21 @@ fn move_color_accumulator_enabled() -> bool {
         Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
     })
+}
+
+fn compute_column_bounds_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FN64_COMPUTE_RASTER_COLUMN_BOUNDS") {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => {
+                panic!("FN64_COMPUTE_RASTER_COLUMN_BOUNDS must be exactly 0 or 1, got {value:?}")
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(error) => panic!("FN64_COMPUTE_RASTER_COLUMN_BOUNDS is not valid Unicode: {error}"),
+        },
+    )
 }
 
 fn own_color_command_input_enabled() -> bool {
