@@ -490,6 +490,29 @@ impl Default for RawDpcCarryIn {
     }
 }
 
+/// Planning can cheaply rule out members whose command shape can never form
+/// a compute segment. `ComputeCandidate` is deliberately not an execution
+/// capability: exact program/TMEM/tile admission happens against captured
+/// execution state and yields a separate move-only `ComputeEligibleTaskMember`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlannedTaskExecution {
+    Cpu,
+    ComputeCandidate,
+}
+
+struct PlannedRawDpcTaskMember {
+    carry_in: RawDpcCarryIn,
+    execution: PlannedTaskExecution,
+}
+
+/// One pending value binds every member's carry-in state to its planning
+/// disposition. It is installed only after the whole batch plans, so a
+/// mid-batch failure cannot advance durable RDP state or leave parallel queue
+/// prefixes for a later execution call to mis-pair.
+struct PlannedRawDpcTaskBatch {
+    members: VecDeque<PlannedRawDpcTaskMember>,
+}
+
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
 /// outright -- there is exactly one route to one, at construction, per
 /// `RawDpcBackendAuthority::into_coordinator`'s own doc comment.
@@ -512,10 +535,9 @@ pub struct WgpuBackend {
     /// value as a unit, so no register can be seeded from the packet's final
     /// state while a sibling is seeded from its carry-in state.
     raw_dpc_carry_in_before_last_plan: Option<RawDpcCarryIn>,
-    /// Per-member pre-delta states retained by the explicitly batched plan
-    /// seam. Ordinary planning never writes this queue.
-    raw_dpc_task_batch_carry_ins: VecDeque<RawDpcCarryIn>,
-    raw_dpc_task_batch_compute_shapes: VecDeque<bool>,
+    /// The one move-only task value retained by the explicitly batched plan
+    /// seam. Ordinary planning never writes it.
+    pending_raw_dpc_task_batch: Option<PlannedRawDpcTaskBatch>,
     /// `Some` only after a successful `RenderBackend::create`; `try_new`
     /// never populates it. Always `Some` together with
     /// `triangle_target_extent`, never one without the other.
@@ -1026,8 +1048,7 @@ impl WgpuBackend {
                 coordinator: authority.into_coordinator(initial),
                 rdp_state: RdpState::default(),
                 raw_dpc_carry_in_before_last_plan: None,
-                raw_dpc_task_batch_carry_ins: VecDeque::new(),
-                raw_dpc_task_batch_compute_shapes: VecDeque::new(),
+                pending_raw_dpc_task_batch: None,
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
@@ -2577,11 +2598,11 @@ pub enum WgpuRawDpcExecutionError {
         previous_ordinal: u64,
         ordinal: u64,
     },
-    /// A member selected for the task-scoped compute segment did not have a
-    /// complete typed raw-triangle representation. The caller must end the
-    /// segment before this member; it cannot silently run CPU work against
-    /// unpublished predecessor bytes.
-    TaskBatchComputeIneligible {
+    /// Exact execution-time admission proved that a coarse planning
+    /// candidate has no complete typed compute representation. This is a
+    /// normal, explicitly typed CPU disposition; only the task-segment
+    /// dispatcher consumes it. Every other caller treats it as an error.
+    TaskBatchComputeNotAdmitted {
         ordinal: u64,
     },
     /// A triangle-bearing plan reached execution with no successful prior
@@ -2852,9 +2873,9 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "compute-raster checkpoint target history is discontinuous between packet \
                 ordinals {previous_ordinal} and {ordinal}"
             ),
-            Self::TaskBatchComputeIneligible { ordinal } => write!(
+            Self::TaskBatchComputeNotAdmitted { ordinal } => write!(
                 formatter,
-                "raw-DPC task member ordinal {ordinal} is not representable by the typed compute executor"
+                "raw-DPC task member ordinal {ordinal} was explicitly not admitted by the typed compute executor"
             ),
             Self::TriangleDrawBeforeCreate => formatter.write_str(
                 "a triangle-bearing plan reached execution with no successful prior \
@@ -3385,26 +3406,30 @@ impl RenderBackend for WgpuBackend {
             });
         }
         assert!(
-            self.raw_dpc_task_batch_carry_ins.is_empty()
-                && self.raw_dpc_task_batch_compute_shapes.is_empty(),
+            self.pending_raw_dpc_task_batch.is_none(),
             "a prior raw-DPC task batch was planned but not executed"
         );
+        let mut next_state = self.rdp_state.fork_for_decode();
         let mut planned = Vec::with_capacity(requests.len());
+        let mut members = VecDeque::with_capacity(requests.len());
         for request in requests {
-            let carry_in = RawDpcCarryIn::capture(&self.rdp_state);
-            let (member, delta, compute_shape) =
-                plan_raw_dpc_inner(&self.coordinator, &self.rdp_state, request).map_err(
-                    |reason| RenderError::Backend {
+            let carry_in = RawDpcCarryIn::capture(&next_state);
+            let (member, delta, execution) =
+                plan_raw_dpc_inner(&self.coordinator, &next_state, request).map_err(|reason| {
+                    RenderError::Backend {
                         backend: "render-wgpu/raw-dpc-task-batch-plan",
                         reason,
-                    },
-                )?;
-            self.rdp_state.apply(&delta);
-            self.raw_dpc_task_batch_carry_ins.push_back(carry_in);
-            self.raw_dpc_task_batch_compute_shapes
-                .push_back(compute_shape);
+                    }
+                })?;
+            next_state.apply(&delta);
+            members.push_back(PlannedRawDpcTaskMember {
+                carry_in,
+                execution,
+            });
             planned.push(member);
         }
+        self.rdp_state = next_state;
+        self.pending_raw_dpc_task_batch = Some(PlannedRawDpcTaskBatch { members });
         Ok(planned)
     }
 
@@ -3596,16 +3621,20 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bounds: Vec<BoundSubmittedRawDpc>,
     ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
-        if bounds.is_empty()
-            || bounds.len() != self.raw_dpc_task_batch_carry_ins.len()
-            || bounds.len() != self.raw_dpc_task_batch_compute_shapes.len()
-        {
+        let planned_batch =
+            self.pending_raw_dpc_task_batch
+                .take()
+                .ok_or_else(|| RenderError::Backend {
+                    backend: "render-wgpu/raw-dpc-task-batch-execute",
+                    reason: "no planned raw-DPC task batch is pending".to_string(),
+                })?;
+        if bounds.is_empty() || bounds.len() != planned_batch.members.len() {
             return Err(RenderError::Backend {
                 backend: "render-wgpu/raw-dpc-task-batch-execute",
                 reason: format!(
-                    "bound member count {} does not match planned carry-in count {}",
+                    "bound member count {} does not match planned member count {}",
                     bounds.len(),
-                    self.raw_dpc_task_batch_carry_ins.len()
+                    planned_batch.members.len()
                 ),
             });
         }
@@ -3615,8 +3644,6 @@ impl RenderBackend for WgpuBackend {
             "task-batch execution requires no unpublished color completion"
         );
 
-        let carry_ins = core::mem::take(&mut self.raw_dpc_task_batch_carry_ins);
-        let compute_shapes = core::mem::take(&mut self.raw_dpc_task_batch_compute_shapes);
         let registry_clone_bytes = self
             .color_targets
             .as_ref()
@@ -3628,10 +3655,10 @@ impl RenderBackend for WgpuBackend {
                     .sum()
             })
             .unwrap_or(0);
-        let mut private_color_targets = task_compute_census::timed_registry_clone(
-            registry_clone_bytes,
-            || self.color_targets.clone(),
-        );
+        let mut private_color_targets =
+            task_compute_census::timed_registry_clone(registry_clone_bytes, || {
+                self.color_targets.clone()
+            });
         let mut pending_publications = VecDeque::new();
         let mut deferred_draws = Vec::with_capacity(bounds.len());
         let mut prepared = Vec::with_capacity(bounds.len());
@@ -3641,12 +3668,22 @@ impl RenderBackend for WgpuBackend {
             let mut batch = self.coordinator.begin_execution_batch();
             let mut members = bounds
                 .into_iter()
-                .zip(carry_ins)
-                .zip(compute_shapes)
-                .map(|((bound, carry_in), compute_shape)| (bound, carry_in, compute_shape))
+                .zip(planned_batch.members)
+                .map(|(bound, member)| {
+                    (
+                        bound,
+                        member.carry_in,
+                        TaskMemberDispatch::Planned(member.execution),
+                    )
+                })
                 .peekable();
-            while let Some((bound, carry_in, compute_shape)) = members.next() {
-                if compute_shape && self.task_compute_raster_enabled {
+            let mut retry_as_cpu = None;
+            while let Some((bound, carry_in, dispatch)) =
+                retry_as_cpu.take().or_else(|| members.next())
+            {
+                if dispatch == TaskMemberDispatch::Planned(PlannedTaskExecution::ComputeCandidate)
+                    && self.task_compute_raster_enabled
+                {
                     let segment_started = task_compute_census::segment_started();
                     let mut color_batch = ColorTargetExecutionBatch::new();
                     let mut staged_segment = Vec::new();
@@ -3663,7 +3700,7 @@ impl RenderBackend for WgpuBackend {
                                 _ => None,
                             })
                             .unwrap_or_else(|| batch.physical());
-                        let staged = stage_raw_dpc_member(
+                        let disposition = admit_task_compute_member(
                             &batch,
                             Some(physical),
                             bound,
@@ -3671,21 +3708,26 @@ impl RenderBackend for WgpuBackend {
                             &mut private_color_targets,
                             self.configured_target_extent,
                             self.project_gpu_tmem,
-                            false,
-                            false,
-                            None,
-                            Some(&mut color_batch),
-                            true,
+                            &mut color_batch,
                         )
                         .map_err(RenderError::from)?;
-                        assert!(matches!(
-                            staged.outcome,
-                            StagedOutcome::DeferredGuestWritesOnly(..)
-                                | StagedOutcome::DeferredMixedColorAndTmem { .. }
-                        ));
+                        let staged = match disposition {
+                            TaskComputeDisposition::Compute(ComputeEligibleTaskMember(staged)) => {
+                                staged
+                            }
+                            TaskComputeDisposition::Cpu { bound, reason } => {
+                                retry_as_cpu =
+                                    Some((bound, carry_in, TaskMemberDispatch::Cpu(reason)));
+                                break;
+                            }
+                        };
                         staged_segment.push(staged);
                         next = match members.peek() {
-                            Some((_, _, true)) => {
+                            Some((
+                                _,
+                                _,
+                                TaskMemberDispatch::Planned(PlannedTaskExecution::ComputeCandidate),
+                            )) => {
                                 let (bound, carry_in, _) =
                                     members.next().expect("peeked compute member disappeared");
                                 Some((bound, carry_in))
@@ -3695,6 +3737,9 @@ impl RenderBackend for WgpuBackend {
                         if next.is_none() {
                             break;
                         }
+                    }
+                    if staged_segment.is_empty() {
+                        continue;
                     }
                     let pipeline = self
                         .triangle_pipeline
@@ -3733,8 +3778,8 @@ impl RenderBackend for WgpuBackend {
                             .expect("a staged color completion built the private registry")
                             .commit_task_shadow_segment(shadow_segment)
                     })
-                        .map_err(WgpuRawDpcExecutionError::Target)
-                        .map_err(RenderError::from)?;
+                    .map_err(WgpuRawDpcExecutionError::Target)
+                    .map_err(RenderError::from)?;
                     for completed in completed_segment {
                         pending_publications.push_back(completed.pending);
                         deferred_draws.push((completed.triangles, completed.draw_tmem));
@@ -3742,9 +3787,10 @@ impl RenderBackend for WgpuBackend {
                     }
                 } else {
                     cpu_members += 1;
-                    let shape_started = (compute_shape && !self.task_compute_raster_enabled)
-                        .then(task_compute_census::segment_started)
-                        .flatten();
+                    let shape_started = (dispatch
+                        != TaskMemberDispatch::Planned(PlannedTaskExecution::Cpu))
+                    .then(task_compute_census::segment_started)
+                    .flatten();
                     let (member, triangles, pending, draw_tmem, _, _) = execute_raw_dpc_inner(
                         &mut batch,
                         bound,
@@ -3759,11 +3805,8 @@ impl RenderBackend for WgpuBackend {
                     .map_err(RenderError::from)?;
                     task_compute_census::record_cpu_shape(shape_started);
                     if let Some(pending) = pending {
-                        let shadow_byte_count = pending
-                            .initialized
-                            .device_bytes()
-                            .device_bytes()
-                            .len();
+                        let shadow_byte_count =
+                            pending.initialized.device_bytes().device_bytes().len();
                         task_compute_census::timed_shadow_clone(shadow_byte_count, || {
                             private_color_targets
                                 .as_mut()
@@ -3772,8 +3815,8 @@ impl RenderBackend for WgpuBackend {
                                     &pending.initialized,
                                 ))
                         })
-                            .map_err(WgpuRawDpcExecutionError::Target)
-                            .map_err(RenderError::from)?;
+                        .map_err(WgpuRawDpcExecutionError::Target)
+                        .map_err(RenderError::from)?;
                         pending_publications.push_back(pending);
                     }
                     deferred_draws.push((triangles, draw_tmem));
@@ -3984,7 +4027,14 @@ fn plan_raw_dpc_inner(
     coordinator: &RawDpcCoordinator<PhysicalTmemState>,
     durable_state: &RdpState,
     request: RawDpcPlanRequest,
-) -> Result<(PlannedRawDpcSubmission, crate::RdpStateDelta, bool), String> {
+) -> Result<
+    (
+        PlannedRawDpcSubmission,
+        crate::RdpStateDelta,
+        PlannedTaskExecution,
+    ),
+    String,
+> {
     let capture = request.capture();
     let layout = capture.memory_layout();
     let submission = capture.submission().clone();
@@ -4056,7 +4106,7 @@ fn plan_raw_dpc_inner(
     })
     .map_err(|error| format!("raw-DPC plan decode failed: {error}"))?;
     let delta = decoded.state_delta().clone();
-    let compute_shape = decoded
+    let execution = if decoded
         .commands()
         .iter()
         .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)))
@@ -4066,7 +4116,11 @@ fn plan_raw_dpc_inner(
                 crate::RawDpcCommandKind::FillRectangle(_)
                     | crate::RawDpcCommandKind::TextureRectangle(_)
             )
-        });
+        }) {
+        PlannedTaskExecution::ComputeCandidate
+    } else {
+        PlannedTaskExecution::Cpu
+    };
 
     let planned = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::AdmitAndSeal, || {
         let mut writer = coordinator.begin_plan(request);
@@ -4082,7 +4136,7 @@ fn plan_raw_dpc_inner(
             .finish(journal)
             .map_err(|error| format!("raw-DPC plan seal failed: {error}"))
     })?;
-    Ok((planned, delta, compute_shape))
+    Ok((planned, delta, execution))
 }
 
 fn submit_locally(decoded: DecodedTicket) -> Result<SubmittedTicket, ValidationError> {
@@ -4367,6 +4421,37 @@ struct StagedRawDpcMember {
     compute_replacement_receipt: Option<ComputeRasterProbeReceipt>,
 }
 
+struct StagedRawDpcFailure {
+    bound: BoundSubmittedRawDpc,
+    error: WgpuRawDpcExecutionError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskComputeCpuReason {
+    ExactAdmissionRejected,
+    CompletionShapeNotDeferred,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskMemberDispatch {
+    Planned(PlannedTaskExecution),
+    Cpu(TaskComputeCpuReason),
+}
+
+/// Only a successfully staged deferred completion is the capability to enter
+/// a device segment. A planning candidate that either fails exact admission or
+/// stages an ordinary completion retains its bound submission for the ordered
+/// CPU path. No generic executor error can construct the CPU variant.
+struct ComputeEligibleTaskMember(StagedRawDpcMember);
+
+enum TaskComputeDisposition {
+    Compute(ComputeEligibleTaskMember),
+    Cpu {
+        bound: BoundSubmittedRawDpc,
+        reason: TaskComputeCpuReason,
+    },
+}
+
 fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     coordinator: &C,
     physical_override: Option<&PhysicalTmemState>,
@@ -4380,7 +4465,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
     color_execution_batch: Option<&mut ColorTargetExecutionBatch>,
     defer_compute_replacement: bool,
-) -> Result<StagedRawDpcMember, WgpuRawDpcExecutionError> {
+) -> Result<StagedRawDpcMember, StagedRawDpcFailure> {
     let mut plan_visitor = PlanCollector::seeded(carry_in);
     let mut view = ExecutionCollector {
         physical: physical_override.unwrap_or_else(|| coordinator.physical()),
@@ -4410,15 +4495,66 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
 
     let outcome = view
         .outcome
-        .expect("execution_view always calls submitted_packet exactly once")?;
-    Ok(StagedRawDpcMember {
+        .expect("execution_view always calls submitted_packet exactly once");
+    match outcome {
+        Ok(outcome) => Ok(StagedRawDpcMember {
+            bound,
+            outcome,
+            triangles: view.plan.triangles,
+            draw_tmem: view.draw_tmem,
+            compute_probes: view.compute_probes,
+            compute_replacement_receipt: view.compute_replacement_receipt,
+        }),
+        Err(error) => Err(StagedRawDpcFailure { bound, error }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
+    coordinator: &C,
+    physical_override: Option<&PhysicalTmemState>,
+    bound: BoundSubmittedRawDpc,
+    carry_in: RawDpcCarryIn,
+    color_targets: &mut Option<ColorTargetRegistry>,
+    configured_target_extent: Option<TriangleTargetExtent>,
+    project_gpu_tmem: bool,
+    color_execution_batch: &mut ColorTargetExecutionBatch,
+) -> Result<TaskComputeDisposition, WgpuRawDpcExecutionError> {
+    match stage_raw_dpc_member(
+        coordinator,
+        physical_override,
         bound,
-        outcome,
-        triangles: view.plan.triangles,
-        draw_tmem: view.draw_tmem,
-        compute_probes: view.compute_probes,
-        compute_replacement_receipt: view.compute_replacement_receipt,
-    })
+        carry_in,
+        color_targets,
+        configured_target_extent,
+        project_gpu_tmem,
+        false,
+        false,
+        None,
+        Some(color_execution_batch),
+        true,
+    ) {
+        Ok(staged)
+            if matches!(
+                staged.outcome,
+                StagedOutcome::DeferredGuestWritesOnly(..)
+                    | StagedOutcome::DeferredMixedColorAndTmem { .. }
+            ) => Ok(TaskComputeDisposition::Compute(ComputeEligibleTaskMember(
+                staged,
+            ))),
+        Ok(staged) => Ok(TaskComputeDisposition::Cpu {
+            bound: staged.bound,
+            reason: TaskComputeCpuReason::CompletionShapeNotDeferred,
+        }),
+        Err(StagedRawDpcFailure {
+            bound,
+            error: WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted { .. },
+        }) => Ok(TaskComputeDisposition::Cpu {
+            bound,
+            reason: TaskComputeCpuReason::ExactAdmissionRejected,
+        }),
+        Err(failure) => Err(failure.error),
+    }
 }
 
 fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
@@ -4568,7 +4704,8 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
         compute_replacement_pipeline,
         None,
         false,
-    )?;
+    )
+    .map_err(|failure| failure.error)?;
     complete_staged_raw_dpc_member(coordinator, staged)
 }
 
@@ -5865,6 +6002,50 @@ fn stage_color_commands(
         .color_targets
         .as_ref()
         .expect("color_target_key populates the registry");
+    if collector.defer_compute_replacement {
+        let batch = collector
+            .color_execution_batch
+            .as_deref()
+            .expect("deferred compute execution requires a task color planner");
+        let (preview, task_input) = batch.preview_candidate(registry, key)?;
+        let Some(plan) = plan_compute_raster_replacement(collector, &preview, &schedule, &tmem)?
+        else {
+            return Err(WgpuRawDpcExecutionError::TaskBatchComputeNotAdmitted {
+                ordinal: collector.ordinal,
+            });
+        };
+
+        // Exact admission completed without mutating the generation planner.
+        // Reserve only now. No other operation can interleave between preview
+        // and reservation because both values are held inside this exclusive
+        // execution borrow.
+        let (candidate, reserved_input) = collector
+            .color_execution_batch
+            .as_deref_mut()
+            .expect("the previewed task color planner remains present")
+            .begin_candidate(registry, key)?;
+        assert_eq!(candidate, preview);
+        assert_eq!(reserved_input, task_input);
+
+        let initial_bytes = match task_input {
+            TaskColorInput::DurableRegistry => Some(
+                registry
+                    .residents()
+                    .iter()
+                    .find(|resident| resident.key() == key)
+                    .map(|resident| resident.device_bytes().device_bytes().to_vec())
+                    .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?,
+            ),
+            TaskColorInput::PriorTaskCheckpoint => None,
+        };
+        collector.deferred_compute = Some(DeferredComputeColor {
+            candidate,
+            plan,
+            initial_bytes,
+        });
+        return Ok(None);
+    }
+
     let (candidate, task_input) = match collector.color_execution_batch.as_deref_mut() {
         Some(batch) => {
             let (candidate, input) = batch.begin_candidate(registry, key)?;
@@ -5888,28 +6069,6 @@ fn stage_color_commands(
                 .find(|resident| resident.key() == key)
                 .map(|resident| resident.device_bytes().device_bytes().to_vec())
         };
-
-    if collector.defer_compute_replacement {
-        let plan = plan_compute_raster_replacement(collector, &candidate, &schedule, &tmem)?
-            .ok_or(WgpuRawDpcExecutionError::TaskBatchComputeIneligible {
-                ordinal: collector.ordinal,
-            })?;
-        let initial_bytes = match task_input {
-            Some(TaskColorInput::DurableRegistry) => Some(
-                accumulated
-                    .take()
-                    .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?,
-            ),
-            Some(TaskColorInput::PriorTaskCheckpoint) => None,
-            None => unreachable!("deferred compute execution requires a task color reservation"),
-        };
-        collector.deferred_compute = Some(DeferredComputeColor {
-            candidate,
-            plan,
-            initial_bytes,
-        });
-        return Ok(None);
-    }
 
     // **The depth accumulator, one RDP depth-memory cell per target pixel,
     // persisting across every draw in this packet's schedule.** It is the
@@ -11663,6 +11822,75 @@ mod tests {
         assert!(!backend.has_pending_fill_publication());
     }
 
+    #[test]
+    fn rejected_task_batch_plan_installs_neither_state_nor_pending_members() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let before = backend.rdp_state.fork_for_decode();
+
+        let mut rejected = partial_width_fill_words();
+        rejected.extend([word(FULL_SYNC, 0), 0]);
+        let requests = vec![
+            session.plan_request(capture(set_other_mode(0, 0x40).to_vec())),
+            session.plan_request(capture(rejected)),
+        ];
+        assert!(backend.plan_raw_dpc_task_batch(requests).is_err());
+        assert_eq!(backend.rdp_state, before);
+        assert!(backend.pending_raw_dpc_task_batch.is_none());
+    }
+
+    #[test]
+    fn task_compute_routes_an_exactly_unadmitted_raw_triangle_through_cpu() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        backend.set_task_compute_raster_enabled(true);
+        backend.gpu_triangle_draw_enabled = false;
+        backend.project_gpu_tmem = false;
+
+        // The flat primitive-color program is a raw-triangle-only planning
+        // candidate, but it is intentionally outside the first compute
+        // kernel's exact hottest-state key. Restoring the old coarse-bool
+        // behavior makes execution fail here instead of producing CPU bytes.
+        let planned = backend
+            .plan_raw_dpc_task_batch(vec![
+                session.plan_request(capture(flat_triangle_packet_words()))
+            ])
+            .unwrap();
+        let bound =
+            finalize_and_submit_pair(&mut session, planned.into_iter().next().unwrap()).unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc_task_batch(vec![bound]).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            backend.staged_guest_render_target_writes(submission).len(),
+            3,
+            "the explicit CPU disposition must retain all three declared triangle rows"
+        );
+    }
+
+    #[test]
+    fn task_compute_routes_a_non_deferred_triangle_completion_through_cpu() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        backend.set_task_compute_raster_enabled(true);
+        backend.gpu_triangle_draw_enabled = false;
+        backend.project_gpu_tmem = false;
+
+        let planned = backend
+            .plan_raw_dpc_task_batch(vec![session.plan_request(capture(triangle_only_words()))])
+            .unwrap();
+        let bound =
+            finalize_and_submit_pair(&mut session, planned.into_iter().next().unwrap()).unwrap();
+        let submission = bound.submission();
+        let prepared = backend.execute_raw_dpc_task_batch(vec![bound]).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert!(
+            backend
+                .staged_guest_render_target_writes(submission)
+                .is_empty(),
+            "a non-write-declaring triangle must keep its ordinary CPU completion shape"
+        );
+    }
+
     #[cfg(feature = "host-gpu-tests")]
     #[test]
     fn task_compute_batches_two_raw_triangle_packets_and_publishes_each_generation() {
@@ -11731,6 +11959,62 @@ mod tests {
             3,
             "both private GPU checkpoints must publish in task order"
         );
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn task_compute_keeps_compute_cpu_compute_members_in_generation_order() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&fn64_render::RenderConfig {
+            width: FILL_TARGET_WIDTH,
+            height: FILL_TARGET_HEIGHT,
+            tv_type: fn64_runtime::TvType::default(),
+        }) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!("required host GPU evidence unavailable: {no_adapter:?}")
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        load_and_publish_full_tmem_fixture(&mut backend, &mut session);
+        backend.set_task_compute_raster_enabled(true);
+
+        let requests = vec![
+            session.plan_request(capture(hot_textured_triangle_packet_words())),
+            session.plan_request(capture(flat_triangle_packet_words())),
+            session.plan_request(capture(hot_textured_triangle_packet_words())),
+        ];
+        let planned = backend.plan_raw_dpc_task_batch(requests).unwrap();
+        let mut bounds = Vec::new();
+        let mut submissions = Vec::new();
+        for member in planned {
+            let bound = finalize_and_submit_pair(&mut session, member).unwrap();
+            submissions.push(bound.submission());
+            bounds.push(bound);
+        }
+
+        let prepared = backend.execute_raw_dpc_task_batch(bounds).unwrap();
+        assert_eq!(prepared.len(), 3);
+        for (index, member) in prepared.into_iter().enumerate() {
+            let writes = backend.staged_guest_render_target_writes(submissions[index]);
+            assert_eq!(writes.len(), 3);
+            let committed = session
+                .commit_guest_render_target_writes(member, writes)
+                .unwrap();
+            let mut fabric = admitted_fabric();
+            let token = fabric.pending_dpc_submission().unwrap().token;
+            let ready = fabric.prepare_dpc_commit(token).unwrap();
+            let capsule = session.seal_publication(committed, ready).unwrap();
+            backend.publish_raw_dpc(capsule);
+            assert_eq!(
+                backend.color_targets().unwrap().residents()[0]
+                    .generation()
+                    .get(),
+                u64::try_from(index + 2).unwrap(),
+                "compute/CPU boundaries must not reorder task color generations"
+            );
+        }
     }
 
     /// **T-6:** the full-width branch stays in lockstep with the per-row
