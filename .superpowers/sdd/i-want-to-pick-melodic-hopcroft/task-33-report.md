@@ -3,7 +3,7 @@
 **Date:** 2026-08-23
 **Lane (renderer-tagged):** all-fn64 Rust stack — `FN64_RECOMP=rs` (fn64-cpu-runtime) + **`FN64_RENDER=wgpu`** (registered, not reference-fallback; play-wm2000.sh banner `renderer=wgpu`).
 **Route:** `scripts/play-wm2000.sh`, `FN64_PUMP_CENSUS=1 WARMUP=300 PUMPS=1200` — identical to Task 22. Bounded; exits via `pump-census-window-complete`.
-**Method:** `/fn64-perf-method`. Temporary sub-phase instrument inside `plan_raw_dpc_inner` (nine `Instant` laps into atomics, gated by `FN64_PLAN_SUBPHASE=1`; disarmed path takes NO clock reads). **Reverted after measurement** (see "Instrument" below). Shares read as the result; absolutes cross-checked, not quoted as ship figures (rule 17). Two interleaved reps for thermal drift (rule 5).
+**Method:** `/fn64-perf-method`. Temporary sub-phase instrument inside `plan_raw_dpc_inner` (nine `Instant` laps into atomics, gated by `FN64_PLAN_SUBPHASE=1`; it appears nowhere in current code because it was reverted after measurement). Shares read as the result; absolutes cross-checked, not quoted as ship figures (rule 17). Two interleaved reps for thermal drift (rule 5).
 
 ---
 

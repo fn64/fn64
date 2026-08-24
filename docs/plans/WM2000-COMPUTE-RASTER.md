@@ -520,8 +520,7 @@ ms. The observed task rectangles cover the full target, so a further typed
 dense mode now dispatches target words directly and indexes the five ordered
 triangles without materializing any worklist. Across ten consecutive native
 Metal replays, all 450 draws retained committed digest `1ac409f336397652` and
-postimage SHA-256
-`a1b7712dff9a3fc605aa2112849a1e7ace2d3baa7124771f3a5b12cc5d72f2a8`.
+postimage SHA-256 `a1b7712dff9a3fc605aa2112849a1e7ace2d3baa7124771f3a5b12cc5d72f2a8` (not tested by the repository; this is a historical observation).
 Mean checkpoint time fell again to 5.175 ms (p95 5.668 ms), versus 8.478 ms
 mean CPU execution for the complete 13-packet replay. This proves a measured
 approximately 3.3 ms execution advantage for the task-scoped triangle
