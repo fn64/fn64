@@ -33,8 +33,8 @@ struct CoverageParams {
     triangle_count: u32,
     first_word: u32,
     word_count: u32,
-    _padding0: u32,
-    _padding1: u32,
+    dispatch_words_per_row: u32,
+    target_words_per_row: u32,
 }
 
 struct SampleLine {
@@ -394,7 +394,14 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     if local_word_index >= params.word_count {
         return;
     }
-    let word_index = params.first_word + local_word_index;
+    var word_index = params.first_word + local_word_index;
+    if params.dispatch_words_per_row != 0u {
+        let local_row = local_word_index / params.dispatch_words_per_row;
+        let local_column = local_word_index % params.dispatch_words_per_row;
+        word_index = params.first_word
+            + local_row * params.target_words_per_row
+            + local_column;
+    }
     if word_index >= arrayLength(&color_target_words) {
         return;
     }

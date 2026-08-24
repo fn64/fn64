@@ -1371,6 +1371,8 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
             tile: tile_params,
             first_row: 0,
             row_count: height,
+            first_column: 2,
+            column_count: 20,
         },
         crate::targets::ComputeHotColorDispatch {
             triangles: &device_triangles[1..],
@@ -1378,6 +1380,8 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
             tile: tile_params,
             first_row: 0,
             row_count: height,
+            first_column: 2,
+            column_count: 20,
         },
     ];
     for run in 1..=10 {
