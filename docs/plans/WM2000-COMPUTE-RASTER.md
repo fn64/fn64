@@ -381,6 +381,29 @@ as closure candidates. The next profiler must use device timestamps around the
 shader execution from queue latency. The next optimization must then reduce
 dispatch/state-boundary GPU work; host setup is too small to fund the gap.
 
+`FN64_COMPUTE_GPU_TIMING=1` now requests `TIMESTAMP_QUERY` explicitly and
+places beginning/end timestamps around every ordered compute pass. An adapter
+without that feature fails with its name instead of silently substituting a
+host clock. The diagnostic rejects zero or non-monotonic query pairs and
+leaves unused sentinel slots at both physical ends of the query set; Metal
+occasionally returned an invalid final used slot even with that padding, so
+wrapping subtraction would otherwise manufacture a many-hour duration.
+Disabled mode requests no extra device feature and creates no query resources.
+
+A five-warmup, twenty-measurement native Metal run of the nine-submission task
+control produced 19 fully valid traces out of 25 timestamped calls. The
+23-pass span had a 1.889 ms median and 1.023--1.958 ms range; the lower mode
+also reduced every pass together and is consistent with device clock changes,
+not a different workload. In the dominant mode, the first one-triangle pass
+cost about 0.056--0.065 ms and each following two-triangle pass clustered
+around 0.079--0.085 ms despite the different draw state. The pass-local sum
+accounted for almost the complete device span. The same run retained final
+RDRAM SHA-256 `4af275f0aa78f5453eeb82ebc7b821b14fd994c0b8e32c041bd3f719acf954c6`.
+This rules out one pathological dispatch and selects exact state-preserving
+pass fusion: upload the immutable TMEM/tile state visible to each draw, retain
+draw order, and scan the bounded target once. Per-pass shader arithmetic
+tuning comes after that architectural candidate is byte-proven.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
