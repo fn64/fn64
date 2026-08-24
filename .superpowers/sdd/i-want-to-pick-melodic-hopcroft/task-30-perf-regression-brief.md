@@ -10,7 +10,7 @@ drawn-frame time and by how much. READ-ONLY diagnosis — do NOT fix, propose th
   5.83)**, ~20.4 fps, 1.47x over the 33.3 ms 30Hz budget — on the CURRENT HEAD.
 - "Last night better" means an EARLIER commit was faster. The regression window is
   the commits below (only render/execute/shell-path commits can affect runtime perf;
-  docs/tests/parity-corpus commits CANNOT — ignore them).
+  documentation, test, and parity-corpus commits CANNOT — ignore them).
 
 ## Prime suspects (commits that touch the live render/execute/shell path, newest→oldest)
 Bisect around these — they are the only ones that can move runtime perf:

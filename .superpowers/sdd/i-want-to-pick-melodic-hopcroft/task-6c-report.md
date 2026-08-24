@@ -31,7 +31,7 @@ not re-measured. All numbers **pure-CPU raster** (`texture_plane_raster_microben
 `raw_triangle/tests.rs:1181`, `--ignored`); `FN64_RENDER` not involved. This is
 **not** a shipped-frame figure.
 
-Instrument: a temporary `FN64_BRACKET_6C` env lane captured **once** before the
+Instrument: a temporary `FN64_BRACKET_6C` env lane (which appears nowhere in current code) captured **once** before the
 pixel loop (one predictable branch per pixel, present in every lane so it
 subtracts out — no per-pixel clock reads, no allocation, no `black_box`
 round-trip inside the timed region). **All temp brackets reverted; tree clean.**
@@ -147,7 +147,7 @@ refused. Do not send a writer after combine or blend.
 - Substrate: `crates/fn64-render-wgpu/src/targets/raw_triangle/tests.rs:1181`
   (`texture_plane_raster_microbench`, `#[ignore]`), release,
   `--ignored --nocapture`, 66,000 covered px × 400 iters/run.
-- Temp instrument: `FN64_BRACKET_6C` lanes in
+- Temp instrument (appears nowhere in current code): `FN64_BRACKET_6C` lanes in
   `crates/fn64-render-wgpu/src/targets/texrect.rs` (execute_texture_rectangle loop).
   **Reverted after measurement; `git status` clean for that file.**
 - Machine load ~1.4-1.7 on 15 cores throughout; interleaved A/B/C(/D/E) per rep.
