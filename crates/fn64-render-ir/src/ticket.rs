@@ -341,6 +341,21 @@ pub struct BackendEffectReport {
 }
 
 impl BackendEffectReport {
+    /// Retain this packet's exact write contract while execution is deferred.
+    ///
+    /// The returned capability is move-only and contains no packet payload or
+    /// guest bytes. It exists for transaction-scoped backends which inspect a
+    /// packet while it is lent through an execution view, submit several
+    /// packets together, and only then receive the completed bytes needed to
+    /// construct [`CompletedWrite`] values. Completion still runs the same
+    /// access-for-access validation as [`Self::try_new`].
+    pub fn defer(packet: &WorkloadPacket) -> DeferredBackendEffectReport {
+        DeferredBackendEffectReport {
+            workload: packet.identity(),
+            expected_writes: packet.journal().write_accesses().collect(),
+        }
+    }
+
     pub fn try_new(
         packet: &WorkloadPacket,
         writes: Vec<CompletedWrite>,
@@ -359,6 +374,44 @@ impl BackendEffectReport {
 
     pub const fn identity(&self) -> EffectIdentity {
         self.identity
+    }
+}
+
+/// Move-only authority to complete one packet's backend effect report after
+/// an asynchronous or batched executor has produced its exact writes.
+///
+/// It deliberately retains only the packet identity and its ordered write
+/// accesses. Command streams, guest reads, and publication authority remain
+/// owned by their existing lifecycle roles.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeferredBackendEffectReport {
+    workload: WorkloadIdentity,
+    expected_writes: Box<[ResourceAccess]>,
+}
+
+impl DeferredBackendEffectReport {
+    pub fn complete(
+        self,
+        writes: Vec<CompletedWrite>,
+    ) -> Result<BackendEffectReport, ValidationError> {
+        validate_effects(
+            self.expected_writes.iter().copied(),
+            &writes,
+            "backend effect",
+        )?;
+        Ok(BackendEffectReport {
+            workload: self.workload,
+            identity: hash_effects(b"fn64.render-ir.backend-effects.v1\0", &writes),
+            writes: writes.into_boxed_slice(),
+        })
+    }
+
+    pub const fn workload(&self) -> WorkloadIdentity {
+        self.workload
+    }
+
+    pub fn expected_writes(&self) -> &[ResourceAccess] {
+        &self.expected_writes
     }
 }
 
@@ -848,6 +901,27 @@ mod tests {
                 .unwrap()
                 .identity()
         );
+    }
+
+    #[test]
+    fn deferred_backend_effect_retains_the_exact_packet_write_contract() {
+        let packet = packet(0xe9, 1);
+        let expected_workload = packet.identity();
+        let expected_access = packet.journal().write_accesses().next().unwrap();
+        let deferred = BackendEffectReport::defer(&packet);
+
+        assert_eq!(deferred.workload(), expected_workload);
+        assert_eq!(deferred.expected_writes(), &[expected_access]);
+        assert!(matches!(
+            deferred.complete(Vec::new()),
+            Err(ValidationError::EffectCountMismatch { .. })
+        ));
+
+        let deferred = BackendEffectReport::defer(&packet);
+        let direct = BackendEffectReport::try_new(&packet, effects(&packet, 1)).unwrap();
+        let completed = deferred.complete(effects(&packet, 1)).unwrap();
+        assert_eq!(completed.identity(), direct.identity());
+        assert_eq!(completed.writes(), direct.writes());
     }
 
     #[test]

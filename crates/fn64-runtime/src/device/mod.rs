@@ -268,6 +268,29 @@ pub struct DpcSubmission {
     pub end: u32,
 }
 
+/// Move-only reservation of an ordered RSP task's future DPC submissions.
+/// Reserving allocates globally ordered fabric tokens but does not touch DPC
+/// registers or make any renderer transaction pending. Members can only be
+/// activated from the front through [`DeviceFabric::activate_reserved_dpc_submission`].
+#[derive(Debug)]
+pub struct ReservedDpcSubmissionBatch {
+    submissions: Box<[DpcSubmission]>,
+    next: usize,
+}
+
+impl ReservedDpcSubmissionBatch {
+    /// All reserved identities in activation order. This read-only view lets
+    /// a renderer bind its plans to the exact future fabric tokens.
+    pub fn submissions(&self) -> &[DpcSubmission] {
+        &self.submissions
+    }
+
+    /// Number of members not yet activated.
+    pub fn remaining(&self) -> usize {
+        self.submissions.len() - self.next
+    }
+}
+
 /// A known-width RDP command parked until a later END exposes the remainder.
 ///
 /// The DPC accepts END extensions in 8-byte increments, so a multiword command

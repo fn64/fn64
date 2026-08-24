@@ -6,6 +6,24 @@ it decodes a bounded raw-DPC subset into ordered typed commands, a
 transaction-local RDP state delta, and an exact resource plan. M3.1's headless
 wgpu 30 fixture remains byte-for-byte frozen as a separate lifecycle bridge.
 
+## WM2000 task-batch production path
+
+The rs + wgpu launcher uses transactional raw-DPC task batching and the
+task-scoped compute raster path by default. `FN64_RAW_DPC_TASK_BATCH=0` and
+`FN64_RAW_DPC_TASK_COMPUTE=0` are diagnostic opt-outs. Exact-range guest-read
+payload sharing and one-transaction guest copyback are also default-on;
+`FN64_TASK_GUEST_READ_ARENA=0` and `FN64_RENDER_COPYBACK_BATCH=0` retain their
+same-binary controls. `FN64_TASK_BATCH_PHASE_CENSUS=1` splits ABI task setup,
+planning/binding, guest capture, staged writes, copyback, and publication.
+`FN64_TASK_COMPUTE_CENSUS=1` reports compute/CPU membership and the explicit
+color-registry/checkpoint clone clocks.
+
+The production boundary keeps physical addresses and byte lengths in typed
+guest units. Conversion to `usize` is owned by the RDRAM allocation/slice
+boundary, not repeated in task transport. This distinction is load-bearing:
+host indices are not guest addresses, even on a host where `u32 as usize`
+happens to preserve the numeric value.
+
 The decoder admits only the eight low no-op variants, fill-cycle Set Other
 Modes, Set Color Image, Set Fill Color, whole-pixel Fill Rectangle, and
 FullSync. The two non-command bits in the wire opcode are ignored for command
@@ -1461,6 +1479,11 @@ fixture reaches the GPU; a batch submission or shader-status error is only
 detected after real GPU submission (`complete()` observes real output), but
 `self.triangle_draw_output` is never touched until every stage succeeds, so
 a failure anywhere leaves the prior successful value in place, unchanged.
+
+The CPU color-target executor uses the same decoded endpoints and destination
+row plan for both opcodes. For `TextureRectangleFlip`, it transposes the
+screen-axis stepping: S advances down rows and T advances across columns,
+while ordinary `TextureRectangle` keeps S across columns and T down rows.
 
 **Nonclaims.** No scissor-rectangle intersection and no `movedFromOrigin`/
 `ExtendedAlignment` origin-stack offset (RT64's `drawRect` applies both
