@@ -152,9 +152,9 @@ The reasoning is in `docs/RT64-ENGINEERING-LOOP.md`; the short form:
    reverting the capture to a raw `to_vec()` fails
    `a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram`.
 
-   **CONFIRMED ON SCREEN. WM2000's textures render.**
-   `docs/frames/wm2000-after-byte-lane-fix-swap4090.png` is committed; the
-   before image `wm2000-after-xor4-fix-swap5192.png` is the same scene under
+   **CONFIRMED ON SCREEN. WM2000's textures render.** The operator-scratch
+   byte-lane-fix frame and the before image from the XOR4-only branch show the
+   same scene under
    the previous two fixes. The contrast is not subtle:
 
    - **Before:** dense magenta/green/black per-pixel speckle across every
