@@ -1044,20 +1044,18 @@ mod tests {
         assert!(zero[0].is_finite() && zero[1].is_finite());
         // atan2(-0, 0) = -0, so pitch = fmod(0 + PI, 2PI) = PI -> 0.5.
         assert_eq!(zero[1], 0.5);
-        // Yaw is the interesting half. atan2(0, -0) = +PI, so on paper this
-        // is fmod(2PI, 2PI) = 0, the same wrap the (0,0,1) case above hits.
-        // It is NOT: `atan2` returns the correctly-rounded f32 of PI,
-        // 0x40490fda, while M_PI's decimal literal 3.14159265f rounds the
-        // other way to 0x40490fdb -- one ULP higher. Their sum therefore
-        // lands one ULP BELOW M_TWO_PI, fmod leaves it untouched, and the
-        // divide gives 0.99999994 rather than 0.0.
-        assert_eq!(zero[0], 0.99999994);
-        assert_ne!(zero[0], 0.0);
-        // The one-ULP gap is the whole cause, and it is a property of the
-        // source's own decimal literal, not of this port: the (0,0,1) case
-        // reaches an exact 0.0 precisely because atan2(0, -1) returns
-        // 0x40490fdb, matching M_PI exactly.
-        assert_eq!((0.0f32).atan2(-0.0f32).to_bits() + 1, M_PI.to_bits());
+        // Yaw is the interesting half. libm implementations are permitted to
+        // return either adjacent f32 representation of PI for atan2(+0,-0).
+        // Matching M_PI wraps to zero; one ULP below it survives the fmod and
+        // divides to 0.99999994. Both retain the source's unguarded behavior.
+        let zero_axis_pi = (0.0f32).atan2(-0.0f32);
+        if zero_axis_pi.to_bits() == M_PI.to_bits() {
+            assert_eq!(zero[0], 0.0);
+        } else {
+            assert_eq!(zero_axis_pi.to_bits() + 1, M_PI.to_bits());
+            assert_eq!(zero[0], 0.99999994);
+        }
+        // The nonzero backward axis is stable and reaches the exact wrap.
         assert_eq!((0.0f32).atan2(-1.0f32).to_bits(), M_PI.to_bits());
     }
 
