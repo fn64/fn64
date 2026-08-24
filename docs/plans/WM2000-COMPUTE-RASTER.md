@@ -284,6 +284,23 @@ and max 26.676 ms. This is still a diagnostic double execution. Its next gate
 is a same-binary replacement A/B that removes the 7.939 ms CPU raster cost
 rather than adding more prototype work around it.
 
+The wider synchronization/transfer sweep then tested whether typed state
+boundaries still required host round trips. An opt-in ordered-chain probe now
+uploads the packet's initial target once, dispatches each typed batch in RDP
+order, copies the target between persistent device slots, retains one status
+buffer per batch, and reads the final target once. Keeping status per batch is
+load-bearing: a later successful dispatch must not overwrite an earlier TMEM
+refusal. A required native Metal differential ran both the ordinary two-draw
+batch and a forced two-dispatch chain ten times each against the CPU target.
+On the same 13-packet game replay, counterbalanced independent/chained and
+chained/independent ten-repeat runs kept effect digest
+`1ac409f336397652`. Independent compute means were 9.797 and 9.690 ms;
+chained means were 8.533 and 8.436 ms, a paired-order average reduction from
+9.744 to 8.485 ms (-1.259 ms, 12.9%). Total means fell from 24.413 to
+23.337 ms (-1.077 ms, 4.4%). This proves intermediate target transport is a
+real cost class and supplies the ordered device mechanism production needs;
+it remains diagnostic double execution and earns no CPU-raster savings yet.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed

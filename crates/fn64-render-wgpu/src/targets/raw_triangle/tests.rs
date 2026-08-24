@@ -1328,13 +1328,14 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
     ];
     let tile_params = crate::TileBindingParams::bound(tile.descriptor(), tile.size())
         .with_lut_mode(crate::TextureLutMode::Disabled);
+    let projection = tmem.projection();
     for run in 1..=10 {
         let actual = renderer
             .compute_triangle_hot_color(
                 crate::TriangleTargetExtent { width, height },
                 &resident,
                 &device_triangles,
-                &tmem.projection(),
+                &projection,
                 tile_params,
             )
             .expect("hot compute color must complete");
@@ -1357,6 +1358,41 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         renderer.compute_hot_color_resource_generations(),
         1,
         "ten identical submissions must allocate one high-water resource generation"
+    );
+
+    // Force a typed boundary between the two draws. The chain must preserve
+    // painter's order without uploading or reading back the intermediate
+    // target; this is the production shape when TMEM/tile/program identity
+    // changes between adjacent admitted draws.
+    let chained = [
+        crate::targets::ComputeHotColorDispatch {
+            triangles: &device_triangles[..1],
+            tmem: &projection,
+            tile: tile_params,
+        },
+        crate::targets::ComputeHotColorDispatch {
+            triangles: &device_triangles[1..],
+            tmem: &projection,
+            tile: tile_params,
+        },
+    ];
+    for run in 1..=10 {
+        let actual = renderer
+            .compute_triangle_hot_color_chain(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &chained,
+            )
+            .expect("ordered compute-color chain must complete");
+        assert_eq!(
+            actual, expected,
+            "ordered compute-color chain differential failed on run {run}"
+        );
+    }
+    assert_eq!(
+        renderer.compute_hot_color_resource_generations(),
+        2,
+        "ten identical two-dispatch chains must add exactly one high-water slot"
     );
 }
 

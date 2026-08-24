@@ -56,9 +56,9 @@ use std::time::{Duration, Instant};
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, CandidateColorTarget, CompletedColorTargetWrite,
-    ComputeCoverageTriangle, ComputeHotColorBatch, ComputeRasterBatch, ComputeRasterBatchBuilder,
-    ComputeRasterDrawAdmission, ComputeRasterProgramKey, ResolvedFragmentBlendParams,
-    TargetRectangle,
+    ComputeCoverageTriangle, ComputeHotColorBatch, ComputeHotColorDispatch, ComputeRasterBatch,
+    ComputeRasterBatchBuilder, ComputeRasterDrawAdmission, ComputeRasterProgramKey,
+    ResolvedFragmentBlendParams, TargetRectangle,
 };
 use crate::tmem::{project_committed_tmem, TileBindingParams, TmemGpuProjection};
 use crate::{
@@ -167,6 +167,11 @@ pub struct WgpuBackend {
     /// `FN64_COMPUTE_RASTER_PROBE=1` admits only the closed hottest-state
     /// batch and rejects any complete-target byte mismatch.
     compute_raster_probe_enabled: bool,
+    /// Diagnostic variant that preserves the same CPU oracle but executes
+    /// all typed batches as one ordered on-device target chain. This is the
+    /// transport shape required by replacement; it remains opt-in until the
+    /// transaction seam consumes its bytes directly.
+    compute_raster_chain_probe_enabled: bool,
     /// Most recent successful probe execution, consumed by the offline
     /// replay's phase accounting. An ineligible packet leaves this `None`.
     compute_raster_probe_receipt: Option<ComputeRasterProbeReceipt>,
@@ -406,6 +411,54 @@ fn push_finished_compute_probe(
     }
 }
 
+fn validate_compute_probe_output(
+    first_probe: &ComputeRasterProbe,
+    last_probe: &ComputeRasterProbe,
+    actual_bytes: &[u8],
+) -> Result<(), WgpuRawDpcExecutionError> {
+    if actual_bytes.len() != last_probe.expected_bytes.len() {
+        return Err(WgpuRawDpcExecutionError::ComputeRasterProbeLength {
+            expected: last_probe.expected_bytes.len(),
+            actual: actual_bytes.len(),
+        });
+    }
+    let Some(byte) = actual_bytes
+        .iter()
+        .zip(&last_probe.expected_bytes)
+        .position(|(actual, expected)| actual != expected)
+    else {
+        return Ok(());
+    };
+    let pixel = byte / 2;
+    let pair = pixel * 2;
+    let expected = u16::from_be_bytes([
+        last_probe.expected_bytes[pair],
+        last_probe.expected_bytes[pair + 1],
+    ]);
+    let actual = u16::from_be_bytes([actual_bytes[pair], actual_bytes[pair + 1]]);
+    let first_draw = first_probe
+        .batch
+        .draws()
+        .first()
+        .expect("a sealed compute batch contains at least one draw");
+    let last_draw = last_probe
+        .batch
+        .draws()
+        .last()
+        .expect("a sealed compute batch contains at least one draw");
+    Err(WgpuRawDpcExecutionError::ComputeRasterProbeMismatch {
+        ordinal: first_probe.ordinal,
+        first_command_index: first_draw.command_index(),
+        last_command_index: last_draw.command_index(),
+        first_triangle_index: first_draw.triangle_index(),
+        last_triangle_index: last_draw.triangle_index(),
+        x: pixel as u32 % last_probe.extent.width,
+        y: pixel as u32 / last_probe.extent.width,
+        expected,
+        actual,
+    })
+}
+
 /// Capacity rationale: 4 is the fixed bounded ceiling for concurrently
 /// resident color targets in this slice (a color image, a Z-adjacent second
 /// target, and two generations of churn headroom). It is a scope bound, not
@@ -490,6 +543,9 @@ impl WgpuBackend {
                 gpu_triangle_draw_enabled,
                 project_gpu_tmem,
                 compute_raster_probe_enabled: env_exact_one("FN64_COMPUTE_RASTER_PROBE"),
+                compute_raster_chain_probe_enabled: env_exact_one(
+                    "FN64_COMPUTE_RASTER_CHAIN_PROBE",
+                ),
                 compute_raster_probe_receipt: None,
                 configured_target_extent: None,
                 color_targets: None,
@@ -523,6 +579,13 @@ impl WgpuBackend {
     /// execution path are unchanged.
     pub fn set_compute_raster_probe_enabled(&mut self, enabled: bool) {
         self.compute_raster_probe_enabled = enabled;
+        self.compute_raster_probe_receipt = None;
+    }
+
+    /// Selects ordered on-device chaining for the diagnostic compute probe.
+    /// Enabling this does not enable probing by itself.
+    pub fn set_compute_raster_chain_probe_enabled(&mut self, enabled: bool) {
+        self.compute_raster_chain_probe_enabled = enabled;
         self.compute_raster_probe_receipt = None;
     }
 
@@ -1861,6 +1924,13 @@ pub enum WgpuRawDpcExecutionError {
         expected: usize,
         actual: usize,
     },
+    /// An ordered chain crossed a target generation or extent boundary.
+    /// Such a boundary requires publication/seed recovery, not an on-device
+    /// target copy, so the diagnostic refuses instead of composing targets.
+    ComputeRasterProbeChainIncompatible {
+        ordinal: u64,
+        batch: usize,
+    },
     /// A triangle-bearing plan reached execution with no successful prior
     /// `RenderBackend::create` call -- `triangle_pipeline`/
     /// `triangle_target_extent` are always `Some` together (§1a/§1e) or
@@ -2111,6 +2181,11 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::ComputeRasterProbeLength { expected, actual } => write!(
                 formatter,
                 "compute-raster probe returned {actual} target bytes; CPU produced {expected}"
+            ),
+            Self::ComputeRasterProbeChainIncompatible { ordinal, batch } => write!(
+                formatter,
+                "compute-raster probe batch {batch} in packet ordinal {ordinal} crosses an \
+                 on-device target generation or extent boundary"
             ),
             Self::TriangleDrawBeforeCreate => formatter.write_str(
                 "a triangle-bearing plan reached execution with no successful prior \
@@ -2647,81 +2722,79 @@ impl RenderBackend for WgpuBackend {
         let mut probe_draws = 0u32;
         let mut probe_pixels = 0u32;
         let mut probe_batches = 0u32;
-        let actual_targets = if compute_probes.is_empty() {
-            Vec::new()
-        } else {
+        for probe in &compute_probes {
+            probe_batches += 1;
+            probe_draws += u32::try_from(probe.batch.draws().len())
+                .expect("bounded raw-DPC draw count fits u32");
+            probe_pixels += probe.extent.width * probe.extent.height;
+        }
+        if !compute_probes.is_empty() {
             let pipeline = self
                 .triangle_pipeline
                 .as_mut()
                 .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                 .map_err(RenderError::from)?;
-            let inputs: Vec<_> = compute_probes
-                .iter()
-                .map(|probe| ComputeHotColorBatch {
-                    extent: probe.extent,
-                    resident_bytes: &probe.resident_bytes,
-                    triangles: &probe.triangles,
-                    tmem: &probe.tmem,
-                    tile: probe.tile,
-                })
-                .collect();
             let started = Instant::now();
-            let outputs = pipeline
-                .compute_triangle_hot_color_batches(&inputs)
-                .map_err(WgpuRawDpcExecutionError::TriangleDraw)
+            if self.compute_raster_chain_probe_enabled {
+                let first = &compute_probes[0];
+                for (batch, probe) in compute_probes.iter().enumerate().skip(1) {
+                    if probe.ordinal != first.ordinal
+                        || probe.extent.width != first.extent.width
+                        || probe.extent.height != first.extent.height
+                        || probe.batch.target() != first.batch.target()
+                        || probe.batch.generation() != first.batch.generation()
+                    {
+                        return Err(RenderError::from(
+                            WgpuRawDpcExecutionError::ComputeRasterProbeChainIncompatible {
+                                ordinal: first.ordinal,
+                                batch,
+                            },
+                        ));
+                    }
+                }
+                let dispatches: Vec<_> = compute_probes
+                    .iter()
+                    .map(|probe| ComputeHotColorDispatch {
+                        triangles: &probe.triangles,
+                        tmem: &probe.tmem,
+                        tile: probe.tile,
+                    })
+                    .collect();
+                let actual = pipeline
+                    .compute_triangle_hot_color_chain(
+                        first.extent,
+                        &first.resident_bytes,
+                        &dispatches,
+                    )
+                    .map_err(WgpuRawDpcExecutionError::TriangleDraw)
+                    .map_err(RenderError::from)?;
+                validate_compute_probe_output(
+                    first,
+                    compute_probes.last().expect("non-empty probe chain"),
+                    &actual,
+                )
                 .map_err(RenderError::from)?;
+            } else {
+                let inputs: Vec<_> = compute_probes
+                    .iter()
+                    .map(|probe| ComputeHotColorBatch {
+                        extent: probe.extent,
+                        resident_bytes: &probe.resident_bytes,
+                        triangles: &probe.triangles,
+                        tmem: &probe.tmem,
+                        tile: probe.tile,
+                    })
+                    .collect();
+                let outputs = pipeline
+                    .compute_triangle_hot_color_batches(&inputs)
+                    .map_err(WgpuRawDpcExecutionError::TriangleDraw)
+                    .map_err(RenderError::from)?;
+                for (probe, actual) in compute_probes.iter().zip(outputs) {
+                    validate_compute_probe_output(probe, probe, &actual)
+                        .map_err(RenderError::from)?;
+                }
+            }
             probe_elapsed = started.elapsed();
-            outputs
-        };
-        for (probe, actual_bytes) in compute_probes.iter().zip(actual_targets) {
-            probe_batches += 1;
-            probe_draws += u32::try_from(probe.batch.draws().len())
-                .expect("bounded raw-DPC draw count fits u32");
-            probe_pixels += probe.extent.width * probe.extent.height;
-            if let Some(byte) = actual_bytes
-                .iter()
-                .zip(&probe.expected_bytes)
-                .position(|(actual, expected)| actual != expected)
-            {
-                let pixel = byte / 2;
-                let pair = pixel * 2;
-                let expected = u16::from_be_bytes([
-                    probe.expected_bytes[pair],
-                    probe.expected_bytes[pair + 1],
-                ]);
-                let actual = u16::from_be_bytes([actual_bytes[pair], actual_bytes[pair + 1]]);
-                let first_draw = probe
-                    .batch
-                    .draws()
-                    .first()
-                    .expect("a sealed compute batch contains at least one draw");
-                let last_draw = probe
-                    .batch
-                    .draws()
-                    .last()
-                    .expect("a sealed compute batch contains at least one draw");
-                return Err(RenderError::from(
-                    WgpuRawDpcExecutionError::ComputeRasterProbeMismatch {
-                        ordinal: probe.ordinal,
-                        first_command_index: first_draw.command_index(),
-                        last_command_index: last_draw.command_index(),
-                        first_triangle_index: first_draw.triangle_index(),
-                        last_triangle_index: last_draw.triangle_index(),
-                        x: pixel as u32 % probe.extent.width,
-                        y: pixel as u32 / probe.extent.width,
-                        expected,
-                        actual,
-                    },
-                ));
-            }
-            if actual_bytes.len() != probe.expected_bytes.len() {
-                return Err(RenderError::from(
-                    WgpuRawDpcExecutionError::ComputeRasterProbeLength {
-                        expected: probe.expected_bytes.len(),
-                        actual: actual_bytes.len(),
-                    },
-                ));
-            }
         }
         if probe_batches != 0 {
             self.compute_raster_probe_receipt = Some(ComputeRasterProbeReceipt {
