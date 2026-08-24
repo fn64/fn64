@@ -484,11 +484,22 @@ def check_rt64_port_inventory() -> None:
 
 # --- 4bac. backend-neutral RT64/Rust parity denominator stays closed --------
 def check_rt64_port_parity() -> None:
+    tools_path = str(ROOT / "tools")
+    sys.path.insert(0, tools_path)
+    try:
+        import check_rt64_port_parity as parity_checker
+
+        parity_environment = parity_checker.environment_without_ambient_code_injection_variables(
+            os.environ
+        )
+    finally:
+        sys.path.remove(tools_path)
     hostile = subprocess.run(
         [sys.executable, str(ROOT / "tools/test_check_rt64_port_parity.py")],
         cwd=ROOT,
         capture_output=True,
         text=True,
+        env=parity_environment,
     )
     if hostile.returncode != 0:
         detail = hostile.stderr.strip() or hostile.stdout.strip() or "hostile tests failed silently"
@@ -503,6 +514,7 @@ def check_rt64_port_parity() -> None:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        env=parity_environment,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
