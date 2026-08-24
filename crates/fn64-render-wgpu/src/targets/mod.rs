@@ -812,6 +812,26 @@ impl ColorTargetExecutionBatch {
         registry: &ColorTargetRegistry,
         key: ColorTargetKey,
     ) -> Result<(CandidateColorTarget, TaskColorInput), TargetError> {
+        let (candidate, input) = self.preview_candidate(registry, key)?;
+        self.reserved.push(ReservedColorTargetGeneration {
+            key: candidate.key,
+            generation: candidate.generation,
+            predecessor: candidate.predecessor,
+        });
+        Ok((candidate, input))
+    }
+
+    /// Derives the next task-private generation without reserving it.
+    ///
+    /// Deferred compute admission uses this value before it decides whether
+    /// the member belongs to a device segment. A rejected member can therefore
+    /// take the ordered CPU path without leaving a generation reservation that
+    /// only a compute completion could redeem.
+    pub(crate) fn preview_candidate(
+        &self,
+        registry: &ColorTargetRegistry,
+        key: ColorTargetKey,
+    ) -> Result<(CandidateColorTarget, TaskColorInput), TargetError> {
         if let Some(previous) = self
             .reserved
             .iter()
@@ -823,11 +843,6 @@ impl ColorTargetExecutionBatch {
                 generation: previous.generation.successor(key)?,
                 predecessor: Some(previous.generation),
             };
-            self.reserved.push(ReservedColorTargetGeneration {
-                key: candidate.key,
-                generation: candidate.generation,
-                predecessor: candidate.predecessor,
-            });
             return Ok((candidate, TaskColorInput::PriorTaskCheckpoint));
         }
 
@@ -855,11 +870,6 @@ impl ColorTargetExecutionBatch {
                 });
             }
         }
-        self.reserved.push(ReservedColorTargetGeneration {
-            key: candidate.key,
-            generation: candidate.generation,
-            predecessor: candidate.predecessor,
-        });
         Ok((candidate, TaskColorInput::DurableRegistry))
     }
 }
