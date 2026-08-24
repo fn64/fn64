@@ -6,8 +6,8 @@ because a better instrument (a wgpu runner in `fn64-render-conformance`) was
 found mid-card. They are recorded so they are not re-derived at full cost, and
 they are explicitly NOT results.
 
-The observed symptom, from committed frames (`docs/frames/wm2000-swap-3000-*`,
-`docs/frames/wm2000-swap-12000-*`): WM2000 plays a match, but every model is
+The observed symptom, from frames retained in operator scratch at swaps 3000
+and 12000: WM2000 plays a match, but every model is
 flat-shaded, broad horizontal colour bands cross the arena, glyphs are blocky,
 and crowd/arena detail is missing.
 

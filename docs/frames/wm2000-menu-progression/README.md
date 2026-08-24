@@ -1,5 +1,8 @@
 # WM2000 menu progression under scripted input
 
+The frames described here are retained in operator scratch only because they
+contain game output. Their filenames remain as labels for the measured frames.
+
 All frames are `reframed-*`: the harness dumps the guest framebuffer at a
 hardcoded 320x240 while WM2000 scans out 480x237, so the raw dump shears every
 row. `docs/tools/wm2000-reframe.py` re-lays the same bytes at stride 480,
