@@ -116,6 +116,8 @@ fn main() {
     let detail = std::env::var_os("FN64_RAW_DPC_REPLAY_DETAIL").is_some();
     let compute_probe_requested =
         std::env::var_os("FN64_COMPUTE_RASTER_PROBE").is_some_and(|value| value == "1");
+    let compute_chain_probe_requested =
+        std::env::var_os("FN64_COMPUTE_RASTER_CHAIN_PROBE").is_some_and(|value| value == "1");
     assert!(repeat > 0, "FN64_RAW_DPC_REPLAY_REPEAT must be nonzero");
 
     let (mut backend, mut session) = WgpuBackend::try_new().expect("construct wgpu backend");
@@ -151,6 +153,7 @@ fn main() {
         );
     }
     backend.set_compute_raster_probe_enabled(compute_probe_requested);
+    backend.set_compute_raster_chain_probe_enabled(compute_chain_probe_requested);
 
     let mut samples = Vec::with_capacity(repeat as usize);
     let mut packet_samples = vec![Vec::with_capacity(repeat as usize); benchmark.len()];

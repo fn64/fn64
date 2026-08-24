@@ -48,7 +48,8 @@ pub use texrect::{
     TexrectShading, TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{
-    admitted_triangle_fixture, ComputeHotColorBatch, ResolvedFragmentBlendParams,
+    admitted_triangle_fixture, ComputeHotColorBatch, ComputeHotColorDispatch,
+    ResolvedFragmentBlendParams,
 };
 pub use triangle_pipeline::{
     fixed_fixture_other_mode, ComputeCoverageTriangle, ComputeRasterSample, InFlightTriangleDraw,
