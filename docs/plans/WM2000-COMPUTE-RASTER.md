@@ -629,9 +629,9 @@ executor corruption. Task planning now carries a move-only execution
 disposition. Exact admission produces the compute capability; an expected
 refusal carries a stable reason into the ordered CPU member; executor errors
 remain loud. The census reports member count and elapsed CPU time for every
-reason. Program rejection additionally reports the exact four RDP program
-words, so widening decisions can be ranked from the sustained route rather
-than inferred from an earlier draw corpus.
+reason. Program-bit and cycle-type rejection additionally report the exact
+four RDP program words, so widening decisions can be ranked from the sustained
+route rather than inferred from an earlier draw corpus.
 
 The reporting-only taxonomy separates packets with no raw triangle, packets
 mixing triangles with fill or texrect commands, disabled compute, completion
@@ -640,6 +640,18 @@ program-bit failures. It does not catch a generic task error and fall back.
 TMEM or tile changes that only require another dispatch are also distinct from
 admission refusal. This keeps the diagnostic denominator closed without
 weakening the task transaction or its command ordering.
+
+The first 800-pump keyed capture measured the sustained-route candidates at
+task 570. The one-cycle program `fc309661/552eff7f/0008ecef/00504240` consumed
+298.559 ms across 657 CPU members. Two-cycle programs consumed 287.059 ms
+across 589 members for `fc1596a3/f0fffe38/0018ac8f/00504240`, 205.864 ms
+across 514 members for `fc1596a3/f0fffe38/0018acef/00504240`, and 350.735 ms
+across 5,095 members for `fc15fea3/f00ff23f/0018acff/0f0a7008`. The last pool
+has the largest aggregate but only 0.069 ms per member, so its dispatch fixed
+cost makes it a poor first widening. The measured one-cycle key is first: it
+has comparable recoverable CPU time to the leading two-cycle key while reusing
+the current one-cycle execution shape. Each widening still requires complete
+CPU/GPU target-byte identity and a same-binary performance kill gate.
 
 ## Sources and nonclaims
 
