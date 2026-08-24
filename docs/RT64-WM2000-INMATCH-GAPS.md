@@ -90,9 +90,9 @@ So one of two things is true, and nobody has yet measured which:
   frames captured earlier came from a run whose conditions differ from the
   committed lead-in's.
 
-**Why this matters.** `docs/frames/wm2000-swap-12000-in-match-groundwork.png`
-and its sibling are cited as evidence that fn64 renders in-match gameplay. That
-evidence stands -- those frames were captured and inspected. What is NOT
+**Why this matters.** The swap-12000 frame and its sibling, retained in
+operator scratch only, are cited as evidence that fn64 renders in-match
+gameplay. That evidence stands -- those frames were captured and inspected. What is NOT
 established is that the committed lead-in reproduces them on demand, which is
 what a regression gate needs.
 
