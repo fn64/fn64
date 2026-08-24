@@ -2,6 +2,43 @@
 
 Status: active measurement and implementation plan, 2026-08-23.
 
+## Sustained-play blocker at the catch-up merge
+
+The 2026-08-24 live Metal/CoreAudio run of the catch-up branch is **not yet
+playable**. Short 180-pump windows had crossed a nominal 16.667 ms host-field
+p95, but that horizon ended near swap 120 and did not reach the deterministic
+later failure. A longer run reached swap approximately 240 and then trapped at
+raw-DPC member ordinal 4091 because the task was marked as a compute shape but
+was not representable by the exact typed compute executor. This is a known
+blocker being merged with the catch-up history; it is not a claim of runtime
+completion.
+
+The failure mechanism is localized. Planning currently records a loose
+`compute_shape` boolean for any raw-triangle packet without fill or texrect
+members. Execution treats that boolean as proof of compute eligibility, while
+the later exact admission can still reject the program key, TMEM/tile sharing,
+draw state, or batch order. The fix must replace that side channel with one
+move-only planned-task value carrying an explicit execution disposition:
+`Cpu(reason)` or a sealed `ComputeEligible` capability. A typed, deliberately
+non-admitted member takes the existing CPU path before mutation; genuine
+validation or corruption errors remain loud. Catching the generic executor
+error and silently falling back is not acceptable.
+
+Audio and timing claims are blocked by the same sustained-run frontier. In the
+longer run, the first 450 audio buffers remained zero-valued while underrun
+slots increased. Warm host-pump p95 ranged from 16.76 to 18.63 ms, with
+5.8--13.3% of pumps over 16.667 ms. WM2000 itself still presents distinct game
+frames at 30 Hz; the 60 Hz target is host-field work headroom, not 60 distinct
+game frames. The reliability bar for extension headroom is p95 at most 14 ms,
+p99 at most 15.5 ms, maximum at most 16.667 ms across ten sustained runs, stable
+swap hashes, and no audio-underrun or late-callback growth.
+
+Fresh profiling comes after the ordinal-4091 correctness fix and must run past
+swap 240. Profiling the current route would measure a path that deterministically
+terminates before sustained play. The first attribution pass will separate GPU
+host preparation, dispatch span, wait, map/readback, and CPU fallback-member
+categories before selecting the next optimization.
+
 ## Goal and acceptance bar
 
 The target is the all-Rust `rs + wgpu` play lane at WM2000's native 30 Hz.
