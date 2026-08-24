@@ -335,6 +335,38 @@ packets and synchronize once at the first access-journal-proven guest or VI
 consumer. Correctness requires that consumer boundary to be represented in
 the transaction types; timing alone cannot authorize delayed guest writes.
 
+A task-shape census and synthetic replay control then separated transport-call
+count from device lifetime. The captured task suffix contains nine consecutive
+all-triangle submissions (45 draws, 27 typed batches), followed by a three-
+submission state/fill boundary and one more triangle submission. Executing the
+nine submissions through packet-local replacement took 13.355 ms total in a
+single sizing run versus 8.540 ms on CPU. Concatenating the same nine command
+streams into one non-certifying task-scoped control retained the final RDRAM
+SHA-256 and reduced the GPU path to roughly 8.84 ms, recovering about 4.5 ms
+of repeated synchronization while only reaching CPU parity. This is evidence
+for task-scoped residency, not authority to concatenate production journals.
+
+The first lower-level optimization after that control bounds every even-width
+compute dispatch to the two-pixel-aligned horizontal union of its journal-
+proven writes as well as its existing row band. Odd-width targets retain the
+contiguous row-band mapping because a packed word can cross a row boundary;
+two row-local invocations must never race on that word. The focused native
+Metal differential matched complete CPU target bytes for 10 consecutive runs.
+In counterbalanced 40-repeat legs over the nine-submission task control, the
+candidate reduced GPU target-pixel visits from 10,598,400 to 2,119,680. Paired-
+order GPU total fell from 8.915 to 8.329 ms (-0.586 ms, 6.6%), and candidate
+GPU total was 0.752 ms below its paired CPU control. The final RDRAM SHA-256
+remained unchanged. `FN64_COMPUTE_RASTER_COLUMN_BOUNDS=0` is the same-binary
+measurement control; absent or `1` enables the bounded path while compute
+replacement itself remains opt-in.
+
+The 80% invocation reduction yielding only a 6.6% total improvement moves the
+next profile below pixel coverage: quantify fixed uploads, bind/encode work,
+GPU execution, wait, status map, and target readback across the remaining 23
+typed dispatches before widening another shader state. Task residency and
+horizontal bounds are retained mechanisms, but together they do not yet fund
+the 13.8 ms certification gap.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
