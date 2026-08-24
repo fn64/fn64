@@ -43,8 +43,8 @@ citation, and the tempting fix that is wrong.
 
 ## It RENDERS
 
-`docs/frames/wm2000-all-fn64-stack-rs-wgpu.png` is frame 443 from this
-stack — fn64's own recompiler, fn64's own wgpu renderer, zero C++ objects.
+An operator-scratch capture of frame 443 is from this stack — fn64's own
+recompiler, fn64's own wgpu renderer, zero C++ objects.
 It shows a wrestler mid-move with correct skin tones, brown hair, a
 green-and-white patterned costume with legible detail, black trunks, an arm
 tattoo, and correctly shaded 3D geometry. Real imagery, not noise.
@@ -95,8 +95,8 @@ build fails in `fn64-render-rt64`'s `build.rs`.
 ## What "playable" still needs — NOT yet measured
 
 1. **A frame-for-frame comparison against the C lane.** The image above is
-   read by eye and is plainly correct; it has not been diffed against
-   `docs/frames/wm2000-after-byte-lane-fix-swap4090.png` at the same swap.
+   read by eye and is plainly correct; it has not been diffed against the
+   operator-scratch byte-lane-fix frame at the same swap.
 2. **Input.** Untested on this stack.
 3. **Sync and speed.** Untested. The C lane's own perf work
    (`RT64-PERF-CEILING.md` and its correction) does not transfer.

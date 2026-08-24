@@ -221,8 +221,9 @@ hardware citation, it is fixed, and both suites are green with it
 (8683 workspace / 4916 host-gpu). **Textures are still noise.**
 
 I ran the ROM myself on this branch (`docs/tools/wm2000-match-run.sh --frames`,
-2M step budget) and looked at the result. `docs/frames/wm2000-after-xor4-fix-swap5192.png`
-is committed. What it shows, described honestly:
+2M step budget) and looked at the result. The captured frame is retained in
+operator scratch only because it contains game output. What it shows,
+described honestly:
 
 - **Geometry is correct.** Two wrestler silhouettes are clearly discernible,
   correctly shaped and correctly placed, with yellow hair blocks in the right

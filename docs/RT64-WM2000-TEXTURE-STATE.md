@@ -9,8 +9,8 @@ VI's real 480x237. Zero panics. `wm2000-frames.py` reports **ADVANCING** --
 every one of the last 20 frames a distinct hash, so this is live animation, not
 a held screen.
 
-Frames: `docs/frames/wm2000-after-texel-scale-fix-swap560.png` and
-`...-swap596.png`.
+The measured frames at swaps 560 and 596 are retained in operator scratch
+only because they contain game output.
 
 ## What changed, and it is real
 
@@ -66,8 +66,8 @@ cases. Full derivation and citation in
 [`RT64-WM2000-TEXEL-LOCALISATION.md`](RT64-WM2000-TEXEL-LOCALISATION.md).
 
 **CONFIRMED, by running the ROM on the fixed branch and looking:** it is not
-sufficient either. `docs/frames/wm2000-after-xor4-fix-swap5192.png` (5,160
-frames dumped to swap 5,021, zero panics, zero backend errors) shows correct
+sufficient either. The operator-scratch frame after the XOR4 fix (5,160 frames
+dumped to swap 5,021, zero panics, zero backend errors) shows correct
 wrestler silhouettes and correct ring structure under dense magenta/green/black
 per-pixel speckle. Same signature as before.
 
@@ -97,7 +97,7 @@ bytes, so every 32-bit word of texture source reached the sampler
 byte-reversed. Fixed in `9168bb9a` on both the production and conformance
 paths.
 
-Evidence, same scene, both committed under `docs/frames/`:
+Evidence, same scene; both filenames label frames retained in operator scratch:
 
 | | image | what it shows |
 |---|---|---|
@@ -118,8 +118,8 @@ before scoping; do not assume they survived.
 
 A full ROM run after the fix (`rc=0`, 4,080 swaps, 9,982 gfx tasks, **zero
 panics and zero backend errors** across 4,198 dumped frames) renders frame
-4090 -- the same swap as the committed
-`wm2000-after-byte-lane-fix-swap4090.png` -- indistinguishable from it:
+4090 -- the same swap as the operator-scratch byte-lane-fix frame --
+indistinguishable from it:
 correct skin tones, facial detail, legible orange "AUSTIN 3:16" shirt
 print, shaded steel trusses, readable "Single Match" / "STEVE AUSTIN VS
 STEVE AUSTIN" / "RAW IS WAR".
@@ -234,8 +234,8 @@ through RT64 and compare.
 | 644 | `(90,186,90)` `(76,95,35)` `(118,182,70)` | `(82,107,41)` `(58,82,33)` |
 
 **At swap 644 the ORACLE is green-dominant too**, and at swap 443 both lanes
-are correct. `docs/frames/wm2000-rt64-oracle-swap644-same-green.png` is
-RT64's own output for the "cast" scene, and it shows the same green skin.
+are correct. The operator-scratch RT64 capture for the "cast" scene shows the
+same green skin.
 
 So the in-match green is **WM2000's own rendering** -- a green-lit arena --
 faithfully reproduced by both renderers. There was never an fn64 defect
