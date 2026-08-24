@@ -68,7 +68,8 @@ patched to dump at true VI geometry via `fn64_abi::vi_width()` /
 | distinct frame hashes | **5** across 3147 swaps | **~3750** across 3757 swaps |
 | frames after swap ~1200 | all black | rendered content throughout |
 
-The five frames in `frames/` are from the rebuilt run and were looked at:
+Five frames retained in operator scratch are from the rebuilt run and were
+looked at:
 
 - **`fn64-fb-700.png`** -- a **wrestling ring**: three dark-red ring ropes
   strung between turnbuckle posts, a pale-green canvas mat below them, and a
