@@ -95,12 +95,23 @@ def is_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def reject_ambient_code_injection_environment(row_id: str) -> None:
-    dangerous = sorted(
-        name for name in os.environ
-        if name.upper() in FORBIDDEN_AMBIENT_ENV_NAMES
-        or name.upper().startswith(FORBIDDEN_AMBIENT_ENV_PREFIXES)
+def is_ambient_code_injection_variable(name: str) -> bool:
+    upper = name.upper()
+    return upper in FORBIDDEN_AMBIENT_ENV_NAMES or upper.startswith(
+        FORBIDDEN_AMBIENT_ENV_PREFIXES
     )
+
+
+def environment_without_ambient_code_injection_variables(environment) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in environment.items()
+        if not is_ambient_code_injection_variable(name)
+    }
+
+
+def reject_ambient_code_injection_environment(row_id: str) -> None:
+    dangerous = sorted(name for name in os.environ if is_ambient_code_injection_variable(name))
     require(
         not dangerous,
         f"{row_id}: ambient loader/interpreter/plugin injection environment is forbidden: {', '.join(dangerous)}",

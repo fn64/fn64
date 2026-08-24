@@ -24,6 +24,16 @@ sys.modules[SPEC.name] = CHECKER
 SPEC.loader.exec_module(CHECKER)
 
 
+def clean_environment_patch():
+    """Keep hosted-runner variables from preempting each test's intended failure.
+
+    The production checker must reject ambient injection variables. The hostile
+    test dedicated to that contract adds them explicitly after this clean base.
+    """
+    clean_environment = CHECKER.environment_without_ambient_code_injection_variables(os.environ)
+    return mock.patch.dict(os.environ, clean_environment, clear=True)
+
+
 class ArtifactAuthorityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -90,6 +100,13 @@ class ArtifactAuthorityTests(unittest.TestCase):
 
 
 class ProductionControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.environment = clean_environment_patch()
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+
     def test_structural_cli_does_not_execute_registered_evidence(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(CHECKER_PATH), "--structural-only"],
@@ -157,13 +174,18 @@ class ClosedEvidenceTests(unittest.TestCase):
         cls.runner = cls.repository / "target" / "debug" / "fn64-render-conformance-test-runner"
 
     def setUp(self) -> None:
+        self.environment = clean_environment_patch()
+        self.environment.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.artifacts = self.root / "evidence" / "rt64-port" / "artifacts"
         self.artifacts.mkdir(parents=True)
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        finally:
+            self.environment.stop()
 
     def artifact(self, name: str, contents: bytes, *, executable: bool = False) -> dict:
         path = self.artifacts / name
