@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use crate::raw_dpc::push_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, CandidateColorTarget, CompletedColorTargetWrite,
-    ComputeCoverageTriangle, ComputeRasterBatch, ComputeRasterBatchBuilder,
+    ComputeCoverageTriangle, ComputeHotColorBatch, ComputeRasterBatch, ComputeRasterBatchBuilder,
     ComputeRasterDrawAdmission, ComputeRasterProgramKey, ResolvedFragmentBlendParams,
     TargetRectangle,
 };
@@ -222,6 +222,7 @@ pub struct WgpuBackend {
 /// intentionally does not pretend those costs are shader-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComputeRasterProbeReceipt {
+    submission_count: u32,
     batch_count: u32,
     draw_count: u32,
     target_pixels: u32,
@@ -229,6 +230,10 @@ pub struct ComputeRasterProbeReceipt {
 }
 
 impl ComputeRasterProbeReceipt {
+    pub const fn submission_count(self) -> u32 {
+        self.submission_count
+    }
+
     pub const fn batch_count(self) -> u32 {
         self.batch_count
     }
@@ -2642,25 +2647,33 @@ impl RenderBackend for WgpuBackend {
         let mut probe_draws = 0u32;
         let mut probe_pixels = 0u32;
         let mut probe_batches = 0u32;
-        for probe in compute_probes {
+        let actual_targets = if compute_probes.is_empty() {
+            Vec::new()
+        } else {
             let pipeline = self
                 .triangle_pipeline
                 .as_mut()
                 .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                 .map_err(RenderError::from)?;
+            let inputs: Vec<_> = compute_probes
+                .iter()
+                .map(|probe| ComputeHotColorBatch {
+                    extent: probe.extent,
+                    resident_bytes: &probe.resident_bytes,
+                    triangles: &probe.triangles,
+                    tmem: &probe.tmem,
+                    tile: probe.tile,
+                })
+                .collect();
             let started = Instant::now();
-            let actual_bytes = pipeline
-                .compute_triangle_hot_color(
-                    probe.extent,
-                    &probe.resident_bytes,
-                    &probe.triangles,
-                    &probe.tmem,
-                    probe.tile,
-                )
+            let outputs = pipeline
+                .compute_triangle_hot_color_batches(&inputs)
                 .map_err(WgpuRawDpcExecutionError::TriangleDraw)
                 .map_err(RenderError::from)?;
-            let elapsed = started.elapsed();
-            probe_elapsed += elapsed;
+            probe_elapsed = started.elapsed();
+            outputs
+        };
+        for (probe, actual_bytes) in compute_probes.iter().zip(actual_targets) {
             probe_batches += 1;
             probe_draws += u32::try_from(probe.batch.draws().len())
                 .expect("bounded raw-DPC draw count fits u32");
@@ -2712,6 +2725,7 @@ impl RenderBackend for WgpuBackend {
         }
         if probe_batches != 0 {
             self.compute_raster_probe_receipt = Some(ComputeRasterProbeReceipt {
+                submission_count: 1,
                 batch_count: probe_batches,
                 draw_count: probe_draws,
                 target_pixels: probe_pixels,
