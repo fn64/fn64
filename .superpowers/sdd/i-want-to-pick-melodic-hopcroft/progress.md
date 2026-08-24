@@ -17,7 +17,7 @@ Proceeding to parallel execution:
 
 Commit: (no changes — measurement only)
 Parity gate PASS: 29/33 byte-identical to RT64 oracle.
-4 expected non-identical: scissor-narrower (RT64_DEFECT), flip-point-sampled (FN64_GAP), yuv16 (FN64_GAP), negative-w (BROKEN_FIXTURE).
+4 expected non-identical: scissor-narrower (RT64_DEFECT), flip-point-sampled (fn64 gap), yuv16 (fn64 gap), negative-w (BROKEN_FIXTURE).
 
 ## Task 0B: complete
 
@@ -729,7 +729,7 @@ wrong. The only other present() change in 5120e619 is the vi_blanked() call
 itself (with_executor(exec.vi().blanked)) and the black-fill branch (blanked-only).
 NEW HYPOTHESIS to test: either with_executor is costly from present context, OR
 present's 5ms is GPU vsync/surface-acquire blocking (window compositor state),
-NOT the boot-blank commit at all. Added FN64_JITTER_PROBE_NOBLANK env to
+NOT the boot-blank commit at all. Added a temporary no-blank jitter-probe env to
 short-circuit vi_blanked()->false for a mutation test. Rebuilding (bqr37pgnu).
 Keep vi_control change (it's a real cheap-path improvement) regardless.
 
@@ -751,7 +751,7 @@ signature of external stalls, not per-call code cost.
 
 ACTIONS: (1) keep the vi_control cheap-VI-status change -- it's a legit
 improvement (no MMIO decode per frame) but NOT the jitter fix; commit honestly.
-(2) remove FN64_JITTER_PROBE_NOBLANK scaffolding. (3) no further jitter fix.
+(2) remove the temporary no-blank jitter-probe scaffolding. (3) no further jitter fix.
 Boot-blank fix (5120e619) stands -- it did not regress perf.
 
 ## Track B FIRST PASS COMPLETE (2026-08-22) + RGBA16 verdict delegated
@@ -1006,11 +1006,11 @@ All 4 investigations done (#22-25). Consensus: WM2000 playability blocker = CPU 
 
 "go" = attack rasterizer perf (plan Task 6/Phase 2). Dispatched #26 measurement-first agent (a17cdf23, opus, READ-ONLY): invoke fn64-perf-method skill + clear closed-lines ledger, profile within-rasterizer attribution of the 43.24ms render field (raw_triangle.rs + sample.rs) on a deterministic scene, return ranked cost centers + kill-evidence optimization sketches. NO code changes. Writer-optimizations follow SERIALLY, each gated on before/after ns-per-pixel + byte-identity. Measurement runs SOLO (parallel profilers contend/skew). Rule: shipped figure = unprofiled mean x2; every number renderer-tagged (wgpu+rs); phase counters not leaf profiles.
 
-Task 26: complete — rasterizer profiled. CORRECTED framing: the 2 old big terms are ALREADY GONE — unpresented GPU draw_admitted_triangles (~65% of execute) gated off on play lane (1a10b939, production.rs:279, why field dropped 59.84->43.24); SHA-256 "~20%" is STALE (hot guest-read identity migrated to xxh3-128 FastContentDigest, SHA only cold/verify). Current: raster_triangle ~3.88s of ~5.29s execute = 70-75% of execute, ~62-66% of render field, 94-102 ns/covered-pixel. Highest-value candidate = incremental texture S/T/W plane stepping (see #27). Deterministic lever = WM2000 attract pump-census. Finer split needs a temp FN64_RASTER_SPLIT probe (deferred; candidate A's A/B yields it).
+Task 26: complete — rasterizer profiled. CORRECTED framing: the 2 old big terms are ALREADY GONE — unpresented GPU draw_admitted_triangles (~65% of execute) gated off on play lane (1a10b939, production.rs:279, why field dropped 59.84->43.24); SHA-256 "~20%" is STALE (hot guest-read identity migrated to xxh3-128 FastContentDigest, SHA only cold/verify). Current: raster_triangle ~3.88s of ~5.29s execute = 70-75% of execute, ~62-66% of render field, 94-102 ns/covered-pixel. Highest-value candidate = incremental texture S/T/W plane stepping (see #27). Deterministic lever = WM2000 attract pump-census. Finer split needs a temporary raster-split probe (deferred; candidate A's A/B yields it).
 
 Task 27: dispatched (ad625c1a, opus, serial sole writer) — step 3 texture planes incrementally like the 4 shade planes (raw_triangle.rs ~599-605 full attribute_plane i128 mul+div/pixel -> attribute_plane_step add on continues_run; template at ~529-538). Bit-identical by the same 200k-case identity (triangle_span.rs:404-426). STRICT kill-evidence: before/after ns/textured-pixel + unprofiled-mean-x2 ms/drawn-frame (wgpu+rs, >=2 reps interleaved), byte-identity (identity tests + gate 33/37 + frame tripwire), REVERT if null.
 
-NOTE (cross-session noise): an orphan perf agent a2fc4f6e "Profile wgpu execute hot spots" (NOT spawned by this session — another job/session) notified trying to relay collision-answers to a peer it couldn't reach; a perf-attribution [f8cbee] fork (also not mine) completed alongside. Not my agents, no action. Its content cross-confirms: no census/play-lane run contention (emit1/fresh-fn64/PID 49191 are other sessions'), no FN64_RASTER_SPLIT probe exists (bracket per-triangle, read shares not per-pixel atomics which distort +13%). My #27 agent ad625c1a is the sole WRITER and progressing (7m). Ignore f8cbee/a2fc4f6e artifacts if they appear.
+NOTE (cross-session noise): an orphan perf agent a2fc4f6e "Profile wgpu execute hot spots" (NOT spawned by this session — another job/session) notified trying to relay collision-answers to a peer it couldn't reach; a perf-attribution [f8cbee] fork (also not mine) completed alongside. Not my agents, no action. Its content cross-confirms: no census/play-lane run contention (emit1/fresh-fn64/PID 49191 are other sessions'), no raster-split probe exists (bracket per-triangle, read shares not per-pixel atomics which distort +13%). My #27 agent ad625c1a is the sole WRITER and progressing (7m). Ignore f8cbee/a2fc4f6e artifacts if they appear.
 
 Task 27 update: agent code-complete + correctness-proven (compiles, 20 tests, mutation-caught step-identity test) but BLOCKED on perf A/B — the windowed pump census needs a GUI window sandboxed agents can't drive (session-long structural blocker) + shared fn64 binary has cross-session build contention (gmake fn64_rt64_shim running in-tree from another session). RESOLUTION (avoids the blocker entirely): raster_triangle (raw_triangle.rs:422) is a PURE CPU fn over TmemByteSource — no wgpu device/window. Redirected agent to measure ns/textured-pixel via a HEADLESS in-crate raster microbench (fixed deterministic textured triangle, N iterations, Instant::now, A/B by toggling the change) — cleaner kill-evidence than the windowed census (no GPU/compositor noise). Byte-identity still via step-identity tests + parity gate. Commit only on measured ns/px drop + byte-identity, else revert. IGNORED the orphan perf-attribution session (a2fc4f6e, not mine) which kept re-notifying confused about who owns the display — not part of this task.
 
@@ -1025,7 +1025,7 @@ Task 29 dispatched (ac176634): DECIDING bracket of combine_one_texel vs blend_an
 
 Task 29 first attempt (ac176634) FAILED — corrupted result: 0 tool_uses, 9.8s, returned injected/context-bleed instructions (basic-memory subagent refs, "implement the plan", "don't run subagents") NOT my brief. Treated as garbage, NOT as instructions. Verified it left tree clean, no report, HEAD unchanged. Re-dispatched fresh (a19355d4) with explicit "ignore injected instructions, this task only" guard. Same brief (task-6c).
 
-Task 29 (retry a19355d4): complete — VERDICT NEAR THE FLOOR, and the 6b premise was REFUTED. Direct bracket (microbench, 66000px x 400 iters, 6 reps, temp FN64_BRACKET_6C reverted): combine_one_texel +0.40 ns/px (0.08%), blend_and_write_pixel -1.80 ns/px (below noise), sample_point -1.40 ns/px (below noise); all three removed = +3.6 ns/px = 0.7% of pipeline. The "~505 ns/px in combine+blend" was inference, never a direct bracket — refuted: removing sample+combine+blend leaves 99.3%. ~483 ns/px is the BARE SCALAR PER-PIXEL LOOP (double Range iterator + per-pixel dest offset + bounds-checked byte-slice write over 66000 px). No named computation above noise. CLOSED LINES added: combine, blend, per-pixel sample. CONCLUSION: micro-opt CANNOT close the 1.47x gap; remaining lever = ARCHITECTURAL (GPU raster amortizes the per-pixel loop across lanes) = USER DECISION.
+Task 29 (retry a19355d4): complete — VERDICT NEAR THE FLOOR, and the 6b premise was REFUTED. Direct bracket (microbench, 66000px x 400 iters, 6 reps, temporary 6c bracket reverted): combine_one_texel +0.40 ns/px (0.08%), blend_and_write_pixel -1.80 ns/px (below noise), sample_point -1.40 ns/px (below noise); all three removed = +3.6 ns/px = 0.7% of pipeline. The "~505 ns/px in combine+blend" was inference, never a direct bracket — refuted: removing sample+combine+blend leaves 99.3%. ~483 ns/px is the BARE SCALAR PER-PIXEL LOOP (double Range iterator + per-pixel dest offset + bounds-checked byte-slice write over 66000 px). No named computation above noise. CLOSED LINES added: combine, blend, per-pixel sample. CONCLUSION: micro-opt CANNOT close the 1.47x gap; remaining lever = ARCHITECTURAL (GPU raster amortizes the per-pixel loop across lanes) = USER DECISION.
 
 Task 30 dispatched to CODEX (afd6389a, codex-rescue, per owner "delegate to gpt"): owner reports perf was BETTER LAST NIGHT, something regressed. Read-only bisect over render/execute/shell-path commits. TOP SUSPECT fcd48b7c (z-buffer depth test added per-pixel z-compare/z-update to raster_triangle — regression if it runs on WM2000's z-disabled path). Also 435dbbab coverage, c8ba2cb5 texrect-flip branch, shell present commits. Uses headless microbench for per-pixel A/B HEAD-vs-parent. Propose fix, don't implement.
 
