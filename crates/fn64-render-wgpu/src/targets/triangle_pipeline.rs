@@ -1653,6 +1653,15 @@ pub(crate) struct ComputeHotColorBatch<'a> {
     pub(crate) tile: TileBindingParams,
 }
 
+/// One state-compatible dispatch in an ordered compute-color chain. The
+/// chain owns the initial target once; later dispatches consume the preceding
+/// dispatch's device result rather than uploading another host snapshot.
+pub(crate) struct ComputeHotColorDispatch<'a> {
+    pub(crate) triangles: &'a [ComputeCoverageTriangle],
+    pub(crate) tmem: &'a TmemGpuProjection,
+    pub(crate) tile: TileBindingParams,
+}
+
 struct PreparedComputeHotColorBatch {
     expected_bytes: usize,
     triangle_bytes: u64,
@@ -2241,6 +2250,210 @@ impl TrianglePipelineRenderer {
             outputs.push(bytes);
         }
         Ok(outputs)
+    }
+
+    /// Executes an ordered sequence of state-compatible dispatches against
+    /// one packed RGBA16 target. Every dispatch after the first is seeded by
+    /// the preceding dispatch's device output through a GPU buffer copy, so
+    /// the chain performs one host upload, one submission/wait, and one
+    /// target readback regardless of the number of typed state boundaries.
+    ///
+    /// Status remains one buffer per dispatch. Collapsing it into the final
+    /// dispatch would let a later successful sample overwrite an earlier
+    /// TMEM refusal, turning a loud error into a silent success.
+    pub(crate) fn compute_triangle_hot_color_chain(
+        &mut self,
+        extent: TriangleTargetExtent,
+        resident_bytes: &[u8],
+        dispatches: &[ComputeHotColorDispatch<'_>],
+    ) -> Result<Vec<u8>, TrianglePipelineError> {
+        if dispatches.is_empty() {
+            return Err(TrianglePipelineError::EmptyCoverageBatch);
+        }
+        validate_triangle_extent(extent)?;
+        let limits = self.device.limits();
+        let pixels = extent
+            .width
+            .checked_mul(extent.height)
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        let expected_bytes = usize::try_from(pixels)
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        if resident_bytes.len() != expected_bytes {
+            return Err(TrianglePipelineError::ComputeColorTargetLength {
+                expected: expected_bytes,
+                actual: resident_bytes.len(),
+            });
+        }
+        let target_bytes = u64::from(pixels.div_ceil(2)) * 4;
+        let status_bytes = u64::from(pixels) * 4;
+        let workgroups = pixels.div_ceil(2).div_ceil(64);
+        if workgroups > limits.max_compute_workgroups_per_dimension
+            || target_bytes > limits.max_buffer_size
+            || target_bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || status_bytes > limits.max_buffer_size
+            || status_bytes > u64::from(limits.max_storage_buffer_binding_size)
+        {
+            return Err(TrianglePipelineError::CoverageTooLarge);
+        }
+
+        let mut prepared = Vec::with_capacity(dispatches.len());
+        for dispatch in dispatches {
+            if dispatch.triangles.is_empty() {
+                return Err(TrianglePipelineError::EmptyCoverageBatch);
+            }
+            let triangle_count = u32::try_from(dispatch.triangles.len())
+                .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+            let triangle_bytes = u64::from(triangle_count) * 160;
+            if triangle_bytes > limits.max_buffer_size
+                || triangle_bytes > u64::from(limits.max_storage_buffer_binding_size)
+            {
+                return Err(TrianglePipelineError::CoverageTooLarge);
+            }
+            let mut packed_triangles = Vec::with_capacity(triangle_bytes as usize);
+            for triangle in dispatch.triangles {
+                packed_triangles.extend_from_slice(&triangle.storage_bytes());
+            }
+            let mut params = Vec::with_capacity(16);
+            for word in [extent.width, extent.height, pixels, triangle_count] {
+                params.extend_from_slice(&word.to_le_bytes());
+            }
+            prepared.push(PreparedComputeHotColorBatch {
+                expected_bytes,
+                triangle_bytes,
+                target_bytes,
+                status_bytes,
+                workgroups,
+                packed_triangles,
+                params,
+                padded_target: Vec::new(),
+            });
+        }
+
+        for (index, batch) in prepared.iter().enumerate() {
+            let replacement = self
+                .compute_hot_color_buffers
+                .get(index)
+                .is_some_and(|buffers| {
+                    !buffers.fits(batch.triangle_bytes, batch.target_bytes, batch.status_bytes)
+                });
+            if index == self.compute_hot_color_buffers.len() || replacement {
+                let buffers = ComputeHotColorBuffers::new(
+                    &self.device,
+                    &self.compute_triangle_color_pipeline,
+                    batch.triangle_bytes,
+                    batch.target_bytes,
+                    batch.status_bytes,
+                );
+                if index == self.compute_hot_color_buffers.len() {
+                    self.compute_hot_color_buffers.push(buffers);
+                } else {
+                    self.compute_hot_color_buffers[index] = buffers;
+                }
+                self.compute_hot_color_resource_generations = self
+                    .compute_hot_color_resource_generations
+                    .checked_add(1)
+                    .expect("compute-color resource generation overflow");
+            }
+        }
+
+        let mut padded_target = resident_bytes.to_vec();
+        padded_target.resize(target_bytes as usize, 0);
+        self.queue
+            .write_buffer(&self.compute_hot_color_buffers[0].target, 0, &padded_target);
+        for (index, (batch, input)) in prepared.iter().zip(dispatches).enumerate() {
+            let buffers = &self.compute_hot_color_buffers[index];
+            self.queue
+                .write_buffer(&buffers.triangle, 0, &batch.packed_triangles);
+            self.queue.write_buffer(&buffers.params, 0, &batch.params);
+            self.queue
+                .write_buffer(&buffers.tmem_bytes, 0, &input.tmem.byte_words_bytes());
+            self.queue.write_buffer(
+                &buffers.tmem_validity,
+                0,
+                &input.tmem.validity_words_bytes(),
+            );
+            self.queue
+                .write_buffer(&buffers.tile, 0, &input.tile.to_bytes());
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fn64-compute-hot-color-chain"),
+            });
+        for (index, batch) in prepared.iter().enumerate() {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("fn64-compute-hot-color-chain-dispatch"),
+                    timestamp_writes: None,
+                });
+                let buffers = &self.compute_hot_color_buffers[index];
+                pass.set_pipeline(&self.compute_triangle_color_pipeline);
+                pass.set_bind_group(0, &buffers.tmem_group, &[]);
+                pass.set_bind_group(1, &buffers.compute_group, &[]);
+                pass.dispatch_workgroups(batch.workgroups, 1, 1);
+            }
+            if let Some(next) = self.compute_hot_color_buffers.get(index + 1) {
+                encoder.copy_buffer_to_buffer(
+                    &self.compute_hot_color_buffers[index].target,
+                    0,
+                    &next.target,
+                    0,
+                    target_bytes,
+                );
+            }
+        }
+        for (index, batch) in prepared.iter().enumerate() {
+            let buffers = &self.compute_hot_color_buffers[index];
+            encoder.copy_buffer_to_buffer(
+                &buffers.status,
+                0,
+                &buffers.status_readback,
+                0,
+                batch.status_bytes,
+            );
+        }
+        let final_buffers = &self.compute_hot_color_buffers[prepared.len() - 1];
+        encoder.copy_buffer_to_buffer(
+            &final_buffers.target,
+            0,
+            &final_buffers.target_readback,
+            0,
+            target_bytes,
+        );
+
+        let submission = self.queue.submit([encoder.finish()]);
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(POLL_TIMEOUT),
+            })
+            .map_err(|error| TrianglePipelineError::ExactSubmissionWait(error.to_string()))?;
+        for (index, batch) in prepared.iter().enumerate() {
+            let statuses = map_and_read_prefix(
+                &self.device,
+                &self.compute_hot_color_buffers[index].status_readback,
+                batch.status_bytes,
+            )?;
+            if let Some((pixel, status)) = statuses
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four status bytes")))
+                .enumerate()
+                .find(|(_, status)| *status != TMEM_SAMPLE_STATUS_OK)
+            {
+                return Err(TrianglePipelineError::ComputeColorBatchTmemStatus {
+                    batch: index,
+                    pixel,
+                    status,
+                });
+            }
+        }
+        let mut output =
+            map_and_read_prefix(&self.device, &final_buffers.target_readback, target_bytes)?;
+        output.truncate(expected_bytes);
+        Ok(output)
     }
 
     /// Submits one fixed-fixture triangle draw (`draw(0..3, 0..1)`) into a
