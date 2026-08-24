@@ -367,6 +367,20 @@ typed dispatches before widening another shader state. Task residency and
 horizontal bounds are retained mechanisms, but together they do not yet fund
 the 13.8 ms certification gap.
 
+`FN64_COMPUTE_CHAIN_TIMING=1` supplies that diagnostic with clocks entirely
+absent when disabled. Thirty measured candidate repetitions attributed a
+2.492 ms mean chain call as follows: 1.995 ms queue/GPU completion wait
+(80.1%), 0.272 ms uploads, 0.138 ms command encoding, 0.037 ms submit, 0.033
+ms status mapping, 0.004 ms target mapping, 0.011 ms bind-group creation, and
+approximately 0.001 ms preparation/resource checks. The surrounding replay
+reported 2.555 ms compute work and retained the same RDRAM SHA-256.
+
+This rejects bind-group caching, readback removal, and host-side check deletion
+as closure candidates. The next profiler must use device timestamps around the
+23 ordered dispatches, if the adapter exposes the required feature, to split
+shader execution from queue latency. The next optimization must then reduce
+dispatch/state-boundary GPU work; host setup is too small to fund the gap.
+
 ## Sources and nonclaims
 
 The semantic oracle is fn64's existing CPU raster and its cited allowed
