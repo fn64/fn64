@@ -1,28 +1,33 @@
 # WM2000 30 Hz optimization loop
 
-Status: active measurement and implementation plan, 2026-08-23.
+Status: active implementation and validation plan, updated 2026-08-24.
 
 ## Sustained-play blocker at the catch-up merge
 
-The 2026-08-24 live Metal/CoreAudio run of the catch-up branch is **not yet
-playable**. Short 180-pump windows had crossed a nominal 16.667 ms host-field
-p95, but that horizon ended near swap 120 and did not reach the deterministic
-later failure. A longer run reached swap approximately 240 and then trapped at
-raw-DPC member ordinal 4091 because the task was marked as a compute shape but
-was not representable by the exact typed compute executor. This is a known
-blocker being merged with the catch-up history; it is not a claim of runtime
-completion.
+The 2026-08-24 clean `main` Metal/CoreAudio run is **not yet certified
+playable**. Its fresh whole-ROM emit and shell build reached swap 240 and
+reproduced raw-DPC member ordinal 4091 exactly. The run also confirmed that all
+450 AI buffers before the trap were zero-valued. Short 180-pump windows had
+crossed a nominal 16.667 ms host-field p95, but that horizon ended near swap 120
+and did not exercise either sustained failure.
 
-The failure mechanism is localized. Planning currently records a loose
-`compute_shape` boolean for any raw-triangle packet without fill or texrect
-members. Execution treats that boolean as proof of compute eligibility, while
-the later exact admission can still reject the program key, TMEM/tile sharing,
-draw state, or batch order. The fix must replace that side channel with one
-move-only planned-task value carrying an explicit execution disposition:
-`Cpu(reason)` or a sealed `ComputeEligible` capability. A typed, deliberately
-non-admitted member takes the existing CPU path before mutation; genuine
-validation or corruption errors remain loud. Catching the generic executor
-error and silently falling back is not acceptable.
+The failure mechanism is localized and the candidate fix is implemented.
+Planning now installs one move-only pending-task value atomically, binding each
+member's carry-in state to only a coarse `ComputeCandidate` hint. Exact
+execution-time program, TMEM/tile, draw-state, and batch-order admission occurs
+before color-generation reservation and produces either a sealed
+`ComputeEligible` deferred completion or a named CPU disposition. Exact
+admission rejection and an ordinary, non-deferred completion are the only
+states routed to the ordered CPU path; genuine validation and corruption errors
+remain loud. Focused content-free tests prove mid-batch planning failure
+installs no partial state, both non-admitted and non-deferred triangles retain
+their ordinary CPU completion, and a live Metal `compute -> CPU -> compute`
+sequence publishes all three generations in order. The first sustained
+candidate run passed the former ordinal-4091 refusal but exposed the missing
+completion-shape check at the same swap-240 frontier. After adding that typed
+check, ten consecutive clean 800-pump Metal/CoreAudio runs completed without a
+trap and retained identical heartbeat hashes through swap 360. The deterministic
+ordinal-4091 blocker is therefore closed; this is not yet a playability claim.
 
 Audio and timing claims are blocked by the same sustained-run frontier. In the
 longer run, the first 450 audio buffers remained zero-valued while underrun
@@ -33,11 +38,14 @@ game frames. The reliability bar for extension headroom is p95 at most 14 ms,
 p99 at most 15.5 ms, maximum at most 16.667 ms across ten sustained runs, stable
 swap hashes, and no audio-underrun or late-callback growth.
 
-Fresh profiling comes after the ordinal-4091 correctness fix and must run past
-swap 240. Profiling the current route would measure a path that deterministically
-terminates before sustained play. The first attribution pass will separate GPU
-host preparation, dispatch span, wait, map/readback, and CPU fallback-member
-categories before selecting the next optimization.
+Those ten runs expose the next repeatable frontier: drawn-frame p95 was
+38.927--39.397 ms, 14.0--14.8% of all 800 measured pumps missed 16.667 ms, and
+the swap-360 window missed on 59/120 pumps. Audio became nonzero by swap 300 in
+every run, but its ring emptied and underrun slots grew sharply during the heavy
+phase; late callbacks remained zero. Fresh profiling can now target this
+reachable route. The first attribution pass will separate GPU host preparation,
+dispatch span, wait, map/readback, and CPU fallback-member categories before
+selecting the next optimization.
 
 ## Goal and acceptance bar
 
