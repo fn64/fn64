@@ -55,7 +55,10 @@ jobs:
       # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
       # libasound headers. Ghidra runner tests execute memory-guard.zsh, while
       # the stock image does not provide zsh.
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev zsh
+      # Renderer tests create a real headless wgpu device. Hosted Linux has no
+      # hardware adapter, so Lavapipe is the explicit test adapter rather than
+      # allowing create() to fail and cascading through every raster fixture.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libvulkan1 mesa-vulkan-drivers zsh
       # The ROM-gated aki-audio-ucode lives in examples/*/audio-ucode, which are
       # their own workspaces -- `--workspace` never reaches them, so no exclude
       # is needed (naming it only emitted "excluded package(s) not found").
