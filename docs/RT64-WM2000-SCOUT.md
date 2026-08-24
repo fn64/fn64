@@ -666,10 +666,9 @@ values:
   behaviour.
 - Frames 248-300: uniform black again.
 
-**Swap 220 digest**:
-`(digest omitted: the frame itself is committed at `docs/scout-frames/wm2000-rs-lane-swap220.png`; no test gates a digest, so citing one would be evidence nothing checks)`
-(sha256 of the PNG). Saved at
-[`docs/scout-frames/wm2000-rs-lane-swap220.png`](scout-frames/wm2000-rs-lane-swap220.png).
+**Swap 220 evidence**: the PNG was retained in operator scratch only. It is
+not committed because it contains game output, and no digest is cited because
+no repository test can gate an external artifact.
 
 **What it shows.** Structured composed geometry: a white band across the
 top third, a large black field, and **two blue textured blocks in the
