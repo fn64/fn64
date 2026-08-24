@@ -6,12 +6,17 @@ tree where the swap-1901 `lookup` trap is fixed), `FN64_RENDER=wgpu`,
 
 ## What these frames are
 
+The frames described here are retained in operator scratch only because they
+contain game output; this directory keeps the measurement record, not the
+PNGs.
+
 `fn64-fb-<swap>.png` is the harness dump, which reads the guest framebuffer at
 a hardcoded 320x240 (`capture_framebuffer` in `packages/wm2000-boot/src/main.rs`).
 WM2000 actually scans out **480x237**, so the raw dump shears every row.
 `reframed-swap-<swap>.png` is the same bytes re-laid at stride 480 by
 `docs/tools/wm2000-reframe.py`, recovering the top 160 true rows unsheared.
-Read the reframed ones; the raw ones are kept only as the unmodified record.
+The analysis used the reframed copies; the raw copies remain only in operator
+scratch as the unmodified record.
 
 ## What they show
 

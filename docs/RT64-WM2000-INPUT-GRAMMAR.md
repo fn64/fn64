@@ -772,8 +772,9 @@ swings, a third camera position at 700. Character bodies move between the
 ropes as large flat-shaded polygons. Over swaps 500-620: **121 frames, 121
 distinct** -- every frame unique.
 
-Frames are committed under `docs/frames/wm2000-attract-ring/`. Read the
-`reframed-*` ones: the harness dumps at a hardcoded 320x240 while WM2000 scans
+The measured frames are retained in operator scratch; their written record is
+under `docs/frames/wm2000-attract-ring/`. The analysis used the `reframed-*`
+copies: the harness dumps at a hardcoded 320x240 while WM2000 scans
 out 480x237, so the raw dumps shear every row (`docs/tools/wm2000-reframe.py`
 re-lays them at stride 480, recovering the top 160 true rows).
 
@@ -785,7 +786,8 @@ textured wrestlers.
 
 ### The menus advance three screens, then stop at a versus screen
 
-Frames committed under `docs/frames/wm2000-menu-progression/`:
+Frames retained in operator scratch and documented under
+`docs/frames/wm2000-menu-progression/`:
 
 | swap | what the frame shows |
 |---|---|
@@ -903,8 +905,7 @@ The second controller **is** reaching the guest -- `sim_time` diverges from the
 one-port run by step 50,000 (895,926,191 vs 895,940,131) and `gfx_tasks` by one
 at swap 2842 -- so the port state is live, not ignored. It simply does not
 change what is drawn. **The versus screen is not gated on a second controller
-being present.** Frame committed as
-`docs/frames/wm2000-menu-progression/reframed-swap-2500-two-controllers.png`.
+being present.** The measured frame is retained in operator scratch only.
 
 That closes the cheapest remaining hypothesis with frames rather than
 inference, and it removes the "unreachable by any button schedule" escape: the
