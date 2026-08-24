@@ -777,6 +777,47 @@ use super::*;
         assert_eq!((extension.start, extension.end), (0x140, 0x180));
     }
 
+    #[test]
+    fn reserved_dpc_batch_allocates_exact_tokens_without_register_mutation_and_activates_in_order() {
+        let mut fabric = fabric();
+        let before = fabric.snapshot();
+        let mut batch = fabric
+            .reserve_dpc_submission_batch_with_temporal_spans(&[
+                (DpcSubmissionSource::Dmem, 0x20, 0x40, 3),
+                (DpcSubmissionSource::Dmem, 0x80, 0xa0, 1),
+            ])
+            .unwrap();
+        assert_eq!(batch.remaining(), 2);
+        assert_eq!(
+            batch.submissions()[1].token,
+            batch.submissions()[0].token + 3,
+            "the second DPC token must sort after the first member's two reserved boundaries"
+        );
+        let reserved = fabric.snapshot();
+        assert_eq!(reserved.dpc_start, before.dpc_start);
+        assert_eq!(reserved.dpc_end, before.dpc_end);
+        assert_eq!(reserved.dpc_current, before.dpc_current);
+        assert_eq!(reserved.dpc_status, before.dpc_status);
+        assert_eq!(fabric.pending_dpc_submission(), None);
+
+        let first = fabric
+            .activate_reserved_dpc_submission(&mut batch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, batch.submissions()[0]);
+        assert_eq!(batch.remaining(), 1);
+        fabric.commit_dpc_submission(first.token).unwrap();
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0x40);
+
+        let second = fabric
+            .activate_reserved_dpc_submission(&mut batch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, batch.submissions()[1]);
+        fabric.commit_dpc_submission(second.token).unwrap();
+        assert_eq!(batch.remaining(), 0);
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0xa0);
+    }
 
     #[test]
     fn empty_dpc_start_end_pair_sets_the_extension_origin() {

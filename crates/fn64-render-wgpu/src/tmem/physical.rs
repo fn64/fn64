@@ -923,6 +923,80 @@ impl PendingTmemTransaction {
             last_load_epoch: self.last_load_epoch,
         })
     }
+
+    /// Derive the private postimage needed by a later member of one ordered
+    /// execution batch while retaining the proposed effects for exact
+    /// validation after the batched device work completes.
+    pub(crate) fn defer_physical_successor(
+        self,
+        base: &PhysicalTmemState,
+        expected_writes: &[fn64_render_ir::ResourceAccess],
+    ) -> Result<DeferredPhysicalTmemSuccessor, PhysicalTmemError> {
+        if base.identity != self.binding.state {
+            return Err(PhysicalTmemError::CrossStatePublication {
+                expected: self.binding.state,
+                actual: base.identity,
+            });
+        }
+        if base.generation != self.binding.base_generation {
+            return Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: self.binding.base_generation,
+                actual: base.generation,
+            });
+        }
+        if base.last_load_epoch != self.binding.base_last_load_epoch {
+            return Err(PhysicalTmemError::StaleLoadEpoch {
+                expected: self.binding.base_last_load_epoch,
+                actual: base.last_load_epoch,
+            });
+        }
+        validate_expected_backend_accesses(expected_writes, &self.effects)?;
+        if revalidate_sealed_tmem_enabled() {
+            validate_proposal(&self)?;
+        }
+        let identity = NEXT_PHYSICAL_TMEM_STATE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(PhysicalTmemStateIdentity)
+            .map_err(|_| PhysicalTmemError::StateIdentityExhausted)?;
+        Ok(DeferredPhysicalTmemSuccessor {
+            physical: PhysicalTmemState {
+                identity,
+                bytes: self.bytes,
+                valid: self.valid,
+                last_touched_generation: self.last_touched_generation,
+                generation: self.binding.next_generation,
+                last_load_epoch: self.last_load_epoch,
+            },
+            proposed_effects: self.effects,
+        })
+    }
+}
+
+/// Private TMEM successor whose bytes are complete but whose enclosing
+/// packet's final backend effect report is still pending batched color work.
+pub(crate) struct DeferredPhysicalTmemSuccessor {
+    physical: PhysicalTmemState,
+    proposed_effects: Box<[CompletedWrite]>,
+}
+
+impl DeferredPhysicalTmemSuccessor {
+    pub(crate) const fn physical(&self) -> &PhysicalTmemState {
+        &self.physical
+    }
+
+    pub(crate) fn proposed_effects(&self) -> &[CompletedWrite] {
+        &self.proposed_effects
+    }
+
+    pub(crate) fn complete(
+        self,
+        effects: &fn64_render_ir::BackendEffectReport,
+    ) -> Result<PhysicalTmemState, PhysicalTmemError> {
+        validate_backend_effects(effects.writes(), &self.proposed_effects)?;
+        Ok(self.physical)
+    }
 }
 
 /// TMEM `bytes`/`valid` copied out of an in-progress
@@ -2246,6 +2320,38 @@ fn validate_backend_effects(
         if reported[matching + 1..]
             .iter()
             .any(|actual| actual.access() == expected.access())
+        {
+            return Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "duplicate proposed access",
+            });
+        }
+        cursor = matching + 1;
+    }
+    Ok(())
+}
+
+fn validate_expected_backend_accesses(
+    expected: &[fn64_render_ir::ResourceAccess],
+    proposed: &[CompletedWrite],
+) -> Result<(), PhysicalTmemError> {
+    if expected.len() < proposed.len() {
+        return Err(PhysicalTmemError::BackendEffectMismatch {
+            field: "write count",
+        });
+    }
+    let mut cursor = 0;
+    for proposed in proposed {
+        let access = proposed.access();
+        let matching = expected[cursor..]
+            .iter()
+            .position(|actual| *actual == access)
+            .map(|offset| cursor + offset)
+            .ok_or(PhysicalTmemError::BackendEffectMismatch {
+                field: "missing proposed write",
+            })?;
+        if expected[matching + 1..]
+            .iter()
+            .any(|actual| *actual == access)
         {
             return Err(PhysicalTmemError::BackendEffectMismatch {
                 field: "duplicate proposed access",

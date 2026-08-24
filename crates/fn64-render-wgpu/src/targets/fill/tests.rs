@@ -315,6 +315,30 @@ fn full_extent_new_target_writes_exact_bytes() {
 }
 
 #[test]
+fn owned_fill_reuses_the_complete_target_allocation() {
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
+    let candidate = registry.begin_candidate(key).unwrap();
+    let resident = vec![0x5a; 16];
+    let allocation = resident.as_ptr();
+    let completed = execute_fill_rectangle_owned(
+        &candidate,
+        fill_cycle_other_mode(),
+        FillColor::from_wire(0xF801_F801),
+        rect(0, 0, 12, 4),
+        crate::targets::RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 0xffff, 0xffff),
+        Some(resident),
+    )
+    .unwrap();
+
+    assert_eq!(completed.device_bytes().device_bytes().as_ptr(), allocation);
+    assert_eq!(
+        completed.device_bytes().device_bytes(),
+        [0xF8, 0x01].repeat(8)
+    );
+}
+
+#[test]
 fn resident_sub_rectangle_write_patches_only_the_claimed_rows_exact_bytes() {
     let mut registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);

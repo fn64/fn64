@@ -23,12 +23,12 @@ pub use production::{
     NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
     NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, NeutralTriangleVertex,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
-    RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
-    RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand, RdpStateIdentity,
-    RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule, RectViewportPixels,
-    TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape, TmemTransferLayout,
-    TriangleAccessSpan, TriangleSource,
+    RawDpcCoordinator, RawDpcExecutionBatch, RawDpcExecutionView, RawDpcIrCapability,
+    RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef,
+    RawDpcTerminalOutcome, RdpFillRectangleCommand, RdpFullSyncSite, RdpStateCommand,
+    RdpStateIdentity, RdpTriangleCommand, ReadyPublication, ReadyRawDpcCommitCapsule,
+    RectViewportPixels, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics, TmemLoadShape,
+    TmemTransferLayout, TriangleAccessSpan, TriangleSource,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.
@@ -425,6 +425,7 @@ impl IrRawDpcBackendCompletion {
 /// hatch anywhere in this module.
 mod production {
     use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
 
     use fn64_render_ir::{
@@ -1853,9 +1854,10 @@ mod production {
         pub fn into_coordinator<P>(self, initial: P) -> RawDpcCoordinator<P> {
             RawDpcCoordinator {
                 authority: self,
-                slots: [Some(initial), None],
+                slots: vec![Some(initial), None],
                 active: 0,
                 ready: None,
+                batch_ready: VecDeque::new(),
             }
         }
     }
@@ -1884,18 +1886,20 @@ mod production {
     struct ReadyPhysicalSlot {
         queue: QueueIdentity,
         submission: SubmissionIdentity,
-        slot_index: u8,
+        slot_index: usize,
         retirement_slot: Rc<RetirementSlot>,
     }
 
     /// Owns one backend's paired [`RawDpcBackendAuthority`] together with
-    /// its double-buffered physical state `P` and the private metadata that
+    /// its publication-buffered physical state `P` and the private metadata that
     /// binds one specific prepared slot to one specific submission. `P` is
     /// the backend's own physical candidate/state value -- a plain owned
     /// type, never a callback or trait object -- so this type is generic
     /// over it without knowing or caring about its fields.
     ///
-    /// **Why two slots, not one `mem::replace`.** `P` is an arbitrary
+    /// Ordinary execution uses two slots; an explicit execution batch adds
+    /// one immutable successor slot per completion until the batch is
+    /// published in order. **Why slots, not one `mem::replace`.** `P` is an arbitrary
     /// backend type whose `Drop` this module does not control; replacing
     /// the *active* slot in place would run the old active `P`'s `Drop`
     /// exactly at the moment a fresh candidate becomes current, meaning an
@@ -1910,9 +1914,10 @@ mod production {
     /// an integer index; it drops nothing.
     pub struct RawDpcCoordinator<P> {
         authority: RawDpcBackendAuthority,
-        slots: [Option<P>; 2],
-        active: u8,
+        slots: Vec<Option<P>>,
+        active: usize,
         ready: Option<ReadyPhysicalSlot>,
+        batch_ready: VecDeque<ReadyPhysicalSlot>,
     }
 
     impl<P> RawDpcCoordinator<P> {
@@ -1920,7 +1925,7 @@ mod production {
         /// successful [`ReadyPublication::commit`] flipped `active` to, or
         /// `into_coordinator`'s `initial` if none has published yet.
         pub fn physical(&self) -> &P {
-            self.slots[self.active as usize]
+            self.slots[self.active]
                 .as_ref()
                 .expect("the active coordinator slot is always occupied")
         }
@@ -1929,6 +1934,27 @@ mod production {
         /// coordinator's own paired authority.
         pub fn begin_plan(&self, request: RawDpcPlanRequest) -> ExactRawDpcPlanWriter {
             self.authority.begin_plan(request)
+        }
+
+        /// Begin an ordered multi-submission execution lifetime. No ordinary
+        /// prepared publication may be outstanding. Old inactive candidates
+        /// are reaped here, before any new execution or terminal commit.
+        pub fn begin_execution_batch(&mut self) -> RawDpcExecutionBatch<'_, P> {
+            assert!(
+                self.ready.is_none() && self.batch_ready.is_empty(),
+                "begin_execution_batch requires no unpublished completion"
+            );
+            if self.active != 0 {
+                self.slots.swap(0, self.active);
+                self.active = 0;
+            }
+            self.slots.truncate(1);
+            self.slots.push(None);
+            RawDpcExecutionBatch {
+                coordinator: self,
+                current_physical: 0,
+                ready: VecDeque::new(),
+            }
         }
 
         /// Forwards to [`BoundSubmittedRawDpc::execution_view`] against this
@@ -1961,9 +1987,13 @@ mod production {
             effects: fn64_render_ir::BackendEffectReport,
             next_physical: P,
         ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            assert!(
+                self.batch_ready.is_empty(),
+                "ordinary completion cannot overtake a prepared execution batch"
+            );
             let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
-            let inactive = 1 - self.active;
-            self.slots[inactive as usize] = Some(next_physical);
+            let inactive = if self.active == 0 { 1 } else { 0 };
+            self.slots[inactive] = Some(next_physical);
             self.ready = Some(ReadyPhysicalSlot {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
@@ -2005,6 +2035,10 @@ mod production {
             &mut self,
             bound: BoundSubmittedRawDpc,
         ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            assert!(
+                self.batch_ready.is_empty(),
+                "ordinary completion cannot overtake a prepared execution batch"
+            );
             let effects =
                 fn64_render_ir::BackendEffectReport::try_new(bound.submitted.packet(), Vec::new())?;
             let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
@@ -2042,6 +2076,10 @@ mod production {
             bound: BoundSubmittedRawDpc,
             effects: fn64_render_ir::BackendEffectReport,
         ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            assert!(
+                self.batch_ready.is_empty(),
+                "ordinary completion cannot overtake a prepared execution batch"
+            );
             let prepared = bound.into_backend_prepared(&mut self.authority, effects)?;
             self.ready = Some(ReadyPhysicalSlot {
                 queue: self.authority.authority.queue_identity(),
@@ -2072,6 +2110,7 @@ mod production {
             let ready = self
                 .ready
                 .take()
+                .or_else(|| self.batch_ready.pop_front())
                 .expect("prepare_publication requires a prior complete_execution for this ordinal");
             assert_eq!(
                 ready.queue,
@@ -2106,6 +2145,102 @@ mod production {
         }
     }
 
+    /// Move-only guard for one ordered backend execution batch. Every
+    /// completion retains its own queue/submission/retirement identity while
+    /// the physical successor of submission N becomes the execution input of
+    /// N+1 before either is published.
+    pub struct RawDpcExecutionBatch<'coord, P> {
+        coordinator: &'coord mut RawDpcCoordinator<P>,
+        current_physical: usize,
+        ready: VecDeque<ReadyPhysicalSlot>,
+    }
+
+    impl<P> RawDpcExecutionBatch<'_, P> {
+        /// Begin an exact plan using the coordinator's paired backend
+        /// authority while this batch exclusively owns the coordinator.
+        pub fn begin_plan(&self, request: RawDpcPlanRequest) -> ExactRawDpcPlanWriter {
+            self.coordinator.authority.begin_plan(request)
+        }
+
+        /// Return the physical successor produced by the most recently
+        /// completed member, or the published seed before the first member.
+        pub fn physical(&self) -> &P {
+            self.coordinator.slots[self.current_physical]
+                .as_ref()
+                .expect("the current batch physical slot is occupied")
+        }
+
+        /// Visit one bound member's exact plan through the paired authority.
+        pub fn execution_view<PV: ExactRawDpcPlanVisitor, V: RawDpcExecutionView<PV>>(
+            &self,
+            bound: &BoundSubmittedRawDpc,
+            plan_visitor: &mut PV,
+            view: &mut V,
+        ) {
+            bound.execution_view(&self.coordinator.authority, plan_visitor, view);
+        }
+
+        /// Record one completed member and retain its physical successor as
+        /// both this member's future publication and the next member's input.
+        pub fn complete_execution(
+            &mut self,
+            bound: BoundSubmittedRawDpc,
+            effects: fn64_render_ir::BackendEffectReport,
+            next_physical: P,
+        ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let prepared = bound.into_backend_prepared(&mut self.coordinator.authority, effects)?;
+            let slot_index = self.coordinator.slots.len();
+            self.coordinator.slots.push(Some(next_physical));
+            self.current_physical = slot_index;
+            self.ready.push_back(ReadyPhysicalSlot {
+                queue: self.coordinator.authority.authority.queue_identity(),
+                submission: prepared.submission(),
+                slot_index,
+                retirement_slot: Rc::clone(&prepared.retirement.slot),
+            });
+            Ok(prepared)
+        }
+
+        /// Record one completed member with real effects but no new physical
+        /// successor; its publication retains the current batch slot.
+        pub fn complete_execution_preserving_physical_with_effects(
+            &mut self,
+            bound: BoundSubmittedRawDpc,
+            effects: fn64_render_ir::BackendEffectReport,
+        ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let prepared = bound.into_backend_prepared(&mut self.coordinator.authority, effects)?;
+            self.ready.push_back(ReadyPhysicalSlot {
+                queue: self.coordinator.authority.authority.queue_identity(),
+                submission: prepared.submission(),
+                slot_index: self.current_physical,
+                retirement_slot: Rc::clone(&prepared.retirement.slot),
+            });
+            Ok(prepared)
+        }
+
+        /// Record one genuinely zero-write member without constructing or
+        /// replacing a physical successor. The packet journal independently
+        /// proves the empty effect list before any ready record is retained.
+        pub fn complete_execution_preserving_physical(
+            &mut self,
+            bound: BoundSubmittedRawDpc,
+        ) -> Result<BackendPreparedRawDpc, ValidationError> {
+            let effects =
+                fn64_render_ir::BackendEffectReport::try_new(bound.submitted.packet(), Vec::new())?;
+            self.complete_execution_preserving_physical_with_effects(bound, effects)
+        }
+
+        /// Seal the ordered ready queue into the coordinator. Dropping the
+        /// guard instead leaves no publishable metadata.
+        pub fn finish(mut self) {
+            assert!(
+                self.coordinator.batch_ready.is_empty(),
+                "an execution batch is already awaiting publication"
+            );
+            self.coordinator.batch_ready = core::mem::take(&mut self.ready);
+        }
+    }
+
     /// Move-only, `#[must_use]` terminal publication: the sole value
     /// [`RawDpcCoordinator::prepare_publication`] produces, and the sole
     /// route to [`CommittedRawDpcOutcome`]. By the time one exists, every
@@ -2123,7 +2258,7 @@ mod production {
     #[must_use = "an unused ReadyPublication cancels its capsule on drop"]
     pub struct ReadyPublication<'coord, 'fabric, P> {
         coordinator: &'coord mut RawDpcCoordinator<P>,
-        ready_index: u8,
+        ready_index: usize,
         capsule: ReadyRawDpcCommitCapsule<'fabric>,
     }
 
@@ -4051,6 +4186,86 @@ mod production {
             assert_eq!(fabric.rsp_execution_state().dpc_current, 0x108);
             assert_eq!(
                 session.ledger.handles[0].outcome(),
+                Some(RawDpcTerminalOutcome::Published)
+            );
+        }
+
+        #[test]
+        fn execution_batch_chains_private_successors_then_publishes_each_submission_in_order() {
+            let (mut session, authority) = new_raw_dpc_roles().unwrap();
+            let mut coordinator = authority.into_coordinator(FakePhysical(0));
+            let (planned_a, destination_a) =
+                planned_fixture(&session, &coordinator.authority, true);
+            let capture_a = matching_guest_read_capture(&planned_a);
+            let (planned_b, destination_b) =
+                planned_fixture(&session, &coordinator.authority, true);
+            let capture_b = matching_guest_read_capture(&planned_b);
+
+            let (prepared_a, prepared_b) = {
+                let mut batch = coordinator.begin_execution_batch();
+
+                let bound_a = session.finalize_and_submit(planned_a, capture_a).unwrap();
+                let effects_a = BackendEffectReport::try_new(
+                    bound_a.submitted.packet(),
+                    vec![CompletedWrite::try_new(
+                        destination_a,
+                        16,
+                        fn64_render_ir::effect_content_digest(&[0xa1; 16]),
+                    )
+                    .unwrap()],
+                )
+                .unwrap();
+                let prepared_a = batch
+                    .complete_execution(bound_a, effects_a, FakePhysical(1))
+                    .unwrap();
+                assert_eq!(batch.physical(), &FakePhysical(1));
+
+                let bound_b = session.finalize_and_submit(planned_b, capture_b).unwrap();
+                let effects_b = BackendEffectReport::try_new(
+                    bound_b.submitted.packet(),
+                    vec![CompletedWrite::try_new(
+                        destination_b,
+                        16,
+                        fn64_render_ir::effect_content_digest(&[0xb2; 16]),
+                    )
+                    .unwrap()],
+                )
+                .unwrap();
+                let prepared_b = batch
+                    .complete_execution(bound_b, effects_b, FakePhysical(2))
+                    .unwrap();
+                assert_eq!(batch.physical(), &FakePhysical(2));
+                batch.finish();
+                (prepared_a, prepared_b)
+            };
+
+            assert_eq!(
+                coordinator.physical(),
+                &FakePhysical(0),
+                "batch execution must not publish a private successor"
+            );
+            let committed_a = session.commit_zero_guest_writes(prepared_a).unwrap();
+            let committed_b = session.commit_zero_guest_writes(prepared_b).unwrap();
+
+            let mut fabric_a = admitted_fabric();
+            let token_a = fabric_a.pending_dpc_submission().unwrap().token;
+            let ready_a = fabric_a.prepare_dpc_commit(token_a).unwrap();
+            let capsule_a = session.seal_publication(committed_a, ready_a).unwrap();
+            coordinator.prepare_publication(capsule_a).commit();
+            assert_eq!(coordinator.physical(), &FakePhysical(1));
+
+            let mut fabric_b = admitted_fabric();
+            let token_b = fabric_b.pending_dpc_submission().unwrap().token;
+            let ready_b = fabric_b.prepare_dpc_commit(token_b).unwrap();
+            let capsule_b = session.seal_publication(committed_b, ready_b).unwrap();
+            coordinator.prepare_publication(capsule_b).commit();
+            assert_eq!(coordinator.physical(), &FakePhysical(2));
+            assert_eq!(
+                session.ledger.handles[0].outcome(),
+                Some(RawDpcTerminalOutcome::Published)
+            );
+            assert_eq!(
+                session.ledger.handles[1].outcome(),
                 Some(RawDpcTerminalOutcome::Published)
             );
         }
