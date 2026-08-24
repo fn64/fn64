@@ -69,6 +69,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The refusal inventory verifies cited assessment commits as commit
+          # objects; a depth-1 checkout cannot satisfy that evidence contract.
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
