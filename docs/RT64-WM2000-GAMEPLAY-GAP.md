@@ -152,7 +152,7 @@ V3, ~925k `RDP_TRI_SHADE_TEX`, composition target must be invented).
 > appeared to show one-pixel striping, and that reading was wrong: the harness
 > captures at a hardcoded 320x240 while WM2000 renders 480x237, which shears
 > every row. See [the frames README](frames/README.md). The correct capture,
-> `docs/frames/wm2000-swap240-true-geometry-480x237.png`, has no striping.
+> retained in operator scratch only, has no striping.
 >
 > This does not clear B3 entirely. The horizontally duplicated menu text this
 > card recorded has the same signature as a stride misread, so it is worth

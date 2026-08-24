@@ -11,7 +11,8 @@ A clean run of the real WM2000 ROM on the all-Rust stack -- `fn64-cpu-runtime`
 plus `fn64-render-wgpu`, no `--features rt64` -- reaches 2,149 VI swaps and
 5,967 gfx tasks, exits 0 with no panics, and terminates on the 400,000-step cap
 rather than on a render wall. No guard is disabled. The captured guest
-framebuffer is `docs/frames/wm2000-swap240-true-geometry-480x237.png`.
+framebuffer was retained in operator scratch only because it contains game
+output.
 
 ## Two claims in the plan were stale
 
