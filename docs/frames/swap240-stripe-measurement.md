@@ -3,7 +3,7 @@
 Measured from the 320x240 PNG the WM2000 harness wrote from guest RDRAM at
 swap 240, and from the live ROM. That misread capture is no longer committed --
 see [the frames README](README.md) for why it was retracted. The correct
-capture is `wm2000-swap240-true-geometry-480x237.png`.
+capture is retained in operator scratch only.
 
 ## 1. The pattern is period 3 at 1/3 density, not period 2 at 1/2
 
@@ -120,8 +120,9 @@ exports beside the `vi_swap_count()` the harness calls two lines away:
     let fb_height = fn64_abi::vi_output_height().unwrap_or(240) as usize;
 
 Verified: with that change and no renderer change at all, the same ROM on the
-same all-Rust stack dumps `docs/frames/wm2000-swap240-true-geometry-480x237.png`
--- 480x237, no striping, vertical coherence 0.958 versus 0.508 before.
+same all-Rust stack dumps a 480x237 frame with no striping and vertical
+coherence 0.958 versus 0.508 before. The frame remains outside git because it
+contains game output.
 
 This file is left in fn64 because the measurement and the RT64 citations
 belong with the renderer; the one-line change belongs to the harness repo,

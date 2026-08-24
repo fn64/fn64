@@ -756,8 +756,8 @@ LAST line, and the run's own summary block agrees with it.
 ### Frame evidence: textured geometry now appears
 
 A `WM2000_FB_DUMP_DIR` run dumps guest framebuffer PNGs (only when
-non-uniform). Measured against the 2D-only baseline
-`docs/frames/wm2000-swap240-true-geometry-480x237.png`:
+non-uniform). Measured against the 2D-only baseline retained in operator
+scratch:
 
 | frame | dims | distinct colours |
 | --- | --- | --- |
@@ -765,8 +765,8 @@ non-uniform). Measured against the 2D-only baseline
 | post-fix (swap 371) | 320x240 | **961** |
 | post-fix (swap 579) | 320x240 | **1017** |
 
-`docs/frames/wm2000-swap579-textured-triangles-320x240.png` is kept as the
-post-fix reference. **Yes, 3D geometry now appears**: the baseline is a
+The post-fix reference is retained in operator scratch rather than committed
+because it contains game output. **Yes, 3D geometry now appears**: the baseline is a
 handful of flat black/white/blue rectangles, and the post-fix frames carry
 a thousand distinct colours across recognizable textured surfaces. A
 hundredfold rise in colour count is not something a 2D blitter produces.
