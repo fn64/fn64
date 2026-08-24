@@ -172,9 +172,16 @@ pub struct WgpuBackend {
     /// transport shape required by replacement; it remains opt-in until the
     /// transaction seam consumes its bytes directly.
     compute_raster_chain_probe_enabled: bool,
+    /// Opt-in production A/B candidate. Eligible all-triangle packets use
+    /// the ordered compute chain as their color executor; every other packet
+    /// retains the existing CPU executor.
+    compute_raster_replace_enabled: bool,
     /// Most recent successful probe execution, consumed by the offline
     /// replay's phase accounting. An ineligible packet leaves this `None`.
     compute_raster_probe_receipt: Option<ComputeRasterProbeReceipt>,
+    /// Most recent packet whose guest-visible target was produced by the
+    /// replacement chain rather than the CPU rasterizer.
+    compute_raster_replace_receipt: Option<ComputeRasterProbeReceipt>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -231,7 +238,9 @@ pub struct ComputeRasterProbeReceipt {
     batch_count: u32,
     draw_count: u32,
     target_pixels: u32,
+    admission_elapsed: Duration,
     elapsed: Duration,
+    effects_elapsed: Duration,
 }
 
 impl ComputeRasterProbeReceipt {
@@ -254,6 +263,14 @@ impl ComputeRasterProbeReceipt {
     pub const fn elapsed(self) -> Duration {
         self.elapsed
     }
+
+    pub const fn admission_elapsed(self) -> Duration {
+        self.admission_elapsed
+    }
+
+    pub const fn effects_elapsed(self) -> Duration {
+        self.effects_elapsed
+    }
 }
 
 struct ComputeRasterProbe {
@@ -265,6 +282,14 @@ struct ComputeRasterProbe {
     tmem: TmemGpuProjection,
     tile: TileBindingParams,
     expected_bytes: Vec<u8>,
+}
+
+struct ComputeRasterDispatch {
+    batch: ComputeRasterBatch,
+    extent: TriangleTargetExtent,
+    triangles: Box<[ComputeCoverageTriangle]>,
+    tmem: TmemGpuProjection,
+    tile: TileBindingParams,
 }
 
 struct ComputeRasterProbeBuilder {
@@ -353,15 +378,29 @@ impl ComputeRasterProbeBuilder {
         Ok(true)
     }
 
+    fn finish_dispatch(self) -> Option<(ComputeRasterDispatch, Vec<u8>)> {
+        Some((
+            ComputeRasterDispatch {
+                batch: self.batch.finish().ok()?,
+                extent: self.extent,
+                triangles: self.triangles.into_boxed_slice(),
+                tmem: self.shared_tmem?,
+                tile: self.shared_tile?,
+            },
+            self.resident_bytes,
+        ))
+    }
+
     fn finish(self, ordinal: u64, expected_bytes: Vec<u8>) -> Option<ComputeRasterProbe> {
+        let (dispatch, resident_bytes) = self.finish_dispatch()?;
         Some(ComputeRasterProbe {
             ordinal,
-            batch: self.batch.finish().ok()?,
-            extent: self.extent,
-            resident_bytes: self.resident_bytes,
-            triangles: self.triangles.into_boxed_slice(),
-            tmem: self.shared_tmem?,
-            tile: self.shared_tile?,
+            batch: dispatch.batch,
+            extent: dispatch.extent,
+            resident_bytes,
+            triangles: dispatch.triangles,
+            tmem: dispatch.tmem,
+            tile: dispatch.tile,
             expected_bytes,
         })
     }
@@ -546,7 +585,9 @@ impl WgpuBackend {
                 compute_raster_chain_probe_enabled: env_exact_one(
                     "FN64_COMPUTE_RASTER_CHAIN_PROBE",
                 ),
+                compute_raster_replace_enabled: env_exact_one("FN64_COMPUTE_RASTER_REPLACE"),
                 compute_raster_probe_receipt: None,
+                compute_raster_replace_receipt: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -587,6 +628,17 @@ impl WgpuBackend {
     pub fn set_compute_raster_chain_probe_enabled(&mut self, enabled: bool) {
         self.compute_raster_chain_probe_enabled = enabled;
         self.compute_raster_probe_receipt = None;
+    }
+
+    /// Selects the transaction-integrated compute replacement for eligible
+    /// packets. It remains an explicit A/B control until live certification.
+    pub fn set_compute_raster_replace_enabled(&mut self, enabled: bool) {
+        self.compute_raster_replace_enabled = enabled;
+        self.compute_raster_replace_receipt = None;
+    }
+
+    pub fn take_compute_raster_replace_receipt(&mut self) -> Option<ComputeRasterProbeReceipt> {
+        self.compute_raster_replace_receipt.take()
     }
 
     /// The currently-published physical TMEM state. Exposed for diagnostics
@@ -1769,6 +1821,13 @@ struct ExecutionCollector<'coord> {
     /// Filled only when the complete color-command schedule is one closed
     /// probe batch. Any boundary or unadmitted state leaves it absent.
     compute_probes: Vec<ComputeRasterProbe>,
+    compute_replacement_enabled: bool,
+    /// Mutable device executor borrowed from the backend only when the
+    /// replacement A/B is enabled. The color stage consumes it before
+    /// effect validation so GPU bytes, not a post-completion probe, become
+    /// the transaction's typed completion.
+    compute_replacement_pipeline: Option<&'coord mut TrianglePipelineRenderer>,
+    compute_replacement_receipt: Option<ComputeRasterProbeReceipt>,
 }
 
 /// What `stage_and_report` found for one sealed plan, structurally
@@ -2705,19 +2764,28 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        let (prepared, triangles, pending, draw_tmem, compute_probes) = execute_raw_dpc_inner(
-            &mut self.coordinator,
-            bound,
-            self.raw_dpc_carry_in_before_last_plan
-                .unwrap_or_else(|| RawDpcCarryIn::capture(&self.rdp_state)),
-            &mut self.color_targets,
-            self.configured_target_extent,
-            self.project_gpu_tmem,
-            self.compute_raster_probe_enabled,
-        )
-        .map_err(RenderError::from)?;
+        let replacement_pipeline = if self.compute_raster_replace_enabled {
+            self.triangle_pipeline.as_deref_mut()
+        } else {
+            None
+        };
+        let (prepared, triangles, pending, draw_tmem, compute_probes, replacement_receipt) =
+            execute_raw_dpc_inner(
+                &mut self.coordinator,
+                bound,
+                self.raw_dpc_carry_in_before_last_plan
+                    .unwrap_or_else(|| RawDpcCarryIn::capture(&self.rdp_state)),
+                &mut self.color_targets,
+                self.configured_target_extent,
+                self.project_gpu_tmem,
+                self.compute_raster_probe_enabled,
+                self.compute_raster_replace_enabled,
+                replacement_pipeline,
+            )
+            .map_err(RenderError::from)?;
 
         self.compute_raster_probe_receipt = None;
+        self.compute_raster_replace_receipt = replacement_receipt;
         let mut probe_elapsed = Duration::ZERO;
         let mut probe_draws = 0u32;
         let mut probe_pixels = 0u32;
@@ -2758,6 +2826,8 @@ impl RenderBackend for WgpuBackend {
                         triangles: &probe.triangles,
                         tmem: &probe.tmem,
                         tile: probe.tile,
+                        first_row: 0,
+                        row_count: probe.extent.height,
                     })
                     .collect();
                 let actual = pipeline
@@ -2802,7 +2872,9 @@ impl RenderBackend for WgpuBackend {
                 batch_count: probe_batches,
                 draw_count: probe_draws,
                 target_pixels: probe_pixels,
+                admission_elapsed: Duration::ZERO,
                 elapsed: probe_elapsed,
+                effects_elapsed: Duration::ZERO,
             });
         }
 
@@ -3271,6 +3343,8 @@ fn execute_raw_dpc_inner(
     configured_target_extent: Option<TriangleTargetExtent>,
     project_gpu_tmem: bool,
     collect_compute_probe: bool,
+    compute_replacement_enabled: bool,
+    compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -3278,6 +3352,7 @@ fn execute_raw_dpc_inner(
         Option<PendingFillPublication>,
         Option<Vec<TmemGpuProjection>>,
         Vec<ComputeRasterProbe>,
+        Option<ComputeRasterProbeReceipt>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -3296,6 +3371,9 @@ fn execute_raw_dpc_inner(
         project_gpu_tmem,
         collect_compute_probe,
         compute_probes: Vec::new(),
+        compute_replacement_enabled,
+        compute_replacement_pipeline,
+        compute_replacement_receipt: None,
     };
     coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
@@ -3310,6 +3388,7 @@ fn execute_raw_dpc_inner(
     // coordinator completion the outcome routes to.
     let draw_tmem = view.draw_tmem;
     let compute_probes = view.compute_probes;
+    let compute_replacement_receipt = view.compute_replacement_receipt;
     let mut pending = None;
 
     let prepared = match outcome {
@@ -3381,7 +3460,14 @@ fn execute_raw_dpc_inner(
         }
     };
 
-    Ok((prepared, triangles, pending, draw_tmem, compute_probes))
+    Ok((
+        prepared,
+        triangles,
+        pending,
+        draw_tmem,
+        compute_probes,
+        compute_replacement_receipt,
+    ))
 }
 
 /// The pipeline `submitted_packet` runs once `&WorkloadPacket` is in scope:
@@ -4131,6 +4217,167 @@ enum TexrectTmemSource<'a> {
     Committed(&'a PhysicalTmemState),
 }
 
+struct ComputeRasterReplacementPlan {
+    dispatches: Vec<ComputeRasterDispatch>,
+    declared: Vec<ResourceAccess>,
+    claimed: TargetRectangle,
+}
+
+fn retain_compute_replacement_draw<S: crate::TmemByteSource + ?Sized>(
+    builder: &mut Option<ComputeRasterProbeBuilder>,
+    dispatches: &mut Vec<ComputeRasterDispatch>,
+    collector: &ExecutionCollector<'_>,
+    candidate: &CandidateColorTarget,
+    index: usize,
+    tmem: &S,
+) -> Result<bool, WgpuRawDpcExecutionError> {
+    if let Some(active) = builder.as_mut() {
+        if active.push(collector, candidate, index, tmem)? {
+            return Ok(true);
+        }
+    }
+    if let Some(previous) = builder.take() {
+        let Some((dispatch, _)) = previous.finish_dispatch() else {
+            return Ok(false);
+        };
+        dispatches.push(dispatch);
+    }
+    let mut next = ComputeRasterProbeBuilder::new(candidate, Vec::new());
+    if !next.push(collector, candidate, index, tmem)? {
+        return Ok(false);
+    }
+    *builder = Some(next);
+    Ok(true)
+}
+
+fn claimed_rectangle_from_accesses(
+    key: ColorTargetKey,
+    accesses: &[ResourceAccess],
+    triangle_index: usize,
+) -> Result<TargetRectangle, WgpuRawDpcExecutionError> {
+    verify_accesses_inside(accesses, key)?;
+    let base = key.address().get();
+    let target_width = key.extent().width();
+    let bytes_per_pixel = key.format().bytes_per_pixel();
+    let mut claimed = None;
+    for access in accesses {
+        let fn64_render_ir::ResourceRegion::Rdram { range, .. } = access.region() else {
+            return Err(WgpuRawDpcExecutionError::FillAccessRegionKind {
+                access_index: access.operation().get(),
+            });
+        };
+        let offset = range.start().get().checked_sub(base).ok_or(
+            WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                access_index: access.operation().get(),
+            },
+        )?;
+        if offset % bytes_per_pixel != 0 || range.len() == 0 || range.len() % bytes_per_pixel != 0 {
+            return Err(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                access_index: access.operation().get(),
+            });
+        }
+        let first_pixel = offset / bytes_per_pixel;
+        let x = first_pixel % target_width;
+        let y = first_pixel / target_width;
+        let width = range.len() / bytes_per_pixel;
+        if x.checked_add(width)
+            .is_none_or(|right| right > target_width)
+        {
+            return Err(WgpuRawDpcExecutionError::FillAccessOutsideTarget {
+                access_index: access.operation().get(),
+            });
+        }
+        claimed = Some(union_target_rectangle(
+            TargetRectangle::try_new(x, y, width, 1)?,
+            claimed,
+        ));
+    }
+    claimed.ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite { triangle_index })
+}
+
+fn plan_compute_raster_replacement(
+    collector: &ExecutionCollector<'_>,
+    candidate: &CandidateColorTarget,
+    schedule: &[(u32, ColorCommandKind)],
+    tmem: &TexrectTmemSource<'_>,
+) -> Result<Option<ComputeRasterReplacementPlan>, WgpuRawDpcExecutionError> {
+    if schedule
+        .iter()
+        .any(|(_, kind)| !matches!(kind, ColorCommandKind::RawTriangle(_)))
+    {
+        return Ok(None);
+    }
+    let mut builder = None;
+    let mut dispatches = Vec::new();
+    for (_, kind) in schedule {
+        let ColorCommandKind::RawTriangle(index) = *kind else {
+            unreachable!("the all-raw-triangle preflight rejected every other command kind")
+        };
+        let command_index = collector.plan.raw_triangle_commands[index].2;
+        let admitted = match tmem {
+            TexrectTmemSource::Pending { pending, prefixes } => {
+                match prefix_before(prefixes, command_index) {
+                    Some(prefix) => retain_compute_replacement_draw(
+                        &mut builder,
+                        &mut dispatches,
+                        collector,
+                        candidate,
+                        index,
+                        &pending.prefix_image(prefix),
+                    )?,
+                    None => retain_compute_replacement_draw(
+                        &mut builder,
+                        &mut dispatches,
+                        collector,
+                        candidate,
+                        index,
+                        collector.physical,
+                    )?,
+                }
+            }
+            TexrectTmemSource::Committed(state) => retain_compute_replacement_draw(
+                &mut builder,
+                &mut dispatches,
+                collector,
+                candidate,
+                index,
+                *state,
+            )?,
+        };
+        if !admitted {
+            return Ok(None);
+        }
+    }
+    if let Some(builder) = builder {
+        let Some((dispatch, _)) = builder.finish_dispatch() else {
+            return Ok(None);
+        };
+        dispatches.push(dispatch);
+    }
+    if dispatches.is_empty() {
+        return Ok(None);
+    }
+    let declared: Vec<_> = dispatches
+        .iter()
+        .flat_map(|dispatch| dispatch.batch.draws())
+        .flat_map(ComputeRasterDrawAdmission::accesses)
+        .copied()
+        .collect();
+    let first_triangle_index = dispatches[0]
+        .batch
+        .draws()
+        .first()
+        .expect("a sealed compute dispatch has an admitted draw")
+        .triangle_index();
+    let claimed =
+        claimed_rectangle_from_accesses(candidate.key(), &declared, first_triangle_index)?;
+    Ok(Some(ComputeRasterReplacementPlan {
+        dispatches,
+        declared,
+        claimed,
+    }))
+}
+
 /// **The N-command accumulation seam.**
 ///
 /// Executes every admitted `FillRectangle` and `TextureRectangle` this
@@ -4265,6 +4512,98 @@ fn stage_color_commands(
     });
     let mut depth_accum: Option<Vec<crate::targets::DepthCell>> =
         wants_depth.then(|| vec![(0u32, 0u8); key.extent().pixels() as usize]);
+
+    if collector.compute_replacement_enabled {
+        let admission_started = Instant::now();
+        if let Some(plan) =
+            plan_compute_raster_replacement(collector, &candidate, &schedule, &tmem)?
+        {
+            let admission_elapsed = admission_started.elapsed();
+            let initial = accumulated
+                .take()
+                .ok_or(crate::targets::TexrectExecutionError::MissingResidentBytes { key })?;
+            let pipeline = collector
+                .compute_replacement_pipeline
+                .as_deref_mut()
+                .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)?;
+            let dispatches: Vec<_> = plan
+                .dispatches
+                .iter()
+                .map(|dispatch| {
+                    let accesses: Vec<_> = dispatch
+                        .batch
+                        .draws()
+                        .iter()
+                        .flat_map(ComputeRasterDrawAdmission::accesses)
+                        .copied()
+                        .collect();
+                    let first_triangle_index = dispatch
+                        .batch
+                        .draws()
+                        .first()
+                        .expect("a sealed compute dispatch has an admitted draw")
+                        .triangle_index();
+                    let claimed =
+                        claimed_rectangle_from_accesses(key, &accesses, first_triangle_index)?;
+                    Ok(ComputeHotColorDispatch {
+                        triangles: &dispatch.triangles,
+                        tmem: &dispatch.tmem,
+                        tile: dispatch.tile,
+                        first_row: claimed.y(),
+                        row_count: claimed.height(),
+                    })
+                })
+                .collect::<Result<_, WgpuRawDpcExecutionError>>()?;
+            let extent = plan.dispatches[0].extent;
+            let target_pixels = dispatches.iter().try_fold(0u32, |count, dispatch| {
+                count.checked_add(extent.width.checked_mul(dispatch.row_count)?)
+            });
+            let target_pixels =
+                target_pixels.expect("bounded replacement target-pixel count fits u32");
+            let started = Instant::now();
+            let output = pipeline
+                .compute_triangle_hot_color_chain(extent, &initial, &dispatches)
+                .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+            let elapsed = started.elapsed();
+            let draw_count = plan.dispatches.iter().try_fold(0u32, |count, dispatch| {
+                count.checked_add(u32::try_from(dispatch.batch.draws().len()).ok()?)
+            });
+            let draw_count = draw_count.expect("bounded raw-DPC replacement draw count fits u32");
+            let batch_count = u32::try_from(plan.dispatches.len())
+                .expect("bounded raw-DPC replacement batch count fits u32");
+            let effects_started = Instant::now();
+            let device_bytes = crate::DeviceColorBytes::new_for_fill(
+                key,
+                candidate.generation(),
+                key.format(),
+                output,
+            )?;
+            let completed = CompletedColorTargetWrite::new_for_fill(
+                key,
+                candidate.generation(),
+                key.range(),
+                plan.claimed,
+                device_bytes,
+            );
+            let guest_writes =
+                fill_completed_writes(key, completed.device_bytes(), &plan.declared)?;
+            let initialized = candidate.admit_completed_initialization(completed)?;
+            let effects_elapsed = effects_started.elapsed();
+            collector.compute_replacement_receipt = Some(ComputeRasterProbeReceipt {
+                submission_count: 1,
+                batch_count,
+                draw_count,
+                target_pixels,
+                admission_elapsed,
+                elapsed,
+                effects_elapsed,
+            });
+            return Ok(Some(StagedFill {
+                initialized,
+                guest_writes,
+            }));
+        }
+    }
 
     // Accesses only, in schedule order. Digests are deliberately absent
     // until the loop ends -- see this function's own doc on staleness.
@@ -10495,18 +10834,21 @@ mod tests {
         let planned = plan_with_no_reads(&mut backend, &session, whole_target_fill_words());
         let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
-        let (_prepared, _triangles, pending, _draw_tmem, _probe) = execute_raw_dpc_inner(
-            &mut backend.coordinator,
-            bound,
-            backend
-                .raw_dpc_carry_in_before_last_plan
-                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
-            &mut backend.color_targets,
-            backend.configured_target_extent,
-            true,
-            false,
-        )
-        .expect("the fill half must stage a real token");
+        let (_prepared, _triangles, pending, _draw_tmem, _probe, _replacement) =
+            execute_raw_dpc_inner(
+                &mut backend.coordinator,
+                bound,
+                backend
+                    .raw_dpc_carry_in_before_last_plan
+                    .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+                &mut backend.color_targets,
+                backend.configured_target_extent,
+                true,
+                false,
+                false,
+                None,
+            )
+            .expect("the fill half must stage a real token");
         assert!(
             pending.is_some(),
             "this fixture must actually produce a token, or the ordering claim is vacuous"
@@ -11927,6 +12269,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -12243,6 +12588,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -13261,18 +13609,21 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, _triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
-            &mut backend.coordinator,
-            bound,
-            backend
-                .raw_dpc_carry_in_before_last_plan
-                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
-            &mut backend.color_targets,
-            backend.configured_target_extent,
-            true,
-            false,
-        )
-        .expect("the sprite strip must execute");
+        let (_prepared, _triangles, _pending, draw_tmem, _probe, _replacement) =
+            execute_raw_dpc_inner(
+                &mut backend.coordinator,
+                bound,
+                backend
+                    .raw_dpc_carry_in_before_last_plan
+                    .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+                &mut backend.color_targets,
+                backend.configured_target_extent,
+                true,
+                false,
+                false,
+                None,
+            )
+            .expect("the sprite strip must execute");
 
         let projections =
             draw_tmem.expect("a load-bearing packet must carry per-triangle TMEM projections");
@@ -13338,18 +13689,21 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
-            &mut backend.coordinator,
-            bound,
-            backend
-                .raw_dpc_carry_in_before_last_plan
-                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
-            &mut backend.color_targets,
-            backend.configured_target_extent,
-            false,
-            false,
-        )
-        .expect("the CPU-raster sprite strip must execute");
+        let (_prepared, triangles, _pending, draw_tmem, _probe, _replacement) =
+            execute_raw_dpc_inner(
+                &mut backend.coordinator,
+                bound,
+                backend
+                    .raw_dpc_carry_in_before_last_plan
+                    .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+                &mut backend.color_targets,
+                backend.configured_target_extent,
+                false,
+                false,
+                false,
+                None,
+            )
+            .expect("the CPU-raster sprite strip must execute");
 
         assert_eq!(triangles.len(), SPRITE_STRIP_PAIRS * 2);
         assert!(
@@ -13458,6 +13812,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan.triangle_commands
@@ -13626,18 +13983,21 @@ mod tests {
         let capture = guest_read_capture_per_read(&planned, &distinct);
         let bound = session.finalize_and_submit(planned, capture).unwrap();
 
-        let (_prepared, _triangles, _pending, draw_tmem, _probe) = execute_raw_dpc_inner(
-            &mut backend.coordinator,
-            bound,
-            backend
-                .raw_dpc_carry_in_before_last_plan
-                .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
-            &mut backend.color_targets,
-            backend.configured_target_extent,
-            true,
-            false,
-        )
-        .expect("a texrect before the packet's own load reads durable TMEM and executes");
+        let (_prepared, _triangles, _pending, draw_tmem, _probe, _replacement) =
+            execute_raw_dpc_inner(
+                &mut backend.coordinator,
+                bound,
+                backend
+                    .raw_dpc_carry_in_before_last_plan
+                    .unwrap_or_else(|| RawDpcCarryIn::capture(&backend.rdp_state)),
+                &mut backend.color_targets,
+                backend.configured_target_extent,
+                true,
+                false,
+                false,
+                None,
+            )
+            .expect("a texrect before the packet's own load reads durable TMEM and executes");
 
         let projections = draw_tmem.expect("a load-bearing packet carries projections");
         assert_eq!(projections.len(), 4, "two texrects, two triangles each");
@@ -14116,6 +14476,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -14167,6 +14530,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
         view.plan
@@ -16197,6 +16563,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         backend
             .coordinator
@@ -16532,6 +16901,9 @@ mod tests {
             project_gpu_tmem: true,
             collect_compute_probe: false,
             compute_probes: Vec::new(),
+            compute_replacement_enabled: false,
+            compute_replacement_pipeline: None,
+            compute_replacement_receipt: None,
         };
         coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
 
@@ -16736,7 +17108,7 @@ mod tests {
         // sibling documents at
         // `execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot`.
         let mut color_targets = None;
-        let (_, triangles, _, _, _) = execute_raw_dpc_inner(
+        let (_, triangles, _, _, _, _) = execute_raw_dpc_inner(
             &mut backend.coordinator,
             bound,
             backend
@@ -16746,6 +17118,8 @@ mod tests {
             backend.configured_target_extent,
             true,
             false,
+            false,
+            None,
         )
         .expect("the triangle-then-SetOtherMode submission executes cleanly");
 
