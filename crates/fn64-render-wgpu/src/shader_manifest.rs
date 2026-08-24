@@ -108,16 +108,64 @@ pub const COMPUTE_TRIANGLE_COVERAGE_ENTRY_POINT: &str = "compute_triangle_covera
 pub const COMPUTE_TRIANGLE_HOT_COLOR_ENTRY_POINT: &str = "compute_triangle_hot_color";
 
 /// Exact compute-raster module assembly. Compute-owned resources live in
-/// bind group 1; the unchanged TMEM sampler keeps its proven group-0 ABI.
+/// bind group 1. The compute-only TMEM variant retains the proven sampler
+/// arithmetic while widening group 0 into immutable per-dispatch state
+/// tables. Each invocation selects its current state before calling the
+/// unchanged addressing and decoding functions.
 pub fn compute_triangle_color_wgsl() -> String {
+    let compute_tmem = compute_tmem_sample_wgsl();
     format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         crate::combiner::COLOR_COMBINER_WGSL,
-        TMEM_SAMPLE_WGSL,
+        compute_tmem,
         crate::alpha_compare::ALPHA_COMPARE_FRAGMENT_FN_WGSL,
         crate::coverage::COVERAGE_FRAGMENT_FN_WGSL,
         crate::blend::BLEND_FRAGMENT_FN_WGSL,
         COMPUTE_TRIANGLE_COVERAGE_WGSL,
+    )
+}
+
+fn compute_tmem_sample_wgsl() -> String {
+    fn replace_once(source: String, from: &str, to: &str) -> String {
+        assert_eq!(
+            source.matches(from).count(),
+            1,
+            "compute TMEM source seam {from:?} must occur exactly once"
+        );
+        source.replacen(from, to, 1)
+    }
+
+    let source = replace_once(
+        TMEM_SAMPLE_WGSL.to_owned(),
+        "@group(0) @binding(2)\nvar<storage, read> tmem_bytes: array<u32, 1024>;\n\
+         @group(0) @binding(3)\nvar<storage, read> tmem_validity_words: array<u32, 128>;\n\
+         @group(0) @binding(4)\nvar<uniform> tmem_tile_binding: TileBindingParams;",
+        "@group(0) @binding(2)\nvar<storage, read> tmem_bytes: array<u32>;\n\
+         @group(0) @binding(3)\nvar<storage, read> tmem_validity_words: array<u32>;\n\
+         @group(0) @binding(4)\nvar<storage, read> tmem_tile_bindings: array<TileBindingParams>;\n\
+         var<private> tmem_state_index: u32;",
+    );
+    let source = replace_once(
+        source,
+        "let word = tmem_validity_words[address / 32u];",
+        "let word = tmem_validity_words[tmem_state_index * 128u + address / 32u];",
+    );
+    let source = replace_once(
+        source,
+        "let word = tmem_bytes[address / 4u];",
+        "let word = tmem_bytes[tmem_state_index * 1024u + address / 4u];",
+    );
+    let source = replace_once(
+        source,
+        "return sample_committed_rgba16_three_nearest(tmem_tile_binding, raw_s, raw_t);",
+        "return sample_committed_rgba16_three_nearest(\n\
+             tmem_tile_bindings[tmem_state_index], raw_s, raw_t\n\
+         );",
+    );
+    replace_once(
+        source,
+        "fn sample_committed_rgba16_point_bound(raw_s: i32, raw_t: i32) -> TmemSampleResult {\n    var result: TmemSampleResult;",
+        "fn sample_committed_rgba16_point_bound(raw_s: i32, raw_t: i32) -> TmemSampleResult {\n    let tmem_tile_binding = tmem_tile_bindings[tmem_state_index];\n    var result: TmemSampleResult;",
     )
 }
 
