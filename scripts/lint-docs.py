@@ -655,6 +655,12 @@ RUST_ITEM = re.compile(
 )
 
 
+def _is_port_source_path(path: str) -> bool:
+    return path.startswith("crates/") and path.endswith(".rs") and not any(
+        excluded in path for excluded in ("/tests/", "/examples/", "/bin/")
+    )
+
+
 def _is_upstream_symbol(token: str) -> bool:
     """True for an upstream C++ name: camelCase, PascalCase, or a dimension
     suffix (`extract3x3`) that has no case transition at all."""
@@ -762,7 +768,7 @@ def _rust_item_index() -> tuple[dict, dict]:
     out = subprocess.run(
         ["git", "grep", "-nE",
          r"^\s*(pub(\([^)]*\))? )?(fn|struct|enum) [A-Za-z_]",
-         "--", "crates/*.rs", "crates/**/*.rs"],
+         "--", "crates"],
         cwd=ROOT, capture_output=True, text=True,
     ).stdout
     public: dict[tuple[str, str], str] = {}
@@ -772,7 +778,7 @@ def _rust_item_index() -> tuple[dict, dict]:
         if not m:
             continue
         path, lineno, _, vis, _kind, name = m.groups()
-        if "/tests/" in path or "/examples/" in path or "/bin/" in path:
+        if not _is_port_source_path(path):
             continue
         # `pub(crate)`/`pub(super)` is NOT reachable from another module the
         # way a card would need; count it with private.
@@ -1067,6 +1073,9 @@ def selftest() -> int:
          lambda: all("*" in r for r in REF.findall("`crates/*/tests/`"))),
         ("env var regex", "catches a fake var",
          lambda: ENV.findall("set `FN64_TOTALLY_FAKE=1`") == ["FN64_TOTALLY_FAKE"]),
+        ("nested port source path", "git pathspec depth must not hide crate modules",
+         lambda: _is_port_source_path("crates/fn64-render-wgpu/src/rt64_rigid_body.rs")
+         and not _is_port_source_path("crates/fn64-render-wgpu/tests/fixture.rs")),
         ("closed-item cap fires", "a bloated [x] item must fail",
          _closed_item_check_fires),
         # The digit boundary is the part that silently gets this wrong.
