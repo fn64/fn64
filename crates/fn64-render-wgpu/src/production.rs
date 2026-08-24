@@ -73,6 +73,155 @@ use crate::{
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
+/// Low-overhead decomposition of the production raw-DPC execute phase.
+///
+/// `FN64_RAW_DPC_EXEC_CENSUS=1` records only submission-boundary clock reads;
+/// it never times a pixel. Every 10,000 completed execution views it prints
+/// cumulative nested totals. `stage` is inside `view`, and `color` is inside
+/// `stage`; the report prints their residuals explicitly so nested time is not
+/// accidentally added twice. When disabled, `timed` calls its closure without
+/// reading the clock.
+mod raw_dpc_execute_census {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        OnceLock,
+    };
+
+    #[derive(Clone, Copy)]
+    pub(super) enum Phase {
+        View,
+        Stage,
+        Color,
+        ColorFill,
+        ColorTexrect,
+        ColorTriangle,
+        ColorFinalize,
+        Complete,
+        DrawValidation,
+    }
+
+    static VIEW_NS: AtomicU64 = AtomicU64::new(0);
+    static STAGE_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_FILL_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_TEXRECT_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_TRIANGLE_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_FINALIZE_NS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_FILL_CALLS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_TEXRECT_CALLS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_TRIANGLE_CALLS: AtomicU64 = AtomicU64::new(0);
+    static COLOR_FINALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+    static COMPLETE_NS: AtomicU64 = AtomicU64::new(0);
+    static DRAW_VALIDATION_NS: AtomicU64 = AtomicU64::new(0);
+    static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FN64_RAW_DPC_EXEC_CENSUS")
+                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+        })
+    }
+
+    pub(super) fn timed<R>(phase: Phase, operation: impl FnOnce() -> R) -> R {
+        if !enabled() {
+            return operation();
+        }
+        let started = std::time::Instant::now();
+        let value = operation();
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        match phase {
+            Phase::View => &VIEW_NS,
+            Phase::Stage => &STAGE_NS,
+            Phase::Color => &COLOR_NS,
+            Phase::ColorFill => &COLOR_FILL_NS,
+            Phase::ColorTexrect => &COLOR_TEXRECT_NS,
+            Phase::ColorTriangle => &COLOR_TRIANGLE_NS,
+            Phase::ColorFinalize => &COLOR_FINALIZE_NS,
+            Phase::Complete => &COMPLETE_NS,
+            Phase::DrawValidation => &DRAW_VALIDATION_NS,
+        }
+        .fetch_add(elapsed, Relaxed);
+        match phase {
+            Phase::ColorFill => &COLOR_FILL_CALLS,
+            Phase::ColorTexrect => &COLOR_TEXRECT_CALLS,
+            Phase::ColorTriangle => &COLOR_TRIANGLE_CALLS,
+            Phase::ColorFinalize => &COLOR_FINALIZE_CALLS,
+            _ => &SUBMISSIONS,
+        }
+        .fetch_add(
+            u64::from(matches!(
+                phase,
+                Phase::ColorFill
+                    | Phase::ColorTexrect
+                    | Phase::ColorTriangle
+                    | Phase::ColorFinalize
+            )),
+            Relaxed,
+        );
+        if matches!(phase, Phase::View) {
+            let submissions = SUBMISSIONS.fetch_add(1, Relaxed) + 1;
+            if submissions % 10_000 == 0 {
+                report(submissions);
+            }
+        }
+        value
+    }
+
+    fn report(submissions: u64) {
+        let view = VIEW_NS.load(Relaxed);
+        let stage = STAGE_NS.load(Relaxed);
+        let color = COLOR_NS.load(Relaxed);
+        let fill = COLOR_FILL_NS.load(Relaxed);
+        let texrect = COLOR_TEXRECT_NS.load(Relaxed);
+        let triangle = COLOR_TRIANGLE_NS.load(Relaxed);
+        let finalize = COLOR_FINALIZE_NS.load(Relaxed);
+        let complete = COMPLETE_NS.load(Relaxed);
+        let draw = DRAW_VALIDATION_NS.load(Relaxed);
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let per = |ns: u64| ms(ns) / submissions as f64;
+        println!(
+            "[fn64-execute-census] submissions={submissions} accounted_ms={:.3} view_ms={:.3} \
+             view_residual_ms={:.3} stage_ms={:.3} stage_non_color_ms={:.3} color_ms={:.3} \
+             complete_ms={:.3} draw_validation_ms={:.3}",
+            ms(view.saturating_add(complete).saturating_add(draw)),
+            ms(view),
+            ms(view.saturating_sub(stage)),
+            ms(stage),
+            ms(stage.saturating_sub(color)),
+            ms(color),
+            ms(complete),
+            ms(draw),
+        );
+        let color_commands = fill.saturating_add(texrect).saturating_add(triangle);
+        println!(
+            "[fn64-execute-census] color_breakdown_ms setup_and_loop={:.3} fill={:.3} \
+             texrect={:.3} triangle={:.3} finalize={:.3} calls fill={} texrect={} triangle={} \
+             finalize={}",
+            ms(color
+                .saturating_sub(color_commands)
+                .saturating_sub(finalize)),
+            ms(fill),
+            ms(texrect),
+            ms(triangle),
+            ms(finalize),
+            COLOR_FILL_CALLS.load(Relaxed),
+            COLOR_TEXRECT_CALLS.load(Relaxed),
+            COLOR_TRIANGLE_CALLS.load(Relaxed),
+            COLOR_FINALIZE_CALLS.load(Relaxed),
+        );
+        println!(
+            "[fn64-execute-census] per_submission_ms view={:.6} stage={:.6} color={:.6} \
+             complete={:.6} draw_validation={:.6}",
+            per(view),
+            per(stage),
+            per(color),
+            per(complete),
+            per(draw),
+        );
+    }
+}
+
 /// Every durable RDP register the execution walk may read before this
 /// submission issues its first state command. One value represents one stream
 /// instant; its fields cannot drift across the packet boundary independently.
@@ -1928,7 +2077,10 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
     }
 
     fn submitted_packet(&mut self, packet: &WorkloadPacket) {
-        self.outcome = Some(stage_and_report(self, packet));
+        self.outcome = Some(raw_dpc_execute_census::timed(
+            raw_dpc_execute_census::Phase::Stage,
+            || stage_and_report(self, packet),
+        ));
     }
 }
 
@@ -2909,8 +3061,10 @@ impl RenderBackend for WgpuBackend {
         if !triangles.is_empty() {
             // Always called: it validates. Only its GPU submission is gated,
             // inside the function -- see the note there.
-            self.draw_admitted_triangles(triangles, draw_tmem, self.project_gpu_tmem)
-                .map_err(RenderError::from)?;
+            raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::DrawValidation, || {
+                self.draw_admitted_triangles(triangles, draw_tmem, self.project_gpu_tmem)
+            })
+            .map_err(RenderError::from)?;
         }
 
         // Stored only after every fallible step of THIS submission has
@@ -3375,7 +3529,9 @@ fn execute_raw_dpc_inner(
         compute_replacement_pipeline,
         compute_replacement_receipt: None,
     };
-    coordinator.execution_view(&bound, &mut plan_visitor, &mut view);
+    raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::View, || {
+        coordinator.execution_view(&bound, &mut plan_visitor, &mut view)
+    });
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
 
     let submission = bound.submission();
@@ -3389,76 +3545,81 @@ fn execute_raw_dpc_inner(
     let draw_tmem = view.draw_tmem;
     let compute_probes = view.compute_probes;
     let compute_replacement_receipt = view.compute_replacement_receipt;
-    let mut pending = None;
-
-    let prepared = match outcome {
-        StagedOutcome::TmemLoads(effects, next_physical) => coordinator
-            .complete_execution(bound, effects, next_physical)
-            .map_err(WgpuRawDpcExecutionError::Coordinator)?,
-        // Mechanical, not inferred: `StagedOutcome::NoPhysicalSuccessor` is only
-        // ever produced when `stage_and_report` observed zero completed
-        // TMEM loads AND at least one admitted triangle (§1c) -- a mixed
-        // plan (loads + triangles) always takes the `TmemLoads` arm above,
-        // never this one. `complete_execution_preserving_physical` itself
-        // additionally, structurally rejects any packet whose journal
-        // declares write accesses (its own internal
-        // `BackendEffectReport::try_new(packet, Vec::new())` call fails
-        // `validate_effects`'s access-count check if the journal expects
-        // any writes) -- this branch selection and that internal
-        // validation are two independent enforcements of the same
-        // invariant, not one relying on the other.
-        StagedOutcome::NoPhysicalSuccessor => coordinator
-            .complete_execution_preserving_physical(bound)
-            .map_err(WgpuRawDpcExecutionError::Coordinator)?,
-        // A fill-only plan: real guest-visible writes, no physical-TMEM
-        // successor. `complete_execution_preserving_physical` is not a legal
-        // destination -- it builds its own *empty* effect report and would
-        // reject this packet's nonempty write journal -- and
-        // `complete_execution` has no `PhysicalTmemState` successor to
-        // offer, because a color-target write never touches physical TMEM.
-        //
-        // The staged token is only recorded *after* the coordinator accepts
-        // the completion: a rejected completion must leave
-        // `pending_fill_publication` untouched, so a later `publish_raw_dpc`
-        // can never redeem a fill whose submission never completed.
-        StagedOutcome::GuestWritesOnly(effects, staged) => {
-            let prepared = coordinator
-                .complete_execution_preserving_physical_with_effects(bound, effects)
-                .map_err(WgpuRawDpcExecutionError::Coordinator)?;
-            pending = Some(PendingFillPublication {
-                submission,
-                initialized: staged.initialized,
-                guest_writes: staged.guest_writes,
-            });
-            prepared
-        }
-        // Both sources in one packet. `complete_execution` -- the same arm
-        // a TMEM-only packet takes -- because this packet genuinely has a
-        // physical successor to install, and it is the only completion that
-        // installs one. The fill token is recorded exactly as the fill-only
-        // arm records it, and for the identical reason: only after the
-        // coordinator has accepted the completion, so a rejected completion
-        // leaves nothing a later `publish_raw_dpc` could redeem.
-        //
-        // The two publications this packet produces stay distinct and each
-        // stays gated on its own acceptance -- the physical-TMEM successor
-        // by `complete_execution`'s inactive-slot record, redeemed when
-        // `prepare_publication`/`commit` flips the active slot, and the
-        // resident color generation by this token, redeemed separately in
-        // `publish_raw_dpc`. Composition merged the *write report*; it did
-        // not merge the two publication identities.
-        StagedOutcome::MixedFillAndTmemLoads(effects, next_physical, staged) => {
-            let prepared = coordinator
-                .complete_execution(bound, effects, next_physical)
-                .map_err(WgpuRawDpcExecutionError::Coordinator)?;
-            pending = Some(PendingFillPublication {
-                submission,
-                initialized: staged.initialized,
-                guest_writes: staged.guest_writes,
-            });
-            prepared
-        }
-    };
+    let (prepared, pending) = raw_dpc_execute_census::timed(
+        raw_dpc_execute_census::Phase::Complete,
+        || -> Result<_, WgpuRawDpcExecutionError> {
+            let mut pending = None;
+            let prepared = match outcome {
+                StagedOutcome::TmemLoads(effects, next_physical) => coordinator
+                    .complete_execution(bound, effects, next_physical)
+                    .map_err(WgpuRawDpcExecutionError::Coordinator)?,
+                // Mechanical, not inferred: `StagedOutcome::NoPhysicalSuccessor` is only
+                // ever produced when `stage_and_report` observed zero completed
+                // TMEM loads AND at least one admitted triangle (§1c) -- a mixed
+                // plan (loads + triangles) always takes the `TmemLoads` arm above,
+                // never this one. `complete_execution_preserving_physical` itself
+                // additionally, structurally rejects any packet whose journal
+                // declares write accesses (its own internal
+                // `BackendEffectReport::try_new(packet, Vec::new())` call fails
+                // `validate_effects`'s access-count check if the journal expects
+                // any writes) -- this branch selection and that internal
+                // validation are two independent enforcements of the same
+                // invariant, not one relying on the other.
+                StagedOutcome::NoPhysicalSuccessor => coordinator
+                    .complete_execution_preserving_physical(bound)
+                    .map_err(WgpuRawDpcExecutionError::Coordinator)?,
+                // A fill-only plan: real guest-visible writes, no physical-TMEM
+                // successor. `complete_execution_preserving_physical` is not a legal
+                // destination -- it builds its own *empty* effect report and would
+                // reject this packet's nonempty write journal -- and
+                // `complete_execution` has no `PhysicalTmemState` successor to
+                // offer, because a color-target write never touches physical TMEM.
+                //
+                // The staged token is only recorded *after* the coordinator accepts
+                // the completion: a rejected completion must leave
+                // `pending_fill_publication` untouched, so a later `publish_raw_dpc`
+                // can never redeem a fill whose submission never completed.
+                StagedOutcome::GuestWritesOnly(effects, staged) => {
+                    let prepared = coordinator
+                        .complete_execution_preserving_physical_with_effects(bound, effects)
+                        .map_err(WgpuRawDpcExecutionError::Coordinator)?;
+                    pending = Some(PendingFillPublication {
+                        submission,
+                        initialized: staged.initialized,
+                        guest_writes: staged.guest_writes,
+                    });
+                    prepared
+                }
+                // Both sources in one packet. `complete_execution` -- the same arm
+                // a TMEM-only packet takes -- because this packet genuinely has a
+                // physical successor to install, and it is the only completion that
+                // installs one. The fill token is recorded exactly as the fill-only
+                // arm records it, and for the identical reason: only after the
+                // coordinator has accepted the completion, so a rejected completion
+                // leaves nothing a later `publish_raw_dpc` could redeem.
+                //
+                // The two publications this packet produces stay distinct and each
+                // stays gated on its own acceptance -- the physical-TMEM successor
+                // by `complete_execution`'s inactive-slot record, redeemed when
+                // `prepare_publication`/`commit` flips the active slot, and the
+                // resident color generation by this token, redeemed separately in
+                // `publish_raw_dpc`. Composition merged the *write report*; it did
+                // not merge the two publication identities.
+                StagedOutcome::MixedFillAndTmemLoads(effects, next_physical, staged) => {
+                    let prepared = coordinator
+                        .complete_execution(bound, effects, next_physical)
+                        .map_err(WgpuRawDpcExecutionError::Coordinator)?;
+                    pending = Some(PendingFillPublication {
+                        submission,
+                        initialized: staged.initialized,
+                        guest_writes: staged.guest_writes,
+                    });
+                    prepared
+                }
+            };
+            Ok((prepared, pending))
+        },
+    )?;
 
     Ok((
         prepared,
@@ -4011,14 +4172,16 @@ fn stage_and_report(
     // staging last means a TMEM rejection returns `Err` with no token in
     // existence at all, which is the same "nothing published" outcome the
     // fill-only path reaches by never storing the token on the error path.
-    let staged_fill = stage_color_commands(
-        collector,
-        packet,
-        TexrectTmemSource::Pending {
-            pending: &pending,
-            prefixes: &prefixes,
-        },
-    )?;
+    let staged_fill = raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::Color, || {
+        stage_color_commands(
+            collector,
+            packet,
+            TexrectTmemSource::Pending {
+                pending: &pending,
+                prefixes: &prefixes,
+            },
+        )
+    })?;
 
     let Some(staged_fill) = staged_fill else {
         let effects = BackendEffectReport::try_new(packet, tmem_writes)
@@ -4147,11 +4310,13 @@ fn stage_fills_and_report(
     // `plan.loads` is empty -- there is no proposal in existence to sample.
     // A texrect here observes exactly what an earlier packet published,
     // which is what the hardware's TMEM holds at this stream position.
-    let staged = stage_color_commands(
-        collector,
-        packet,
-        TexrectTmemSource::Committed(collector.physical),
-    )?
+    let staged = raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::Color, || {
+        stage_color_commands(
+            collector,
+            packet,
+            TexrectTmemSource::Committed(collector.physical),
+        )
+    })?
     .ok_or(WgpuRawDpcExecutionError::FillExecution(
         FillExecutionError::NotFillCycle,
     ))?;
@@ -4626,122 +4791,165 @@ fn stage_color_commands(
                 &mut collector.compute_probes,
             );
         }
-        let (completed, accesses) = match *kind {
-            ColorCommandKind::Fill(index) => {
-                execute_scheduled_fill(collector, &candidate, index, accumulated.as_deref())?
-            }
-            ColorCommandKind::Texrect(index) => {
-                // **A texrect samples TMEM at its OWN stream position.**
-                //
-                // `stage_and_report` chose the family once, upstream, from
-                // a fact about the wire stream (does this packet carry
-                // loads at all). Within the pending family the position is
-                // still per command, because TMEM is durable within a
-                // packet: a texrect observes every load before it and no
-                // load after it. Selecting on the command index the
-                // decoder's own stream walk assigned -- the same index this
-                // schedule is sorted by -- keeps that a recovery of the
-                // stream's order rather than a policy.
-                let resident = color_command_input(&mut accumulated, own_command_input, key)?;
-                let command_index = collector.plan.texrect_commands[index].3;
-                match tmem {
-                    TexrectTmemSource::Pending { pending, prefixes } => {
-                        match prefix_before(prefixes, command_index) {
-                            Some(prefix) => execute_scheduled_texrect(
-                                collector,
-                                &candidate,
-                                &pending.prefix_image(prefix),
-                                true,
-                                index,
-                                resident,
-                                claimed,
-                            )?,
-                            // No load precedes this texrect in its own
-                            // packet, so what TMEM holds here is exactly
-                            // what an earlier packet published: durable
-                            // committed state, read through the same one
-                            // sampler. Not a fallback for a missing image
-                            // -- the absence of a preceding load IS the
-                            // stream fact that makes committed correct.
-                            None => execute_scheduled_texrect(
-                                collector,
-                                &candidate,
-                                collector.physical,
-                                false,
-                                index,
-                                resident,
-                                claimed,
+        let color_phase = match *kind {
+            ColorCommandKind::Fill(_) => raw_dpc_execute_census::Phase::ColorFill,
+            ColorCommandKind::Texrect(_) => raw_dpc_execute_census::Phase::ColorTexrect,
+            ColorCommandKind::RawTriangle(_) => raw_dpc_execute_census::Phase::ColorTriangle,
+        };
+        let (completed, accesses) = raw_dpc_execute_census::timed(
+            color_phase,
+            || -> Result<_, WgpuRawDpcExecutionError> {
+                Ok(match *kind {
+                    ColorCommandKind::Fill(index) => execute_scheduled_fill(
+                        collector,
+                        &candidate,
+                        index,
+                        accumulated.as_deref(),
+                    )?,
+                    ColorCommandKind::Texrect(index) => {
+                        // **A texrect samples TMEM at its OWN stream position.**
+                        //
+                        // `stage_and_report` chose the family once, upstream, from
+                        // a fact about the wire stream (does this packet carry
+                        // loads at all). Within the pending family the position is
+                        // still per command, because TMEM is durable within a
+                        // packet: a texrect observes every load before it and no
+                        // load after it. Selecting on the command index the
+                        // decoder's own stream walk assigned -- the same index this
+                        // schedule is sorted by -- keeps that a recovery of the
+                        // stream's order rather than a policy.
+                        let resident =
+                            color_command_input(&mut accumulated, own_command_input, key)?;
+                        let command_index = collector.plan.texrect_commands[index].3;
+                        match tmem {
+                            TexrectTmemSource::Pending { pending, prefixes } => {
+                                match prefix_before(prefixes, command_index) {
+                                    Some(prefix) => execute_scheduled_texrect(
+                                        collector,
+                                        &candidate,
+                                        &pending.prefix_image(prefix),
+                                        true,
+                                        index,
+                                        resident,
+                                        claimed,
+                                    )?,
+                                    // No load precedes this texrect in its own
+                                    // packet, so what TMEM holds here is exactly
+                                    // what an earlier packet published: durable
+                                    // committed state, read through the same one
+                                    // sampler. Not a fallback for a missing image
+                                    // -- the absence of a preceding load IS the
+                                    // stream fact that makes committed correct.
+                                    None => execute_scheduled_texrect(
+                                        collector,
+                                        &candidate,
+                                        collector.physical,
+                                        false,
+                                        index,
+                                        resident,
+                                        claimed,
+                                    )?,
+                                }
+                            }
+                            TexrectTmemSource::Committed(state) => execute_scheduled_texrect(
+                                collector, &candidate, state, false, index, resident, claimed,
                             )?,
                         }
                     }
-                    TexrectTmemSource::Committed(state) => execute_scheduled_texrect(
-                        collector, &candidate, state, false, index, resident, claimed,
-                    )?,
-                }
-            }
-            ColorCommandKind::RawTriangle(index) => {
-                // Same resident-bytes requirement as a texrect and for the
-                // same reason: a triangle writes a sub-region, so every
-                // pixel outside it must come from real prior content.
-                let resident = color_command_input(&mut accumulated, own_command_input, key)?;
-                // **A raw triangle samples TMEM at its OWN stream position,
-                // by the SAME rule a texrect does.**
-                //
-                // Not a parallel implementation: this is the identical
-                // `prefix_before` call over the identical `prefixes` slice,
-                // dispatched on the identical `TexrectTmemSource` the arm
-                // above matches on. WM2000's own triangle packets carry NINE
-                // TMEM loads each, so "which load did this draw see" is a
-                // live question for a triangle exactly as it is for a
-                // texrect -- and answering it with a per-packet image would
-                // draw every triangle with the ninth load's texels.
-                let command_index = collector.plan.raw_triangle_commands[index].2;
-                match tmem {
-                    TexrectTmemSource::Pending { pending, prefixes } => {
-                        match prefix_before(prefixes, command_index) {
-                            Some(prefix) => {
-                                let image = pending.prefix_image(prefix);
-                                if collector.collect_compute_probe {
-                                    if let Some(previous) = retain_compute_probe_draw(
-                                        &mut compute_probe_builder,
-                                        collector,
-                                        &candidate,
-                                        index,
-                                        &image,
-                                        resident.as_ref(),
-                                    )? {
-                                        push_finished_compute_probe(
-                                            previous,
-                                            collector.ordinal,
-                                            resident.as_ref(),
-                                            &mut collector.compute_probes,
-                                        );
+                    ColorCommandKind::RawTriangle(index) => {
+                        // Same resident-bytes requirement as a texrect and for the
+                        // same reason: a triangle writes a sub-region, so every
+                        // pixel outside it must come from real prior content.
+                        let resident =
+                            color_command_input(&mut accumulated, own_command_input, key)?;
+                        // **A raw triangle samples TMEM at its OWN stream position,
+                        // by the SAME rule a texrect does.**
+                        //
+                        // Not a parallel implementation: this is the identical
+                        // `prefix_before` call over the identical `prefixes` slice,
+                        // dispatched on the identical `TexrectTmemSource` the arm
+                        // above matches on. WM2000's own triangle packets carry NINE
+                        // TMEM loads each, so "which load did this draw see" is a
+                        // live question for a triangle exactly as it is for a
+                        // texrect -- and answering it with a per-packet image would
+                        // draw every triangle with the ninth load's texels.
+                        let command_index = collector.plan.raw_triangle_commands[index].2;
+                        match tmem {
+                            TexrectTmemSource::Pending { pending, prefixes } => {
+                                match prefix_before(prefixes, command_index) {
+                                    Some(prefix) => {
+                                        let image = pending.prefix_image(prefix);
+                                        if collector.collect_compute_probe {
+                                            if let Some(previous) = retain_compute_probe_draw(
+                                                &mut compute_probe_builder,
+                                                collector,
+                                                &candidate,
+                                                index,
+                                                &image,
+                                                resident.as_ref(),
+                                            )? {
+                                                push_finished_compute_probe(
+                                                    previous,
+                                                    collector.ordinal,
+                                                    resident.as_ref(),
+                                                    &mut collector.compute_probes,
+                                                );
+                                            }
+                                        }
+                                        execute_scheduled_raw_triangle(
+                                            collector,
+                                            &candidate,
+                                            index,
+                                            resident,
+                                            &image,
+                                            true,
+                                            depth_accum.as_deref_mut(),
+                                        )?
+                                    }
+                                    // No load precedes this triangle in its own
+                                    // packet, so TMEM holds exactly what an earlier
+                                    // packet published -- durable committed state,
+                                    // read through the same one sampler. The absence
+                                    // of a preceding load IS the stream fact that
+                                    // makes committed correct; it is not a fallback.
+                                    None => {
+                                        if collector.collect_compute_probe {
+                                            if let Some(previous) = retain_compute_probe_draw(
+                                                &mut compute_probe_builder,
+                                                collector,
+                                                &candidate,
+                                                index,
+                                                collector.physical,
+                                                resident.as_ref(),
+                                            )? {
+                                                push_finished_compute_probe(
+                                                    previous,
+                                                    collector.ordinal,
+                                                    resident.as_ref(),
+                                                    &mut collector.compute_probes,
+                                                );
+                                            }
+                                        }
+                                        execute_scheduled_raw_triangle(
+                                            collector,
+                                            &candidate,
+                                            index,
+                                            resident,
+                                            collector.physical,
+                                            false,
+                                            depth_accum.as_deref_mut(),
+                                        )?
                                     }
                                 }
-                                execute_scheduled_raw_triangle(
-                                    collector,
-                                    &candidate,
-                                    index,
-                                    resident,
-                                    &image,
-                                    true,
-                                    depth_accum.as_deref_mut(),
-                                )?
                             }
-                            // No load precedes this triangle in its own
-                            // packet, so TMEM holds exactly what an earlier
-                            // packet published -- durable committed state,
-                            // read through the same one sampler. The absence
-                            // of a preceding load IS the stream fact that
-                            // makes committed correct; it is not a fallback.
-                            None => {
+                            TexrectTmemSource::Committed(state) => {
                                 if collector.collect_compute_probe {
                                     if let Some(previous) = retain_compute_probe_draw(
                                         &mut compute_probe_builder,
                                         collector,
                                         &candidate,
                                         index,
-                                        collector.physical,
+                                        state,
                                         resident.as_ref(),
                                     )? {
                                         push_finished_compute_probe(
@@ -4757,44 +4965,16 @@ fn stage_color_commands(
                                     &candidate,
                                     index,
                                     resident,
-                                    collector.physical,
+                                    state,
                                     false,
                                     depth_accum.as_deref_mut(),
                                 )?
                             }
                         }
                     }
-                    TexrectTmemSource::Committed(state) => {
-                        if collector.collect_compute_probe {
-                            if let Some(previous) = retain_compute_probe_draw(
-                                &mut compute_probe_builder,
-                                collector,
-                                &candidate,
-                                index,
-                                state,
-                                resident.as_ref(),
-                            )? {
-                                push_finished_compute_probe(
-                                    previous,
-                                    collector.ordinal,
-                                    resident.as_ref(),
-                                    &mut collector.compute_probes,
-                                );
-                            }
-                        }
-                        execute_scheduled_raw_triangle(
-                            collector,
-                            &candidate,
-                            index,
-                            resident,
-                            state,
-                            false,
-                            depth_accum.as_deref_mut(),
-                        )?
-                    }
-                }
-            }
-        };
+                })
+            },
+        )?;
         if schedule_index + 1 == schedule.len() {
             flush_compute_probe(
                 &mut compute_probe_builder,
@@ -4833,29 +5013,34 @@ fn stage_color_commands(
         }
     }
 
-    let completed = last_completed.expect("a non-empty schedule ran at least one command");
-    // **Every digest, computed once, against the final buffer.** No write
-    // in this list can describe an intermediate state, because none of them
-    // existed until now -- `declared` carried only accesses through the
-    // loop, and this is the single call that turns them into digests.
-    //
-    // `fill_completed_writes` is the existing per-access digest derivation,
-    // reused rather than duplicated: what changed with N commands is *when*
-    // it is called (once, at the end) and over *which* buffer (the composed
-    // one), not how a digest is derived from an access.
-    let guest_writes = fill_completed_writes(key, completed.device_bytes(), &declared)?;
-    // The claimed rectangle is the union of every command's own, which is
-    // what `admit_completed_initialization` reads to decide whether a
-    // brand-new target is fully initialized. Reporting one command's
-    // rectangle would understate what N proved.
-    let completed = completed.with_claimed_rectangle(
-        claimed.expect("a non-empty schedule claimed at least one rectangle"),
-    );
-    let initialized = candidate.admit_completed_initialization(completed)?;
-    Ok(Some(StagedFill {
-        initialized,
-        guest_writes,
-    }))
+    raw_dpc_execute_census::timed(
+        raw_dpc_execute_census::Phase::ColorFinalize,
+        || -> Result<_, WgpuRawDpcExecutionError> {
+            let completed = last_completed.expect("a non-empty schedule ran at least one command");
+            // **Every digest, computed once, against the final buffer.** No write
+            // in this list can describe an intermediate state, because none of them
+            // existed until now -- `declared` carried only accesses through the
+            // loop, and this is the single call that turns them into digests.
+            //
+            // `fill_completed_writes` is the existing per-access digest derivation,
+            // reused rather than duplicated: what changed with N commands is *when*
+            // it is called (once, at the end) and over *which* buffer (the composed
+            // one), not how a digest is derived from an access.
+            let guest_writes = fill_completed_writes(key, completed.device_bytes(), &declared)?;
+            // The claimed rectangle is the union of every command's own, which is
+            // what `admit_completed_initialization` reads to decide whether a
+            // brand-new target is fully initialized. Reporting one command's
+            // rectangle would understate what N proved.
+            let completed = completed.with_claimed_rectangle(
+                claimed.expect("a non-empty schedule claimed at least one rectangle"),
+            );
+            let initialized = candidate.admit_completed_initialization(completed)?;
+            Ok(Some(StagedFill {
+                initialized,
+                guest_writes,
+            }))
+        },
+    )
 }
 
 fn move_color_accumulator_enabled() -> bool {
