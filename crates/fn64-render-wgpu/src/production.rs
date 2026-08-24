@@ -349,6 +349,9 @@ mod task_compute_census {
             super::TaskComputeCpuReason::ExactAdmissionRejected(
                 super::TaskComputeAdmissionRefusal::ProgramBits([lo, hi, omh, oml]),
             ) => format!("program_bits:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}"),
+            super::TaskComputeCpuReason::ExactAdmissionRejected(
+                super::TaskComputeAdmissionRefusal::CycleType([lo, hi, omh, oml]),
+            ) => format!("cycle_type:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}"),
             _ => format!("{reason:?}"),
         }
     }
@@ -424,6 +427,12 @@ mod task_compute_census {
             assert_eq!(totals.get(&second), Some(&(1, 17)));
             assert_eq!(totals.values().map(|(members, _)| members).sum::<u64>(), 3);
             assert_eq!(totals.values().map(|(_, ns)| ns).sum::<u64>(), 41);
+            assert_eq!(
+                reason_name(super::super::TaskComputeCpuReason::ExactAdmissionRejected(
+                    super::super::TaskComputeAdmissionRefusal::CycleType([1, 2, 3, 4]),
+                )),
+                "cycle_type:00000001/00000002/00000003/00000004"
+            );
         }
     }
 }
@@ -5807,7 +5816,7 @@ pub enum TaskComputeAdmissionRefusal {
     Untextured,
     AffineTexture,
     Depth,
-    CycleType,
+    CycleType([u32; 4]),
     ProgramBits([u32; 4]),
     EmptyAccesses,
     AccessMode,
@@ -5826,7 +5835,7 @@ impl From<ComputeRasterAdmissionRefusal> for TaskComputeAdmissionRefusal {
             ComputeRasterAdmissionRefusal::Untextured => Self::Untextured,
             ComputeRasterAdmissionRefusal::AffineTexture => Self::AffineTexture,
             ComputeRasterAdmissionRefusal::Depth => Self::Depth,
-            ComputeRasterAdmissionRefusal::CycleType => Self::CycleType,
+            ComputeRasterAdmissionRefusal::CycleType(words) => Self::CycleType(words),
             ComputeRasterAdmissionRefusal::ProgramBits(words) => Self::ProgramBits(words),
             ComputeRasterAdmissionRefusal::EmptyAccesses => Self::EmptyAccesses,
             ComputeRasterAdmissionRefusal::AccessMode => Self::AccessMode,

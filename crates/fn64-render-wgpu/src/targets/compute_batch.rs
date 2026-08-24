@@ -46,20 +46,21 @@ impl ComputeRasterProgramKey {
         if other_mode.depth_compare_enabled() || other_mode.depth_update_enabled() {
             return Err(ComputeRasterAdmissionRefusal::Depth);
         }
+        let program_words = [
+            combine.low(),
+            combine.high(),
+            other_mode.high(),
+            other_mode.low(),
+        ];
         if other_mode.cycle_type() != CycleType::OneCycle {
-            return Err(ComputeRasterAdmissionRefusal::CycleType);
+            return Err(ComputeRasterAdmissionRefusal::CycleType(program_words));
         }
         if combine.low() != HOT_COMBINE_LOW
             || combine.high() != HOT_COMBINE_HIGH
             || other_mode.high() != HOT_OTHER_MODE_HIGH
             || other_mode.low() != HOT_OTHER_MODE_LOW
         {
-            return Err(ComputeRasterAdmissionRefusal::ProgramBits([
-                combine.low(),
-                combine.high(),
-                other_mode.high(),
-                other_mode.low(),
-            ]));
+            return Err(ComputeRasterAdmissionRefusal::ProgramBits(program_words));
         }
         Ok(Self {
             combine_low: combine.low(),
@@ -85,7 +86,7 @@ pub(crate) enum ComputeRasterAdmissionRefusal {
     Untextured,
     AffineTexture,
     Depth,
-    CycleType,
+    CycleType([u32; 4]),
     ProgramBits([u32; 4]),
     EmptyAccesses,
     AccessMode,
@@ -327,6 +328,20 @@ mod tests {
                 true,
             ),
             Err(ComputeRasterAdmissionRefusal::TargetFormat)
+        );
+        assert_eq!(
+            ComputeRasterProgramKey::try_admit(
+                rgba16_target,
+                CombineParams::from_wire(HOT_COMBINE_LOW, HOT_COMBINE_HIGH),
+                OtherMode::from_wire(HOT_OTHER_MODE_HIGH | (1 << 20), HOT_OTHER_MODE_LOW),
+                true,
+            ),
+            Err(ComputeRasterAdmissionRefusal::CycleType([
+                HOT_COMBINE_LOW,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH | (1 << 20),
+                HOT_OTHER_MODE_LOW,
+            ]))
         );
     }
 
