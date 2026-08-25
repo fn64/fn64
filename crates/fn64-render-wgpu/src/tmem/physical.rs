@@ -90,20 +90,7 @@ impl DefinedPhysicalTmemWordBytes {
         word: TmemTransferWord,
         physical_lanes: [Option<u8>; 8],
     ) -> Result<Self, PhysicalTmemError> {
-        let expected = physical_defined_lane_mask(word)?;
-        let actual = physical_lanes
-            .iter()
-            .enumerate()
-            .fold(0_u8, |mask, (lane, byte)| {
-                mask | (u8::from(byte.is_some()) << lane)
-            });
-        if actual != expected {
-            return Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
-                index: word.index(),
-                expected,
-                actual,
-            });
-        }
+        validate_physical_lane_mask(word, &physical_lanes)?;
         Ok(Self {
             packet_binding,
             load_binding,
@@ -587,12 +574,12 @@ impl StagedTmemTransaction {
 
     /// Returns the next word this transaction will accept.
     ///
-    /// Callers that immediately mint and stage each word can advance through
-    /// a load without cloning the complete word plan merely to end the
-    /// immutable borrow from [`Self::expected_words`]. `stage_word` remains
-    /// the authority that validates the returned word against the private
-    /// plan and advances `next_word`; an error poisons the same packet-local
-    /// transaction exactly as before.
+    /// Callers that immediately stage each word can advance through a load
+    /// without cloning the complete word plan merely to end the immutable
+    /// borrow from [`Self::expected_words`]. The generic payload path still
+    /// validates the returned word against the private plan; production's
+    /// crate-private [`Self::stage_next_physical_lanes`] accepts no word at
+    /// all and therefore cannot be used to reorder or rebind one.
     pub(crate) fn next_expected_word(&self) -> Option<TmemTransferWord> {
         self.words.get(self.next_word).copied()
     }
@@ -666,8 +653,52 @@ impl StagedTmemTransaction {
             });
         }
 
+        self.stage_expected_word(expected, physical_bytes.physical_lanes())
+    }
+
+    /// Stages physical lanes only for the private cursor's next exact word.
+    ///
+    /// This is the production raw-DPC loop's tighter counterpart to the
+    /// generic move-only payload seam above. The caller can arrange bytes but
+    /// cannot supply a word, packet binding, load binding, or cursor index.
+    /// The independently-derived lane mask and physical fragment are still
+    /// checked here on every accepted word. Any rejection poisons the same
+    /// packet-local transaction before it can be reused.
+    pub(crate) fn stage_next_physical_lanes(
+        &mut self,
+        physical_lanes: [Option<u8>; 8],
+    ) -> Result<(), PhysicalTmemError> {
+        if self.poisoned {
+            return Err(PhysicalTmemError::PoisonedTransaction);
+        }
+        let result = self.stage_next_physical_lanes_inner(&physical_lanes);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn stage_next_physical_lanes_inner(
+        &mut self,
+        physical_lanes: &[Option<u8>; 8],
+    ) -> Result<(), PhysicalTmemError> {
+        let expected =
+            self.words
+                .get(self.next_word)
+                .copied()
+                .ok_or(PhysicalTmemError::ExtraWord {
+                    index: u16::try_from(self.next_word).unwrap_or(u16::MAX),
+                })?;
+        validate_physical_lane_mask(expected, physical_lanes)?;
+        self.stage_expected_word(expected, physical_lanes)
+    }
+
+    fn stage_expected_word(
+        &mut self,
+        expected: TmemTransferWord,
+        physical_lanes: &[Option<u8>; 8],
+    ) -> Result<(), PhysicalTmemError> {
         let lanes = fragment_lanes(expected.physical())?;
-        let physical_lanes = physical_bytes.physical_lanes();
         for (lane, address) in lanes.into_iter().enumerate() {
             self.packet.last_touched_generation[address] = self.packet.binding.next_generation;
             if let Some(byte) = physical_lanes[lane] {
@@ -752,6 +783,9 @@ type PhysicalWordPayloadMint = fn(
     [Option<u8>; 8],
 ) -> Result<DefinedPhysicalTmemWordBytes, PhysicalTmemError>;
 const _: PhysicalWordPayloadMint = StagedTmemTransaction::physical_word_payload;
+type PhysicalWordStageNext =
+    fn(&mut StagedTmemTransaction, [Option<u8>; 8]) -> Result<(), PhysicalTmemError>;
+const _: PhysicalWordStageNext = StagedTmemTransaction::stage_next_physical_lanes;
 
 /// Complete packet transaction awaiting an exact GPU effect report.
 pub struct PendingTmemTransaction {
@@ -2006,6 +2040,27 @@ fn physical_defined_lane_mask(word: TmemTransferWord) -> Result<u8, PhysicalTmem
             Ok(physical_mask)
         }
     }
+}
+
+fn validate_physical_lane_mask(
+    word: TmemTransferWord,
+    physical_lanes: &[Option<u8>; 8],
+) -> Result<(), PhysicalTmemError> {
+    let expected = physical_defined_lane_mask(word)?;
+    let actual = physical_lanes
+        .iter()
+        .enumerate()
+        .fold(0_u8, |mask, (lane, byte)| {
+            mask | (u8::from(byte.is_some()) << lane)
+        });
+    if actual != expected {
+        return Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
+            index: word.index(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn fragment_lanes(physical: TmemTransferPhysicalWord) -> Result<[usize; 8], PhysicalTmemError> {
@@ -3374,6 +3429,87 @@ mod tests {
             Err(PhysicalTmemError::DuplicateWord { index: 0 })
         ));
         assert_eq!(state.generation(), 0);
+    }
+
+    #[test]
+    fn production_next_lane_mutation_rejects_and_poisons_staging() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let fixture = fixture(1);
+        let transfer = fixture
+            .decoded
+            .resource_plan()
+            .bind_tmem_transfer(load(&fixture.decoded, 0))
+            .unwrap();
+        let mut staged = state
+            .stage_transfer(fixture.decoded.submitted(), &transfer)
+            .unwrap();
+        let word = staged.next_expected_word().unwrap();
+        let mut mutated = defined_physical_lanes(word, 0x20);
+        let removed_lane = mutated
+            .iter()
+            .rposition(Option::is_some)
+            .expect("a transfer word defines at least one lane");
+        mutated[removed_lane] = None;
+        let expected = physical_defined_lane_mask(word).unwrap();
+        let actual = expected & !(1 << removed_lane);
+
+        assert_eq!(
+            staged.stage_next_physical_lanes(mutated).unwrap_err(),
+            PhysicalTmemError::PhysicalLaneMaskMismatch {
+                index: word.index(),
+                expected,
+                actual,
+            }
+        );
+        assert_eq!(
+            staged
+                .stage_next_physical_lanes(defined_physical_lanes(word, 0x20))
+                .unwrap_err(),
+            PhysicalTmemError::PoisonedTransaction
+        );
+    }
+
+    #[test]
+    fn production_next_preserves_undefined_backing_validity_and_generation() {
+        let mut state = PhysicalTmemState::try_new().unwrap();
+        state.bytes.fill(0xaa);
+        state.valid.fill(true);
+        state.last_touched_generation.fill(7);
+        state.generation = 7;
+        let fixture = fixture(1);
+        let transfer = fixture
+            .decoded
+            .resource_plan()
+            .bind_tmem_transfer(load(&fixture.decoded, 0))
+            .unwrap();
+        let mut staged = state
+            .stage_transfer(fixture.decoded.submitted(), &transfer)
+            .unwrap();
+        let mut word = staged.next_expected_word().unwrap();
+        assert!(matches!(
+            word.physical(),
+            TmemTransferPhysicalWord::Linear(_)
+        ));
+        word.forge_masks_for_test(0x03, 0x03);
+        staged.words[0] = word;
+        let physical_lanes = [Some(0x10), Some(0x11), None, None, None, None, None, None];
+
+        staged.stage_next_physical_lanes(physical_lanes).unwrap();
+
+        for (lane, address) in fragment_lanes(word.physical())
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(staged.packet.last_touched_generation[address], 8);
+            if let Some(byte) = physical_lanes[lane] {
+                assert_eq!(staged.packet.bytes[address], byte);
+                assert!(staged.packet.valid[address]);
+            } else {
+                assert_eq!(staged.packet.bytes[address], 0xaa);
+                assert!(!staged.packet.valid[address]);
+            }
+        }
     }
 
     #[test]

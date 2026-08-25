@@ -6913,11 +6913,8 @@ fn stage_and_report(
                     .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
                     let physical_lanes = map_physical_lanes(load, word, bytes)
                         .map_err(WgpuRawDpcExecutionError::Physical)?;
-                    let payload = staged
-                        .physical_word_payload(word, physical_lanes)
-                        .map_err(WgpuRawDpcExecutionError::Physical)?;
                     staged
-                        .stage_word(payload)
+                        .stage_next_physical_lanes(physical_lanes)
                         .map_err(WgpuRawDpcExecutionError::Physical)?;
                 }
 

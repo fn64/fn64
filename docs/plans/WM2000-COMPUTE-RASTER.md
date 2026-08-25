@@ -874,6 +874,18 @@ which is then moved into the staged transaction; the former second conversion
 and allocation are gone without changing the public staging API, word
 poisoning, destination coverage, or proposal identity.
 
+The next bounded source/load candidate keeps the generic move-only physical
+word payload seam for hostile and non-production callers, but the exact
+production loop now stages only the private cursor's next word. That
+crate-private route accepts physical lanes but no caller-selected word,
+packet/load binding, or cursor index. It still independently checks the
+expected defined-lane mask and physical fragment on every word, poisons the
+packet-local transaction on rejection, advances every touched lane's
+generation, preserves undefined backing bytes while clearing their validity,
+and leaves LoadBlock footprint promotion unchanged. This is a mechanism
+candidate only: it has no performance claim until a same-binary candidate /
+control census and the required live validation runs are attached.
+
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
 `FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
