@@ -9,6 +9,7 @@ mod triangle_draw_data;
 pub(crate) mod triangle_span;
 mod triangle_vertices;
 
+pub(crate) use production_adapter::push_planning_decoded_raw_dpc;
 pub use production_adapter::{
     push_decoded_raw_dpc, DegenerateTextureRectangle, PushDecodedRawDpcError,
     TextureRectangleBeforeAnyOtherMode, TriangleBeforeAnyOtherMode, UnadmittedRawDpcCommand,
@@ -777,6 +778,31 @@ pub struct DecodedRawDpc {
     origin: RawDpcDecodeOrigin,
 }
 
+/// A decoder result whose resource plan is authoritative even though the
+/// submitted ticket carried only a preflight seed journal. This type cannot
+/// enter ordinary decoded execution; the planning adapter is its sole
+/// consumer and seals the derived accesses into the real plan journal.
+pub(crate) struct PlanningDecodedRawDpc {
+    base_state: RdpState,
+    commands: Box<[DecodedRawDpcCommand]>,
+    state_delta: RdpStateDelta,
+    resource_plan: RawDpcResourcePlan,
+}
+
+impl PlanningDecodedRawDpc {
+    pub(crate) fn commands(&self) -> &[DecodedRawDpcCommand] {
+        &self.commands
+    }
+
+    pub(crate) const fn state_delta(&self) -> &RdpStateDelta {
+        &self.state_delta
+    }
+
+    pub(crate) const fn resource_plan(&self) -> &RawDpcResourcePlan {
+        &self.resource_plan
+    }
+}
+
 impl DecodedRawDpc {
     pub const fn submitted(&self) -> &SubmittedTicket {
         &self.submitted
@@ -938,11 +964,23 @@ pub fn decode_raw_dpc(
     submitted: SubmittedTicket,
     durable_state: &RdpState,
 ) -> Result<DecodedRawDpc, RawDpcDecodeError> {
-    decode_from_state(
+    decode_exact_from_state(
         submitted,
         durable_state.fork_for_decode(),
         RawDpcDecodeOrigin::Durable,
     )
+}
+
+pub(crate) fn decode_raw_dpc_for_planning(
+    submitted: SubmittedTicket,
+    durable_state: &RdpState,
+) -> Result<PlanningDecodedRawDpc, RawDpcDecodeError> {
+    decode_derivation(
+        submitted,
+        durable_state.fork_for_decode(),
+        RawDpcDecodeOrigin::Durable,
+    )
+    .map(RawDpcDecodeDerivation::into_planning)
 }
 
 pub fn decode_raw_dpc_after(
@@ -975,14 +1013,65 @@ pub fn decode_raw_dpc_after(
             reason: "raw-DPC transaction sequence is not the immediate successor",
         });
     }
-    decode_from_state(submitted, state, RawDpcDecodeOrigin::SpeculativeStaged)
+    decode_exact_from_state(submitted, state, RawDpcDecodeOrigin::SpeculativeStaged)
 }
 
-fn decode_from_state(
+struct RawDpcDecodeDerivation {
+    submitted: SubmittedTicket,
+    base_state: RdpState,
+    commands: Box<[DecodedRawDpcCommand]>,
+    state_delta: RdpStateDelta,
+    staged_state: StagedRdpState,
+    resource_plan: RawDpcResourcePlan,
+    origin: RawDpcDecodeOrigin,
+}
+
+impl RawDpcDecodeDerivation {
+    fn into_exact(self) -> DecodedRawDpc {
+        DecodedRawDpc {
+            submitted: self.submitted,
+            base_state: self.base_state,
+            commands: self.commands,
+            state_delta: self.state_delta,
+            staged_state: self.staged_state,
+            resource_plan: self.resource_plan,
+            origin: self.origin,
+        }
+    }
+
+    fn into_planning(self) -> PlanningDecodedRawDpc {
+        PlanningDecodedRawDpc {
+            base_state: self.base_state,
+            commands: self.commands,
+            state_delta: self.state_delta,
+            resource_plan: self.resource_plan,
+        }
+    }
+}
+
+fn decode_exact_from_state(
+    submitted: SubmittedTicket,
+    state: RdpState,
+    origin: RawDpcDecodeOrigin,
+) -> Result<DecodedRawDpc, RawDpcDecodeError> {
+    let derived = decode_derivation(submitted, state, origin)?;
+    let actual = derived.submitted.packet().journal().accesses();
+    let expected = derived.resource_plan.accesses();
+    if actual != expected {
+        return Err(RawDpcDecodeError::JournalMismatch {
+            workload: derived.submitted.packet().identity(),
+            expected: expected.to_vec().into_boxed_slice(),
+            actual: actual.to_vec().into_boxed_slice(),
+        });
+    }
+    Ok(derived.into_exact())
+}
+
+fn decode_derivation(
     submitted: SubmittedTicket,
     mut state: RdpState,
     origin: RawDpcDecodeOrigin,
-) -> Result<DecodedRawDpc, RawDpcDecodeError> {
+) -> Result<RawDpcDecodeDerivation, RawDpcDecodeError> {
     // The contract layer compares this immutable predecessor with its
     // exclusively borrowed durable state before it admits GPU work. Keeping
     // the proof inside the move-only decoded value closes the otherwise-safe
@@ -1044,15 +1133,7 @@ fn decode_from_state(
         )?;
     }
 
-    let actual = packet.journal().accesses();
-    if actual != planned {
-        return Err(RawDpcDecodeError::JournalMismatch {
-            workload,
-            expected: planned.into_boxed_slice(),
-            actual: actual.to_vec().into_boxed_slice(),
-        });
-    }
-    let resource_accesses = actual.to_vec().into_boxed_slice();
+    let resource_accesses = planned.into_boxed_slice();
     let tmem_transfers = commands
         .iter()
         .filter_map(|command| match command.kind {
@@ -1070,19 +1151,21 @@ fn decode_from_state(
     let staged_state =
         StagedRdpState::from_transaction(state, queue, submission_ordinal, transaction_sequence);
 
-    Ok(DecodedRawDpc {
+    let commands = commands.into_boxed_slice();
+    let resource_plan = RawDpcResourcePlan {
+        tmem_source_identity,
+        accesses: resource_accesses,
+        tmem_transfers,
+        fill_spans: fill_spans.into_boxed_slice(),
+        fill_seeds: fill_seeds.into_boxed_slice(),
+    };
+    Ok(RawDpcDecodeDerivation {
         submitted,
         base_state,
-        commands: commands.into_boxed_slice(),
+        commands,
         state_delta: delta,
         staged_state,
-        resource_plan: RawDpcResourcePlan {
-            tmem_source_identity,
-            accesses: resource_accesses,
-            tmem_transfers,
-            fill_spans: fill_spans.into_boxed_slice(),
-            fill_seeds: fill_seeds.into_boxed_slice(),
-        },
+        resource_plan,
         origin,
     })
 }
@@ -4191,7 +4274,45 @@ mod tests {
             };
             assert_eq!(&*planned, expected);
             assert_eq!(&*actual, accesses);
+
+            let seed_journal = ResourceJournal::try_new(
+                ResourceJournalLimits::try_new(64, LAYOUT_BYTES).unwrap(),
+                accesses,
+            )
+            .unwrap();
+            let seed_packet = WorkloadPacket::try_new(
+                valid.memory_layout(),
+                valid.admission(),
+                valid.streams().to_vec(),
+                seed_journal,
+            )
+            .unwrap();
+            let planning =
+                decode_raw_dpc_for_planning(submit(seed_packet), &RdpState::default()).unwrap();
+            assert_eq!(
+                planning.resource_plan().accesses(),
+                expected,
+                "planning authority must be decoder-derived for every seed mutation",
+            );
         }
+    }
+
+    #[test]
+    fn planning_decode_type_exposes_no_submitted_or_staged_execution_authority() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub(crate) struct PlanningDecodedRawDpc")
+            .expect("typed planning output exists");
+        let end = source[start..]
+            .find("impl DecodedRawDpc {")
+            .map(|offset| start + offset)
+            .expect("ordinary decoded execution surface follows planning output");
+        let planning_surface = &source[start..end];
+        assert!(!planning_surface.contains("SubmittedTicket"));
+        assert!(!planning_surface.contains("StagedRdpState"));
+        assert!(!planning_surface.contains("fn submitted("));
+        assert!(!planning_surface.contains("fn staged_state("));
+        assert!(!planning_surface.contains("fn into_staged_state("));
     }
 
     #[test]
