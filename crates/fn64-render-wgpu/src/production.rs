@@ -262,9 +262,19 @@ mod task_compute_census {
         static TASK_CPU_REASONS: RefCell<BTreeMap<super::TaskComputeCpuReason, (u64, u64)>> =
             RefCell::new(BTreeMap::new());
         static TASK_COMPUTE: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
+        static COMPUTE_PROGRAMS: RefCell<BTreeMap<super::ComputeProgramAttribution, (u64, u64, u64)>> =
+            RefCell::new(BTreeMap::new());
+        static TASK_COMPUTE_PROGRAMS: RefCell<BTreeMap<super::ComputeProgramAttribution, (u64, u64, u64)>> =
+            RefCell::new(BTreeMap::new());
+        #[cfg(test)]
+        static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn enabled() -> bool {
+        #[cfg(test)]
+        if TEST_ENABLED.with(std::cell::Cell::get) {
+            return true;
+        }
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var_os("FN64_TASK_COMPUTE_CENSUS")
@@ -319,16 +329,24 @@ mod task_compute_census {
         value
     }
 
-    pub(super) fn record_segment(members: usize, started: Option<std::time::Instant>) {
+    pub(super) fn record_segment(
+        members: usize,
+        program: Option<super::ComputeProgramAttribution>,
+        started: Option<std::time::Instant>,
+    ) {
         if !enabled() {
             return;
         }
+        let program = program.expect("enabled segment census classifies its program mix");
         SEGMENTS.fetch_add(1, Relaxed);
         COMPUTE_MEMBERS.fetch_add(u64::try_from(members).unwrap_or(u64::MAX), Relaxed);
         let elapsed = started
             .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         COMPUTE_NS.fetch_add(elapsed, Relaxed);
+        COMPUTE_PROGRAMS.with(|programs| {
+            accumulate_program(&mut programs.borrow_mut(), program, members, elapsed);
+        });
         if tail_enabled() {
             TASK_COMPUTE.with(|task| {
                 let mut task = task.borrow_mut();
@@ -337,7 +355,37 @@ mod task_compute_census {
                     .saturating_add(u64::try_from(members).unwrap_or(u64::MAX));
                 task.1 = task.1.saturating_add(elapsed);
             });
+            TASK_COMPUTE_PROGRAMS.with(|programs| {
+                accumulate_program(&mut programs.borrow_mut(), program, members, elapsed);
+            });
         }
+    }
+
+    fn accumulate_program(
+        programs: &mut BTreeMap<super::ComputeProgramAttribution, (u64, u64, u64)>,
+        program: super::ComputeProgramAttribution,
+        members: usize,
+        elapsed_ns: u64,
+    ) {
+        let entry = programs.entry(program).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry
+            .1
+            .saturating_add(u64::try_from(members).unwrap_or(u64::MAX));
+        entry.2 = entry.2.saturating_add(elapsed_ns);
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin_enabled_segment_test() {
+        TEST_ENABLED.with(|enabled| assert!(!enabled.replace(true)));
+        COMPUTE_PROGRAMS.with(|programs| programs.borrow_mut().clear());
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_enabled_segment_test(
+    ) -> BTreeMap<super::ComputeProgramAttribution, (u64, u64, u64)> {
+        TEST_ENABLED.with(|enabled| assert!(enabled.replace(false)));
+        COMPUTE_PROGRAMS.with(|programs| core::mem::take(&mut *programs.borrow_mut()))
     }
 
     pub(super) fn record_cpu(
@@ -410,6 +458,8 @@ mod task_compute_census {
             });
             let reasons =
                 TASK_CPU_REASONS.with(|reasons| core::mem::take(&mut *reasons.borrow_mut()));
+            let programs =
+                TASK_COMPUTE_PROGRAMS.with(|programs| core::mem::take(&mut *programs.borrow_mut()));
             let reason_fields = reasons
                 .iter()
                 .map(|(reason, (members, elapsed_ns))| {
@@ -421,9 +471,20 @@ mod task_compute_census {
                 })
                 .collect::<Vec<_>>()
                 .join(";");
+            let program_fields = programs
+                .iter()
+                .map(|(program, (segments, members, elapsed_ns))| {
+                    format!(
+                        "{program:?}={segments}:{members}:{:.3}",
+                        *elapsed_ns as f64 / 1_000_000.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
             eprintln!(
                 "[task-compute-tail] task={tasks} members={members} cpu_members={cpu_members} \
-                 compute_members={compute_members} compute_ms={:.3} cpu={reason_fields}",
+                 compute_members={compute_members} compute_ms={:.3} \
+                 programs={program_fields} cpu={reason_fields}",
                 compute_ns as f64 / 1_000_000.0,
             );
         }
@@ -468,12 +529,29 @@ mod task_compute_census {
                     );
                 }
             });
+            COMPUTE_PROGRAMS.with(|programs| {
+                for (program, (segments, members, elapsed_ns)) in programs.borrow().iter() {
+                    eprintln!(
+                        "[task-compute-program] program={program:?} segments={segments} \
+                         members={members} total_ms={:.3} ms/member={:.3}",
+                        *elapsed_ns as f64 / 1_000_000.0,
+                        *elapsed_ns as f64 / 1_000_000.0 / (*members).max(1) as f64,
+                    );
+                }
+            });
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn with_census_enabled<R>(operation: impl FnOnce() -> R) -> R {
+            begin_enabled_segment_test();
+            let value = operation();
+            finish_enabled_segment_test();
+            value
+        }
 
         #[test]
         fn reason_totals_keep_distinct_program_keys_and_close() {
@@ -505,6 +583,75 @@ mod task_compute_census {
                 )),
                 "cycle_type:00000001/00000002/00000003/00000004"
             );
+
+            let mut programs = BTreeMap::new();
+            accumulate_program(
+                &mut programs,
+                super::super::ComputeProgramAttribution::Program(0),
+                2,
+                11,
+            );
+            accumulate_program(
+                &mut programs,
+                super::super::ComputeProgramAttribution::Program(0),
+                3,
+                13,
+            );
+            accumulate_program(
+                &mut programs,
+                super::super::ComputeProgramAttribution::MixedPrograms,
+                5,
+                17,
+            );
+            assert_eq!(
+                programs
+                    .values()
+                    .map(|(segments, _, _)| segments)
+                    .sum::<u64>(),
+                3,
+            );
+            assert_eq!(
+                programs
+                    .values()
+                    .map(|(_, members, _)| members)
+                    .sum::<u64>(),
+                10,
+            );
+            assert_eq!(programs.values().map(|(_, _, ns)| ns).sum::<u64>(), 41,);
+        }
+
+        #[test]
+        fn enabled_segment_path_records_nonempty_program_member_denominator() {
+            with_census_enabled(|| {
+                let started = segment_started();
+                record_segment(
+                    2,
+                    Some(super::super::ComputeProgramAttribution::Program(2)),
+                    started,
+                );
+                COMPUTE_PROGRAMS.with(|programs| {
+                    let programs = programs.borrow();
+                    let (segments, members, _) = programs
+                        .get(&super::super::ComputeProgramAttribution::Program(2))
+                        .copied()
+                        .expect("enabled census records the typed program bucket");
+                    assert_eq!((segments, members), (1, 2));
+                    assert_eq!(
+                        programs
+                            .values()
+                            .map(|(segments, _, _)| segments)
+                            .sum::<u64>(),
+                        1,
+                    );
+                    assert_eq!(
+                        programs
+                            .values()
+                            .map(|(_, members, _)| members)
+                            .sum::<u64>(),
+                        2,
+                    );
+                });
+            });
         }
     }
 }
@@ -646,9 +793,28 @@ impl Default for RawDpcCarryIn {
 /// execution state and yields a separate move-only `ComputeEligibleTaskMember`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PlannedTaskCpuReason {
-    NoRawTriangle,
+    NoRawTriangle(PlannedNoRawTriangleReason),
     MixedFillOrTexrect,
     DefinitelyCpu(TaskComputeAdmissionRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PlannedNoRawTriangleReason {
+    FillOnly,
+    TexrectOnly,
+    FillAndTexrect,
+    TmemLoadOnly,
+    FillAndTmemLoad,
+    TexrectAndTmemLoad,
+    FillTexrectAndTmemLoad,
+    SyncStateOnly,
+    NoOpOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ComputeProgramAttribution {
+    Program(u32),
+    MixedPrograms,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2735,6 +2901,7 @@ enum StagedOutcome {
 struct DeferredComputeColor {
     candidate: CandidateColorTarget,
     plan: ComputeRasterReplacementPlan,
+    program_attribution: ComputeProgramAttribution,
     initial_bytes: Option<Vec<u8>>,
 }
 
@@ -4020,10 +4187,17 @@ impl RenderBackend for WgpuBackend {
                         .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                         .map_err(RenderError::from)?;
                     let segment_members = staged_segment.len();
+                    let program_attribution = segment_started
+                        .is_some()
+                        .then(|| compute_segment_program_attribution(&staged_segment));
                     let completed_segment =
                         complete_deferred_compute_segment(&mut batch, pipeline, staged_segment)
                             .map_err(RenderError::from)?;
-                    task_compute_census::record_segment(segment_members, segment_started);
+                    task_compute_census::record_segment(
+                        segment_members,
+                        program_attribution,
+                        segment_started,
+                    );
                     compute_members += segment_members;
                     let mut completed = completed_segment.iter();
                     let first = completed
@@ -4378,7 +4552,9 @@ fn classify_task_execution(
         .iter()
         .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)));
     if !has_raw_triangle {
-        return PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle);
+        return PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle(
+            classify_no_raw_triangle(commands),
+        ));
     }
     if commands.iter().any(|command| {
         matches!(
@@ -4416,6 +4592,49 @@ fn classify_task_execution(
         }
     }
     PlannedTaskExecution::ComputeCandidate
+}
+
+fn classify_no_raw_triangle(
+    commands: &[crate::DecodedRawDpcCommand],
+) -> PlannedNoRawTriangleReason {
+    let mut fill = false;
+    let mut texrect = false;
+    let mut tmem_load = false;
+    let mut sync_or_state = false;
+    for command in commands {
+        match command.kind() {
+            crate::RawDpcCommandKind::FillRectangle(_) => fill = true,
+            crate::RawDpcCommandKind::TextureRectangle(_) => texrect = true,
+            crate::RawDpcCommandKind::LoadBlock(_)
+            | crate::RawDpcCommandKind::LoadTile(_)
+            | crate::RawDpcCommandKind::LoadTlut(_) => tmem_load = true,
+            crate::RawDpcCommandKind::NoOp { .. } => {}
+            crate::RawDpcCommandKind::RawTriangle(_) => {
+                unreachable!("no-triangle classification received a raw triangle")
+            }
+            _ => sync_or_state = true,
+        }
+    }
+    classify_no_raw_triangle_flags(fill, texrect, tmem_load, sync_or_state)
+}
+
+fn classify_no_raw_triangle_flags(
+    fill: bool,
+    texrect: bool,
+    tmem_load: bool,
+    sync_or_state: bool,
+) -> PlannedNoRawTriangleReason {
+    match (fill, texrect, tmem_load) {
+        (true, false, false) => PlannedNoRawTriangleReason::FillOnly,
+        (false, true, false) => PlannedNoRawTriangleReason::TexrectOnly,
+        (true, true, false) => PlannedNoRawTriangleReason::FillAndTexrect,
+        (false, false, true) => PlannedNoRawTriangleReason::TmemLoadOnly,
+        (true, false, true) => PlannedNoRawTriangleReason::FillAndTmemLoad,
+        (false, true, true) => PlannedNoRawTriangleReason::TexrectAndTmemLoad,
+        (true, true, true) => PlannedNoRawTriangleReason::FillTexrectAndTmemLoad,
+        (false, false, false) if sync_or_state => PlannedNoRawTriangleReason::SyncStateOnly,
+        (false, false, false) => PlannedNoRawTriangleReason::NoOpOnly,
+    }
 }
 
 fn submit_locally(decoded: DecodedTicket) -> Result<SubmittedTicket, ValidationError> {
@@ -4678,6 +4897,57 @@ struct StagedRawDpcMember {
     draw_tmem: Option<Vec<TmemGpuProjection>>,
     compute_probes: Vec<ComputeRasterProbe>,
     compute_replacement_receipt: Option<ComputeRasterProbeReceipt>,
+}
+
+fn compute_segment_program_attribution(
+    members: &[StagedRawDpcMember],
+) -> ComputeProgramAttribution {
+    compute_program_attribution_from_members(members.iter().map(|member| {
+        let color = match &member.outcome {
+            StagedOutcome::DeferredGuestWritesOnly(_, color)
+            | StagedOutcome::DeferredMixedColorAndTmem { color, .. } => color,
+            _ => unreachable!("a compute-eligible segment contains only deferred outcomes"),
+        };
+        color.program_attribution
+    }))
+}
+
+fn compute_program_attribution_from_members(
+    programs: impl IntoIterator<Item = ComputeProgramAttribution>,
+) -> ComputeProgramAttribution {
+    let mut program = None;
+    for attribution in programs {
+        let id = match attribution {
+            ComputeProgramAttribution::Program(id) => id,
+            ComputeProgramAttribution::MixedPrograms => {
+                return ComputeProgramAttribution::MixedPrograms;
+            }
+        };
+        match program {
+            None => program = Some(id),
+            Some(first) if first == id => {}
+            Some(_) => return ComputeProgramAttribution::MixedPrograms,
+        }
+    }
+    ComputeProgramAttribution::Program(
+        program.expect("an admitted compute segment contains at least one member"),
+    )
+}
+
+fn compute_program_attribution_from_ids(
+    ids: impl IntoIterator<Item = u32>,
+) -> ComputeProgramAttribution {
+    let mut program = None;
+    for id in ids {
+        match program {
+            None => program = Some(id),
+            Some(first) if first == id => {}
+            Some(_) => return ComputeProgramAttribution::MixedPrograms,
+        }
+    }
+    ComputeProgramAttribution::Program(
+        program.expect("an admitted deferred compute plan contains at least one draw"),
+    )
 }
 
 struct StagedRawDpcFailure {
@@ -6384,6 +6654,12 @@ fn stage_color_commands(
                 });
             }
         };
+        let program_attribution = compute_program_attribution_from_ids(
+            plan.dispatches
+                .iter()
+                .flat_map(|dispatch| dispatch.batch.draws())
+                .map(|draw| draw.program().shader_id()),
+        );
 
         // Exact admission completed without mutating the generation planner.
         // Reserve only now. No other operation can interleave between preview
@@ -6411,6 +6687,7 @@ fn stage_color_commands(
         collector.deferred_compute = Some(DeferredComputeColor {
             candidate,
             plan,
+            program_attribution,
             initial_bytes,
         });
         return Ok(None);
@@ -12164,7 +12441,15 @@ mod tests {
             submissions.push(bound.submission());
             bounds.push(bound);
         }
+        task_compute_census::begin_enabled_segment_test();
         let prepared = backend.execute_raw_dpc_task_batch(bounds).unwrap();
+        let programs = task_compute_census::finish_enabled_segment_test();
+        let (segments, members, _) = programs
+            .get(&ComputeProgramAttribution::Program(0))
+            .copied()
+            .expect("the deferred hot-program segment has typed attribution");
+        assert_eq!((segments, members), (1, 2));
+        assert_eq!(programs.len(), 1);
         assert_eq!(prepared.len(), 2);
         assert!(
             backend.color_targets().unwrap().residents().is_empty(),
@@ -12252,11 +12537,77 @@ mod tests {
         let pending = backend.pending_raw_dpc_task_batch.as_ref().unwrap();
         assert_eq!(
             pending.members[0].execution,
-            PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle)
+            PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle(
+                PlannedNoRawTriangleReason::FillOnly,
+            ))
         );
         assert_eq!(
             pending.members[1].execution,
             PlannedTaskExecution::Cpu(PlannedTaskCpuReason::MixedFillOrTexrect)
+        );
+    }
+
+    #[test]
+    fn no_triangle_reason_partition_is_exhaustive_and_non_overlapping() {
+        let expected = [
+            PlannedNoRawTriangleReason::NoOpOnly,
+            PlannedNoRawTriangleReason::SyncStateOnly,
+            PlannedNoRawTriangleReason::TmemLoadOnly,
+            PlannedNoRawTriangleReason::TexrectOnly,
+            PlannedNoRawTriangleReason::TexrectAndTmemLoad,
+            PlannedNoRawTriangleReason::FillOnly,
+            PlannedNoRawTriangleReason::FillAndTmemLoad,
+            PlannedNoRawTriangleReason::FillAndTexrect,
+            PlannedNoRawTriangleReason::FillTexrectAndTmemLoad,
+        ];
+        let actual = [
+            classify_no_raw_triangle_flags(false, false, false, false),
+            classify_no_raw_triangle_flags(false, false, false, true),
+            classify_no_raw_triangle_flags(false, false, true, false),
+            classify_no_raw_triangle_flags(false, true, false, false),
+            classify_no_raw_triangle_flags(false, true, true, false),
+            classify_no_raw_triangle_flags(true, false, false, false),
+            classify_no_raw_triangle_flags(true, false, true, false),
+            classify_no_raw_triangle_flags(true, true, false, false),
+            classify_no_raw_triangle_flags(true, true, true, false),
+        ];
+        assert_eq!(actual, expected);
+        let distinct = actual
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), expected.len());
+    }
+
+    #[test]
+    fn compute_program_attribution_closes_draws_and_segment_members() {
+        assert_eq!(
+            compute_program_attribution_from_ids([2, 2, 2]),
+            ComputeProgramAttribution::Program(2),
+        );
+        assert_eq!(
+            compute_program_attribution_from_ids([0, 2]),
+            ComputeProgramAttribution::MixedPrograms,
+        );
+        assert_eq!(
+            compute_program_attribution_from_members([
+                ComputeProgramAttribution::Program(2),
+                ComputeProgramAttribution::Program(2),
+            ]),
+            ComputeProgramAttribution::Program(2),
+        );
+        assert_eq!(
+            compute_program_attribution_from_members([
+                ComputeProgramAttribution::Program(2),
+                ComputeProgramAttribution::MixedPrograms,
+            ]),
+            ComputeProgramAttribution::MixedPrograms,
+        );
+        assert_eq!(
+            compute_program_attribution_from_members([
+                ComputeProgramAttribution::Program(0),
+                ComputeProgramAttribution::Program(2),
+            ]),
+            ComputeProgramAttribution::MixedPrograms,
         );
     }
 
