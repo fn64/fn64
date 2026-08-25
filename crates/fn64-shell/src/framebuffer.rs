@@ -49,6 +49,129 @@ enum PresentPixels {
     Rgba5551(Box<[u8]>),
 }
 
+/// Display policy which changes the submitted image without changing the VI
+/// framebuffer bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentPolicy {
+    overscan: u32,
+    zoom_fill: bool,
+}
+
+impl PresentPolicy {
+    pub fn new(overscan: u32, zoom_fill: bool) -> Self {
+        Self {
+            overscan,
+            zoom_fill,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PresentCacheStats {
+    pub requests: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub successful_presents: u64,
+    pub failed_presents: u64,
+    pub invalidations: u64,
+    pub dependency_samples: u64,
+    pub dependency_bytes: u64,
+    pub logical_digest: u64,
+}
+
+#[derive(Debug)]
+struct CachedPresent {
+    generation: u64,
+    dependency: PresentDependency,
+}
+
+/// Exact presentation reuse authority plus its experiment accounting.
+///
+/// A generation closes the class of stale-window bugs where framebuffer bytes
+/// remain unchanged while composition, display policy, or surface state
+/// changes. Only a successful submission installs an authority in the current
+/// generation; a failed submission invalidates it so the next pump retries.
+#[derive(Debug, Default)]
+pub struct PresentCache {
+    generation: u64,
+    policy: Option<PresentPolicy>,
+    last: Option<CachedPresent>,
+    stats: PresentCacheStats,
+}
+
+impl PresentCache {
+    pub fn synchronize_policy(&mut self, policy: PresentPolicy) {
+        match self.policy.replace(policy) {
+            Some(previous) if previous != policy => self.invalidate(),
+            _ => {}
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("present cache generation overflow");
+        self.stats.invalidations = self.stats.invalidations.saturating_add(1);
+    }
+
+    pub fn record_uncacheable_request(&mut self) {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        self.stats.misses = self.stats.misses.saturating_add(1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn is_current(
+        &mut self,
+        rdram: &[u8],
+        start: usize,
+        src_stride: usize,
+        dst_width: usize,
+        dst_height: usize,
+        blanked: bool,
+    ) -> bool {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        let (digest, bytes) =
+            dependency_digest(rdram, start, src_stride, dst_width, dst_height, blanked);
+        self.stats.dependency_samples = self.stats.dependency_samples.saturating_add(1);
+        self.stats.dependency_bytes = self
+            .stats
+            .dependency_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.stats.logical_digest = fnv_u64(self.stats.logical_digest, digest);
+
+        let hit = self.last.as_ref().is_some_and(|cached| {
+            cached.generation == self.generation
+                && cached
+                    .dependency
+                    .matches(rdram, start, src_stride, dst_width, dst_height, blanked)
+        });
+        if hit {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+        } else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+        }
+        hit
+    }
+
+    pub fn record_success(&mut self, dependency: PresentDependency) {
+        self.stats.successful_presents = self.stats.successful_presents.saturating_add(1);
+        self.last = Some(CachedPresent {
+            generation: self.generation,
+            dependency,
+        });
+    }
+
+    pub fn record_failure(&mut self) {
+        self.stats.failed_presents = self.stats.failed_presents.saturating_add(1);
+        self.invalidate();
+    }
+
+    pub fn stats(&self) -> PresentCacheStats {
+        self.stats
+    }
+}
+
 impl PresentDependency {
     pub fn capture(
         rdram: &[u8],
@@ -97,6 +220,38 @@ impl PresentDependency {
             }
             _ => false,
         }
+    }
+}
+
+fn fnv_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn fnv_u64(hash: u64, value: u64) -> u64 {
+    fnv_bytes(hash, &value.to_le_bytes())
+}
+
+fn dependency_digest(
+    rdram: &[u8],
+    start: usize,
+    src_stride: usize,
+    dst_width: usize,
+    dst_height: usize,
+    blanked: bool,
+) -> (u64, usize) {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for value in [start, src_stride, dst_width, dst_height] {
+        hash = fnv_u64(hash, u64::try_from(value).unwrap_or(u64::MAX));
+    }
+    hash = fnv_bytes(hash, &[u8::from(blanked)]);
+    if blanked {
+        (hash, 0)
+    } else {
+        let pixels = decoded_storage(rdram, start, src_stride, dst_width, dst_height);
+        (fnv_bytes(hash, pixels), pixels.len())
     }
 }
 
@@ -270,6 +425,93 @@ mod tests {
         assert!(saved.matches(&rdram, 0, 8, 8, 2, true));
         assert!(!saved.matches(&rdram, 0, 8, 8, 2, false));
         assert!(!saved.matches(&rdram, 0, 8, 8, 3, true));
+    }
+
+    fn install_test_present(cache: &mut PresentCache, rdram: &[u8]) {
+        cache.record_success(PresentDependency::capture(rdram, 0, 8, 8, 2, false));
+    }
+
+    #[test]
+    fn overlay_close_generation_cannot_reuse_composited_frame() {
+        let rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        install_test_present(&mut cache, &rdram);
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, false));
+
+        // Closing the overlay changes the window image but not these guest
+        // bytes. The transition's generation bump must force one clean draw.
+        cache.invalidate();
+        assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
+    }
+
+    #[test]
+    fn video_policy_changes_invalidate_but_identical_observations_do_not() {
+        let rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        cache.synchronize_policy(PresentPolicy::new(1, false));
+        install_test_present(&mut cache, &rdram);
+
+        cache.synchronize_policy(PresentPolicy::new(1, false));
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, false));
+        cache.synchronize_policy(PresentPolicy::new(1, true));
+        assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
+
+        install_test_present(&mut cache, &rdram);
+        cache.synchronize_policy(PresentPolicy::new(2, true));
+        assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
+    }
+
+    #[test]
+    fn failed_submission_forces_retry_of_identical_dependency() {
+        let rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        install_test_present(&mut cache, &rdram);
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, false));
+
+        cache.record_failure();
+        assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
+        assert_eq!(cache.stats().failed_presents, 1);
+    }
+
+    #[test]
+    fn cache_stats_keep_skipped_requests_in_the_denominator_and_digest() {
+        let mut rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        install_test_present(&mut cache, &rdram);
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, false));
+        let first = cache.stats();
+        assert_eq!(first.requests, 1);
+        assert_eq!(first.hits, 1);
+        assert_eq!(first.misses, 0);
+        assert_eq!(first.dependency_samples, 1);
+        assert_eq!(first.dependency_bytes, 32);
+
+        rdram[0] ^= 1;
+        assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
+        cache.record_uncacheable_request();
+        let final_stats = cache.stats();
+        assert_eq!(final_stats.requests, 3);
+        assert_eq!(final_stats.hits, 1);
+        assert_eq!(final_stats.misses, 2);
+        assert_eq!(final_stats.dependency_samples, 2);
+        assert_eq!(final_stats.dependency_bytes, 64);
+        assert_ne!(first.logical_digest, final_stats.logical_digest);
+    }
+
+    #[test]
+    fn blank_logical_sample_hashes_policy_key_without_rdram_bytes() {
+        let mut rdram = vec![0; 64];
+        let mut cache = PresentCache::default();
+        cache.record_success(PresentDependency::capture(&rdram, 0, 8, 8, 2, true));
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, true));
+        let first = cache.stats();
+        rdram.fill(0xff);
+        assert!(cache.is_current(&rdram, 0, 8, 8, 2, true));
+        let second = cache.stats();
+        assert_eq!(second.dependency_samples, 2);
+        assert_eq!(second.dependency_bytes, 0);
+        assert_ne!(first.logical_digest, 0);
+        assert_ne!(first.logical_digest, second.logical_digest);
     }
 
     /// Build a word-aligned framebuffer holding `px` values at pixels 0..n,

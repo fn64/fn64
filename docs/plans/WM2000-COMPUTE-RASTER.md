@@ -835,10 +835,17 @@ The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns
 the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
 comparison borrows live RDRAM without allocating, and the snapshot advances
-only after a successful surface render. OS redraw, overlay, tripwire, and
-frame-dump paths always redraw. One same-binary run changed p95 only from
-40.368 to 40.237 ms, too small for a claim under the measured background-load
-noise, so it remains opt-in pending a quiet counterbalanced A/B.
+only after a successful surface render. A separate generation invalidates
+that authority when overlay/HUD composition closes or toggles, overscan or
+zoom-fill policy changes, the window resizes or changes scale/fullscreen, or a
+surface submission fails. OS redraw/expose, overlay, tripwire, and frame-dump
+paths always redraw. Heartbeats and the final `[fn64-present-cache]` row report
+the cumulative request/hit/miss denominator, successful and failed submits,
+invalidations, and a logical dependency digest with its sample and byte counts,
+so skipped submissions no longer disappear from the experiment. One
+same-binary run changed p95 only from 40.368 to 40.237 ms, too small for a
+claim under the measured background-load noise, so it remains opt-in pending a
+quiet counterbalanced A/B.
 
 ## Sources and nonclaims
 
