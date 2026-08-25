@@ -13,6 +13,10 @@ host-gpu-tests = []
 # `fn64-render-conformance`'s wgpu runner drives. Additive and inert when
 # off: it gates one module and adds no dependency.
 conformance-runner = []
+# Compile the unwired RT64 literal-port portfolio outside its unit-test
+# target. Shipping builds leave this off; the port remains available for
+# explicit characterization checks and private-item documentation.
+rt64-port-characterization = []
 
 [dependencies]
 fn64-render = { path = "../fn64-render" }

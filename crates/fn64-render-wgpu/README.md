@@ -6,6 +6,33 @@ it decodes a bounded raw-DPC subset into ordered typed commands, a
 transaction-local RDP state delta, and an exact resource plan. M3.1's headless
 wgpu 30 fixture remains byte-for-byte frozen as a separate lifecycle bridge.
 
+## Characterization-only RT64 portfolio
+
+The 61 private `rt64_*` modules with no shipping consumer, plus the five
+unwired companion modules `color_converter`, `color_hlsli`, `depth_encode`,
+`fbcommon`, and `texture_lod`, compile under
+`cfg(any(test, feature = "rt64-port-characterization"))`. Normal backend and
+shell builds therefore compile only code reachable by the shipping renderer.
+`rt64_gbi_rdp_decode` remains unconditional because production raw-DPC
+`SetScissor` decoding consumes its typed result.
+
+Unit tests compile the full portfolio and run its characterization cases. The
+default-off `rt64-port-characterization` feature additionally makes the
+private modules available to explicit characterization checks and private-item
+documentation:
+
+```text
+cargo check -p fn64-render-wgpu --features rt64-port-characterization
+cargo doc -p fn64-render-wgpu --features rt64-port-characterization --document-private-items
+```
+
+Dead-code diagnostics in that explicit feature build remain useful evidence
+that a port has not acquired a production consumer; the feature is not a
+shipping-admission mechanism and adds no public API. When a module gains a
+real production caller, its module declaration moves out of this gate in the
+same change as that caller rather than acquiring an allow or a synthetic
+keep-alive reference.
+
 ## WM2000 task-batch production path
 
 The rs + wgpu launcher uses transactional raw-DPC task batching and the

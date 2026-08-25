@@ -270,7 +270,7 @@ The width table gating it all is
 Two corrections to the standing summary, both in the port's favor:
 
 1. **Triangles are admitted and genuinely wired**, not present-but-unwired like
-   the 48 inert `rt64_*` modules. The chain is
+   the characterization-only `rt64_*` portfolio. The chain is
    `execute_raw_dpc` → `draw_admitted_triangles`
    (`crates/fn64-render-wgpu/src/production.rs:1351`) →
    `TrianglePipelineRenderer::submit_triangles`
@@ -283,9 +283,17 @@ Two corrections to the standing summary, both in the port's favor:
    (`production.rs:1316`) therefore *understates* the decoder. The enum is a
    coarse label, not the admitted set.
 
-And one correction against it: the dead-code signal measured here is **1041**
-`never used` warnings from `cargo build -p fn64-render-wgpu` (ANSI-stripped),
-not the ~1198 the brief quoted. Baseline measured, not quoted.
+And one correction against it: the dead-code signal measured for this audit
+was **1041** `never used` warnings from
+`cargo build -p fn64-render-wgpu` (ANSI-stripped), not the ~1198 the brief
+quoted. That historical baseline remains the audit's evidence. On 2026-08-25,
+the grown source tree produced 1211 warnings in a normal library check: 1151
+from 61 still-unwired `rt64_*` modules, 41 from five unwired companion modules,
+and 19 from the shipping graph. Those 61+5 characterization modules now compile
+only for unit tests or the explicit default-off
+`rt64-port-characterization` feature; the normal check reports the remaining
+19 without hiding any lint behind an allow. `rt64_gbi_rdp_decode` stays in the
+shipping graph because its `SetScissor` decode has a real production caller.
 
 ### 3a. Three structural restrictions matter more than the missing opcodes
 
@@ -408,9 +416,12 @@ commands. What WM2000 hands the system is a *GBI display list*, which must be
 walked, its matrix/vertex/lighting/texture state maintained, and its geometry
 transformed into RDP triangles. That is the entire body of work
 `crates/fn64-render-reference/src/gbi/` represents, and none of it exists in
-`fn64-render-wgpu`. The 1041 dead-code warnings in that crate are consistent
-with a large body of ported-but-unreferenced material, matching the previously
-recorded finding that ported `rt64_*` modules are inert.
+`fn64-render-wgpu`. The audit's 1041 dead-code warnings were consistent with a
+large body of ported-but-unreferenced material. That material remains source-
+controlled and compiled by its unit tests, but normal shipping builds now omit
+the 61-module unwired portfolio through the explicit characterization gate
+described above rather than repeatedly presenting its expected dead-code
+signal as production-build noise.
 
 **Is the goal reachable on the current architecture?** Yes — the architecture
 is not the obstacle. `RenderBackend` is a clean trait seam; `ReferenceBackend`

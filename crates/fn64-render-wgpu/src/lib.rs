@@ -319,17 +319,21 @@ mod blend;
 // Public only under `conformance-runner`: the adapterless entry point the
 // renderer-conformance harness's wgpu runner drives. Off by default, so the
 // default build's public surface is unchanged.
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod color_converter;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod color_hlsli;
 mod combiner;
 #[cfg(feature = "conformance-runner")]
 pub mod conformance;
 mod coverage;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod depth_encode;
 mod depth_mode;
 mod depth_strict_less;
 mod device;
 mod endian_swap;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod fbcommon;
 mod formats_dither;
 mod lifecycle;
@@ -342,78 +346,183 @@ mod raw_dpc;
 #[cfg(test)]
 mod rdp_harness;
 mod rgb_dither;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_blender_analysis;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_blender_emulation;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_common;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_extended_gbi;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_extra_params;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_fb_reinterpret;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_float4_quantize;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_frame_compatibility;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_framebuffer_geometry;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_framebuffer_shaders;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_framebuffer_storage;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_framebuffer_tile;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_fullscreen_vs;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gaussian_filter;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_extended_decode;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_f3d;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_f3d_variants;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_f3dex;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_f3dex2;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_opcodes;
 mod rt64_gbi_rdp_decode;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_gbi_s2dex2;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_hle_geometry;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_hlsl_interop;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_interpolation_helpers;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_light_estimation;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_lights_math;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_luminance_histogram;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_math;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_math_decompose;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_math_matrix;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_postprocess;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_present_shaders;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_preset_draw_call_match;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_preset_light;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_preset_material;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_preset_scene;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_profiling_timer;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rdp_state;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_render_flags;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_render_pipeline_types;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_render_target_geometry;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_replacement_resolve;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_resample;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rigid_body;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_matrix_stack;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_patch;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_process;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_segment;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_smooth_normal;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_rsp_world_modify;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_shader_description;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_shared_params;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_texture_map_lru;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_texture_sampler;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_tmem_hasher;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_tmem_regions;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_upload_geometry;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_user_configuration;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_vi_registers;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_vi_timing;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod rt64_workload_geometry;
 mod shader_manifest;
 mod state;
 mod targets;
 mod texture_gen;
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 mod texture_lod;
 mod tmem;
 mod vi;
 mod vi_scanout;
 #[cfg(test)]
 mod wire_words;
+
+#[cfg(test)]
+mod characterization_gate_tests {
+    const GATE: &str = "#[cfg(any(test, feature = \"rt64-port-characterization\"))]";
+
+    #[test]
+    fn only_the_production_scissor_decode_rt64_module_bypasses_the_gate() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<_> = source.lines().collect();
+        let modules: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("mod rt64_") && line.ends_with(';'))
+            .collect();
+        assert_eq!(modules.len(), 62);
+        for (index, module) in modules {
+            if *module == "mod rt64_gbi_rdp_decode;" {
+                assert_ne!(lines[index - 1], GATE);
+            } else {
+                assert_eq!(lines[index - 1], GATE, "ungated characterization {module}");
+            }
+        }
+    }
+
+    #[test]
+    fn unwired_companion_modules_share_the_characterization_gate() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<_> = source.lines().collect();
+        for module in [
+            "mod color_converter;",
+            "mod color_hlsli;",
+            "mod depth_encode;",
+            "mod fbcommon;",
+            "mod texture_lod;",
+        ] {
+            let index = lines
+                .iter()
+                .position(|line| *line == module)
+                .unwrap_or_else(|| panic!("missing characterization companion {module}"));
+            assert_eq!(lines[index - 1], GATE, "ungated characterization {module}");
+        }
+    }
+}
 
 pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value, AlphaCompareNoise,
