@@ -2395,7 +2395,7 @@ impl WgpuBackend {
                 compute_raster_probe_receipt: None,
                 compute_raster_replace_receipt: None,
                 task_compute_raster_enabled: env_default_one("FN64_RAW_DPC_TASK_COMPUTE"),
-                task_cpu_color_batch_enabled: env_exact_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
+                task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
                 configured_target_extent: None,
                 color_targets: None,
