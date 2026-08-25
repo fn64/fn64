@@ -777,6 +777,18 @@ tranche therefore targets the combined texrect/TMEM transaction rather than
 optimizing the cheap standalone shapes or broadening synchronous GPU
 admission.
 
+`FN64_TEXRECT_TIMING_CENSUS=1` provides the next exact specialization
+ranking. It keys successful CPU texrects by the complete combiner, other-mode,
+target, LUT, tile descriptor, address controls, tile bounds/parity, and axis
+orientation, and reports calls, requested/clipped pixels, total/max elapsed
+nanoseconds, and cost per clipped pixel. Periodic cumulative rows plus a
+thread-exit tail snapshot close bounded-run evidence; an explicit flush seam
+is available for backend teardown. The armed census includes its aggregation
+and reporting overhead in outer task/frame clocks, so it is attribution
+evidence only, never an authoritative p95 comparison. The disabled path reads
+only a cached enable flag and performs no clock, key construction, locking, or
+map traversal.
+
 The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns
 the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
