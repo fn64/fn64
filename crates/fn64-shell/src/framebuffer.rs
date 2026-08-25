@@ -29,6 +29,103 @@ pub const FB_HEIGHT: usize = 240;
 /// RGBA5551 is 2 bytes per pixel.
 pub const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2;
 
+/// Exact inputs consumed by one shell framebuffer decode.
+///
+/// This is deliberately byte-backed rather than hash-backed: equality is an
+/// authority for suppressing a redundant window submission, so a collision
+/// may not turn a changed guest framebuffer into a missed redraw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentDependency {
+    start: usize,
+    src_stride: usize,
+    dst_width: usize,
+    dst_height: usize,
+    pixels: PresentPixels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PresentPixels {
+    Blanked,
+    Rgba5551(Box<[u8]>),
+}
+
+impl PresentDependency {
+    pub fn capture(
+        rdram: &[u8],
+        start: usize,
+        src_stride: usize,
+        dst_width: usize,
+        dst_height: usize,
+        blanked: bool,
+    ) -> Self {
+        let pixels = if blanked {
+            PresentPixels::Blanked
+        } else {
+            PresentPixels::Rgba5551(
+                decoded_storage(rdram, start, src_stride, dst_width, dst_height).into(),
+            )
+        };
+        Self {
+            start,
+            src_stride,
+            dst_width,
+            dst_height,
+            pixels,
+        }
+    }
+
+    pub fn matches(
+        &self,
+        rdram: &[u8],
+        start: usize,
+        src_stride: usize,
+        dst_width: usize,
+        dst_height: usize,
+        blanked: bool,
+    ) -> bool {
+        if self.start != start
+            || self.src_stride != src_stride
+            || self.dst_width != dst_width
+            || self.dst_height != dst_height
+        {
+            return false;
+        }
+        match (&self.pixels, blanked) {
+            (PresentPixels::Blanked, true) => true,
+            (PresentPixels::Rgba5551(saved), false) => {
+                saved.as_ref() == decoded_storage(rdram, start, src_stride, dst_width, dst_height)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn decoded_storage(
+    rdram: &[u8],
+    start: usize,
+    src_stride: usize,
+    dst_width: usize,
+    dst_height: usize,
+) -> &[u8] {
+    assert!(
+        start.is_multiple_of(4),
+        "framebuffer start is not word-aligned"
+    );
+    let copy_width = dst_width.min(src_stride.max(1));
+    let pixels = dst_height
+        .saturating_sub(1)
+        .checked_mul(src_stride.max(1))
+        .and_then(|prefix| prefix.checked_add(copy_width))
+        .expect("framebuffer dependency footprint overflow");
+    let bytes = pixels
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(3))
+        .map(|bytes| bytes & !3)
+        .expect("framebuffer dependency byte count overflow");
+    let available = rdram.len().saturating_sub(start);
+    &rdram[start..start + bytes.min(available)]
+}
+
 /// Expand a 5-bit channel (0..=31) to 8-bit (0..=255) with rounding, the same
 /// `(v*255+15)/31` expansion oot-boot uses -- so a byte-for-byte identical
 /// image to the PNG dumps.
@@ -143,6 +240,36 @@ mod tests {
 
     fn blank_dst() -> Vec<u8> {
         vec![0u8; FB_WIDTH * FB_HEIGHT * 4]
+    }
+
+    #[test]
+    fn present_dependency_matches_only_exact_decoded_inputs() {
+        let mut rdram = vec![0u8; 128];
+        let saved = PresentDependency::capture(&rdram, 16, 8, 7, 3, false);
+        assert!(saved.matches(&rdram, 16, 8, 7, 3, false));
+
+        // Last decoded pixel is row 2, column 6. Its containing word belongs
+        // to the dependency and must invalidate reuse.
+        rdram[60] = 1;
+        assert!(!saved.matches(&rdram, 16, 8, 7, 3, false));
+
+        // Bytes after the final containing word are not read by the decoder.
+        rdram[64] = 1;
+        let saved = PresentDependency::capture(&rdram, 16, 8, 7, 3, false);
+        rdram[100] = 1;
+        assert!(saved.matches(&rdram, 16, 8, 7, 3, false));
+        assert!(!saved.matches(&rdram, 16, 8, 6, 3, false));
+        assert!(!saved.matches(&rdram, 20, 8, 7, 3, false));
+    }
+
+    #[test]
+    fn blank_dependency_ignores_rdram_but_not_output_state() {
+        let mut rdram = vec![0u8; 64];
+        let saved = PresentDependency::capture(&rdram, 0, 8, 8, 2, true);
+        rdram.fill(0xff);
+        assert!(saved.matches(&rdram, 0, 8, 8, 2, true));
+        assert!(!saved.matches(&rdram, 0, 8, 8, 2, false));
+        assert!(!saved.matches(&rdram, 0, 8, 8, 3, true));
     }
 
     /// Build a word-aligned framebuffer holding `px` values at pixels 0..n,

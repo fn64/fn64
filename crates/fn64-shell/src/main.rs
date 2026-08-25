@@ -271,6 +271,13 @@ mod game {
         /// blitting to the pixels surface -- reused per frame, reallocated if
         /// the framebuffer width changes.
         rgba: Vec<u8>,
+        /// Exact guest bytes and VI geometry used for the last successful
+        /// window submission. This is the authority for suppressing a
+        /// redundant pump-driven redraw; OS-requested redraws still present.
+        last_present_dependency: Option<framebuffer::PresentDependency>,
+        /// Experimental exact-input redraw suppression. Default-off until a
+        /// repeated live A/B establishes its wall-time effect.
+        present_cache_enabled: bool,
         /// Current pixels-surface / scratch width in pixels. Starts at
         /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
         /// latched, so the full framebuffer line is presented (not cropped).
@@ -612,6 +619,16 @@ mod game {
                 );
             }
 
+            let present_cache_enabled = std::env::var("FN64_PRESENT_CACHE")
+                .ok()
+                .as_deref()
+                == Some("1");
+            if present_cache_enabled {
+                println!(
+                    "[fn64-shell] FN64_PRESENT_CACHE=1 (exact framebuffer dependency gate)"
+                );
+            }
+
             Shell {
                 rdram,
                 pad: PadState::new(),
@@ -627,6 +644,8 @@ mod game {
                 },
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
+                last_present_dependency: None,
+                present_cache_enabled,
                 fb_width: FB_WIDTH,
                 fb_height: FB_HEIGHT,
                 window: None,
@@ -770,6 +789,40 @@ mod game {
             (kb_buttons | gp_buttons, sx, sy)
         }
 
+        fn presented_frame_is_current(&self) -> bool {
+            if !self.present_cache_enabled
+                || self.overlay.active()
+                || self.frame_trip.is_some()
+                || self.frame_dump_dir.is_some()
+            {
+                return false;
+            }
+            let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
+                .or_else(fn64_abi::current_vi_framebuffer)
+                .map(|offset| offset as usize)
+            else {
+                return false;
+            };
+            if !fb_offset.is_multiple_of(4) {
+                return false;
+            }
+            let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
+            let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
+            let target_width = (src_stride - overscan).clamp(1, 4096);
+            let target_height = fn64_abi::vi_output_height()
+                .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
+            self.last_present_dependency.as_ref().is_some_and(|dependency| {
+                dependency.matches(
+                    &self.rdram,
+                    fb_offset,
+                    src_stride,
+                    target_width,
+                    target_height,
+                    fn64_abi::vi_blanked(),
+                )
+            })
+        }
+
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
         /// present. Reports blank/uniform frames honestly.
         fn present(&mut self) {
@@ -854,6 +907,16 @@ mod game {
                     );
                 }
             }
+            let dependency = self.present_cache_enabled.then(|| {
+                framebuffer::PresentDependency::capture(
+                    &self.rdram,
+                    fb_offset,
+                    src_stride,
+                    self.fb_width,
+                    self.fb_height,
+                    vi_blanked,
+                )
+            });
             if vi_blanked {
                 framebuffer::fill_opaque_black(&mut self.rgba);
             } else {
@@ -955,6 +1018,7 @@ mod game {
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
             }
+            self.last_present_dependency = dependency;
             self.present_times.record(present_started.elapsed());
 
             if !self.reported_first_frame {
@@ -1533,8 +1597,10 @@ mod game {
                     } else {
                         now_t + FRAME
                     };
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
+                if !self.presented_frame_is_current() {
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
                 }
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
