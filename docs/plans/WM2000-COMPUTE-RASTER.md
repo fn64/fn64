@@ -779,8 +779,9 @@ packet shape: removing every CPU-triangle bucket would lower p95 by at most
 2.725 ms and removing only combined texrect/TMEM would lower it by at most
 1.328 ms. These are correlation ceilings, not predicted speedups.
 
-`FN64_RAW_DPC_TASK_CPU_COLOR_BATCH=1` enables the first ordered CPU triangle
-batching tranche for same-binary A/B measurement. Compatible same-target,
+The first ordered CPU triangle batching tranche is enabled by default;
+`FN64_RAW_DPC_TASK_CPU_COLOR_BATCH=0` disables it for same-binary A/B
+measurement. Compatible same-target,
 depth-free triangle members move one full accumulator through the task instead
 of cloning a seed and private shadow for every packet. Each packet still owns
 an independently ordered, journal- and digest-bound sparse publication token;
@@ -790,14 +791,17 @@ boundaries move the final accumulator into the private registry once. TMEM
 staging also advances its already-validated word plan directly rather than
 cloning the plan for a second scan. This tranche deliberately does not combine
 the scalar triangle raster walks, so its live ceiling is the eliminated
-allocation and framebuffer-copy work. It remains default-off until a long
-counterbalanced live run proves byte identity and a net timing win. The first
-two counterbalanced 1,600-pump pairs used one release binary and changed only
-this flag. Candidate/control p95 was 34.173/34.961 ms and 34.539/35.447 ms;
-mean was 24.692/25.387 ms and 25.078/25.589 ms. Recorded framebuffer hashes
-matched at every 60-swap checkpoint through swap 900 in both pairs. This is a
-repeatable positive A/B result, but not the ten-run deterministic gate, and
-candidate p95 still exceeds the 33.333 ms field budget.
+allocation and framebuffer-copy work. The first two counterbalanced
+1,600-pump pairs used one release binary and changed only this flag.
+Candidate/control p95 was 34.173/34.961 ms and 34.539/35.447 ms; mean was
+24.692/25.387 ms and 25.078/25.589 ms. A later clean same-binary comparison on
+the optimized stack measured 30.837 ms with batching versus 31.719--31.941 ms
+without it. Ten consecutive 1,600-pump batching runs then completed with all
+15 framebuffer heartbeat hashes identical through swap 900: mean was
+22.949--23.305 ms, p95 30.728--31.545 ms, p99 34.598--36.209 ms, and max
+36.803--37.894 ms. No late audio callback was recorded. That clears the
+deterministic default-on gate and proves a repeatable p95 improvement, but the
+p99/max tail still exceeds the 33.333 ms field budget.
 
 `FN64_TEXRECT_TIMING_CENSUS=1` provides the next exact specialization
 ranking. It keys successful CPU texrects by the complete combiner, other-mode,
