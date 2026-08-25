@@ -848,6 +848,7 @@ dependencies = [
  "oot-recompiled",
  "pixels",
  "serde",
+ "sha2",
  "toml",
  "winit",
 ]
