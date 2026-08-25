@@ -35,6 +35,19 @@ class Pump:
     resume_dispatch_ms: float
     rsp_steps_gfx: int
     rsp_steps_audio: int
+    task_completion_before: int | None = None
+    task_completion_after: int | None = None
+    task_envelope_ms: float | None = None
+    task_hot_member_ms: float | None = None
+    task_all_cpu_member_ms: float | None = None
+    task_compute_segment_ms: float | None = None
+    task_renderer_work_ms: float | None = None
+    task_member_accounted_ms: float | None = None
+    task_view_plan_residual_ms: float | None = None
+    task_finalize_coordinator_ms: float | None = None
+    task_post_view_wrapper_residual_ms: float | None = None
+    task_outer_residual_ms: float | None = None
+    task_rdp_outside_envelope_ms: float | None = None
 
 
 METRICS = (
@@ -52,6 +65,20 @@ METRICS = (
     "rsp_steps_audio",
 )
 
+TASK_PHASE_METRICS = (
+    "task_envelope_ms",
+    "task_hot_member_ms",
+    "task_all_cpu_member_ms",
+    "task_compute_segment_ms",
+    "task_renderer_work_ms",
+    "task_member_accounted_ms",
+    "task_view_plan_residual_ms",
+    "task_finalize_coordinator_ms",
+    "task_post_view_wrapper_residual_ms",
+    "task_outer_residual_ms",
+    "task_rdp_outside_envelope_ms",
+)
+
 
 def percentile(values: list[float], fraction: float) -> float:
     if not values:
@@ -67,8 +94,20 @@ def parse_pumps(text: str) -> list[Pump]:
         if not line.startswith(SEQUENCE_PREFIX):
             continue
         fields = line[len(SEQUENCE_PREFIX) :].split(",")
-        if len(fields) != 15:
-            raise ValueError(f"pump sequence row has {len(fields)} fields, expected 15")
+        if len(fields) not in (15, 28):
+            raise ValueError(
+                f"pump sequence row has {len(fields)} fields, expected legacy 15 or expanded 28"
+            )
+        task_fields: dict[str, int | float | None] = {}
+        if len(fields) == 28:
+            task_fields = {
+                "task_completion_before": int(fields[15]),
+                "task_completion_after": int(fields[16]),
+                **{
+                    metric: float(value)
+                    for metric, value in zip(TASK_PHASE_METRICS, fields[17:])
+                },
+            }
         pump = Pump(
             index=int(fields[0]),
             wall_ms=float(fields[1]),
@@ -85,6 +124,7 @@ def parse_pumps(text: str) -> list[Pump]:
             resume_dispatch_ms=float(fields[12]),
             rsp_steps_gfx=int(fields[13]),
             rsp_steps_audio=int(fields[14]),
+            **task_fields,
         )
         if pump.index != len(pumps):
             raise ValueError(
@@ -99,7 +139,9 @@ def parse_pumps(text: str) -> list[Pump]:
     return pumps
 
 
-def population_means(frames: list[dict[str, float]]) -> dict[str, float]:
+def population_means(
+    frames: list[dict[str, float]], metrics: tuple[str, ...] = METRICS
+) -> dict[str, float]:
     if not frames:
         return {"count": 0}
     return {
@@ -107,8 +149,18 @@ def population_means(frames: list[dict[str, float]]) -> dict[str, float]:
         "drawn_frame_ms": sum(frame["drawn_frame_ms"] for frame in frames) / len(frames),
         **{
             metric: sum(frame[metric] for frame in frames) / len(frames)
-            for metric in METRICS
+            for metric in metrics
         },
+    }
+
+
+def distribution(values: list[float]) -> dict[str, float]:
+    return {
+        "mean": sum(values) / len(values),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "p99": percentile(values, 0.99),
+        "max": max(values),
     }
 
 
@@ -118,6 +170,9 @@ def summarize(text: str) -> dict[str, object]:
         raise ValueError("pump census renderer identity is missing")
     renderer = renderer_match.group(1)
     pumps = parse_pumps(text)
+    task_phase_available = pumps[0].task_completion_before is not None
+    if any((pump.task_completion_before is not None) != task_phase_available for pump in pumps):
+        raise ValueError("pump sequence mixes legacy 15-field and expanded 28-field rows")
     swap_indices = [pump.index for pump in pumps if pump.swapped]
     if len(swap_indices) < 2:
         raise ValueError("at least two post-warmup VI swaps are required")
@@ -126,15 +181,27 @@ def summarize(text: str) -> dict[str, object]:
     frames = []
     for previous, current in zip(swap_indices, swap_indices[1:]):
         span = pumps[previous + 1 : current + 1]
-        frames.append(
-            {
-                "drawn_frame_ms": sum(pump.wall_ms for pump in span),
-                **{
-                    metric: sum(getattr(pump, metric) for pump in span)
-                    for metric in METRICS
-                },
-            }
-        )
+        frame = {
+            "drawn_frame_ms": sum(pump.wall_ms for pump in span),
+            **{
+                metric: sum(getattr(pump, metric) for pump in span)
+                for metric in METRICS
+            },
+        }
+        if task_phase_available:
+            frame.update(
+                {
+                    "task_completions": (
+                        span[-1].task_completion_after
+                        - span[0].task_completion_before
+                    ),
+                    **{
+                        metric: sum(getattr(pump, metric) for pump in span)
+                        for metric in TASK_PHASE_METRICS
+                    },
+                }
+            )
+        frames.append(frame)
     drawn_ms = [frame["drawn_frame_ms"] for frame in frames]
     gap_counts = Counter(gaps)
     over_budget = sum(value > BUDGET_MS for value in drawn_ms)
@@ -143,8 +210,8 @@ def summarize(text: str) -> dict[str, object]:
     within_means = population_means(within)
     over_means = population_means(over)
 
-    return {
-        "schema": "fn64.wm2000-swap-latency.v2",
+    result = {
+        "schema": "fn64.wm2000-swap-latency.v3",
         "renderer": renderer,
         "pumps": len(pumps),
         "swaps": len(swap_indices),
@@ -153,11 +220,7 @@ def summarize(text: str) -> dict[str, object]:
         "gap_two_fraction": gap_counts[2] / len(gaps),
         "budget_ms": BUDGET_MS,
         "drawn_frame_ms": {
-            "mean": sum(drawn_ms) / len(drawn_ms),
-            "p50": percentile(drawn_ms, 0.50),
-            "p95": percentile(drawn_ms, 0.95),
-            "p99": percentile(drawn_ms, 0.99),
-            "max": max(drawn_ms),
+            **distribution(drawn_ms),
         },
         "over_budget": {
             "count": over_budget,
@@ -173,6 +236,28 @@ def summarize(text: str) -> dict[str, object]:
             },
         },
     }
+    if task_phase_available:
+        phase_metrics = ("task_completions", *TASK_PHASE_METRICS)
+        result["task_cpu_phase_frames"] = {
+            "available": True,
+            "metrics": {
+                metric: distribution([frame[metric] for frame in frames])
+                for metric in phase_metrics
+            },
+            "within_budget_mean": population_means(within, phase_metrics),
+            "over_budget_mean": population_means(over, phase_metrics),
+            "over_minus_within": {
+                metric: (
+                    sum(frame[metric] for frame in over) / len(over)
+                    - sum(frame[metric] for frame in within) / len(within)
+                )
+                for metric in phase_metrics
+                if within and over
+            },
+        }
+    else:
+        result["task_cpu_phase_frames"] = {"available": False}
+    return result
 
 
 def main() -> int:

@@ -73,7 +73,12 @@ all five conditions hold, the status is “not verified.”
 sequence and emits a path-free JSON receipt containing the exact swap-gap and
 swap-to-swap latency distributions. Set `FN64_PUMP_CENSUS_SEQUENCE` equal to
 `FN64_PUMP_CENSUS_PUMPS`; otherwise the summarizer refuses the incomplete
-window.
+window. The parser accepts both the legacy 15-field sequence rows and the
+expanded 28-field rows. Expanded rows add renderer completion ordinals and
+task phase deltas; the v3 receipt folds those deltas between consecutive swaps
+under `task_cpu_phase_frames`. Legacy input remains valid and reports that
+optional section as unavailable rather than turning absent counters into
+zero-cost claims.
 
 For the ordinary path, build the linked shell once and run:
 
