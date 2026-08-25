@@ -604,7 +604,15 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         })
     }
 
-    let exact = CoverageFogRgba16Program::try_admit(
+    let coverage_fog = CoverageFogRgba16Program::try_admit(
+        format,
+        shading.combine(),
+        blend_state.other_mode,
+        evaluation,
+        triangle.flags().shaded(),
+        triangle.flags().textured(),
+    );
+    let fog_noise = FogNoiseRgba16Program::try_admit(
         format,
         shading.combine(),
         blend_state.other_mode,
@@ -621,8 +629,9 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         })
     };
     let fragment_program = match fragment_selection {
-        FragmentProgramSelection::AdmitExact => exact
+        FragmentProgramSelection::AdmitExact => coverage_fog
             .map(RawTriangleFragmentProgram::CoverageFogRgba16)
+            .or_else(|| fog_noise.map(RawTriangleFragmentProgram::FogNoiseRgba16))
             .unwrap_or_else(generic),
         #[cfg(test)]
         FragmentProgramSelection::GenericOracle => generic(),
@@ -711,6 +720,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
 enum RawTriangleFragmentProgram {
     Generic(Option<PreparedTwoCycleCombiner>),
     CoverageFogRgba16(CoverageFogRgba16Program),
+    FogNoiseRgba16(FogNoiseRgba16Program),
 }
 
 #[derive(Clone, Copy)]
@@ -737,13 +747,37 @@ impl CoverageFogRgba16Program {
     }
 }
 
-/// Exact specialization of `fc15fea3/f00ff23f` for the two measured
-/// `0f0a7008` fragment modes. Cycle zero is `Texel0 * ShadeAlpha` for RGB
-/// and carries `Texel0Alpha`; cycle one lerps that RGB toward Environment by
-/// Primitive and multiplies alpha by PrimitiveAlpha. Every operand is in
-/// `[0, 1]`, so both of the generic combiner's cross-cycle wrap and final
-/// wrap-clamp stages are identities for this closed program.
-fn combine_coverage_fog(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+#[derive(Clone, Copy)]
+struct FogNoiseRgba16Program;
+
+impl FogNoiseRgba16Program {
+    fn try_admit(
+        format: ColorTargetFormat,
+        combine: CombineParams,
+        other_mode: OtherMode,
+        evaluation: TexrectCombinerEvaluation,
+        shaded: bool,
+        textured: bool,
+    ) -> Option<Self> {
+        (format == ColorTargetFormat::Rgba16
+            && combine.low() == 0xfc15_96a3
+            && combine.high() == 0xf0ff_fe38
+            && other_mode.high() == 0x0018_acef
+            && other_mode.low() == 0x0050_4240
+            && evaluation == TexrectCombinerEvaluation::TwoCycle
+            && shaded
+            && textured)
+            .then_some(Self)
+    }
+}
+
+/// Exact shared algebra of the closed `fc15fea3/f00ff23f` and
+/// `fc1596a3/f0fffe38` programs. Both decode to `Texel0 * ShadeAlpha` for
+/// cycle-zero RGB and carry `Texel0Alpha`; cycle one lerps that RGB toward
+/// Environment by Primitive and multiplies alpha by PrimitiveAlpha. Every
+/// operand is in `[0, 1]`, so the generic combiner's cross-cycle wrap and
+/// final wrap-clamp stages are identities for both closed programs.
+fn combine_fog_lerp(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
     let texel = texel.map(|channel| f32::from(channel) / 255.0);
     let first_rgb = [
         texel[0] * inputs.shade_color[3],
@@ -1139,11 +1173,23 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                 ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
             match fragment_program {
                 RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
-                    let combined = combine_coverage_fog(inputs, texel);
+                    let combined = combine_fog_lerp(inputs, texel);
                     write_coverage_fog_rgba16(
                         &mut bytes[offset..offset + bytes_per_pixel],
                         combined,
                     );
+                }
+                RawTriangleFragmentProgram::FogNoiseRgba16(_) => {
+                    let combined = combine_fog_lerp(inputs, texel);
+                    blend_and_write_pixel(
+                        format,
+                        &mut bytes[offset..offset + bytes_per_pixel],
+                        combined,
+                        blend_state,
+                        stages,
+                        x,
+                        row.y,
+                    )?;
                 }
                 RawTriangleFragmentProgram::Generic(prepared_two_cycle) => {
                     let combined = match prepared_two_cycle {

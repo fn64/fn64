@@ -753,6 +753,17 @@ improved the clean 1,600-pump result from 40.368 to 36.126 ms p95, 29.199 to
 not the required repeatability gate, and leaves a 2.793 ms p95 gap to the
 33.333 ms line.
 
+The next sustained-tail profile identified
+`fc1596a3/f0fffe38/0018acef/00504240` as the new dominant exact CPU program in
+the slowest fields. A second closed program proof specializes only its fog
+lerp combiner and deliberately retains the shared noise-dither, blend,
+coverage, and packing stages. Its shortcut matched the generic combiner over
+all 65,536 texel-alpha/primitive-alpha pairs with deterministic channel
+variation and matched three complete-frame fixtures ten times. Twenty
+alternating release samples reduced the exact-program microbenchmark median
+from 0.413 to 0.309 ms, a 25.2-percent kernel reduction. Its sustained live
+effect remains unmeasured until the linked shell is rebuilt.
+
 The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns
 the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
