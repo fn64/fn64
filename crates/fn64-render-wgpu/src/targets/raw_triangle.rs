@@ -87,7 +87,7 @@ use crate::tmem::{
     sample_point, PointSampleCoordinates, PointSampleRequest, TextureCoordinateS10_5,
     TmemFirstRowParity,
 };
-use crate::{CycleType, OtherMode, TextureLutMode, TmemByteSource};
+use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
 /// 18-bit working Z and the stored four-bit DeltaZ exponent, exactly the pair
@@ -225,6 +225,40 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
     declared: &[fn64_render_ir::ResourceAccess],
     texture: Option<RawTriangleTexture<'_, S>>,
     depth: Option<RawTriangleDepth<'_>>,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    execute_raw_triangle_selected(
+        candidate,
+        other_mode,
+        triangle,
+        shading,
+        blend_registers,
+        resident_bytes,
+        declared,
+        texture,
+        depth,
+        FragmentProgramSelection::AdmitExact,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FragmentProgramSelection {
+    AdmitExact,
+    #[cfg(test)]
+    GenericOracle,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
+    declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
+    fragment_selection: FragmentProgramSelection,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     let mut bytes = resident_bytes.into().into_owned();
     // Cycle, combiner-program, blender and fragment-stage admission all run
@@ -426,6 +460,7 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
         stages,
         evaluation,
         depth,
+        fragment_selection,
     );
     rasterized?;
     if let (Some(start), Some(census_key)) = (draw_census_start, draw_census_key) {
@@ -444,6 +479,33 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
         rectangle,
         device_bytes,
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn execute_raw_triangle_generic_oracle<'a, S: TmemByteSource + ?Sized>(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
+    declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    execute_raw_triangle_selected(
+        candidate,
+        other_mode,
+        triangle,
+        shading,
+        blend_registers,
+        resident_bytes,
+        declared,
+        texture,
+        depth,
+        FragmentProgramSelection::GenericOracle,
+    )
 }
 
 /// The per-pixel loop, over exactly the declared rows.
@@ -487,6 +549,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
     depth: Option<RawTriangleDepth<'_>>,
+    fragment_selection: FragmentProgramSelection,
 ) -> Result<(), TexrectExecutionError> {
     const MIN_PARALLEL_PIXELS: u64 = 4_096;
 
@@ -541,11 +604,28 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         })
     }
 
-    let prepared_two_cycle = match evaluation {
-        TexrectCombinerEvaluation::TwoCycle if prepared_combiner_enabled() => {
-            Some(PreparedTwoCycleCombiner::new(shading.combine()))
-        }
-        _ => None,
+    let exact = CoverageFogRgba16Program::try_admit(
+        format,
+        shading.combine(),
+        blend_state.other_mode,
+        evaluation,
+        triangle.flags().shaded(),
+        triangle.flags().textured(),
+    );
+    let generic = || {
+        RawTriangleFragmentProgram::Generic(match evaluation {
+            TexrectCombinerEvaluation::TwoCycle if prepared_combiner_enabled() => {
+                Some(PreparedTwoCycleCombiner::new(shading.combine()))
+            }
+            _ => None,
+        })
+    };
+    let fragment_program = match fragment_selection {
+        FragmentProgramSelection::AdmitExact => exact
+            .map(RawTriangleFragmentProgram::CoverageFogRgba16)
+            .unwrap_or_else(generic),
+        #[cfg(test)]
+        FragmentProgramSelection::GenericOracle => generic(),
     };
     let incremental_texture_planes = incremental_texture_planes_enabled();
 
@@ -597,7 +677,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     blend_state,
                     stages,
                     evaluation,
-                    prepared_two_cycle,
+                    fragment_program,
                     incremental_texture_planes,
                     None,
                     y,
@@ -620,11 +700,114 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         blend_state,
         stages,
         evaluation,
-        prepared_two_cycle,
+        fragment_program,
         incremental_texture_planes,
         depth,
         0,
     )
+}
+
+#[derive(Clone, Copy)]
+enum RawTriangleFragmentProgram {
+    Generic(Option<PreparedTwoCycleCombiner>),
+    CoverageFogRgba16(CoverageFogRgba16Program),
+}
+
+#[derive(Clone, Copy)]
+struct CoverageFogRgba16Program;
+
+impl CoverageFogRgba16Program {
+    fn try_admit(
+        format: ColorTargetFormat,
+        combine: CombineParams,
+        other_mode: OtherMode,
+        evaluation: TexrectCombinerEvaluation,
+        shaded: bool,
+        textured: bool,
+    ) -> Option<Self> {
+        (format == ColorTargetFormat::Rgba16
+            && combine.low() == 0xfc15_fea3
+            && combine.high() == 0xf00f_f23f
+            && matches!(other_mode.high(), 0x0018_ac8f | 0x0018_acff)
+            && other_mode.low() == 0x0f0a_7008
+            && evaluation == TexrectCombinerEvaluation::TwoCycle
+            && shaded
+            && textured)
+            .then_some(Self)
+    }
+}
+
+/// Exact specialization of `fc15fea3/f00ff23f` for the two measured
+/// `0f0a7008` fragment modes. Cycle zero is `Texel0 * ShadeAlpha` for RGB
+/// and carries `Texel0Alpha`; cycle one lerps that RGB toward Environment by
+/// Primitive and multiplies alpha by PrimitiveAlpha. Every operand is in
+/// `[0, 1]`, so both of the generic combiner's cross-cycle wrap and final
+/// wrap-clamp stages are identities for this closed program.
+fn combine_coverage_fog(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+    let texel = texel.map(|channel| f32::from(channel) / 255.0);
+    let first_rgb = [
+        texel[0] * inputs.shade_color[3],
+        texel[1] * inputs.shade_color[3],
+        texel[2] * inputs.shade_color[3],
+    ];
+    let combined = [
+        (inputs.env_color[0] - first_rgb[0]) * inputs.prim_color[0] + first_rgb[0],
+        (inputs.env_color[1] - first_rgb[1]) * inputs.prim_color[1] + first_rgb[1],
+        (inputs.env_color[2] - first_rgb[2]) * inputs.prim_color[2] + first_rgb[2],
+        texel[3] * inputs.prim_color[3],
+    ];
+    combined.map(|channel| (channel * 255.0).round() as u8)
+}
+
+/// Exact terminal stages for the same closed program on RGBA16.
+/// `CVG_X_ALPHA` reduces full coverage from the quantized combined alpha;
+/// zero coverage discards, while `CVG_DST_CLAMP` with image-read disabled
+/// stores that fragment coverage directly. `ALPHA_CVG_SEL` and alpha dither
+/// feed only alpha, which this program's blender does not select. Its RGB
+/// output is Combined, so neither destination color nor blender arithmetic
+/// is observable.
+fn write_coverage_fog_rgba16(dest: &mut [u8], combined: [u8; 4]) {
+    let coverage = ((8 * u16::from(combined[3]) + 127) / 255) as u8;
+    if coverage == 0 {
+        return;
+    }
+    let packed = (u16::from(combined[0] >> 3) << 11)
+        | (u16::from(combined[1] >> 3) << 6)
+        | (u16::from(combined[2] >> 3) << 1)
+        | u16::from(((coverage - 1) >> 2) & 1);
+    dest.copy_from_slice(&packed.to_be_bytes());
+}
+
+#[cfg(test)]
+fn generic_coverage_fog_rgba16_oracle(
+    other_mode: OtherMode,
+    inputs: crate::CombinerInputs,
+    texel: [u8; 4],
+    registers: TexrectBlendRegisters,
+    resident: [u8; 2],
+    column: u32,
+    row: u32,
+) -> [u8; 2] {
+    let combined = combine_one_texel_prepared_two_cycle(
+        PreparedTwoCycleCombiner::new(CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f)),
+        inputs,
+        texel,
+    );
+    let state = registers.mode_state(other_mode);
+    require_blendable_mode(state).unwrap();
+    let stages = TexrectFragmentStages::try_new(other_mode, registers.blend_color()).unwrap();
+    let mut output = resident;
+    blend_and_write_pixel(
+        ColorTargetFormat::Rgba16,
+        &mut output,
+        combined,
+        state,
+        stages,
+        column,
+        row,
+    )
+    .unwrap();
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -643,7 +826,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     blend_state: crate::BlendModeState,
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
-    prepared_two_cycle: Option<PreparedTwoCycleCombiner>,
+    fragment_program: RawTriangleFragmentProgram,
     incremental_texture_planes: bool,
     mut depth: Option<RawTriangleDepth<'_>>,
     base_y: u32,
@@ -952,21 +1135,34 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             if !passes_depth {
                 continue;
             }
-            let combined = match prepared_two_cycle {
-                Some(prepared) => combine_one_texel_prepared_two_cycle(prepared, inputs, texel),
-                None => combine_one_texel(shading.combine(), inputs, texel, evaluation),
-            };
             let offset =
                 ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
-            blend_and_write_pixel(
-                format,
-                &mut bytes[offset..offset + bytes_per_pixel],
-                combined,
-                blend_state,
-                stages,
-                x,
-                row.y,
-            )?;
+            match fragment_program {
+                RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
+                    let combined = combine_coverage_fog(inputs, texel);
+                    write_coverage_fog_rgba16(
+                        &mut bytes[offset..offset + bytes_per_pixel],
+                        combined,
+                    );
+                }
+                RawTriangleFragmentProgram::Generic(prepared_two_cycle) => {
+                    let combined = match prepared_two_cycle {
+                        Some(prepared) => {
+                            combine_one_texel_prepared_two_cycle(prepared, inputs, texel)
+                        }
+                        None => combine_one_texel(shading.combine(), inputs, texel, evaluation),
+                    };
+                    blend_and_write_pixel(
+                        format,
+                        &mut bytes[offset..offset + bytes_per_pixel],
+                        combined,
+                        blend_state,
+                        stages,
+                        x,
+                        row.y,
+                    )?;
+                }
+            }
             // Commit depth AFTER the colour write, and only when `Z_UPD` is
             // set and this draw carries a fragment Z. The stored value is
             // quantized through the RDP's exponent/mantissa codec so a later

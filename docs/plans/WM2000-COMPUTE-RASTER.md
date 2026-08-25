@@ -722,6 +722,29 @@ clean 1,600-pump route, p95 fell from 43.410 to 40.368 ms, mean from 31.069 to
 29.199 ms, and the over-budget share from 50.7 to 39.4 percent. The result is
 promising but not yet the required ten-run quiet-machine gate.
 
+Raw-DPC planning no longer runs a speculative prepare/decode followed by the
+authoritative decode. A command-only seed preflight performs no placeholder
+TMEM allocation; one planning-only decode derives the exact journal and a
+sealed adapter pushes it into the coordinator. The planning output type owns
+neither a submitted ticket nor staged execution state, while ordinary decode
+still rejects any exact-journal disagreement loudly. The previous 80,000-plan
+census attributed 687.249 ms to probe prepare/decode alone; the one-pass live
+effect remains to be measured after the linked shell is rebuilt.
+
+The two largest coverage/fog CPU programs now enter a closed exact-program
+specialization for their combiner and terminal RGBA16 write. Every skipped
+generic terminal condition is part of the fallible proof. The specialized and
+generic paths matched across 131,072 alpha/channel-boundary comparisons and
+six full-frame fixtures repeated ten times. Twenty alternating release
+microbenchmark samples reduced a 300x220 exact-program raster from a 1.897 ms
+median to 1.458 ms, a 23.1-percent reduction. This is kernel evidence only;
+the sustained WM2000 gate remains authoritative. With presentation caching
+disabled, the rebuilt one-pass-planning plus CPU-specialization binary
+improved the clean 1,600-pump result from 40.368 to 36.126 ms p95, 29.199 to
+25.649 ms mean, and 39.4 to 13.6 percent over budget. This is one clean run,
+not the required repeatability gate, and leaves a 2.793 ms p95 gap to the
+33.333 ms line.
+
 The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns
 the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
