@@ -1001,6 +1001,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "pixels",
  "serde",
+ "sha2",
  "tempfile",
  "toml",
  "winit",

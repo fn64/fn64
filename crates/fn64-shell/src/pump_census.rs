@@ -76,6 +76,10 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::framebuffer::{
+    PresentCacheMode, PresentDependencyObservation, PresentDependencyReceipt,
+};
+
 /// One pump's wall time and the counter deltas attributed to it.
 ///
 /// `u64` nanoseconds throughout: these are differences of monotonic running
@@ -492,6 +496,7 @@ pub struct PumpCensus {
     pending_wall: Option<PendingWallCadence>,
     wall_samples: Vec<WallCadenceSample>,
     swap_wall_samples: Vec<(usize, u64)>,
+    present_dependencies: Vec<(usize, PresentDependencyReceipt)>,
     last_swap_started: Option<Instant>,
     reported: bool,
 }
@@ -507,6 +512,7 @@ impl PumpCensus {
             pending_wall: None,
             wall_samples: Vec::new(),
             swap_wall_samples: Vec::new(),
+            present_dependencies: Vec::new(),
             last_swap_started: None,
             reported: false,
         }
@@ -533,6 +539,7 @@ impl PumpCensus {
             self.samples.reserve(cap);
             self.wall_samples.reserve(cap);
             self.swap_wall_samples.reserve(cap / 2);
+            self.present_dependencies.reserve(cap);
         }
         self.before = Totals::read();
     }
@@ -549,6 +556,7 @@ impl PumpCensus {
         scheduled_deadline: Instant,
         next_deadline: Instant,
         reanchored: bool,
+        present_dependency: Option<PresentDependencyReceipt>,
     ) -> bool {
         if !self.armed {
             return false;
@@ -571,6 +579,9 @@ impl PumpCensus {
             .flatten();
         if let (Some(index), Some(duration)) = (sample_index, swap_to_swap_ns) {
             self.swap_wall_samples.push((index, duration));
+        }
+        if let (Some(index), Some(receipt)) = (sample_index, present_dependency) {
+            self.present_dependencies.push((index, receipt));
         }
         if sample_index.is_some() && swapped {
             self.last_swap_started = Some(started);
@@ -687,6 +698,10 @@ impl PumpCensus {
         print!(
             "{}",
             render_wall_report(&self.wall_samples, &self.swap_wall_samples, sequence_len())
+        );
+        print!(
+            "{}",
+            render_present_dependency_report(&self.present_dependencies, sequence_len())
         );
         print!("{}", render_session_phase_report());
     }
@@ -1873,6 +1888,96 @@ fn render_wall_report(
     out
 }
 
+fn render_present_dependency_report(
+    samples: &[(usize, PresentDependencyReceipt)],
+    sequence: usize,
+) -> String {
+    if samples.is_empty() {
+        return String::new();
+    }
+    let cacheable = samples
+        .iter()
+        .filter(|(_, receipt)| {
+            matches!(
+                receipt.dependency,
+                PresentDependencyObservation::Cacheable(_)
+            )
+        })
+        .count();
+    let hits = samples
+        .iter()
+        .filter(|(_, receipt)| receipt.exact_hit)
+        .count();
+    let suppressed = samples
+        .iter()
+        .filter(|(_, receipt)| receipt.suppress_redraw)
+        .count();
+    let probe_ns = samples
+        .iter()
+        .map(|(_, receipt)| receipt.probe_ns)
+        .sum::<u64>();
+    let mut out = format!(
+        "[present-dependency] receipts={} cacheable={} uncacheable={} exact_hits={} suppressed={} probe_ms={:.3}\n",
+        samples.len(),
+        cacheable,
+        samples.len().saturating_sub(cacheable),
+        hits,
+        suppressed,
+        ms(probe_ns),
+    );
+    for (pump_index, receipt) in samples.iter().take(sequence) {
+        let mode = match receipt.mode {
+            PresentCacheMode::Disabled => "Disabled",
+            PresentCacheMode::Observe => "Observe",
+            PresentCacheMode::Suppress => "Suppress",
+        };
+        let disposition = if receipt.suppress_redraw {
+            "Suppress"
+        } else {
+            "Redraw"
+        };
+        let common = format!(
+            "overscan={} zoom_fill={} generation={} invalidations={} probe_ns={}",
+            receipt.policy.overscan(),
+            u8::from(receipt.policy.zoom_fill()),
+            receipt.generation,
+            receipt.invalidations,
+            receipt.probe_ns,
+        );
+        match receipt.dependency {
+            PresentDependencyObservation::Cacheable(dependency) => out.push_str(&format!(
+                "[present-dependency-seq] pump={pump_index} mode={mode} dependency=Cacheable \
+                 {common} start={} src_stride={} dst_width={} dst_height={} blanked={} bytes={} \
+                 fnv_digest={:016x} sha256={} exact_hit={} disposition={disposition}\n",
+                dependency.start,
+                dependency.src_stride,
+                dependency.dst_width,
+                dependency.dst_height,
+                u8::from(dependency.blanked),
+                dependency.bytes,
+                dependency.fnv_digest,
+                hex_sha256(dependency.sha256),
+                u8::from(receipt.exact_hit),
+            )),
+            PresentDependencyObservation::Uncacheable(reason) => out.push_str(&format!(
+                "[present-dependency-seq] pump={pump_index} mode={mode} \
+                 dependency=Uncacheable {common} reason={} exact_hit=0 disposition={disposition}\n",
+                reason.name(),
+            )),
+        }
+    }
+    out
+}
+
+fn hex_sha256(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,6 +1987,56 @@ mod tests {
             wall_ns: (wall_ms * 1e6) as u64,
             ..Default::default()
         }
+    }
+
+    fn dependency_receipt(mode: PresentCacheMode, hit: bool) -> PresentDependencyReceipt {
+        PresentDependencyReceipt {
+            mode,
+            policy: crate::framebuffer::PresentPolicy::new(3, true),
+            dependency: PresentDependencyObservation::Cacheable(
+                crate::framebuffer::CacheablePresentDependency {
+                    start: 16,
+                    src_stride: 320,
+                    dst_width: 319,
+                    dst_height: 240,
+                    blanked: false,
+                    bytes: 153_600,
+                    fnv_digest: 0x0123_4567_89ab_cdef,
+                    sha256: [0xab; 32],
+                },
+            ),
+            exact_hit: hit,
+            suppress_redraw: mode == PresentCacheMode::Suppress && hit,
+            generation: 7,
+            invalidations: 2,
+            probe_ns: 125_000,
+        }
+    }
+
+    #[test]
+    fn bounded_final_pump_keeps_its_present_dependency_receipt() {
+        let mut census = PumpCensus::new();
+        census.armed = true;
+        census.seen = warmup();
+        let started = Instant::now();
+        census.before_pump(started, started);
+        let _ = census.after_pump(
+            Duration::from_millis(1),
+            1,
+            true,
+            started,
+            started,
+            started + Duration::from_millis(16),
+            false,
+            Some(dependency_receipt(PresentCacheMode::Observe, true)),
+        );
+        assert_eq!(census.samples.len(), 1);
+        assert_eq!(
+            census.present_dependencies,
+            vec![(0, dependency_receipt(PresentCacheMode::Observe, true))]
+        );
+        let report = render_present_dependency_report(&census.present_dependencies, 1);
+        assert!(report.contains("pump=0 mode=Observe dependency=Cacheable"));
     }
 
     #[test]
@@ -1899,6 +2054,7 @@ mod tests {
                 started,
                 started + Duration::from_millis(16),
                 false,
+                None,
             );
             started += Duration::from_millis(17);
         }
@@ -1912,6 +2068,7 @@ mod tests {
             started,
             started + Duration::from_millis(16),
             false,
+            None,
         );
         census.record_present(
             started + Duration::from_millis(10),
@@ -1927,6 +2084,7 @@ mod tests {
             second,
             second + Duration::from_millis(16),
             false,
+            None,
         );
         let third = started + Duration::from_millis(33);
         census.before_pump(third, third);
@@ -1938,10 +2096,15 @@ mod tests {
             third,
             third + Duration::from_millis(16),
             false,
+            None,
         );
 
         assert_eq!(census.samples.len(), 3);
-        assert_eq!(census.wall_samples.len(), 2, "the final interval is pending");
+        assert_eq!(
+            census.wall_samples.len(),
+            2,
+            "the final interval is pending"
+        );
         assert_eq!(census.swap_wall_samples, vec![(2, 33_000_000)]);
         let first = census.wall_samples[0];
         assert_eq!(first.pump_index, 0);

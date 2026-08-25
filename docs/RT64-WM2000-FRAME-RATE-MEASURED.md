@@ -35,6 +35,18 @@ rows under `wall_cadence`; old logs remain readable and report it unavailable.
 This join is the arbiter for a rare long event-loop/wake stall: subtracting
 unrelated percentile maxima is not.
 
+Schema v5 additionally carries `present_dependencies` when
+`FN64_PRESENT_CACHE=observe` or `1` is paired with the full pump sequence. Its
+separate `[present-dependency-seq]` stream is indexed by the pump whose work
+has just completed, so unlike the forward wall interval it includes the
+bounded final pump. A complete stream has exactly one contiguous receipt per
+measured pump. The Observe/Suppress comparator requires 1,600 receipts in each
+lane and exact equality of their canonical Cacheable identity or Uncacheable
+reason. The identity binds overscan/zoom policy and a SHA-256 computed during
+the single live-framebuffer traversal. FNV, cache generation/invalidation,
+probe time, hit, and redraw disposition remain lane-specific diagnostics; the
+receipt reports probe-time distribution separately from pump/present work.
+
 ## 2026-08-22 pacing diagnosis: sub-field DP completion was rounded to a field
 
 This supersedes the hypothesis that the renderer's submissions merely needed

@@ -796,47 +796,83 @@ mod game {
             }
         }
 
-        fn should_suppress_pump_redraw(&mut self) -> bool {
+        fn probe_pump_present_dependency(
+            &mut self,
+        ) -> Option<framebuffer::PresentDependencyReceipt> {
             if !self.present_cache_mode.samples_dependencies() {
-                return false;
+                return None;
             }
-            self.present_cache
-                .synchronize_policy(framebuffer::PresentPolicy::new(
-                    self.video.overscan,
-                    self.video.zoom_fill,
-                ));
-            if self.overlay.active()
-                || self.frame_trip.is_some()
-                || self.frame_dump_dir.is_some()
-            {
-                self.present_cache.record_uncacheable_request();
-                return false;
-            }
-            let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
+            let probe_started = Instant::now();
+            let policy = framebuffer::PresentPolicy::new(
+                self.video.overscan,
+                self.video.zoom_fill,
+            );
+            self.present_cache.synchronize_policy(policy);
+            let uncacheable = if self.overlay.active() {
+                Some(framebuffer::UncacheablePresentReason::Overlay)
+            } else if self.frame_trip.is_some() {
+                Some(framebuffer::UncacheablePresentReason::FrameTrip)
+            } else if self.frame_dump_dir.is_some() {
+                Some(framebuffer::UncacheablePresentReason::FrameDump)
+            } else {
+                None
+            };
+            let receipt = if let Some(reason) = uncacheable {
+                self.present_cache.record_uncacheable_request(
+                    self.present_cache_mode,
+                    policy,
+                    reason,
+                )
+            } else if self.pixels.is_none() {
+                self.present_cache.record_uncacheable_request(
+                    self.present_cache_mode,
+                    policy,
+                    framebuffer::UncacheablePresentReason::UnavailableFramebuffer,
+                )
+            } else if let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
                 .or_else(fn64_abi::current_vi_framebuffer)
                 .map(|offset| offset as usize)
-            else {
-                self.present_cache.record_uncacheable_request();
-                return false;
+            {
+                if fb_offset >= self.rdram.len() {
+                    self.present_cache.record_uncacheable_request(
+                        self.present_cache_mode,
+                        policy,
+                        framebuffer::UncacheablePresentReason::OutsideRdram,
+                    )
+                } else if !fb_offset.is_multiple_of(4) {
+                    self.present_cache.record_uncacheable_request(
+                        self.present_cache_mode,
+                        policy,
+                        framebuffer::UncacheablePresentReason::UnalignedFramebuffer,
+                    )
+                } else {
+                    let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
+                    let overscan =
+                        (self.video.overscan as usize).min(src_stride.saturating_sub(1));
+                    let target_width = (src_stride - overscan).clamp(1, 4096);
+                    let target_height = fn64_abi::vi_output_height()
+                        .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
+                    self.present_cache.probe(
+                        self.present_cache_mode,
+                        policy,
+                        &self.rdram,
+                        fb_offset,
+                        src_stride,
+                        target_width,
+                        target_height,
+                        fn64_abi::vi_blanked(),
+                    )
+                }
+            } else {
+                self.present_cache.record_uncacheable_request(
+                    self.present_cache_mode,
+                    policy,
+                    framebuffer::UncacheablePresentReason::MissingFramebuffer,
+                )
             };
-            if !fb_offset.is_multiple_of(4) {
-                self.present_cache.record_uncacheable_request();
-                return false;
-            }
-            let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
-            let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-            let target_width = (src_stride - overscan).clamp(1, 4096);
-            let target_height = fn64_abi::vi_output_height()
-                .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
-            let exact_hit = self.present_cache.is_current(
-                &self.rdram,
-                fb_offset,
-                src_stride,
-                target_width,
-                target_height,
-                fn64_abi::vi_blanked(),
-            );
-            self.present_cache_mode.suppresses_redraw(exact_hit)
+            Some(receipt.with_probe_ns(
+                u64::try_from(probe_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            ))
         }
 
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
@@ -1605,6 +1641,13 @@ mod game {
                     .before_pump(now_t, self.next_frame_deadline);
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
+                // The dependency census belongs to this completed pump and
+                // must include the bounded window's final pump. It is outside
+                // `pump_wall`, so Observe/Suppress comparison does not charge
+                // the diagnostic byte traversal to emulated work.
+                let present_dependency = self.probe_pump_present_dependency();
+                let suppress_pump_redraw = present_dependency
+                    .is_some_and(|receipt| receipt.suppress_redraw);
                 let start_debt = now_t.saturating_duration_since(self.next_frame_deadline);
                 let reanchored = start_debt >= FRAME;
                 let following_deadline = if reanchored {
@@ -1634,6 +1677,7 @@ mod game {
                     self.next_frame_deadline,
                     following_deadline,
                     reanchored,
+                    present_dependency,
                 ) {
                     // Bounded run: a windowed benchmark that needs a human to
                     // close the window cannot be repeated identically, and
@@ -1677,7 +1721,7 @@ mod game {
                 // Catch-up-free schedule: hold cadence while we keep up,
                 // re-anchor (dropping missed frames) when we fall behind.
                 self.next_frame_deadline = following_deadline;
-                if !self.should_suppress_pump_redraw() {
+                if !suppress_pump_redraw {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }

@@ -70,7 +70,65 @@ def cadence_row(
     )
 
 
+def dependency_row(
+    pump: int,
+    mode: str = "Observe",
+    *,
+    sha256: str = "01" * 32,
+    exact_hit: bool = False,
+    suppress: bool = False,
+) -> str:
+    return (
+        f"[present-dependency-seq] pump={pump} mode={mode} dependency=Cacheable "
+        f"overscan=3 zoom_fill=1 generation=7 invalidations=2 probe_ns=125000 "
+        f"start=16 src_stride=320 dst_width=319 dst_height=240 blanked=0 "
+        f"bytes=153600 fnv_digest=0123456789abcdef sha256={sha256} exact_hit={int(exact_hit)} "
+        f"disposition={'Suppress' if suppress else 'Redraw'}"
+    )
+
+
 class PumpCensusSummaryTests(unittest.TestCase):
+    def test_present_dependencies_cover_final_pump_and_keep_disposition_separate(self) -> None:
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 2.0, False),
+                row(2, 3.0, True),
+                dependency_row(0),
+                dependency_row(1, exact_hit=True),
+                dependency_row(2, exact_hit=True),
+            ]
+        )
+        result = MODULE.summarize(text)["present_dependencies"]
+        self.assertEqual(result["receipts"], 3)
+        self.assertEqual(result["exact_hits"], 2)
+        self.assertEqual(result["suppressed"], 0)
+        self.assertEqual(len(result["canonical_identity_sha256"]), 64)
+
+    def test_present_dependency_parser_rejects_gaps_modes_and_policy_lies(self) -> None:
+        with self.assertRaisesRegex(ValueError, "expected pump 1"):
+            MODULE.parse_present_dependencies(
+                "\n".join((dependency_row(0), dependency_row(2)))
+            )
+        with self.assertRaisesRegex(ValueError, "mixes Observe and Suppress"):
+            MODULE.parse_present_dependencies(
+                "\n".join((dependency_row(0), dependency_row(1, "Suppress")))
+            )
+        with self.assertRaisesRegex(ValueError, "Observe.*cannot suppress"):
+            MODULE.parse_present_dependencies(
+                dependency_row(0, exact_hit=True, suppress=True)
+            )
+
+    def test_uncacheable_dependency_reason_is_canonical_identity(self) -> None:
+        text = (
+            "[present-dependency-seq] pump=0 mode=Observe dependency=Uncacheable "
+            "overscan=3 zoom_fill=1 generation=7 invalidations=2 probe_ns=125000 "
+            "reason=Overlay exact_hit=0 disposition=Redraw"
+        )
+        sample = MODULE.parse_present_dependencies(text, 1)[0]
+        self.assertEqual(sample.canonical_identity(), (3, True, "Uncacheable", "Overlay"))
+
     def test_legacy_rows_remain_supported_without_phase_claims(self) -> None:
         text = "\n".join(
             [
