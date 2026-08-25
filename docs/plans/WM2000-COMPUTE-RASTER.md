@@ -886,6 +886,15 @@ and leaves LoadBlock footprint promotion unchanged. This is a mechanism
 candidate only: it has no performance claim until a same-binary candidate /
 control census and the required live validation runs are attached.
 
+The first counterbalanced 1,600-pump control/candidate pair at `d6322dd4` /
+`304af2c7` used identical task and hot-member populations (2,190 tasks,
+43,156 members, 47,324 loads, and 9,871,664 staged words). The cursor-owned
+route reduced word-stage time from 346.123 ms to 98.439 ms (-71.6%) and the
+attributed CPU-member total from 1,949.999 ms to 1,689.002 ms (-13.4%). Drawn
+p95 fell from 33.264 ms to 32.189 ms, while all 15 sampled framebuffer hashes
+through swap 900 remained identical. This is retained A/B evidence, not the
+ten-run deterministic-fix bar or evidence of comfortable field-budget margin.
+
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
 `FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
