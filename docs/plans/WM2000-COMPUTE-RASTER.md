@@ -811,6 +811,26 @@ evidence only, never an authoritative p95 comparison. The disabled path reads
 only a cached enable flag and performs no clock, key construction, locking, or
 map traversal.
 
+The first complete 1,600-pump census recorded 25,725 successful texrect calls
+and 1.290 seconds in the executor. The rank-one exact program accounted for
+12,680 calls and 537.8 ms: CI4 texels, RGBA16 TLUT and target, point sampling,
+and the exact `fcffffff/fffdf6fb` plus `0000acef/005041c8` fragment state. A
+closed admission type now specializes that exact sampler while every other
+shape retains the generic path. `FN64_TEXRECT_RANK_ONE_SPECIALIZATION=0`
+disables only this admission for same-binary live A/B runs. Mutating each of
+the 24 admitted fields falls
+back; boundary coordinates, 50,000 deterministic coordinate mutations, and
+invalid source/TLUT bytes match the generic oracle. Ten alternating release
+rounds reduced the sampler by 69.3 percent and a complete 64x64 texrect draw by
+27.0 percent, with identical final target bytes. This is bounded kernel
+evidence. Two counterbalanced 1,600-pump same-binary pairs then kept CPU color
+batching enabled and changed only this specialization. Candidate/control p95
+was 33.447/33.623 ms and 33.584/33.712
+ms; mean was 24.233/24.398 ms and 24.319/24.394 ms. Every recorded framebuffer
+hash matched through swap 900. The small positive effect repeats, but neither
+run reaches the required margin or ten-run gate, so wider texrect shapes remain
+subordinate to the higher-ceiling ordered CPU triangle work.
+
 The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns
 the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;

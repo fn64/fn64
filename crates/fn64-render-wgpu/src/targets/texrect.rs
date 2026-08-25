@@ -223,9 +223,9 @@ use crate::targets::{
     TargetError, TargetRectangle,
 };
 use crate::tmem::{
-    sample_point, PointSampleCoordinates, PointSampleError, PointSampleRequest,
-    TextureCoordinateS10_5, TileAddressMode, TileCoordinate, TileDescriptor, TileSize,
-    TmemFirstRowParity, TmemWordAddress,
+    sample_point, PhysicalTexelReadError, PointSampleCoordinates, PointSampleError,
+    PointSampleRequest, TextureCoordinateS10_5, TileAddressMode, TileCoordinate, TileDescriptor,
+    TileSize, TmemFirstRowParity, TmemWordAddress,
 };
 use crate::{CycleType, ImageFormat, OtherMode, PixelSize, TextureLutMode};
 
@@ -1687,6 +1687,591 @@ impl core::fmt::Display for TexrectConstantRegister {
     }
 }
 
+/// The census's sustained rank-1 program and its complete CI4/RGBA16
+/// sampling identity. Admission is deliberately literal: changing any one
+/// field routes the draw through [`sample_point`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RankOneCi4Rgba16;
+
+fn rank_one_ci4_rgba16_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FN64_TEXRECT_RANK_ONE_SPECIALIZATION")
+            .is_none_or(|value| value != "0")
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_RANK_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn with_generic_rank_one_for_test<R>(run: impl FnOnce() -> R) -> R {
+    FORCE_GENERIC_RANK_ONE.with(|forced| {
+        struct Reset<'a> {
+            forced: &'a std::cell::Cell<bool>,
+            previous: bool,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.forced.set(self.previous);
+            }
+        }
+        let previous = forced.replace(true);
+        let _reset = Reset { forced, previous };
+        run()
+    })
+}
+
+impl RankOneCi4Rgba16 {
+    const COMBINE_LOW: u32 = 0xfcff_ffff;
+    const COMBINE_HIGH: u32 = 0xfffd_f6fb;
+    const OTHER_MODE_HIGH: u32 = 0x0000_acef;
+    const OTHER_MODE_LOW: u32 = 0x0050_41c8;
+
+    fn admit(
+        combine: CombineParams,
+        other_mode: OtherMode,
+        target_format: ColorTargetFormat,
+        lut_mode: TextureLutMode,
+        tile: TexrectTileBinding,
+        draw: TexrectDraw,
+    ) -> Option<Self> {
+        #[cfg(test)]
+        if FORCE_GENERIC_RANK_ONE.with(std::cell::Cell::get) {
+            return None;
+        }
+        let descriptor = tile.descriptor();
+        let size = tile.size();
+        (rank_one_ci4_rgba16_enabled()
+            && combine.low() == Self::COMBINE_LOW
+            && combine.high() == Self::COMBINE_HIGH
+            && other_mode.high() == Self::OTHER_MODE_HIGH
+            && other_mode.low() == Self::OTHER_MODE_LOW
+            && target_format == ColorTargetFormat::Rgba16
+            && lut_mode == TextureLutMode::Rgba16
+            && descriptor.format() == ImageFormat::ColorIndex
+            && descriptor.size() == PixelSize::Bits4
+            && descriptor.line_words() == 1
+            && descriptor.tmem().get() == 0
+            && descriptor.palette() == 0
+            && !descriptor.s_mode().mirror()
+            && !descriptor.s_mode().clamp()
+            && descriptor.mask_s() == 4
+            && descriptor.shift_s() == 0
+            && !descriptor.t_mode().mirror()
+            && !descriptor.t_mode().clamp()
+            && descriptor.mask_t() == 4
+            && descriptor.shift_t() == 0
+            && size.low_s().raw() == 0
+            && size.low_t().raw() == 0
+            && size.high_s().raw() == 60
+            && size.high_t().raw() == 60
+            && !draw.flipped_axes)
+            .then_some(Self)
+    }
+
+    fn sample<S: crate::TmemByteSource + ?Sized>(
+        self,
+        tmem: &S,
+        s: i16,
+        t: i16,
+    ) -> Result<[u8; 4], PointSampleError> {
+        let column = (i64::from(s).div_euclid(32) & 15) as u16;
+        let row = (i64::from(t).div_euclid(32) & 15) as u16;
+        let linear = row * 8 + column / 2;
+        let source_address = if row & 1 == 0 { linear } else { linear ^ 4 };
+        let packed = tmem.valid_byte(source_address).ok_or_else(|| {
+            PointSampleError::from(PhysicalTexelReadError::InvalidTexelByte {
+                address: source_address,
+            })
+        })?;
+        let index = if column & 1 == 0 {
+            packed >> 4
+        } else {
+            packed & 0x0f
+        };
+        let palette_address = 0x0800 + u16::from(index) * 8;
+        let high = tmem.valid_byte(palette_address).ok_or_else(|| {
+            PointSampleError::from(PhysicalTexelReadError::InvalidTexelByte {
+                address: palette_address,
+            })
+        })?;
+        let low_address = palette_address + 1;
+        let low = tmem.valid_byte(low_address).ok_or_else(|| {
+            PointSampleError::from(PhysicalTexelReadError::InvalidTexelByte {
+                address: low_address,
+            })
+        })?;
+        let packed = u16::from_be_bytes([high, low]);
+        let expand = |five: u16| ((five << 3) | (five >> 2)) as u8;
+        Ok([
+            expand((packed >> 11) & 0x1f),
+            expand((packed >> 6) & 0x1f),
+            expand((packed >> 1) & 0x1f),
+            if packed & 1 == 0 { 0 } else { 0xff },
+        ])
+    }
+}
+
+#[cfg(test)]
+mod rank_one_ci4_rgba16_tests {
+    use super::*;
+    use fn64_render::{
+        NeutralImageFormat, NeutralPixelSize, NeutralTileAddressMode, NeutralTileDescriptor,
+        NeutralTileSize,
+    };
+    use fn64_render_ir::PhysicalMemoryLayout;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use crate::targets::{ColorTargetExtent, ColorTargetRegistry};
+
+    #[derive(Clone, Copy)]
+    struct AdmissionInputs {
+        combine: CombineParams,
+        other_mode: OtherMode,
+        target_format: ColorTargetFormat,
+        lut_mode: TextureLutMode,
+        descriptor: NeutralTileDescriptor,
+        size: NeutralTileSize,
+        draw: TexrectDraw,
+    }
+
+    impl AdmissionInputs {
+        fn tile(self) -> TexrectTileBinding {
+            TexrectTileBinding::try_from_neutral(self.descriptor, self.size).unwrap()
+        }
+
+        fn admit(self) -> Option<RankOneCi4Rgba16> {
+            RankOneCi4Rgba16::admit(
+                self.combine,
+                self.other_mode,
+                self.target_format,
+                self.lut_mode,
+                self.tile(),
+                self.draw,
+            )
+        }
+    }
+
+    fn exact_inputs() -> AdmissionInputs {
+        AdmissionInputs {
+            combine: CombineParams::from_wire(
+                RankOneCi4Rgba16::COMBINE_LOW,
+                RankOneCi4Rgba16::COMBINE_HIGH,
+            ),
+            other_mode: OtherMode::from_wire(
+                RankOneCi4Rgba16::OTHER_MODE_HIGH,
+                RankOneCi4Rgba16::OTHER_MODE_LOW,
+            ),
+            target_format: ColorTargetFormat::Rgba16,
+            lut_mode: TextureLutMode::Rgba16,
+            descriptor: NeutralTileDescriptor {
+                format: NeutralImageFormat::ColorIndex,
+                size: NeutralPixelSize::Bits4,
+                line_words: 1,
+                tmem_word_address: 0,
+                palette: 0,
+                s_mode: NeutralTileAddressMode::default(),
+                mask_s: 4,
+                shift_s: 0,
+                t_mode: NeutralTileAddressMode::default(),
+                mask_t: 4,
+                shift_t: 0,
+            },
+            size: NeutralTileSize {
+                low_s: 0,
+                low_t: 0,
+                high_s: 60,
+                high_t: 60,
+            },
+            draw: TexrectDraw {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+                s_start: 0,
+                t_start: 0,
+                s_end: 2048,
+                t_end: 2048,
+                flipped_axes: false,
+            },
+        }
+    }
+
+    #[test]
+    fn admission_is_closed_over_every_census_field_the_sampler_depends_on() {
+        let exact = exact_inputs();
+        assert_eq!(exact.admit(), Some(RankOneCi4Rgba16));
+        let mut mutations = Vec::new();
+
+        let mut input = exact;
+        input.combine = CombineParams::from_wire(0, RankOneCi4Rgba16::COMBINE_HIGH);
+        mutations.push(input);
+        let mut input = exact;
+        input.combine = CombineParams::from_wire(RankOneCi4Rgba16::COMBINE_LOW, 0);
+        mutations.push(input);
+        let mut input = exact;
+        input.other_mode = OtherMode::from_wire(0, RankOneCi4Rgba16::OTHER_MODE_LOW);
+        mutations.push(input);
+        let mut input = exact;
+        input.other_mode = OtherMode::from_wire(RankOneCi4Rgba16::OTHER_MODE_HIGH, 0);
+        mutations.push(input);
+        let mut input = exact;
+        input.target_format = ColorTargetFormat::Rgba32;
+        mutations.push(input);
+        let mut input = exact;
+        input.lut_mode = TextureLutMode::Ia16;
+        mutations.push(input);
+
+        let mut input = exact;
+        input.descriptor.format = NeutralImageFormat::IntensityAlpha;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.size = NeutralPixelSize::Bits8;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.line_words = 2;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.tmem_word_address = 1;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.palette = 1;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.s_mode.mirror = true;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.s_mode.clamp = true;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.mask_s = 3;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.shift_s = 1;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.t_mode.mirror = true;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.t_mode.clamp = true;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.mask_t = 3;
+        mutations.push(input);
+        let mut input = exact;
+        input.descriptor.shift_t = 1;
+        mutations.push(input);
+
+        let mut input = exact;
+        input.size.low_s = 4;
+        mutations.push(input);
+        let mut input = exact;
+        input.size.low_t = 4;
+        mutations.push(input);
+        let mut input = exact;
+        input.size.high_s = 56;
+        mutations.push(input);
+        let mut input = exact;
+        input.size.high_t = 56;
+        mutations.push(input);
+        let mut input = exact;
+        input.draw = input.draw.with_flipped_axes();
+        mutations.push(input);
+
+        assert_eq!(mutations.len(), 24);
+        for (index, mutation) in mutations.into_iter().enumerate() {
+            assert_eq!(mutation.admit(), None, "mutation {index} escaped admission");
+        }
+    }
+
+    struct CorpusTmem {
+        bytes: [u8; 4096],
+        valid: [bool; 4096],
+        snapshot: crate::TmemSnapshotIdentity,
+    }
+
+    impl CorpusTmem {
+        fn complete() -> Self {
+            let mut bytes = [0; 4096];
+            for (address, byte) in bytes.iter_mut().enumerate() {
+                *byte = (address as u8)
+                    .wrapping_mul(73)
+                    .wrapping_add((address >> 4) as u8)
+                    .wrapping_add(19);
+            }
+            let physical = crate::PhysicalTmemState::try_new().unwrap();
+            Self {
+                bytes,
+                valid: [true; 4096],
+                snapshot: crate::TmemByteSource::snapshot(&physical),
+            }
+        }
+    }
+
+    impl crate::TmemByteSource for CorpusTmem {
+        fn snapshot(&self) -> crate::TmemSnapshotIdentity {
+            self.snapshot
+        }
+
+        fn valid_byte(&self, address: u16) -> Option<u8> {
+            let index = usize::from(address);
+            self.valid[index].then_some(self.bytes[index])
+        }
+    }
+
+    fn generic_sample(
+        tmem: &CorpusTmem,
+        tile: TexrectTileBinding,
+        s: i16,
+        t: i16,
+    ) -> Result<[u8; 4], PointSampleError> {
+        sample_point(
+            tmem,
+            tile.descriptor(),
+            tile.size(),
+            PointSampleRequest::new(
+                PointSampleCoordinates::new(
+                    TextureCoordinateS10_5::from_raw(s),
+                    TextureCoordinateS10_5::from_raw(t),
+                ),
+                TmemFirstRowParity::Even,
+            ),
+            TextureLutMode::Rgba16,
+        )
+        .map(|sample| sample.texel().rgba8888())
+    }
+
+    #[test]
+    fn specialization_matches_the_generic_oracle_at_boundaries_and_mutations() {
+        let mut tmem = CorpusTmem::complete();
+        let tile = exact_inputs().tile();
+        let specialized = RankOneCi4Rgba16;
+        let boundaries = [
+            i16::MIN,
+            -1025,
+            -513,
+            -512,
+            -511,
+            -33,
+            -32,
+            -31,
+            -1,
+            0,
+            1,
+            31,
+            32,
+            33,
+            479,
+            480,
+            481,
+            511,
+            512,
+            513,
+            i16::MAX,
+        ];
+        for &s in &boundaries {
+            for &t in &boundaries {
+                assert_eq!(specialized.sample(&tmem, s, t), generic_sample(&tmem, tile, s, t));
+            }
+        }
+
+        let mut state = 0x9e37_79b9u32;
+        for _ in 0..50_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let s = state as i16;
+            state = state.rotate_left(11).wrapping_add(0x7f4a_7c15);
+            let t = state as i16;
+            assert_eq!(specialized.sample(&tmem, s, t), generic_sample(&tmem, tile, s, t));
+        }
+
+        for address in [0u16, 4, 127, 0x0800, 0x0878, 0x0879] {
+            tmem.valid[usize::from(address)] = false;
+            for &s in &boundaries {
+                for &t in &boundaries {
+                    assert_eq!(
+                        specialized.sample(&tmem, s, t),
+                        generic_sample(&tmem, tile, s, t)
+                    );
+                }
+            }
+            tmem.valid[usize::from(address)] = true;
+        }
+    }
+
+    fn time_samples(
+        generic: bool,
+        tmem: &CorpusTmem,
+        tile: TexrectTileBinding,
+        coordinates: &[(i16, i16)],
+    ) -> Duration {
+        let started = Instant::now();
+        let mut checksum = 0u64;
+        for &(s, t) in coordinates {
+            let rgba = if generic {
+                generic_sample(tmem, tile, black_box(s), black_box(t)).unwrap()
+            } else {
+                RankOneCi4Rgba16
+                    .sample(tmem, black_box(s), black_box(t))
+                    .unwrap()
+            };
+            checksum = checksum.wrapping_add(u64::from(rgba[0]) + u64::from(rgba[3]));
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn full_draw(
+        generic: bool,
+        candidate: &CandidateColorTarget,
+        tmem: &CorpusTmem,
+        resident: &[u8],
+    ) -> CompletedColorTargetWrite {
+        let inputs = exact_inputs();
+        let execute = || {
+            execute_texture_rectangle(
+                candidate,
+                inputs.other_mode,
+                inputs.draw,
+                inputs.tile(),
+                tmem,
+                inputs.lut_mode,
+                TexrectShading::new(
+                    inputs.combine,
+                    Color4::from_wire(0x2040_80ff),
+                    PrimColor::from_wire(0, 0x80ff_40ff),
+                ),
+                TexrectBlendRegisters::new(
+                    Color4::from_wire(0x1020_30ff),
+                    Color4::from_wire(0x4050_60ff),
+                ),
+                RdpScissorRect::from_wire_quarter_pixels(0, 0, 0, 256, 256),
+                Cow::Borrowed(resident),
+                None,
+            )
+            .unwrap()
+        };
+        if generic {
+            with_generic_rank_one_for_test(execute)
+        } else {
+            execute()
+        }
+    }
+
+    fn full_draw_fixture() -> (CandidateColorTarget, CorpusTmem, Vec<u8>) {
+        let layout = PhysicalMemoryLayout::try_new(8 * 1024 * 1024).unwrap();
+        let key = ColorTargetKey::try_new(
+            layout.address(0x400).unwrap(),
+            ColorTargetExtent::try_new(64, 64).unwrap(),
+            ColorTargetFormat::Rgba16,
+        )
+        .unwrap();
+        let registry = ColorTargetRegistry::try_new(layout, 1).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let resident = vec![0x5a; key.extent().pixels() as usize * 2];
+        (candidate, CorpusTmem::complete(), resident)
+    }
+
+    #[test]
+    fn full_draw_device_bytes_match_the_forced_generic_oracle() {
+        let (candidate, tmem, resident) = full_draw_fixture();
+        let generic = full_draw(true, &candidate, &tmem, &resident);
+        let specialized = full_draw(false, &candidate, &tmem, &resident);
+        assert_eq!(
+            specialized.device_bytes().device_bytes(),
+            generic.device_bytes().device_bytes()
+        );
+        assert_eq!(specialized.rectangle(), generic.rectangle());
+    }
+
+    fn time_full_draws(
+        generic: bool,
+        count: usize,
+        candidate: &CandidateColorTarget,
+        tmem: &CorpusTmem,
+        resident: &[u8],
+    ) -> Duration {
+        let started = Instant::now();
+        let mut checksum = 0u64;
+        for iteration in 0..count {
+            let completed = full_draw(generic, candidate, tmem, black_box(resident));
+            let bytes = completed.device_bytes().device_bytes();
+            checksum = checksum.wrapping_add(u64::from(bytes[iteration % bytes.len()]));
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    #[test]
+    #[ignore = "release-only alternating microbenchmark"]
+    fn release_microbenchmark_is_a_meaningful_win() {
+        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+        let tmem = CorpusTmem::complete();
+        let tile = exact_inputs().tile();
+        let coordinates = (0..250_000u32)
+            .map(|index| {
+                let s = index.wrapping_mul(73).wrapping_add(index >> 3) as i16;
+                let t = index.wrapping_mul(151).wrapping_add(index >> 5) as i16;
+                (s, t)
+            })
+            .collect::<Vec<_>>();
+        let mut generic = Duration::ZERO;
+        let mut specialized = Duration::ZERO;
+        for round in 0..10 {
+            if round & 1 == 0 {
+                generic += time_samples(true, &tmem, tile, &coordinates);
+                specialized += time_samples(false, &tmem, tile, &coordinates);
+            } else {
+                specialized += time_samples(false, &tmem, tile, &coordinates);
+                generic += time_samples(true, &tmem, tile, &coordinates);
+            }
+        }
+        eprintln!(
+            "rank-one-ci4-rgba16 generic_ns={} specialized_ns={} speedup={:.2}x",
+            generic.as_nanos(),
+            specialized.as_nanos(),
+            generic.as_secs_f64() / specialized.as_secs_f64()
+        );
+        assert!(
+            specialized.as_nanos() * 10 < generic.as_nanos() * 9,
+            "the specialization must save at least 10%: generic={generic:?}, specialized={specialized:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only alternating full-draw microbenchmark"]
+    fn release_full_draw_microbenchmark_is_a_meaningful_net_win() {
+        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+        let (candidate, tmem, resident) = full_draw_fixture();
+        let mut generic = Duration::ZERO;
+        let mut specialized = Duration::ZERO;
+        for round in 0..10 {
+            if round & 1 == 0 {
+                generic += time_full_draws(true, 20, &candidate, &tmem, &resident);
+                specialized += time_full_draws(false, 20, &candidate, &tmem, &resident);
+            } else {
+                specialized += time_full_draws(false, 20, &candidate, &tmem, &resident);
+                generic += time_full_draws(true, 20, &candidate, &tmem, &resident);
+            }
+        }
+        eprintln!(
+            "rank-one-full-draw generic_ns={} specialized_ns={} speedup={:.2}x",
+            generic.as_nanos(),
+            specialized.as_nanos(),
+            generic.as_secs_f64() / specialized.as_secs_f64()
+        );
+        assert!(
+            specialized.as_nanos() * 100 < generic.as_nanos() * 95,
+            "the full draw must save at least 5%: generic={generic:?}, specialized={specialized:?}"
+        );
+    }
+}
+
 /// Executes one admitted `TextureRectangle` against `candidate`, sampling
 /// every texel from `tmem` -- any [`TmemByteSource`], which in practice is
 /// one of exactly two images the caller chooses between by a rule this
@@ -1778,6 +2363,14 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
 
     let key = candidate.key();
     let format = key.format();
+    let rank_one = RankOneCi4Rgba16::admit(
+        shading.combine(),
+        other_mode,
+        format,
+        lut_mode,
+        tile,
+        draw,
+    );
     let extent = key.extent();
     let rectangle = TargetRectangle::try_new(draw.left(), draw.top(), draw.width(), draw.height())?;
     // **Clipped, not refused.** Pinned RT64 intersects the scissor and draw
@@ -1884,15 +2477,19 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
                 ),
                 first_row_parity,
             );
-            let decoded = sample_point(tmem, tile.descriptor(), tile.size(), request, lut_mode)
-                .map_err(|source| TexrectExecutionError::Sample {
-                    column,
-                    row,
-                    source,
-                })?;
+            let sampled_rgba = match rank_one {
+                Some(specialized) => specialized.sample(tmem, s, t),
+                None => sample_point(tmem, tile.descriptor(), tile.size(), request, lut_mode)
+                    .map(|decoded| decoded.texel().rgba8888()),
+            }
+            .map_err(|source| TexrectExecutionError::Sample {
+                column,
+                row,
+                source,
+            })?;
             let rgba = match base_inputs {
                 // Copy cycle: the sampled texel's own RGBA8888, unchanged.
-                None => decoded.texel().rgba8888(),
+                None => sampled_rgba,
                 // One cycle: `(A-B)*C+D` for color and alpha independently,
                 // then RT64's final `wrapClamp` -- all inside
                 // `run_one_cycle`, which is the triangle pipeline's own
@@ -1909,7 +2506,7 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
                 Some(base) => combine_one_texel(
                     shading.combine(),
                     base,
-                    decoded.texel().rgba8888(),
+                    sampled_rgba,
                     evaluation,
                 ),
             };
