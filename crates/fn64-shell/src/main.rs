@@ -271,10 +271,9 @@ mod game {
         /// blitting to the pixels surface -- reused per frame, reallocated if
         /// the framebuffer width changes.
         rgba: Vec<u8>,
-        /// Exact guest bytes and VI geometry used for the last successful
-        /// window submission. This is the authority for suppressing a
-        /// redundant pump-driven redraw; OS-requested redraws still present.
-        last_present_dependency: Option<framebuffer::PresentDependency>,
+        /// Exact successful-submit authority, invalidation generation, and
+        /// experiment accounting for pump-driven redraw suppression.
+        present_cache: framebuffer::PresentCache,
         /// Experimental exact-input redraw suppression. Default-off until a
         /// repeated live A/B establishes its wall-time effect.
         present_cache_enabled: bool,
@@ -644,7 +643,7 @@ mod game {
                 },
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
-                last_present_dependency: None,
+                present_cache: framebuffer::PresentCache::default(),
                 present_cache_enabled,
                 fb_width: FB_WIDTH,
                 fb_height: FB_HEIGHT,
@@ -789,21 +788,37 @@ mod game {
             (kb_buttons | gp_buttons, sx, sy)
         }
 
-        fn presented_frame_is_current(&self) -> bool {
-            if !self.present_cache_enabled
-                || self.overlay.active()
+        fn invalidate_present_cache(&mut self) {
+            if self.present_cache_enabled {
+                self.present_cache.invalidate();
+            }
+        }
+
+        fn presented_frame_is_current(&mut self) -> bool {
+            if !self.present_cache_enabled {
+                return false;
+            }
+            self.present_cache
+                .synchronize_policy(framebuffer::PresentPolicy::new(
+                    self.video.overscan,
+                    self.video.zoom_fill,
+                ));
+            if self.overlay.active()
                 || self.frame_trip.is_some()
                 || self.frame_dump_dir.is_some()
             {
+                self.present_cache.record_uncacheable_request();
                 return false;
             }
             let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
                 .or_else(fn64_abi::current_vi_framebuffer)
                 .map(|offset| offset as usize)
             else {
+                self.present_cache.record_uncacheable_request();
                 return false;
             };
             if !fb_offset.is_multiple_of(4) {
+                self.present_cache.record_uncacheable_request();
                 return false;
             }
             let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
@@ -811,16 +826,14 @@ mod game {
             let target_width = (src_stride - overscan).clamp(1, 4096);
             let target_height = fn64_abi::vi_output_height()
                 .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
-            self.last_present_dependency.as_ref().is_some_and(|dependency| {
-                dependency.matches(
-                    &self.rdram,
-                    fb_offset,
-                    src_stride,
-                    target_width,
-                    target_height,
-                    fn64_abi::vi_blanked(),
-                )
-            })
+            self.present_cache.is_current(
+                &self.rdram,
+                fb_offset,
+                src_stride,
+                target_width,
+                target_height,
+                fn64_abi::vi_blanked(),
+            )
         }
 
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
@@ -977,6 +990,11 @@ mod game {
             pixels.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
             // pixels/window fields immutably alongside `&mut self.config`.
+            let overlay_open_before = self.overlay.open;
+            let video_policy_before = framebuffer::PresentPolicy::new(
+                self.video.overscan,
+                self.video.zoom_fill,
+            );
             let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
@@ -1015,10 +1033,28 @@ mod game {
                 self.pixels.as_ref().expect("checked above").render()
             };
             if let Err(e) = render_result {
+                if self.present_cache_enabled {
+                    self.present_cache.record_failure();
+                }
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
             }
-            self.last_present_dependency = dependency;
+            if let Some(dependency) = dependency {
+                self.present_cache.record_success(dependency);
+                // The overlay's Done button and Video controls mutate their
+                // state during this submission. That submission still
+                // contains the old composition, so install it first and then
+                // invalidate the generation consumed by the next pump.
+                if overlay_open_before != self.overlay.open {
+                    self.present_cache.invalidate();
+                }
+                let video_policy_after = framebuffer::PresentPolicy::new(
+                    self.video.overscan,
+                    self.video.zoom_fill,
+                );
+                self.present_cache.synchronize_policy(video_policy_before);
+                self.present_cache.synchronize_policy(video_policy_after);
+            }
             self.present_times.record(present_started.elapsed());
 
             if !self.reported_first_frame {
@@ -1122,6 +1158,7 @@ mod game {
                     let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
                     let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
                     let audio_rates = fn64_abi::audio_rates();
+                    let present_cache = self.present_cache.stats();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
@@ -1136,7 +1173,10 @@ mod game {
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
-                         guest/stream_hz={audio_rates:?}",
+                         guest/stream_hz={audio_rates:?}; present_cache: enabled={} \
+                         requests={} hits={} misses={} successful_presents={} failed_presents={} \
+                         invalidations={} dependency_samples={} dependency_bytes={} \
+                         logical_digest={:016x}",
                         interval.median_ms,
                         interval.p95_ms,
                         interval.p99_ms,
@@ -1156,7 +1196,17 @@ mod game {
                         audio.samples,
                         audio.nonzero_samples,
                         audio.backend_buffers,
-                        fn64_abi::audio_frames_remaining()
+                        fn64_abi::audio_frames_remaining(),
+                        self.present_cache_enabled,
+                        present_cache.requests,
+                        present_cache.hits,
+                        present_cache.misses,
+                        present_cache.successful_presents,
+                        present_cache.failed_presents,
+                        present_cache.invalidations,
+                        present_cache.dependency_samples,
+                        present_cache.dependency_bytes,
+                        present_cache.logical_digest,
                     );
                     self.last_heartbeat_swap = swaps;
                     self.pump_steps_total = 0;
@@ -1292,6 +1342,7 @@ mod game {
                     event_loop.exit();
                 }
                 WindowEvent::Resized(new_size) => {
+                    self.invalidate_present_cache();
                     if let Some(px) = self.pixels.as_mut() {
                         // Keep the game's 320x240 aspect; pixels letterboxes
                         // the surface to the window automatically.
@@ -1301,6 +1352,12 @@ mod game {
                             eprintln!("[fn64-shell] resize_surface failed: {e}");
                         }
                     }
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    // Winit follows this with the platform's redraw/resize
+                    // traffic, but the cached surface belongs to the old
+                    // scale until a successful new submission proves it.
+                    self.invalidate_present_cache();
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if event.repeat {
@@ -1336,6 +1393,7 @@ mod game {
                         }
                         if code == KeyCode::F3 && pressed {
                             self.overlay.toggle_hud();
+                            self.invalidate_present_cache();
                             // Named in the log too: a player who hits F3 by
                             // accident should learn what it is, and a log
                             // reader gets the stack line either way.
@@ -1347,6 +1405,7 @@ mod game {
                         }
                         if code == KeyCode::F1 && pressed {
                             self.overlay.toggle();
+                            self.invalidate_present_cache();
                             if self.overlay.open {
                                 // Keys held at open would otherwise stay
                                 // latched into the game across the overlay.
@@ -1362,6 +1421,7 @@ mod game {
                                 };
                                 window.set_fullscreen(next);
                             }
+                            self.invalidate_present_cache();
                             return;
                         }
                         if self.overlay.open {
@@ -1374,6 +1434,7 @@ mod game {
                                     self.overlay.capture = None;
                                 } else {
                                     self.overlay.toggle();
+                                    self.invalidate_present_cache();
                                 }
                                 return;
                             }
@@ -1418,6 +1479,11 @@ mod game {
                     }
                 }
                 WindowEvent::RedrawRequested => {
+                    // OS expose/redraw requests bypass the pump-side cache
+                    // gate. Invalidate first so even an early/failed attempt
+                    // makes the next pump retry; a successful submission
+                    // installs fresh authority in the new generation.
+                    self.invalidate_present_cache();
                     self.present();
                 }
                 _ => {}
@@ -1682,6 +1748,23 @@ mod game {
             return;
         }
         use std::io::Write as _;
+        if shell.present_cache_enabled {
+            let stats = shell.present_cache.stats();
+            println!(
+                "[fn64-present-cache] phase=final path={path} requests={} hits={} misses={} \
+                 successful_presents={} failed_presents={} invalidations={} \
+                 dependency_samples={} dependency_bytes={} logical_digest={:016x}",
+                stats.requests,
+                stats.hits,
+                stats.misses,
+                stats.successful_presents,
+                stats.failed_presents,
+                stats.invalidations,
+                stats.dependency_samples,
+                stats.dependency_bytes,
+                stats.logical_digest,
+            );
+        }
         let exit = fn64_abi::prepare_process_exit();
         let left_un_detached = exit.threads - exit.detached_coroutines;
         println!(
