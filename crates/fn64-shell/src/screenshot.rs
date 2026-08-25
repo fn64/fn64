@@ -192,6 +192,14 @@ impl Screenshotter {
         self.seq = self.seq.saturating_add(1);
         n
     }
+
+    /// Name the next diagnostic frame dump with this same session-wide
+    /// capture authority. Frame dumping does not require a hash tripwire, so
+    /// its chronology cannot be derived from a tripwire observation count.
+    pub fn next_frame_dump_file_name(&mut self, rgba_hash: u64) -> String {
+        let seq = self.next_seq();
+        format!("frame-{seq:04}-{rgba_hash:016x}.png")
+    }
 }
 
 /// Encode `rgba` and write it into `dir`, returning the path written.
@@ -347,6 +355,19 @@ mod tests {
         }
         let unique: std::collections::BTreeSet<u64> = seen.iter().copied().collect();
         assert_eq!(unique.len(), seen.len(), "sequence numbers must be unique");
+    }
+
+    #[test]
+    fn frame_dump_names_advance_without_a_tripwire_and_repeated_pixels_do_not_overwrite() {
+        let mut shots = Screenshotter::new();
+        assert_eq!(
+            shots.next_frame_dump_file_name(0x1234),
+            "frame-0000-0000000000001234.png"
+        );
+        assert_eq!(
+            shots.next_frame_dump_file_name(0x1234),
+            "frame-0001-0000000000001234.png"
+        );
     }
 
     #[test]
