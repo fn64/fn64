@@ -260,6 +260,7 @@ pub fn decode_set_scissor(w0: u32, w1: u32) -> SetScissorDecoded {
 /// reinterpretation, if any, happens inside the out-of-scope
 /// `state->rdp->setConvert` dispatch call, not here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub struct SetConvertDecoded {
     pub k0: i32,
     pub k1: i32,
@@ -269,6 +270,7 @@ pub struct SetConvertDecoded {
     pub k5: i32,
 }
 
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub fn decode_set_convert(w0: u32, w1: u32) -> SetConvertDecoded {
     SetConvertDecoded {
         k0: p0(w0, 13, 9) as i32,
@@ -284,12 +286,14 @@ pub fn decode_set_convert(w0: u32, w1: u32) -> SetConvertDecoded {
 /// p1(16, 12)`. All three are `uint32_t` in the source; `w0` is unused (the
 /// command's first word carries only the opcode byte for this command).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub struct SetKeyRDecoded {
     pub c_r: u32,
     pub s_r: u32,
     pub w_r: u32,
 }
 
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub fn decode_set_key_r(_w0: u32, w1: u32) -> SetKeyRDecoded {
     SetKeyRDecoded {
         c_r: p1(w1, 8, 8),
@@ -304,6 +308,7 @@ pub fn decode_set_key_r(_w0: u32, w1: u32) -> SetKeyRDecoded {
 /// `cG`/`sG`/`cB`/`sB` read from `w1` -- the only field pair in this file
 /// split across both words for a single-word-per-field opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub struct SetKeyGbDecoded {
     pub c_g: u32,
     pub s_g: u32,
@@ -313,6 +318,7 @@ pub struct SetKeyGbDecoded {
     pub w_b: u32,
 }
 
+#[cfg(any(test, feature = "rt64-port-characterization"))]
 pub fn decode_set_key_gb(w0: u32, w1: u32) -> SetKeyGbDecoded {
     SetKeyGbDecoded {
         c_g: p1(w1, 24, 8),

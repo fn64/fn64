@@ -32,8 +32,11 @@ mod triangle_pipeline;
 
 pub(crate) use compute_batch::{
     ComputeRasterAdmissionRefusal, ComputeRasterBatch, ComputeRasterBatchBuilder,
-    ComputeRasterDrawAdmission, ComputeRasterProgramKey, HOT_COMBINE_HIGH, HOT_COMBINE_LOW,
-    HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
+    ComputeRasterDrawAdmission, ComputeRasterProgramKey,
+};
+#[cfg(all(test, feature = "host-gpu-tests"))]
+pub(crate) use compute_batch::{
+    HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
 };
 pub use fill::{
     decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,
@@ -48,9 +51,9 @@ pub use raster::{
 };
 pub use raw_triangle::{execute_raw_triangle, DepthCell, RawTriangleDepth, RawTriangleTexture};
 pub use texrect::{
-    execute_texture_rectangle, ClippedTexrectExtent, RdpScissorRect, TexrectAxis,
-    TexrectBlendRegisters, TexrectConstantRegister, TexrectDraw, TexrectExecutionError,
-    TexrectShading, TexrectTileBinding,
+    execute_texture_rectangle, RdpScissorRect, TexrectAxis, TexrectBlendRegisters,
+    TexrectConstantRegister, TexrectDraw, TexrectExecutionError, TexrectShading,
+    TexrectTileBinding,
 };
 pub(crate) use triangle_pipeline::{
     admitted_triangle_fixture, ComputeHotColorBatch, ComputeHotColorDispatch,

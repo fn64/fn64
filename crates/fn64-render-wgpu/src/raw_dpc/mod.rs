@@ -1970,16 +1970,6 @@ pub struct FillSeedRead {
     access_index: Option<u32>,
 }
 
-impl FillSeedRead {
-    pub const fn command_index(self) -> u32 {
-        self.command_index
-    }
-
-    pub const fn access_index(self) -> Option<u32> {
-        self.access_index
-    }
-}
-
 /// Intersects one fill's whole-pixel destination rectangle with the staged
 /// scissor, in the scissor's own quarter-pixel domain, returning `None` when
 /// nothing survives.

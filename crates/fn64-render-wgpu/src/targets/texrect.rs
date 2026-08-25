@@ -2585,13 +2585,6 @@ fn union_rectangle(
         .expect("a union of two in-bounds rectangles is in bounds")
 }
 
-/// Emits the current exact-key texrect timing snapshot when the census is
-/// enabled. Backend teardown may call this explicitly; normal thread exit
-/// also flushes the final partial reporting interval.
-pub(crate) fn flush_texrect_timing_census() {
-    texrect_timing_census::flush("explicit");
-}
-
 /// Default-off timing for successful CPU texrect execution, keyed by every
 /// state field needed to choose a closed exact specialization.
 ///

@@ -887,50 +887,6 @@ fn source_row_range(
         .map_err(|_| TmemWireError::new(context))
 }
 
-fn source_range(
-    layout: PhysicalMemoryLayout,
-    image: TextureImage,
-    first_texel: u32,
-    texel_count: u32,
-    context: &'static str,
-) -> Result<PhysicalRange, TmemWireError> {
-    let (first_byte, end_byte) = match image.size() {
-        PixelSize::Bits4 => {
-            return Err(TmemWireError::new(
-                "direct four-bit TMEM loads are unsupported; load through a public 16-bit form",
-            ));
-        }
-        size => {
-            let bytes_per_texel = size
-                .bytes_per_pixel()
-                .expect("only four-bit pixels are sub-byte");
-            let first = first_texel
-                .checked_mul(bytes_per_texel)
-                .ok_or(TmemWireError::new("TMEM load source byte offset overflows"))?;
-            let bytes = texel_count
-                .checked_mul(bytes_per_texel)
-                .ok_or(TmemWireError::new("TMEM load source byte count overflows"))?;
-            let end = first
-                .checked_add(bytes)
-                .ok_or(TmemWireError::new("TMEM load source byte end overflows"))?;
-            (first, end)
-        }
-    };
-    let start = image
-        .address()
-        .get()
-        .checked_add(first_byte)
-        .ok_or(TmemWireError::new(context))?;
-    let end = image
-        .address()
-        .get()
-        .checked_add(end_byte)
-        .ok_or(TmemWireError::new(context))?;
-    layout
-        .range(start, end)
-        .map_err(|_| TmemWireError::new(context))
-}
-
 fn tile_size(w0: u32, w1: u32) -> Result<TileSize, TmemWireError> {
     Ok(TileSize::from_wire(
         coordinate((w0 >> 12) & 0x0fff)?,

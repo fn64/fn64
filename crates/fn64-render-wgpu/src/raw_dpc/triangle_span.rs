@@ -277,13 +277,8 @@ pub(crate) fn covered_rows(triangle: &RawTriangle, width: u32, height: u32) -> V
 /// eight [`COVERAGE_SAMPLES`] fall inside the triangle. The X columns
 /// alternate by Y row -- it is a checkerboard, not a grid.
 ///
-/// Used by the rasterizer, not the decoder: a declared row is declared as a
-/// whole `[x0, x1)` range because that is what `plan_render_target_rows`
-/// can express, while a pixel at the very edge of that range may still have
-/// zero coverage. That asymmetry is safe in exactly one direction -- the
-/// declaration is a superset of what is drawn -- and the rasterizer closes
-/// it by writing *every* pixel in the declared range, using the resident's
-/// own prior byte where coverage is zero. See `raster_flat_triangle`.
+/// Test oracle for the row-hoisted rasterizer coverage path.
+#[cfg(test)]
 pub(crate) fn pixel_coverage(triangle: &RawTriangle, x: i32, y: i32) -> u32 {
     let yh_eighth = i32::from(triangle.yh()) * 2;
     let yl_eighth = i32::from(triangle.yl()) * 2;
@@ -507,16 +502,13 @@ impl AttributeSampleRow {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn attribute_sample(triangle: &RawTriangle, x: i32, y: i32) -> Option<(i32, i64)> {
     AttributeSampleRow::new(triangle, y).sample(x)
 }
 
 #[cfg(test)]
-fn attribute_sample_unhoisted(
-    triangle: &RawTriangle,
-    x: i32,
-    y: i32,
-) -> Option<(i32, i64)> {
+fn attribute_sample_unhoisted(triangle: &RawTriangle, x: i32, y: i32) -> Option<(i32, i64)> {
     let yh_eighth = i32::from(triangle.yh()) * 2;
     let yl_eighth = i32::from(triangle.yl()) * 2;
     let high_origin_eighth = i32::from(triangle.yh() & !3) * 2;

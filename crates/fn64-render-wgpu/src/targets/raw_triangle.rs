@@ -65,7 +65,6 @@
 //! [`raster_triangle`]'s loop and
 //! `a_declared_pixel_with_no_subpixel_coverage_is_not_painted`.
 
-use fn64_render_ir::ResourceAccess;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -181,10 +180,6 @@ pub struct RawTriangleTexture<'a, S: TmemByteSource + ?Sized> {
     pub tmem: &'a S,
     pub lut_mode: TextureLutMode,
 }
-
-/// The subpixel coverage a fully-covered pixel has: two X sample columns
-/// times four Y sample rows.
-const FULL_COVERAGE: u32 = 8;
 
 /// Rasterizes one flat raw triangle into `resident_bytes`, returning the
 /// full-extent result.
@@ -1431,15 +1426,6 @@ mod draw_census {
         }
     }
 }
-
-/// The exact ordered accesses one rasterized triangle's rows correspond to,
-/// for the caller to hand back to the journal.
-///
-/// Deliberately absent: this module never derives accesses. The decoder's
-/// own `plan_raw_triangle` pushed them and `bind_texture_rectangle` returns
-/// them; a second derivation here is exactly the drift
-/// `ExactRawDpcPlanWriter::finish` exists to catch.
-pub type DeclaredAccesses<'a> = &'a [ResourceAccess];
 
 #[cfg(test)]
 mod tests;
