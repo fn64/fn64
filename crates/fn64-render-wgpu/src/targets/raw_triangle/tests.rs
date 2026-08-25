@@ -1727,6 +1727,71 @@ fn fog_noise_specialization_admission_is_closed_over_every_required_predicate() 
     ));
 }
 
+fn generic_fog_noise_terminal(combined: [u8; 4], resident: [u8; 2]) -> [u8; 2] {
+    let other_mode = OtherMode::from_wire(0x0018_acef, 0x0050_4240);
+    let registers = TexrectBlendRegisters::default();
+    let state = registers.mode_state(other_mode);
+    let stages = TexrectFragmentStages::try_new(other_mode, registers.blend_color()).unwrap();
+    let mut output = resident;
+    blend_and_write_pixel(
+        ColorTargetFormat::Rgba16,
+        &mut output,
+        combined,
+        state,
+        stages,
+        0,
+        0,
+    )
+    .unwrap();
+    output
+}
+
+#[test]
+fn fog_noise_terminal_matches_noise_endpoint_and_generic_rgb_domain() {
+    let other_mode = OtherMode::from_wire(0x0018_acef, 0x0050_4240);
+    for alpha in 0u16..=255 {
+        let alpha = alpha as u8;
+        let five = alpha >> 3;
+        let expected = (five << 3) | (five >> 2);
+        assert_eq!(
+            crate::alpha_compare::apply_alpha_dither(
+                alpha,
+                other_mode.alpha_dither(),
+                other_mode.rgb_dither(),
+                0,
+                0,
+                crate::alpha_compare::AlphaCompareNoise(7),
+            ),
+            expected,
+            "alpha endpoint mismatch alpha={alpha}"
+        );
+    }
+
+    for channel in 0..3 {
+        for alpha_five in 0u16..=31 {
+            for destination_five in 0u16..=31 {
+                for source in 0u16..=255 {
+                    let mut combined = [0u8; 4];
+                    combined[channel] = source as u8;
+                    combined[3] = (alpha_five << 3) as u8;
+                    let shift = [11, 6, 1][channel];
+                    for coverage_bit in 0u16..=1 {
+                        let resident_word = (destination_five << shift) | coverage_bit;
+                        let resident = resident_word.to_be_bytes();
+                        let mut specialized = resident;
+                        FogNoiseRgba16Program.write_rgba16(&mut specialized, combined);
+                        assert_eq!(
+                            specialized,
+                            generic_fog_noise_terminal(combined, resident),
+                            "terminal mismatch channel={channel} source={source} destination_five={destination_five} alpha_five={alpha_five} coverage_bit={coverage_bit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn fog_noise_specialization_matches_generic_at_every_alpha_pair_and_channel_boundaries() {
     let prepared =
@@ -1778,6 +1843,7 @@ fn fog_noise_specialization_matches_generic_at_every_alpha_pair_and_channel_boun
 enum RasterDifferentialLane {
     Specialized,
     GenericOracle,
+    GenericTerminalOracle,
 }
 
 #[test]
@@ -1840,6 +1906,19 @@ fn fog_noise_specialization_matches_generic_full_frame_ten_times() {
                     texture,
                     None,
                 ),
+                RasterDifferentialLane::GenericTerminalOracle => {
+                    execute_raw_triangle_fog_noise_generic_terminal_oracle(
+                        &candidate,
+                        OtherMode::from_wire(0x0018_acef, 0x0050_4240),
+                        &triangle,
+                        shading,
+                        TexrectBlendRegisters::default(),
+                        &resident,
+                        &declared,
+                        texture,
+                        None,
+                    )
+                }
             }
             .unwrap();
             completed.device_bytes().device_bytes().to_vec()
@@ -1901,12 +1980,25 @@ fn fog_noise_specialization_microbench() {
                 texture,
                 None,
             ),
+            RasterDifferentialLane::GenericTerminalOracle => {
+                execute_raw_triangle_fog_noise_generic_terminal_oracle(
+                    &candidate,
+                    OtherMode::from_wire(0x0018_acef, 0x0050_4240),
+                    &triangle,
+                    shading.clone(),
+                    TexrectBlendRegisters::default(),
+                    &resident,
+                    &declared,
+                    texture,
+                    None,
+                )
+            }
         }
         .unwrap();
         std::hint::black_box(completed.device_bytes().device_bytes().len());
     };
     for _ in 0..8 {
-        run(RasterDifferentialLane::GenericOracle);
+        run(RasterDifferentialLane::GenericTerminalOracle);
         run(RasterDifferentialLane::Specialized);
     }
     let mut generic = Vec::with_capacity(20);
@@ -1920,11 +2012,11 @@ fn fog_noise_specialization_microbench() {
             samples.push(start.elapsed().as_nanos());
         };
         if sample & 1 == 0 {
-            measure(RasterDifferentialLane::GenericOracle, &mut generic);
+            measure(RasterDifferentialLane::GenericTerminalOracle, &mut generic);
             measure(RasterDifferentialLane::Specialized, &mut specialized);
         } else {
             measure(RasterDifferentialLane::Specialized, &mut specialized);
-            measure(RasterDifferentialLane::GenericOracle, &mut generic);
+            measure(RasterDifferentialLane::GenericTerminalOracle, &mut generic);
         }
     }
     generic.sort_unstable();
@@ -2090,9 +2182,16 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         .device_bytes()
         .device_bytes()
         .to_vec();
+    let full_coverage_program = crate::targets::ComputeRasterProgramKey::try_admit_program(
+        CombineParams::from_wire(0xfc30_9661, 0x552e_ff7f),
+        full_coverage_mode,
+        true,
+    )
+    .expect("full-coverage fixture program is exactly admitted")
+    .shader_id();
     let full_coverage_triangle = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(environment, primitive)
-        .with_program(1)];
+        .with_program(full_coverage_program)];
     let full_coverage_tile = crate::TileBindingParams::bound(tile.descriptor(), tile.size())
         .with_lut_mode(crate::TextureLutMode::Ia16);
     for run in 1..=10 {
@@ -2154,10 +2253,26 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
     let fog_triangles = [
         crate::ComputeCoverageTriangle::from_raw(triangle)
             .with_material(environment, primitive)
-            .with_program(2),
+            .with_program(
+                crate::targets::ComputeRasterProgramKey::try_admit_program(
+                    CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
+                    fog_mode,
+                    true,
+                )
+                .expect("fog fixture program is exactly admitted")
+                .shader_id(),
+            ),
         crate::ComputeCoverageTriangle::from_raw(triangle)
             .with_material(second_environment, second_primitive)
-            .with_program(2),
+            .with_program(
+                crate::targets::ComputeRasterProgramKey::try_admit_program(
+                    CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
+                    fog_mode,
+                    true,
+                )
+                .expect("fog fixture program is exactly admitted")
+                .shader_id(),
+            ),
     ];
     for run in 1..=10 {
         let actual = renderer
@@ -2217,7 +2332,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         .to_vec();
     let coverage_fog_triangles = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(coverage_fog_environment, coverage_fog_primitive)
-        .with_program(3)];
+        .with_program(crate::targets::ComputeRasterShaderProgram::coverage_fog_fixture())];
     let coverage_fog_tile_params =
         crate::TileBindingParams::bound(coverage_fog_tile.descriptor(), coverage_fog_tile.size())
             .with_lut_mode(crate::TextureLutMode::Rgba16);

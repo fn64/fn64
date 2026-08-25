@@ -245,6 +245,8 @@ enum FragmentProgramSelection {
     AdmitExact,
     #[cfg(test)]
     GenericOracle,
+    #[cfg(test)]
+    FogNoiseGenericTerminalOracle,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +510,33 @@ fn execute_raw_triangle_generic_oracle<'a, S: TmemByteSource + ?Sized>(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn execute_raw_triangle_fog_noise_generic_terminal_oracle<'a, S: TmemByteSource + ?Sized>(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
+    declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    execute_raw_triangle_selected(
+        candidate,
+        other_mode,
+        triangle,
+        shading,
+        blend_registers,
+        resident_bytes,
+        declared,
+        texture,
+        depth,
+        FragmentProgramSelection::FogNoiseGenericTerminalOracle,
+    )
+}
+
 /// The per-pixel loop, over exactly the declared rows.
 ///
 /// **Every pixel in a declared run is visited**, including the ones whose
@@ -635,6 +664,10 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             .unwrap_or_else(generic),
         #[cfg(test)]
         FragmentProgramSelection::GenericOracle => generic(),
+        #[cfg(test)]
+        FragmentProgramSelection::FogNoiseGenericTerminalOracle => fog_noise
+            .map(RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal)
+            .unwrap_or_else(generic),
     };
     let incremental_texture_planes = incremental_texture_planes_enabled();
 
@@ -721,6 +754,8 @@ enum RawTriangleFragmentProgram {
     Generic(Option<PreparedTwoCycleCombiner>),
     CoverageFogRgba16(CoverageFogRgba16Program),
     FogNoiseRgba16(FogNoiseRgba16Program),
+    #[cfg(test)]
+    FogNoiseRgba16GenericTerminal(FogNoiseRgba16Program),
 }
 
 #[derive(Clone, Copy)]
@@ -768,6 +803,33 @@ impl FogNoiseRgba16Program {
             && shaded
             && textured)
             .then_some(Self)
+    }
+
+    /// Closed terminal for this exact program. The admitted mode supplies a
+    /// full fragment, performs no coverage-to-alpha or alpha compare, stores
+    /// `CVG_DST_FULL`, and has disabled RGB dither. Its threshold-seven Noise
+    /// alpha dither is exactly RGBA5551 quantization/expansion. Both blender
+    /// cycles select `(Combined * CombinedAlpha) + (Framebuffer * (1-A))`;
+    /// cycle two's Combined is cycle one's unchanged source, so the terminal
+    /// is one source-over composite against the expanded resident RGB5.
+    fn write_rgba16(self, dest: &mut [u8], combined: [u8; 4]) {
+        let resident = u16::from_be_bytes([dest[0], dest[1]]);
+        let expand_five = |five: u16| -> u32 {
+            let five = u32::from(five);
+            (five << 3) | (five >> 2)
+        };
+        let alpha_five = combined[3] >> 3;
+        let alpha = u32::from((alpha_five << 3) | (alpha_five >> 2));
+        let blend = |source: u8, destination_five: u16| -> u16 {
+            let source = u32::from(source);
+            let destination = expand_five(destination_five);
+            ((source * alpha + destination * (255 - alpha) + 127) / 255) as u16
+        };
+        let red = blend(combined[0], (resident >> 11) & 0x1f);
+        let green = blend(combined[1], (resident >> 6) & 0x1f);
+        let blue = blend(combined[2], (resident >> 1) & 0x1f);
+        let packed = ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | 1;
+        dest.copy_from_slice(&packed.to_be_bytes());
     }
 }
 
@@ -1180,6 +1242,12 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                     );
                 }
                 RawTriangleFragmentProgram::FogNoiseRgba16(_) => {
+                    let combined = combine_fog_lerp(inputs, texel);
+                    FogNoiseRgba16Program
+                        .write_rgba16(&mut bytes[offset..offset + bytes_per_pixel], combined);
+                }
+                #[cfg(test)]
+                RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
                     let combined = combine_fog_lerp(inputs, texel);
                     blend_and_write_pixel(
                         format,
