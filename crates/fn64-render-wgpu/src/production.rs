@@ -46,13 +46,13 @@ use fn64_render::{
 };
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CapturedGuestRead, CompletedWrite,
-    DecodedTicket, DeferredBackendEffectReport, ResourceAccess, ResourceJournal,
-    ResourceJournalLimits, SubmittedTicket, TicketAuthoritySet, ValidationError, WorkloadAdmission,
-    WorkloadPacket,
+    DecodedTicket, DeferredBackendEffectReport, FastContentDigest, PhysicalRange, ResourceAccess,
+    ResourceJournal, ResourceJournalLimits, SubmittedTicket, TicketAuthoritySet, ValidationError,
+    WorkloadAdmission, WorkloadPacket,
 };
 use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::sync::OnceLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::raw_dpc::push_decoded_raw_dpc;
@@ -258,12 +258,24 @@ mod task_compute_census {
     thread_local! {
         static CPU_REASONS: RefCell<BTreeMap<super::TaskComputeCpuReason, (u64, u64)>> =
             RefCell::new(BTreeMap::new());
+        static TASK_CPU_REASONS: RefCell<BTreeMap<super::TaskComputeCpuReason, (u64, u64)>> =
+            RefCell::new(BTreeMap::new());
+        static TASK_COMPUTE: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
     }
 
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var_os("FN64_TASK_COMPUTE_CENSUS")
+                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+                || tail_enabled()
+        })
+    }
+
+    fn tail_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FN64_TASK_COMPUTE_TAIL_CENSUS")
                 .is_some_and(|value| value.to_string_lossy().trim() == "1")
         })
     }
@@ -316,6 +328,15 @@ mod task_compute_census {
             .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         COMPUTE_NS.fetch_add(elapsed, Relaxed);
+        if tail_enabled() {
+            TASK_COMPUTE.with(|task| {
+                let mut task = task.borrow_mut();
+                task.0 = task
+                    .0
+                    .saturating_add(u64::try_from(members).unwrap_or(u64::MAX));
+                task.1 = task.1.saturating_add(elapsed);
+            });
+        }
     }
 
     pub(super) fn record_cpu(
@@ -332,6 +353,12 @@ mod task_compute_census {
             let mut reasons = reasons.borrow_mut();
             accumulate_reason(&mut reasons, reason, elapsed);
         });
+        if tail_enabled() {
+            TASK_CPU_REASONS.with(|reasons| {
+                let mut reasons = reasons.borrow_mut();
+                accumulate_reason(&mut reasons, reason, elapsed);
+            });
+        }
     }
 
     fn accumulate_reason(
@@ -347,11 +374,23 @@ mod task_compute_census {
     fn reason_name(reason: super::TaskComputeCpuReason) -> String {
         match reason {
             super::TaskComputeCpuReason::ExactAdmissionRejected(
-                super::TaskComputeAdmissionRefusal::ProgramBits([lo, hi, omh, oml]),
-            ) => format!("program_bits:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}"),
+                super::TaskComputeAdmissionRefusal::ProgramBits(words),
+            )
+            | super::TaskComputeCpuReason::Planned(super::PlannedTaskCpuReason::DefinitelyCpu(
+                super::TaskComputeAdmissionRefusal::ProgramBits(words),
+            )) => {
+                let [lo, hi, omh, oml] = words;
+                format!("program_bits:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}")
+            }
             super::TaskComputeCpuReason::ExactAdmissionRejected(
-                super::TaskComputeAdmissionRefusal::CycleType([lo, hi, omh, oml]),
-            ) => format!("cycle_type:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}"),
+                super::TaskComputeAdmissionRefusal::CycleType(words),
+            )
+            | super::TaskComputeCpuReason::Planned(super::PlannedTaskCpuReason::DefinitelyCpu(
+                super::TaskComputeAdmissionRefusal::CycleType(words),
+            )) => {
+                let [lo, hi, omh, oml] = words;
+                format!("cycle_type:{lo:08x}/{hi:08x}/{omh:08x}/{oml:08x}")
+            }
             _ => format!("{reason:?}"),
         }
     }
@@ -363,6 +402,30 @@ mod task_compute_census {
         MEMBERS.fetch_add(u64::try_from(members).unwrap_or(u64::MAX), Relaxed);
         CPU_MEMBERS.fetch_add(u64::try_from(cpu_members).unwrap_or(u64::MAX), Relaxed);
         let tasks = TASKS.fetch_add(1, Relaxed) + 1;
+        if tail_enabled() {
+            let (compute_members, compute_ns) = TASK_COMPUTE.with(|task| {
+                let mut task = task.borrow_mut();
+                core::mem::take(&mut *task)
+            });
+            let reasons =
+                TASK_CPU_REASONS.with(|reasons| core::mem::take(&mut *reasons.borrow_mut()));
+            let reason_fields = reasons
+                .iter()
+                .map(|(reason, (members, elapsed_ns))| {
+                    format!(
+                        "{}={members}:{:.3}",
+                        reason_name(*reason),
+                        *elapsed_ns as f64 / 1_000_000.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            eprintln!(
+                "[task-compute-tail] task={tasks} members={members} cpu_members={cpu_members} \
+                 compute_members={compute_members} compute_ms={:.3} cpu={reason_fields}",
+                compute_ns as f64 / 1_000_000.0,
+            );
+        }
         if tasks % 30 == 0 {
             let compute_members = COMPUTE_MEMBERS.load(Relaxed);
             let compute_ns = COMPUTE_NS.load(Relaxed);
@@ -430,6 +493,14 @@ mod task_compute_census {
             assert_eq!(
                 reason_name(super::super::TaskComputeCpuReason::ExactAdmissionRejected(
                     super::super::TaskComputeAdmissionRefusal::CycleType([1, 2, 3, 4]),
+                )),
+                "cycle_type:00000001/00000002/00000003/00000004"
+            );
+            assert_eq!(
+                reason_name(super::super::TaskComputeCpuReason::Planned(
+                    super::super::PlannedTaskCpuReason::DefinitelyCpu(
+                        super::super::TaskComputeAdmissionRefusal::CycleType([1, 2, 3, 4]),
+                    ),
                 )),
                 "cycle_type:00000001/00000002/00000003/00000004"
             );
@@ -576,6 +647,7 @@ impl Default for RawDpcCarryIn {
 enum PlannedTaskCpuReason {
     NoRawTriangle,
     MixedFillOrTexrect,
+    DefinitelyCpu(TaskComputeAdmissionRefusal),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -936,7 +1008,8 @@ impl ComputeRasterProbeBuilder {
         self.shared_tile = Some(tile);
         self.triangles.push(
             ComputeCoverageTriangle::from_raw(triangle)
-                .with_material(draw.env_color, draw.prim_color),
+                .with_material(draw.env_color, draw.prim_color)
+                .with_program(program.shader_id()),
         );
         Ok(ComputeRasterProbePush::Admitted)
     }
@@ -1050,6 +1123,8 @@ fn validate_compute_probe_output(
         .expect("a sealed compute batch contains at least one draw");
     Err(WgpuRawDpcExecutionError::ComputeRasterProbeMismatch {
         ordinal: first_probe.ordinal,
+        first_program: first_draw.program().words(),
+        last_program: last_draw.program().words(),
         first_command_index: first_draw.command_index(),
         last_command_index: last_draw.command_index(),
         first_triangle_index: first_draw.triangle_index(),
@@ -1254,10 +1329,14 @@ impl WgpuBackend {
             )
             .map_err(WgpuRawDpcExecutionError::TriangleDraw)
             .map_err(RenderError::from)?;
-        for (&limit, actual) in retained.checkpoint_limits.iter().zip(outputs) {
+        let mut outputs = ExactCheckpointImages::try_new(outputs, retained.checkpoint_limits.len())
+            .map_err(RenderError::from)?;
+        for &limit in &retained.checkpoint_limits {
+            let actual = outputs.take_next();
             let last = &retained.probes[limit - 1];
             validate_compute_probe_output(first, last, &actual).map_err(RenderError::from)?;
         }
+        outputs.finish();
         let elapsed = started.elapsed();
         let draw_count = retained.probes.iter().try_fold(0u32, |count, probe| {
             count.checked_add(u32::try_from(probe.batch.draws().len()).ok()?)
@@ -2433,13 +2512,87 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
 /// `&WorkloadPacket` (which `BackendEffectReport::try_new` requires) is
 /// still in scope. `outcome` carries the result out; `execute_raw_dpc_inner`
 /// takes it after `execution_view` returns.
+struct CapturedGuestReadBytes(Arc<[u8]>);
+
+impl CapturedGuestReadBytes {
+    fn copied(bytes: &[u8]) -> Self {
+        Self(Arc::from(bytes))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// One packet's journal binding to immutable captured bytes. This remains a
+/// distinct value even when the task pool shares its payload allocation with
+/// another packet's binding.
+struct CapturedGuestReadBinding {
+    access_index: u32,
+    bytes: CapturedGuestReadBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TaskGuestReadPayloadKey {
+    range: PhysicalRange,
+    content: FastContentDigest,
+}
+
+/// Task-local ownership of immutable guest-read payloads.
+///
+/// Each packet keeps its own access-index binding in `ExecutionCollector`;
+/// only byte storage for an identical physical range and content identity is
+/// shared. The byte comparison is load-bearing: the fast digest selects a
+/// small candidate bucket but can never authorize reuse by itself.
+#[derive(Default)]
+struct TaskGuestReadCapturePool {
+    payloads: HashMap<TaskGuestReadPayloadKey, Vec<Arc<[u8]>>>,
+}
+
+impl TaskGuestReadCapturePool {
+    fn intern(&mut self, captured: &CapturedGuestRead) -> CapturedGuestReadBytes {
+        self.intern_parts(
+            captured.read().range(),
+            captured.fast_content(),
+            captured.bytes(),
+        )
+    }
+
+    fn intern_parts(
+        &mut self,
+        range: PhysicalRange,
+        content: FastContentDigest,
+        bytes: &[u8],
+    ) -> CapturedGuestReadBytes {
+        let candidates = self
+            .payloads
+            .entry(TaskGuestReadPayloadKey { range, content })
+            .or_default();
+        if let Some(existing) = candidates
+            .iter()
+            .find(|existing| existing.as_ref() == bytes)
+        {
+            return CapturedGuestReadBytes(Arc::clone(existing));
+        }
+        let owned: Arc<[u8]> = Arc::from(bytes);
+        candidates.push(Arc::clone(&owned));
+        CapturedGuestReadBytes(owned)
+    }
+}
+
 struct ExecutionCollector<'coord> {
     physical: &'coord PhysicalTmemState,
     queue: fn64_render_ir::QueueIdentity,
     ordinal: u64,
     submission: fn64_render_ir::SubmissionIdentity,
     plan: PlanCollector,
-    reads: Vec<(u32, Vec<u8>)>,
+    reads: Vec<CapturedGuestReadBinding>,
+    task_guest_read_pool: Option<&'coord mut TaskGuestReadCapturePool>,
     outcome: Option<Result<StagedOutcome, WgpuRawDpcExecutionError>>,
     /// The lazily-built color-target registry, borrowed for the duration of
     /// this execution so `stage_and_report` can `begin_candidate` against it
@@ -2607,10 +2760,18 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
     }
 
     fn captured_reads(&mut self, reads: &[CapturedGuestRead]) {
-        self.reads = reads
-            .iter()
-            .map(|captured| (captured.read().access_index(), captured.bytes().to_vec()))
-            .collect();
+        self.reads.clear();
+        self.reads.reserve(reads.len());
+        for captured in reads {
+            let bytes = match self.task_guest_read_pool.as_deref_mut() {
+                Some(pool) => pool.intern(captured),
+                None => CapturedGuestReadBytes::copied(captured.bytes()),
+            };
+            self.reads.push(CapturedGuestReadBinding {
+                access_index: captured.read().access_index(),
+                bytes,
+            });
+        }
     }
 
     fn submitted_packet(&mut self, packet: &WorkloadPacket) {
@@ -2657,6 +2818,8 @@ pub enum WgpuRawDpcExecutionError {
     /// from the existing CPU executor's complete target.
     ComputeRasterProbeMismatch {
         ordinal: u64,
+        first_program: [u32; 4],
+        last_program: [u32; 4],
         first_command_index: u32,
         last_command_index: u32,
         first_triangle_index: usize,
@@ -2669,6 +2832,13 @@ pub enum WgpuRawDpcExecutionError {
     /// The explicitly-enabled game-derived probe returned a target of the
     /// wrong length, so no byte-for-byte comparison is possible.
     ComputeRasterProbeLength {
+        expected: usize,
+        actual: usize,
+    },
+    /// The compute chain returned a different number of packet images than
+    /// the ordered checkpoint request. Pairing with `Iterator::zip` would
+    /// silently discard the unmatched authority on either side.
+    ComputeRasterCheckpointCount {
         expected: usize,
         actual: usize,
     },
@@ -2929,6 +3099,8 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             Self::TriangleDraw(error) => write!(formatter, "triangle draw failed: {error}"),
             Self::ComputeRasterProbeMismatch {
                 ordinal,
+                first_program,
+                last_program,
                 first_command_index,
                 last_command_index,
                 first_triangle_index,
@@ -2940,13 +3112,18 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
             } => write!(
                 formatter,
                 "compute-raster probe disagreed with the CPU target in packet ordinal {ordinal}, \
-                 command range #{first_command_index}..=#{last_command_index}, triangle range \
+                 program range {first_program:08x?}..={last_program:08x?}, command range \
+                 #{first_command_index}..=#{last_command_index}, triangle range \
                  #{first_triangle_index}..=#{last_triangle_index}, pixel ({x}, {y}): expected RGBA16 \
                  {expected:#06x}, got {actual:#06x}"
             ),
             Self::ComputeRasterProbeLength { expected, actual } => write!(
                 formatter,
                 "compute-raster probe returned {actual} target bytes; CPU produced {expected}"
+            ),
+            Self::ComputeRasterCheckpointCount { expected, actual } => write!(
+                formatter,
+                "compute-raster chain returned {actual} checkpoint images; requested {expected}"
             ),
             Self::ComputeRasterProbeChainIncompatible { ordinal, batch } => write!(
                 formatter,
@@ -3173,7 +3350,7 @@ fn destination_access_run(accesses: &[ResourceAccess], start: usize) -> &[Resour
 /// that happened to arrive. A partial-width `LoadTile` declares one source
 /// read per row, so a 49-row load must find all 49.
 fn load_source_bytes<'a>(
-    reads: &'a [(u32, Vec<u8>)],
+    reads: &'a [CapturedGuestReadBinding],
     load: &TmemLoadSemantics,
 ) -> Option<Vec<&'a [u8]>> {
     let first = load.source_access_index();
@@ -3184,8 +3361,8 @@ fn load_source_bytes<'a>(
             let access_index = first.checked_add(u32::try_from(ordinal).ok()?)?;
             reads
                 .iter()
-                .find(|(captured_index, _)| *captured_index == access_index)
-                .map(|(_, bytes)| bytes.as_slice())
+                .find(|captured| captured.access_index == access_index)
+                .map(|captured| captured.bytes.as_slice())
         })
         .collect()
 }
@@ -3546,6 +3723,7 @@ impl RenderBackend for WgpuBackend {
                 self.compute_raster_probe_enabled,
                 self.compute_raster_replace_enabled,
                 replacement_pipeline,
+                None,
             )
             .map_err(RenderError::from)?;
 
@@ -3754,6 +3932,7 @@ impl RenderBackend for WgpuBackend {
         let mut pending_publications = VecDeque::new();
         let mut deferred_draws = Vec::with_capacity(bounds.len());
         let mut prepared = Vec::with_capacity(bounds.len());
+        let mut guest_read_pool = TaskGuestReadCapturePool::default();
         let mut compute_members = 0usize;
         let mut cpu_members = 0usize;
         {
@@ -3801,6 +3980,7 @@ impl RenderBackend for WgpuBackend {
                             self.configured_target_extent,
                             self.project_gpu_tmem,
                             &mut color_batch,
+                            &mut guest_read_pool,
                         )
                         .map_err(RenderError::from)?;
                         let staged = match disposition {
@@ -3856,22 +4036,30 @@ impl RenderBackend for WgpuBackend {
                             .map_err(WgpuRawDpcExecutionError::Target)
                             .map_err(RenderError::from)?;
                     }
-                    let shadow_byte_count = completed_segment
-                        .last()
-                        .expect("a completed compute segment is nonempty")
-                        .pending
-                        .initialized
-                        .device_bytes()
-                        .device_bytes()
-                        .len();
-                    task_compute_census::timed_shadow_clone(shadow_byte_count, || {
-                        private_color_targets
-                            .as_mut()
-                            .expect("a staged color completion built the private registry")
-                            .commit_task_shadow_segment(shadow_segment)
-                    })
-                    .map_err(WgpuRawDpcExecutionError::Target)
-                    .map_err(RenderError::from)?;
+                    // `shadow_segment` has already validated every generation
+                    // edge. Its full tail bytes are copied into the private
+                    // registry only when another task member can consume
+                    // them. A terminal segment's pending publications own all
+                    // checkpoint images through `ExactCheckpointImages`; the
+                    // private shadow has no remaining reader.
+                    if retry_as_cpu.is_some() || members.peek().is_some() {
+                        let shadow_byte_count = completed_segment
+                            .last()
+                            .expect("a completed compute segment is nonempty")
+                            .pending
+                            .initialized
+                            .device_bytes()
+                            .device_bytes()
+                            .len();
+                        task_compute_census::timed_shadow_clone(shadow_byte_count, || {
+                            private_color_targets
+                                .as_mut()
+                                .expect("a staged color completion built the private registry")
+                                .commit_task_shadow_segment(shadow_segment)
+                        })
+                        .map_err(WgpuRawDpcExecutionError::Target)
+                        .map_err(RenderError::from)?;
+                    }
                     for completed in completed_segment {
                         pending_publications.push_back(completed.pending);
                         deferred_draws.push((completed.triangles, completed.draw_tmem));
@@ -3899,22 +4087,25 @@ impl RenderBackend for WgpuBackend {
                         false,
                         false,
                         None,
+                        Some(&mut guest_read_pool),
                     )
                     .map_err(RenderError::from)?;
                     task_compute_census::record_cpu(reason, cpu_started);
                     if let Some(pending) = pending {
-                        let shadow_byte_count =
-                            pending.initialized.device_bytes().device_bytes().len();
-                        task_compute_census::timed_shadow_clone(shadow_byte_count, || {
-                            private_color_targets
-                                .as_mut()
-                                .expect("a staged color completion built the private registry")
-                                .commit_task_shadow_segment(CompletedTaskColorSegment::new(
-                                    &pending.initialized,
-                                ))
-                        })
-                        .map_err(WgpuRawDpcExecutionError::Target)
-                        .map_err(RenderError::from)?;
+                        if members.peek().is_some() {
+                            let shadow_byte_count =
+                                pending.initialized.device_bytes().device_bytes().len();
+                            task_compute_census::timed_shadow_clone(shadow_byte_count, || {
+                                private_color_targets
+                                    .as_mut()
+                                    .expect("a staged color completion built the private registry")
+                                    .commit_task_shadow_segment(CompletedTaskColorSegment::new(
+                                        &pending.initialized,
+                                    ))
+                            })
+                            .map_err(WgpuRawDpcExecutionError::Target)
+                            .map_err(RenderError::from)?;
+                        }
                         pending_publications.push_back(pending);
                     }
                     deferred_draws.push((triangles, draw_tmem));
@@ -4204,24 +4395,7 @@ fn plan_raw_dpc_inner(
     })
     .map_err(|error| format!("raw-DPC plan decode failed: {error}"))?;
     let delta = decoded.state_delta().clone();
-    let has_raw_triangle = decoded
-        .commands()
-        .iter()
-        .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)));
-    let has_mixed_color_command = decoded.commands().iter().any(|command| {
-        matches!(
-            command.kind(),
-            crate::RawDpcCommandKind::FillRectangle(_)
-                | crate::RawDpcCommandKind::TextureRectangle(_)
-        )
-    });
-    let execution = if has_raw_triangle && !has_mixed_color_command {
-        PlannedTaskExecution::ComputeCandidate
-    } else if has_raw_triangle {
-        PlannedTaskExecution::Cpu(PlannedTaskCpuReason::MixedFillOrTexrect)
-    } else {
-        PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle)
-    };
+    let execution = classify_task_execution(decoded.commands(), durable_state);
 
     let planned = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::AdmitAndSeal, || {
         let mut writer = coordinator.begin_plan(request);
@@ -4238,6 +4412,54 @@ fn plan_raw_dpc_inner(
             .map_err(|error| format!("raw-DPC plan seal failed: {error}"))
     })?;
     Ok((planned, delta, execution))
+}
+
+fn classify_task_execution(
+    commands: &[crate::DecodedRawDpcCommand],
+    durable_state: &RdpState,
+) -> PlannedTaskExecution {
+    let has_raw_triangle = commands
+        .iter()
+        .any(|command| matches!(command.kind(), crate::RawDpcCommandKind::RawTriangle(_)));
+    if !has_raw_triangle {
+        return PlannedTaskExecution::Cpu(PlannedTaskCpuReason::NoRawTriangle);
+    }
+    if commands.iter().any(|command| {
+        matches!(
+            command.kind(),
+            crate::RawDpcCommandKind::FillRectangle(_)
+                | crate::RawDpcCommandKind::TextureRectangle(_)
+        )
+    }) {
+        return PlannedTaskExecution::Cpu(PlannedTaskCpuReason::MixedFillOrTexrect);
+    }
+
+    let mut other_mode = durable_state.other_mode();
+    let mut combine = durable_state.combine();
+    for command in commands {
+        match command.kind() {
+            crate::RawDpcCommandKind::SetOtherMode(value) => other_mode = Some(value),
+            crate::RawDpcCommandKind::SetCombine(value) => combine = Some(value),
+            crate::RawDpcCommandKind::RawTriangle(triangle) => {
+                let (Some(combine), Some(other_mode)) = (combine, other_mode) else {
+                    // Missing state remains a runtime admission concern so its
+                    // existing loud typed refusal is not converted to CPU.
+                    continue;
+                };
+                if let Err(reason) = ComputeRasterProgramKey::try_admit_program(
+                    combine,
+                    other_mode,
+                    triangle.flags().textured(),
+                ) {
+                    return PlannedTaskExecution::Cpu(PlannedTaskCpuReason::DefinitelyCpu(
+                        reason.into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    PlannedTaskExecution::ComputeCandidate
 }
 
 fn submit_locally(decoded: DecodedTicket) -> Result<SubmittedTicket, ValidationError> {
@@ -4568,6 +4790,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
     color_execution_batch: Option<&mut ColorTargetExecutionBatch>,
     defer_compute_replacement: bool,
+    task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
 ) -> Result<StagedRawDpcMember, StagedRawDpcFailure> {
     let mut plan_visitor = PlanCollector::seeded(carry_in);
     let mut view = ExecutionCollector {
@@ -4577,6 +4800,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         submission: bound.submission(),
         plan: PlanCollector::seeded(carry_in),
         reads: Vec::new(),
+        task_guest_read_pool,
         outcome: None,
         color_targets,
         configured_target_extent,
@@ -4622,6 +4846,7 @@ fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
     configured_target_extent: Option<TriangleTargetExtent>,
     project_gpu_tmem: bool,
     color_execution_batch: &mut ColorTargetExecutionBatch,
+    task_guest_read_pool: &mut TaskGuestReadCapturePool,
 ) -> Result<TaskComputeDisposition, WgpuRawDpcExecutionError> {
     match stage_raw_dpc_member(
         coordinator,
@@ -4636,6 +4861,7 @@ fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
         None,
         Some(color_execution_batch),
         true,
+        Some(task_guest_read_pool),
     ) {
         Ok(staged)
             if matches!(
@@ -4786,6 +5012,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
     collect_compute_probe: bool,
     compute_replacement_enabled: bool,
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
+    task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -4810,6 +5037,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
         compute_replacement_pipeline,
         None,
         false,
+        task_guest_read_pool,
     )
     .map_err(|failure| failure.error)?;
     complete_staged_raw_dpc_member(coordinator, staged)
@@ -4820,6 +5048,43 @@ struct CompletedDeferredSegmentMember {
     pending: PendingFillPublication,
     triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
     draw_tmem: Option<Vec<TmemGpuProjection>>,
+}
+
+/// Move-only redemption of exactly one device image per requested packet
+/// checkpoint. Construction closes cardinality before any candidate or guest
+/// effect is mutated; callers can then consume images in order without a
+/// truncating `zip` side channel.
+#[must_use]
+struct ExactCheckpointImages {
+    images: std::vec::IntoIter<Vec<u8>>,
+}
+
+impl ExactCheckpointImages {
+    fn try_new(images: Vec<Vec<u8>>, expected: usize) -> Result<Self, WgpuRawDpcExecutionError> {
+        if images.len() != expected {
+            return Err(WgpuRawDpcExecutionError::ComputeRasterCheckpointCount {
+                expected,
+                actual: images.len(),
+            });
+        }
+        Ok(Self {
+            images: images.into_iter(),
+        })
+    }
+
+    fn take_next(&mut self) -> Vec<u8> {
+        self.images
+            .next()
+            .expect("validated checkpoint cardinality has an image for every redemption")
+    }
+
+    fn finish(self) {
+        assert_eq!(
+            self.images.len(),
+            0,
+            "validated checkpoint cardinality is redeemed exactly once"
+        );
+    }
 }
 
 fn merge_deferred_packet_writes(
@@ -4953,9 +5218,11 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
             &checkpoint_limits,
         )
         .map_err(WgpuRawDpcExecutionError::TriangleDraw)?;
+    let mut outputs = ExactCheckpointImages::try_new(outputs, staged_members.len())?;
 
     let mut completed_members = Vec::with_capacity(staged_members.len());
-    for (mut member, output) in staged_members.into_iter().zip(outputs) {
+    for mut member in staged_members {
+        let output = outputs.take_next();
         let submission = member.bound.submission();
         let outcome = core::mem::replace(&mut member.outcome, StagedOutcome::NoPhysicalSuccessor);
         let (deferred_effects, deferred_tmem, color) = match outcome {
@@ -5031,6 +5298,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
             draw_tmem: None,
         });
     }
+    outputs.finish();
     Ok(completed_members)
 }
 
@@ -6934,12 +7202,12 @@ fn execute_scheduled_fill(
             let captured = collector
                 .reads
                 .iter()
-                .find(|(index, _)| *index == *access_index)
-                .map(|(_, bytes)| bytes)
+                .find(|captured| captured.access_index == *access_index)
+                .map(|captured| &captured.bytes)
                 .ok_or(WgpuRawDpcExecutionError::MissingFillSeedBytes {
                     access_index: *access_index,
                 })?;
-            Some(logical_bytes_from_captured_rdram(captured))
+            Some(logical_bytes_from_captured_rdram(captured.as_slice()))
         }
         (None, None) => None,
     };
@@ -7751,6 +8019,28 @@ fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_guest_read_pool_shares_only_identical_range_and_bytes() {
+        let range = fn64_render_ir::PhysicalRange::try_new(0x1000, 0x1004).unwrap();
+        let other_range = fn64_render_ir::PhysicalRange::try_new(0x2000, 0x2004).unwrap();
+        let bytes = [1, 2, 3, 4];
+        let content = fn64_render_ir::FastContentDigest::hash(b"task-read-test", &[&bytes]);
+        let mut pool = super::TaskGuestReadCapturePool::default();
+
+        let first = pool.intern_parts(range, content, &bytes);
+        let duplicate = pool.intern_parts(range, content, &bytes);
+        assert!(first.shares_allocation_with(&duplicate));
+
+        // The fast digest is a bucket selector, not reuse authority. This
+        // deliberately supplies the same digest for different bytes to pin
+        // the collision check that guards correctness.
+        let collision = pool.intern_parts(range, content, &[4, 3, 2, 1]);
+        assert!(!first.shares_allocation_with(&collision));
+
+        let other_address = pool.intern_parts(other_range, content, &bytes);
+        assert!(!first.shares_allocation_with(&other_address));
+    }
+
     #[test]
     fn owned_color_command_input_transfers_the_same_allocation() {
         let mut accumulated = Some(vec![1, 2, 3, 4]);
@@ -12009,6 +12299,25 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_images_close_cardinality_before_ordered_redemption() {
+        for (images, expected, actual) in [(vec![vec![1]], 2, 1), (vec![vec![1], vec![2]], 1, 2)] {
+            match ExactCheckpointImages::try_new(images, expected) {
+                Err(WgpuRawDpcExecutionError::ComputeRasterCheckpointCount {
+                    expected: rejected_expected,
+                    actual: rejected_actual,
+                }) => assert_eq!((rejected_expected, rejected_actual), (expected, actual)),
+                Err(other) => panic!("unexpected checkpoint cardinality error: {other}"),
+                Ok(_) => panic!("mismatched checkpoint cardinality was accepted"),
+            }
+        }
+
+        let mut exact = ExactCheckpointImages::try_new(vec![vec![1], vec![2]], 2).unwrap();
+        assert_eq!(exact.take_next(), vec![1]);
+        assert_eq!(exact.take_next(), vec![2]);
+        exact.finish();
+    }
+
+    #[test]
     fn task_planning_reason_codes_non_triangle_and_mixed_color_cpu_members() {
         let (mut backend, session) = WgpuBackend::try_new().unwrap();
         let planned = backend
@@ -12030,6 +12339,71 @@ mod tests {
     }
 
     #[test]
+    fn task_planning_routes_two_coverage_fog_refusals_and_one_admitted_program_exactly() {
+        const COVERAGE_FOG_COMBINE_LOW: u32 = 0xfc15_fea3;
+        const COVERAGE_FOG_COMBINE_HIGH: u32 = 0xf00f_f23f;
+        const COVERAGE_FOG_OTHER_MODE_LOW: u32 = 0x0f0a_7008;
+        const HOT_COMBINE_LOW: u32 = 0xfc51_96a3;
+        const HOT_COMBINE_HIGH: u32 = 0x112c_fe7f;
+        const HOT_OTHER_MODE_HIGH: u32 = 0x0008_acef;
+        const HOT_OTHER_MODE_LOW: u32 = 0x0050_41c8;
+
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let planned = backend
+            .plan_raw_dpc_task_batch(vec![
+                session.plan_request(capture(textured_triangle_packet_words(
+                    COVERAGE_FOG_COMBINE_LOW,
+                    COVERAGE_FOG_COMBINE_HIGH,
+                    0x0018_ac8f,
+                    COVERAGE_FOG_OTHER_MODE_LOW,
+                ))),
+                session.plan_request(capture(textured_triangle_packet_words(
+                    COVERAGE_FOG_COMBINE_LOW,
+                    COVERAGE_FOG_COMBINE_HIGH,
+                    0x0018_acff,
+                    COVERAGE_FOG_OTHER_MODE_LOW,
+                ))),
+                session.plan_request(capture(textured_triangle_packet_words(
+                    HOT_COMBINE_LOW,
+                    HOT_COMBINE_HIGH,
+                    HOT_OTHER_MODE_HIGH,
+                    HOT_OTHER_MODE_LOW,
+                ))),
+            ])
+            .unwrap();
+        assert_eq!(planned.len(), 3);
+        let pending = backend.pending_raw_dpc_task_batch.as_ref().unwrap();
+        let executions = pending
+            .members
+            .iter()
+            .map(|member| member.execution)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            executions,
+            vec![
+                PlannedTaskExecution::Cpu(PlannedTaskCpuReason::DefinitelyCpu(
+                    TaskComputeAdmissionRefusal::CycleType([
+                        COVERAGE_FOG_COMBINE_LOW,
+                        COVERAGE_FOG_COMBINE_HIGH,
+                        0x0018_ac8f,
+                        COVERAGE_FOG_OTHER_MODE_LOW,
+                    ]),
+                )),
+                PlannedTaskExecution::Cpu(PlannedTaskCpuReason::DefinitelyCpu(
+                    TaskComputeAdmissionRefusal::CycleType([
+                        COVERAGE_FOG_COMBINE_LOW,
+                        COVERAGE_FOG_COMBINE_HIGH,
+                        0x0018_acff,
+                        COVERAGE_FOG_OTHER_MODE_LOW,
+                    ]),
+                )),
+                PlannedTaskExecution::ComputeCandidate,
+            ],
+        );
+    }
+
+    #[test]
     fn task_compute_routes_an_exactly_unadmitted_raw_triangle_through_cpu() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         configure_fill_target_height(&mut backend);
@@ -12047,15 +12421,37 @@ mod tests {
                 session.plan_request(capture(flat_triangle_packet_words()))
             ])
             .unwrap();
+        assert_eq!(
+            backend.pending_raw_dpc_task_batch.as_ref().unwrap().members[0].execution,
+            PlannedTaskExecution::Cpu(PlannedTaskCpuReason::DefinitelyCpu(
+                TaskComputeAdmissionRefusal::Untextured,
+            )),
+        );
         let bound =
             finalize_and_submit_pair(&mut session, planned.into_iter().next().unwrap()).unwrap();
         let submission = bound.submission();
-        let prepared = backend.execute_raw_dpc_task_batch(vec![bound]).unwrap();
+        let mut prepared = backend.execute_raw_dpc_task_batch(vec![bound]).unwrap();
         assert_eq!(prepared.len(), 1);
+        let writes = backend.staged_guest_render_target_writes(submission);
         assert_eq!(
-            backend.staged_guest_render_target_writes(submission).len(),
+            writes.len(),
             3,
             "the explicit CPU disposition must retain all three declared triangle rows"
+        );
+        let committed = session
+            .commit_guest_render_target_writes(prepared.pop().unwrap(), writes)
+            .unwrap();
+        let mut fabric = admitted_fabric();
+        let token = fabric.pending_dpc_submission().unwrap().token;
+        let ready = fabric.prepare_dpc_commit(token).unwrap();
+        let capsule = session.seal_publication(committed, ready).unwrap();
+        backend.publish_raw_dpc(capsule);
+        assert_eq!(
+            backend.color_targets().unwrap().residents()[0]
+                .generation()
+                .get(),
+            2,
+            "a terminal member's pending image must publish without a private shadow copy"
         );
     }
 
@@ -12993,6 +13389,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .expect("the fill half must stage a real token");
@@ -14405,6 +14802,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
             ordinal: bound.ordinal(),
@@ -14727,6 +15125,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
             ordinal: bound.ordinal(),
@@ -14879,20 +15278,21 @@ mod tests {
     /// program key; the shaded+textured wire triangle and published fixture
     /// TMEM force this test through the same typed texture dependency path as
     /// the live WM2000 packets without embedding any game bytes.
-    #[cfg(feature = "host-gpu-tests")]
-    fn hot_textured_triangle_packet_words() -> Vec<u32> {
+    fn textured_triangle_packet_words(
+        combine_low: u32,
+        combine_high: u32,
+        other_mode_high: u32,
+        other_mode_low: u32,
+    ) -> Vec<u32> {
         use crate::rdp_harness::Tri;
-        use crate::targets::{
-            HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
-        };
 
         let mut words = Vec::new();
         words.extend(crate::wire_words::set_other_mode_bits(
             0,
-            HOT_OTHER_MODE_HIGH,
-            HOT_OTHER_MODE_LOW,
+            other_mode_high,
+            other_mode_low,
         ));
-        words.extend(set_combine(HOT_COMBINE_LOW, HOT_COMBINE_HIGH));
+        words.extend(set_combine(combine_low, combine_high));
         words.extend(set_tile(
             0,
             FIXTURE_LINE_WORDS as u32,
@@ -14923,6 +15323,20 @@ mod tests {
                 .words(),
         );
         words
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    fn hot_textured_triangle_packet_words() -> Vec<u32> {
+        use crate::targets::{
+            HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
+        };
+
+        textured_triangle_packet_words(
+            HOT_COMBINE_LOW,
+            HOT_COMBINE_HIGH,
+            HOT_OTHER_MODE_HIGH,
+            HOT_OTHER_MODE_LOW,
+        )
     }
 
     /// **A flat raw triangle's real bytes reach guest RDRAM.**
@@ -15826,6 +16240,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .expect("the sprite strip must execute");
 
@@ -15905,6 +16320,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .expect("the CPU-raster sprite strip must execute");
@@ -16009,6 +16425,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             color_targets: &mut color_targets,
             configured_target_extent,
@@ -16202,6 +16619,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .expect("a texrect before the packet's own load reads durable TMEM and executes");
@@ -16672,6 +17090,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
             ordinal: bound.ordinal(),
@@ -16729,6 +17148,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
             ordinal: bound.ordinal(),
@@ -18765,6 +19185,7 @@ mod tests {
                 [(None, None); 8],
             ),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
             ordinal: bound.ordinal(),
@@ -19110,6 +19531,7 @@ mod tests {
             submission: bound.submission(),
             plan: PlanCollector::seeded(seed),
             reads: Vec::new(),
+            task_guest_read_pool: None,
             outcome: None,
             color_targets: &mut color_targets,
             configured_target_extent,
@@ -19338,6 +19760,7 @@ mod tests {
             true,
             false,
             false,
+            None,
             None,
         )
         .expect("the triangle-then-SetOtherMode submission executes cleanly");
