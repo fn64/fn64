@@ -1425,7 +1425,26 @@ mod renderer_copyback_census {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskBatchPhaseRunningTotals {
+    pub tasks: u64,
+    pub members: u64,
+    pub total_ns: u64,
+    pub setup_ns: u64,
+    pub plan_bind_ns: u64,
+    pub guest_reads_ns: u64,
+    pub staged_writes_ns: u64,
+    pub copyback_ns: u64,
+    pub publication_ns: u64,
+}
+
+/// Existing task-batch clocks, exposed without adding a read or timing site.
+pub fn task_batch_phase_running_totals() -> Option<TaskBatchPhaseRunningTotals> {
+    task_batch_phase_census::running_totals()
+}
+
 mod task_batch_phase_census {
+    use super::TaskBatchPhaseRunningTotals;
     use std::sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
         OnceLock,
@@ -1476,6 +1495,23 @@ mod task_batch_phase_census {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var_os("FN64_TASK_BATCH_PHASE_CENSUS").is_some_and(|value| value == "1")
+        })
+    }
+
+    pub(super) fn running_totals() -> Option<TaskBatchPhaseRunningTotals> {
+        if !enabled() {
+            return None;
+        }
+        Some(TaskBatchPhaseRunningTotals {
+            tasks: TASKS.load(Relaxed),
+            members: MEMBERS.load(Relaxed),
+            total_ns: TOTAL_NS.load(Relaxed),
+            setup_ns: PHASE_NS[Phase::Setup.index()].load(Relaxed),
+            plan_bind_ns: PHASE_NS[Phase::PlanBind.index()].load(Relaxed),
+            guest_reads_ns: PHASE_NS[Phase::GuestReads.index()].load(Relaxed),
+            staged_writes_ns: PHASE_NS[Phase::StagedWrites.index()].load(Relaxed),
+            copyback_ns: PHASE_NS[Phase::Copyback.index()].load(Relaxed),
+            publication_ns: PHASE_NS[Phase::Publication.index()].load(Relaxed),
         })
     }
 

@@ -33,14 +33,19 @@ def armed_row(
     completion_before: int,
     completion_after: int,
     phases: tuple[float, ...],
+    abi_phases: tuple[float, ...] = (),
+    abi_tasks: int = 0,
 ) -> str:
     assert len(phases) == 11
+    assert len(abi_phases) in (0, 11)
     return ",".join(
         (
             row(index, wall_ms, swapped),
             str(completion_before),
             str(completion_after),
             *(f"{value:.4f}" for value in phases),
+            *(f"{value:.4f}" for value in abi_phases),
+            *((str(abi_tasks),) if abi_phases else ()),
         )
     )
 
@@ -81,6 +86,34 @@ class PumpCensusSummaryTests(unittest.TestCase):
         self.assertEqual(
             phases["metrics"]["task_rdp_outside_envelope_ms"]["mean"], 3.0
         )
+        self.assertEqual(result["abi_task_phase_frames"], {"available": False})
+
+    def test_existing_abi_clocks_fold_and_close_without_new_timing_fields(self) -> None:
+        zero = (0.0,) * 11
+        task = (18.0, 2.0, 6.0, 4.0, 10.0, 1.0, 0.5, 0.1, 0.0, 8.0, 7.0)
+        # plan, finalize, execute, commit, total, setup, plan-bind, guest-reads,
+        # staged-writes, copyback, publication
+        abi = (1.0, 0.5, 13.0, 0.7, 25.0, 1.2, 0.3, 0.8, 0.9, 0.4, 0.6)
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                armed_row(0, 1.0, True, 7, 7, zero, zero, 0),
+                armed_row(1, 2.0, False, 7, 8, task, abi, 1),
+                armed_row(2, 3.0, True, 8, 8, zero, zero, 0),
+            ]
+        )
+        metrics = MODULE.summarize(text)["abi_task_phase_frames"]["metrics"]
+        self.assertEqual(metrics["execute_outer_ms"]["mean"], 3.0)
+        self.assertEqual(metrics["post_execute_outer_ms"]["mean"], 5.0)
+        self.assertEqual(metrics["post_execute_accounted_ms"]["mean"], 2.6)
+        self.assertAlmostEqual(
+            metrics["post_execute_unattributed_ms"]["mean"], 2.4
+        )
+        self.assertEqual(metrics["pre_execute_accounted_ms"]["mean"], 3.8)
+        self.assertEqual(metrics["outside_unattributed_ms"]["mean"], 3.2)
+        abi_summary = MODULE.summarize(text)["abi_task_phase_frames"]
+        self.assertEqual(abi_summary["identity_closed_frames"], 1.0)
+        self.assertEqual(abi_summary["identity_mismatch_frames"], 0)
 
     def test_drawn_frames_are_measured_between_consecutive_swaps(self) -> None:
         text = "\n".join(

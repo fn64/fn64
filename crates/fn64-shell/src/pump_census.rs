@@ -136,6 +136,21 @@ pub struct PumpSample {
     pub task_cpu_outer_residual_ns: u64,
     pub task_cpu_rdp_outside_envelope_ns: u64,
 
+    // ---- existing ABI session/task-batch clocks joined at pump boundaries
+    pub abi_phase_armed: bool,
+    pub session_plan_ns: u64,
+    pub session_finalize_ns: u64,
+    pub session_execute_ns: u64,
+    pub session_commit_ns: u64,
+    pub task_batch_total_ns: u64,
+    pub task_batch_setup_ns: u64,
+    pub task_batch_plan_bind_ns: u64,
+    pub task_batch_guest_reads_ns: u64,
+    pub task_batch_staged_writes_ns: u64,
+    pub task_batch_copyback_ns: u64,
+    pub task_batch_publication_ns: u64,
+    pub task_batch_tasks: u64,
+
     // ---- FN64_DPC_COPY_CENSUS
     pub rsp_steps_gfx: u64,
     pub rsp_steps_audio: u64,
@@ -154,6 +169,8 @@ struct Totals {
     rsp_entries: u64,
     dpc_calls: u64,
     task_cpu: Option<fn64_render_wgpu::TaskCpuPhaseRunningTotals>,
+    session: (u64, u64, u64, u64, u64),
+    task_batch: Option<fn64_abi::TaskBatchPhaseRunningTotals>,
 }
 
 /// Only the `PhaseTiming` fields this census attributes. A local copy rather
@@ -197,6 +214,8 @@ impl Totals {
         let (rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls) =
             fn64_abi::dpc_census_running_totals();
         let task_cpu = fn64_render_wgpu::task_cpu_phase_running_totals();
+        let session = fn64_abi::session_phase_running_totals();
+        let task_batch = fn64_abi::task_batch_phase_running_totals();
         Self {
             phase: PhaseSnapshot {
                 executor_ns: p.executor_ns,
@@ -234,6 +253,8 @@ impl Totals {
             rsp_entries,
             dpc_calls,
             task_cpu,
+            session,
+            task_batch,
         }
     }
 
@@ -280,6 +301,10 @@ impl Totals {
                 .finalize_coordinator_ns
                 .saturating_sub(task_before.finalize_coordinator_ns),
         };
+        let session_after = self.session;
+        let session_before = before.session;
+        let batch_after = self.task_batch.unwrap_or_default();
+        let batch_before = before.task_batch.unwrap_or_default();
         PumpSample {
             wall_ns,
             steps,
@@ -342,6 +367,30 @@ impl Totals {
                 .gfx_lle_rdp_ns
                 .saturating_sub(b.gfx_lle_rdp_ns)
                 .saturating_sub(task_delta.task_envelope_ns),
+            abi_phase_armed: (session_after.4 > 0 || session_before.4 > 0)
+                && (self.task_batch.is_some() || before.task_batch.is_some()),
+            session_plan_ns: session_after.0.saturating_sub(session_before.0),
+            session_finalize_ns: session_after.1.saturating_sub(session_before.1),
+            session_execute_ns: session_after.2.saturating_sub(session_before.2),
+            session_commit_ns: session_after.3.saturating_sub(session_before.3),
+            task_batch_total_ns: batch_after.total_ns.saturating_sub(batch_before.total_ns),
+            task_batch_setup_ns: batch_after.setup_ns.saturating_sub(batch_before.setup_ns),
+            task_batch_plan_bind_ns: batch_after
+                .plan_bind_ns
+                .saturating_sub(batch_before.plan_bind_ns),
+            task_batch_guest_reads_ns: batch_after
+                .guest_reads_ns
+                .saturating_sub(batch_before.guest_reads_ns),
+            task_batch_staged_writes_ns: batch_after
+                .staged_writes_ns
+                .saturating_sub(batch_before.staged_writes_ns),
+            task_batch_copyback_ns: batch_after
+                .copyback_ns
+                .saturating_sub(batch_before.copyback_ns),
+            task_batch_publication_ns: batch_after
+                .publication_ns
+                .saturating_sub(batch_before.publication_ns),
+            task_batch_tasks: batch_after.tasks.saturating_sub(batch_before.tasks),
             rsp_steps_gfx: self.rsp_steps_gfx.saturating_sub(before.rsp_steps_gfx),
             rsp_steps_audio: self.rsp_steps_audio.saturating_sub(before.rsp_steps_audio),
             rsp_entries: self.rsp_entries.saturating_sub(before.rsp_entries),
@@ -800,6 +849,18 @@ struct TaskCpuFrameSpan {
     post_view_wrapper_residual_ns: u64,
     outer_residual_ns: u64,
     rdp_outside_envelope_ns: u64,
+    session_plan_ns: u64,
+    session_finalize_ns: u64,
+    session_execute_ns: u64,
+    session_commit_ns: u64,
+    task_batch_total_ns: u64,
+    task_batch_setup_ns: u64,
+    task_batch_plan_bind_ns: u64,
+    task_batch_guest_reads_ns: u64,
+    task_batch_staged_writes_ns: u64,
+    task_batch_copyback_ns: u64,
+    task_batch_publication_ns: u64,
+    task_batch_tasks: u64,
 }
 
 impl TaskCpuFrameSpan {
@@ -838,6 +899,74 @@ impl TaskCpuFrameSpan {
         self.rdp_outside_envelope_ns = self
             .rdp_outside_envelope_ns
             .saturating_add(sample.task_cpu_rdp_outside_envelope_ns);
+        self.session_plan_ns = self.session_plan_ns.saturating_add(sample.session_plan_ns);
+        self.session_finalize_ns = self
+            .session_finalize_ns
+            .saturating_add(sample.session_finalize_ns);
+        self.session_execute_ns = self
+            .session_execute_ns
+            .saturating_add(sample.session_execute_ns);
+        self.session_commit_ns = self
+            .session_commit_ns
+            .saturating_add(sample.session_commit_ns);
+        self.task_batch_total_ns = self
+            .task_batch_total_ns
+            .saturating_add(sample.task_batch_total_ns);
+        self.task_batch_setup_ns = self
+            .task_batch_setup_ns
+            .saturating_add(sample.task_batch_setup_ns);
+        self.task_batch_plan_bind_ns = self
+            .task_batch_plan_bind_ns
+            .saturating_add(sample.task_batch_plan_bind_ns);
+        self.task_batch_guest_reads_ns = self
+            .task_batch_guest_reads_ns
+            .saturating_add(sample.task_batch_guest_reads_ns);
+        self.task_batch_staged_writes_ns = self
+            .task_batch_staged_writes_ns
+            .saturating_add(sample.task_batch_staged_writes_ns);
+        self.task_batch_copyback_ns = self
+            .task_batch_copyback_ns
+            .saturating_add(sample.task_batch_copyback_ns);
+        self.task_batch_publication_ns = self
+            .task_batch_publication_ns
+            .saturating_add(sample.task_batch_publication_ns);
+        self.task_batch_tasks = self
+            .task_batch_tasks
+            .saturating_add(sample.task_batch_tasks);
+    }
+
+    fn execute_outer_ns(self) -> u64 {
+        self.session_execute_ns
+            .saturating_sub(self.renderer_work_ns)
+    }
+
+    fn post_execute_outer_ns(self) -> u64 {
+        self.envelope_ns.saturating_sub(self.session_execute_ns)
+    }
+
+    fn pre_execute_accounted_ns(self) -> u64 {
+        self.task_batch_setup_ns
+            .saturating_add(self.task_batch_plan_bind_ns)
+            .saturating_add(self.task_batch_guest_reads_ns)
+            .saturating_add(self.session_plan_ns)
+            .saturating_add(self.session_finalize_ns)
+    }
+
+    fn outside_unattributed_ns(self) -> u64 {
+        self.rdp_outside_envelope_ns
+            .saturating_sub(self.pre_execute_accounted_ns())
+    }
+
+    fn post_execute_accounted_ns(self) -> u64 {
+        self.task_batch_staged_writes_ns
+            .saturating_add(self.session_commit_ns)
+            .saturating_add(self.task_batch_copyback_ns)
+            .saturating_add(self.task_batch_publication_ns)
+    }
+
+    fn post_execute_unattributed_ns(self) -> u64 {
+        self.post_execute_outer_ns()
+            .saturating_sub(self.post_execute_accounted_ns())
     }
 }
 
@@ -956,6 +1085,40 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
                 total.rdp_outside_envelope_ns = total
                     .rdp_outside_envelope_ns
                     .saturating_add(frame.rdp_outside_envelope_ns);
+                total.session_plan_ns = total.session_plan_ns.saturating_add(frame.session_plan_ns);
+                total.session_finalize_ns = total
+                    .session_finalize_ns
+                    .saturating_add(frame.session_finalize_ns);
+                total.session_execute_ns = total
+                    .session_execute_ns
+                    .saturating_add(frame.session_execute_ns);
+                total.session_commit_ns = total
+                    .session_commit_ns
+                    .saturating_add(frame.session_commit_ns);
+                total.task_batch_total_ns = total
+                    .task_batch_total_ns
+                    .saturating_add(frame.task_batch_total_ns);
+                total.task_batch_setup_ns = total
+                    .task_batch_setup_ns
+                    .saturating_add(frame.task_batch_setup_ns);
+                total.task_batch_plan_bind_ns = total
+                    .task_batch_plan_bind_ns
+                    .saturating_add(frame.task_batch_plan_bind_ns);
+                total.task_batch_guest_reads_ns = total
+                    .task_batch_guest_reads_ns
+                    .saturating_add(frame.task_batch_guest_reads_ns);
+                total.task_batch_staged_writes_ns = total
+                    .task_batch_staged_writes_ns
+                    .saturating_add(frame.task_batch_staged_writes_ns);
+                total.task_batch_copyback_ns = total
+                    .task_batch_copyback_ns
+                    .saturating_add(frame.task_batch_copyback_ns);
+                total.task_batch_publication_ns = total
+                    .task_batch_publication_ns
+                    .saturating_add(frame.task_batch_publication_ns);
+                total.task_batch_tasks = total
+                    .task_batch_tasks
+                    .saturating_add(frame.task_batch_tasks);
                 total
             });
     let denominator = u64::try_from(folded.complete.len())
@@ -980,6 +1143,44 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
         ms(complete_total.outer_residual_ns / denominator),
         ms(complete_total.rdp_outside_envelope_ns / denominator),
     );
+    if samples.iter().any(|sample| sample.abi_phase_armed) {
+        let complete_completions = folded.complete.iter().fold(0u64, |total, frame| {
+            total.saturating_add(
+                frame
+                    .completion_after
+                    .saturating_sub(frame.completion_before),
+            )
+        });
+        let _ = writeln!(
+            out,
+            "[task-cpu-frames] ABI phase means: execute_outer_ms={:.3} \
+             post_execute_outer_ms={:.3} post_execute_accounted_ms={:.3} \
+             post_execute_unattributed_ms={:.3} pre_execute_accounted_ms={:.3} \
+             outside_unattributed_ms={:.3} batch_tasks={} completions={}",
+            ms(complete_total.execute_outer_ns() / denominator),
+            ms(complete_total.post_execute_outer_ns() / denominator),
+            ms(complete_total.post_execute_accounted_ns() / denominator),
+            ms(complete_total.post_execute_unattributed_ns() / denominator),
+            ms(complete_total.pre_execute_accounted_ns() / denominator),
+            ms(complete_total.outside_unattributed_ns() / denominator),
+            complete_total.task_batch_tasks,
+            complete_completions,
+        );
+        if complete_total.task_batch_tasks != complete_completions {
+            let _ = writeln!(
+                out,
+                "[task-cpu-frames] ABI JOIN VIOLATION: task-batch tasks={} but renderer \
+                 completions={}; phase attribution is not identity-closed.",
+                complete_total.task_batch_tasks, complete_completions,
+            );
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "[task-cpu-frames] ABI phase join NOT ARMED \
+             (FN64_TASK_BATCH_PHASE_CENSUS + FN64_SESSION_PHASE_CENSUS); zeros are not costs."
+        );
+    }
     for (index, frame) in folded.complete.iter().take(sequence).enumerate() {
         let _ = writeln!(
             out,
@@ -987,7 +1188,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
              hot_member_ms={:.3} all_cpu_member_ms={:.3} compute_segment_ms={:.3} \
              renderer_work_ms={:.3} member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
              finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
-             outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+            outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
             frame.pumps,
             frame.completion_before,
             frame.completion_after,
@@ -1003,6 +1204,20 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             ms(frame.outer_residual_ns),
             ms(frame.rdp_outside_envelope_ns),
         );
+        if samples.iter().any(|sample| sample.abi_phase_armed) {
+            let _ = writeln!(
+                out,
+                "[task-abi-frame] {index} execute_outer_ms={:.3} post_execute_outer_ms={:.3} \
+                 post_execute_accounted_ms={:.3} post_execute_unattributed_ms={:.3} \
+                 pre_execute_accounted_ms={:.3} outside_unattributed_ms={:.3}",
+                ms(frame.execute_outer_ns()),
+                ms(frame.post_execute_outer_ns()),
+                ms(frame.post_execute_accounted_ns()),
+                ms(frame.post_execute_unattributed_ns()),
+                ms(frame.pre_execute_accounted_ns()),
+                ms(frame.outside_unattributed_ns()),
+            );
+        }
     }
     out
 }
@@ -1280,12 +1495,16 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
              task_hot_member_ms,task_all_cpu_member_ms,task_compute_segment_ms,task_renderer_work_ms,\
              task_member_accounted_ms,task_view_plan_residual_ms,\
              task_finalize_coordinator_ms,task_post_view_wrapper_residual_ms,\
-             task_outer_residual_ms,task_rdp_outside_envelope_ms\n",
+             task_outer_residual_ms,task_rdp_outside_envelope_ms,session_plan_ms,\
+             session_finalize_ms,session_execute_ms,session_commit_ms,task_batch_total_ms,\
+             task_batch_setup_ms,task_batch_plan_bind_ms,task_batch_guest_reads_ms,\
+             task_batch_staged_writes_ms,task_batch_copyback_ms,task_batch_publication_ms,\
+             task_batch_tasks\n",
             sequence.min(samples.len())
         ));
         for (i, s) in samples.iter().take(sequence).enumerate() {
             out.push_str(&format!(
-                "[pump-seq] {i},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
+                "[pump-seq] {i},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{}\n",
                 ms(s.wall_ns),
                 s.steps,
                 u8::from(s.swapped),
@@ -1313,6 +1532,18 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
                 ms(s.task_cpu_post_view_wrapper_residual_ns),
                 ms(s.task_cpu_outer_residual_ns),
                 ms(s.task_cpu_rdp_outside_envelope_ns),
+                ms(s.session_plan_ns),
+                ms(s.session_finalize_ns),
+                ms(s.session_execute_ns),
+                ms(s.session_commit_ns),
+                ms(s.task_batch_total_ns),
+                ms(s.task_batch_setup_ns),
+                ms(s.task_batch_plan_bind_ns),
+                ms(s.task_batch_guest_reads_ns),
+                ms(s.task_batch_staged_writes_ns),
+                ms(s.task_batch_copyback_ns),
+                ms(s.task_batch_publication_ns),
+                s.task_batch_tasks,
             ));
         }
     }
@@ -1581,6 +1812,12 @@ mod tests {
         let samples: Vec<PumpSample> = (0..10).map(|i| sample(i as f64)).collect();
         let text = render_report(&samples, "test", 3);
         assert_eq!(text.matches("[pump-seq] ").count(), 3, "{text}");
+        for row in text
+            .lines()
+            .filter_map(|line| line.strip_prefix("[pump-seq] "))
+        {
+            assert_eq!(row.split(',').count(), 40, "{row}");
+        }
     }
 
     #[test]
@@ -1599,6 +1836,13 @@ mod tests {
                 compute_segment_ns: 10,
                 execution_view_gross_ns: 45,
                 finalize_coordinator_ns: 10,
+                ..Default::default()
+            }),
+            session: (10, 20, 30, 40, 1),
+            task_batch: Some(fn64_abi::TaskBatchPhaseRunningTotals {
+                tasks: 7,
+                total_ns: 100,
+                setup_ns: 5,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1624,6 +1868,18 @@ mod tests {
                 finalize_coordinator_ns: 25,
                 ..Default::default()
             }),
+            session: (20, 35, 150, 55, 2),
+            task_batch: Some(fn64_abi::TaskBatchPhaseRunningTotals {
+                tasks: 8,
+                total_ns: 250,
+                setup_ns: 15,
+                plan_bind_ns: 5,
+                guest_reads_ns: 7,
+                staged_writes_ns: 8,
+                copyback_ns: 4,
+                publication_ns: 6,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let sample = after.delta(&before, 1_000, 1, false);
@@ -1646,6 +1902,47 @@ mod tests {
         assert_eq!(sample.task_cpu_post_view_wrapper_residual_ns, 0);
         assert_eq!(sample.task_cpu_outer_residual_ns, 10);
         assert_eq!(sample.task_cpu_rdp_outside_envelope_ns, 30);
+        assert!(sample.abi_phase_armed);
+        assert_eq!(sample.session_execute_ns, 120);
+        assert_eq!(sample.task_batch_total_ns, 150);
+        assert_eq!(sample.task_batch_setup_ns, 10);
+        assert_eq!(sample.task_batch_tasks, 1);
+    }
+
+    #[test]
+    fn abi_phase_split_closes_outer_and_outside_residuals() {
+        let span = TaskCpuFrameSpan {
+            envelope_ns: 180,
+            renderer_work_ns: 100,
+            rdp_outside_envelope_ns: 70,
+            session_plan_ns: 10,
+            session_finalize_ns: 5,
+            session_execute_ns: 130,
+            session_commit_ns: 7,
+            task_batch_setup_ns: 12,
+            task_batch_plan_bind_ns: 3,
+            task_batch_guest_reads_ns: 8,
+            task_batch_staged_writes_ns: 9,
+            task_batch_copyback_ns: 4,
+            task_batch_publication_ns: 6,
+            ..Default::default()
+        };
+        assert_eq!(span.execute_outer_ns(), 30);
+        assert_eq!(span.post_execute_outer_ns(), 50);
+        assert_eq!(span.execute_outer_ns() + span.post_execute_outer_ns(), 80);
+        assert_eq!(span.post_execute_accounted_ns(), 26);
+        assert_eq!(span.post_execute_unattributed_ns(), 24);
+        assert_eq!(span.pre_execute_accounted_ns(), 38);
+        assert_eq!(span.outside_unattributed_ns(), 32);
+
+        let saturated = TaskCpuFrameSpan {
+            envelope_ns: 1,
+            renderer_work_ns: 2,
+            session_execute_ns: 3,
+            ..Default::default()
+        };
+        assert_eq!(saturated.execute_outer_ns(), 1);
+        assert_eq!(saturated.post_execute_outer_ns(), 0);
     }
 
     #[test]
