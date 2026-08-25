@@ -1,5 +1,9 @@
 # WM2000 performance: the 30 Hz budget and the open post-fix question
 
+For the game-content-free planning feedback loop used while investigating
+renderer costs, see [`RENDERER-TASK-REPLAY.md`](RENDERER-TASK-REPLAY.md).
+That synthetic harness is tooling, not live WM2000 performance evidence.
+
 **Status corrected 2026-08-22.** This document previously framed WM2000 as a
 60 fps problem and compared one field's work with a 16.667 ms rendered-frame
 budget. That was wrong for the title under test: WM2000 renders at 30 Hz, so

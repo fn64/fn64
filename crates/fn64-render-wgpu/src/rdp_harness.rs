@@ -874,5 +874,7 @@ fn publish_packet(
     Ok(staged)
 }
 
+mod task_replay;
+
 #[cfg(test)]
 mod tests;
