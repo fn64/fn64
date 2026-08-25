@@ -802,7 +802,7 @@ mod game {
             if !self.present_cache_mode.samples_dependencies() {
                 return None;
             }
-            let probe_started = Instant::now();
+            let probe_started = std::time::Instant::now();
             let policy = framebuffer::PresentPolicy::new(
                 self.video.overscan,
                 self.video.zoom_fill,
