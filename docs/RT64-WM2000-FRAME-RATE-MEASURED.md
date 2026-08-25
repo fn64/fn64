@@ -21,6 +21,20 @@ The pump census's own `over_budget` column is taken against 16.667 ms and is
 therefore a FIELD statistic, not a drawn-frame one -- do not read it as "35% of
 frames are late".
 
+When `FN64_PUMP_CENSUS_SEQUENCE` is armed, the census also emits one joined
+`[wall-cadence-seq]` row after the following pump starts. It attributes the
+exact pump-to-pump wall interval to the prior pump index, including its
+scheduled deadline, start debt, reanchor decision, pump and redraw costs,
+intended wait, wake overshoot, and the residual outside those measured regions.
+Separate `[wall-swap-seq]` rows carry swap-to-swap wall time under the ending
+swapped pump's index; that backward-looking interval must not be correlated
+with the cadence row covering the ending pump's following interval. The last
+pump is intentionally pending because no following start exists, while a
+completed final swap interval remains reportable. The v4 receipt exposes these
+rows under `wall_cadence`; old logs remain readable and report it unavailable.
+This join is the arbiter for a rare long event-loop/wake stall: subtracting
+unrelated percentile maxima is not.
+
 ## 2026-08-22 pacing diagnosis: sub-field DP completion was rounded to a field
 
 This supersedes the hypothesis that the renderer's submissions merely needed

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 
 SEQUENCE_PREFIX = "[pump-seq] "
+WALL_CADENCE_PREFIX = "[wall-cadence-seq] "
+WALL_SWAP_PREFIX = "[wall-swap-seq] "
 RENDERER_RE = re.compile(r"^\[pump-census\] RENDERER: (\S+)$", re.MULTILINE)
 BUDGET_MS = 1000.0 / 30.0
 
@@ -60,6 +62,21 @@ class Pump:
     task_batch_copyback_ms: float | None = None
     task_batch_publication_ms: float | None = None
     task_batch_tasks: int | None = None
+
+
+@dataclass(frozen=True)
+class WallCadence:
+    index: int
+    pump_start_ms: float
+    scheduled_deadline_ms: float
+    interval_ms: float
+    start_debt_ms: float
+    wake_overshoot_ms: float
+    reanchored: bool
+    prior_pump_ms: float
+    prior_present_ms: float
+    intended_wait_ms: float
+    outside_residual_ms: float
 
 
 METRICS = (
@@ -182,6 +199,63 @@ def parse_pumps(text: str) -> list[Pump]:
     return pumps
 
 
+def parse_wall_cadence(text: str, pumps: list[Pump]) -> list[WallCadence]:
+    samples: list[WallCadence] = []
+    for line in text.splitlines():
+        if not line.startswith(WALL_CADENCE_PREFIX):
+            continue
+        fields = line[len(WALL_CADENCE_PREFIX) :].split(",")
+        if len(fields) != 11:
+            raise ValueError(
+                f"wall cadence row has {len(fields)} fields, expected 11"
+            )
+        index = int(fields[0])
+        if index < 0:
+            raise ValueError("wall cadence index must be non-negative")
+        if fields[6] not in ("0", "1"):
+            raise ValueError("wall cadence reanchored field must be 0 or 1")
+        sample = WallCadence(
+            index=index,
+            pump_start_ms=float(fields[1]),
+            scheduled_deadline_ms=float(fields[2]),
+            interval_ms=float(fields[3]),
+            start_debt_ms=float(fields[4]),
+            wake_overshoot_ms=float(fields[5]),
+            reanchored=fields[6] == "1",
+            prior_pump_ms=float(fields[7]),
+            prior_present_ms=float(fields[8]),
+            intended_wait_ms=float(fields[9]),
+            outside_residual_ms=float(fields[10]),
+        )
+        if sample.index >= len(pumps):
+            raise ValueError(
+                f"wall cadence index {sample.index} has no matching pump row"
+            )
+        if samples and sample.index <= samples[-1].index:
+            raise ValueError("wall cadence rows are not in strictly increasing pump order")
+        samples.append(sample)
+    return samples
+
+
+def parse_wall_swaps(text: str, pumps: list[Pump]) -> list[tuple[int, float]]:
+    samples: list[tuple[int, float]] = []
+    for line in text.splitlines():
+        if not line.startswith(WALL_SWAP_PREFIX):
+            continue
+        fields = line[len(WALL_SWAP_PREFIX) :].split(",")
+        if len(fields) != 2:
+            raise ValueError(f"wall swap row has {len(fields)} fields, expected 2")
+        index, duration_ms = int(fields[0]), float(fields[1])
+        if index < 0:
+            raise ValueError("wall swap index must be non-negative")
+        if index >= len(pumps) or not pumps[index].swapped:
+            raise ValueError(f"wall swap index {index} does not name a swapped pump")
+        if samples and index <= samples[-1][0]:
+            raise ValueError("wall swap rows are not in strictly increasing pump order")
+        samples.append((index, duration_ms))
+    return samples
+
+
 def population_means(
     frames: list[dict[str, float]], metrics: tuple[str, ...] = METRICS
 ) -> dict[str, float]:
@@ -213,6 +287,8 @@ def summarize(text: str) -> dict[str, object]:
         raise ValueError("pump census renderer identity is missing")
     renderer = renderer_match.group(1)
     pumps = parse_pumps(text)
+    wall_cadence = parse_wall_cadence(text, pumps)
+    wall_swaps = parse_wall_swaps(text, pumps)
     task_phase_available = pumps[0].task_completion_before is not None
     abi_phase_available = pumps[0].session_plan_ms is not None
     if any((pump.task_completion_before is not None) != task_phase_available for pump in pumps):
@@ -305,7 +381,7 @@ def summarize(text: str) -> dict[str, object]:
     over_means = population_means(over)
 
     result = {
-        "schema": "fn64.wm2000-swap-latency.v3",
+        "schema": "fn64.wm2000-swap-latency.v4",
         "renderer": renderer,
         "pumps": len(pumps),
         "swaps": len(swap_indices),
@@ -365,6 +441,40 @@ def summarize(text: str) -> dict[str, object]:
         }
     else:
         result["abi_task_phase_frames"] = {"available": False}
+    if wall_cadence:
+        swap_wall = [duration_ms for _, duration_ms in wall_swaps]
+        result["wall_cadence"] = {
+            "available": True,
+            "completed_intervals": len(wall_cadence),
+            "swap_intervals": len(swap_wall),
+            "reanchors": sum(sample.reanchored for sample in wall_cadence),
+            "totals_ms": {
+                metric: sum(getattr(sample, metric) for sample in wall_cadence)
+                for metric in (
+                    "interval_ms",
+                    "prior_pump_ms",
+                    "prior_present_ms",
+                    "intended_wait_ms",
+                    "outside_residual_ms",
+                    "start_debt_ms",
+                    "wake_overshoot_ms",
+                )
+            },
+            "distributions_ms": {
+                metric: distribution(
+                    [getattr(sample, metric) for sample in wall_cadence]
+                )
+                for metric in (
+                    "interval_ms",
+                    "start_debt_ms",
+                    "wake_overshoot_ms",
+                    "outside_residual_ms",
+                )
+            },
+            "swap_to_swap_ms": distribution(swap_wall) if swap_wall else None,
+        }
+    else:
+        result["wall_cadence"] = {"available": False}
     return result
 
 

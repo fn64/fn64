@@ -60,9 +60,21 @@
 //!   pumps as raw per-pump rows. A series of summary percentiles cannot
 //!   distinguish "the game entered a slow regime" from "the emulator
 //!   alternates"; only the raw sequence can.
+//!
+//! The same sequence gate also emits `[wall-cadence-seq]` rows. Each row is
+//! finalized at the following pump start and joins the exact scheduled
+//! deadline, start debt, wake overshoot, reanchor decision, prior pump and
+//! redraw costs, intended wait, and the remaining outside-loop residual under
+//! the prior pump's index. Separate `[wall-swap-seq]` rows are indexed by the
+//! ending swapped pump; keeping that backward-looking interval out of the
+//! forward-looking cadence row prevents a false same-row correlation. The
+//! final pump has no following start and is deliberately absent rather than
+//! assigned a fabricated interval. All clocks are the `Instant`s the shell
+//! already reads for its heartbeat pump/present timing; this collector adds no
+//! hot clock read.
 
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One pump's wall time and the counter deltas attributed to it.
 ///
@@ -156,6 +168,39 @@ pub struct PumpSample {
     pub rsp_steps_audio: u64,
     pub rsp_entries: u64,
     pub dpc_calls: u64,
+}
+
+/// Joined wall-clock attribution for one completed pump-to-pump interval.
+///
+/// The row is finalized only when the following pump starts. All durations
+/// therefore share the exact pump index from [`PumpSample`] without guessing
+/// which redraw callback belonged to which interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WallCadenceSample {
+    pub pump_index: usize,
+    pub pump_start_ns: u64,
+    pub scheduled_deadline_ns: u64,
+    pub interval_ns: u64,
+    pub start_debt_ns: u64,
+    pub wake_overshoot_ns: u64,
+    pub reanchored: bool,
+    pub prior_pump_ns: u64,
+    pub prior_present_ns: u64,
+    pub intended_wait_ns: u64,
+    pub outside_residual_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingWallCadence {
+    sample_index: Option<usize>,
+    pump_start: Instant,
+    pump_end: Instant,
+    scheduled_deadline: Instant,
+    next_deadline: Instant,
+    start_debt_ns: u64,
+    reanchored: bool,
+    present_ns: u64,
+    present_ended: Option<Instant>,
 }
 
 /// The raw running totals, read once at each pump boundary.
@@ -443,6 +488,11 @@ pub struct PumpCensus {
     seen: usize,
     before: Totals,
     samples: Vec<PumpSample>,
+    wall_origin: Option<Instant>,
+    pending_wall: Option<PendingWallCadence>,
+    wall_samples: Vec<WallCadenceSample>,
+    swap_wall_samples: Vec<(usize, u64)>,
+    last_swap_started: Option<Instant>,
     reported: bool,
 }
 
@@ -453,6 +503,11 @@ impl PumpCensus {
             seen: 0,
             before: Totals::default(),
             samples: Vec::new(),
+            wall_origin: None,
+            pending_wall: None,
+            wall_samples: Vec::new(),
+            swap_wall_samples: Vec::new(),
+            last_swap_started: None,
             reported: false,
         }
     }
@@ -463,39 +518,162 @@ impl PumpCensus {
 
     /// Read the running totals immediately before a pump. Cheap enough to be
     /// unconditional when armed; a no-op when not.
-    pub fn before_pump(&mut self) {
+    pub fn before_pump(&mut self, started: Instant, scheduled_deadline: Instant) {
         if !self.armed {
             return;
         }
+        self.finish_wall_interval(started);
+        self.wall_origin
+            .get_or_insert(started.min(scheduled_deadline));
         if self.samples.capacity() == 0 {
             // One allocation for the whole run, taken on the first armed pump
             // rather than at construction so an unarmed shell allocates
             // nothing. Sized to the bounded run when one was requested.
             let cap = if pump_limit() > 0 { pump_limit() } else { 8192 };
             self.samples.reserve(cap);
+            self.wall_samples.reserve(cap);
+            self.swap_wall_samples.reserve(cap / 2);
         }
         self.before = Totals::read();
     }
 
     /// Attribute the counter deltas since `before_pump` to this pump.
     /// Returns true when the requested pump budget is exhausted.
-    pub fn after_pump(&mut self, wall: Duration, steps: u64, swapped: bool) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub fn after_pump(
+        &mut self,
+        wall: Duration,
+        steps: u64,
+        swapped: bool,
+        started: Instant,
+        scheduled_deadline: Instant,
+        next_deadline: Instant,
+        reanchored: bool,
+    ) -> bool {
         if !self.armed {
             return false;
         }
         self.seen += 1;
-        if self.seen <= warmup() {
-            return false;
-        }
         let after = Totals::read();
-        self.samples
-            .push(after.delta(&self.before, wall.as_nanos() as u64, steps, swapped));
+        let sample_index = if self.seen <= warmup() {
+            None
+        } else {
+            self.samples
+                .push(after.delta(&self.before, wall.as_nanos() as u64, steps, swapped));
+            Some(self.samples.len() - 1)
+        };
+        let swap_to_swap_ns = (sample_index.is_some() && swapped)
+            .then(|| {
+                self.last_swap_started
+                    .and_then(|previous| started.checked_duration_since(previous))
+                    .map(|duration| duration.as_nanos() as u64)
+            })
+            .flatten();
+        if let (Some(index), Some(duration)) = (sample_index, swap_to_swap_ns) {
+            self.swap_wall_samples.push((index, duration));
+        }
+        if sample_index.is_some() && swapped {
+            self.last_swap_started = Some(started);
+        } else if sample_index.is_none() {
+            self.last_swap_started = None;
+        }
+        debug_assert!(self.pending_wall.is_none());
+        self.pending_wall = Some(PendingWallCadence {
+            sample_index,
+            pump_start: started,
+            pump_end: started + wall,
+            scheduled_deadline,
+            next_deadline,
+            start_debt_ns: started
+                .checked_duration_since(scheduled_deadline)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            reanchored,
+            present_ns: 0,
+            present_ended: None,
+        });
         let limit = pump_limit();
         limit > 0 && self.samples.len() >= limit
     }
 
+    /// Join a redraw callback to the pump that requested it. The caller uses
+    /// the same start/end clock reads already required by the heartbeat's
+    /// presentation timing, so arming this census adds no clock reads here.
+    pub fn record_present(&mut self, started: Instant, wall: Duration) {
+        if !self.armed {
+            return;
+        }
+        let Some(pending) = self.pending_wall.as_mut() else {
+            return;
+        };
+        if started < pending.pump_start {
+            return;
+        }
+        pending.present_ns = pending.present_ns.saturating_add(wall.as_nanos() as u64);
+        pending.present_ended = Some(started + wall);
+    }
+
+    fn finish_wall_interval(&mut self, next_started: Instant) {
+        let Some(pending) = self.pending_wall.take() else {
+            return;
+        };
+        let Some(pump_index) = pending.sample_index else {
+            return;
+        };
+        let origin = self
+            .wall_origin
+            .expect("armed wall cadence must retain its first pump origin");
+        let ready = pending
+            .present_ended
+            .map_or(pending.pump_end, |ended| ended.max(pending.pump_end));
+        let intended_wait = pending
+            .next_deadline
+            .checked_duration_since(ready)
+            .unwrap_or_default();
+        let wake_boundary = pending.next_deadline.max(ready);
+        let interval = next_started
+            .checked_duration_since(pending.pump_start)
+            .unwrap_or_default();
+        let outside_residual_ns = (interval.as_nanos() as u64)
+            .saturating_sub(
+                pending
+                    .pump_end
+                    .duration_since(pending.pump_start)
+                    .as_nanos() as u64,
+            )
+            .saturating_sub(pending.present_ns)
+            .saturating_sub(intended_wait.as_nanos() as u64);
+        self.wall_samples.push(WallCadenceSample {
+            pump_index,
+            pump_start_ns: pending.pump_start.duration_since(origin).as_nanos() as u64,
+            scheduled_deadline_ns: pending
+                .scheduled_deadline
+                .checked_duration_since(origin)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            interval_ns: interval.as_nanos() as u64,
+            start_debt_ns: pending.start_debt_ns,
+            wake_overshoot_ns: next_started
+                .checked_duration_since(wake_boundary)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            reanchored: pending.reanchored,
+            prior_pump_ns: pending
+                .pump_end
+                .duration_since(pending.pump_start)
+                .as_nanos() as u64,
+            prior_present_ns: pending.present_ns,
+            intended_wait_ns: intended_wait.as_nanos() as u64,
+            outside_residual_ns,
+        });
+    }
+
     pub fn samples(&self) -> &[PumpSample] {
         &self.samples
+    }
+
+    pub fn wall_samples(&self) -> &[WallCadenceSample] {
+        &self.wall_samples
     }
 
     /// Print once. Idempotent: the bounded-run exit path and any later
@@ -506,6 +684,10 @@ impl PumpCensus {
         }
         self.reported = true;
         print!("{}", render_report(&self.samples, renderer, sequence_len()));
+        print!(
+            "{}",
+            render_wall_report(&self.wall_samples, &self.swap_wall_samples, sequence_len())
+        );
         print!("{}", render_session_phase_report());
     }
 }
@@ -1632,6 +1814,65 @@ fn periodicity_report(samples: &[PumpSample], budget_ns: u64) -> String {
     out
 }
 
+fn render_wall_report(
+    samples: &[WallCadenceSample],
+    swap_samples: &[(usize, u64)],
+    sequence: usize,
+) -> String {
+    let mut out = String::new();
+    if samples.is_empty() {
+        out.push_str(
+            "[wall-cadence] no completed pump-to-pump intervals (the final pump is intentionally pending)\n",
+        );
+        return out;
+    }
+    let reanchors = samples.iter().filter(|sample| sample.reanchored).count();
+    let sum = |get: fn(&WallCadenceSample) -> u64| -> f64 { ms(samples.iter().map(get).sum()) };
+    out.push_str(&format!(
+        "[wall-cadence] intervals={} swap_intervals={} reanchors={} \
+         interval_total_ms={:.3} pump_ms={:.3} present_ms={:.3} intended_wait_ms={:.3} \
+         outside_residual_ms={:.3}\n",
+        samples.len(),
+        swap_samples.len(),
+        reanchors,
+        sum(|sample| sample.interval_ns),
+        sum(|sample| sample.prior_pump_ns),
+        sum(|sample| sample.prior_present_ns),
+        sum(|sample| sample.intended_wait_ns),
+        sum(|sample| sample.outside_residual_ns),
+    ));
+    if sequence > 0 {
+        out.push_str(
+            "[wall-cadence] sequence: idx,pump_start_ms,scheduled_deadline_ms,interval_ms,\
+             start_debt_ms,wake_overshoot_ms,reanchored,prior_pump_ms,\
+             prior_present_ms,intended_wait_ms,outside_residual_ms\n",
+        );
+        for sample in samples.iter().take(sequence) {
+            out.push_str(&format!(
+                "[wall-cadence-seq] {},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4}\n",
+                sample.pump_index,
+                ms(sample.pump_start_ns),
+                ms(sample.scheduled_deadline_ns),
+                ms(sample.interval_ns),
+                ms(sample.start_debt_ns),
+                ms(sample.wake_overshoot_ns),
+                u8::from(sample.reanchored),
+                ms(sample.prior_pump_ns),
+                ms(sample.prior_present_ns),
+                ms(sample.intended_wait_ns),
+                ms(sample.outside_residual_ns),
+            ));
+        }
+        for (pump_index, duration_ns) in swap_samples.iter().take(sequence) {
+            out.push_str(&format!(
+                "[wall-swap-seq] {pump_index},{:.4}\n",
+                ms(*duration_ns)
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,6 +1882,79 @@ mod tests {
             wall_ns: (wall_ms * 1e6) as u64,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn wall_cadence_lifecycle_preserves_final_swap_while_last_interval_is_pending() {
+        let mut census = PumpCensus::new();
+        census.armed = true;
+        let mut started = Instant::now();
+        for _ in 0..warmup() {
+            census.before_pump(started, started);
+            let _ = census.after_pump(
+                Duration::from_millis(1),
+                1,
+                false,
+                started,
+                started,
+                started + Duration::from_millis(16),
+                false,
+            );
+            started += Duration::from_millis(17);
+        }
+
+        census.before_pump(started, started);
+        let _ = census.after_pump(
+            Duration::from_millis(10),
+            1,
+            true,
+            started,
+            started,
+            started + Duration::from_millis(16),
+            false,
+        );
+        census.record_present(
+            started + Duration::from_millis(10),
+            Duration::from_millis(1),
+        );
+        let second = started + Duration::from_millis(17);
+        census.before_pump(second, second);
+        let _ = census.after_pump(
+            Duration::from_millis(2),
+            1,
+            false,
+            second,
+            second,
+            second + Duration::from_millis(16),
+            false,
+        );
+        let third = started + Duration::from_millis(33);
+        census.before_pump(third, third);
+        let _ = census.after_pump(
+            Duration::from_millis(3),
+            1,
+            true,
+            third,
+            third,
+            third + Duration::from_millis(16),
+            false,
+        );
+
+        assert_eq!(census.samples.len(), 3);
+        assert_eq!(census.wall_samples.len(), 2, "the final interval is pending");
+        assert_eq!(census.swap_wall_samples, vec![(2, 33_000_000)]);
+        let first = census.wall_samples[0];
+        assert_eq!(first.pump_index, 0);
+        assert_eq!(first.interval_ns, 17_000_000);
+        assert_eq!(first.prior_pump_ns, 10_000_000);
+        assert_eq!(first.prior_present_ns, 1_000_000);
+        assert_eq!(first.intended_wait_ns, 5_000_000);
+        assert_eq!(first.wake_overshoot_ns, 1_000_000);
+        assert_eq!(first.outside_residual_ns, 1_000_000);
+
+        let report = render_wall_report(&census.wall_samples, &census.swap_wall_samples, 3);
+        assert_eq!(report.matches("[wall-cadence-seq] ").count(), 2, "{report}");
+        assert!(report.contains("[wall-swap-seq] 2,33.0000"), "{report}");
     }
 
     /// Every row's declared parent must exist as a row (or be the derived
