@@ -50,6 +50,26 @@ def armed_row(
     )
 
 
+def cadence_row(
+    index: int,
+    *,
+    interval_ms: float,
+    start_debt_ms: float = 0.0,
+    wake_overshoot_ms: float = 0.0,
+    reanchored: bool = False,
+    pump_ms: float = 10.0,
+    present_ms: float = 1.0,
+    wait_ms: float = 5.0,
+    outside_ms: float = 0.0,
+) -> str:
+    return (
+        f"[wall-cadence-seq] {index},{index * 16.0:.4f},{index * 16.0:.4f},"
+        f"{interval_ms:.4f},{start_debt_ms:.4f},{wake_overshoot_ms:.4f},"
+        f"{int(reanchored)},{pump_ms:.4f},"
+        f"{present_ms:.4f},{wait_ms:.4f},{outside_ms:.4f}"
+    )
+
+
 class PumpCensusSummaryTests(unittest.TestCase):
     def test_legacy_rows_remain_supported_without_phase_claims(self) -> None:
         text = "\n".join(
@@ -148,6 +168,66 @@ class PumpCensusSummaryTests(unittest.TestCase):
         self.assertEqual(result["swap_gap_histogram"], {"3": 1})
         self.assertEqual(result["gap_two_fraction"], 0.0)
         self.assertEqual(result["drawn_frame_ms"]["mean"], 9.0)
+
+    def test_wall_cadence_rows_join_exact_indices_and_preserve_stalls(self) -> None:
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 2.0, False),
+                row(2, 3.0, True),
+                cadence_row(index=0, interval_ms=16.0, outside_ms=0.0),
+                cadence_row(
+                    index=1,
+                    interval_ms=365.0,
+                    start_debt_ms=348.0,
+                    wake_overshoot_ms=338.0,
+                    reanchored=True,
+                    outside_ms=338.0,
+                ),
+                "[wall-swap-seq] 2,381.0000",
+            ]
+        )
+        cadence = MODULE.summarize(text)["wall_cadence"]
+        self.assertTrue(cadence["available"])
+        self.assertEqual(cadence["completed_intervals"], 2)
+        self.assertEqual(cadence["reanchors"], 1)
+        self.assertEqual(cadence["swap_to_swap_ms"]["max"], 381.0)
+        self.assertEqual(cadence["totals_ms"]["outside_residual_ms"], 338.0)
+        self.assertEqual(
+            cadence["distributions_ms"]["wake_overshoot_ms"]["max"], 338.0
+        )
+
+    def test_wall_cadence_index_without_a_pump_is_rejected(self) -> None:
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 2.0, False),
+                row(2, 3.0, True),
+                cadence_row(index=3, interval_ms=16.0),
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "has no matching pump row"):
+            MODULE.summarize(text)
+
+    def test_wall_cadence_rejects_negative_indices_and_non_boolean_reanchor(self) -> None:
+        base = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 2.0, False),
+                row(2, 3.0, True),
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            MODULE.summarize(base + "\n" + cadence_row(index=-1, interval_ms=16.0))
+        invalid_reanchor = cadence_row(index=0, interval_ms=16.0).split(",")
+        invalid_reanchor[6] = "2"
+        with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+            MODULE.summarize(base + "\n" + ",".join(invalid_reanchor))
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            MODULE.summarize(base + "\n[wall-swap-seq] -1,33.0000")
 
     def test_missing_sequence_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "no \\[pump-seq\\] rows"):

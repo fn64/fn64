@@ -1058,7 +1058,10 @@ mod game {
                 self.present_cache.synchronize_policy(video_policy_before);
                 self.present_cache.synchronize_policy(video_policy_after);
             }
-            self.present_times.record(present_started.elapsed());
+            let present_wall = present_started.elapsed();
+            self.present_times.record(present_wall);
+            self.pump_census
+                .record_present(present_started, present_wall);
 
             if !self.reported_first_frame {
                 let swaps = fn64_abi::vi_swap_count();
@@ -1598,9 +1601,17 @@ mod game {
                 // adds no clock to the hot loop (perf-method rule 17 -- a
                 // predicted instrumentation cost was once wrong by 56x, so
                 // the instrument that adds no timer is the one to prefer).
-                self.pump_census.before_pump();
+                self.pump_census
+                    .before_pump(now_t, self.next_frame_deadline);
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
+                let start_debt = now_t.saturating_duration_since(self.next_frame_deadline);
+                let reanchored = start_debt >= FRAME;
+                let following_deadline = if reanchored {
+                    now_t + FRAME
+                } else {
+                    self.next_frame_deadline + FRAME
+                };
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
                 // flip on microsecond scheduler jitter -- measured at 50.4%
@@ -1615,10 +1626,15 @@ mod game {
                 if let Some(interval) = hud_interval {
                     self.hud_timing.record(interval, pump_wall);
                 }
-                if self
-                    .pump_census
-                    .after_pump(pump_wall, outcome.steps, outcome.swapped)
-                {
+                if self.pump_census.after_pump(
+                    pump_wall,
+                    outcome.steps,
+                    outcome.swapped,
+                    now_t,
+                    self.next_frame_deadline,
+                    following_deadline,
+                    reanchored,
+                ) {
                     // Bounded run: a windowed benchmark that needs a human to
                     // close the window cannot be repeated identically, and
                     // "any timing claim needs repeated runs" is the bar.
@@ -1660,12 +1676,7 @@ mod game {
                 }
                 // Catch-up-free schedule: hold cadence while we keep up,
                 // re-anchor (dropping missed frames) when we fall behind.
-                self.next_frame_deadline =
-                    if now_t.saturating_duration_since(self.next_frame_deadline) < FRAME {
-                        self.next_frame_deadline + FRAME
-                    } else {
-                        now_t + FRAME
-                    };
+                self.next_frame_deadline = following_deadline;
                 if !self.should_suppress_pump_redraw() {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
