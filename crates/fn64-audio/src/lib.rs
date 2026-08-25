@@ -142,10 +142,7 @@ impl AudioConfig {
 pub struct AudioStreamHealth {
     pub callbacks: u64,
     pub requested_sample_slots: HostSampleSlotCount,
-    /// Compatibility total: empty-ring plus producer-lock-miss silence.
     pub underrun_sample_slots: HostSampleSlotCount,
-    pub empty_ring_underrun_sample_slots: HostSampleSlotCount,
-    pub lock_miss_underrun_sample_slots: HostSampleSlotCount,
     pub late_callbacks: u64,
     pub max_callback_gap_us: u64,
 }
@@ -388,34 +385,13 @@ fn drain_ring_into_f32(mut ring: MutexGuard<'_, OutputRing>, output: &mut [f32])
 /// Never wait on the emulation thread from cpal's realtime callback. A busy
 /// producer is indistinguishable from an empty ring for this one pull: both
 /// must become silence and both are included in `underrun_sample_slots`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RingUnderrun {
-    empty_ring_sample_slots: usize,
-    lock_miss_sample_slots: usize,
-}
-
-impl RingUnderrun {
-    fn total(self) -> usize {
-        self.empty_ring_sample_slots + self.lock_miss_sample_slots
-    }
-}
-
-fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> RingUnderrun {
+fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> usize {
     match ring.try_lock() {
-        Ok(guard) => RingUnderrun {
-            empty_ring_sample_slots: drain_ring_into_f32(guard, output),
-            lock_miss_sample_slots: 0,
-        },
-        Err(TryLockError::Poisoned(error)) => RingUnderrun {
-            empty_ring_sample_slots: drain_ring_into_f32(error.into_inner(), output),
-            lock_miss_sample_slots: 0,
-        },
+        Ok(guard) => drain_ring_into_f32(guard, output),
+        Err(TryLockError::Poisoned(error)) => drain_ring_into_f32(error.into_inner(), output),
         Err(TryLockError::WouldBlock) => {
             output.fill(0.0);
-            RingUnderrun {
-                empty_ring_sample_slots: 0,
-                lock_miss_sample_slots: output.len(),
-            }
+            output.len()
         }
     }
 }
@@ -455,8 +431,6 @@ pub struct CpalBackend {
     callback_count: Arc<AtomicU64>,
     requested_sample_slots: Arc<AtomicU64>,
     underrun_sample_slots: Arc<AtomicU64>,
-    empty_ring_underrun_sample_slots: Arc<AtomicU64>,
-    lock_miss_underrun_sample_slots: Arc<AtomicU64>,
     late_callbacks: Arc<AtomicU64>,
     max_callback_gap_us: Arc<AtomicU64>,
     output_dump: Option<PcmStreamDump>,
@@ -484,8 +458,6 @@ impl CpalBackend {
             callback_count: Arc::new(AtomicU64::new(0)),
             requested_sample_slots: Arc::new(AtomicU64::new(0)),
             underrun_sample_slots: Arc::new(AtomicU64::new(0)),
-            empty_ring_underrun_sample_slots: Arc::new(AtomicU64::new(0)),
-            lock_miss_underrun_sample_slots: Arc::new(AtomicU64::new(0)),
             late_callbacks: Arc::new(AtomicU64::new(0)),
             max_callback_gap_us: Arc::new(AtomicU64::new(0)),
             output_dump: None,
@@ -805,9 +777,6 @@ impl AudioBackend for CpalBackend {
             let callback_count = Arc::clone(&self.callback_count);
             let requested_sample_slots = Arc::clone(&self.requested_sample_slots);
             let underrun_sample_slots = Arc::clone(&self.underrun_sample_slots);
-            let empty_ring_underrun_sample_slots =
-                Arc::clone(&self.empty_ring_underrun_sample_slots);
-            let lock_miss_underrun_sample_slots = Arc::clone(&self.lock_miss_underrun_sample_slots);
             let late_callbacks = Arc::clone(&self.late_callbacks);
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
             let mut last_pull = None;
@@ -834,11 +803,7 @@ impl AudioBackend for CpalBackend {
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let underrun = try_drain_ring_into_f32(&callback_ring, data);
-                        underrun_sample_slots.fetch_add(underrun.total() as u64, Ordering::Relaxed);
-                        empty_ring_underrun_sample_slots
-                            .fetch_add(underrun.empty_ring_sample_slots as u64, Ordering::Relaxed);
-                        lock_miss_underrun_sample_slots
-                            .fetch_add(underrun.lock_miss_sample_slots as u64, Ordering::Relaxed);
+                        underrun_sample_slots.fetch_add(underrun as u64, Ordering::Relaxed);
                     },
                     move |err| {
                         // cpal stream error callback: no runtime state to
@@ -1013,13 +978,6 @@ impl AudioBackend for CpalBackend {
             ),
             underrun_sample_slots: HostSampleSlotCount::new(
                 self.underrun_sample_slots.load(Ordering::Relaxed),
-            ),
-            empty_ring_underrun_sample_slots: HostSampleSlotCount::new(
-                self.empty_ring_underrun_sample_slots
-                    .load(Ordering::Relaxed),
-            ),
-            lock_miss_underrun_sample_slots: HostSampleSlotCount::new(
-                self.lock_miss_underrun_sample_slots.load(Ordering::Relaxed),
             ),
             late_callbacks: self.late_callbacks.load(Ordering::Relaxed),
             max_callback_gap_us: self.max_callback_gap_us.load(Ordering::Relaxed),
@@ -1318,43 +1276,13 @@ mod tests {
         let producer_guard = ring.lock().unwrap();
         let mut output = [99.0; 5];
 
-        assert_eq!(
-            try_drain_ring_into_f32(&ring, &mut output),
-            RingUnderrun {
-                empty_ring_sample_slots: 0,
-                lock_miss_sample_slots: 5,
-            }
-        );
+        assert_eq!(try_drain_ring_into_f32(&ring, &mut output), 5);
         assert_eq!(output, [0.0; 5]);
         assert_eq!(
             producer_guard.samples.len(),
             3,
             "contention consumes nothing"
         );
-    }
-
-    #[test]
-    fn realtime_callback_distinguishes_empty_ring_from_producer_lock_miss() {
-        let mut output_ring = OutputRing::with_capacity(8);
-        output_ring.push_dma(&[i16::MAX], dma_bytes(2));
-        let ring = Arc::new(Mutex::new(output_ring));
-        let mut output = [99.0; 3];
-
-        let underrun = try_drain_ring_into_f32(&ring, &mut output);
-        assert_eq!(
-            underrun,
-            RingUnderrun {
-                empty_ring_sample_slots: 2,
-                lock_miss_sample_slots: 0,
-            }
-        );
-        assert_eq!(underrun.total(), 2);
-        assert_eq!(
-            underrun.total(),
-            underrun.empty_ring_sample_slots + underrun.lock_miss_sample_slots,
-            "the compatibility total must close over the two causal buckets"
-        );
-        assert_eq!(output, [i16::MAX as f32 / 32768.0, 0.0, 0.0]);
     }
 
     #[test]

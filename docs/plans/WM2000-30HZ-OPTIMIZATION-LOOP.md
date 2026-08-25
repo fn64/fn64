@@ -47,27 +47,6 @@ reachable route. The first attribution pass will separate GPU host preparation,
 dispatch span, wait, map/readback, and CPU fallback-member categories before
 selecting the next optimization.
 
-`FN64_SCHEDULER_FRAME_DEBT=1` arms a default-off audio/video scheduling A/B.
-The legacy deadline rule preserves cadence only while the next event-loop turn
-starts less than one field late. A heavy pump can finish in that window, then
-its separately dispatched redraw/presentation pushes the following turn past
-one field; legacy scheduling reanchors there and drops the otherwise cheap
-retrace that produces the next audio task. The A/B retains that fact as a
-typed, renderer-independent one-field debt after the pump has fully returned.
-The next event-loop turn clears the debt before advancing exactly one ordinary
-`next_vi_deadline`; it then reanchors from a fresh post-pump/redraw-request
-instant and cannot rearm itself. There is never a second pump in one
-`about_to_wait` callback, so close/input/redraw events retain an opportunity
-between retraces and guest retraces, audio tasks, and RSP ownership are never
-coalesced. The heartbeat reports cumulative `scheduler_debt` retained,
-catch-up, reanchor, and maximum-debt counters; `max_debt` is structurally at
-most one. Unset or `0` preserves the prior deadline rule and zero counters.
-
-Audio health now partitions the compatibility `underrun_sample_slots` total
-into `empty_ring` and `lock_miss` slots. The realtime callback still uses
-`try_lock` and silence on contention; the split changes only evidence, not
-callback or producer ownership.
-
 ## Goal and acceptance bar
 
 The target is the all-Rust `rs + wgpu` play lane at WM2000's native 30 Hz.
