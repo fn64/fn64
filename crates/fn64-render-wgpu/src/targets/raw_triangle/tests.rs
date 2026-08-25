@@ -2188,7 +2188,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         true,
     )
     .expect("full-coverage fixture program is exactly admitted")
-    .shader_program();
+    .shader_id();
     let full_coverage_triangle = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(environment, primitive)
         .with_program(full_coverage_program)];
@@ -2260,7 +2260,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
                     true,
                 )
                 .expect("fog fixture program is exactly admitted")
-                .shader_program(),
+                .shader_id(),
             ),
         crate::ComputeCoverageTriangle::from_raw(triangle)
             .with_material(second_environment, second_primitive)
@@ -2271,31 +2271,17 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
                     true,
                 )
                 .expect("fog fixture program is exactly admitted")
-                .shader_program(),
+                .shader_id(),
             ),
     ];
-    let fog_dispatches = [crate::targets::ComputeHotColorDispatch {
-        triangles: &fog_triangles,
-        tmem: &projection,
-        tile: tile_params,
-        first_row: 0,
-        row_count: height,
-        first_column: 0,
-        column_count: width,
-    }];
-    assert_eq!(
-        renderer.compute_p2_plan_cache_counters(),
-        Default::default(),
-        "the default-off path must not attempt or hit the schedule cache"
-    );
-    renderer.set_compute_p2_plan_cache_enabled(true);
-    let mut cached_resource_generation = None;
     for run in 1..=10 {
         let actual = renderer
-            .compute_triangle_hot_color_chain(
+            .compute_triangle_hot_color(
                 crate::TriangleTargetExtent { width, height },
                 &resident,
-                &fog_dispatches,
+                &fog_triangles,
+                &projection,
+                tile_params,
             )
             .expect("fog compute color must complete");
         if actual != fog_expected {
@@ -2314,103 +2300,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
                 &fog_expected[byte / 2 * 2..byte / 2 * 2 + 2],
             );
         }
-        let generation = renderer.compute_hot_color_resource_generations();
-        if let Some(expected) = cached_resource_generation {
-            assert_eq!(
-                generation, expected,
-                "cache hit {run} must not grow compute resources"
-            );
-        } else {
-            cached_resource_generation = Some(generation);
-        }
     }
-    assert_eq!(
-        renderer.compute_p2_plan_cache_counters(),
-        crate::targets::triangle_pipeline::ComputeP2PlanCacheCounters {
-            attempts: 10,
-            hits: 9,
-            cold_misses: 1,
-            ..Default::default()
-        },
-        "the ten-run P2 differential must build once and reuse nine times"
-    );
-
-    let mut mutated_projection = projection;
-    mutated_projection.bytes[0] ^= 0xff;
-    let mut mutated_resident = resident.clone();
-    mutated_resident[0] ^= 0x7f;
-    let mutated_raw = bench_textured_triangle(18.0, 14);
-    let mutated_triangles = [
-        crate::ComputeCoverageTriangle::from_raw(mutated_raw)
-            .with_material(second_environment, primitive)
-            .with_program(
-                crate::targets::ComputeRasterProgramKey::try_admit_program(
-                    CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
-                    fog_mode,
-                    true,
-                )
-                .unwrap()
-                .shader_program(),
-            ),
-        crate::ComputeCoverageTriangle::from_raw(mutated_raw)
-            .with_material(environment, second_primitive)
-            .with_program(
-                crate::targets::ComputeRasterProgramKey::try_admit_program(
-                    CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
-                    fog_mode,
-                    true,
-                )
-                .unwrap()
-                .shader_program(),
-            ),
-    ];
-    let mutated_dispatches = [crate::targets::ComputeHotColorDispatch {
-        triangles: &mutated_triangles,
-        tmem: &mutated_projection,
-        tile: tile_params.with_lut_mode(crate::TextureLutMode::Rgba16),
-        ..fog_dispatches[0]
-    }];
-    let cached_mutation = renderer
-        .compute_triangle_hot_color_chain(
-            crate::TriangleTargetExtent { width, height },
-            &mutated_resident,
-            &mutated_dispatches,
-        )
-        .expect("live P2 payload mutation must complete through cached schedule");
-    renderer.set_compute_p2_plan_cache_enabled(false);
-    let uncached_mutation = renderer
-        .compute_triangle_hot_color_chain(
-            crate::TriangleTargetExtent { width, height },
-            &mutated_resident,
-            &mutated_dispatches,
-        )
-        .expect("live P2 payload mutation must complete through uncached planner");
-    assert_eq!(cached_mutation, uncached_mutation);
-    assert_eq!(renderer.compute_p2_plan_cache_counters().hits, 10);
-
-    let mut poisoned_projection = mutated_projection;
-    poisoned_projection.validity_words.fill(0);
-    let poisoned_dispatches = [crate::targets::ComputeHotColorDispatch {
-        tmem: &poisoned_projection,
-        ..mutated_dispatches[0]
-    }];
-    renderer.set_compute_p2_plan_cache_enabled(true);
-    let cached_poison = renderer
-        .compute_triangle_hot_color_chain(
-            crate::TriangleTargetExtent { width, height },
-            &mutated_resident,
-            &poisoned_dispatches,
-        )
-        .expect_err("cached P2 schedule must retain invalid-TMEM refusal");
-    renderer.set_compute_p2_plan_cache_enabled(false);
-    let uncached_poison = renderer
-        .compute_triangle_hot_color_chain(
-            crate::TriangleTargetExtent { width, height },
-            &mutated_resident,
-            &poisoned_dispatches,
-        )
-        .expect_err("uncached P2 planner must retain invalid-TMEM refusal");
-    assert_eq!(format!("{cached_poison:?}"), format!("{uncached_poison:?}"));
 
     let coverage_fog_mode = OtherMode::from_wire(0x0018_ac8f, 0x0f0a_7008);
     let coverage_fog_environment = Color4::from_wire(u32::MAX);
@@ -2442,7 +2332,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         .to_vec();
     let coverage_fog_triangles = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(coverage_fog_environment, coverage_fog_primitive)
-        .with_program(crate::targets::ComputeRasterShaderProgram::CoverageFog)];
+        .with_program(crate::targets::ComputeRasterShaderProgram::coverage_fog_fixture())];
     let coverage_fog_tile_params =
         crate::TileBindingParams::bound(coverage_fog_tile.descriptor(), coverage_fog_tile.size())
             .with_lut_mode(crate::TextureLutMode::Rgba16);
@@ -2602,169 +2492,8 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
     }
     assert_eq!(
         renderer.compute_hot_color_resource_generations(),
-        3,
-        "the three chain shapes must add exactly two high-water slots"
-    );
-}
-
-#[test]
-#[ignore = "release native-GPU P2 schedule-cache kill gate; run with --ignored --nocapture"]
-fn compute_p2_prepared_schedule_cache_release_gate() {
-    use std::future::Future;
-    use std::pin::pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct ThreadWaker(std::thread::Thread);
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
-        let mut context = Context::from_waker(&waker);
-        let mut future = pin!(future);
-        loop {
-            match Future::poll(future.as_mut(), &mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::thread::park(),
-            }
-        }
-    }
-
-    let requested = block_on(
-        crate::UninitializedTrianglePipeline::new(crate::HeadlessBackend::AnyNative).request(),
-    )
-    .unwrap();
-    let mut renderer = match requested {
-        crate::TrianglePipelineDeviceOutcome::Ready(renderer) => renderer,
-        crate::TrianglePipelineDeviceOutcome::NoAdapter(no_adapter) => panic!(
-            "required host GPU evidence unavailable: typed no-adapter for {:?}",
-            no_adapter.requested()
-        ),
-    };
-    let extent = crate::TriangleTargetExtent {
-        width: 320,
-        height: 240,
-    };
-    let resident = vec![0u8; (extent.width * extent.height * 2) as usize];
-    let raw = bench_textured_triangle(300.0, 220);
-    let mode = OtherMode::from_wire(0x0018_ac8f, 0x0050_4240);
-    let program = crate::targets::ComputeRasterProgramKey::try_admit_program(
-        CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
-        mode,
-        true,
-    )
-    .unwrap()
-    .shader_program();
-    let triangles = (0..4)
-        .map(|index| {
-            crate::ComputeCoverageTriangle::from_raw(raw)
-                .with_material(
-                    Color4::from_wire(ENV_WIRE ^ index * 0x0101_0101),
-                    PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE ^ index * 0x1010_1010),
-                )
-                .with_program(program)
-        })
-        .collect::<Vec<_>>();
-    let tmem = BenchTmem::new();
-    let projection = tmem.projection();
-    let tile = bench_tile_binding();
-    let tile = crate::TileBindingParams::bound(tile.descriptor(), tile.size())
-        .with_lut_mode(crate::TextureLutMode::Disabled);
-    let dispatches = (0..27)
-        .map(|index| crate::targets::ComputeHotColorDispatch {
-            triangles: &triangles[..1 + index as usize % 4],
-            tmem: &projection,
-            tile,
-            first_row: (index * 8) % 208,
-            row_count: 32,
-            first_column: 0,
-            column_count: extent.width,
-        })
-        .collect::<Vec<_>>();
-    let checkpoints = [9, 18, 27];
-
-    renderer.set_compute_p2_plan_cache_enabled(false);
-    let uncached = renderer
-        .compute_triangle_hot_color_chain_checkpoints(extent, &resident, &dispatches, &checkpoints)
-        .unwrap();
-    renderer.set_compute_p2_plan_cache_enabled(true);
-    let cached = renderer
-        .compute_triangle_hot_color_chain_checkpoints(extent, &resident, &dispatches, &checkpoints)
-        .unwrap();
-    assert_eq!(cached, uncached);
-    for _ in 0..4 {
-        renderer
-            .compute_triangle_hot_color_chain_checkpoints(
-                extent,
-                &resident,
-                &dispatches,
-                &checkpoints,
-            )
-            .unwrap();
-    }
-
-    let mut uncached_ns = Vec::with_capacity(15);
-    let mut cached_ns = Vec::with_capacity(15);
-    for sample in 0..15 {
-        let measure_uncached = |renderer: &mut crate::TrianglePipelineRenderer| {
-            renderer.set_compute_p2_plan_cache_enabled(false);
-            let start = std::time::Instant::now();
-            renderer
-                .compute_triangle_hot_color_chain_checkpoints(
-                    extent,
-                    &resident,
-                    &dispatches,
-                    &checkpoints,
-                )
-                .unwrap();
-            start.elapsed().as_nanos()
-        };
-        let measure_cached = |renderer: &mut crate::TrianglePipelineRenderer| {
-            renderer.set_compute_p2_plan_cache_enabled(true);
-            let start = std::time::Instant::now();
-            renderer
-                .compute_triangle_hot_color_chain_checkpoints(
-                    extent,
-                    &resident,
-                    &dispatches,
-                    &checkpoints,
-                )
-                .unwrap();
-            start.elapsed().as_nanos()
-        };
-        if sample & 1 == 0 {
-            uncached_ns.push(measure_uncached(&mut renderer));
-            cached_ns.push(measure_cached(&mut renderer));
-        } else {
-            cached_ns.push(measure_cached(&mut renderer));
-            uncached_ns.push(measure_uncached(&mut renderer));
-        }
-    }
-    uncached_ns.sort_unstable();
-    cached_ns.sort_unstable();
-    let uncached_median = uncached_ns[uncached_ns.len() / 2] as f64;
-    let cached_median = cached_ns[cached_ns.len() / 2] as f64;
-    let reduction = (uncached_median - cached_median) / uncached_median;
-    let counters = renderer.compute_p2_plan_cache_counters();
-    let hit_rate = counters.hits as f64 / counters.attempts as f64;
-    println!(
-        "[compute-p2-plan-cache-gate] uncached_median_ns={uncached_median:.0} cached_median_ns={cached_median:.0} reduction={:.1}% attempts={} hits={} hit_rate={:.1}%",
-        reduction * 100.0,
-        counters.attempts,
-        counters.hits,
-        hit_rate * 100.0,
-    );
-    assert!(
-        hit_rate >= 0.90,
-        "representative P2 shape hit rate must be at least 90%"
-    );
-    assert!(
-        reduction >= 0.10,
-        "P2 schedule cache must reduce the same full chain by at least 10%; measured {:.1}%",
-        reduction * 100.0,
+        2,
+        "ten identical two-dispatch chains must add exactly one high-water slot"
     );
 }
 

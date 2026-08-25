@@ -2068,7 +2068,7 @@ impl ComputeRasterProbeBuilder {
         self.triangles.push(
             ComputeCoverageTriangle::from_raw(triangle)
                 .with_material(draw.env_color, draw.prim_color)
-                .with_program(program.shader_program()),
+                .with_program(program.shader_id()),
         );
         Ok(ComputeRasterProbePush::Admitted)
     }

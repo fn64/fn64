@@ -27,29 +27,10 @@ pub(crate) const COVERAGE_FOG_COMBINE_LOW: u32 = 0xfc15_fea3;
 pub(crate) const COVERAGE_FOG_COMBINE_HIGH: u32 = 0xf00f_f23f;
 pub(crate) const COVERAGE_FOG_OTHER_MODE_HIGH: u32 = 0x0018_ac8f;
 pub(crate) const COVERAGE_FOG_OTHER_MODE_LOW: u32 = 0x0f0a_7008;
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ComputeRasterShaderProgram {
-    #[default]
-    Hot,
-    FullCoverage,
-    Fog,
-    CoverageFog,
-}
-
-impl ComputeRasterShaderProgram {
-    pub(crate) const fn wire_id(self) -> u32 {
-        match self {
-            Self::Hot => 0,
-            Self::FullCoverage => 1,
-            Self::Fog => 2,
-            Self::CoverageFog => 3,
-        }
-    }
-
-    pub(crate) const fn has_prepared_p2_schedule(self) -> bool {
-        matches!(self, Self::Fog)
-    }
-}
+const HOT_PROGRAM_ID: u32 = 0;
+const FULL_COVERAGE_PROGRAM_ID: u32 = 1;
+const FOG_PROGRAM_ID: u32 = 2;
+const COVERAGE_FOG_PROGRAM_ID: u32 = 3;
 
 /// The one complete RDP program admitted by the first compute prototype.
 /// Raw halves are retained because a shader pipeline key must distinguish
@@ -124,26 +105,22 @@ impl ComputeRasterProgramKey {
         ]
     }
 
-    pub(crate) fn shader_program(self) -> ComputeRasterShaderProgram {
+    pub(crate) fn shader_id(self) -> u32 {
         match self.words() {
             [HOT_COMBINE_LOW, HOT_COMBINE_HIGH, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW] => {
-                ComputeRasterShaderProgram::Hot
+                HOT_PROGRAM_ID
             }
             [FULL_COVERAGE_COMBINE_LOW, FULL_COVERAGE_COMBINE_HIGH, FULL_COVERAGE_OTHER_MODE_HIGH, FULL_COVERAGE_OTHER_MODE_LOW] => {
-                ComputeRasterShaderProgram::FullCoverage
+                FULL_COVERAGE_PROGRAM_ID
             }
             [FOG_COMBINE_LOW, FOG_COMBINE_HIGH, FOG_OTHER_MODE_HIGH, FOG_OTHER_MODE_LOW] => {
-                ComputeRasterShaderProgram::Fog
+                FOG_PROGRAM_ID
             }
             [COVERAGE_FOG_COMBINE_LOW, COVERAGE_FOG_COMBINE_HIGH, COVERAGE_FOG_OTHER_MODE_HIGH, COVERAGE_FOG_OTHER_MODE_LOW] => {
-                ComputeRasterShaderProgram::CoverageFog
+                COVERAGE_FOG_PROGRAM_ID
             }
             _ => unreachable!("an admitted compute program has an exact shader identity"),
         }
-    }
-
-    pub(crate) fn shader_id(self) -> u32 {
-        self.shader_program().wire_id()
     }
 }
 
@@ -380,10 +357,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(
-            full_coverage.shader_program(),
-            ComputeRasterShaderProgram::FullCoverage
-        );
+        assert_eq!(full_coverage.shader_id(), FULL_COVERAGE_PROGRAM_ID);
         let fog = ComputeRasterProgramKey::try_admit(
             rgba16_target,
             CombineParams::from_wire(FOG_COMBINE_LOW, FOG_COMBINE_HIGH),
@@ -391,7 +365,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(fog.shader_program(), ComputeRasterShaderProgram::Fog);
+        assert_eq!(fog.shader_id(), FOG_PROGRAM_ID);
         assert!(matches!(
             ComputeRasterProgramKey::try_admit(
                 rgba16_target,
