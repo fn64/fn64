@@ -46,9 +46,9 @@ use fn64_render::{
 };
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CapturedGuestRead, CompletedWrite,
-    DecodedTicket, DeferredBackendEffectReport, FastContentDigest, PhysicalRange, ResourceAccess,
-    ResourceJournal, ResourceJournalLimits, SubmittedTicket, TicketAuthoritySet, ValidationError,
-    WorkloadAdmission, WorkloadPacket,
+    DecodedTicket, DeferredBackendEffectReport, DeferredGuestRead, FastContentDigest,
+    PhysicalRange, ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion,
+    SubmittedTicket, TicketAuthoritySet, ValidationError, WorkloadAdmission, WorkloadPacket,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -523,6 +523,32 @@ mod task_cpu_phase_census {
             );
             assert_eq!(value, 9);
             assert_eq!(task.phase_ns[Phase::PrefixCapture as usize], 11);
+            assert!(ticks.next().is_none());
+        }
+
+        #[test]
+        fn captured_read_binding_time_is_accounted_to_the_member_load_phase() {
+            let mut task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                cpu_member_ns: 29,
+                members: 1,
+                publications_remaining: 1,
+            };
+            let mut ticks = [TestInstant(5), TestInstant(18)].into_iter();
+            let value = timed_optional_with_clock(
+                Some(&mut task),
+                Phase::SourceBindingLoad,
+                || 17,
+                || {
+                    ticks
+                        .next()
+                        .expect("enabled binding timing reads exactly two clocks")
+                },
+            );
+            assert_eq!(value, 17);
+            assert_eq!(task.phase_ns[Phase::SourceBindingLoad as usize], 13);
+            assert_eq!(task.member_accounted_ns(), 13);
+            assert_eq!(task.residual_ns(), 16);
             assert!(ticks.next().is_none());
         }
 
@@ -3193,8 +3219,100 @@ impl CapturedGuestReadBytes {
 /// distinct value even when the task pool shares its payload allocation with
 /// another packet's binding.
 struct CapturedGuestReadBinding {
-    access_index: u32,
+    read: DeferredGuestRead,
     bytes: CapturedGuestReadBytes,
+}
+
+struct IndexedCapturedGuestRead {
+    access: ResourceAccess,
+    bytes: CapturedGuestReadBytes,
+}
+
+/// Packet-sized, access-indexed authority over finalized captured reads.
+///
+/// `pending` exists only between `captured_reads` and `submitted_packet` in
+/// the sealed execution view. Binding consumes it once, validates every
+/// descriptor against the packet's exact journal access, and leaves direct
+/// indexing as the only production lookup path.
+#[derive(Default)]
+struct CapturedGuestReadAuthority {
+    pending: Vec<CapturedGuestReadBinding>,
+    by_access: Vec<Option<IndexedCapturedGuestRead>>,
+}
+
+impl CapturedGuestReadAuthority {
+    fn clear_and_reserve(&mut self, len: usize) {
+        self.pending.clear();
+        self.pending.reserve(len);
+        self.by_access.clear();
+    }
+
+    fn push(&mut self, read: DeferredGuestRead, bytes: CapturedGuestReadBytes) {
+        self.pending.push(CapturedGuestReadBinding { read, bytes });
+    }
+
+    fn bind_packet(&mut self, packet: &WorkloadPacket) -> Result<(), WgpuRawDpcExecutionError> {
+        self.bind_accesses(packet.journal().accesses())
+    }
+
+    fn bind_accesses(
+        &mut self,
+        accesses: &[ResourceAccess],
+    ) -> Result<(), WgpuRawDpcExecutionError> {
+        self.by_access.clear();
+        self.by_access.resize_with(accesses.len(), || None);
+
+        for binding in self.pending.drain(..) {
+            let access_index = binding.read.access_index();
+            let index = usize::try_from(access_index).map_err(|_| {
+                WgpuRawDpcExecutionError::CapturedSourceAccessOutOfRange { access_index }
+            })?;
+            let expected = accesses
+                .get(index)
+                .copied()
+                .ok_or(WgpuRawDpcExecutionError::CapturedSourceAccessOutOfRange { access_index })?;
+            let descriptor_matches = binding.read.operation() == expected.operation()
+                && expected.mode() == AccessMode::Read
+                && expected.purpose() == AccessPurpose::TmemLoadSource
+                && matches!(
+                    expected.region(),
+                    ResourceRegion::Rdram { resource, range }
+                        if resource == binding.read.resource() && range == binding.read.range()
+                );
+            if !descriptor_matches {
+                return Err(WgpuRawDpcExecutionError::CapturedSourceAccessMismatch {
+                    access_index,
+                });
+            }
+            let slot = &mut self.by_access[index];
+            if slot.is_some() {
+                return Err(WgpuRawDpcExecutionError::DuplicateCapturedSource { access_index });
+            }
+            *slot = Some(IndexedCapturedGuestRead {
+                access: expected,
+                bytes: binding.bytes,
+            });
+        }
+
+        for (index, access) in accesses.iter().enumerate() {
+            if access.purpose() == AccessPurpose::TmemLoadSource && self.by_access[index].is_none()
+            {
+                return Err(WgpuRawDpcExecutionError::MissingCapturedSourceAccess {
+                    access_index: u32::try_from(index)
+                        .expect("packet resource-access count exceeds u32"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn bytes(&self, access_index: u32, expected: ResourceAccess) -> Option<&[u8]> {
+        let indexed = self
+            .by_access
+            .get(usize::try_from(access_index).ok()?)?
+            .as_ref()?;
+        (indexed.access == expected).then(|| indexed.bytes.as_slice())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3251,7 +3369,7 @@ struct ExecutionCollector<'coord> {
     ordinal: u64,
     submission: fn64_render_ir::SubmissionIdentity,
     plan: PlanCollector,
-    reads: Vec<CapturedGuestReadBinding>,
+    reads: CapturedGuestReadAuthority,
     task_guest_read_pool: Option<&'coord mut TaskGuestReadCapturePool>,
     outcome: Option<Result<StagedOutcome, WgpuRawDpcExecutionError>>,
     /// The lazily-built color-target registry, borrowed for the duration of
@@ -3424,21 +3542,29 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
     }
 
     fn captured_reads(&mut self, reads: &[CapturedGuestRead]) {
-        self.reads.clear();
-        self.reads.reserve(reads.len());
+        self.reads.clear_and_reserve(reads.len());
         for captured in reads {
             let bytes = match self.task_guest_read_pool.as_deref_mut() {
                 Some(pool) => pool.intern(captured),
                 None => CapturedGuestReadBytes::copied(captured.bytes()),
             };
-            self.reads.push(CapturedGuestReadBinding {
-                access_index: captured.read().access_index(),
-                bytes,
-            });
+            self.reads.push(captured.read(), bytes);
         }
     }
 
     fn submitted_packet(&mut self, packet: &WorkloadPacket) {
+        let cpu_phase_attributed =
+            self.task_cpu_phase_census.is_some() && ordered_depth_free_acff_triangle_member(self);
+        let binding = task_cpu_phase_census::timed(
+            self.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::Phase::SourceBindingLoad,
+            || self.reads.bind_packet(packet),
+        );
+        if let Err(error) = binding {
+            self.outcome = Some(Err(error));
+            return;
+        }
         self.outcome = Some(raw_dpc_execute_census::timed(
             raw_dpc_execute_census::Phase::Stage,
             || stage_and_report(self, packet),
@@ -3464,6 +3590,18 @@ pub enum WgpuRawDpcExecutionError {
     /// access list disagrees with what the ABI-side capture supplied.
     MissingCapturedSource {
         command_index: u32,
+    },
+    CapturedSourceAccessOutOfRange {
+        access_index: u32,
+    },
+    DuplicateCapturedSource {
+        access_index: u32,
+    },
+    CapturedSourceAccessMismatch {
+        access_index: u32,
+    },
+    MissingCapturedSourceAccess {
+        access_index: u32,
     },
     /// A plan with zero TMEM loads AND zero admitted triangles reached
     /// execution -- there is nothing for this backend to do with it.
@@ -3751,6 +3889,23 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "raw-DPC command #{command_index}'s source bytes are missing from the captured \
                  guest reads"
             ),
+            Self::CapturedSourceAccessOutOfRange { access_index } => write!(
+                formatter,
+                "captured guest-read access index {access_index} is outside the submitted packet"
+            ),
+            Self::DuplicateCapturedSource { access_index } => write!(
+                formatter,
+                "captured guest-read access index {access_index} is bound more than once"
+            ),
+            Self::CapturedSourceAccessMismatch { access_index } => write!(
+                formatter,
+                "captured guest-read access index {access_index} does not match the submitted \
+                 packet's exact TMEM-source access"
+            ),
+            Self::MissingCapturedSourceAccess { access_index } => write!(
+                formatter,
+                "submitted packet TMEM-source access index {access_index} has no captured binding"
+            ),
             Self::NoCompletedLoads => {
                 formatter.write_str("raw-DPC plan reached execution with zero TMEM loads")
             }
@@ -3999,38 +4154,6 @@ fn destination_access_run(accesses: &[ResourceAccess], start: usize) -> &[Resour
     &accesses[start..end]
 }
 
-/// The exact captured source bytes for **every** access in one load's
-/// ordered source run, returned in that same order -- mirrors
-/// `crate::tmem::execute::load_tile::ExactLoadTileGuestReads::bind`'s
-/// binding rule (one `CapturedGuestRead::read().access_index()` match per
-/// declared source access, at `first_access_index + ordinal`), but against
-/// [`ExecutionCollector`]'s owned `(access_index, bytes)` pairs (extracted
-/// from `execution_view`'s finalized `&[CapturedGuestRead]` in
-/// `captured_reads`, since neither the slice nor its elements outlive that
-/// call).
-///
-/// Returns `None` if any fragment of the run is missing, so a partially
-/// captured load is refused rather than executed against the fragments
-/// that happened to arrive. A partial-width `LoadTile` declares one source
-/// read per row, so a 49-row load must find all 49.
-fn load_source_bytes<'a>(
-    reads: &'a [CapturedGuestReadBinding],
-    load: &TmemLoadSemantics,
-) -> Option<Vec<&'a [u8]>> {
-    let first = load.source_access_index();
-    load.sources()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, _)| {
-            let access_index = first.checked_add(u32::try_from(ordinal).ok()?)?;
-            reads
-                .iter()
-                .find(|captured| captured.access_index == access_index)
-                .map(|captured| captured.bytes.as_slice())
-        })
-        .collect()
-}
-
 /// One transfer word's exact captured source-byte slice, bound first to the
 /// **access** the word names (`word.source_access_index()`, resolved
 /// against the load's own `source_access_index()` base) and then by
@@ -4044,12 +4167,14 @@ fn load_source_bytes<'a>(
 /// storing it. Slicing a flattened run at that offset would silently read
 /// the wrong row for every access after the first.
 fn word_source_bytes<'a>(
-    source_bytes: &[&'a [u8]],
+    reads: &'a CapturedGuestReadAuthority,
+    source_accesses: &[ResourceAccess],
     first_access_index: u32,
     word: TmemTransferWord,
 ) -> Option<&'a [u8]> {
     let relative = word.source_access_index().checked_sub(first_access_index)?;
-    let access_bytes = *source_bytes.get(usize::try_from(relative).ok()?)?;
+    let expected = *source_accesses.get(usize::try_from(relative).ok()?)?;
+    let access_bytes = reads.bytes(word.source_access_index(), expected)?;
     let defined = word.defined_source_byte_mask().count_ones() as usize;
     let start = word.source_access_byte_offset() as usize;
     let end = start.checked_add(defined)?;
@@ -5587,7 +5712,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         ordinal: bound.ordinal(),
         submission: bound.submission(),
         plan: PlanCollector::seeded(carry_in),
-        reads: Vec::new(),
+        reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool,
         outcome: None,
         color_targets,
@@ -6480,9 +6605,6 @@ fn stage_and_report(
         if destination_accesses.is_empty() {
             return Err(WgpuRawDpcExecutionError::MalformedDestinationAccessRun { command_index });
         }
-        let source_bytes = load_source_bytes(&collector.reads, load)
-            .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
-
         let mut staged = match packet_transaction.take() {
             None => collector
                 .physical
@@ -6512,8 +6634,13 @@ fn stage_and_report(
                     });
                 }
             }
-            let bytes = word_source_bytes(&source_bytes, load.source_access_index(), word)
-                .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
+            let bytes = word_source_bytes(
+                &collector.reads,
+                load.sources(),
+                load.source_access_index(),
+                word,
+            )
+            .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
             let physical_lanes = map_physical_lanes(load, word, bytes)
                 .map_err(WgpuRawDpcExecutionError::Physical)?;
             let payload = staged
@@ -8164,15 +8291,25 @@ fn execute_scheduled_fill(
     let seed = match (accumulated, fill_seed_access) {
         (Some(bytes), _) => Some(bytes),
         (None, Some(access_index)) => {
-            let captured = collector
-                .reads
-                .iter()
-                .find(|captured| captured.access_index == *access_index)
-                .map(|captured| &captured.bytes)
+            let access_position = usize::try_from(*access_index).map_err(|_| {
+                WgpuRawDpcExecutionError::MissingFillSeedBytes {
+                    access_index: *access_index,
+                }
+            })?;
+            let expected = collector
+                .plan
+                .accesses
+                .get(access_position)
+                .copied()
                 .ok_or(WgpuRawDpcExecutionError::MissingFillSeedBytes {
                     access_index: *access_index,
                 })?;
-            Some(logical_bytes_from_captured_rdram(captured.as_slice()))
+            let captured = collector.reads.bytes(*access_index, expected).ok_or(
+                WgpuRawDpcExecutionError::MissingFillSeedBytes {
+                    access_index: *access_index,
+                },
+            )?;
+            Some(logical_bytes_from_captured_rdram(captured))
         }
         (None, None) => None,
     };
@@ -9223,6 +9360,38 @@ mod tests {
 
     use crate::wire_words::word;
 
+    fn indexed_source_rows(
+        first_access: u32,
+        rows: &[Vec<u8>],
+    ) -> (CapturedGuestReadAuthority, Vec<ResourceAccess>) {
+        let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let mut authority = CapturedGuestReadAuthority::default();
+        authority
+            .by_access
+            .resize_with(first_access as usize + rows.len(), || None);
+        let mut accesses = Vec::with_capacity(rows.len());
+        for (ordinal, bytes) in rows.iter().enumerate() {
+            let access_index = first_access + ordinal as u32;
+            let start = ordinal as u32 * bytes.len() as u32;
+            let access = ResourceAccess::try_new(
+                fn64_render_ir::OperationId::new(access_index),
+                AccessMode::Read,
+                AccessPurpose::TmemLoadSource,
+                ResourceRegion::Rdram {
+                    resource: fn64_render_ir::RdramResource::Buffer,
+                    range: layout.range(start, start + bytes.len() as u32).unwrap(),
+                },
+            )
+            .unwrap();
+            authority.by_access[access_index as usize] = Some(IndexedCapturedGuestRead {
+                access,
+                bytes: CapturedGuestReadBytes::copied(bytes),
+            });
+            accesses.push(access);
+        }
+        (authority, accesses)
+    }
+
     #[test]
     fn compute_replacement_threshold_is_inclusive_and_keeps_small_work_on_cpu() {
         assert!(!compute_raster_replacement_admitted(16_383, 16_384));
@@ -9248,7 +9417,7 @@ mod tests {
         const FIRST_ACCESS: u32 = 1;
 
         let rows: Vec<Vec<u8>> = (0..ROWS).map(|row| vec![row as u8; ROW_BYTES]).collect();
-        let source_bytes: Vec<&[u8]> = rows.iter().map(|row| row.as_slice()).collect();
+        let (reads, source_accesses) = indexed_source_rows(FIRST_ACCESS, &rows);
 
         for row in 0..ROWS {
             let word = TmemTransferWord::new(
@@ -9265,7 +9434,7 @@ mod tests {
                     fn64_render_ir::TmemRange::try_new(row * 8, row * 8 + 8).unwrap(),
                 ),
             );
-            let bytes = word_source_bytes(&source_bytes, FIRST_ACCESS, word)
+            let bytes = word_source_bytes(&reads, &source_accesses, FIRST_ACCESS, word)
                 .expect("every word binds to a row in the run");
             assert_eq!(
                 bytes,
@@ -9283,7 +9452,7 @@ mod tests {
     fn word_source_bytes_refuses_a_word_that_overruns_its_own_row() {
         const ROW_BYTES: usize = 8;
         let rows = [vec![0xaa_u8; ROW_BYTES], vec![0xbb_u8; ROW_BYTES]];
-        let source_bytes: Vec<&[u8]> = rows.iter().map(|row| row.as_slice()).collect();
+        let (reads, source_accesses) = indexed_source_rows(1, &rows);
 
         // Offset 4 with 8 defined bytes runs 4 bytes past row 0's end. If
         // the rows were flattened this would happily return 4 bytes of
@@ -9303,7 +9472,7 @@ mod tests {
             ),
         );
         assert!(
-            word_source_bytes(&source_bytes, 1, overrun).is_none(),
+            word_source_bytes(&reads, &source_accesses, 1, overrun).is_none(),
             "a word may not read past the end of the row it names"
         );
 
@@ -9323,7 +9492,7 @@ mod tests {
                 fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
             ),
         );
-        assert!(word_source_bytes(&source_bytes, 1, before_run).is_none());
+        assert!(word_source_bytes(&reads, &source_accesses, 1, before_run).is_none());
         let past_run = TmemTransferWord::new(
             0,
             0,
@@ -9338,7 +9507,36 @@ mod tests {
                 fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
             ),
         );
-        assert!(word_source_bytes(&source_bytes, 1, past_run).is_none());
+        assert!(word_source_bytes(&reads, &source_accesses, 1, past_run).is_none());
+    }
+
+    #[test]
+    fn word_source_bytes_refuses_a_different_exact_source_access() {
+        let rows = [vec![0xaa_u8; 8]];
+        let (reads, mut source_accesses) = indexed_source_rows(1, &rows);
+        let original = source_accesses[0];
+        source_accesses[0] = ResourceAccess::try_new(
+            original.operation(),
+            AccessMode::Read,
+            AccessPurpose::UploadSource,
+            original.region(),
+        )
+        .unwrap();
+        let word = TmemTransferWord::new(
+            0,
+            0,
+            1,
+            0,
+            0xff,
+            0xff,
+            0,
+            0,
+            false,
+            crate::TmemTransferPhysicalWord::Linear(
+                fn64_render_ir::TmemRange::try_new(0, 8).unwrap(),
+            ),
+        );
+        assert!(word_source_bytes(&reads, &source_accesses, 1, word).is_none());
     }
 
     use crate::wire_words::set_other_mode;
@@ -9695,6 +9893,95 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn captured_binding_fixture() -> (DeferredGuestRead, Vec<ResourceAccess>, Vec<u8>) {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let (planned, bytes) =
+            plan_with_deterministic_reads(&mut backend, &session, one_load_block_words());
+        let read = planned.guest_read_plan().reads()[0];
+        let access = ResourceAccess::try_new(
+            read.operation(),
+            AccessMode::Read,
+            AccessPurpose::TmemLoadSource,
+            ResourceRegion::Rdram {
+                resource: read.resource(),
+                range: read.range(),
+            },
+        )
+        .unwrap();
+        let layout = read.range().layout();
+        let mut accesses: Vec<ResourceAccess> = (0..=read.access_index())
+            .map(|index| {
+                ResourceAccess::try_new(
+                    fn64_render_ir::OperationId::new(index),
+                    AccessMode::Read,
+                    AccessPurpose::CommandDecode,
+                    ResourceRegion::Rdram {
+                        resource: fn64_render_ir::RdramResource::RawCommands,
+                        range: layout.range(0, 4).unwrap(),
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        accesses[read.access_index() as usize] = access;
+        (read, accesses, bytes)
+    }
+
+    #[test]
+    fn captured_read_index_refuses_missing_binding() {
+        let (_, accesses, _) = captured_binding_fixture();
+        let mut authority = CapturedGuestReadAuthority::default();
+        assert!(matches!(
+            authority.bind_accesses(&accesses),
+            Err(WgpuRawDpcExecutionError::MissingCapturedSourceAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn captured_read_index_refuses_duplicate_binding() {
+        let (read, accesses, bytes) = captured_binding_fixture();
+        let mut authority = CapturedGuestReadAuthority::default();
+        authority.push(read, CapturedGuestReadBytes::copied(&bytes));
+        authority.push(read, CapturedGuestReadBytes::copied(&bytes));
+        assert!(matches!(
+            authority.bind_accesses(&accesses),
+            Err(WgpuRawDpcExecutionError::DuplicateCapturedSource { .. })
+        ));
+    }
+
+    #[test]
+    fn captured_read_index_refuses_out_of_range_binding() {
+        let (read, _, bytes) = captured_binding_fixture();
+        let mut authority = CapturedGuestReadAuthority::default();
+        authority.push(read, CapturedGuestReadBytes::copied(&bytes));
+        assert!(matches!(
+            authority.bind_accesses(&[]),
+            Err(WgpuRawDpcExecutionError::CapturedSourceAccessOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn captured_read_index_refuses_wrong_access_binding() {
+        let (read, mut accesses, bytes) = captured_binding_fixture();
+        let wrong = ResourceAccess::try_new(
+            read.operation(),
+            AccessMode::Read,
+            AccessPurpose::UploadSource,
+            ResourceRegion::Rdram {
+                resource: read.resource(),
+                range: read.range(),
+            },
+        )
+        .unwrap();
+        accesses[read.access_index() as usize] = wrong;
+        let mut authority = CapturedGuestReadAuthority::default();
+        authority.push(read, CapturedGuestReadBytes::copied(&bytes));
+        assert!(matches!(
+            authority.bind_accesses(&accesses),
+            Err(WgpuRawDpcExecutionError::CapturedSourceAccessMismatch { .. })
+        ));
     }
 
     fn admitted_fabric(
@@ -15985,7 +16272,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
@@ -16310,7 +16597,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
@@ -17616,7 +17903,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             color_targets: &mut color_targets,
@@ -18285,7 +18572,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
@@ -18345,7 +18632,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
@@ -20384,7 +20671,7 @@ mod tests {
                 None,
                 [(None, None); 8],
             ),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             queue: bound.queue(),
@@ -20732,7 +21019,7 @@ mod tests {
             ordinal: bound.ordinal(),
             submission: bound.submission(),
             plan: PlanCollector::seeded(seed),
-            reads: Vec::new(),
+            reads: CapturedGuestReadAuthority::default(),
             task_guest_read_pool: None,
             outcome: None,
             color_targets: &mut color_targets,
