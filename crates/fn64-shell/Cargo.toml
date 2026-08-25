@@ -36,6 +36,7 @@ fn64-render-wgpu = { path = "../fn64-render-wgpu" }
 # cpal-backed AudioBackend lives here; we register it via
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.
 fn64-audio = { path = "../fn64-audio" }
+sha2 = "0.10"
 
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
 # `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way

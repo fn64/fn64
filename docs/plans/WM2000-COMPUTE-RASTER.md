@@ -936,8 +936,19 @@ two presentation requests per WM2000 swap. Unset or
 compares the same exact dependencies while always redrawing; and the existing
 `FN64_PRESENT_CACHE=1` value is `suppress`, where an exact hit skips the
 pump-driven redraw. The observe/suppress pair therefore supplies the same
-logical dependency samples and digest on both sides of a same-binary A/B while
+logical dependency samples on both sides of a same-binary A/B while
 changing only suppression. Startup, heartbeat, and final logs name the mode.
+An armed pump sequence emits one canonical `[present-dependency-seq]` receipt
+for every measured pump, including the bounded final pump. `Cacheable` rows
+bind VI origin, stride, output extent, blanking, exact dependency byte count,
+overscan/zoom policy, and the SHA-256 computed during the
+same framebuffer traversal that performs the collision-free byte comparison
+against the prior successful submission.
+`Uncacheable` rows retain a typed overlay, frame-trip, frame-dump, missing-
+framebuffer, unavailable-surface, outside-RDRAM, or unaligned-framebuffer
+reason. Mode, exact-hit result, redraw/suppress disposition, cache generation,
+invalidation count, FNV heartbeat, and probe time are diagnostics rather than
+dependency identity.
 The dependency key owns the VI origin and geometry plus the exact word-rounded
 RGBA5551 source bytes; comparison borrows live RDRAM without allocating, and
 the snapshot advances only after a successful surface render. A separate
@@ -951,6 +962,17 @@ with its sample and byte counts, so skipped submissions no longer disappear
 from the experiment. One same-binary run changed p95 only from 40.368 to 40.237
 ms, too small for a claim under the measured background-load noise, so it
 remains opt-in pending a quiet counterbalanced A/B.
+
+For a canonical 1,600-pump Observe/Suppress pair, run
+`tools/compare_wm2000_present_dependencies.py OBSERVE.log SUPPRESS.log`. The
+comparator rejects missing, duplicate, noncontiguous, mixed-mode, or malformed
+rows and any per-pump dependency-identity difference; disposition differences
+are the experiment rather than an identity mismatch. This receipt does not
+weaken exact suppression authority: the logged SHA-256 is cross-run comparison
+evidence, while suppression still requires equality of every owned dependency
+byte in the current cache generation. OS expose/redraw, policy invalidation,
+and failed surface-submission retry behavior remain authoritative and
+unchanged.
 
 ## Sources and nonclaims
 

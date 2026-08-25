@@ -13,6 +13,7 @@
 //! one byte each R,G,B,A in that order. This converts one into the other.
 
 use fn64_runtime::{RdramAddr, RdramView};
+use sha2::{Digest, Sha256};
 
 /// N64 low-res NTSC framebuffer dimensions, used only as the pre-boot
 /// default: the surface starts at this size and is resized to the guest's
@@ -57,12 +58,132 @@ pub struct PresentPolicy {
     zoom_fill: bool,
 }
 
+/// Why one pump cannot form the same exact framebuffer dependency that a
+/// successful ordinary presentation installs in [`PresentCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncacheablePresentReason {
+    Overlay,
+    FrameTrip,
+    FrameDump,
+    MissingFramebuffer,
+    UnavailableFramebuffer,
+    OutsideRdram,
+    UnalignedFramebuffer,
+}
+
+impl UncacheablePresentReason {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Overlay => "Overlay",
+            Self::FrameTrip => "FrameTrip",
+            Self::FrameDump => "FrameDump",
+            Self::MissingFramebuffer => "MissingFramebuffer",
+            Self::UnavailableFramebuffer => "UnavailableFramebuffer",
+            Self::OutsideRdram => "OutsideRdram",
+            Self::UnalignedFramebuffer => "UnalignedFramebuffer",
+        }
+    }
+}
+
+/// Canonical identity of the bytes and VI geometry consumed by one ordinary
+/// framebuffer decode. SHA-256 is the cross-run comparison identity; exact
+/// redraw suppression still requires byte equality against the owned prior
+/// successful dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheablePresentDependency {
+    pub start: usize,
+    pub src_stride: usize,
+    pub dst_width: usize,
+    pub dst_height: usize,
+    pub blanked: bool,
+    pub bytes: usize,
+    pub fnv_digest: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Dependency observation made once for a measured pump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentDependencyObservation {
+    Cacheable(CacheablePresentDependency),
+    Uncacheable(UncacheablePresentReason),
+}
+
+/// What the cache experiment decided for one measured pump. `dependency` is
+/// the canonical comparison identity. Mode, byte equality, and redraw policy
+/// are deliberately separate so Observe/Suppress A/B logs can require equal
+/// inputs without requiring equal dispositions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentDependencyReceipt {
+    pub mode: PresentCacheMode,
+    pub policy: PresentPolicy,
+    pub dependency: PresentDependencyObservation,
+    pub exact_hit: bool,
+    pub suppress_redraw: bool,
+    pub generation: u64,
+    pub invalidations: u64,
+    pub probe_ns: u64,
+}
+
+impl PresentDependencyReceipt {
+    fn cacheable(
+        mode: PresentCacheMode,
+        policy: PresentPolicy,
+        dependency: CacheablePresentDependency,
+        exact_hit: bool,
+        generation: u64,
+        invalidations: u64,
+    ) -> Self {
+        Self {
+            mode,
+            policy,
+            dependency: PresentDependencyObservation::Cacheable(dependency),
+            exact_hit,
+            suppress_redraw: mode.suppresses_redraw(exact_hit),
+            generation,
+            invalidations,
+            probe_ns: 0,
+        }
+    }
+
+    pub fn uncacheable(
+        mode: PresentCacheMode,
+        policy: PresentPolicy,
+        reason: UncacheablePresentReason,
+        generation: u64,
+        invalidations: u64,
+    ) -> Self {
+        Self {
+            mode,
+            policy,
+            dependency: PresentDependencyObservation::Uncacheable(reason),
+            exact_hit: false,
+            suppress_redraw: false,
+            generation,
+            invalidations,
+            probe_ns: 0,
+        }
+    }
+
+    pub fn with_probe_ns(mut self, probe_ns: u64) -> Self {
+        self.probe_ns = probe_ns;
+        self
+    }
+}
+
 impl PresentPolicy {
-    pub fn new(overscan: u32, zoom_fill: bool) -> Self {
+    pub const fn new(overscan: u32, zoom_fill: bool) -> Self {
         Self {
             overscan,
             zoom_fill,
         }
+    }
+
+    pub const fn overscan(self) -> u32 {
+        self.overscan
+    }
+
+    pub const fn zoom_fill(self) -> bool {
+        self.zoom_fill
     }
 }
 
@@ -155,13 +276,65 @@ impl PresentCache {
         self.stats.invalidations = self.stats.invalidations.saturating_add(1);
     }
 
-    pub fn record_uncacheable_request(&mut self) {
+    pub fn record_uncacheable_request(
+        &mut self,
+        mode: PresentCacheMode,
+        policy: PresentPolicy,
+        reason: UncacheablePresentReason,
+    ) -> PresentDependencyReceipt {
         self.stats.requests = self.stats.requests.saturating_add(1);
         self.stats.misses = self.stats.misses.saturating_add(1);
+        PresentDependencyReceipt::uncacheable(
+            mode,
+            policy,
+            reason,
+            self.generation,
+            self.stats.invalidations,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn is_current(
+    pub fn probe(
+        &mut self,
+        mode: PresentCacheMode,
+        policy: PresentPolicy,
+        rdram: &[u8],
+        start: usize,
+        src_stride: usize,
+        dst_width: usize,
+        dst_height: usize,
+        blanked: bool,
+    ) -> PresentDependencyReceipt {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        let comparable = self.last.as_ref().and_then(|cached| {
+            (cached.generation == self.generation).then_some(&cached.dependency)
+        });
+        let (dependency, hit) = observe_dependency(
+            rdram, start, src_stride, dst_width, dst_height, blanked, comparable,
+        );
+        self.stats.dependency_samples = self.stats.dependency_samples.saturating_add(1);
+        self.stats.dependency_bytes = self
+            .stats
+            .dependency_bytes
+            .saturating_add(u64::try_from(dependency.bytes).unwrap_or(u64::MAX));
+        self.stats.logical_digest = fnv_u64(self.stats.logical_digest, dependency.fnv_digest);
+        if hit {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+        } else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+        }
+        PresentDependencyReceipt::cacheable(
+            mode,
+            policy,
+            dependency,
+            hit,
+            self.generation,
+            self.stats.invalidations,
+        )
+    }
+
+    #[cfg(test)]
+    fn is_current(
         &mut self,
         rdram: &[u8],
         start: usize,
@@ -170,28 +343,17 @@ impl PresentCache {
         dst_height: usize,
         blanked: bool,
     ) -> bool {
-        self.stats.requests = self.stats.requests.saturating_add(1);
-        let (digest, bytes) =
-            dependency_digest(rdram, start, src_stride, dst_width, dst_height, blanked);
-        self.stats.dependency_samples = self.stats.dependency_samples.saturating_add(1);
-        self.stats.dependency_bytes = self
-            .stats
-            .dependency_bytes
-            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        self.stats.logical_digest = fnv_u64(self.stats.logical_digest, digest);
-
-        let hit = self.last.as_ref().is_some_and(|cached| {
-            cached.generation == self.generation
-                && cached
-                    .dependency
-                    .matches(rdram, start, src_stride, dst_width, dst_height, blanked)
-        });
-        if hit {
-            self.stats.hits = self.stats.hits.saturating_add(1);
-        } else {
-            self.stats.misses = self.stats.misses.saturating_add(1);
-        }
-        hit
+        self.probe(
+            PresentCacheMode::Observe,
+            self.policy.unwrap_or(PresentPolicy::new(0, false)),
+            rdram,
+            start,
+            src_stride,
+            dst_width,
+            dst_height,
+            blanked,
+        )
+        .exact_hit
     }
 
     pub fn record_success(&mut self, dependency: PresentDependency) {
@@ -274,25 +436,82 @@ fn fnv_u64(hash: u64, value: u64) -> u64 {
     fnv_bytes(hash, &value.to_le_bytes())
 }
 
-fn dependency_digest(
+#[cfg(test)]
+thread_local! {
+    static DEPENDENCY_BYTE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn observe_dependency(
     rdram: &[u8],
     start: usize,
     src_stride: usize,
     dst_width: usize,
     dst_height: usize,
     blanked: bool,
-) -> (u64, usize) {
+    comparable: Option<&PresentDependency>,
+) -> (CacheablePresentDependency, bool) {
     let mut hash = 0xcbf2_9ce4_8422_2325;
+    let mut sha256 = Sha256::new();
+    sha256.update(b"fn64.present-dependency.v1\0");
     for value in [start, src_stride, dst_width, dst_height] {
-        hash = fnv_u64(hash, u64::try_from(value).unwrap_or(u64::MAX));
+        let value = u64::try_from(value).unwrap_or(u64::MAX);
+        hash = fnv_u64(hash, value);
+        sha256.update(value.to_le_bytes());
     }
     hash = fnv_bytes(hash, &[u8::from(blanked)]);
-    if blanked {
-        (hash, 0)
+    sha256.update([u8::from(blanked)]);
+    let same_shape = comparable.is_some_and(|saved| {
+        saved.start == start
+            && saved.src_stride == src_stride
+            && saved.dst_width == dst_width
+            && saved.dst_height == dst_height
+    });
+    let (bytes, exact_hit) = if blanked {
+        let hit = same_shape
+            && comparable.is_some_and(|saved| matches!(saved.pixels, PresentPixels::Blanked));
+        (0, hit)
     } else {
         let pixels = decoded_storage(rdram, start, src_stride, dst_width, dst_height);
-        (fnv_bytes(hash, pixels), pixels.len())
-    }
+        let expected = comparable.and_then(|saved| match &saved.pixels {
+            PresentPixels::Rgba5551(bytes) if same_shape && bytes.len() == pixels.len() => {
+                Some(bytes.as_ref())
+            }
+            _ => None,
+        });
+        let equal = if let Some(expected) = expected {
+            let mut equal = true;
+            for (byte, saved_byte) in pixels.iter().copied().zip(expected.iter().copied()) {
+                sha256.update([byte]);
+                #[cfg(test)]
+                DEPENDENCY_BYTE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+                equal &= saved_byte == byte;
+            }
+            equal
+        } else {
+            for byte in pixels.iter().copied() {
+                sha256.update([byte]);
+                #[cfg(test)]
+                DEPENDENCY_BYTE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            false
+        };
+        (pixels.len(), equal)
+    };
+    (
+        CacheablePresentDependency {
+            start,
+            src_stride,
+            dst_width,
+            dst_height,
+            blanked,
+            bytes,
+            fnv_digest: hash,
+            sha256: sha256.finalize().into(),
+        },
+        exact_hit,
+    )
 }
 
 fn decoded_storage(
@@ -433,6 +652,8 @@ pub fn rgba_hash(rgba: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    const TEST_POLICY: PresentPolicy = PresentPolicy::new(1, false);
+
     fn blank_dst() -> Vec<u8> {
         vec![0u8; FB_WIDTH * FB_HEIGHT * 4]
     }
@@ -469,11 +690,183 @@ mod tests {
         let mut cache = PresentCache::default();
         cache.record_success(PresentDependency::capture(&rdram, 0, 8, 8, 2, false));
 
-        let exact_hit = cache.is_current(&rdram, 0, 8, 8, 2, false);
-        assert!(exact_hit);
-        assert!(!PresentCacheMode::Observe.suppresses_redraw(exact_hit));
-        assert!(PresentCacheMode::Suppress.suppresses_redraw(exact_hit));
+        let receipt = cache.probe(
+            PresentCacheMode::Observe,
+            TEST_POLICY,
+            &rdram,
+            0,
+            8,
+            8,
+            2,
+            false,
+        );
+        assert!(receipt.exact_hit);
+        assert!(!receipt.suppress_redraw);
+        let receipt = cache.probe(
+            PresentCacheMode::Suppress,
+            TEST_POLICY,
+            &rdram,
+            0,
+            8,
+            8,
+            2,
+            false,
+        );
+        assert!(receipt.exact_hit);
+        assert!(receipt.suppress_redraw);
+        assert!(matches!(
+            receipt.dependency,
+            PresentDependencyObservation::Cacheable(CacheablePresentDependency {
+                start: 0,
+                src_stride: 8,
+                dst_width: 8,
+                dst_height: 2,
+                blanked: false,
+                bytes: 32,
+                ..
+            })
+        ));
+        assert_eq!(cache.stats().hits, 2);
+    }
+
+    #[test]
+    fn one_probe_traversal_computes_digest_and_exact_byte_hit() {
+        let mut rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        cache.record_success(PresentDependency::capture(&rdram, 0, 8, 8, 2, false));
+        DEPENDENCY_BYTE_VISITS.with(|visits| visits.set(0));
+
+        let first = cache.probe(
+            PresentCacheMode::Observe,
+            TEST_POLICY,
+            &rdram,
+            0,
+            8,
+            8,
+            2,
+            false,
+        );
+        assert!(first.exact_hit);
+        let PresentDependencyObservation::Cacheable(first_dependency) = first.dependency else {
+            panic!("ordinary probe must be cacheable");
+        };
+        let mut expected_sha256 = Sha256::new();
+        expected_sha256.update(b"fn64.present-dependency.v1\0");
+        for value in [0_u64, 8, 8, 2] {
+            expected_sha256.update(value.to_le_bytes());
+        }
+        expected_sha256.update([0]);
+        expected_sha256.update(&rdram[..32]);
+        assert_eq!(
+            first_dependency.sha256,
+            <[u8; 32]>::from(expected_sha256.finalize())
+        );
+        assert_eq!(DEPENDENCY_BYTE_VISITS.with(std::cell::Cell::get), 32);
+        rdram[7] ^= 1;
+        let second = cache.probe(
+            PresentCacheMode::Observe,
+            TEST_POLICY,
+            &rdram,
+            0,
+            8,
+            8,
+            2,
+            false,
+        );
+        assert!(!second.exact_hit);
+        assert_ne!(first.dependency, second.dependency);
         assert_eq!(cache.stats().hits, 1);
+        assert_eq!(DEPENDENCY_BYTE_VISITS.with(std::cell::Cell::get), 64);
+    }
+
+    #[test]
+    #[ignore = "release-only diagnostic; not a correctness or landing gate"]
+    fn release_probe_core_chunked_sha_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BYTES: usize = 227_520;
+        const REPEATS: usize = 40;
+        let pixels = (0..BYTES)
+            .map(|index| (index as u8).wrapping_mul(37))
+            .collect::<Vec<_>>();
+        let expected = pixels.clone();
+
+        let probe_core = |per_byte_sha: bool| {
+            let mut sha256 = Sha256::new();
+            let mut fnv = 0xcbf2_9ce4_8422_2325;
+            let mut equal = true;
+            if per_byte_sha {
+                for (index, byte) in pixels.iter().copied().enumerate() {
+                    sha256.update([byte]);
+                    fnv = (fnv ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+                    equal &= expected[index] == byte;
+                }
+            } else {
+                for (chunk, saved_chunk) in pixels.chunks(4 * 1024).zip(expected.chunks(4 * 1024)) {
+                    sha256.update(chunk);
+                    for (byte, saved_byte) in chunk.iter().copied().zip(saved_chunk.iter().copied())
+                    {
+                        fnv = (fnv ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+                        equal &= saved_byte == byte;
+                    }
+                }
+            }
+            (sha256.finalize(), fnv, equal)
+        };
+
+        assert_eq!(probe_core(true), probe_core(false));
+        let mut legacy_samples = Vec::with_capacity(REPEATS);
+        let mut chunked_samples = Vec::with_capacity(REPEATS);
+        let measure = |per_byte_sha, samples: &mut Vec<u128>| {
+            let started = Instant::now();
+            black_box(probe_core(per_byte_sha));
+            samples.push(started.elapsed().as_nanos());
+        };
+        for repeat in 0..REPEATS {
+            if repeat.is_multiple_of(2) {
+                measure(true, &mut legacy_samples);
+                measure(false, &mut chunked_samples);
+            } else {
+                measure(false, &mut chunked_samples);
+                measure(true, &mut legacy_samples);
+            }
+        }
+        legacy_samples.sort_unstable();
+        chunked_samples.sort_unstable();
+        let legacy_ns = legacy_samples[REPEATS / 2];
+        let chunked_ns = chunked_samples[REPEATS / 2];
+        eprintln!(
+            "227520-byte probe core: legacy_per_byte_sha_ns={legacy_ns} \
+             chunked_sha_ns={chunked_ns}"
+        );
+    }
+
+    #[test]
+    fn uncacheable_reasons_are_typed_and_never_suppress() {
+        let mut cache = PresentCache::default();
+        let reasons = [
+            UncacheablePresentReason::Overlay,
+            UncacheablePresentReason::FrameTrip,
+            UncacheablePresentReason::FrameDump,
+            UncacheablePresentReason::MissingFramebuffer,
+            UncacheablePresentReason::UnavailableFramebuffer,
+            UncacheablePresentReason::OutsideRdram,
+            UncacheablePresentReason::UnalignedFramebuffer,
+        ];
+        for reason in reasons {
+            let receipt =
+                cache.record_uncacheable_request(PresentCacheMode::Suppress, TEST_POLICY, reason);
+            assert_eq!(
+                receipt.dependency,
+                PresentDependencyObservation::Uncacheable(reason)
+            );
+            assert!(!receipt.exact_hit);
+            assert!(!receipt.suppress_redraw);
+            assert!(!reason.name().is_empty());
+        }
+        assert_eq!(cache.stats().requests, reasons.len() as u64);
+        assert_eq!(cache.stats().misses, reasons.len() as u64);
     }
 
     #[test]
@@ -567,7 +960,11 @@ mod tests {
 
         rdram[0] ^= 1;
         assert!(!cache.is_current(&rdram, 0, 8, 8, 2, false));
-        cache.record_uncacheable_request();
+        cache.record_uncacheable_request(
+            PresentCacheMode::Observe,
+            TEST_POLICY,
+            UncacheablePresentReason::Overlay,
+        );
         let final_stats = cache.stats();
         assert_eq!(final_stats.requests, 3);
         assert_eq!(final_stats.hits, 1);
@@ -733,8 +1130,8 @@ mod tests {
         rgba5551_to_rgba8888(
             RdramView::from_storage(&src),
             RdramAddr::from_offset(0),
-            STRIDE,   // stride unchanged -- row offsets stay correct
-            VISIBLE,  // present only the scanned-out columns
+            STRIDE,  // stride unchanged -- row offsets stay correct
+            VISIBLE, // present only the scanned-out columns
             ROWS,
             &mut cropped,
         );

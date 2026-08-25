@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import pathlib
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 SEQUENCE_PREFIX = "[pump-seq] "
 WALL_CADENCE_PREFIX = "[wall-cadence-seq] "
 WALL_SWAP_PREFIX = "[wall-swap-seq] "
+PRESENT_DEPENDENCY_PREFIX = "[present-dependency-seq] "
 RENDERER_RE = re.compile(r"^\[pump-census\] RENDERER: (\S+)$", re.MULTILINE)
 BUDGET_MS = 1000.0 / 30.0
 
@@ -77,6 +79,44 @@ class WallCadence:
     prior_present_ms: float
     intended_wait_ms: float
     outside_residual_ms: float
+
+
+@dataclass(frozen=True)
+class PresentDependency:
+    pump: int
+    mode: str
+    overscan: int
+    zoom_fill: bool
+    generation: int
+    invalidations: int
+    probe_ns: int
+    dependency: str
+    reason: str | None
+    start: int | None
+    src_stride: int | None
+    dst_width: int | None
+    dst_height: int | None
+    blanked: bool | None
+    bytes: int | None
+    fnv_digest: str | None
+    sha256: str | None
+    exact_hit: bool
+    disposition: str
+
+    def canonical_identity(self) -> tuple[object, ...]:
+        policy = (self.overscan, self.zoom_fill)
+        if self.dependency == "Uncacheable":
+            return (*policy, "Uncacheable", self.reason)
+        return (*policy,
+            "Cacheable",
+            self.start,
+            self.src_stride,
+            self.dst_width,
+            self.dst_height,
+            self.blanked,
+            self.bytes,
+            self.sha256,
+        )
 
 
 METRICS = (
@@ -256,6 +296,159 @@ def parse_wall_swaps(text: str, pumps: list[Pump]) -> list[tuple[int, float]]:
     return samples
 
 
+def parse_present_dependencies(
+    text: str, expected_count: int | None = None
+) -> list[PresentDependency]:
+    samples: list[PresentDependency] = []
+    for line in text.splitlines():
+        if not line.startswith(PRESENT_DEPENDENCY_PREFIX):
+            continue
+        raw_fields = line[len(PRESENT_DEPENDENCY_PREFIX) :].split()
+        if any(field.count("=") != 1 for field in raw_fields):
+            raise ValueError("present dependency row fields must be canonical key=value tokens")
+        fields = dict(field.split("=", 1) for field in raw_fields)
+        if len(fields) != len(raw_fields):
+            raise ValueError("present dependency row contains a duplicate field")
+        common = {
+            "pump", "mode", "dependency", "overscan", "zoom_fill",
+            "generation", "invalidations", "probe_ns", "exact_hit", "disposition",
+        }
+        missing = common - fields.keys()
+        if missing:
+            raise ValueError(
+                "present dependency row is missing " + ", ".join(sorted(missing))
+            )
+        if fields["mode"] not in ("Observe", "Suppress"):
+            raise ValueError("present dependency mode must be Observe or Suppress")
+        if fields["exact_hit"] not in ("0", "1"):
+            raise ValueError("present dependency exact_hit must be 0 or 1")
+        if fields["disposition"] not in ("Redraw", "Suppress"):
+            raise ValueError("present dependency disposition must be Redraw or Suppress")
+        pump = int(fields["pump"])
+        if pump != len(samples):
+            raise ValueError(
+                f"present dependency rows are not contiguous: expected pump {len(samples)}, got {pump}"
+            )
+        exact_hit = fields["exact_hit"] == "1"
+        if fields["zoom_fill"] not in ("0", "1"):
+            raise ValueError("present dependency zoom_fill must be 0 or 1")
+        diagnostics = {
+            "overscan": int(fields["overscan"]),
+            "zoom_fill": fields["zoom_fill"] == "1",
+            "generation": int(fields["generation"]),
+            "invalidations": int(fields["invalidations"]),
+            "probe_ns": int(fields["probe_ns"]),
+        }
+        if any(value < 0 for key, value in diagnostics.items() if key != "zoom_fill"):
+            raise ValueError("present dependency policy/diagnostic fields must be non-negative")
+        if fields["dependency"] == "Cacheable":
+            keys = common | {
+                "start",
+                "src_stride",
+                "dst_width",
+                "dst_height",
+                "blanked",
+                "bytes",
+                "fnv_digest",
+                "sha256",
+            }
+            if fields.keys() != keys:
+                raise ValueError("cacheable present dependency row has a non-canonical field set")
+            if fields["blanked"] not in ("0", "1"):
+                raise ValueError("present dependency blanked must be 0 or 1")
+            if not re.fullmatch(r"[0-9a-f]{16}", fields["fnv_digest"]):
+                raise ValueError("present dependency FNV digest must be 16 lowercase hex digits")
+            if not re.fullmatch(r"[0-9a-f]{64}", fields["sha256"]):
+                raise ValueError("present dependency SHA-256 must be 64 lowercase hex digits")
+            sample = PresentDependency(
+                pump=pump,
+                mode=fields["mode"],
+                **diagnostics,
+                dependency="Cacheable",
+                reason=None,
+                start=int(fields["start"]),
+                src_stride=int(fields["src_stride"]),
+                dst_width=int(fields["dst_width"]),
+                dst_height=int(fields["dst_height"]),
+                blanked=fields["blanked"] == "1",
+                bytes=int(fields["bytes"]),
+                fnv_digest=fields["fnv_digest"],
+                sha256=fields["sha256"],
+                exact_hit=exact_hit,
+                disposition=fields["disposition"],
+            )
+            if any(
+                value is not None and value < 0
+                for value in (
+                    sample.start,
+                    sample.src_stride,
+                    sample.dst_width,
+                    sample.dst_height,
+                    sample.bytes,
+                )
+            ):
+                raise ValueError("present dependency numeric identity fields must be non-negative")
+        elif fields["dependency"] == "Uncacheable":
+            if fields.keys() != common | {"reason"}:
+                raise ValueError("uncacheable present dependency row has a non-canonical field set")
+            if exact_hit or fields["disposition"] != "Redraw":
+                raise ValueError("uncacheable present dependency must miss and redraw")
+            if fields["reason"] not in (
+                "Overlay",
+                "FrameTrip",
+                "FrameDump",
+                "MissingFramebuffer",
+                "UnavailableFramebuffer",
+                "OutsideRdram",
+                "UnalignedFramebuffer",
+            ):
+                raise ValueError("uncacheable present dependency reason is unknown")
+            sample = PresentDependency(
+                pump=pump,
+                mode=fields["mode"],
+                **diagnostics,
+                dependency="Uncacheable",
+                reason=fields["reason"],
+                start=None,
+                src_stride=None,
+                dst_width=None,
+                dst_height=None,
+                blanked=None,
+                bytes=None,
+                fnv_digest=None,
+                sha256=None,
+                exact_hit=False,
+                disposition="Redraw",
+            )
+        else:
+            raise ValueError("present dependency must be Cacheable or Uncacheable")
+        if sample.mode == "Observe" and sample.disposition != "Redraw":
+            raise ValueError("Observe present dependency cannot suppress redraw")
+        if sample.disposition == "Suppress" and not sample.exact_hit:
+            raise ValueError("only an exact hit may suppress redraw")
+        if sample.mode == "Suppress" and sample.exact_hit != (
+            sample.disposition == "Suppress"
+        ):
+            raise ValueError("Suppress present dependency disposition disagrees with exact_hit")
+        samples.append(sample)
+    if expected_count is not None and len(samples) != expected_count:
+        raise ValueError(
+            f"present dependency receipt requires {expected_count} contiguous rows, got {len(samples)}"
+        )
+    if samples and any(sample.mode != samples[0].mode for sample in samples):
+        raise ValueError("present dependency receipt mixes Observe and Suppress rows")
+    return samples
+
+
+def present_identity_sha256(samples: list[PresentDependency]) -> str:
+    wire = json.dumps(
+        [sample.canonical_identity() for sample in samples],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(wire).hexdigest()
+
+
 def population_means(
     frames: list[dict[str, float]], metrics: tuple[str, ...] = METRICS
 ) -> dict[str, float]:
@@ -289,6 +482,11 @@ def summarize(text: str) -> dict[str, object]:
     pumps = parse_pumps(text)
     wall_cadence = parse_wall_cadence(text, pumps)
     wall_swaps = parse_wall_swaps(text, pumps)
+    present_dependencies = parse_present_dependencies(text)
+    if present_dependencies and len(present_dependencies) != len(pumps):
+        raise ValueError(
+            "present dependency rows must cover every measured pump, including the final pump"
+        )
     task_phase_available = pumps[0].task_completion_before is not None
     abi_phase_available = pumps[0].session_plan_ms is not None
     if any((pump.task_completion_before is not None) != task_phase_available for pump in pumps):
@@ -381,7 +579,7 @@ def summarize(text: str) -> dict[str, object]:
     over_means = population_means(over)
 
     result = {
-        "schema": "fn64.wm2000-swap-latency.v4",
+        "schema": "fn64.wm2000-swap-latency.v5",
         "renderer": renderer,
         "pumps": len(pumps),
         "swaps": len(swap_indices),
@@ -475,6 +673,29 @@ def summarize(text: str) -> dict[str, object]:
         }
     else:
         result["wall_cadence"] = {"available": False}
+    if present_dependencies:
+        result["present_dependencies"] = {
+            "available": True,
+            "receipts": len(present_dependencies),
+            "mode": present_dependencies[0].mode,
+            "cacheable": sum(
+                sample.dependency == "Cacheable" for sample in present_dependencies
+            ),
+            "uncacheable": sum(
+                sample.dependency == "Uncacheable" for sample in present_dependencies
+            ),
+            "exact_hits": sum(sample.exact_hit for sample in present_dependencies),
+            "suppressed": sum(
+                sample.disposition == "Suppress" for sample in present_dependencies
+            ),
+            "canonical_identity_sha256": present_identity_sha256(present_dependencies),
+            "probe_total_ms": sum(sample.probe_ns for sample in present_dependencies) / 1e6,
+            "probe_ms": distribution(
+                [sample.probe_ns / 1e6 for sample in present_dependencies]
+            ),
+        }
+    else:
+        result["present_dependencies"] = {"available": False}
     return result
 
 

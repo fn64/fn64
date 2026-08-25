@@ -76,10 +76,21 @@ swap-to-swap latency distributions. Set `FN64_PUMP_CENSUS_SEQUENCE` equal to
 window. The parser accepts both the legacy 15-field sequence rows and the
 expanded 28-field rows, and 40-field rows carrying the existing ABI session
 and task-batch clocks. Expanded rows add renderer completion ordinals and task
-phase deltas; the v3 receipt folds those deltas between consecutive swaps
+phase deltas; the v5 receipt folds those deltas between consecutive swaps
 under `task_cpu_phase_frames` and `abi_task_phase_frames`. Legacy input remains
 valid and reports optional sections as unavailable rather than turning absent
 counters into zero-cost claims.
+
+An Observe/Suppress presentation-cache gate also requires exactly 1,600
+contiguous `[present-dependency-seq]` rows per lane. Compare the original logs
+with `tools/compare_wm2000_present_dependencies.py`: it requires equal
+per-pump Cacheable identities or typed Uncacheable reasons while leaving
+exact-hit and redraw/suppress disposition lane-specific. This makes a final-
+pump omission or changed dependency population a failed A/B, not an inferred
+cache win. Canonical identity includes overscan/zoom policy and a SHA-256 over
+the geometry, blanking state, and framebuffer bytes. The FNV heartbeat,
+generation/invalidation counters, and separately timed probe cost are
+diagnostics and are deliberately excluded from cross-lane identity.
 
 For the ordinary path, build the linked shell once and run:
 
