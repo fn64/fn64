@@ -158,28 +158,56 @@ impl RawTriangle {
     /// so no partial optional block can be read: length is checked once,
     /// before any word is interpreted.
     pub fn decode(opcode: u8, command: &[u8]) -> Result<Self, TriangleDecodeError> {
+        Self::decode_words(opcode, command.len(), |index| {
+            let offset = index * 8;
+            RawWord {
+                w0: u32::from_be_bytes(
+                    command[offset..offset + 4]
+                        .try_into()
+                        .expect("triangle word is eight bytes"),
+                ),
+                w1: u32::from_be_bytes(
+                    command[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("triangle word is eight bytes"),
+                ),
+            }
+        })
+    }
+
+    /// Decodes the same wire payload from its already-separated big-endian
+    /// 32-bit halves, without materializing an intermediate byte or
+    /// [`RawWord`] buffer.
+    pub(crate) fn decode_u32_words(
+        opcode: u8,
+        command: &[u32],
+    ) -> Result<Self, TriangleDecodeError> {
+        let actual_bytes = command.len().checked_mul(4).unwrap_or(usize::MAX);
+        Self::decode_words(opcode, actual_bytes, |index| RawWord {
+            w0: command[index * 2],
+            w1: command[index * 2 + 1],
+        })
+    }
+
+    fn decode_words(
+        opcode: u8,
+        actual_bytes: usize,
+        mut word: impl FnMut(usize) -> RawWord,
+    ) -> Result<Self, TriangleDecodeError> {
         if !(0x08..=0x0f).contains(&opcode) {
             return Err(TriangleDecodeError::OpcodeOutOfRange { opcode });
         }
         let flags = TriangleFlags::from_opcode(opcode);
         let expected = triangle_word_count(flags) * 8;
-        let actual = u32::try_from(command.len()).unwrap_or(u32::MAX);
+        let actual = u32::try_from(actual_bytes).unwrap_or(u32::MAX);
         if actual != expected {
             return Err(TriangleDecodeError::UnexpectedLength { expected, actual });
         }
 
-        let words: Vec<RawWord> = command
-            .chunks_exact(8)
-            .map(|chunk| RawWord {
-                w0: u32::from_be_bytes(chunk[0..4].try_into().expect("chunk is 8 bytes")),
-                w1: u32::from_be_bytes(chunk[4..8].try_into().expect("chunk is 8 bytes")),
-            })
-            .collect();
-
         // Base edge block (RT64 `triangleBaseWords` = 4): word 0 carries
         // tile/level/flip and YL/YM/YH; words 1..=3 carry XL/dxldy, XH/dxhdy,
         // XM/dxmdy in that RT64 order.
-        let w0 = words[0];
+        let w0 = word(0);
         let tile_raw = ((w0.w0 >> 16) & 0x7) as u8;
         let tile = TileIndex::try_new(tile_raw).expect("triangle tile field is masked to 3 bits");
         let level = ((w0.w0 >> 19) & 0x7) as u8;
@@ -188,39 +216,39 @@ impl RawTriangle {
         let ym = (w0.w1 >> 16) as i16;
         let yh = (w0.w1 & 0xffff) as i16;
 
-        let edge1 = words[1];
+        let edge1 = word(1);
         let xl = edge1.w0 as i32;
         let dxldy = edge1.w1 as i32;
-        let edge2 = words[2];
+        let edge2 = word(2);
         let xh = edge2.w0 as i32;
         let dxhdy = edge2.w1 as i32;
-        let edge3 = words[3];
+        let edge3 = word(3);
         let xm = edge3.w0 as i32;
         let dxmdy = edge3.w1 as i32;
 
         let mut cursor = 4usize;
         let shade = if flags.shaded {
-            let block = read_coefficient_block(&words, cursor);
+            let block = core::array::from_fn(|index| word(cursor + index));
             cursor += 8;
             Some(block)
         } else {
             None
         };
         let texture = if flags.textured {
-            let block = read_coefficient_block(&words, cursor);
+            let block = core::array::from_fn(|index| word(cursor + index));
             cursor += 8;
             Some(block)
         } else {
             None
         };
         let depth = if flags.depth {
-            let block = [words[cursor], words[cursor + 1]];
+            let block = [word(cursor), word(cursor + 1)];
             cursor += 2;
             Some(block)
         } else {
             None
         };
-        debug_assert_eq!(cursor, words.len());
+        debug_assert_eq!(cursor as u32, triangle_word_count(flags));
 
         Ok(Self {
             flags,
@@ -322,12 +350,6 @@ impl RawTriangle {
     pub const fn depth(&self) -> Option<&DepthWords> {
         self.depth.as_ref()
     }
-}
-
-fn read_coefficient_block(words: &[RawWord], start: usize) -> CoefficientWords {
-    let mut block = [RawWord { w0: 0, w1: 0 }; 8];
-    block.copy_from_slice(&words[start..start + 8]);
-    block
 }
 
 #[cfg(test)]
@@ -634,6 +656,45 @@ mod tests {
             assert_eq!(triangle.shade().is_some(), flags.shaded());
             assert_eq!(triangle.texture().is_some(), flags.textured());
             assert_eq!(triangle.depth().is_some(), flags.depth());
+        }
+    }
+
+    #[test]
+    fn raw_triangle_carrier_direct_u32_decode_matches_bytes_for_all_eight_opcodes() {
+        for opcode in 0x08u8..=0x0f {
+            let flags = TriangleFlags::from_opcode(opcode);
+            let mut bytes = concat(&[
+                base_word0(u32::from(opcode & 0x7), 3, true, 0x1234, 0x2345, 0x3456),
+                edge_word(0x1020_3040, -0x0102_0304),
+                edge_word(-0x1122_3344, 0x5566_7788),
+                edge_word(0x7f00_00ff, i32::MIN),
+            ]);
+            if flags.shaded() {
+                bytes.extend(filler_block(0x1000_0000).iter().flatten().copied());
+            }
+            if flags.textured() {
+                bytes.extend(filler_block(0x2000_0000).iter().flatten().copied());
+            }
+            if flags.depth() {
+                bytes.extend(
+                    [
+                        triangle_word(0x3000_0001, 0x3000_0002),
+                        triangle_word(0x3000_0003, 0x3000_0004),
+                    ]
+                    .iter()
+                    .flatten()
+                    .copied(),
+                );
+            }
+            let words = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                RawTriangle::decode_u32_words(opcode, &words),
+                RawTriangle::decode(opcode, &bytes),
+                "opcode {opcode:#04x}"
+            );
         }
     }
 
