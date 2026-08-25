@@ -66,6 +66,46 @@ impl PresentPolicy {
     }
 }
 
+/// Runtime disposition of the exact presentation dependency experiment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PresentCacheMode {
+    #[default]
+    Disabled,
+    Observe,
+    Suppress,
+}
+
+impl PresentCacheMode {
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            None | Some("0") => Self::Disabled,
+            Some("observe") => Self::Observe,
+            Some("1") => Self::Suppress,
+            Some(value) => {
+                panic!("FN64_PRESENT_CACHE={value:?} is invalid; expected 0, observe, or 1")
+            }
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Observe => "observe",
+            Self::Suppress => "suppress",
+        }
+    }
+
+    pub const fn samples_dependencies(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Convert an exact dependency comparison into the pump's redraw answer.
+    /// Observe intentionally records the hit while refusing to skip the draw.
+    pub const fn suppresses_redraw(self, exact_hit: bool) -> bool {
+        matches!(self, Self::Suppress) && exact_hit
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PresentCacheStats {
     pub requests: u64,
@@ -395,6 +435,45 @@ mod tests {
 
     fn blank_dst() -> Vec<u8> {
         vec![0u8; FB_WIDTH * FB_HEIGHT * 4]
+    }
+
+    #[test]
+    fn present_cache_mode_parses_only_the_documented_values() {
+        assert_eq!(
+            PresentCacheMode::from_env_value(None),
+            PresentCacheMode::Disabled
+        );
+        assert_eq!(
+            PresentCacheMode::from_env_value(Some("0")),
+            PresentCacheMode::Disabled
+        );
+        assert_eq!(
+            PresentCacheMode::from_env_value(Some("observe")),
+            PresentCacheMode::Observe
+        );
+        assert_eq!(
+            PresentCacheMode::from_env_value(Some("1")),
+            PresentCacheMode::Suppress
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 0, observe, or 1")]
+    fn present_cache_mode_rejects_ambiguous_values() {
+        PresentCacheMode::from_env_value(Some("true"));
+    }
+
+    #[test]
+    fn observe_records_exact_hits_without_suppressing_redraws() {
+        let rdram = vec![0x5a; 64];
+        let mut cache = PresentCache::default();
+        cache.record_success(PresentDependency::capture(&rdram, 0, 8, 8, 2, false));
+
+        let exact_hit = cache.is_current(&rdram, 0, 8, 8, 2, false);
+        assert!(exact_hit);
+        assert!(!PresentCacheMode::Observe.suppresses_redraw(exact_hit));
+        assert!(PresentCacheMode::Suppress.suppresses_redraw(exact_hit));
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]

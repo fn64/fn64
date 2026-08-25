@@ -831,21 +831,27 @@ hash matched through swap 900. The small positive effect repeats, but neither
 run reaches the required margin or ten-run gate, so wider texrect shapes remain
 subordinate to the higher-ceiling ordered CPU triangle work.
 
-The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
-observed two presentation requests per WM2000 swap. Its dependency key owns
-the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
-comparison borrows live RDRAM without allocating, and the snapshot advances
-only after a successful surface render. A separate generation invalidates
-that authority when overlay/HUD composition closes or toggles, overscan or
-zoom-fill policy changes, the window resizes or changes scale/fullscreen, or a
-surface submission fails. OS redraw/expose, overlay, tripwire, and frame-dump
-paths always redraw. Heartbeats and the final `[fn64-present-cache]` row report
-the cumulative request/hit/miss denominator, successful and failed submits,
-invalidations, and a logical dependency digest with its sample and byte counts,
-so skipped submissions no longer disappear from the experiment. One
-same-binary run changed p95 only from 40.368 to 40.237 ms, too small for a
-claim under the measured background-load noise, so it remains opt-in pending a
-quiet counterbalanced A/B.
+The shell also has a default-off presentation-cache experiment for the observed
+two presentation requests per WM2000 swap. Unset or
+`FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
+compares the same exact dependencies while always redrawing; and the existing
+`FN64_PRESENT_CACHE=1` value is `suppress`, where an exact hit skips the
+pump-driven redraw. The observe/suppress pair therefore supplies the same
+logical dependency samples and digest on both sides of a same-binary A/B while
+changing only suppression. Startup, heartbeat, and final logs name the mode.
+The dependency key owns the VI origin and geometry plus the exact word-rounded
+RGBA5551 source bytes; comparison borrows live RDRAM without allocating, and
+the snapshot advances only after a successful surface render. A separate
+generation invalidates that authority when overlay/HUD composition closes or
+toggles, overscan or zoom-fill policy changes, the window resizes or changes
+scale/fullscreen, or a surface submission fails. OS redraw/expose, overlay,
+tripwire, and frame-dump paths always redraw. Heartbeats and the final
+`[fn64-present-cache]` row report the cumulative request/hit/miss denominator,
+successful and failed submits, invalidations, and a logical dependency digest
+with its sample and byte counts, so skipped submissions no longer disappear
+from the experiment. One same-binary run changed p95 only from 40.368 to 40.237
+ms, too small for a claim under the measured background-load noise, so it
+remains opt-in pending a quiet counterbalanced A/B.
 
 ## Sources and nonclaims
 
