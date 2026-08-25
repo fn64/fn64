@@ -214,11 +214,6 @@ pub const TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT: u32 = 4;
 /// what the refusal protected -- an index read can still never reach the
 /// palette's own half -- without refusing a frame the RDP would draw.
 ///
-/// No shader path emits this value any more. It is kept, unused, so the
-/// numbering of codes 0..4 is undisturbed and a stale readback carrying a
-/// 5 is still nameable.
-pub const TMEM_SAMPLE_STATUS_CI_SOURCE_OUTSIDE_LOW_HALF: u32 = 5;
-
 /// One `RasterVS`-shaped vertex: RDP screen-pixel position, UV (unused by
 /// this slice's textureless fragment shader, but present in the layout to
 /// keep it stable for a future textured slice -- port card §3 step 1), and

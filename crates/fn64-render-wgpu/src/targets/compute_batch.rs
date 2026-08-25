@@ -201,6 +201,7 @@ impl ComputeRasterDrawAdmission {
         self.program
     }
 
+    #[cfg(test)]
     pub(crate) const fn tmem(&self) -> TmemSnapshotIdentity {
         self.tmem
     }

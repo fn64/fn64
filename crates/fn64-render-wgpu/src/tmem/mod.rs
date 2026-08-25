@@ -61,10 +61,11 @@ pub use execute::{
     PreparedLoadTlut, TmemPacketExecutionError,
 };
 pub(crate) use execute::{map_physical_lanes_block, map_physical_lanes_tlut};
+#[cfg(test)]
+pub(crate) use gpu_projection::TLUT_MODE_DISABLED;
 pub use gpu_projection::{
     project_committed_tmem, project_tmem, TileBindingParams, TmemGpuProjection,
-    TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TLUT_MODE_DISABLED, TLUT_MODE_IA16,
-    TLUT_MODE_RGBA16, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
+    TILE_BINDING_PARAMS_BYTES, TILE_BINDING_PARAMS_FIELDS, TMEM_BYTE_WORDS, TMEM_VALIDITY_WORDS,
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
@@ -72,9 +73,7 @@ pub use physical::{
     PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
     PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
-pub(crate) use physical::{
-    DeferredPhysicalTmemSuccessor, PendingTmemPrefixImage, TmemPrefixSnapshot,
-};
+pub(crate) use physical::{DeferredPhysicalTmemSuccessor, TmemPrefixSnapshot};
 #[cfg(test)]
 pub(crate) use read::proposed_identity_for_test;
 pub use read::{
