@@ -42,6 +42,7 @@ use fn64_render::{
 };
 use fn64_render_ir::PhysicalMemoryLayout;
 
+use super::PlanningDecodedRawDpc;
 use crate::raw_dpc::FillAccessSpanError;
 use crate::raw_dpc::{decode_triangle_vertices, texture_rectangle_vertices};
 use crate::state::OtherMode;
@@ -50,6 +51,40 @@ use crate::{
     TileAddressMode, TileDescriptor, TileIndex, TileSize, TmemLoad, TmemLoadKind,
     TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferWord,
 };
+
+trait DecodedPlanningView {
+    fn base_state(&self) -> &crate::RdpState;
+    fn commands(&self) -> &[crate::DecodedRawDpcCommand];
+    fn resource_plan(&self) -> &RawDpcResourcePlan;
+}
+
+impl DecodedPlanningView for DecodedRawDpc {
+    fn base_state(&self) -> &crate::RdpState {
+        &self.base_state
+    }
+
+    fn commands(&self) -> &[crate::DecodedRawDpcCommand] {
+        self.commands()
+    }
+
+    fn resource_plan(&self) -> &RawDpcResourcePlan {
+        self.resource_plan()
+    }
+}
+
+impl DecodedPlanningView for PlanningDecodedRawDpc {
+    fn base_state(&self) -> &crate::RdpState {
+        &self.base_state
+    }
+
+    fn commands(&self) -> &[crate::DecodedRawDpcCommand] {
+        self.commands()
+    }
+
+    fn resource_plan(&self) -> &RawDpcResourcePlan {
+        self.resource_plan()
+    }
+}
 
 /// A decoded raw-DPC command this production seam does not admit. Every
 /// command kind carried by [`RawDpcCommandKind`] outside `SetTextureImage`/
@@ -684,6 +719,16 @@ pub fn push_decoded_raw_dpc(
     layout: PhysicalMemoryLayout,
     submission_start: u32,
 ) -> Result<(), PushDecodedRawDpcError> {
+    push_decoded_body(writer, decoded, capture_words, layout, submission_start)
+}
+
+fn push_decoded_body<D: DecodedPlanningView>(
+    writer: &mut ExactRawDpcPlanWriter,
+    decoded: &D,
+    capture_words: &[u32],
+    layout: PhysicalMemoryLayout,
+    submission_start: u32,
+) -> Result<(), PushDecodedRawDpcError> {
     let resource_plan: &RawDpcResourcePlan = decoded.resource_plan();
     let mut tracker = StateIdentityTracker::default();
     // `decode_triangle_vertices`'s own `texture_perspective` parameter is
@@ -720,7 +765,7 @@ pub fn push_decoded_raw_dpc(
     // recent `SetOtherMode` at position < N -- either carried in from
     // `base_state` or set later in this same plan -- never a later one and
     // never this plan's final value.
-    let mut current_other_mode: Option<OtherMode> = decoded.base_state.other_mode();
+    let mut current_other_mode: Option<OtherMode> = decoded.base_state().other_mode();
 
     // The staged `SetColorImage`/`SetFillColor` *values* (not merely their
     // `RdpStateIdentity`s, which `tracker` already carries) current at the
@@ -734,8 +779,8 @@ pub fn push_decoded_raw_dpc(
     // a `SetColorImage` issued by an earlier submission. `plan_fill`'s own
     // admission gate reads the identical durable state, so a fill this loop
     // sees is one `plan_fill` already proved has both staged.
-    let mut current_color_image: Option<crate::ColorImage> = decoded.base_state.color_image();
-    let mut current_fill_color: Option<crate::FillColor> = decoded.base_state.fill_color();
+    let mut current_color_image: Option<crate::ColorImage> = decoded.base_state().color_image();
+    let mut current_fill_color: Option<crate::FillColor> = decoded.base_state().fill_color();
 
     // The journal's ordered access list opens with one `CommandDecode` read
     // access per source stream (`decode_from_state` pushes these before it
@@ -1293,6 +1338,16 @@ pub fn push_decoded_raw_dpc(
         }
     }
     Ok(())
+}
+
+pub(crate) fn push_planning_decoded_raw_dpc(
+    writer: &mut ExactRawDpcPlanWriter,
+    decoded: &PlanningDecodedRawDpc,
+    capture_words: &[u32],
+    layout: PhysicalMemoryLayout,
+    submission_start: u32,
+) -> Result<(), PushDecodedRawDpcError> {
+    push_decoded_body(writer, decoded, capture_words, layout, submission_start)
 }
 
 fn push_tmem_load(

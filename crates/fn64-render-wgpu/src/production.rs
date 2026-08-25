@@ -55,7 +55,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::raw_dpc::push_decoded_raw_dpc;
+use crate::raw_dpc::push_planning_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned,
     CandidateColorTarget, ColorTargetExecutionBatch, CompletedColorTargetWrite,
@@ -67,15 +67,16 @@ use crate::targets::{
 use crate::tmem::{
     project_committed_tmem, DeferredPhysicalTmemSuccessor, TileBindingParams, TmemGpuProjection,
 };
+#[cfg(test)]
+use crate::RawDpcDecodeError;
 use crate::{
     AlphaCompare, BlendColorInput, BlendModeState, Color4, ColorImage, ColorTargetExtent,
     ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CombineParams, CycleType, FillColor,
     FillExecutionError, FillRectangle, HeadlessBackend, InitializedCandidateColorTarget,
     MissingTriangleDrawState, OtherMode, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemState, PrimColor, RawDpcDecodeError, RdpState, ResolvedBlendCycle,
-    RetrievedTriangleDraw, TargetError, TmemLoadSourceIdentity, TmemTransferWord,
-    TriangleDrawOutput, TrianglePipelineDeviceOutcome, TrianglePipelineError,
-    TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
+    PhysicalTmemState, PrimColor, RdpState, ResolvedBlendCycle, RetrievedTriangleDraw, TargetError,
+    TmemLoadSourceIdentity, TmemTransferWord, TriangleDrawOutput, TrianglePipelineDeviceOutcome,
+    TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
@@ -523,17 +524,13 @@ mod raw_dpc_plan_census {
 
     #[derive(Clone, Copy)]
     pub(super) enum Phase {
-        ProbePrepare,
-        ProbeDecode,
-        RealPrepare,
-        RealDecode,
+        Prepare,
+        DecodeAndDerive,
         AdmitAndSeal,
     }
 
-    static PROBE_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
-    static PROBE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
-    static REAL_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
-    static REAL_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+    static DECODE_AND_DERIVE_NS: AtomicU64 = AtomicU64::new(0);
     static ADMIT_AND_SEAL_NS: AtomicU64 = AtomicU64::new(0);
     static PLANS: AtomicU64 = AtomicU64::new(0);
 
@@ -553,10 +550,8 @@ mod raw_dpc_plan_census {
         let value = operation();
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         match phase {
-            Phase::ProbePrepare => &PROBE_PREPARE_NS,
-            Phase::ProbeDecode => &PROBE_DECODE_NS,
-            Phase::RealPrepare => &REAL_PREPARE_NS,
-            Phase::RealDecode => &REAL_DECODE_NS,
+            Phase::Prepare => &PREPARE_NS,
+            Phase::DecodeAndDerive => &DECODE_AND_DERIVE_NS,
             Phase::AdmitAndSeal => &ADMIT_AND_SEAL_NS,
         }
         .fetch_add(elapsed, Relaxed);
@@ -569,30 +564,36 @@ mod raw_dpc_plan_census {
         value
     }
 
+    fn accounted_ns(prepare: u64, decode_and_derive: u64, admit_and_seal: u64) -> u64 {
+        prepare
+            .saturating_add(decode_and_derive)
+            .saturating_add(admit_and_seal)
+    }
+
     fn report(plans: u64) {
-        let probe_prepare = PROBE_PREPARE_NS.load(Relaxed);
-        let probe_decode = PROBE_DECODE_NS.load(Relaxed);
-        let real_prepare = REAL_PREPARE_NS.load(Relaxed);
-        let real_decode = REAL_DECODE_NS.load(Relaxed);
+        let prepare = PREPARE_NS.load(Relaxed);
+        let decode_and_derive = DECODE_AND_DERIVE_NS.load(Relaxed);
         let admit_and_seal = ADMIT_AND_SEAL_NS.load(Relaxed);
-        let total = probe_prepare
-            .saturating_add(probe_decode)
-            .saturating_add(real_prepare)
-            .saturating_add(real_decode)
-            .saturating_add(admit_and_seal);
+        let total = accounted_ns(prepare, decode_and_derive, admit_and_seal);
         let ms = |ns: u64| ns as f64 / 1e6;
         println!(
-            "[fn64-plan-census] plans={plans} accounted_ms={:.3} probe_prepare_ms={:.3} \
-             probe_decode_ms={:.3} real_prepare_ms={:.3} real_decode_ms={:.3} \
-             admit_and_seal_ms={:.3} per_plan_ms={:.6}",
+            "[fn64-plan-census] plans={plans} accounted_ms={:.3} prepare_ms={:.3} \
+             decode_and_derive_ms={:.3} admit_and_seal_ms={:.3} per_plan_ms={:.6}",
             ms(total),
-            ms(probe_prepare),
-            ms(probe_decode),
-            ms(real_prepare),
-            ms(real_decode),
+            ms(prepare),
+            ms(decode_and_derive),
             ms(admit_and_seal),
             ms(total) / plans as f64,
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn one_pass_census_closes_and_saturates() {
+            assert_eq!(super::accounted_ns(11, 13, 17), 41);
+            assert_eq!(super::accounted_ns(u64::MAX, 1, 1), u64::MAX);
+        }
     }
 }
 
@@ -4274,36 +4275,24 @@ impl RenderBackend for WgpuBackend {
     }
 }
 
-/// `plan_raw_dpc`'s body: decode `request`'s capture through T1's real
-/// decoder, push every admitted command through T0's sealed writer, and
-/// seal the result. `fn64_render::ExactRawDpcPlanWriter::finish` requires
-/// the exact journal T1's decode used; that journal is not knowable ahead
-/// of decoding (it depends on the capture's own admitted TMEM sources), so
-/// this mirrors T1's own test harness's two-pass probe: decode once against
-/// a throwaway single-source journal, read the real access list back off
-/// `RawDpcDecodeError::JournalMismatch::expected` when the probe
-/// (correctly) disagrees, then decode again for real.
+/// `plan_raw_dpc`'s body: decode `request`'s capture once through T1's typed
+/// planning decoder, push every admitted command through T0's sealed writer,
+/// and seal the decoder-derived journal. The seed journal exists only to
+/// satisfy capture preflight; [`crate::raw_dpc::PlanningDecodedRawDpc`]
+/// cannot enter ordinary execution and carries the authoritative access plan
+/// derived during that same decode.
 ///
-/// **Both passes decode against `durable_state`, and that is load-bearing.**
+/// **The decode observes `durable_state`, and that is load-bearing.**
 /// The journal a capture declares is not a function of its bytes alone: a
 /// `FillRectangle`/`TextureRectangle` reads its destination back off
 /// `RdpState::color_image()`, which an *earlier* submission's
 /// `SetColorImage` may have staged. `plan_texture_rectangle` treats a
 /// missing color image as "declares no write" (`return Ok(())`) rather than
-/// as an error, so a probe decoded against `RdpState::default()` silently
-/// returns a *shorter* access list than the real pass -- and the real pass
-/// then fails `JournalMismatch` against the journal the probe just built.
-/// That is not a hypothetical: it is exactly what WM2000's attract loop hit
-/// under `FN64_RENDER=wgpu`, where the title stages its color image once and
-/// then submits texrect-only XBUS runs against it (`expected 65 accesses,
-/// found 9` on the third coalesced run -- the first whose durable state is
-/// non-default, hence the first where the two passes could disagree at all).
-/// The probe is a *shape* probe, and the shape is state-dependent, so the
-/// probe must observe the same state the real decode will. The probe's
-/// throwaway-ness is entirely about its journal and its zero-filled read
-/// bytes; it was never about its RDP state.
+/// as an error, so deriving against `RdpState::default()` silently returns a
+/// shorter access list. The derivation therefore observes the same durable
+/// predecessor as command planning.
 ///
-/// Decoding the probe against durable state is side-effect-free:
+/// Decoding against durable state is side-effect-free:
 /// `decode_raw_dpc` takes `&RdpState` and forks it (`fork_for_decode`), so
 /// neither pass can mutate the caller's state, and only the real pass's
 /// `state_delta` is ever applied. Every `SubmittedTicket`
@@ -4330,76 +4319,43 @@ fn plan_raw_dpc_inner(
     let submission_start = submission.start();
     let capture_words = submission.command_words();
 
-    let probe_ticket =
-        raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::ProbePrepare, || {
-            let probe_journal = single_source_probe_journal(&submission, layout)
-                .map_err(|error| format!("raw-DPC plan probe journal failed: {error}"))?;
-            let probe_decoded = finalize_with_zero_reads(
-                layout,
-                capture.transaction_sequence(),
-                submission.clone(),
-                capture.cmd_end(),
-                capture.full_sync_boundaries().to_vec(),
-                probe_journal,
-            )
-            .map_err(|error| format!("raw-DPC plan probe preflight failed: {error}"))?;
-            submit_locally(probe_decoded)
-                .map_err(|error| format!("raw-DPC plan probe submission failed: {error}"))
-        })?;
-
-    let probe_result = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::ProbeDecode, || {
-        crate::decode_raw_dpc(probe_ticket, durable_state)
-    });
-    let journal = match probe_result {
-        Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => {
-            let accesses = expected.into_vec();
-            let declared = accesses
-                .iter()
-                .map(|access| access.region().declared_bytes())
-                .sum::<u32>();
-            ResourceJournal::try_new(
-                ResourceJournalLimits::try_new(
-                    fn64_render_ir::MAX_RESOURCE_ACCESSES,
-                    declared.max(1),
-                )
-                .map_err(|error| format!("raw-DPC plan journal limits failed: {error}"))?,
-                accesses,
-            )
-            .map_err(|error| format!("raw-DPC plan journal failed: {error}"))?
-        }
-        Ok(_) => {
-            return Err(
-                "raw-DPC plan probe unexpectedly succeeded against a single-source journal"
-                    .to_string(),
-            )
-        }
-        Err(error) => return Err(format!("raw-DPC plan probe decode failed: {error}")),
-    };
-
-    let ticket = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::RealPrepare, || {
+    let ticket = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::Prepare, || {
+        let seed_journal = planning_seed_journal(&submission, layout)
+            .map_err(|error| format!("raw-DPC plan seed journal failed: {error}"))?;
         let decoded_ticket = finalize_with_zero_reads(
             layout,
             capture.transaction_sequence(),
             submission,
             capture.cmd_end(),
             capture.full_sync_boundaries().to_vec(),
-            journal.clone(),
+            seed_journal,
         )
         .map_err(|error| format!("raw-DPC plan preflight failed: {error}"))?;
         submit_locally(decoded_ticket)
             .map_err(|error| format!("raw-DPC plan submission failed: {error}"))
     })?;
 
-    let decoded = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::RealDecode, || {
-        crate::decode_raw_dpc(ticket, durable_state)
+    let decoded = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::DecodeAndDerive, || {
+        crate::raw_dpc::decode_raw_dpc_for_planning(ticket, durable_state)
     })
     .map_err(|error| format!("raw-DPC plan decode failed: {error}"))?;
+    let accesses = decoded.resource_plan().accesses().to_vec();
+    let declared = accesses
+        .iter()
+        .map(|access| access.region().declared_bytes())
+        .sum::<u32>();
+    let journal = ResourceJournal::try_new(
+        ResourceJournalLimits::try_new(fn64_render_ir::MAX_RESOURCE_ACCESSES, declared.max(1))
+            .map_err(|error| format!("raw-DPC plan journal limits failed: {error}"))?,
+        accesses,
+    )
+    .map_err(|error| format!("raw-DPC plan journal failed: {error}"))?;
     let delta = decoded.state_delta().clone();
     let execution = classify_task_execution(decoded.commands(), durable_state);
 
     let planned = raw_dpc_plan_census::timed(raw_dpc_plan_census::Phase::AdmitAndSeal, || {
         let mut writer = coordinator.begin_plan(request);
-        push_decoded_raw_dpc(
+        push_planning_decoded_raw_dpc(
             &mut writer,
             &decoded,
             &capture_words,
@@ -4471,20 +4427,17 @@ fn submit_locally(decoded: DecodedTicket) -> Result<SubmittedTicket, ValidationE
 /// `DeferredGuestReadCapture::empty()`, which only satisfies a plan whose
 /// guest-read plan is itself empty -- never true here, since every admitted
 /// TMEM load declares at least one `TmemLoadSource` read. `plan_raw_dpc`'s
-/// two internal decode passes (the single-source probe, and the real
-/// journal-backed decode) both exist purely to learn the command
-/// structure/journal shape and drive T1's push loop -- neither one is the
+/// internal planning decode exists purely to learn the command
+/// structure/journal shape and drive T1's push loop -- it is not the
 /// production submission the ABI session's `finalize_and_submit` performs
 /// later with the real captured bytes -- so a correctly *sized*, zero-filled
 /// capture is exactly as valid here as any other byte content: `finish`'s
-/// own access-count/order check (and, for the probe, the deliberate
-/// `JournalMismatch` this function is built to catch) never inspects read
-/// content, only shape.
+/// own access-count/order check never inspects read content, only shape.
 ///
 /// `full_sync_boundaries` is NOT zero-filled the way the read bytes are, and
 /// must be the originating capture's own list. Stream derivation requires one
 /// boundary per decoded `SYNC_FULL` opcode, so an empty list here would fail
-/// both internal decode passes with `MissingFullSyncObservation` for any
+/// the planning decode with `MissingFullSyncObservation` for any
 /// capture containing a FullSync -- making the site unplannable no matter
 /// what its producer supplied. Shape, unlike content, is load-bearing here.
 fn finalize_with_zero_reads(
@@ -4519,11 +4472,10 @@ fn finalize_with_zero_reads(
     preflight.finalize(capture)
 }
 
-/// A minimal, self-consistent probe journal (command-decode access plus one
-/// whole-capture TMEM-source access) sufficient only to drive one decode
-/// attempt whose sole purpose is reading back the real access list via
-/// `JournalMismatch::expected`. Mirrors
-/// `crate::raw_dpc::production_adapter::tests::journal_for`.
+/// A minimal, self-consistent command-decode seed journal sufficient to pass
+/// capture preflight.
+/// The typed planning decoder derives the authoritative access list instead
+/// of admitting this seed as execution authority.
 ///
 /// The command-decode access's region kind must match `submission.source()`
 /// exactly (`fn64_render_ir::workload::validate_one_to_one_command_reads`
@@ -4535,26 +4487,15 @@ fn finalize_with_zero_reads(
 /// an XBUS submission (`OwnedRawDpcSubmission::validate_range` bounds XBUS
 /// ranges to `RSP_DMEM_BYTES`, never the RDP's 24-bit physical space).
 ///
-/// The TMEM-source access stays `ResourceRegion::Rdram { resource:
-/// RdramResource::Buffer, .. }` for both sources: every admitted TMEM
-/// load's source bytes are RDP-physical RDRAM addresses regardless of which
-/// bus carried the command stream (`crate::raw_dpc::production_adapter`'s
-/// push loop; XBUS changes only where the *command words* come from). For
-/// an XBUS submission this probe access intentionally does NOT reuse
-/// `submission.start()`/`end()` (DMEM-relative, wrong address space for an
-/// RDRAM buffer read) -- it covers the same-sized span at RDRAM offset 0
-/// instead. This is only a self-consistent probe (its own doc comment: read
-/// back the real access list via the deliberate `JournalMismatch` it
-/// causes), never the real journal `plan_raw_dpc_inner` submits for
-/// execution, so its exact placement is arbitrary as long as it lies in
-/// bounds and is internally consistent.
-fn single_source_probe_journal(
+/// It contains no speculative TMEM source: the typed planning decode derives
+/// those exact ranges, and preflight need not allocate or zero bytes for a
+/// placeholder read that execution can never consume.
+fn planning_seed_journal(
     submission: &fn64_render::OwnedRawDpcSubmission,
     layout: fn64_render_ir::PhysicalMemoryLayout,
 ) -> Result<ResourceJournal, ValidationError> {
     use fn64_render_ir::{DmemRange, OperationId, RdramResource, ResourceRegion};
     let start = submission.start();
-    let end = submission.end();
     let command_bytes = u32::try_from(submission.command_words().len() * 4)
         .expect("bounded command stream fits u32 bytes");
     let command_access = ResourceAccess::try_new(
@@ -4571,20 +4512,7 @@ fn single_source_probe_journal(
             }
         },
     )?;
-    let source_bytes = end.saturating_sub(start).max(1);
-    let source_access = ResourceAccess::try_new(
-        OperationId::new(1),
-        AccessMode::Read,
-        AccessPurpose::TmemLoadSource,
-        ResourceRegion::Rdram {
-            resource: RdramResource::Buffer,
-            range: match submission.source() {
-                fn64_render::RawDpcSource::Rdram => layout.range(start, end)?,
-                fn64_render::RawDpcSource::XbusDmem => layout.range(0, source_bytes)?,
-            },
-        },
-    )?;
-    let accesses = vec![command_access, source_access];
+    let accesses = vec![command_access];
     let declared = accesses
         .iter()
         .map(|access| access.region().declared_bytes())
@@ -4593,6 +4521,14 @@ fn single_source_probe_journal(
         ResourceJournalLimits::try_new(64, declared.max(1))?,
         accesses,
     )
+}
+
+#[cfg(test)]
+fn single_source_probe_journal(
+    submission: &fn64_render::OwnedRawDpcSubmission,
+    layout: fn64_render_ir::PhysicalMemoryLayout,
+) -> Result<ResourceJournal, ValidationError> {
+    planning_seed_journal(submission, layout)
 }
 
 /// `plan_raw_dpc` always constructs raw-DPC admission (via
@@ -10650,11 +10586,9 @@ mod tests {
     /// `RdpState`, so a black-box test cannot distinguish "state is threaded
     /// through" from "state is discarded but happens to look populated"
     /// purely by observing `plan_raw_dpc`'s success/failure. This test
-    /// instead pins down the source-level fact that makes state threading
-    /// real: **both** decode calls inside `plan_raw_dpc_inner` -- the probe
-    /// and the real pass -- pass `durable_state`, the caller-supplied
-    /// `&RdpState`, and no `RdpState::default()` appears anywhere in the
-    /// function. It mirrors
+    /// instead pins down the source-level facts that make state threading
+    /// real: exactly one typed planning decode receives `durable_state`, and
+    /// neither a second decode nor `RdpState::default()` appears. It mirrors
     /// `publish_raw_dpc_source_is_exactly_prepare_publication_then_commit`'s
     /// source-shape idiom.
     ///
@@ -10671,11 +10605,10 @@ mod tests {
     /// doc. The companion behavioral tests
     /// (`plan_raw_dpc_carries_durable_rdp_state_across_submissions` and
     /// `plan_raw_dpc_plans_a_texrect_against_a_color_image_an_earlier_submission_staged`)
-    /// prove the state accumulates and that the two passes agree once it
-    /// does; this one proves decoding actually consults it instead of a
-    /// hardcoded default.
+    /// prove the state accumulates; this one proves the sole derivation
+    /// actually consults it instead of a hardcoded default.
     #[test]
-    fn plan_raw_dpc_inner_decodes_both_passes_against_durable_state_not_default() {
+    fn plan_raw_dpc_inner_decodes_once_against_durable_state_not_default() {
         let source = include_str!("production.rs");
         let body_start = source
             .find("fn plan_raw_dpc_inner(")
@@ -10686,26 +10619,15 @@ mod tests {
             .unwrap_or(source.len());
         let body = &source[body_start..next_fn];
         assert!(
-            body.contains("crate::decode_raw_dpc(ticket, durable_state)"),
-            "plan_raw_dpc_inner's real (non-probe) decode call must pass `durable_state`, \
-             not a fresh `RdpState::default()` -- otherwise no submission's state ever \
-             carries forward to the next"
+            body.contains("crate::raw_dpc::decode_raw_dpc_for_planning(ticket, durable_state)"),
+            "the one planning decode must derive commands and journal against durable state",
         );
-        assert!(
-            body.contains("crate::decode_raw_dpc(probe_ticket, durable_state)"),
-            "plan_raw_dpc_inner's probe decode must pass `durable_state` too. The probe \
-             derives the journal the real pass is then checked against, and a journal is a \
-             function of durable state as well as of the capture's bytes (a texrect reads \
-             its destination off `RdpState::color_image()`, which an earlier submission may \
-             have staged). A probe blind to that state declares a shorter access list than \
-             the real pass and the real pass then fails JournalMismatch against it"
-        );
+        assert_eq!(body.matches("decode_raw_dpc_for_planning(").count(), 1);
+        assert!(!body.contains("crate::decode_raw_dpc("));
         let default_state_appearances = body.matches("RdpState::default()").count();
         assert_eq!(
             default_state_appearances, 0,
-            "RdpState::default() must not appear in plan_raw_dpc_inner at all -- both the \
-             probe and the real decode must observe the caller's durable state, or the two \
-             passes can disagree about how many accesses the capture declares"
+            "RdpState::default() must not replace the durable predecessor during derivation"
         );
     }
 
