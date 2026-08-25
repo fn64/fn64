@@ -15,7 +15,8 @@ from summarize_wm2000_pump_census import BUDGET_MS, parse_pumps, percentile
 
 TASK_RE = re.compile(
     r"^\[task-compute-tail\] task=(\d+) members=(\d+) cpu_members=(\d+) "
-    r"compute_members=(\d+) compute_ms=([0-9.]+) cpu=(.*)$"
+    r"compute_members=(\d+) compute_ms=([0-9.]+) "
+    r"(?:programs=(.*?) )?cpu=(.*)$"
 )
 
 
@@ -26,6 +27,7 @@ class Task:
     cpu_members: int
     compute_members: int
     compute_ms: float
+    programs: dict[str, tuple[int, int, float]]
     cpu: dict[str, tuple[int, float]]
 
 
@@ -35,8 +37,17 @@ def parse_tasks(text: str) -> list[Task]:
         match = TASK_RE.match(line)
         if match is None:
             continue
-        reasons: dict[str, tuple[int, float]] = {}
+        programs: dict[str, tuple[int, int, float]] = {}
         fields = match.group(6).split(";") if match.group(6) else []
+        for field in fields:
+            try:
+                program, value = field.rsplit("=", 1)
+                segments, members, elapsed_ms = value.split(":", 2)
+                programs[program] = (int(segments), int(members), float(elapsed_ms))
+            except ValueError as error:
+                raise ValueError(f"malformed task compute program: {field}") from error
+        reasons: dict[str, tuple[int, float]] = {}
+        fields = match.group(7).split(";") if match.group(7) else []
         for field in fields:
             try:
                 reason, value = field.rsplit("=", 1)
@@ -51,6 +62,7 @@ def parse_tasks(text: str) -> list[Task]:
                 cpu_members=int(match.group(3)),
                 compute_members=int(match.group(4)),
                 compute_ms=float(match.group(5)),
+                programs=programs,
                 cpu=reasons,
             )
         )
@@ -67,10 +79,15 @@ def mean(values: list[float]) -> float:
 
 def population(frames: list[dict[str, object]]) -> dict[str, object]:
     reasons: dict[str, list[float | int]] = defaultdict(lambda: [0, 0.0])
+    programs: dict[str, list[float | int]] = defaultdict(lambda: [0, 0, 0.0])
     for frame in frames:
         for reason, value in frame["cpu_reasons"].items():
             reasons[reason][0] += value["members"]
             reasons[reason][1] += value["elapsed_ms"]
+        for program, value in frame["compute_programs"].items():
+            programs[program][0] += value["segments"]
+            programs[program][1] += value["members"]
+            programs[program][2] += value["elapsed_ms"]
     count = len(frames)
     return {
         "count": count,
@@ -78,6 +95,16 @@ def population(frames: list[dict[str, object]]) -> dict[str, object]:
         "mean_rdp_ms": mean([float(frame["rdp_ms"]) for frame in frames]),
         "mean_task_cpu_ms": mean([float(frame["task_cpu_ms"]) for frame in frames]),
         "mean_task_compute_ms": mean([float(frame["task_compute_ms"]) for frame in frames]),
+        "compute_programs": {
+            program: {
+                "segments_per_frame": values[0] / count if count else 0.0,
+                "members_per_frame": values[1] / count if count else 0.0,
+                "ms_per_frame": values[2] / count if count else 0.0,
+            }
+            for program, values in sorted(
+                programs.items(), key=lambda item: item[1][2], reverse=True
+            )
+        },
         "cpu_reasons": {
             reason: {
                 "members_per_frame": values[0] / count if count else 0.0,
@@ -122,10 +149,15 @@ def summarize(text: str) -> dict[str, object]:
             for task in pump_tasks[index]
         ]
         reasons: dict[str, list[float | int]] = defaultdict(lambda: [0, 0.0])
+        programs: dict[str, list[float | int]] = defaultdict(lambda: [0, 0, 0.0])
         for task in frame_tasks:
             for reason, (members, elapsed_ms) in task.cpu.items():
                 reasons[reason][0] += members
                 reasons[reason][1] += elapsed_ms
+            for program, (segments, members, elapsed_ms) in task.programs.items():
+                programs[program][0] += segments
+                programs[program][1] += members
+                programs[program][2] += elapsed_ms
         frames.append(
             {
                 "pump": current,
@@ -138,6 +170,14 @@ def summarize(text: str) -> dict[str, object]:
                     for _, elapsed_ms in task.cpu.values()
                 ),
                 "task_compute_ms": sum(task.compute_ms for task in frame_tasks),
+                "compute_programs": {
+                    program: {
+                        "segments": values[0],
+                        "members": values[1],
+                        "elapsed_ms": values[2],
+                    }
+                    for program, values in programs.items()
+                },
                 "cpu_reasons": {
                     reason: {"members": values[0], "elapsed_ms": values[1]}
                     for reason, values in reasons.items()

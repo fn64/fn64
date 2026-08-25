@@ -762,7 +762,20 @@ all 65,536 texel-alpha/primitive-alpha pairs with deterministic channel
 variation and matched three complete-frame fixtures ten times. Twenty
 alternating release samples reduced the exact-program microbenchmark median
 from 0.413 to 0.309 ms, a 25.2-percent kernel reduction. Its sustained live
-effect remains unmeasured until the linked shell is rebuilt.
+effect was smaller but positive: the comparable instrumented 1,600-pump p95
+fell from 36.837 to 35.942 ms. In the slowest five percent of fields, the
+program's CPU bucket fell from 6.830 to 5.945 ms per frame. The remaining
+2.609 ms p95 gap therefore cannot be closed by this specialization alone.
+
+That same run made the next repeated-work target explicit. In the slowest five
+percent of fields, combined texrect-and-TMEM packets consumed 3.853 ms per
+frame, versus 0.242 ms for texrect-only, 0.254 ms for TMEM-only, and 0.063 ms
+for fill-only packets. The task-tail analyzer now understands the typed
+non-triangle partition and per-segment compute program fields, correlating
+both CPU and compute buckets with the exact drawn frames. The next batching
+tranche therefore targets the combined texrect/TMEM transaction rather than
+optimizing the cheap standalone shapes or broadening synchronous GPU
+admission.
 
 The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
 observed two presentation requests per WM2000 swap. Its dependency key owns

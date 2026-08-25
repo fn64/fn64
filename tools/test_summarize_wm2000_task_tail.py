@@ -24,10 +24,16 @@ def pump(index: int, swapped: bool, gfx_tasks: int, wall_ms: float) -> str:
     )
 
 
-def task(ordinal: int, cpu: str, compute_ms: float = 0.0) -> str:
+def task(
+    ordinal: int,
+    cpu: str,
+    compute_ms: float = 0.0,
+    programs: str | None = None,
+) -> str:
+    program_field = f"programs={programs} " if programs is not None else ""
     return (
         f"[task-compute-tail] task={ordinal} members=2 cpu_members=1 "
-        f"compute_members=1 compute_ms={compute_ms:.3f} cpu={cpu}"
+        f"compute_members=1 compute_ms={compute_ms:.3f} {program_field}cpu={cpu}"
     )
 
 
@@ -43,12 +49,27 @@ class TaskTailTest(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0].cpu["Planned(NoRawTriangle)"], (1, 0.5))
 
+    def test_compute_program_fields_are_parsed_without_losing_cpu_reasons(self) -> None:
+        parsed = parse_tasks(
+            task(
+                1,
+                "Planned(NoRawTriangle(TexrectOnly))=1:0.500",
+                1.25,
+                "Program(0)=1:2:1.000;MixedPrograms=1:1:0.250",
+            )
+        )
+        self.assertEqual(parsed[0].programs["Program(0)"], (1, 2, 1.0))
+        self.assertEqual(parsed[0].programs["MixedPrograms"], (1, 1, 0.25))
+        self.assertEqual(
+            parsed[0].cpu["Planned(NoRawTriangle(TexrectOnly))"], (1, 0.5)
+        )
+
     def test_warmup_prefix_is_removed_and_frame_populations_close(self) -> None:
         text = "\n".join(
             [
                 "[pump-census] RENDERER: wgpu",
                 task(1, "Planned(NoRawTriangle)=1:99.000"),
-                task(2, "program_bits:1/2/3/4=1:2.000", 1.0),
+                task(2, "program_bits:1/2/3/4=1:2.000", 1.0, "Program(0)=1:1:1.000"),
                 task(3, "cycle_type:5/6/7/8=1:20.000"),
                 pump(0, True, 0, 1.0),
                 pump(1, False, 1, 10.0),
@@ -63,6 +84,10 @@ class TaskTailTest(unittest.TestCase):
         self.assertEqual(result["within_budget"]["count"], 1)
         self.assertEqual(result["over_budget"]["count"], 1)
         self.assertEqual(result["over_budget"]["mean_task_cpu_ms"], 20.0)
+        self.assertEqual(
+            result["within_budget"]["compute_programs"]["Program(0)"]["ms_per_frame"],
+            1.0,
+        )
         self.assertNotIn(
             "Planned(NoRawTriangle)", result["over_budget"]["cpu_reasons"]
         )
