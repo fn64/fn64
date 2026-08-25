@@ -257,6 +257,7 @@ mod task_cpu_phase_census {
     }
 
     const PHASE_COUNT: usize = 7;
+    const SOURCE_SUBPHASE_COUNT: usize = 5;
     const MEMBER_PHASES: [Phase; 4] = [
         Phase::SourceBindingLoad,
         Phase::PrefixCapture,
@@ -268,9 +269,54 @@ mod task_cpu_phase_census {
     static MEMBERS: AtomicU64 = AtomicU64::new(0);
     static CPU_MEMBER_NS: AtomicU64 = AtomicU64::new(0);
     static PHASE_NS: [AtomicU64; PHASE_COUNT] = [const { AtomicU64::new(0) }; PHASE_COUNT];
+    static SOURCE_SUBPHASE_NS: [AtomicU64; SOURCE_SUBPHASE_COUNT] =
+        [const { AtomicU64::new(0) }; SOURCE_SUBPHASE_COUNT];
+
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub(super) enum SourceSubphase {
+        PacketCapturedReadBind,
+        LoadAccessBind,
+        TransactionBegin,
+        WordStageAndBlockValidity,
+        FinishProjectEffect,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct SourceCounters {
+        pub(super) loads: u64,
+        pub(super) source_fragments: u64,
+        pub(super) words: u64,
+        pub(super) destination_accesses: u64,
+        pub(super) first_loads: u64,
+        pub(super) cumulative_expected_destination_elements: u64,
+        pub(super) projected_destination_bytes: u64,
+    }
+
+    impl SourceCounters {
+        fn merge_from(&mut self, other: Self) {
+            self.loads = self.loads.saturating_add(other.loads);
+            self.source_fragments = self.source_fragments.saturating_add(other.source_fragments);
+            self.words = self.words.saturating_add(other.words);
+            self.destination_accesses = self
+                .destination_accesses
+                .saturating_add(other.destination_accesses);
+            self.first_loads = self.first_loads.saturating_add(other.first_loads);
+            self.cumulative_expected_destination_elements = self
+                .cumulative_expected_destination_elements
+                .saturating_add(other.cumulative_expected_destination_elements);
+            self.projected_destination_bytes = self
+                .projected_destination_bytes
+                .saturating_add(other.projected_destination_bytes);
+        }
+    }
+
+    static SOURCE_COUNTERS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
     pub(super) struct Task {
         phase_ns: [u64; PHASE_COUNT],
+        source_subphase_ns: [u64; SOURCE_SUBPHASE_COUNT],
+        source_counters: SourceCounters,
         cpu_member_ns: u64,
         members: u64,
         publications_remaining: usize,
@@ -287,6 +333,8 @@ mod task_cpu_phase_census {
             }
             Some(Self {
                 phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
                 cpu_member_ns: 0,
                 members: 0,
                 publications_remaining: publications,
@@ -304,6 +352,29 @@ mod task_cpu_phase_census {
         fn record(&mut self, phase: Phase, elapsed_ns: u64) {
             self.phase_ns[phase as usize] =
                 self.phase_ns[phase as usize].saturating_add(elapsed_ns);
+        }
+
+        fn record_source_subphase(&mut self, phase: SourceSubphase, elapsed_ns: u64) {
+            self.source_subphase_ns[phase as usize] =
+                self.source_subphase_ns[phase as usize].saturating_add(elapsed_ns);
+        }
+
+        fn record_source_counters(&mut self, counters: SourceCounters) {
+            self.source_counters.merge_from(counters);
+        }
+
+        #[cfg(test)]
+        fn source_subphase_accounted_ns(&self) -> u64 {
+            self.source_subphase_ns
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add)
+        }
+
+        #[cfg(test)]
+        fn source_residual_ns(&self) -> u64 {
+            self.phase_ns[Phase::SourceBindingLoad as usize]
+                .saturating_sub(self.source_subphase_accounted_ns())
         }
 
         pub(super) fn publication_finished(mut self) -> Option<Self> {
@@ -359,6 +430,32 @@ mod task_cpu_phase_census {
         )
     }
 
+    pub(super) fn timed_source<R>(
+        task: Option<&mut Task>,
+        attributed: bool,
+        phase: SourceSubphase,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        timed_source_optional_with_clock(
+            task.filter(|_| attributed),
+            phase,
+            operation,
+            std::time::Instant::now,
+        )
+    }
+
+    pub(super) fn record_source_counters(
+        task: Option<&mut Task>,
+        attributed: bool,
+        counters: impl FnOnce() -> SourceCounters,
+    ) {
+        if attributed {
+            if let Some(task) = task {
+                task.record_source_counters(counters());
+            }
+        }
+    }
+
     pub(super) fn started(task: Option<&Task>, attributed: bool) -> Option<std::time::Instant> {
         (attributed && task.is_some()).then(std::time::Instant::now)
     }
@@ -407,6 +504,36 @@ mod task_cpu_phase_census {
         timed_with_clock(task, phase, operation, now)
     }
 
+    fn timed_source_with_clock<R, I: Copy>(
+        task: &mut Task,
+        phase: SourceSubphase,
+        operation: impl FnOnce() -> R,
+        mut now: impl FnMut() -> I,
+    ) -> R
+    where
+        I: InstantLike,
+    {
+        let started = now();
+        let value = operation();
+        task.record_source_subphase(phase, started.elapsed_ns(now()));
+        value
+    }
+
+    fn timed_source_optional_with_clock<R, I: Copy>(
+        task: Option<&mut Task>,
+        phase: SourceSubphase,
+        operation: impl FnOnce() -> R,
+        now: impl FnMut() -> I,
+    ) -> R
+    where
+        I: InstantLike,
+    {
+        let Some(task) = task else {
+            return operation();
+        };
+        timed_source_with_clock(task, phase, operation, now)
+    }
+
     trait InstantLike {
         fn elapsed_ns(self, later: Self) -> u64;
     }
@@ -423,6 +550,21 @@ mod task_cpu_phase_census {
         for (total, elapsed) in PHASE_NS.iter().zip(task.phase_ns) {
             total.fetch_add(elapsed, Relaxed);
         }
+        for (total, elapsed) in SOURCE_SUBPHASE_NS.iter().zip(task.source_subphase_ns) {
+            total.fetch_add(elapsed, Relaxed);
+        }
+        for (total, value) in SOURCE_COUNTERS.iter().zip([
+            task.source_counters.loads,
+            task.source_counters.source_fragments,
+            task.source_counters.words,
+            task.source_counters.destination_accesses,
+            task.source_counters.first_loads,
+            task.source_counters
+                .cumulative_expected_destination_elements,
+            task.source_counters.projected_destination_bytes,
+        ]) {
+            total.fetch_add(value, Relaxed);
+        }
         let tasks = TASKS.fetch_add(1, Relaxed) + 1;
         if tasks % 30 == 0 {
             report(tasks);
@@ -433,6 +575,12 @@ mod task_cpu_phase_census {
         let phases: [u64; PHASE_COUNT] =
             core::array::from_fn(|index| PHASE_NS[index].load(Relaxed));
         let cpu_member_ns = CPU_MEMBER_NS.load(Relaxed);
+        let source_subphases: [u64; SOURCE_SUBPHASE_COUNT] =
+            core::array::from_fn(|index| SOURCE_SUBPHASE_NS[index].load(Relaxed));
+        let source_subphase_ns = source_subphases
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
         let member_accounted_ns = MEMBER_PHASES.iter().fold(0u64, |total, phase| {
             total.saturating_add(phases[*phase as usize])
         });
@@ -440,6 +588,12 @@ mod task_cpu_phase_census {
         eprintln!(
             "[task-cpu-phase-census] tasks={tasks} members={} cpu_member_total_ms={:.3} \
              member_accounted_ms={:.3} residual_ms={:.3} source_binding_load_ms={:.3} \
+             source_subphase_sum_ms={:.3} source_residual_ms={:.3} \
+             source_packet_captured_read_bind_ms={:.3} source_load_access_bind_ms={:.3} \
+             source_transaction_begin_ms={:.3} source_word_stage_block_validity_ms={:.3} \
+             source_finish_project_effect_ms={:.3} loads={} source_fragments={} words={} \
+             destination_accesses={} first_loads={} \
+             cumulative_expected_destination_elements={} projected_destination_bytes={} \
              prefix_capture_ms={:.3} schedule_decode_row_prep_raster_ms={:.3} \
              candidate_seed_copy_ms={:.3} \
              sparse_checkpoint_ms={:.3} guest_payload_materialization_ms={:.3} \
@@ -449,6 +603,20 @@ mod task_cpu_phase_census {
             ms(member_accounted_ns),
             ms(cpu_member_ns.saturating_sub(member_accounted_ns)),
             ms(phases[Phase::SourceBindingLoad as usize]),
+            ms(source_subphase_ns),
+            ms(phases[Phase::SourceBindingLoad as usize].saturating_sub(source_subphase_ns)),
+            ms(source_subphases[SourceSubphase::PacketCapturedReadBind as usize]),
+            ms(source_subphases[SourceSubphase::LoadAccessBind as usize]),
+            ms(source_subphases[SourceSubphase::TransactionBegin as usize]),
+            ms(source_subphases[SourceSubphase::WordStageAndBlockValidity as usize]),
+            ms(source_subphases[SourceSubphase::FinishProjectEffect as usize]),
+            SOURCE_COUNTERS[0].load(Relaxed),
+            SOURCE_COUNTERS[1].load(Relaxed),
+            SOURCE_COUNTERS[2].load(Relaxed),
+            SOURCE_COUNTERS[3].load(Relaxed),
+            SOURCE_COUNTERS[4].load(Relaxed),
+            SOURCE_COUNTERS[5].load(Relaxed),
+            SOURCE_COUNTERS[6].load(Relaxed),
             ms(phases[Phase::PrefixCapture as usize]),
             ms(phases[Phase::ScheduleDecodeRowPrepRaster as usize]),
             ms(phases[Phase::CandidateSeedCopy as usize]),
@@ -475,6 +643,8 @@ mod task_cpu_phase_census {
         fn phase_totals_close_against_the_existing_cpu_member_clock() {
             let mut task = Task {
                 phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
                 cpu_member_ns: 100,
                 members: 1,
                 publications_remaining: 1,
@@ -506,6 +676,8 @@ mod task_cpu_phase_census {
 
             let mut task = Task {
                 phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
                 cpu_member_ns: 0,
                 members: 0,
                 publications_remaining: 1,
@@ -530,6 +702,8 @@ mod task_cpu_phase_census {
         fn captured_read_binding_time_is_accounted_to_the_member_load_phase() {
             let mut task = Task {
                 phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
                 cpu_member_ns: 29,
                 members: 1,
                 publications_remaining: 1,
@@ -550,6 +724,48 @@ mod task_cpu_phase_census {
             assert_eq!(task.member_accounted_ns(), 13);
             assert_eq!(task.residual_ns(), 16);
             assert!(ticks.next().is_none());
+        }
+
+        #[test]
+        fn source_subphases_close_against_the_existing_source_total() {
+            let mut task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
+                cpu_member_ns: 0,
+                members: 1,
+                publications_remaining: 1,
+            };
+            task.record(Phase::SourceBindingLoad, 101);
+            task.record_source_subphase(SourceSubphase::PacketCapturedReadBind, 7);
+            task.record_source_subphase(SourceSubphase::LoadAccessBind, 11);
+            task.record_source_subphase(SourceSubphase::TransactionBegin, 13);
+            task.record_source_subphase(SourceSubphase::WordStageAndBlockValidity, 17);
+            task.record_source_subphase(SourceSubphase::FinishProjectEffect, 19);
+            assert_eq!(task.source_subphase_accounted_ns(), 67);
+            assert_eq!(task.source_residual_ns(), 34);
+            task.phase_ns[Phase::SourceBindingLoad as usize] = 1;
+            assert_eq!(task.source_residual_ns(), 0, "clock nesting must saturate");
+        }
+
+        #[test]
+        fn disabled_source_subphase_path_reads_neither_clock_nor_counters() {
+            let mut calls = 0;
+            let value = timed_source_optional_with_clock::<_, TestInstant>(
+                None,
+                SourceSubphase::LoadAccessBind,
+                || {
+                    calls += 1;
+                    23
+                },
+                || panic!("disabled source timing must not read a clock"),
+            );
+            assert_eq!(value, 23);
+            assert_eq!(calls, 1);
+
+            record_source_counters(None, true, || {
+                panic!("disabled source counters must remain uncomputed")
+            });
         }
 
         #[test]
@@ -3555,11 +3771,20 @@ impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
     fn submitted_packet(&mut self, packet: &WorkloadPacket) {
         let cpu_phase_attributed =
             self.task_cpu_phase_census.is_some() && ordered_depth_free_acff_triangle_member(self);
-        let binding = task_cpu_phase_census::timed(
+        let binding_started = task_cpu_phase_census::started(
+            self.task_cpu_phase_census.as_deref(),
+            cpu_phase_attributed,
+        );
+        let binding = task_cpu_phase_census::timed_source(
             self.task_cpu_phase_census.as_deref_mut(),
             cpu_phase_attributed,
-            task_cpu_phase_census::Phase::SourceBindingLoad,
+            task_cpu_phase_census::SourceSubphase::PacketCapturedReadBind,
             || self.reads.bind_packet(packet),
+        );
+        task_cpu_phase_census::record_started(
+            self.task_cpu_phase_census.as_deref_mut(),
+            task_cpu_phase_census::Phase::SourceBindingLoad,
+            binding_started,
         );
         if let Err(error) = binding {
             self.outcome = Some(Err(error));
@@ -6590,6 +6815,7 @@ fn stage_and_report(
     // the LAST entry whose command index is below C -- see
     // `tmem_source_for_command`.
     let mut prefixes: Vec<(u32, crate::tmem::TmemPrefixSnapshot)> = Vec::new();
+    let mut expected_destination_elements = 0u64;
 
     for (command_index, load) in collector.plan.loads.iter() {
         let command_index = *command_index;
@@ -6598,77 +6824,131 @@ fn stage_and_report(
             cpu_phase_attributed,
         );
 
-        let destination_accesses = destination_access_run(
-            &collector.plan.accesses,
-            load.destination_access_index() as usize,
+        let (destination_accesses, source_accesses) = task_cpu_phase_census::timed_source(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::SourceSubphase::LoadAccessBind,
+            || {
+                let destination_accesses = destination_access_run(
+                    &collector.plan.accesses,
+                    load.destination_access_index() as usize,
+                );
+                let source_accesses = load.sources();
+                (destination_accesses, source_accesses)
+            },
         );
         if destination_accesses.is_empty() {
             return Err(WgpuRawDpcExecutionError::MalformedDestinationAccessRun { command_index });
         }
-        let mut staged = match packet_transaction.take() {
-            None => collector
-                .physical
-                .stage_neutral_transfer(
-                    source,
-                    collector.queue,
-                    collector.ordinal,
-                    sequence,
-                    load,
-                    destination_accesses,
-                )
-                .map_err(WgpuRawDpcExecutionError::Physical)?,
-            Some(packet) => packet
-                .stage_neutral_transfer_next(source, load, destination_accesses)
-                .map_err(WgpuRawDpcExecutionError::Physical)?,
-        };
-
-        let tracks_block_footprint = matches!(load.shape(), TmemLoadShape::Block);
-        let mut block_footprint: Option<(u16, u16)> = None;
-        while let Some(word) = staged.next_expected_word() {
-            if tracks_block_footprint {
-                if let crate::tmem::TmemTransferPhysicalWord::Linear(_) = word.physical() {
-                    let destination = word.destination_word();
-                    block_footprint = Some(match block_footprint {
-                        None => (destination, destination),
-                        Some((low, high)) => (low.min(destination), high.max(destination)),
-                    });
+        let first_load = packet_transaction.is_none();
+        task_cpu_phase_census::record_source_counters(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            || {
+                let destination_access_count =
+                    u64::try_from(destination_accesses.len()).unwrap_or(u64::MAX);
+                expected_destination_elements =
+                    expected_destination_elements.saturating_add(destination_access_count);
+                task_cpu_phase_census::SourceCounters {
+                    loads: 1,
+                    source_fragments: u64::try_from(source_accesses.len()).unwrap_or(u64::MAX),
+                    words: u64::try_from(load.transfer_words().len()).unwrap_or(u64::MAX),
+                    destination_accesses: destination_access_count,
+                    first_loads: u64::from(first_load),
+                    cumulative_expected_destination_elements: expected_destination_elements,
+                    projected_destination_bytes: destination_accesses.iter().fold(
+                        0u64,
+                        |total, access| {
+                            total.saturating_add(u64::from(access.region().declared_bytes()))
+                        },
+                    ),
                 }
-            }
-            let bytes = word_source_bytes(
-                &collector.reads,
-                load.sources(),
-                load.source_access_index(),
-                word,
-            )
-            .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
-            let physical_lanes = map_physical_lanes(load, word, bytes)
-                .map_err(WgpuRawDpcExecutionError::Physical)?;
-            let payload = staged
-                .physical_word_payload(word, physical_lanes)
-                .map_err(WgpuRawDpcExecutionError::Physical)?;
-            staged
-                .stage_word(payload)
-                .map_err(WgpuRawDpcExecutionError::Physical)?;
-        }
+            },
+        );
+        let mut staged = task_cpu_phase_census::timed_source(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::SourceSubphase::TransactionBegin,
+            || match packet_transaction.take() {
+                None => collector
+                    .physical
+                    .stage_neutral_transfer(
+                        source,
+                        collector.queue,
+                        collector.ordinal,
+                        sequence,
+                        load,
+                        destination_accesses,
+                    )
+                    .map_err(WgpuRawDpcExecutionError::Physical),
+                Some(packet) => packet
+                    .stage_neutral_transfer_next(source, load, destination_accesses)
+                    .map_err(WgpuRawDpcExecutionError::Physical),
+            },
+        )?;
 
-        // A LoadBlock with DXT >= 0x800 advances its destination by more than
-        // one TMEM word per source word -- the row advance for tile rows
-        // >= 1 -- so it writes scattered words (e.g. DXT=0x800 -> words 0, 2,
-        // 4, 6) and skips the words between them. Hardware and both oracles
-        // (RT64, angrylion) read those skipped words back as their prior,
-        // zero-initialised content; only fn64's validity tracking would
-        // otherwise refuse a render tile that re-describes the block with a
-        // `line` reading a skipped word. The sweep is contiguous, so mark
-        // every word in `[low, high]` valid. Scoped to Block: a LoadTile
-        // that reads outside its own footprint still refuses (its interior
-        // has no such sweep gaps), keeping the WM2000 origin-term guard.
-        if let Some((low_word, high_word)) = block_footprint {
-            staged.mark_block_footprint_valid(low_word, high_word);
-        }
+        task_cpu_phase_census::timed_source(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::SourceSubphase::WordStageAndBlockValidity,
+            || -> Result<(), WgpuRawDpcExecutionError> {
+                let tracks_block_footprint = matches!(load.shape(), TmemLoadShape::Block);
+                let mut block_footprint: Option<(u16, u16)> = None;
+                while let Some(word) = staged.next_expected_word() {
+                    if tracks_block_footprint {
+                        if let crate::tmem::TmemTransferPhysicalWord::Linear(_) = word.physical() {
+                            let destination = word.destination_word();
+                            block_footprint = Some(match block_footprint {
+                                None => (destination, destination),
+                                Some((low, high)) => (low.min(destination), high.max(destination)),
+                            });
+                        }
+                    }
+                    let bytes = word_source_bytes(
+                        &collector.reads,
+                        source_accesses,
+                        load.source_access_index(),
+                        word,
+                    )
+                    .ok_or(WgpuRawDpcExecutionError::MissingCapturedSource { command_index })?;
+                    let physical_lanes = map_physical_lanes(load, word, bytes)
+                        .map_err(WgpuRawDpcExecutionError::Physical)?;
+                    let payload = staged
+                        .physical_word_payload(word, physical_lanes)
+                        .map_err(WgpuRawDpcExecutionError::Physical)?;
+                    staged
+                        .stage_word(payload)
+                        .map_err(WgpuRawDpcExecutionError::Physical)?;
+                }
 
-        let finished = staged
-            .finish_load()
-            .map_err(WgpuRawDpcExecutionError::Physical)?;
+                // A LoadBlock with DXT >= 0x800 advances its destination by more than
+                // one TMEM word per source word -- the row advance for tile rows
+                // >= 1 -- so it writes scattered words (e.g. DXT=0x800 -> words 0, 2,
+                // 4, 6) and skips the words between them. Hardware and both oracles
+                // (RT64, angrylion) read those skipped words back as their prior,
+                // zero-initialised content; only fn64's validity tracking would
+                // otherwise refuse a render tile that re-describes the block with a
+                // `line` reading a skipped word. The sweep is contiguous, so mark
+                // every word in `[low, high]` valid. Scoped to Block: a LoadTile
+                // that reads outside its own footprint still refuses (its interior
+                // has no such sweep gaps), keeping the WM2000 origin-term guard.
+                if let Some((low_word, high_word)) = block_footprint {
+                    staged.mark_block_footprint_valid(low_word, high_word);
+                }
+                Ok(())
+            },
+        )?;
+
+        let finished = task_cpu_phase_census::timed_source(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::SourceSubphase::FinishProjectEffect,
+            || {
+                staged
+                    .finish_load()
+                    .map_err(WgpuRawDpcExecutionError::Physical)
+            },
+        )?;
         task_cpu_phase_census::record_started(
             collector.task_cpu_phase_census.as_deref_mut(),
             task_cpu_phase_census::Phase::SourceBindingLoad,

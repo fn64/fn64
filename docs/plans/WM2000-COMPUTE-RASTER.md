@@ -838,13 +838,16 @@ key is `fc15fea3/f00ff23f/0018acff/0f0a7008`, and reports cumulative source
 binding/load, TMEM prefix capture, schedule/decode/row-preparation/raster,
 candidate seed/copy, sparse-checkpoint, guest-payload, and sparse-publication
 time. The existing CPU-member clock supplies the denominator and an explicit
-residual. Decode/row preparation and raster remain one bucket because the
-current command loop interleaves them; separating them would require a
-semantic refactor or per-draw clocks. A fixed-size task-local accumulator is
-merged only after the task's final ordered publication. The disabled path
-performs one cached flag check and creates no clock, map, allocation, or
-program walk. As with the texrect census, an armed run is attribution evidence
-and not authoritative p95/p99 evidence.
+residual. Source/load is further closed over packet read binding, per-load
+access binding, transaction/neutral validation, word staging/block validity,
+and finish/projection/effect subphases, with load/source/word/destination and
+materialized-byte denominators. Decode/row preparation and raster remain one
+bucket because the current command loop interleaves them; separating them
+would require a semantic refactor or per-draw clocks. A fixed-size task-local
+accumulator is merged only after the task's final ordered publication. The
+disabled path performs one cached flag check and creates no clock, map,
+allocation, or program walk. As with the texrect census, an armed run is
+attribution evidence and not authoritative p95/p99 evidence.
 
 The first complete exact-key census attributed 2,015.443 ms across 43,156 hot
 members: 839.597 ms to source binding/load, 747.653 ms to the combined
