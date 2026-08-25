@@ -423,8 +423,11 @@ same private-capture identity. No test can rederive final RDRAM SHA-256
 `4af275f0aa78f5453eeb82ebc7b821b14fd994c0b8e32c041bd3f719acf954c6`; no test owns that private artifact.
 Paired means fell from 3.362 to 2.324 ms for compute work (-1.038 ms, 30.9%)
 and from 8.794 to 7.740 ms total (-1.054 ms, 12.0%); paired p95 fell from
-9.573 to 7.913 ms. `FN64_COMPUTE_STATE_TABLE_FUSION=0` retains the same-binary
-multi-pass measurement control; absent or `1` enables fusion.
+9.573 to 7.913 ms. That experiment used a historical same-binary multi-pass
+control. The control was removed when packet-checkpoint execution adopted
+sparse boundary events: the old multi-pass shape cannot produce those
+boundaries through the same typed output mechanism and is no longer a runtime
+mode.
 
 The focused native differential retains three independent contracts. The
 ordinary two-draw compute batch matches the CPU raster's complete target
@@ -652,6 +655,81 @@ cost makes it a poor first widening. The measured one-cycle key is first: it
 has comparable recoverable CPU time to the leading two-cycle key while reusing
 the current one-cycle execution shape. Each widening still requires complete
 CPU/GPU target-byte identity and a same-binary performance kill gate.
+
+The later 1,600-pump route changed the optimization boundary. Over-budget
+frames executed 32,519 CPU members of
+`fc15fea3/f00ff23f/0018acff/0f0a7008`, averaging 5.733 ms per over-budget frame
+but only 0.074 ms per member. An exact shader widening passed ten separate
+4,300-packet production-path CPU/GPU byte differentials, but failed its live
+performance kill gate: p95 rose to 63.738 ms and 59.7 percent of 792 drawn
+frames exceeded 33.333 ms. The widening is therefore not admitted. This class
+is a repetition problem, not an individually expensive draw problem: the
+current compute chain preserves each packet generation by repeating dispatch
+and checkpoint work. The next optimization must reduce that per-member cost
+while retaining exact ordered packet publications; admitting more members to
+the existing mechanism is known-worse. Checkpoint images are redeemed through
+one move-only exact-cardinality value, so a missing or extra device result is
+rejected before candidate or guest-effect mutation instead of being silently
+truncated by iterator pairing.
+
+Cross-checkpoint fusion then tested whether packet-sized GPU fixed cost was
+the whole failure. The chain now emits one word-major ordered event stream,
+uses checkpoint markers to capture deterministic sparse packed-word outputs,
+and submits one compute pass per chain. The host reconstructs the existing
+ordered full images, so packet generations and publication semantics are
+unchanged. On the 800-pump instrumented route this reduced 9,876 passes to
+742, GPU-valid time from 1,259 to 527 ms, and planner preparation from its
+first fused implementation's 1,595 to 483 ms. The latter improvement came
+from a two-pass dispatch-major planner and reusable target-sized scratch
+storage rather than a word-by-dispatch scan or nested per-row vectors.
+
+Fusion was not enough to make the many-small-member program profitable. On
+the same 2,190-task/80,156-member tail, admitting it moved 43,869 members to
+compute, added 10,616 ms of compute work, and removed only 3,575 ms of CPU
+work: 7,041 ms more serialized task work, or 8.81 ms per drawn frame. Clean
+1,600-pump p95 was 57.248 ms. Refusing only that exact program while retaining
+fusion restored p95 to 43.410 ms (mean 31.069, p99 47.256, max 48.884). It
+remains rejected; the next widening candidates are ranked by recovered CPU
+time per member, not aggregate member count.
+
+The next high-cost-per-member candidate,
+`fc15fea3/f00ff23f/0018ac8f/0f0a7008`, also passed the native Metal
+CPU/GPU byte differential ten times and one complete 4,300-packet
+production-state differential. Its committed digest and final postimage hash
+were unchanged. It nevertheless failed the sustained live kill gate: against
+the exact id3-off 1,600-pump baseline, p95 rose from 43.410 to 45.335 ms,
+mean from 31.069 to 32.161 ms, and the over-budget share from 50.7 to 57.2
+percent. It is therefore not live-admitted. Exact shader support remains a
+future batching primitive, not evidence that the current per-member transport
+is profitable.
+
+The task read arena now also shares immutable captured bytes across packet
+bindings. Each journal access index remains distinct, while a task-local pool
+interns bytes only after a typed physical-range/content-digest match and a
+full byte comparison, so neither a hash collision nor equal bytes at a
+different address can authorize reuse. Ordinary single-packet execution does
+not retain the pool. This closes the remaining 97.9-percent duplicate-capture
+ownership path without weakening per-packet ordering; its live effect must be
+measured separately from the rejected-program rollback.
+
+Planning now performs the immutable program-shape half of compute admission
+before task execution. A typed definitely-CPU disposition carries the exact
+refusal reason; only packets whose program shape passes can request the later
+target, access, TMEM, and generation admission. Missing state remains a loud
+runtime concern. This removed the speculative stage/decode followed by a
+second CPU stage/decode for 63,224 of 80,156 sustained-route members. On the
+clean 1,600-pump route, p95 fell from 43.410 to 40.368 ms, mean from 31.069 to
+29.199 ms, and the over-budget share from 50.7 to 39.4 percent. The result is
+promising but not yet the required ten-run quiet-machine gate.
+
+The shell also has a default-off `FN64_PRESENT_CACHE=1` experiment for the
+observed two presentation requests per WM2000 swap. Its dependency key owns
+the VI origin and geometry plus the exact word-rounded RGBA5551 source bytes;
+comparison borrows live RDRAM without allocating, and the snapshot advances
+only after a successful surface render. OS redraw, overlay, tripwire, and
+frame-dump paths always redraw. One same-binary run changed p95 only from
+40.368 to 40.237 ms, too small for a claim under the measured background-load
+noise, so it remains opt-in pending a quiet counterbalanced A/B.
 
 ## Sources and nonclaims
 
