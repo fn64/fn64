@@ -846,6 +846,25 @@ performs one cached flag check and creates no clock, map, allocation, or
 program walk. As with the texrect census, an armed run is attribution evidence
 and not authoritative p95/p99 evidence.
 
+The first complete exact-key census attributed 2,015.443 ms across 43,156 hot
+members: 839.597 ms to source binding/load, 747.653 ms to the combined
+schedule/decode/row/raster phase, 415.877 ms to residual work, 8.770 ms to
+prefix capture, and 3.546 ms to candidate seed/copy. Prefix snapshots are
+therefore not the next bottleneck despite their framebuffer-like copy shape.
+The first source/load tranche replaces each load's temporary source-reference
+vector and repeated linear captured-read scans with one packet-sized, exact
+access-indexed authority. Binding rejects missing, duplicate, out-of-range, or
+descriptor-mismatched reads before execution; TMEM words and partial-fill
+seeds then perform checked direct lookup. Two counterbalanced candidate/control
+pairs kept every recorded framebuffer hash and logical presentation digest
+identical while improving drawn-frame p95 by 0.243--0.389 ms before a profiling
+boundary correction. With packet binding charged to the same source/load
+bucket on both sides, one further candidate run reduced that phase from
+835.27 ms in both controls to 807.93 ms, and total hot-member time from
+2,019--2,023 ms to 1,991.46 ms. Its p95 was 33.313 ms, only 0.020 ms inside the
+field budget; this is a retained mechanism win, not reliable-budget or
+ten-run evidence.
+
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
 `FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
