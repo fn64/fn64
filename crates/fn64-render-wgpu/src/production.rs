@@ -230,6 +230,376 @@ mod raw_dpc_execute_census {
     }
 }
 
+/// Coarse attribution for the ordered, depth-free, triangle-only
+/// `0x0018_acff` CPU task path. One fixed-size accumulator follows a task
+/// through its last packet publication and is merged into process totals
+/// exactly once. Decode/row preparation and raster remain one schedule clock:
+/// the existing loop interleaves them, and separating them would require a
+/// semantic restructuring or per-draw clocks. The disabled path performs only
+/// the cached flag check made by [`Task::begin`]; no clocks, census-owned
+/// allocations, or program classification are reached.
+mod task_cpu_phase_census {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        OnceLock,
+    };
+
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub(super) enum Phase {
+        SourceBindingLoad,
+        PrefixCapture,
+        ScheduleDecodeRowPrepRaster,
+        CandidateSeedCopy,
+        SparseCheckpoint,
+        GuestPayloadMaterialization,
+        SparsePublication,
+    }
+
+    const PHASE_COUNT: usize = 7;
+    const MEMBER_PHASES: [Phase; 4] = [
+        Phase::SourceBindingLoad,
+        Phase::PrefixCapture,
+        Phase::ScheduleDecodeRowPrepRaster,
+        Phase::CandidateSeedCopy,
+    ];
+
+    static TASKS: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS: AtomicU64 = AtomicU64::new(0);
+    static CPU_MEMBER_NS: AtomicU64 = AtomicU64::new(0);
+    static PHASE_NS: [AtomicU64; PHASE_COUNT] = [const { AtomicU64::new(0) }; PHASE_COUNT];
+
+    pub(super) struct Task {
+        phase_ns: [u64; PHASE_COUNT],
+        cpu_member_ns: u64,
+        members: u64,
+        publications_remaining: usize,
+    }
+
+    impl Task {
+        pub(super) fn begin(publications: usize) -> Option<Self> {
+            assert!(
+                publications > 0,
+                "a task CPU phase census requires at least one eventual publication"
+            );
+            if !enabled() {
+                return None;
+            }
+            Some(Self {
+                phase_ns: [0; PHASE_COUNT],
+                cpu_member_ns: 0,
+                members: 0,
+                publications_remaining: publications,
+            })
+        }
+
+        pub(super) fn record_member_total(&mut self, attributed: bool, elapsed_ns: Option<u64>) {
+            if !attributed {
+                return;
+            }
+            self.members = self.members.saturating_add(1);
+            self.cpu_member_ns = self.cpu_member_ns.saturating_add(elapsed_ns.unwrap_or(0));
+        }
+
+        fn record(&mut self, phase: Phase, elapsed_ns: u64) {
+            self.phase_ns[phase as usize] =
+                self.phase_ns[phase as usize].saturating_add(elapsed_ns);
+        }
+
+        pub(super) fn publication_finished(mut self) -> Option<Self> {
+            self.publications_remaining = self
+                .publications_remaining
+                .checked_sub(1)
+                .expect("a task CPU phase census observes at most one publication per member");
+            if self.publications_remaining == 0 {
+                merge(self);
+                None
+            } else {
+                Some(self)
+            }
+        }
+
+        #[cfg(test)]
+        fn member_accounted_ns(&self) -> u64 {
+            MEMBER_PHASES.iter().fold(0, |total, phase| {
+                total.saturating_add(self.phase_ns[*phase as usize])
+            })
+        }
+
+        #[cfg(test)]
+        fn residual_ns(&self) -> u64 {
+            self.cpu_member_ns
+                .saturating_sub(self.member_accounted_ns())
+        }
+    }
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FN64_TASK_CPU_PHASE_CENSUS")
+                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+        })
+    }
+
+    pub(super) fn wants_member_clock() -> bool {
+        enabled()
+    }
+
+    pub(super) fn timed<R>(
+        task: Option<&mut Task>,
+        attributed: bool,
+        phase: Phase,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        timed_optional_with_clock(
+            task.filter(|_| attributed),
+            phase,
+            operation,
+            std::time::Instant::now,
+        )
+    }
+
+    pub(super) fn started(task: Option<&Task>, attributed: bool) -> Option<std::time::Instant> {
+        (attributed && task.is_some()).then(std::time::Instant::now)
+    }
+
+    pub(super) fn record_started(
+        task: Option<&mut Task>,
+        phase: Phase,
+        started: Option<std::time::Instant>,
+    ) {
+        let (Some(task), Some(started)) = (task, started) else {
+            return;
+        };
+        task.record(
+            phase,
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+
+    fn timed_with_clock<R, I: Copy>(
+        task: &mut Task,
+        phase: Phase,
+        operation: impl FnOnce() -> R,
+        mut now: impl FnMut() -> I,
+    ) -> R
+    where
+        I: InstantLike,
+    {
+        let started = now();
+        let value = operation();
+        task.record(phase, started.elapsed_ns(now()));
+        value
+    }
+
+    fn timed_optional_with_clock<R, I: Copy>(
+        task: Option<&mut Task>,
+        phase: Phase,
+        operation: impl FnOnce() -> R,
+        now: impl FnMut() -> I,
+    ) -> R
+    where
+        I: InstantLike,
+    {
+        let Some(task) = task else {
+            return operation();
+        };
+        timed_with_clock(task, phase, operation, now)
+    }
+
+    trait InstantLike {
+        fn elapsed_ns(self, later: Self) -> u64;
+    }
+
+    impl InstantLike for std::time::Instant {
+        fn elapsed_ns(self, later: Self) -> u64 {
+            u64::try_from(later.duration_since(self).as_nanos()).unwrap_or(u64::MAX)
+        }
+    }
+
+    fn merge(task: Task) {
+        MEMBERS.fetch_add(task.members, Relaxed);
+        CPU_MEMBER_NS.fetch_add(task.cpu_member_ns, Relaxed);
+        for (total, elapsed) in PHASE_NS.iter().zip(task.phase_ns) {
+            total.fetch_add(elapsed, Relaxed);
+        }
+        let tasks = TASKS.fetch_add(1, Relaxed) + 1;
+        if tasks % 30 == 0 {
+            report(tasks);
+        }
+    }
+
+    fn report(tasks: u64) {
+        let phases: [u64; PHASE_COUNT] =
+            core::array::from_fn(|index| PHASE_NS[index].load(Relaxed));
+        let cpu_member_ns = CPU_MEMBER_NS.load(Relaxed);
+        let member_accounted_ns = MEMBER_PHASES.iter().fold(0u64, |total, phase| {
+            total.saturating_add(phases[*phase as usize])
+        });
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        eprintln!(
+            "[task-cpu-phase-census] tasks={tasks} members={} cpu_member_total_ms={:.3} \
+             member_accounted_ms={:.3} residual_ms={:.3} source_binding_load_ms={:.3} \
+             prefix_capture_ms={:.3} schedule_decode_row_prep_raster_ms={:.3} \
+             candidate_seed_copy_ms={:.3} \
+             sparse_checkpoint_ms={:.3} guest_payload_materialization_ms={:.3} \
+             sparse_publication_ms={:.3}",
+            MEMBERS.load(Relaxed),
+            ms(cpu_member_ns),
+            ms(member_accounted_ns),
+            ms(cpu_member_ns.saturating_sub(member_accounted_ns)),
+            ms(phases[Phase::SourceBindingLoad as usize]),
+            ms(phases[Phase::PrefixCapture as usize]),
+            ms(phases[Phase::ScheduleDecodeRowPrepRaster as usize]),
+            ms(phases[Phase::CandidateSeedCopy as usize]),
+            ms(phases[Phase::SparseCheckpoint as usize]),
+            ms(phases[Phase::GuestPayloadMaterialization as usize]),
+            ms(phases[Phase::SparsePublication as usize]),
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[derive(Clone, Copy)]
+        struct TestInstant(u64);
+
+        impl InstantLike for TestInstant {
+            fn elapsed_ns(self, later: Self) -> u64 {
+                later.0 - self.0
+            }
+        }
+
+        #[test]
+        fn phase_totals_close_against_the_existing_cpu_member_clock() {
+            let mut task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                cpu_member_ns: 100,
+                members: 1,
+                publications_remaining: 1,
+            };
+            task.record(Phase::SourceBindingLoad, 11);
+            task.record(Phase::PrefixCapture, 13);
+            task.record(Phase::ScheduleDecodeRowPrepRaster, 36);
+            task.record(Phase::CandidateSeedCopy, 23);
+            assert_eq!(task.member_accounted_ns(), 83);
+            assert_eq!(task.residual_ns(), 17);
+            task.cpu_member_ns = 1;
+            assert_eq!(task.residual_ns(), 0, "clock nesting must saturate");
+        }
+
+        #[test]
+        fn disabled_timing_path_runs_the_closure_without_reading_a_clock() {
+            let mut calls = 0;
+            let value = timed_optional_with_clock::<_, TestInstant>(
+                None,
+                Phase::PrefixCapture,
+                || {
+                    calls += 1;
+                    7
+                },
+                || panic!("disabled timing must not read a clock"),
+            );
+            assert_eq!(value, 7);
+            assert_eq!(calls, 1);
+
+            let mut task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                cpu_member_ns: 0,
+                members: 0,
+                publications_remaining: 1,
+            };
+            let mut ticks = [TestInstant(3), TestInstant(14)].into_iter();
+            let value = timed_with_clock(
+                &mut task,
+                Phase::PrefixCapture,
+                || 9,
+                || {
+                    ticks
+                        .next()
+                        .expect("enabled timing reads exactly two clocks")
+                },
+            );
+            assert_eq!(value, 9);
+            assert_eq!(task.phase_ns[Phase::PrefixCapture as usize], 11);
+            assert!(ticks.next().is_none());
+        }
+
+        #[test]
+        fn exact_hot_program_and_shape_are_closed_under_single_fact_mutations() {
+            let combine = super::super::CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f);
+            let other = super::super::OtherMode::from_wire(0x0018_acff, 0x0f0a_7008);
+            assert!(super::super::task_cpu_phase_hot_program(
+                combine, other, true, true
+            ));
+
+            let program_mutations = [
+                (
+                    super::super::CombineParams::from_wire(0xfc15_fea2, 0xf00f_f23f),
+                    other,
+                    true,
+                    true,
+                ),
+                (
+                    super::super::CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23e),
+                    other,
+                    true,
+                    true,
+                ),
+                (
+                    combine,
+                    super::super::OtherMode::from_wire(0x0018_acfe, 0x0f0a_7008),
+                    true,
+                    true,
+                ),
+                (
+                    combine,
+                    super::super::OtherMode::from_wire(0x0018_acff, 0x0f0a_7009),
+                    true,
+                    true,
+                ),
+                (
+                    combine,
+                    super::super::OtherMode::from_wire(0x0018_acff, 0x0f0a_7018),
+                    true,
+                    true,
+                ),
+                (
+                    combine,
+                    super::super::OtherMode::from_wire(0x0018_acff, 0x0f0a_7028),
+                    true,
+                    true,
+                ),
+                (combine, other, false, true),
+                (combine, other, true, false),
+            ];
+            for (combine, other, shaded, textured) in program_mutations {
+                assert!(!super::super::task_cpu_phase_hot_program(
+                    combine, other, shaded, textured
+                ));
+            }
+
+            assert!(super::super::task_cpu_phase_shape(
+                true, true, 0, 0, 1, false, false
+            ));
+            for shape in [
+                (false, true, 0, 0, 1, false, false),
+                (true, false, 0, 0, 1, false, false),
+                (true, true, 1, 0, 1, false, false),
+                (true, true, 0, 1, 1, false, false),
+                (true, true, 0, 0, 0, false, false),
+                (true, true, 0, 0, 1, true, false),
+                (true, true, 0, 0, 1, false, true),
+            ] {
+                assert!(!super::super::task_cpu_phase_shape(
+                    shape.0, shape.1, shape.2, shape.3, shape.4, shape.5, shape.6
+                ));
+            }
+        }
+    }
+}
+
 /// Task-transport census for the opt-in compute replacement. It records only
 /// task/segment boundaries and prints every 30 graphics tasks, making short
 /// live A/B runs answer whether the kernel was actually reached and how much
@@ -297,7 +667,8 @@ mod task_compute_census {
     }
 
     pub(super) fn cpu_started() -> Option<std::time::Instant> {
-        enabled().then(std::time::Instant::now)
+        (enabled() || super::task_cpu_phase_census::wants_member_clock())
+            .then(std::time::Instant::now)
     }
 
     pub(super) fn timed_registry_clone<R>(bytes: usize, operation: impl FnOnce() -> R) -> R {
@@ -392,11 +763,14 @@ mod task_compute_census {
     pub(super) fn record_cpu(
         reason: super::TaskComputeCpuReason,
         started: Option<std::time::Instant>,
-    ) {
+    ) -> Option<u64> {
         let Some(started) = started else {
-            return;
+            return None;
         };
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if !enabled() {
+            return Some(elapsed);
+        }
         TIMED_CPU_MEMBERS.fetch_add(1, Relaxed);
         TIMED_CPU_NS.fetch_add(elapsed, Relaxed);
         CPU_REASONS.with(|reasons| {
@@ -409,6 +783,7 @@ mod task_compute_census {
                 accumulate_reason(&mut reasons, reason, elapsed);
             });
         }
+        Some(elapsed)
     }
 
     fn accumulate_reason(
@@ -914,6 +1289,7 @@ pub struct WgpuBackend {
     /// Opt-in same-binary A/B control for task-local CPU target accumulation
     /// and sparse per-packet publication.
     task_cpu_color_batch_enabled: bool,
+    task_cpu_phase_census: Option<task_cpu_phase_census::Task>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -1336,6 +1712,7 @@ struct PendingFillPublication {
     /// The exact N `CompletedWrite`s this fill contributed to the
     /// submission's `BackendEffectReport`, in journal order.
     guest_writes: Vec<CompletedWrite>,
+    cpu_phase_attributed: bool,
 }
 
 enum PendingColorPublication {
@@ -1507,6 +1884,7 @@ impl WgpuBackend {
                 compute_raster_replace_receipt: None,
                 task_compute_raster_enabled: env_default_one("FN64_RAW_DPC_TASK_COMPUTE"),
                 task_cpu_color_batch_enabled: env_exact_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
+                task_cpu_phase_census: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -2934,6 +3312,7 @@ struct ExecutionCollector<'coord> {
     /// placeholder color bytes.
     color_execution_batch: Option<&'coord mut ColorTargetExecutionBatch>,
     ordered_cpu_color_batch: Option<&'coord mut OrderedCpuColorBatch>,
+    task_cpu_phase_census: Option<&'coord mut task_cpu_phase_census::Task>,
     /// Selects planning-only compute admission. The resulting owned plan is
     /// retained below and completed after the task's single GPU submission.
     defer_compute_replacement: bool,
@@ -3028,6 +3407,7 @@ struct DeferredComputeColor {
 struct StagedFill {
     initialized: InitializedCandidateColorTarget,
     guest_writes: Vec<CompletedWrite>,
+    cpu_phase_attributed: bool,
 }
 
 impl RawDpcExecutionView<PlanCollector> for ExecutionCollector<'_> {
@@ -4009,6 +4389,7 @@ impl RenderBackend for WgpuBackend {
                 replacement_pipeline,
                 None,
                 None,
+                None,
             )
             .map_err(RenderError::from)?;
 
@@ -4176,6 +4557,10 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bounds: Vec<BoundSubmittedRawDpc>,
     ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
+        assert!(
+            self.task_cpu_phase_census.is_none(),
+            "a task CPU phase census must reach its final publication before the next task"
+        );
         let planned_batch =
             self.pending_raw_dpc_task_batch
                 .take()
@@ -4219,6 +4604,7 @@ impl RenderBackend for WgpuBackend {
         let mut prepared = Vec::with_capacity(bounds.len());
         let mut guest_read_pool = TaskGuestReadCapturePool::default();
         let mut ordered_cpu_color_batch = OrderedCpuColorBatch::new();
+        let mut task_cpu_phase_census = task_cpu_phase_census::Task::begin(bounds.len());
         let mut compute_members = 0usize;
         let mut cpu_members = 0usize;
         {
@@ -4394,14 +4780,25 @@ impl RenderBackend for WgpuBackend {
                         None,
                         Some(&mut guest_read_pool),
                         ordered_cpu_batch,
+                        task_cpu_phase_census.as_mut(),
                     )
                     .map_err(RenderError::from)?;
-                    task_compute_census::record_cpu(reason, cpu_started);
+                    let cpu_phase_attributed = pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.cpu_phase_attributed);
+                    let cpu_elapsed = task_compute_census::record_cpu(reason, cpu_started);
+                    if let Some(task) = task_cpu_phase_census.as_mut() {
+                        task.record_member_total(cpu_phase_attributed, cpu_elapsed);
+                    }
                     if let Some(pending) = pending {
-                        let pending = ordered_cpu_color_batch
-                            .finish_member(pending)
-                            .map_err(WgpuRawDpcExecutionError::Target)
-                            .map_err(RenderError::from)?;
+                        let pending = task_cpu_phase_census::timed(
+                            task_cpu_phase_census.as_mut(),
+                            pending.cpu_phase_attributed,
+                            task_cpu_phase_census::Phase::SparseCheckpoint,
+                            || ordered_cpu_color_batch.finish_member(pending),
+                        )
+                        .map_err(WgpuRawDpcExecutionError::Target)
+                        .map_err(RenderError::from)?;
                         if members.peek().is_some()
                             && matches!(&pending.color, PendingColorPublication::Full(_))
                         {
@@ -4450,6 +4847,7 @@ impl RenderBackend for WgpuBackend {
             }
         }
         self.task_batch_pending_fill_publications = pending_publications;
+        self.task_cpu_phase_census = task_cpu_phase_census;
         Ok(prepared)
     }
 
@@ -4513,7 +4911,17 @@ impl RenderBackend for WgpuBackend {
 
         match &pending.color {
             PendingColorPublication::Sparse(checkpoint) => {
-                return checkpoint.payloads().map(<[u8]>::to_vec).collect();
+                let started = task_cpu_phase_census::started(
+                    self.task_cpu_phase_census.as_ref(),
+                    pending.cpu_phase_attributed,
+                );
+                let payloads = checkpoint.payloads().map(<[u8]>::to_vec).collect();
+                task_cpu_phase_census::record_started(
+                    self.task_cpu_phase_census.as_mut(),
+                    task_cpu_phase_census::Phase::GuestPayloadMaterialization,
+                    started,
+                );
+                return payloads;
             }
             PendingColorPublication::Full(_) => {}
         }
@@ -4550,6 +4958,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
     ) -> CommittedRawDpcOutcome {
+        let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
         // Taken unconditionally: a stale token from an earlier submission
         // must never survive into a later one. Its
         // `InitializedCandidateColorTarget` is simply dropped, leaving the
@@ -4597,14 +5006,25 @@ impl RenderBackend for WgpuBackend {
                         .publish();
                 }
                 PendingColorPublication::Sparse(checkpoint) => {
+                    let started = task_cpu_phase_census::started(
+                        task_cpu_phase_census.as_ref(),
+                        pending.cpu_phase_attributed,
+                    );
                     registry
                         .commit_sparse_checkpoint(checkpoint)
                         .unwrap_or_else(|error| {
                             panic!("sparse color-target publication rejected after guest commit: {error}")
                         });
+                    task_cpu_phase_census::record_started(
+                        task_cpu_phase_census.as_mut(),
+                        task_cpu_phase_census::Phase::SparsePublication,
+                        started,
+                    );
                 }
             }
         }
+        self.task_cpu_phase_census =
+            task_cpu_phase_census.and_then(task_cpu_phase_census::Task::publication_finished);
         outcome
     }
 }
@@ -5156,6 +5576,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
     color_execution_batch: Option<&mut ColorTargetExecutionBatch>,
     ordered_cpu_color_batch: Option<&mut OrderedCpuColorBatch>,
+    task_cpu_phase_census: Option<&mut task_cpu_phase_census::Task>,
     defer_compute_replacement: bool,
     task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
 ) -> Result<StagedRawDpcMember, StagedRawDpcFailure> {
@@ -5180,6 +5601,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         compute_replacement_receipt: None,
         color_execution_batch,
         ordered_cpu_color_batch,
+        task_cpu_phase_census,
         defer_compute_replacement,
         deferred_compute: None,
     };
@@ -5228,6 +5650,7 @@ fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
         false,
         None,
         Some(color_execution_batch),
+        None,
         None,
         true,
         Some(task_guest_read_pool),
@@ -5323,6 +5746,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
                         guest_writes: staged.guest_writes,
+                        cpu_phase_attributed: staged.cpu_phase_attributed,
                     });
                     prepared
                 }
@@ -5349,6 +5773,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
                         guest_writes: staged.guest_writes,
+                        cpu_phase_attributed: staged.cpu_phase_attributed,
                     });
                     prepared
                 }
@@ -5383,6 +5808,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
     task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
     ordered_cpu_color_batch: Option<&mut OrderedCpuColorBatch>,
+    task_cpu_phase_census: Option<&mut task_cpu_phase_census::Task>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -5407,6 +5833,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
         compute_replacement_pipeline,
         None,
         ordered_cpu_color_batch,
+        task_cpu_phase_census,
         false,
         task_guest_read_pool,
     )
@@ -5643,6 +6070,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    cpu_phase_attributed: false,
                 },
             )
         } else {
@@ -5651,6 +6079,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    cpu_phase_attributed: false,
                 },
             )
         };
@@ -6010,6 +6439,8 @@ fn stage_and_report(
     // caught it, which is the design working -- but the packet was refused
     // rather than drawn.
     let writing_raw_triangle_count = collector.plan.raw_triangle_commands.len();
+    let cpu_phase_attributed = collector.task_cpu_phase_census.is_some()
+        && ordered_depth_free_acff_triangle_member(collector);
     if (!collector.plan.fills.is_empty()
         || writing_texrect_count > 0
         || writing_raw_triangle_count > 0)
@@ -6037,6 +6468,10 @@ fn stage_and_report(
 
     for (command_index, load) in collector.plan.loads.iter() {
         let command_index = *command_index;
+        let load_started = task_cpu_phase_census::started(
+            collector.task_cpu_phase_census.as_deref(),
+            cpu_phase_attributed,
+        );
 
         let destination_accesses = destination_access_run(
             &collector.plan.accesses,
@@ -6107,11 +6542,22 @@ fn stage_and_report(
         let finished = staged
             .finish_load()
             .map_err(WgpuRawDpcExecutionError::Physical)?;
+        task_cpu_phase_census::record_started(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            task_cpu_phase_census::Phase::SourceBindingLoad,
+            load_started,
+        );
         // Taken after THIS load and before the next stages anything, so the
         // snapshot is exactly what TMEM holds at this command's position.
         // A read of arrays that already exist: it cannot fail and touches
         // no registry, so the load loop stays a pure phase.
-        prefixes.push((command_index, finished.capture_prefix()));
+        let prefix = task_cpu_phase_census::timed(
+            collector.task_cpu_phase_census.as_deref_mut(),
+            cpu_phase_attributed,
+            task_cpu_phase_census::Phase::PrefixCapture,
+            || finished.capture_prefix(),
+        );
+        prefixes.push((command_index, prefix));
         packet_transaction = Some(finished);
     }
 
@@ -6765,27 +7211,37 @@ fn stage_color_commands(
     // decoder already fixed rather than imposing one. Stable, so two
     // entries that somehow shared an index would keep their relative plan
     // order rather than being silently transposed.
-    let mut schedule: Vec<(u32, ColorCommandKind)> = collector
-        .plan
-        .fills
-        .iter()
-        .enumerate()
-        .map(|(index, (command_index, ..))| (*command_index, ColorCommandKind::Fill(index)))
-        .chain(collector.plan.texrect_commands.iter().enumerate().map(
-            |(index, (_, _, _, command_index, _))| {
-                (*command_index, ColorCommandKind::Texrect(index))
-            },
-        ))
-        .chain(collector.plan.raw_triangle_commands.iter().enumerate().map(
-            |(index, (_, _, command_index, _))| {
-                (*command_index, ColorCommandKind::RawTriangle(index))
-            },
-        ))
-        .collect();
+    let cpu_phase_attributed = collector.task_cpu_phase_census.is_some()
+        && ordered_depth_free_acff_triangle_member(collector);
+    let plan = &collector.plan;
+    let schedule = task_cpu_phase_census::timed(
+        collector.task_cpu_phase_census.as_deref_mut(),
+        cpu_phase_attributed,
+        task_cpu_phase_census::Phase::ScheduleDecodeRowPrepRaster,
+        || {
+            let mut schedule: Vec<(u32, ColorCommandKind)> = plan
+                .fills
+                .iter()
+                .enumerate()
+                .map(|(index, (command_index, ..))| (*command_index, ColorCommandKind::Fill(index)))
+                .chain(plan.texrect_commands.iter().enumerate().map(
+                    |(index, (_, _, _, command_index, _))| {
+                        (*command_index, ColorCommandKind::Texrect(index))
+                    },
+                ))
+                .chain(plan.raw_triangle_commands.iter().enumerate().map(
+                    |(index, (_, _, command_index, _))| {
+                        (*command_index, ColorCommandKind::RawTriangle(index))
+                    },
+                ))
+                .collect();
+            schedule.sort_by_key(|(command_index, _)| *command_index);
+            schedule
+        },
+    );
     if schedule.is_empty() {
         return Ok(None);
     }
-    schedule.sort_by_key(|(command_index, _)| *command_index);
 
     // The candidate, and the target key, derived once from this packet's
     // own staged `SetColorImage`. Every command in the schedule composes
@@ -6865,69 +7321,83 @@ fn stage_color_commands(
         && !collector.compute_replacement_enabled;
 
     let mut ordered_seed = None;
-    let (candidate, task_input) = match collector.ordered_cpu_color_batch.as_deref_mut() {
-        Some(batch) if ordered_cpu_eligible => {
-            let registry = collector
-                .color_targets
-                .as_mut()
-                .expect("color_target_key populates the registry");
-            let (candidate, seed) = batch.begin_member(registry, key)?;
-            ordered_seed = seed;
-            (candidate, None)
-        }
-        Some(batch) => {
-            if batch.tail.is_some() {
-                batch.flush(
-                    collector
+    let (candidate, task_input) = task_cpu_phase_census::timed(
+        collector.task_cpu_phase_census.as_deref_mut(),
+        cpu_phase_attributed,
+        task_cpu_phase_census::Phase::CandidateSeedCopy,
+        || -> Result<_, WgpuRawDpcExecutionError> {
+            Ok(match collector.ordered_cpu_color_batch.as_deref_mut() {
+                Some(batch) if ordered_cpu_eligible => {
+                    let registry = collector
                         .color_targets
                         .as_mut()
-                        .expect("an ordered CPU accumulator implies a registry"),
-                )?;
-            }
-            let registry = collector
-                .color_targets
-                .as_ref()
-                .expect("color_target_key populates the registry");
-            (registry.begin_candidate(key)?, None)
-        }
-        None => match collector.color_execution_batch.as_deref_mut() {
-            Some(batch) => {
-                let registry = collector
-                    .color_targets
-                    .as_ref()
-                    .expect("color_target_key populates the registry");
-                let (candidate, input) = batch.begin_candidate(registry, key)?;
-                (candidate, Some(input))
-            }
-            None => {
-                let registry = collector
-                    .color_targets
-                    .as_ref()
-                    .expect("color_target_key populates the registry");
-                (registry.begin_candidate(key)?, None)
-            }
+                        .expect("color_target_key populates the registry");
+                    let (candidate, seed) = batch.begin_member(registry, key)?;
+                    ordered_seed = seed;
+                    (candidate, None)
+                }
+                Some(batch) => {
+                    if batch.tail.is_some() {
+                        batch.flush(
+                            collector
+                                .color_targets
+                                .as_mut()
+                                .expect("an ordered CPU accumulator implies a registry"),
+                        )?;
+                    }
+                    let registry = collector
+                        .color_targets
+                        .as_ref()
+                        .expect("color_target_key populates the registry");
+                    (registry.begin_candidate(key)?, None)
+                }
+                None => match collector.color_execution_batch.as_deref_mut() {
+                    Some(batch) => {
+                        let registry = collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry");
+                        let (candidate, input) = batch.begin_candidate(registry, key)?;
+                        (candidate, Some(input))
+                    }
+                    None => {
+                        let registry = collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry");
+                        (registry.begin_candidate(key)?, None)
+                    }
+                },
+            })
         },
-    };
+    )?;
 
     // The accumulator. Seeded from the resident's real prior bytes when
     // this target already exists, and left `None` for a brand-new target --
     // exactly the distinction `execute_fill_rectangle` already draws, and
     // deliberately NOT flattened to a zero buffer here, which would
     // fabricate content for a resident whose bytes failed to thread.
-    let mut accumulated: Option<Vec<u8>> = ordered_seed.or_else(|| {
-        if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
-            None
-        } else {
-            collector
-                .color_targets
-                .as_ref()
-                .expect("color_target_key populates the registry")
-                .residents()
-                .iter()
-                .find(|resident| resident.key() == key)
-                .map(|resident| resident.device_bytes().device_bytes().to_vec())
-        }
-    });
+    let mut accumulated: Option<Vec<u8>> = task_cpu_phase_census::timed(
+        collector.task_cpu_phase_census.as_deref_mut(),
+        cpu_phase_attributed,
+        task_cpu_phase_census::Phase::CandidateSeedCopy,
+        || {
+            ordered_seed.or_else(|| {
+                if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
+                    None
+                } else {
+                    collector
+                        .color_targets
+                        .as_ref()
+                        .expect("color_target_key populates the registry")
+                        .residents()
+                        .iter()
+                        .find(|resident| resident.key() == key)
+                        .map(|resident| resident.device_bytes().device_bytes().to_vec())
+                }
+            })
+        },
+    );
 
     // **The depth accumulator, one RDP depth-memory cell per target pixel,
     // persisting across every draw in this packet's schedule.** It is the
@@ -7059,6 +7529,7 @@ fn stage_color_commands(
             return Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                cpu_phase_attributed: false,
             }));
         }
     }
@@ -7072,6 +7543,10 @@ fn stage_color_commands(
     let move_accumulator = move_color_accumulator_enabled();
     let own_command_input = own_color_command_input_enabled();
     let mut compute_probe_builder = None;
+    let schedule_started = task_cpu_phase_census::started(
+        collector.task_cpu_phase_census.as_deref(),
+        cpu_phase_attributed,
+    );
     for (schedule_index, (_, kind)) in schedule.iter().enumerate() {
         if compute_probe_builder.is_some() && !matches!(*kind, ColorCommandKind::RawTriangle(_)) {
             let expected = accumulated
@@ -7309,6 +7784,11 @@ fn stage_color_commands(
             last_completed = Some(completed);
         }
     }
+    task_cpu_phase_census::record_started(
+        collector.task_cpu_phase_census.as_deref_mut(),
+        task_cpu_phase_census::Phase::ScheduleDecodeRowPrepRaster,
+        schedule_started,
+    );
 
     raw_dpc_execute_census::timed(
         raw_dpc_execute_census::Phase::ColorFinalize,
@@ -7335,9 +7815,74 @@ fn stage_color_commands(
             Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                cpu_phase_attributed,
             }))
         },
     )
+}
+
+fn ordered_depth_free_acff_triangle_member(collector: &ExecutionCollector<'_>) -> bool {
+    task_cpu_phase_shape(
+        collector.ordered_cpu_color_batch.is_some(),
+        collector.plan.current_color_image.is_some_and(|image| {
+            image.format() == crate::ImageFormat::Rgba && image.size() == crate::PixelSize::Bits16
+        }),
+        collector.plan.fills.len(),
+        collector.plan.texrect_commands.len(),
+        collector.plan.raw_triangle_commands.len(),
+        collector.defer_compute_replacement,
+        collector.compute_replacement_enabled,
+    ) && collector
+        .plan
+        .raw_triangle_commands
+        .iter()
+        .all(|(_, triangle_index, _, raw_words)| {
+            let opcode = raw_words.first().map(|word| ((word >> 24) & 0x3f) as u8);
+            collector.plan.triangles[*triangle_index]
+                .as_ref()
+                .is_ok_and(|draw| {
+                    task_cpu_phase_hot_program(
+                        draw.combine_params,
+                        draw.other_mode,
+                        opcode.is_some_and(|opcode| opcode & 0x4 != 0),
+                        opcode.is_some_and(|opcode| opcode & 0x2 != 0),
+                    )
+                })
+        })
+}
+
+const fn task_cpu_phase_shape(
+    ordered_batch: bool,
+    rgba16_target: bool,
+    fill_count: usize,
+    texrect_count: usize,
+    raw_triangle_count: usize,
+    deferred_compute: bool,
+    compute_replacement: bool,
+) -> bool {
+    ordered_batch
+        && rgba16_target
+        && fill_count == 0
+        && texrect_count == 0
+        && raw_triangle_count > 0
+        && !deferred_compute
+        && !compute_replacement
+}
+
+const fn task_cpu_phase_hot_program(
+    combine: CombineParams,
+    other_mode: OtherMode,
+    shaded: bool,
+    textured: bool,
+) -> bool {
+    combine.low() == 0xfc15_fea3
+        && combine.high() == 0xf00f_f23f
+        && other_mode.high() == 0x0018_acff
+        && other_mode.low() == 0x0f0a_7008
+        && !other_mode.depth_compare_enabled()
+        && !other_mode.depth_update_enabled()
+        && shaded
+        && textured
 }
 
 fn move_color_accumulator_enabled() -> bool {
@@ -14029,6 +14574,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("the fill half must stage a real token");
         assert!(
@@ -15457,6 +16003,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -15781,6 +16328,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -16882,6 +17430,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("the sprite strip must execute");
 
@@ -16961,6 +17510,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -17080,6 +17630,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -17262,6 +17813,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -17751,6 +18303,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -17810,6 +18363,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -19848,6 +20402,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -20191,6 +20746,7 @@ mod tests {
             compute_replacement_receipt: None,
             color_execution_batch: None,
             ordered_cpu_color_batch: None,
+            task_cpu_phase_census: None,
             defer_compute_replacement: false,
             deferred_compute: None,
         };
@@ -20408,6 +20964,7 @@ mod tests {
             true,
             false,
             false,
+            None,
             None,
             None,
             None,
