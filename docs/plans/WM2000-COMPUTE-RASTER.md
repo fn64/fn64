@@ -868,6 +868,12 @@ bucket on both sides, one further candidate run reduced that phase from
 field budget; this is a retained mechanism win, not reliable-budget or
 ten-run evidence.
 
+Neutral TMEM staging also materializes each renderer-neutral transfer word
+once into the private validated word plan. Validation borrows that exact plan,
+which is then moved into the staged transaction; the former second conversion
+and allocation are gone without changing the public staging API, word
+poisoning, destination coverage, or proposal identity.
+
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
 `FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
