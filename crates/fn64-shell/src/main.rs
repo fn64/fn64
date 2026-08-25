@@ -997,16 +997,16 @@ mod game {
             // extern "C" redraw callback, where `process::exit`'s teardown
             // cannot unwind. `about_to_wait` is ordinary Rust, and is where
             // the pump census already terminates bounded runs safely.
-            // `FN64_FRAME_DUMP=<dir>` writes every tripwire frame as a PNG.
+            // `FN64_FRAME_DUMP=<dir>` writes every presented frame as a PNG.
             // Diagnostic sibling of the tripwire: the tripwire says WHICH
             // frame changed, this says what it looks like. Same recording
             // point, so the two always agree about frame numbering.
             if let Some(dir) = self.frame_dump_dir.as_ref() {
-                let index = self
-                    .frame_trip
-                    .as_ref()
-                    .map_or(0, |t| t.observed_len());
-                let file = format!("frame-{index:04}-{rgba_hash:016x}.png");
+                // Share Screenshotter's move-only session sequence with F2.
+                // Frame dumps may be armed without a frame tripwire; deriving
+                // this suffix from FrameTrip made every such capture `0000`
+                // and silently overwrote repeated-content chronology.
+                let file = self.screenshotter.next_frame_dump_file_name(rgba_hash);
                 if let Err(e) = crate::screenshot::capture(
                     dir,
                     &file,
