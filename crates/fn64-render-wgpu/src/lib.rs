@@ -475,7 +475,10 @@ pub use native_contract::{
     NATIVE_FILL_TARGET_START, NATIVE_FILL_TRANSACTION_SEQUENCE, NATIVE_FILL_WIDTH,
     NATIVE_FILL_WORKLOAD_SHA256,
 };
-pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
+pub use production::{
+    task_cpu_phase_running_totals, TaskCpuPhaseRunningTotals, WgpuBackend,
+    WgpuBackendConstructionError, WgpuRawDpcExecutionError,
+};
 pub use random::{RandomState, RANDOM_ENTRY_POINT, RANDOM_WGSL};
 pub use raster_vs::{
     raster_vs, RasterVsParams, RasterVsPosition, Resolution, ScreenTransform,

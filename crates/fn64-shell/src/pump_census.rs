@@ -119,6 +119,23 @@ pub struct PumpSample {
     pub gfx_tasks: u64,
     pub audio_tasks: u64,
 
+    // ---- FN64_TASK_CPU_PHASE_CENSUS, renderer completion ordinals
+    pub task_cpu_armed: bool,
+    pub task_cpu_completion_before: u64,
+    pub task_cpu_completion_after: u64,
+    pub task_cpu_envelope_ns: u64,
+    pub task_cpu_members: u64,
+    pub task_cpu_member_ns: u64,
+    pub task_cpu_all_cpu_member_ns: u64,
+    pub task_cpu_compute_segment_ns: u64,
+    pub task_cpu_renderer_work_ns: u64,
+    pub task_cpu_member_accounted_ns: u64,
+    pub task_cpu_execution_view_plan_residual_ns: u64,
+    pub task_cpu_finalize_coordinator_ns: u64,
+    pub task_cpu_post_view_wrapper_residual_ns: u64,
+    pub task_cpu_outer_residual_ns: u64,
+    pub task_cpu_rdp_outside_envelope_ns: u64,
+
     // ---- FN64_DPC_COPY_CENSUS
     pub rsp_steps_gfx: u64,
     pub rsp_steps_audio: u64,
@@ -136,6 +153,7 @@ struct Totals {
     rsp_steps_audio: u64,
     rsp_entries: u64,
     dpc_calls: u64,
+    task_cpu: Option<fn64_render_wgpu::TaskCpuPhaseRunningTotals>,
 }
 
 /// Only the `PhaseTiming` fields this census attributes. A local copy rather
@@ -178,6 +196,7 @@ impl Totals {
         let (gfx_tasks, audio_tasks) = fn64_abi::task_counts();
         let (rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls) =
             fn64_abi::dpc_census_running_totals();
+        let task_cpu = fn64_render_wgpu::task_cpu_phase_running_totals();
         Self {
             phase: PhaseSnapshot {
                 executor_ns: p.executor_ns,
@@ -214,11 +233,53 @@ impl Totals {
             rsp_steps_audio,
             rsp_entries,
             dpc_calls,
+            task_cpu,
         }
     }
 
     fn delta(&self, before: &Self, wall_ns: u64, steps: u64, swapped: bool) -> PumpSample {
         let (a, b) = (&self.phase, &before.phase);
+        let task_cpu_armed = self.task_cpu.is_some() || before.task_cpu.is_some();
+        let task_after = self.task_cpu.unwrap_or_default();
+        let task_before = before.task_cpu.unwrap_or_default();
+        let task_delta = fn64_render_wgpu::TaskCpuPhaseRunningTotals {
+            completed_tasks: task_after
+                .completed_tasks
+                .saturating_sub(task_before.completed_tasks),
+            task_envelope_ns: task_after
+                .task_envelope_ns
+                .saturating_sub(task_before.task_envelope_ns),
+            attributed_members: task_after
+                .attributed_members
+                .saturating_sub(task_before.attributed_members),
+            cpu_member_ns: task_after
+                .cpu_member_ns
+                .saturating_sub(task_before.cpu_member_ns),
+            all_cpu_member_ns: task_after
+                .all_cpu_member_ns
+                .saturating_sub(task_before.all_cpu_member_ns),
+            compute_segment_ns: task_after
+                .compute_segment_ns
+                .saturating_sub(task_before.compute_segment_ns),
+            source_binding_load_ns: task_after
+                .source_binding_load_ns
+                .saturating_sub(task_before.source_binding_load_ns),
+            prefix_capture_ns: task_after
+                .prefix_capture_ns
+                .saturating_sub(task_before.prefix_capture_ns),
+            schedule_decode_row_prep_raster_ns: task_after
+                .schedule_decode_row_prep_raster_ns
+                .saturating_sub(task_before.schedule_decode_row_prep_raster_ns),
+            candidate_seed_copy_ns: task_after
+                .candidate_seed_copy_ns
+                .saturating_sub(task_before.candidate_seed_copy_ns),
+            execution_view_gross_ns: task_after
+                .execution_view_gross_ns
+                .saturating_sub(task_before.execution_view_gross_ns),
+            finalize_coordinator_ns: task_after
+                .finalize_coordinator_ns
+                .saturating_sub(task_before.finalize_coordinator_ns),
+        };
         PumpSample {
             wall_ns,
             steps,
@@ -244,11 +305,15 @@ impl Totals {
             exec_guard_suspend_ns: a
                 .exec_guard_suspend_ns
                 .saturating_sub(b.exec_guard_suspend_ns),
-            exec_guard_device_ns: a.exec_guard_device_ns.saturating_sub(b.exec_guard_device_ns),
+            exec_guard_device_ns: a
+                .exec_guard_device_ns
+                .saturating_sub(b.exec_guard_device_ns),
             resume_reconcile_ns: a.resume_reconcile_ns.saturating_sub(b.resume_reconcile_ns),
             resume_cop0_ns: a.resume_cop0_ns.saturating_sub(b.resume_cop0_ns),
             resume_dispatch_ns: a.resume_dispatch_ns.saturating_sub(b.resume_dispatch_ns),
-            resume_invalidate_ns: a.resume_invalidate_ns.saturating_sub(b.resume_invalidate_ns),
+            resume_invalidate_ns: a
+                .resume_invalidate_ns
+                .saturating_sub(b.resume_invalidate_ns),
             resume_exit_ns: a.resume_exit_ns.saturating_sub(b.resume_exit_ns),
             resume_suspend_ns: a.resume_suspend_ns.saturating_sub(b.resume_suspend_ns),
             resume_resolve_ns: a.resume_resolve_ns.saturating_sub(b.resume_resolve_ns),
@@ -258,6 +323,25 @@ impl Totals {
                 .saturating_sub(b.resume_hostcall_calls),
             gfx_tasks: self.gfx_tasks.saturating_sub(before.gfx_tasks),
             audio_tasks: self.audio_tasks.saturating_sub(before.audio_tasks),
+            task_cpu_armed,
+            task_cpu_completion_before: task_before.completed_tasks,
+            task_cpu_completion_after: task_after.completed_tasks,
+            task_cpu_envelope_ns: task_delta.task_envelope_ns,
+            task_cpu_members: task_delta.attributed_members,
+            task_cpu_member_ns: task_delta.cpu_member_ns,
+            task_cpu_all_cpu_member_ns: task_delta.all_cpu_member_ns,
+            task_cpu_compute_segment_ns: task_delta.compute_segment_ns,
+            task_cpu_renderer_work_ns: task_delta.renderer_work_ns(),
+            task_cpu_member_accounted_ns: task_delta.member_accounted_ns(),
+            task_cpu_execution_view_plan_residual_ns: task_delta
+                .execution_view_captured_read_plan_residual_ns(),
+            task_cpu_finalize_coordinator_ns: task_delta.finalize_coordinator_ns,
+            task_cpu_post_view_wrapper_residual_ns: task_delta.post_view_wrapper_residual_ns(),
+            task_cpu_outer_residual_ns: task_delta.outer_task_residual_ns(),
+            task_cpu_rdp_outside_envelope_ns: a
+                .gfx_lle_rdp_ns
+                .saturating_sub(b.gfx_lle_rdp_ns)
+                .saturating_sub(task_delta.task_envelope_ns),
             rsp_steps_gfx: self.rsp_steps_gfx.saturating_sub(before.rsp_steps_gfx),
             rsp_steps_audio: self.rsp_steps_audio.saturating_sub(before.rsp_steps_audio),
             rsp_entries: self.rsp_entries.saturating_sub(before.rsp_entries),
@@ -496,7 +580,12 @@ struct Row {
 /// here disagrees with the ABI's tree is a mislabelled measurement, which is
 /// exactly the defect rule 31's third case was.
 const ROWS: &[Row] = &[
-    Row { name: "executor_ns", parent: None, gate: "FN64_PHASE_TIMING", get: |s| s.executor_ns },
+    Row {
+        name: "executor_ns",
+        parent: None,
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.executor_ns,
+    },
     Row {
         name: "exec_resume_ns",
         parent: Some("executor_ns"),
@@ -609,7 +698,12 @@ const ROWS: &[Row] = &[
     // harness's `advance_virtual_time` arm. Parenting it under the executor
     // would be the inference `counter_tree` explicitly forbids. It is still
     // inside the PUMP, which is why it appears here at all.
-    Row { name: "vi_present_ns", parent: None, gate: "FN64_PHASE_TIMING", get: |s| s.vi_present_ns },
+    Row {
+        name: "vi_present_ns",
+        parent: None,
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.vi_present_ns,
+    },
 ];
 
 /// `resume NET` = `exec_resume_ns - exec_mirror_ns - exec_guard_suspend_ns`.
@@ -690,6 +784,229 @@ fn gate_armed(totals: &[(&'static str, u64)], gate: &str) -> bool {
         .any(|r| lookup(totals, r.name) > 0)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TaskCpuFrameSpan {
+    pumps: u64,
+    completion_before: u64,
+    completion_after: u64,
+    envelope_ns: u64,
+    member_ns: u64,
+    all_cpu_member_ns: u64,
+    compute_segment_ns: u64,
+    renderer_work_ns: u64,
+    member_accounted_ns: u64,
+    execution_view_plan_residual_ns: u64,
+    finalize_coordinator_ns: u64,
+    post_view_wrapper_residual_ns: u64,
+    outer_residual_ns: u64,
+    rdp_outside_envelope_ns: u64,
+}
+
+impl TaskCpuFrameSpan {
+    fn push(&mut self, sample: &PumpSample) {
+        if self.pumps == 0 {
+            self.completion_before = sample.task_cpu_completion_before;
+        }
+        self.pumps = self.pumps.saturating_add(1);
+        self.completion_after = sample.task_cpu_completion_after;
+        self.envelope_ns = self.envelope_ns.saturating_add(sample.task_cpu_envelope_ns);
+        self.member_ns = self.member_ns.saturating_add(sample.task_cpu_member_ns);
+        self.all_cpu_member_ns = self
+            .all_cpu_member_ns
+            .saturating_add(sample.task_cpu_all_cpu_member_ns);
+        self.compute_segment_ns = self
+            .compute_segment_ns
+            .saturating_add(sample.task_cpu_compute_segment_ns);
+        self.renderer_work_ns = self
+            .renderer_work_ns
+            .saturating_add(sample.task_cpu_renderer_work_ns);
+        self.member_accounted_ns = self
+            .member_accounted_ns
+            .saturating_add(sample.task_cpu_member_accounted_ns);
+        self.execution_view_plan_residual_ns = self
+            .execution_view_plan_residual_ns
+            .saturating_add(sample.task_cpu_execution_view_plan_residual_ns);
+        self.finalize_coordinator_ns = self
+            .finalize_coordinator_ns
+            .saturating_add(sample.task_cpu_finalize_coordinator_ns);
+        self.post_view_wrapper_residual_ns = self
+            .post_view_wrapper_residual_ns
+            .saturating_add(sample.task_cpu_post_view_wrapper_residual_ns);
+        self.outer_residual_ns = self
+            .outer_residual_ns
+            .saturating_add(sample.task_cpu_outer_residual_ns);
+        self.rdp_outside_envelope_ns = self
+            .rdp_outside_envelope_ns
+            .saturating_add(sample.task_cpu_rdp_outside_envelope_ns);
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TaskCpuFrameFold {
+    complete: Vec<TaskCpuFrameSpan>,
+    incomplete_prefix: Option<TaskCpuFrameSpan>,
+    incomplete_suffix: Option<TaskCpuFrameSpan>,
+}
+
+fn fold_task_cpu_drawn_frames(samples: &[PumpSample]) -> TaskCpuFrameFold {
+    let mut folded = TaskCpuFrameFold::default();
+    let mut current = TaskCpuFrameSpan::default();
+    let mut saw_boundary = false;
+    for sample in samples {
+        current.push(sample);
+        if sample.swapped {
+            if saw_boundary {
+                folded.complete.push(current);
+            } else {
+                folded.incomplete_prefix = Some(current);
+                saw_boundary = true;
+            }
+            current = TaskCpuFrameSpan::default();
+        }
+    }
+    if current.pumps > 0 {
+        if saw_boundary {
+            folded.incomplete_suffix = Some(current);
+        } else {
+            folded.incomplete_prefix = Some(current);
+        }
+    }
+    folded
+}
+
+fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !samples.iter().any(|sample| sample.task_cpu_armed) {
+        let _ = writeln!(
+            out,
+            "[task-cpu-frames] NOT ARMED (FN64_TASK_CPU_PHASE_CENSUS); zeros are not costs."
+        );
+        return out;
+    }
+    let folded = fold_task_cpu_drawn_frames(samples);
+    let rdp_parent_observed = samples.iter().any(|sample| sample.gfx_lle_rdp_ns > 0);
+    let prefix_pumps = folded.incomplete_prefix.map_or(0, |span| span.pumps);
+    let suffix_pumps = folded.incomplete_suffix.map_or(0, |span| span.pumps);
+    let _ = writeln!(
+        out,
+        "[task-cpu-frames] complete_drawn_frames={} incomplete_prefix_pumps={} \
+         incomplete_suffix_pumps={} rdp_parent={} \
+         (incomplete spans excluded from frame means)",
+        folded.complete.len(),
+        prefix_pumps,
+        suffix_pumps,
+        if rdp_parent_observed {
+            "OBSERVED"
+        } else {
+            "NOT-OBSERVED(zeros are not costs)"
+        },
+    );
+    for (label, span) in [
+        ("prefix", folded.incomplete_prefix),
+        ("suffix", folded.incomplete_suffix),
+    ] {
+        let Some(span) = span else { continue };
+        let _ = writeln!(
+            out,
+            "[task-cpu-incomplete-{label}] pumps={} completion_ordinals=({},{}] \
+             envelope_ms={:.3} renderer_work_ms={:.3} outer_residual_ms={:.3} \
+             rdp_outside_envelope_ms={:.3}",
+            span.pumps,
+            span.completion_before,
+            span.completion_after,
+            ms(span.envelope_ns),
+            ms(span.renderer_work_ns),
+            ms(span.outer_residual_ns),
+            ms(span.rdp_outside_envelope_ns),
+        );
+    }
+    let complete_total =
+        folded
+            .complete
+            .iter()
+            .fold(TaskCpuFrameSpan::default(), |mut total, frame| {
+                total.pumps = total.pumps.saturating_add(frame.pumps);
+                total.envelope_ns = total.envelope_ns.saturating_add(frame.envelope_ns);
+                total.member_ns = total.member_ns.saturating_add(frame.member_ns);
+                total.all_cpu_member_ns = total
+                    .all_cpu_member_ns
+                    .saturating_add(frame.all_cpu_member_ns);
+                total.compute_segment_ns = total
+                    .compute_segment_ns
+                    .saturating_add(frame.compute_segment_ns);
+                total.renderer_work_ns = total
+                    .renderer_work_ns
+                    .saturating_add(frame.renderer_work_ns);
+                total.member_accounted_ns = total
+                    .member_accounted_ns
+                    .saturating_add(frame.member_accounted_ns);
+                total.execution_view_plan_residual_ns = total
+                    .execution_view_plan_residual_ns
+                    .saturating_add(frame.execution_view_plan_residual_ns);
+                total.finalize_coordinator_ns = total
+                    .finalize_coordinator_ns
+                    .saturating_add(frame.finalize_coordinator_ns);
+                total.post_view_wrapper_residual_ns = total
+                    .post_view_wrapper_residual_ns
+                    .saturating_add(frame.post_view_wrapper_residual_ns);
+                total.outer_residual_ns = total
+                    .outer_residual_ns
+                    .saturating_add(frame.outer_residual_ns);
+                total.rdp_outside_envelope_ns = total
+                    .rdp_outside_envelope_ns
+                    .saturating_add(frame.rdp_outside_envelope_ns);
+                total
+            });
+    let denominator = u64::try_from(folded.complete.len())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let _ = writeln!(
+        out,
+        "[task-cpu-frames] complete means: envelope_ms={:.3} hot_member_ms={:.3} \
+         all_cpu_member_ms={:.3} compute_segment_ms={:.3} renderer_work_ms={:.3} \
+         member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
+         finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
+         outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+        ms(complete_total.envelope_ns / denominator),
+        ms(complete_total.member_ns / denominator),
+        ms(complete_total.all_cpu_member_ns / denominator),
+        ms(complete_total.compute_segment_ns / denominator),
+        ms(complete_total.renderer_work_ns / denominator),
+        ms(complete_total.member_accounted_ns / denominator),
+        ms(complete_total.execution_view_plan_residual_ns / denominator),
+        ms(complete_total.finalize_coordinator_ns / denominator),
+        ms(complete_total.post_view_wrapper_residual_ns / denominator),
+        ms(complete_total.outer_residual_ns / denominator),
+        ms(complete_total.rdp_outside_envelope_ns / denominator),
+    );
+    for (index, frame) in folded.complete.iter().take(sequence).enumerate() {
+        let _ = writeln!(
+            out,
+            "[task-cpu-frame] {index} pumps={} completion_ordinals=({},{}] envelope_ms={:.3} \
+             hot_member_ms={:.3} all_cpu_member_ms={:.3} compute_segment_ms={:.3} \
+             renderer_work_ms={:.3} member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
+             finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
+             outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+            frame.pumps,
+            frame.completion_before,
+            frame.completion_after,
+            ms(frame.envelope_ns),
+            ms(frame.member_ns),
+            ms(frame.all_cpu_member_ns),
+            ms(frame.compute_segment_ns),
+            ms(frame.renderer_work_ns),
+            ms(frame.member_accounted_ns),
+            ms(frame.execution_view_plan_residual_ns),
+            ms(frame.finalize_coordinator_ns),
+            ms(frame.post_view_wrapper_residual_ns),
+            ms(frame.outer_residual_ns),
+            ms(frame.rdp_outside_envelope_ns),
+        );
+    }
+    out
+}
+
 pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) -> String {
     let mut out = String::new();
     out.push_str("\n[pump-census] ================================================\n");
@@ -724,10 +1041,16 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         out.push_str(&format!(
             "[pump-census]   {:>4}: n={:<6} wall mean/p50/p95/max = {:.3}/{:.3}/{:.3}/{:.3} ms  \
              (total {:.1} ms)\n",
-            p.name, p.pumps, p.wall_mean_ms, p.wall_p50_ms, p.wall_p95_ms, p.wall_max_ms,
+            p.name,
+            p.pumps,
+            p.wall_mean_ms,
+            p.wall_p50_ms,
+            p.wall_p95_ms,
+            p.wall_max_ms,
             p.wall_total_ms
         ));
     }
+    out.push_str(&render_task_cpu_frame_report(samples, sequence));
 
     // THE TAIL, and WHICH tail. Two denominators, both printed, because a
     // share is meaningless without the one it was taken against (rule 32) and
@@ -765,9 +1088,17 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
          ({:.3} ms/slow pump)  <-- the part that misses deadlines\n",
         pop_slow.pumps,
         pop_fast.wall_mean_ms,
-        if pop_slow.pumps > 0 { excess_ms / pop_slow.pumps as f64 } else { 0.0 },
+        if pop_slow.pumps > 0 {
+            excess_ms / pop_slow.pumps as f64
+        } else {
+            0.0
+        },
         FIELD_BUDGET_MS,
-        if pop_slow.pumps > 0 { over_budget_ms / pop_slow.pumps as f64 } else { 0.0 },
+        if pop_slow.pumps > 0 {
+            over_budget_ms / pop_slow.pumps as f64
+        } else {
+            0.0
+        },
     ));
 
     let t_all = totals_for(&all);
@@ -776,16 +1107,28 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
 
     // Gate status BEFORE any row, so a zero is never read as a cost.
     out.push_str("[pump-census] gates: ");
-    for gate in ["FN64_PHASE_TIMING", "FN64_EXECUTOR_SPLIT", "FN64_RESUME_SPLIT"] {
+    for gate in [
+        "FN64_PHASE_TIMING",
+        "FN64_EXECUTOR_SPLIT",
+        "FN64_RESUME_SPLIT",
+    ] {
         out.push_str(&format!(
             "{gate}={} ",
-            if gate_armed(&t_all, gate) { "ARMED" } else { "NOT-ARMED(zeros are not costs)" }
+            if gate_armed(&t_all, gate) {
+                "ARMED"
+            } else {
+                "NOT-ARMED(zeros are not costs)"
+            }
         ));
     }
     let dpc_armed = all.iter().any(|s| s.rsp_entries > 0 || s.rsp_steps_gfx > 0);
     out.push_str(&format!(
         "FN64_DPC_COPY_CENSUS={}\n",
-        if dpc_armed { "ARMED" } else { "NOT-ARMED(zeros are not costs)" }
+        if dpc_armed {
+            "ARMED"
+        } else {
+            "NOT-ARMED(zeros are not costs)"
+        }
     ));
 
     // Closure, unconditionally, before the rows it validates.
@@ -820,7 +1163,11 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
              OUTSIDE the executor: roots(executor+vi_present)={clean_roots:.1}ms vs pump \
              wall={clean_wall:.1}ms -> unattributed residual {residual:.1}ms ({:.1}%){}\n",
             clean.len(),
-            if clean_wall > 0.0 { 100.0 * residual / clean_wall } else { 0.0 },
+            if clean_wall > 0.0 {
+                100.0 * residual / clean_wall
+            } else {
+                0.0
+            },
             if residual < -0.005 * clean_wall.max(1.0) {
                 "  <-- NEGATIVE beyond tolerance: the split does NOT close, treat rows as broken"
             } else {
@@ -865,7 +1212,11 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         // Excess = what this phase costs in slow pumps beyond what it costs
         // in fast ones, summed over the slow pumps. The tail's composition.
         let excess_total = (s - f) * pop_slow.pumps as f64;
-        let share = if tail_ms > 0.0 { 100.0 * excess_total / tail_ms } else { 0.0 };
+        let share = if tail_ms > 0.0 {
+            100.0 * excess_total / tail_ms
+        } else {
+            0.0
+        };
         ranked.push((name, f, s, s - f, share));
     }
     ranked.sort_by(|a, b| b.4.total_cmp(&a.4));
@@ -908,7 +1259,11 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         };
         out.push_str(&format!(
             "[pump-census]   {name:<24} {f:>10.2} | {s:>10.2} | {:>7}\n",
-            if f > 0.0 { format!("{:.2}x", s / f) } else { "n/a".to_string() }
+            if f > 0.0 {
+                format!("{:.2}x", s / f)
+            } else {
+                "n/a".to_string()
+            }
         ));
     }
 
@@ -921,12 +1276,16 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
             "[pump-census] sequence dump, first {} pumps: \
              idx,wall_ms,steps,swapped,gfx_tasks,audio_tasks,executor_ms,gfx_ms,gfx_lle_rsp_ms,\
              gfx_lle_rdp_ms,audio_lle_ms,vi_present_ms,resume_dispatch_ms,rsp_steps_gfx,\
-             rsp_steps_audio\n",
+             rsp_steps_audio,task_completion_before,task_completion_after,task_envelope_ms,\
+             task_hot_member_ms,task_all_cpu_member_ms,task_compute_segment_ms,task_renderer_work_ms,\
+             task_member_accounted_ms,task_view_plan_residual_ms,\
+             task_finalize_coordinator_ms,task_post_view_wrapper_residual_ms,\
+             task_outer_residual_ms,task_rdp_outside_envelope_ms\n",
             sequence.min(samples.len())
         ));
         for (i, s) in samples.iter().take(sequence).enumerate() {
             out.push_str(&format!(
-                "[pump-seq] {i},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{}\n",
+                "[pump-seq] {i},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
                 ms(s.wall_ns),
                 s.steps,
                 u8::from(s.swapped),
@@ -941,6 +1300,19 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
                 ms(s.resume_dispatch_ns),
                 s.rsp_steps_gfx,
                 s.rsp_steps_audio,
+                s.task_cpu_completion_before,
+                s.task_cpu_completion_after,
+                ms(s.task_cpu_envelope_ns),
+                ms(s.task_cpu_member_ns),
+                ms(s.task_cpu_all_cpu_member_ns),
+                ms(s.task_cpu_compute_segment_ns),
+                ms(s.task_cpu_renderer_work_ns),
+                ms(s.task_cpu_member_accounted_ns),
+                ms(s.task_cpu_execution_view_plan_residual_ns),
+                ms(s.task_cpu_finalize_coordinator_ns),
+                ms(s.task_cpu_post_view_wrapper_residual_ns),
+                ms(s.task_cpu_outer_residual_ns),
+                ms(s.task_cpu_rdp_outside_envelope_ns),
             ));
         }
     }
@@ -978,7 +1350,10 @@ fn periodicity_report(samples: &[PumpSample], budget_ns: u64) -> String {
         .iter()
         .take(6)
         .map(|(gap, count)| {
-            format!("{gap}:{count}({:.0}%)", 100.0 * *count as f64 / total_gaps as f64)
+            format!(
+                "{gap}:{count}({:.0}%)",
+                100.0 * *count as f64 / total_gaps as f64
+            )
         })
         .collect();
     out.push_str(&format!(
@@ -999,7 +1374,9 @@ fn periodicity_report(samples: &[PumpSample], budget_ns: u64) -> String {
         ("audio_task>0", |s| s.audio_tasks > 0),
         ("vi_swap", |s| s.swapped),
         ("gfx_lle_call>0", |s| s.gfx_lle_calls > 0),
-        ("no gfx and no audio task", |s| s.gfx_tasks == 0 && s.audio_tasks == 0),
+        ("no gfx and no audio task", |s| {
+            s.gfx_tasks == 0 && s.audio_tasks == 0
+        }),
     ];
     for (label, pred) in conditions {
         let matching: Vec<&PumpSample> = samples.iter().filter(|s| pred(s)).collect();
@@ -1029,7 +1406,10 @@ mod tests {
     use super::*;
 
     fn sample(wall_ms: f64) -> PumpSample {
-        PumpSample { wall_ns: (wall_ms * 1e6) as u64, ..Default::default() }
+        PumpSample {
+            wall_ns: (wall_ms * 1e6) as u64,
+            ..Default::default()
+        }
     }
 
     /// Every row's declared parent must exist as a row (or be the derived
@@ -1054,7 +1434,9 @@ mod tests {
     #[test]
     fn nesting_matches_the_abi_counter_tree() {
         for row in ROWS {
-            let Some(node) = fn64_abi::counter_tree::TREE.iter().find(|n| n.name == row.name)
+            let Some(node) = fn64_abi::counter_tree::TREE
+                .iter()
+                .find(|n| n.name == row.name)
             else {
                 panic!("{} is not in fn64_abi's counter tree", row.name);
             };
@@ -1063,7 +1445,11 @@ mod tests {
                 "{} nests under {:?} in fn64-abi but under {:?} here",
                 row.name, node.parent, row.parent
             );
-            assert_eq!(node.gate, row.gate, "{} gate disagrees with fn64-abi", row.name);
+            assert_eq!(
+                node.gate, row.gate,
+                "{} gate disagrees with fn64-abi",
+                row.name
+            );
         }
     }
 
@@ -1072,7 +1458,10 @@ mod tests {
     #[test]
     fn a_child_exceeding_its_parent_is_reported_as_a_violation() {
         let clean = totals_for(&[]);
-        assert!(closure_violations(&clean).is_empty(), "an empty run has no violations");
+        assert!(
+            closure_violations(&clean).is_empty(),
+            "an empty run has no violations"
+        );
 
         let broken: Vec<(&'static str, u64)> = vec![
             ("executor_ns", 1_000_000),
@@ -1080,9 +1469,21 @@ mod tests {
             ("exec_devtime_ns", 0),
         ];
         let violations = closure_violations(&broken);
-        assert_eq!(violations.len(), 1, "exactly the executor_ns parent is violated");
-        assert!(violations[0].contains("VIOLATION under executor_ns"), "{}", violations[0]);
-        assert!(violations[0].contains("3.00"), "the arithmetic is attached: {}", violations[0]);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the executor_ns parent is violated"
+        );
+        assert!(
+            violations[0].contains("VIOLATION under executor_ns"),
+            "{}",
+            violations[0]
+        );
+        assert!(
+            violations[0].contains("3.00"),
+            "the arithmetic is attached: {}",
+            violations[0]
+        );
     }
 
     /// The fast/slow boundary is the 16.667 ms field budget, the same
@@ -1097,8 +1498,14 @@ mod tests {
         // so excess-over-fast is (16.7-16.3)+(40-16.3) = 24.1, while
         // excess-over-budget is (16.7-16.667)+(40-16.667) = 23.4. Quoting one
         // where the other was meant is the error this pair exists to prevent.
-        assert!(text.contains("excess over the fast-population mean (16.300 ms) = 24.1 ms"), "{text}");
-        assert!(text.contains("excess over the 16.667 ms field budget       = 23.4 ms"), "{text}");
+        assert!(
+            text.contains("excess over the fast-population mean (16.300 ms) = 24.1 ms"),
+            "{text}"
+        );
+        assert!(
+            text.contains("excess over the 16.667 ms field budget       = 23.4 ms"),
+            "{text}"
+        );
     }
 
     /// A zero from an unarmed gate must never be rendered as "this phase is
@@ -1133,10 +1540,19 @@ mod tests {
     #[test]
     fn a_fixed_period_shows_one_dominant_gap() {
         let periodic: Vec<PumpSample> = (0..60)
-            .map(|i| if i % 4 == 0 { sample(30.0) } else { sample(8.0) })
+            .map(|i| {
+                if i % 4 == 0 {
+                    sample(30.0)
+                } else {
+                    sample(8.0)
+                }
+            })
             .collect();
         let text = render_report(&periodic, "test", 0);
-        assert!(text.contains("gap histogram (gap:count) = 4:14(100%)"), "{text}");
+        assert!(
+            text.contains("gap histogram (gap:count) = 4:14(100%)"),
+            "{text}"
+        );
     }
 
     /// A condition that does not move the slow rate must report lift ~1x. This
@@ -1165,6 +1581,144 @@ mod tests {
         let samples: Vec<PumpSample> = (0..10).map(|i| sample(i as f64)).collect();
         let text = render_report(&samples, "test", 3);
         assert_eq!(text.matches("[pump-seq] ").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn completion_ordinals_delta_independently_of_gfx_admissions() {
+        let before = Totals {
+            gfx_tasks: 40,
+            phase: PhaseSnapshot {
+                gfx_lle_rdp_ns: 100,
+                ..Default::default()
+            },
+            task_cpu: Some(fn64_render_wgpu::TaskCpuPhaseRunningTotals {
+                completed_tasks: 7,
+                task_envelope_ns: 100,
+                cpu_member_ns: 60,
+                all_cpu_member_ns: 80,
+                compute_segment_ns: 10,
+                execution_view_gross_ns: 45,
+                finalize_coordinator_ns: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let after = Totals {
+            gfx_tasks: 43,
+            phase: PhaseSnapshot {
+                gfx_lle_rdp_ns: 250,
+                ..Default::default()
+            },
+            task_cpu: Some(fn64_render_wgpu::TaskCpuPhaseRunningTotals {
+                completed_tasks: 8,
+                task_envelope_ns: 220,
+                attributed_members: 2,
+                cpu_member_ns: 130,
+                all_cpu_member_ns: 170,
+                compute_segment_ns: 30,
+                source_binding_load_ns: 10,
+                prefix_capture_ns: 10,
+                schedule_decode_row_prep_raster_ns: 20,
+                candidate_seed_copy_ns: 10,
+                execution_view_gross_ns: 100,
+                finalize_coordinator_ns: 25,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sample = after.delta(&before, 1_000, 1, false);
+        assert_eq!(sample.gfx_tasks, 3);
+        assert_eq!(
+            (
+                sample.task_cpu_completion_before,
+                sample.task_cpu_completion_after
+            ),
+            (7, 8)
+        );
+        assert_eq!(sample.task_cpu_envelope_ns, 120);
+        assert_eq!(sample.task_cpu_member_ns, 70);
+        assert_eq!(sample.task_cpu_all_cpu_member_ns, 90);
+        assert_eq!(sample.task_cpu_compute_segment_ns, 20);
+        assert_eq!(sample.task_cpu_renderer_work_ns, 110);
+        assert_eq!(sample.task_cpu_member_accounted_ns, 50);
+        assert_eq!(sample.task_cpu_execution_view_plan_residual_ns, 5);
+        assert_eq!(sample.task_cpu_finalize_coordinator_ns, 15);
+        assert_eq!(sample.task_cpu_post_view_wrapper_residual_ns, 0);
+        assert_eq!(sample.task_cpu_outer_residual_ns, 10);
+        assert_eq!(sample.task_cpu_rdp_outside_envelope_ns, 30);
+    }
+
+    #[test]
+    fn drawn_frame_fold_excludes_and_accounts_for_incomplete_spans() {
+        let samples = vec![
+            PumpSample {
+                task_cpu_armed: true,
+                task_cpu_completion_before: 4,
+                task_cpu_completion_after: 5,
+                task_cpu_member_ns: 10,
+                ..Default::default()
+            },
+            PumpSample {
+                swapped: true,
+                task_cpu_armed: true,
+                task_cpu_completion_before: 5,
+                task_cpu_completion_after: 6,
+                task_cpu_member_ns: 20,
+                ..Default::default()
+            },
+            PumpSample {
+                task_cpu_armed: true,
+                task_cpu_completion_before: 6,
+                task_cpu_completion_after: 7,
+                task_cpu_member_ns: 30,
+                ..Default::default()
+            },
+            PumpSample {
+                swapped: true,
+                task_cpu_armed: true,
+                task_cpu_completion_before: 7,
+                task_cpu_completion_after: 8,
+                task_cpu_member_ns: 40,
+                ..Default::default()
+            },
+            PumpSample {
+                task_cpu_armed: true,
+                task_cpu_completion_before: 8,
+                task_cpu_completion_after: 9,
+                task_cpu_member_ns: 50,
+                ..Default::default()
+            },
+        ];
+        let folded = fold_task_cpu_drawn_frames(&samples);
+        assert_eq!(folded.incomplete_prefix.unwrap().pumps, 2);
+        assert_eq!(folded.incomplete_prefix.unwrap().member_ns, 30);
+        assert_eq!(folded.complete.len(), 1);
+        assert_eq!(folded.complete[0].pumps, 2);
+        assert_eq!(folded.complete[0].member_ns, 70);
+        assert_eq!(
+            (
+                folded.complete[0].completion_before,
+                folded.complete[0].completion_after
+            ),
+            (6, 8)
+        );
+        assert_eq!(folded.incomplete_suffix.unwrap().pumps, 1);
+        assert_eq!(folded.incomplete_suffix.unwrap().member_ns, 50);
+        let text = render_task_cpu_frame_report(&samples, 0);
+        assert!(
+            text.contains(
+                "complete_drawn_frames=1 incomplete_prefix_pumps=2 incomplete_suffix_pumps=1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("[task-cpu-incomplete-prefix] pumps=2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[task-cpu-incomplete-suffix] pumps=1"),
+            "{text}"
+        );
     }
 
     /// The whole point of the instrument: it must attribute the tail to the
