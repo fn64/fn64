@@ -656,6 +656,15 @@ spans ending at VI swaps; because a bounded sample window normally begins and
 ends in the middle of a frame, it reports and excludes the incomplete prefix
 and suffix rather than presenting either as a complete drawn frame.
 
+When `FN64_TASK_BATCH_PHASE_CENSUS=1` and `FN64_SESSION_PHASE_CENSUS=1` are
+also armed, the same pump-boundary snapshot joins their existing clocks to the
+renderer completion span. No clock site is added. Session execute minus
+renderer work identifies non-member backend execution; envelope minus session
+execute identifies post-execute work through final publication. The existing
+setup/plan/read/finalize and staged-write/commit/copyback/publication buckets
+then close the outside-envelope and post-execute residuals, with saturating
+unattributed remainders printed rather than inferred away.
+
 ## Nonclaims (2026-08-18 fourth pass)
 
 - **"Runs to the step budget" is not "playable."** The lane renders and does

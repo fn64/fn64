@@ -48,6 +48,18 @@ class Pump:
     task_post_view_wrapper_residual_ms: float | None = None
     task_outer_residual_ms: float | None = None
     task_rdp_outside_envelope_ms: float | None = None
+    session_plan_ms: float | None = None
+    session_finalize_ms: float | None = None
+    session_execute_ms: float | None = None
+    session_commit_ms: float | None = None
+    task_batch_total_ms: float | None = None
+    task_batch_setup_ms: float | None = None
+    task_batch_plan_bind_ms: float | None = None
+    task_batch_guest_reads_ms: float | None = None
+    task_batch_staged_writes_ms: float | None = None
+    task_batch_copyback_ms: float | None = None
+    task_batch_publication_ms: float | None = None
+    task_batch_tasks: int | None = None
 
 
 METRICS = (
@@ -79,6 +91,29 @@ TASK_PHASE_METRICS = (
     "task_rdp_outside_envelope_ms",
 )
 
+ABI_PHASE_METRICS = (
+    "session_plan_ms",
+    "session_finalize_ms",
+    "session_execute_ms",
+    "session_commit_ms",
+    "task_batch_total_ms",
+    "task_batch_setup_ms",
+    "task_batch_plan_bind_ms",
+    "task_batch_guest_reads_ms",
+    "task_batch_staged_writes_ms",
+    "task_batch_copyback_ms",
+    "task_batch_publication_ms",
+)
+
+ABI_DERIVED_METRICS = (
+    "execute_outer_ms",
+    "post_execute_outer_ms",
+    "post_execute_accounted_ms",
+    "post_execute_unattributed_ms",
+    "pre_execute_accounted_ms",
+    "outside_unattributed_ms",
+)
+
 
 def percentile(values: list[float], fraction: float) -> float:
     if not values:
@@ -94,12 +129,12 @@ def parse_pumps(text: str) -> list[Pump]:
         if not line.startswith(SEQUENCE_PREFIX):
             continue
         fields = line[len(SEQUENCE_PREFIX) :].split(",")
-        if len(fields) not in (15, 28):
+        if len(fields) not in (15, 28, 40):
             raise ValueError(
-                f"pump sequence row has {len(fields)} fields, expected legacy 15 or expanded 28"
+                f"pump sequence row has {len(fields)} fields, expected 15, 28, or 40"
             )
         task_fields: dict[str, int | float | None] = {}
-        if len(fields) == 28:
+        if len(fields) >= 28:
             task_fields = {
                 "task_completion_before": int(fields[15]),
                 "task_completion_after": int(fields[16]),
@@ -108,6 +143,14 @@ def parse_pumps(text: str) -> list[Pump]:
                     for metric, value in zip(TASK_PHASE_METRICS, fields[17:])
                 },
             }
+        if len(fields) == 40:
+            task_fields.update(
+                {
+                    metric: float(value)
+                    for metric, value in zip(ABI_PHASE_METRICS, fields[28:])
+                }
+            )
+            task_fields["task_batch_tasks"] = int(fields[39])
         pump = Pump(
             index=int(fields[0]),
             wall_ms=float(fields[1]),
@@ -171,8 +214,11 @@ def summarize(text: str) -> dict[str, object]:
     renderer = renderer_match.group(1)
     pumps = parse_pumps(text)
     task_phase_available = pumps[0].task_completion_before is not None
+    abi_phase_available = pumps[0].session_plan_ms is not None
     if any((pump.task_completion_before is not None) != task_phase_available for pump in pumps):
-        raise ValueError("pump sequence mixes legacy 15-field and expanded 28-field rows")
+        raise ValueError("pump sequence mixes rows with and without task phase fields")
+    if any((pump.session_plan_ms is not None) != abi_phase_available for pump in pumps):
+        raise ValueError("pump sequence mixes rows with and without ABI phase fields")
     swap_indices = [pump.index for pump in pumps if pump.swapped]
     if len(swap_indices) < 2:
         raise ValueError("at least two post-warmup VI swaps are required")
@@ -200,6 +246,54 @@ def summarize(text: str) -> dict[str, object]:
                         for metric in TASK_PHASE_METRICS
                     },
                 }
+            )
+        if abi_phase_available:
+            frame.update(
+                {
+                    metric: sum(getattr(pump, metric) for pump in span)
+                    for metric in ABI_PHASE_METRICS
+                }
+            )
+            frame["task_batch_tasks"] = sum(pump.task_batch_tasks for pump in span)
+            frame["abi_identity_closed"] = float(
+                frame["task_batch_tasks"] == frame["task_completions"]
+            )
+            frame.update(
+                {
+                    "execute_outer_ms": max(
+                        frame["session_execute_ms"] - frame["task_renderer_work_ms"], 0.0
+                    ),
+                    "post_execute_outer_ms": max(
+                        frame["task_envelope_ms"] - frame["session_execute_ms"], 0.0
+                    ),
+                }
+            )
+            frame["post_execute_accounted_ms"] = sum(
+                frame[metric]
+                for metric in (
+                    "task_batch_staged_writes_ms",
+                    "session_commit_ms",
+                    "task_batch_copyback_ms",
+                    "task_batch_publication_ms",
+                )
+            )
+            frame["post_execute_unattributed_ms"] = max(
+                frame["post_execute_outer_ms"] - frame["post_execute_accounted_ms"], 0.0
+            )
+            frame["pre_execute_accounted_ms"] = sum(
+                frame[metric]
+                for metric in (
+                    "task_batch_setup_ms",
+                    "task_batch_plan_bind_ms",
+                    "task_batch_guest_reads_ms",
+                    "session_plan_ms",
+                    "session_finalize_ms",
+                )
+            )
+            frame["outside_unattributed_ms"] = max(
+                frame["task_rdp_outside_envelope_ms"]
+                - frame["pre_execute_accounted_ms"],
+                0.0,
             )
         frames.append(frame)
     drawn_ms = [frame["drawn_frame_ms"] for frame in frames]
@@ -257,6 +351,20 @@ def summarize(text: str) -> dict[str, object]:
         }
     else:
         result["task_cpu_phase_frames"] = {"available": False}
+    if abi_phase_available:
+        result["abi_task_phase_frames"] = {
+            "available": True,
+            "metrics": {
+                metric: distribution([frame[metric] for frame in frames])
+                for metric in (*ABI_PHASE_METRICS, *ABI_DERIVED_METRICS)
+            },
+            "identity_closed_frames": sum(frame["abi_identity_closed"] for frame in frames),
+            "identity_mismatch_frames": sum(
+                not frame["abi_identity_closed"] for frame in frames
+            ),
+        }
+    else:
+        result["abi_task_phase_frames"] = {"available": False}
     return result
 
 
