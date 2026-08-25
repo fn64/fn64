@@ -3,6 +3,140 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+/// One field of host scheduler debt, retained only between event-loop turns.
+/// The shell never represents or services more than this one catch-up retrace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoundedFrameDebt(bool);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameDebtCounters {
+    pub debt_retained: u64,
+    pub catchups: u64,
+    pub reanchors: u64,
+    pub max_debt: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PumpTurnKind {
+    Scheduled,
+    CatchUp,
+}
+
+/// Move-only authority for one selected pump. The start/deadline identity is
+/// captured here so completion cannot accidentally be paired with another
+/// turn's timestamps.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PumpTurn<T> {
+    kind: PumpTurnKind,
+    started: T,
+    deadline: T,
+}
+
+impl<T> PumpTurn<T> {
+    pub const fn is_catch_up(&self) -> bool {
+        matches!(self.kind, PumpTurnKind::CatchUp)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpBurstDecision<T> {
+    /// Return to the event loop immediately. Redraw and input events remain
+    /// eligible before the debt is consumed by a later `about_to_wait` turn.
+    PollForCatchUp(T),
+    WaitUntil(T),
+}
+
+/// Default-off, one-field scheduler-debt policy. Times are generic so tests
+/// can use an integer fake clock while the live shell uses `Instant`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FrameDebtScheduler {
+    enabled: bool,
+    debt: BoundedFrameDebt,
+    counters: FrameDebtCounters,
+}
+
+impl FrameDebtScheduler {
+    pub fn from_env_value(value: Option<&std::ffi::OsStr>) -> Self {
+        let enabled = match value {
+            None => false,
+            Some(value) if value == std::ffi::OsStr::new("0") => false,
+            Some(value) if value == std::ffi::OsStr::new("1") => true,
+            Some(value) => {
+                panic!("FN64_SCHEDULER_FRAME_DEBT must be exactly 0 or 1, got {value:?}")
+            }
+        };
+        Self {
+            enabled,
+            debt: BoundedFrameDebt::default(),
+            counters: FrameDebtCounters::default(),
+        }
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn counters(&self) -> FrameDebtCounters {
+        self.counters
+    }
+
+    /// Select at most one retrace for this event-loop callback. Catch-up debt
+    /// is cleared before guest execution, so a slow catch-up cannot rearm it.
+    pub fn begin_turn<T: Copy + Ord>(&mut self, now: T, deadline: T) -> Option<PumpTurn<T>> {
+        if self.debt.0 {
+            self.debt.0 = false;
+            self.counters.catchups = self.counters.catchups.saturating_add(1);
+            return Some(PumpTurn {
+                kind: PumpTurnKind::CatchUp,
+                started: now,
+                deadline,
+            });
+        }
+        (now >= deadline).then_some(PumpTurn {
+            kind: PumpTurnKind::Scheduled,
+            started: now,
+            deadline,
+        })
+    }
+
+    /// Complete the selected turn. `add_frame` is the only clock operation
+    /// needed, keeping the policy deterministic and independent of `Instant`.
+    pub fn finish_turn<T: Copy + Ord>(
+        &mut self,
+        turn: PumpTurn<T>,
+        finished: T,
+        add_frame: impl Fn(T) -> T,
+    ) -> PumpBurstDecision<T> {
+        match turn.kind {
+            PumpTurnKind::CatchUp => {
+                self.counters.reanchors = self.counters.reanchors.saturating_add(1);
+                PumpBurstDecision::WaitUntil(add_frame(finished))
+            }
+            PumpTurnKind::Scheduled
+                if self.enabled
+                    && turn.started < add_frame(turn.deadline)
+                    && finished >= add_frame(turn.deadline) =>
+            {
+                self.debt = BoundedFrameDebt(true);
+                self.counters.debt_retained = self.counters.debt_retained.saturating_add(1);
+                self.counters.max_debt = 1;
+                PumpBurstDecision::PollForCatchUp(add_frame(turn.deadline))
+            }
+            PumpTurnKind::Scheduled => {
+                // Preserve the legacy disabled lane exactly: cadence advances
+                // from the old deadline while the turn began less than one
+                // field late, otherwise it reanchors from the pump start.
+                let next = if turn.started < add_frame(turn.deadline) {
+                    add_frame(turn.deadline)
+                } else {
+                    add_frame(turn.started)
+                };
+                PumpBurstDecision::WaitUntil(next)
+            }
+        }
+    }
+}
+
 const MAX_SAMPLES: usize = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +287,124 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 mod tests {
     use super::*;
 
+    const FIELD: u64 = 10;
+
+    #[test]
+    fn late_pump_retains_one_debt_then_next_turn_catches_up_and_reanchors() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("1")));
+        let turn = scheduler.begin_turn(100, 100).unwrap();
+        assert!(!turn.is_catch_up());
+        assert_eq!(
+            scheduler.finish_turn(turn, 112, |time| time + FIELD),
+            PumpBurstDecision::PollForCatchUp(110)
+        );
+        assert_eq!(scheduler.counters().max_debt, 1);
+
+        // Exact interleaving: pump returns -> redraw/input event opportunity ->
+        // next about_to_wait consumes debt -> exactly one VI retrace -> reanchor.
+        let catch_up = scheduler.begin_turn(113, 110).unwrap();
+        assert!(catch_up.is_catch_up());
+        assert_eq!(
+            scheduler.finish_turn(catch_up, 129, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(139)
+        );
+        assert_eq!(
+            scheduler.counters(),
+            FrameDebtCounters {
+                debt_retained: 1,
+                catchups: 1,
+                reanchors: 1,
+                max_debt: 1,
+            }
+        );
+        assert_eq!(scheduler.begin_turn(130, 139), None);
+    }
+
+    #[test]
+    fn slow_catchup_cannot_rearm_or_coalesce_another_guest_retrace() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("1")));
+        let regular = scheduler.begin_turn(20, 20).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(regular, 35, |time| time + FIELD),
+            PumpBurstDecision::PollForCatchUp(30)
+        );
+        let catch_up = scheduler.begin_turn(36, 30).unwrap();
+        assert!(catch_up.is_catch_up(), "debt clears before execution");
+        assert_eq!(
+            scheduler.finish_turn(catch_up, 80, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(90),
+            "even a four-field catch-up reanchors instead of rearming"
+        );
+        assert_eq!(scheduler.begin_turn(80, 90), None);
+        assert_eq!(scheduler.counters().max_debt, 1);
+    }
+
+    #[test]
+    fn completion_exactly_at_the_next_field_retains_exactly_one_debt() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("1")));
+        let turn = scheduler.begin_turn(50, 50).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(turn, 60, |time| time + FIELD),
+            PumpBurstDecision::PollForCatchUp(60)
+        );
+        assert_eq!(scheduler.counters().debt_retained, 1);
+        assert_eq!(scheduler.counters().max_debt, 1);
+    }
+
+    #[test]
+    fn turn_already_one_field_late_reanchors_without_manufacturing_debt() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("1")));
+        let turn = scheduler.begin_turn(70, 60).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(turn, 75, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(80)
+        );
+        assert_eq!(scheduler.counters(), FrameDebtCounters::default());
+    }
+
+    #[test]
+    fn disabled_lane_keeps_catchup_free_deadline_rules_and_zero_counters() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(None);
+        let on_time = scheduler.begin_turn(100, 100).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(on_time, 150, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(110)
+        );
+        let already_late = scheduler.begin_turn(125, 110).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(already_late, 180, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(135)
+        );
+        assert_eq!(scheduler.counters(), FrameDebtCounters::default());
+    }
+
+    #[test]
+    fn explicit_zero_uses_the_legacy_lane_and_keeps_zero_counters() {
+        let mut scheduler = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("0")));
+        let turn = scheduler.begin_turn(100, 100).unwrap();
+        assert_eq!(
+            scheduler.finish_turn(turn, 150, |time| time + FIELD),
+            PumpBurstDecision::WaitUntil(110)
+        );
+        assert!(!scheduler.enabled());
+        assert_eq!(scheduler.counters(), FrameDebtCounters::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "FN64_SCHEDULER_FRAME_DEBT must be exactly 0 or 1")]
+    fn scheduler_debt_rejects_unknown_env_values() {
+        let _ = FrameDebtScheduler::from_env_value(Some(std::ffi::OsStr::new("yes")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "FN64_SCHEDULER_FRAME_DEBT must be exactly 0 or 1")]
+    fn scheduler_debt_rejects_non_utf8_env_values_loudly() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let value = std::ffi::OsString::from_vec(vec![0xff]);
+        let _ = FrameDebtScheduler::from_env_value(Some(&value));
+    }
+
     #[test]
     fn reports_nearest_rank_median_and_p95_then_clears() {
         let mut window = TimingWindow::default();
@@ -176,8 +428,7 @@ mod tests {
     /// The worst-case bar cannot be read off the median or p95: this window is
     /// comfortably fast by both and still misses 60fps on one frame in fifty.
     #[test]
-    fn a_single_long_frame_fails_the_60fps_bound_while_median_and_p95_stay_fast()
-    {
+    fn a_single_long_frame_fails_the_60fps_bound_while_median_and_p95_stay_fast() {
         let mut window = TimingWindow::default();
         for _ in 0..49 {
             window.record(Duration::from_millis(8));

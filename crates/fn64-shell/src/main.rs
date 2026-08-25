@@ -62,11 +62,11 @@
 // content-free build (no game linked) the binary's `main` never touches them,
 // so `dead_code` would fire on every item -- allow it here rather than
 // littering per-item attributes; the tests + game module are the real users.
+mod app_identity;
 /// Content-free UI demo: the real presentation path driven by a synthetic
 /// RDRAM field, so a checkout with no game content can still open the window.
 #[cfg(not(fn64_game_linked))]
 mod demo;
-mod app_identity;
 #[allow(dead_code)]
 mod frame_trip;
 mod framebuffer;
@@ -178,7 +178,8 @@ mod game {
     use crate::input_map::{InputConfig, PadState};
     use crate::overlay::{Capture, Overlay};
     use crate::timing::{
-        subfield_device_deadline, DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow,
+        subfield_device_deadline, DrainDecision, FrameDebtScheduler, PumpBurstDecision,
+        RetraceDrain, RetraceOutcome, TimingWindow,
     };
     use std::sync::Arc;
 
@@ -316,6 +317,9 @@ mod game {
         frame_dump_dir: Option<std::path::PathBuf>,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
+        /// Default-off, at-most-one-field catch-up policy. Debt is consumed
+        /// only on a later event-loop turn, never inside the pump that earns it.
+        frame_debt_scheduler: FrameDebtScheduler,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
         /// Pumps in the current heartbeat window whose interval exceeded one
@@ -328,6 +332,8 @@ mod game {
         pump_steps_max: u64,
         pump_step_samples: u64,
         last_audio_underrun_sample_slots: u64,
+        last_audio_empty_ring_underrun_sample_slots: u64,
+        last_audio_lock_miss_underrun_sample_slots: u64,
         last_audio_late_callbacks: u64,
         /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
         /// unarmed it is one `bool` load per pump and nothing else.
@@ -629,6 +635,13 @@ mod game {
                 present_cache_mode.samples_dependencies(),
                 present_cache_mode.suppresses_redraw(true),
             );
+            let frame_debt_scheduler = FrameDebtScheduler::from_env_value(
+                std::env::var_os("FN64_SCHEDULER_FRAME_DEBT").as_deref(),
+            );
+            println!(
+                "[fn64-shell] FN64_SCHEDULER_FRAME_DEBT enabled={} max_debt=1",
+                frame_debt_scheduler.enabled()
+            );
 
             Shell {
                 rdram,
@@ -661,6 +674,7 @@ mod game {
                 frame_trip_exit_code: None,
                 frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 next_frame_deadline: std::time::Instant::now(),
+                frame_debt_scheduler,
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
                 pumps_over_budget: 0,
@@ -670,6 +684,8 @@ mod game {
                 pump_steps_max: 0,
                 pump_step_samples: 0,
                 last_audio_underrun_sample_slots: 0,
+                last_audio_empty_ring_underrun_sample_slots: 0,
+                last_audio_lock_miss_underrun_sample_slots: 0,
                 last_audio_late_callbacks: 0,
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
@@ -696,8 +712,8 @@ mod game {
             // this pump may have serviced sub-field device deadlines since the
             // preceding edge, and adding a field to that later time would drift
             // the independent VI schedule.
-            let tick = fn64_abi::next_vi_deadline()
-                .expect("typed television standard must keep VI armed");
+            let tick =
+                fn64_abi::next_vi_deadline().expect("typed television standard must keep VI armed");
             fn64_abi::advance_virtual_time(tick);
 
             loop {
@@ -713,11 +729,9 @@ mod game {
                     let current = fn64_abi::sim_time();
                     let next_vi = fn64_abi::next_vi_deadline()
                         .expect("typed television standard must keep VI armed");
-                    if let Some(deadline) = subfield_device_deadline(
-                        current,
-                        fn64_abi::next_device_deadline(),
-                        next_vi,
-                    ) {
+                    if let Some(deadline) =
+                        subfield_device_deadline(current, fn64_abi::next_device_deadline(), next_vi)
+                    {
                         fn64_abi::advance_virtual_time(deadline);
                         continue;
                     }
@@ -805,10 +819,7 @@ mod game {
                     self.video.overscan,
                     self.video.zoom_fill,
                 ));
-            if self.overlay.active()
-                || self.frame_trip.is_some()
-                || self.frame_dump_dir.is_some()
-            {
+            if self.overlay.active() || self.frame_trip.is_some() || self.frame_dump_dir.is_some() {
                 self.present_cache.record_uncacheable_request();
                 return false;
             }
@@ -877,8 +888,8 @@ mod game {
             // The guest's own active output rectangle, from V_START. Rows
             // past it were never rendered into, so presenting a fixed 240
             // shows stale RDRAM along the bottom -- WM2000 programs 237.
-            let target_height = fn64_abi::vi_output_height()
-                .map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
+            let target_height =
+                fn64_abi::vi_output_height().map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
@@ -966,10 +977,7 @@ mod game {
             // frame changed, this says what it looks like. Same recording
             // point, so the two always agree about frame numbering.
             if let Some(dir) = self.frame_dump_dir.as_ref() {
-                let index = self
-                    .frame_trip
-                    .as_ref()
-                    .map_or(0, |t| t.observed_len());
+                let index = self.frame_trip.as_ref().map_or(0, |t| t.observed_len());
                 let file = format!("frame-{index:04}-{rgba_hash:016x}.png");
                 if let Err(e) = crate::screenshot::capture(
                     dir,
@@ -994,10 +1002,8 @@ mod game {
             // End the `as_mut` borrow: the overlay path re-borrows the
             // pixels/window fields immutably alongside `&mut self.config`.
             let overlay_open_before = self.overlay.open;
-            let video_policy_before = framebuffer::PresentPolicy::new(
-                self.video.overscan,
-                self.video.zoom_fill,
-            );
+            let video_policy_before =
+                framebuffer::PresentPolicy::new(self.video.overscan, self.video.zoom_fill);
             let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
@@ -1051,10 +1057,8 @@ mod game {
                 if overlay_open_before != self.overlay.open {
                     self.present_cache.invalidate();
                 }
-                let video_policy_after = framebuffer::PresentPolicy::new(
-                    self.video.overscan,
-                    self.video.zoom_fill,
-                );
+                let video_policy_after =
+                    framebuffer::PresentPolicy::new(self.video.overscan, self.video.zoom_fill);
                 self.present_cache.synchronize_policy(video_policy_before);
                 self.present_cache.synchronize_policy(video_policy_after);
             }
@@ -1138,6 +1142,10 @@ mod game {
                         audio_callbacks,
                         audio_underrun_sample_slots,
                         window_underrun_sample_slots,
+                        audio_empty_ring_underrun_sample_slots,
+                        window_empty_ring_underrun_sample_slots,
+                        audio_lock_miss_underrun_sample_slots,
+                        window_lock_miss_underrun_sample_slots,
                         audio_late_callbacks,
                         window_late_callbacks,
                         max_callback_gap_us,
@@ -1150,6 +1158,17 @@ mod game {
                                     .underrun_sample_slots
                                     .get()
                                     .saturating_sub(self.last_audio_underrun_sample_slots),
+                                health.empty_ring_underrun_sample_slots.get(),
+                                health
+                                    .empty_ring_underrun_sample_slots
+                                    .get()
+                                    .saturating_sub(
+                                        self.last_audio_empty_ring_underrun_sample_slots,
+                                    ),
+                                health.lock_miss_underrun_sample_slots.get(),
+                                health.lock_miss_underrun_sample_slots.get().saturating_sub(
+                                    self.last_audio_lock_miss_underrun_sample_slots,
+                                ),
                                 health.late_callbacks,
                                 health
                                     .late_callbacks
@@ -1157,11 +1176,12 @@ mod game {
                                 health.max_callback_gap_us,
                             )
                         })
-                        .unwrap_or((0, 0, 0, 0, 0, 0));
+                        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                     let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
                     let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
                     let audio_rates = fn64_abi::audio_rates();
                     let present_cache = self.present_cache.stats();
+                    let scheduler_debt = self.frame_debt_scheduler.counters();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
@@ -1172,11 +1192,14 @@ mod game {
                          pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
                          callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
-                         (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
+                         (+{window_underrun_sample_slots} window; empty_ring={audio_empty_ring_underrun_sample_slots} \
+                         +{window_empty_ring_underrun_sample_slots}; lock_miss={audio_lock_miss_underrun_sample_slots} \
+                         +{window_lock_miss_underrun_sample_slots}) late_callbacks={audio_late_callbacks} \
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
-                         guest/stream_hz={audio_rates:?}; present_cache: mode={} \
+                         guest/stream_hz={audio_rates:?}; scheduler_debt: retained={} \
+                         catchups={} reanchors={} max_debt={}; present_cache: mode={} \
                          requests={} hits={} misses={} successful_presents={} failed_presents={} \
                          invalidations={} dependency_samples={} dependency_bytes={} \
                          logical_digest={:016x}",
@@ -1200,6 +1223,10 @@ mod game {
                         audio.nonzero_samples,
                         audio.backend_buffers,
                         fn64_abi::audio_frames_remaining(),
+                        scheduler_debt.debt_retained,
+                        scheduler_debt.catchups,
+                        scheduler_debt.reanchors,
+                        scheduler_debt.max_debt,
                         self.present_cache_mode.name(),
                         present_cache.requests,
                         present_cache.hits,
@@ -1216,6 +1243,10 @@ mod game {
                     self.pump_steps_max = 0;
                     self.pump_step_samples = 0;
                     self.last_audio_underrun_sample_slots = audio_underrun_sample_slots;
+                    self.last_audio_empty_ring_underrun_sample_slots =
+                        audio_empty_ring_underrun_sample_slots;
+                    self.last_audio_lock_miss_underrun_sample_slots =
+                        audio_lock_miss_underrun_sample_slots;
                     self.last_audio_late_callbacks = audio_late_callbacks;
                 }
             }
@@ -1507,7 +1538,12 @@ mod game {
                 let code = match verdict {
                     Verdict::Pending => unreachable!("Pending is never stored"),
                     Verdict::Recorded(n) => {
-                        match self.frame_trip.as_ref().expect("verdict implies trip").write() {
+                        match self
+                            .frame_trip
+                            .as_ref()
+                            .expect("verdict implies trip")
+                            .write()
+                        {
                             Ok(()) => {
                                 println!(
                                     "[fn64-shell] frame tripwire: recorded {n} frame hashes to {path}"
@@ -1515,7 +1551,9 @@ mod game {
                                 0
                             }
                             Err(e) => {
-                                eprintln!("[fn64-shell] frame tripwire: FAILED to write {path}: {e}");
+                                eprintln!(
+                                    "[fn64-shell] frame tripwire: FAILED to write {path}: {e}"
+                                );
                                 1
                             }
                         }
@@ -1528,12 +1566,14 @@ mod game {
                         // Fails the run. A gate that cannot compare must not
                         // report success: a comment-only baseline was
                         // measured reporting "PASS -- 1 frames match".
-                        eprintln!(
-                            "[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})"
-                        );
+                        eprintln!("[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})");
                         1
                     }
-                    Verdict::Mismatch { index, expected, actual } => {
+                    Verdict::Mismatch {
+                        index,
+                        expected,
+                        actual,
+                    } => {
                         eprintln!(
                             "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
                              {expected:016x}, got {actual:016x} (baseline {path}). A differing \
@@ -1579,7 +1619,14 @@ mod game {
             const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
             let now_t = std::time::Instant::now();
-            if now_t >= self.next_frame_deadline {
+            let Some(pump_turn) = self
+                .frame_debt_scheduler
+                .begin_turn(now_t, self.next_frame_deadline)
+            else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
+                return;
+            };
+            {
                 // Held rather than recorded here: the HUD pairs each pump's
                 // COST with the interval that preceded it, and the cost is
                 // only known below. Keeping the pair together is what lets
@@ -1600,7 +1647,8 @@ mod game {
                 // the instrument that adds no timer is the one to prefer).
                 self.pump_census.before_pump();
                 let outcome = self.pump_one_frame();
-                let pump_wall = now_t.elapsed();
+                let pump_finished = std::time::Instant::now();
+                let pump_wall = pump_finished.saturating_duration_since(now_t);
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
                 // flip on microsecond scheduler jitter -- measured at 50.4%
@@ -1658,21 +1706,33 @@ mod game {
                 if outcome.swapped {
                     self.last_swap_count = fn64_abi::vi_swap_count();
                 }
-                // Catch-up-free schedule: hold cadence while we keep up,
-                // re-anchor (dropping missed frames) when we fall behind.
-                self.next_frame_deadline =
-                    if now_t.saturating_duration_since(self.next_frame_deadline) < FRAME {
-                        self.next_frame_deadline + FRAME
-                    } else {
-                        now_t + FRAME
-                    };
                 if !self.should_suppress_pump_redraw() {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }
                 }
+                let turn_finished = std::time::Instant::now();
+                // Ordering is load-bearing: the pump has fully quiesced and
+                // its redraw has been requested before debt is retained. A
+                // catch-up therefore runs only on a later event-loop turn,
+                // after close/input/redraw events have had an opportunity to
+                // run. `begin_turn` cleared catch-up debt before this pump, so
+                // its completion can only reanchor, never queue another VI.
+                match self.frame_debt_scheduler.finish_turn(
+                    pump_turn,
+                    turn_finished,
+                    |deadline| deadline + FRAME,
+                ) {
+                    PumpBurstDecision::PollForCatchUp(debt_deadline) => {
+                        self.next_frame_deadline = debt_deadline;
+                        event_loop.set_control_flow(ControlFlow::Poll);
+                    }
+                    PumpBurstDecision::WaitUntil(deadline) => {
+                        self.next_frame_deadline = deadline;
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    }
+                }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
         }
 
         fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
