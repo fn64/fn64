@@ -918,7 +918,13 @@ raw-word clone, temporary byte vector, and decoded-word vector. Under the
 observed 43,156 single-triangle members, those represented 129,468 allocations
 and about 19.76 MiB of materialized payload. Direct-u32 and byte decoding match
 across all eight triangle opcodes, with mutation and malformed-route coverage;
-the allocation count is structural evidence only pending a live A/B.
+the allocation count is structural evidence. The counterbalanced `f9eafb5e` /
+`60a8dfce` pair retained identical task/member/load populations and reduced
+schedule/decode/row-prep/raster time from 758.289 ms to 738.898 ms (-2.6%) and
+CPU-member time from 1,668.004 ms to 1,646.786 ms (-1.3%). All 15 framebuffer
+hashes through swap 900 matched. Drawn p95 was 31.498 ms for control and
+31.654 ms for candidate, so this is a retained phase/allocation win rather
+than a frame-tail improvement claim.
 
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
