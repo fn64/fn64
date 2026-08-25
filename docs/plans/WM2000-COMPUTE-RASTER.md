@@ -895,6 +895,31 @@ p95 fell from 33.264 ms to 32.189 ms, while all 15 sampled framebuffer hashes
 through swap 900 remained identical. This is retained A/B evidence, not the
 ten-run deterministic-fix bar or evidence of comfortable field-budget margin.
 
+Every accepted destination byte in a completed TMEM load also has one packet
+`next_generation`: the physical plan proves destination coverage equals the
+union of every planned word's eight lanes, successful finish proves every word
+staged, and staging assigns that generation before validity handling. A
+private completion capability now carries that proof, so immutable projections
+retain one scalar generation while durable TMEM keeps its per-byte generation
+array. Render IR streams the scalar as the identical repeated big-endian field
+under the frozen SHA-256 domain. The counterbalanced `304af2c7` / `f9eafb5e`
+pair kept all 47,324 loads and 78,973,312 projected bytes identical while
+reducing finish/project/effect time from 338.487 ms to 300.463 ms (-11.2%) and
+CPU-member time from 1,698.750 ms to 1,666.406 ms (-1.9%). All 15 framebuffer
+hashes through swap 900 matched. Drawn p95 moved from 31.934 ms to 32.212 ms,
+so this is a retained phase/allocation win, not a frame-tail improvement claim.
+
+Scheduled raw triangles now carry a private exact `RawTriangle`, decoded
+allocation-free directly from the neutral plan's authoritative u32 wire words
+during plan collection. The carrier retains a typed missing-opcode or concrete
+decode failure until the existing named execution-error boundary; routing,
+provenance, and raster semantics are unchanged. This removes the per-triangle
+raw-word clone, temporary byte vector, and decoded-word vector. Under the
+observed 43,156 single-triangle members, those represented 129,468 allocations
+and about 19.76 MiB of materialized payload. Direct-u32 and byte decoding match
+across all eight triangle opcodes, with mutation and malformed-route coverage;
+the allocation count is structural evidence only pending a live A/B.
+
 The shell also has a default-off presentation-cache experiment for the observed
 two presentation requests per WM2000 swap. Unset or
 `FN64_PRESENT_CACHE=0` is `disabled`; `FN64_PRESENT_CACHE=observe` captures and
