@@ -47,6 +47,14 @@ the single live-framebuffer traversal. FNV, cache generation/invalidation,
 probe time, hit, and redraw disposition remain lane-specific diagnostics; the
 receipt reports probe-time distribution separately from pump/present work.
 
+The first same-binary live pair on 2026-08-25 passed this authority for all
+1,600 pumps: the external comparator accepted every canonical identity;
+both lanes observed 800 exact hits, Observe suppressed none, and Suppress
+suppressed all 800. Both lanes had zero Uncacheable receipts and zero failed presents.
+The armed probe cost 0.214/0.216 ms mean and 0.267/0.268 ms p95. Drawn-frame
+p95 was 31.289/30.895 ms and p99 35.458/35.410 ms (Observe/Suppress). This is
+one encouraging pair, not the required repeated scheduling/concurrency gate.
+
 ## 2026-08-22 pacing diagnosis: sub-field DP completion was rounded to a field
 
 This supersedes the hypothesis that the renderer's submissions merely needed

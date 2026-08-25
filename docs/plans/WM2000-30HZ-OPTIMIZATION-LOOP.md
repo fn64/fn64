@@ -107,6 +107,20 @@ ordinary before/after timing leaves them explicitly off. Environment switches
 for a candidate are inherited, so the same binary can be run in `A/B, B/A`
 order without changing this runner.
 
+For presentation-cache certification, the paired runner alternates order and
+invokes the canonical comparator after every pair:
+
+```sh
+scripts/benchmark-wm2000-present-cache.zsh --rom /path/to/wm2000.z64 \
+  --bin /path/to/the/exact/fn64 --output-dir /private/tmp/present-cache \
+  --pairs 10
+```
+
+It requires exactly 1,600 measured pumps per lane and stops at the first
+missing receipt or dependency mismatch. Ten pairs provide the required 20
+clean scheduling runs; the per-run timing receipts remain separate rather
+than being replaced by an aggregate-only pass.
+
 `FN64_RSP_DPC_TASK_CENSUS=1` reports the physical DPC runs captured by each
 completed RSP task, including the original END-write count, coalesced run
 sizes, incomplete-command stalls, and the run containing each FullSync. This
