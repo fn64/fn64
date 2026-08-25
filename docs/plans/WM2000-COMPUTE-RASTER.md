@@ -644,6 +644,14 @@ TMEM or tile changes that only require another dispatch are also distinct from
 admission refusal. This keeps the diagnostic denominator closed without
 weakening the task transaction or its command ordering.
 
+The sustained-tail census further partitions the former `NoRawTriangle`
+bucket into fill, texrect, TMEM-load, their mixed shapes, sync/state-only, and
+no-op-only packets. Compute segments are attributed to their exact shader
+program or to a typed mixed-program bucket, with segment, member, and elapsed
+totals that close against the existing census denominator. These labels are
+reporting metadata derived from the already-decoded command stream; they do
+not change execution or add per-draw clocks when the census is disabled.
+
 The first 800-pump keyed capture measured the sustained-route candidates at
 task 570. The one-cycle program `fc309661/552eff7f/0008ecef/00504240` consumed
 298.559 ms across 657 CPU members. Two-cycle programs consumed 287.059 ms
