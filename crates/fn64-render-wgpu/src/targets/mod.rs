@@ -32,8 +32,8 @@ mod triangle_pipeline;
 
 pub(crate) use compute_batch::{
     ComputeRasterAdmissionRefusal, ComputeRasterBatch, ComputeRasterBatchBuilder,
-    ComputeRasterDrawAdmission, ComputeRasterProgramKey, ComputeRasterShaderProgram,
-    HOT_COMBINE_HIGH, HOT_COMBINE_LOW, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
+    ComputeRasterDrawAdmission, ComputeRasterProgramKey, HOT_COMBINE_HIGH, HOT_COMBINE_LOW,
+    HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW,
 };
 pub use fill::{
     decode_fill_cycle_pixel, execute_combined_fill_rectangle, execute_fill_rectangle,

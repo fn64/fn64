@@ -390,23 +390,6 @@ occasionally returned an invalid final used slot even with that padding, so
 wrapping subtraction would otherwise manufacture a many-hour duration.
 Disabled mode requests no extra device feature and creates no query resources.
 
-`FN64_COMPUTE_P2_PLAN_CACHE=1` enables the separate default-off prepared-
-schedule A/B for the exact typed fog shader program. It retains only immutable
-word-event/checkpoint schedules under full structural equality; triangle,
-material, TMEM, tile, resident-target, and generation data remain live on every
-call. The renderer-local cache is bounded by both 32 entries and 8 MiB of
-retained key/schedule allocation and evicts the least-recently used entries by
-weight. The unset or `0`
-lane performs the original owned-`Vec` planning and records zero cache attempts
-or hits.
-
-An enabled run emits `[compute-p2-plan-cache]` on its first eligible lookup and
-every 256 eligible lookups thereafter. Each row reports attempts, hits and hit
-rate; miss buckets for cold/extent/partition/range/triangle/checkpoint changes;
-evictions, oversized rejections and non-P2 bypasses; and current entry/byte
-retention versus both budgets. These rows are diagnostic hit-rate evidence,
-not a performance claim; full-chain before/after timing remains the kill gate.
-
 A five-warmup, twenty-measurement native Metal run of the nine-submission task
 control produced 19 fully valid traces out of 25 timestamped calls. The
 23-pass span had a 1.889 ms median and 1.023--1.958 ms range; the lower mode

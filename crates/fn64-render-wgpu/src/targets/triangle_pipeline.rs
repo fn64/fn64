@@ -125,7 +125,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::ComputeRasterShaderProgram;
 use crate::device::{HeadlessBackend, NoAdapter};
 use crate::shader_manifest::{
     triangle_pipeline_fragment_wgsl, COMPUTE_RASTER_RGBA16_ROUND_TRIP_ENTRY_POINT,
@@ -164,19 +163,6 @@ fn compute_gpu_timing_enabled() -> bool {
         Err(std::env::VarError::NotPresent) => false,
         Err(error) => panic!("FN64_COMPUTE_GPU_TIMING is not valid Unicode: {error}"),
     })
-}
-
-/// Default-off A/B switch for the exact fog-program structural schedule
-/// cache. A malformed value is configuration corruption, not a request to
-/// silently choose either lane.
-fn compute_p2_plan_cache_enabled() -> bool {
-    match std::env::var("FN64_COMPUTE_P2_PLAN_CACHE") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_COMPUTE_P2_PLAN_CACHE must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => panic!("FN64_COMPUTE_P2_PLAN_CACHE is not valid Unicode: {error}"),
-    }
 }
 
 fn compute_chain_timing_lap(mark: &mut Option<Instant>) -> Duration {
@@ -1299,8 +1285,6 @@ impl UninitializedTrianglePipeline {
                 compute_hot_color_buffers: Vec::new(),
                 compute_hot_color_chain_status_readback: None,
                 compute_hot_color_plan_scratch: ComputeHotColorPlanScratch::default(),
-                compute_p2_plan_cache_enabled: compute_p2_plan_cache_enabled(),
-                compute_p2_plan_cache: ComputeP2PlanCache::default(),
                 compute_hot_color_resource_generations: 0,
                 errors,
             },
@@ -1439,8 +1423,6 @@ pub struct TrianglePipelineRenderer {
     /// before it is observed; retaining capacities removes target-sized heap
     /// churn without retaining dispatch, TMEM, or checkpoint ownership.
     compute_hot_color_plan_scratch: ComputeHotColorPlanScratch,
-    compute_p2_plan_cache_enabled: bool,
-    compute_p2_plan_cache: ComputeP2PlanCache,
     compute_hot_color_resource_generations: u64,
     errors: Arc<BoundedErrorSink>,
 }
@@ -1480,368 +1462,6 @@ struct ComputeHotColorPlanScratch {
     interval_words: Vec<u32>,
     event_cursors: Vec<u32>,
     checkpoint_words: Vec<Vec<u32>>,
-}
-
-const COMPUTE_P2_PLAN_CACHE_MAX_ENTRIES: usize = 32;
-const COMPUTE_P2_PLAN_CACHE_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
-
-/// Monotonic runtime evidence for the default-off P2 schedule-cache A/B.
-/// Attempts count only eligible cache-enabled P2 batches; the disabled lane
-/// and non-P2 bypasses never perform a lookup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ComputeP2PlanCacheCounters {
-    pub(crate) attempts: u64,
-    pub(crate) hits: u64,
-    pub(crate) cold_misses: u64,
-    pub(crate) extent_misses: u64,
-    pub(crate) partition_misses: u64,
-    pub(crate) dispatch_range_misses: u64,
-    pub(crate) triangle_count_misses: u64,
-    pub(crate) checkpoint_misses: u64,
-    pub(crate) evictions: u64,
-    pub(crate) oversized_rejections: u64,
-    pub(crate) non_p2_bypasses: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ComputeP2PlanKey {
-    extent: TriangleTargetExtent,
-    dispatch_start: usize,
-    dispatches: Vec<ComputeP2DispatchPlanKey>,
-    checkpoint_dispatch_limits: Vec<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ComputeP2DispatchPlanKey {
-    first_row: u32,
-    row_count: u32,
-    first_column: u32,
-    column_count: u32,
-    triangle_count: usize,
-}
-
-#[derive(Debug)]
-struct ComputeP2PreparedSchedule {
-    status_bytes: u64,
-    word_count: u32,
-    workgroups: u32,
-    checkpoint_output_count: u32,
-    checkpoint_patches: Vec<Vec<(u32, u32)>>,
-    work_items: Vec<u8>,
-    work_triangle_indices: Vec<u8>,
-    work_item_words: Vec<u32>,
-}
-
-struct ComputeP2PlanCacheEntry {
-    key: ComputeP2PlanKey,
-    schedule: ComputeP2PreparedSchedule,
-    retained_bytes: usize,
-    last_used: u64,
-}
-
-struct ComputeP2PlanCache {
-    entries: Vec<ComputeP2PlanCacheEntry>,
-    max_entries: usize,
-    max_retained_bytes: usize,
-    retained_bytes: usize,
-    use_clock: u64,
-    counters: ComputeP2PlanCacheCounters,
-}
-
-#[derive(Clone, Copy)]
-struct ComputeP2PlanKeyView<'a> {
-    extent: TriangleTargetExtent,
-    dispatch_start: usize,
-    dispatches: &'a [ComputeHotColorDispatch<'a>],
-    checkpoint_dispatch_limits: &'a [usize],
-}
-
-trait ComputeP2PlanLookup: Copy {
-    fn matches(self, key: &ComputeP2PlanKey) -> bool;
-    fn same_extent(self, key: &ComputeP2PlanKey) -> bool;
-    fn same_partition(self, key: &ComputeP2PlanKey) -> bool;
-    fn same_ranges(self, key: &ComputeP2PlanKey) -> bool;
-    fn same_triangle_counts(self, key: &ComputeP2PlanKey) -> bool;
-}
-
-impl Default for ComputeP2PlanCache {
-    fn default() -> Self {
-        Self::with_limits(
-            COMPUTE_P2_PLAN_CACHE_MAX_ENTRIES,
-            COMPUTE_P2_PLAN_CACHE_MAX_RETAINED_BYTES,
-        )
-    }
-}
-
-impl ComputeP2PlanKey {
-    fn from_view(view: ComputeP2PlanKeyView<'_>) -> Self {
-        Self {
-            extent: view.extent,
-            dispatch_start: view.dispatch_start,
-            dispatches: view
-                .dispatches
-                .iter()
-                .map(|dispatch| ComputeP2DispatchPlanKey {
-                    first_row: dispatch.first_row,
-                    row_count: dispatch.row_count,
-                    first_column: dispatch.first_column,
-                    column_count: dispatch.column_count,
-                    triangle_count: dispatch.triangles.len(),
-                })
-                .collect(),
-            checkpoint_dispatch_limits: view.checkpoint_dispatch_limits.to_vec(),
-        }
-    }
-
-    fn is_exact_p2(dispatches: &[ComputeHotColorDispatch<'_>]) -> bool {
-        dispatches.iter().all(|dispatch| {
-            !dispatch.triangles.is_empty()
-                && dispatch
-                    .triangles
-                    .iter()
-                    .all(|triangle| triangle.program.has_prepared_p2_schedule())
-        })
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.dispatches.capacity() * std::mem::size_of::<ComputeP2DispatchPlanKey>()
-            + self.checkpoint_dispatch_limits.capacity() * std::mem::size_of::<usize>()
-    }
-}
-
-impl ComputeP2PlanCache {
-    fn with_max_retained_bytes(max_retained_bytes: usize) -> Self {
-        Self::with_limits(COMPUTE_P2_PLAN_CACHE_MAX_ENTRIES, max_retained_bytes)
-    }
-
-    fn with_limits(max_entries: usize, max_retained_bytes: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            max_entries,
-            max_retained_bytes,
-            retained_bytes: 0,
-            use_clock: 0,
-            counters: ComputeP2PlanCacheCounters::default(),
-        }
-    }
-
-    fn lookup(&mut self, key: impl ComputeP2PlanLookup) -> Option<usize> {
-        self.counters.attempts += 1;
-        self.use_clock = self.use_clock.wrapping_add(1);
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| key.matches(&entry.key))
-        {
-            self.counters.hits += 1;
-            self.entries[index].last_used = self.use_clock;
-            self.maybe_report("periodic");
-            return Some(index);
-        }
-        if self.entries.is_empty() {
-            self.counters.cold_misses += 1;
-        } else if !self.entries.iter().any(|entry| key.same_extent(&entry.key)) {
-            self.counters.extent_misses += 1;
-        } else if !self
-            .entries
-            .iter()
-            .any(|entry| key.same_partition(&entry.key))
-        {
-            self.counters.partition_misses += 1;
-        } else if !self.entries.iter().any(|entry| key.same_ranges(&entry.key)) {
-            self.counters.dispatch_range_misses += 1;
-        } else if !self
-            .entries
-            .iter()
-            .any(|entry| key.same_triangle_counts(&entry.key))
-        {
-            self.counters.triangle_count_misses += 1;
-        } else {
-            self.counters.checkpoint_misses += 1;
-        }
-        self.maybe_report("periodic");
-        None
-    }
-
-    fn insert(
-        &mut self,
-        key: ComputeP2PlanKey,
-        schedule: ComputeP2PreparedSchedule,
-    ) -> Result<usize, ComputeP2PreparedSchedule> {
-        let retained_bytes = key.retained_bytes() + schedule.retained_bytes();
-        if retained_bytes > self.max_retained_bytes {
-            self.counters.oversized_rejections += 1;
-            return Err(schedule);
-        }
-        while self.entries.len() >= self.max_entries
-            || self.retained_bytes + retained_bytes > self.max_retained_bytes
-        {
-            let lru = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(index, _)| index)
-                .expect("an over-budget non-oversized insertion has an eviction candidate");
-            self.retained_bytes -= self.entries.remove(lru).retained_bytes;
-            self.counters.evictions += 1;
-        }
-        self.use_clock = self.use_clock.wrapping_add(1);
-        self.retained_bytes += retained_bytes;
-        self.entries.push(ComputeP2PlanCacheEntry {
-            key,
-            schedule,
-            retained_bytes,
-            last_used: self.use_clock,
-        });
-        Ok(self.entries.len() - 1)
-    }
-
-    fn maybe_report(&self, tag: &str) {
-        if self.counters.attempts == 1 || self.counters.attempts % 256 == 0 {
-            self.report(tag);
-        }
-    }
-
-    fn report(&self, tag: &str) {
-        let hit_rate = if self.counters.attempts == 0 {
-            0.0
-        } else {
-            self.counters.hits as f64 * 100.0 / self.counters.attempts as f64
-        };
-        eprintln!(
-            "[compute-p2-plan-cache] snapshot={tag} attempts={} hits={} hit_rate={hit_rate:.1}% cold={} extent={} partition={} ranges={} triangles={} checkpoints={} evictions={} oversized={} bypasses={} entries={} entry_budget={} retained_bytes={} byte_budget={}",
-            self.counters.attempts,
-            self.counters.hits,
-            self.counters.cold_misses,
-            self.counters.extent_misses,
-            self.counters.partition_misses,
-            self.counters.dispatch_range_misses,
-            self.counters.triangle_count_misses,
-            self.counters.checkpoint_misses,
-            self.counters.evictions,
-            self.counters.oversized_rejections,
-            self.counters.non_p2_bypasses,
-            self.entries.len(),
-            self.max_entries,
-            self.retained_bytes,
-            self.max_retained_bytes,
-        );
-    }
-}
-
-impl ComputeP2PlanKey {
-    fn same_extent(&self, view: ComputeP2PlanKeyView<'_>) -> bool {
-        self.extent == view.extent
-    }
-
-    fn same_partition(&self, view: ComputeP2PlanKeyView<'_>) -> bool {
-        self.same_extent(view) && self.dispatch_start == view.dispatch_start
-    }
-
-    fn same_ranges(&self, view: ComputeP2PlanKeyView<'_>) -> bool {
-        self.same_partition(view)
-            && self.dispatches.len() == view.dispatches.len()
-            && self
-                .dispatches
-                .iter()
-                .zip(view.dispatches)
-                .all(|(key, dispatch)| {
-                    key.first_row == dispatch.first_row
-                        && key.row_count == dispatch.row_count
-                        && key.first_column == dispatch.first_column
-                        && key.column_count == dispatch.column_count
-                })
-    }
-
-    fn same_triangle_counts(&self, view: ComputeP2PlanKeyView<'_>) -> bool {
-        self.same_ranges(view)
-            && self
-                .dispatches
-                .iter()
-                .zip(view.dispatches)
-                .all(|(key, dispatch)| key.triangle_count == dispatch.triangles.len())
-    }
-
-    fn matches(&self, view: ComputeP2PlanKeyView<'_>) -> bool {
-        self.same_triangle_counts(view)
-            && self.checkpoint_dispatch_limits == view.checkpoint_dispatch_limits
-    }
-}
-
-impl ComputeP2PlanLookup for ComputeP2PlanKeyView<'_> {
-    fn matches(self, key: &ComputeP2PlanKey) -> bool {
-        key.matches(self)
-    }
-
-    fn same_extent(self, key: &ComputeP2PlanKey) -> bool {
-        key.same_extent(self)
-    }
-
-    fn same_partition(self, key: &ComputeP2PlanKey) -> bool {
-        key.same_partition(self)
-    }
-
-    fn same_ranges(self, key: &ComputeP2PlanKey) -> bool {
-        key.same_ranges(self)
-    }
-
-    fn same_triangle_counts(self, key: &ComputeP2PlanKey) -> bool {
-        key.same_triangle_counts(self)
-    }
-}
-
-impl ComputeP2PlanLookup for &ComputeP2PlanKey {
-    fn matches(self, key: &ComputeP2PlanKey) -> bool {
-        self == key
-    }
-
-    fn same_extent(self, key: &ComputeP2PlanKey) -> bool {
-        self.extent == key.extent
-    }
-
-    fn same_partition(self, key: &ComputeP2PlanKey) -> bool {
-        self.extent == key.extent && self.dispatch_start == key.dispatch_start
-    }
-
-    fn same_ranges(self, key: &ComputeP2PlanKey) -> bool {
-        self.extent == key.extent
-            && self.dispatch_start == key.dispatch_start
-            && self.dispatches.len() == key.dispatches.len()
-            && self
-                .dispatches
-                .iter()
-                .zip(&key.dispatches)
-                .all(|(left, right)| {
-                    left.first_row == right.first_row
-                        && left.row_count == right.row_count
-                        && left.first_column == right.first_column
-                        && left.column_count == right.column_count
-                })
-    }
-
-    fn same_triangle_counts(self, key: &ComputeP2PlanKey) -> bool {
-        ComputeP2PlanLookup::same_ranges(self, key)
-            && self
-                .dispatches
-                .iter()
-                .zip(&key.dispatches)
-                .all(|(left, right)| left.triangle_count == right.triangle_count)
-    }
-}
-
-impl ComputeP2PreparedSchedule {
-    fn retained_bytes(&self) -> usize {
-        self.work_items.capacity()
-            + self.work_triangle_indices.capacity()
-            + self.work_item_words.capacity() * std::mem::size_of::<u32>()
-            + self.checkpoint_patches.capacity() * std::mem::size_of::<Vec<(u32, u32)>>()
-            + self
-                .checkpoint_patches
-                .iter()
-                .map(|patches| patches.capacity() * std::mem::size_of::<(u32, u32)>())
-                .sum::<usize>()
-    }
 }
 
 impl ComputeHotColorBuffers {
@@ -2107,7 +1727,7 @@ pub struct ComputeCoverageTriangle {
     planes: [ComputeAttributePlane; 7],
     env_rgba8: u32,
     prim_rgba8: u32,
-    program: ComputeRasterShaderProgram,
+    program_id: u32,
 }
 
 const COMPUTE_COVERAGE_TRIANGLE_BYTES: u64 = 168;
@@ -2195,27 +1815,9 @@ struct PreparedComputeHotColorChainBatch {
     tmem_bytes: Vec<u8>,
     tmem_validity: Vec<u8>,
     tiles: Vec<u8>,
-    schedule: PreparedComputeHotColorChainSchedule,
-}
-
-impl PreparedComputeHotColorChainBatch {
-    fn schedule<'a>(&'a self, cache: &'a ComputeP2PlanCache) -> &'a ComputeP2PreparedSchedule {
-        self.schedule.get(cache)
-    }
-}
-
-enum PreparedComputeHotColorChainSchedule {
-    Owned(ComputeP2PreparedSchedule),
-    Cached(usize),
-}
-
-impl PreparedComputeHotColorChainSchedule {
-    fn get<'a>(&'a self, cache: &'a ComputeP2PlanCache) -> &'a ComputeP2PreparedSchedule {
-        match self {
-            Self::Owned(schedule) => schedule,
-            Self::Cached(index) => &cache.entries[*index].schedule,
-        }
-    }
+    work_items: Vec<u8>,
+    work_triangle_indices: Vec<u8>,
+    work_item_words: Vec<u32>,
 }
 
 fn validate_compute_color_checkpoints(
@@ -2290,128 +1892,6 @@ fn for_each_compute_dispatch_word(
     Ok(())
 }
 
-fn build_compute_hot_color_chain_schedule(
-    extent: TriangleTargetExtent,
-    target_words: u32,
-    dispatch_start: usize,
-    dispatch_triangle_ranges: &[(&ComputeHotColorDispatch<'_>, u32, u32)],
-    checkpoint_dispatch_limits: &[usize],
-    scratch: &mut ComputeHotColorPlanScratch,
-) -> Result<ComputeP2PreparedSchedule, TrianglePipelineError> {
-    let aligned_rectangles = extent.width.is_multiple_of(2)
-        && dispatch_triangle_ranges.iter().all(|(dispatch, _, _)| {
-            dispatch.first_column.is_multiple_of(2) && dispatch.column_count.is_multiple_of(2)
-        });
-    let mut checkpoint_patches = vec![Vec::new(); checkpoint_dispatch_limits.len()];
-    let mut checkpoint_output_count = 0u32;
-    scratch.event_counts.clear();
-    scratch.event_counts.resize(target_words as usize, 0);
-    scratch.touched.clear();
-    scratch.touched.resize(target_words as usize, false);
-    scratch.interval_words.clear();
-    if scratch.checkpoint_words.len() < checkpoint_dispatch_limits.len() {
-        scratch
-            .checkpoint_words
-            .resize_with(checkpoint_dispatch_limits.len(), Vec::new);
-    }
-    for words in &mut scratch.checkpoint_words[..checkpoint_dispatch_limits.len()] {
-        words.clear();
-    }
-    for (local_dispatch, (dispatch, _, dispatch_triangle_count)) in
-        dispatch_triangle_ranges.iter().enumerate()
-    {
-        for_each_compute_dispatch_word(extent, dispatch, aligned_rectangles, |target_word| {
-            let word = target_word as usize;
-            scratch.event_counts[word] = scratch.event_counts[word]
-                .checked_add(*dispatch_triangle_count)
-                .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-            if !scratch.touched[word] {
-                scratch.touched[word] = true;
-                scratch.interval_words.push(target_word);
-            }
-            Ok(())
-        })?;
-        let dispatch_limit = dispatch_start + local_dispatch + 1;
-        if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
-            for target_word in scratch.interval_words.drain(..) {
-                let word = target_word as usize;
-                scratch.event_counts[word] = scratch.event_counts[word]
-                    .checked_add(1)
-                    .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-                scratch.touched[word] = false;
-                scratch.checkpoint_words[checkpoint].push(target_word);
-            }
-        }
-    }
-
-    scratch.event_cursors.clear();
-    scratch.event_cursors.reserve(scratch.event_counts.len());
-    let mut event_count = 0u32;
-    for &word_events in &scratch.event_counts {
-        scratch.event_cursors.push(event_count);
-        event_count = event_count
-            .checked_add(word_events)
-            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
-    }
-    let mut work_triangle_indices = vec![0u32; event_count as usize];
-    for (local_dispatch, (dispatch, first_triangle, dispatch_triangle_count)) in
-        dispatch_triangle_ranges.iter().enumerate()
-    {
-        for_each_compute_dispatch_word(extent, dispatch, aligned_rectangles, |target_word| {
-            let cursor = &mut scratch.event_cursors[target_word as usize];
-            for triangle in *first_triangle..*first_triangle + *dispatch_triangle_count {
-                work_triangle_indices[*cursor as usize] = triangle;
-                *cursor += 1;
-            }
-            Ok(())
-        })?;
-        let dispatch_limit = dispatch_start + local_dispatch + 1;
-        if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
-            for &target_word in &scratch.checkpoint_words[checkpoint] {
-                if checkpoint_output_count >= 0x8000_0000 {
-                    return Err(TrianglePipelineError::CoverageSizeOverflow);
-                }
-                let cursor = &mut scratch.event_cursors[target_word as usize];
-                work_triangle_indices[*cursor as usize] = 0x8000_0000 | checkpoint_output_count;
-                *cursor += 1;
-                checkpoint_patches[checkpoint].push((target_word, checkpoint_output_count));
-                checkpoint_output_count += 1;
-            }
-        }
-    }
-
-    let mut work_items = Vec::new();
-    let mut work_item_words = Vec::new();
-    for (target_word, &word_events) in scratch.event_counts.iter().enumerate() {
-        if word_events == 0 {
-            continue;
-        }
-        let first_event = scratch.event_cursors[target_word] - word_events;
-        let target_word =
-            u32::try_from(target_word).map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
-        for word in [target_word, first_event, word_events] {
-            work_items.extend_from_slice(&word.to_le_bytes());
-        }
-        work_item_words.push(target_word);
-    }
-    let word_count = u32::try_from(work_item_words.len())
-        .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
-    let mut work_triangle_index_bytes = Vec::with_capacity(work_triangle_indices.len() * 4);
-    for triangle_index in work_triangle_indices {
-        work_triangle_index_bytes.extend_from_slice(&triangle_index.to_le_bytes());
-    }
-    Ok(ComputeP2PreparedSchedule {
-        status_bytes: u64::from(word_count) * 8,
-        word_count,
-        workgroups: word_count.div_ceil(64),
-        checkpoint_output_count,
-        checkpoint_patches: checkpoint_patches.into(),
-        work_items: work_items.into(),
-        work_triangle_indices: work_triangle_index_bytes.into(),
-        work_item_words: work_item_words.into(),
-    })
-}
-
 impl ComputeCoverageTriangle {
     pub fn from_raw(triangle: crate::RawTriangle) -> Self {
         let mut result = Self {
@@ -2435,7 +1915,7 @@ impl ComputeCoverageTriangle {
             }; 7],
             env_rgba8: 0,
             prim_rgba8: 0,
-            program: ComputeRasterShaderProgram::default(),
+            program_id: 0,
         };
         if let Some(shade) = triangle.shade() {
             for (destination, source) in result.planes[..4]
@@ -2462,8 +1942,8 @@ impl ComputeCoverageTriangle {
         self
     }
 
-    pub(crate) const fn with_program(mut self, program: ComputeRasterShaderProgram) -> Self {
-        self.program = program;
+    pub(crate) const fn with_program(mut self, program_id: u32) -> Self {
+        self.program_id = program_id;
         self
     }
 
@@ -2503,7 +1983,7 @@ impl ComputeCoverageTriangle {
         bytes[152..156].copy_from_slice(&self.env_rgba8.to_le_bytes());
         bytes[156..160].copy_from_slice(&self.prim_rgba8.to_le_bytes());
         bytes[160..164].copy_from_slice(&tmem_state_index.to_le_bytes());
-        bytes[164..168].copy_from_slice(&self.program.wire_id().to_le_bytes());
+        bytes[164..168].copy_from_slice(&self.program_id.to_le_bytes());
         bytes
     }
 }
@@ -2516,16 +1996,6 @@ impl TrianglePipelineRenderer {
     #[cfg(all(test, feature = "host-gpu-tests"))]
     pub(crate) const fn compute_hot_color_resource_generations(&self) -> u64 {
         self.compute_hot_color_resource_generations
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_compute_p2_plan_cache_enabled(&mut self, enabled: bool) {
-        self.compute_p2_plan_cache_enabled = enabled;
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn compute_p2_plan_cache_counters(&self) -> ComputeP2PlanCacheCounters {
-        self.compute_p2_plan_cache.counters
     }
 
     /// Runs the transport-only compute shader over an arbitrary packed
@@ -3163,6 +2633,8 @@ impl TrianglePipelineRenderer {
         }
 
         let dispatch_ranges = [(0, dispatches.len())];
+        let mut checkpoint_patches = vec![Vec::new(); checkpoint_dispatch_limits.len()];
+        let mut checkpoint_output_count = 0u32;
         let mut prepared = Vec::with_capacity(dispatch_ranges.len());
         for (dispatch_start, dispatch_end) in dispatch_ranges {
             let batch_dispatches = &dispatches[dispatch_start..dispatch_end];
@@ -3253,49 +2725,123 @@ impl TrianglePipelineRenderer {
                 tmem_validity.extend_from_slice(&dispatch.tmem.validity_words_bytes());
                 tiles.extend_from_slice(&dispatch.tile.to_bytes());
             }
-            let cacheable = self.compute_p2_plan_cache_enabled
-                && ComputeP2PlanKey::is_exact_p2(batch_dispatches);
-            let key_view = ComputeP2PlanKeyView {
-                extent,
-                dispatch_start,
-                dispatches: batch_dispatches,
-                checkpoint_dispatch_limits,
-            };
-            let cached = cacheable
-                .then(|| self.compute_p2_plan_cache.lookup(key_view))
-                .flatten();
-            if self.compute_p2_plan_cache_enabled && !cacheable {
-                self.compute_p2_plan_cache.counters.non_p2_bypasses += 1;
+            let aligned_rectangles = extent.width.is_multiple_of(2)
+                && dispatch_triangle_ranges.iter().all(|(dispatch, _, _)| {
+                    dispatch.first_column.is_multiple_of(2)
+                        && dispatch.column_count.is_multiple_of(2)
+                });
+            // Count first, then prefix-sum exact word-major storage. The
+            // dispatch-major walk preserves painter order without testing
+            // every candidate word against every dispatch.
+            let scratch = &mut self.compute_hot_color_plan_scratch;
+            scratch.event_counts.clear();
+            scratch.event_counts.resize(target_words as usize, 0);
+            scratch.touched.clear();
+            scratch.touched.resize(target_words as usize, false);
+            scratch.interval_words.clear();
+            if scratch.checkpoint_words.len() < checkpoint_dispatch_limits.len() {
+                scratch
+                    .checkpoint_words
+                    .resize_with(checkpoint_dispatch_limits.len(), Vec::new);
             }
-            let schedule = if let Some(index) = cached {
-                PreparedComputeHotColorChainSchedule::Cached(index)
-            } else {
-                let schedule = build_compute_hot_color_chain_schedule(
+            for words in &mut scratch.checkpoint_words[..checkpoint_dispatch_limits.len()] {
+                words.clear();
+            }
+            for (local_dispatch, (dispatch, _, dispatch_triangle_count)) in
+                dispatch_triangle_ranges.iter().enumerate()
+            {
+                for_each_compute_dispatch_word(
                     extent,
-                    target_words,
-                    dispatch_start,
-                    &dispatch_triangle_ranges,
-                    checkpoint_dispatch_limits,
-                    &mut self.compute_hot_color_plan_scratch,
+                    dispatch,
+                    aligned_rectangles,
+                    |target_word| {
+                        let word = target_word as usize;
+                        scratch.event_counts[word] = scratch.event_counts[word]
+                            .checked_add(*dispatch_triangle_count)
+                            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                        if !scratch.touched[word] {
+                            scratch.touched[word] = true;
+                            scratch.interval_words.push(target_word);
+                        }
+                        Ok(())
+                    },
                 )?;
-                if cacheable {
-                    match self
-                        .compute_p2_plan_cache
-                        .insert(ComputeP2PlanKey::from_view(key_view), schedule)
-                    {
-                        Ok(index) => PreparedComputeHotColorChainSchedule::Cached(index),
-                        Err(schedule) => PreparedComputeHotColorChainSchedule::Owned(schedule),
+                let dispatch_limit = dispatch_start + local_dispatch + 1;
+                if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
+                    for target_word in scratch.interval_words.drain(..) {
+                        let word = target_word as usize;
+                        scratch.event_counts[word] = scratch.event_counts[word]
+                            .checked_add(1)
+                            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                        scratch.touched[word] = false;
+                        scratch.checkpoint_words[checkpoint].push(target_word);
                     }
-                } else {
-                    PreparedComputeHotColorChainSchedule::Owned(schedule)
                 }
-            };
-            let schedule_data = schedule.get(&self.compute_p2_plan_cache);
-            let word_count = schedule_data.word_count;
-            let status_bytes = schedule_data.status_bytes;
-            let work_item_bytes = schedule_data.work_items.len() as u64;
-            let work_triangle_index_bytes = schedule_data.work_triangle_indices.len() as u64;
-            let workgroups = schedule_data.workgroups;
+            }
+
+            scratch.event_cursors.clear();
+            scratch.event_cursors.reserve(scratch.event_counts.len());
+            let mut event_count = 0u32;
+            for &word_events in &scratch.event_counts {
+                scratch.event_cursors.push(event_count);
+                event_count = event_count
+                    .checked_add(word_events)
+                    .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            }
+            let mut work_triangle_indices = vec![0u32; event_count as usize];
+            for (local_dispatch, (dispatch, first_triangle, dispatch_triangle_count)) in
+                dispatch_triangle_ranges.iter().enumerate()
+            {
+                for_each_compute_dispatch_word(
+                    extent,
+                    dispatch,
+                    aligned_rectangles,
+                    |target_word| {
+                        let cursor = &mut scratch.event_cursors[target_word as usize];
+                        for triangle in *first_triangle..*first_triangle + *dispatch_triangle_count
+                        {
+                            work_triangle_indices[*cursor as usize] = triangle;
+                            *cursor += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+                let dispatch_limit = dispatch_start + local_dispatch + 1;
+                if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
+                    for &target_word in &scratch.checkpoint_words[checkpoint] {
+                        if checkpoint_output_count >= 0x8000_0000 {
+                            return Err(TrianglePipelineError::CoverageSizeOverflow);
+                        }
+                        let cursor = &mut scratch.event_cursors[target_word as usize];
+                        work_triangle_indices[*cursor as usize] =
+                            0x8000_0000 | checkpoint_output_count;
+                        *cursor += 1;
+                        checkpoint_patches[checkpoint].push((target_word, checkpoint_output_count));
+                        checkpoint_output_count += 1;
+                    }
+                }
+            }
+
+            let mut work_items = Vec::new();
+            let mut work_item_words = Vec::new();
+            for (target_word, &word_events) in scratch.event_counts.iter().enumerate() {
+                if word_events == 0 {
+                    continue;
+                }
+                let first_event = scratch.event_cursors[target_word] - word_events;
+                let target_word = u32::try_from(target_word)
+                    .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+                for word in [target_word, first_event, word_events] {
+                    work_items.extend_from_slice(&word.to_le_bytes());
+                }
+                work_item_words.push(target_word);
+            }
+            let word_count = u32::try_from(work_item_words.len())
+                .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+            let status_bytes = u64::from(word_count) * 8;
+            let work_item_bytes = work_items.len() as u64;
+            let work_triangle_index_bytes = work_triangle_indices.len() as u64 * 4;
+            let workgroups = word_count.div_ceil(64);
             if triangle_bytes > limits.max_buffer_size
                 || triangle_bytes > u64::from(limits.max_storage_buffer_binding_size)
                 || status_bytes > limits.max_buffer_size
@@ -3313,6 +2859,11 @@ impl TrianglePipelineRenderer {
                 || workgroups > limits.max_compute_workgroups_per_dimension
             {
                 return Err(TrianglePipelineError::CoverageTooLarge);
+            }
+            let mut work_triangle_index_bytes =
+                Vec::with_capacity(work_triangle_index_bytes as usize);
+            for triangle_index in &work_triangle_indices {
+                work_triangle_index_bytes.extend_from_slice(&triangle_index.to_le_bytes());
             }
             let mut params = Vec::with_capacity(32);
             for word in [
@@ -3342,13 +2893,11 @@ impl TrianglePipelineRenderer {
                 tmem_bytes,
                 tmem_validity,
                 tiles,
-                schedule,
+                work_items,
+                work_triangle_indices: work_triangle_index_bytes,
+                work_item_words,
             });
         }
-        let checkpoint_output_count = prepared[0]
-            .schedule
-            .get(&self.compute_p2_plan_cache)
-            .checkpoint_output_count;
         let checkpoint_output_bytes = u64::from(checkpoint_output_count) * 4;
         let combined_status_bytes = prepared[0]
             .status_bytes
@@ -3363,7 +2912,6 @@ impl TrianglePipelineRenderer {
         let timing_prepare = compute_chain_timing_lap(&mut timing_mark);
 
         for (index, batch) in prepared.iter().enumerate() {
-            let schedule = batch.schedule(&self.compute_p2_plan_cache);
             let replacement = self
                 .compute_hot_color_buffers
                 .get(index)
@@ -3373,8 +2921,8 @@ impl TrianglePipelineRenderer {
                         batch.target_bytes,
                         combined_status_bytes,
                         batch.tmem_state_count,
-                        schedule.work_items.len() as u64,
-                        schedule.work_triangle_indices.len() as u64,
+                        batch.work_items.len() as u64,
+                        batch.work_triangle_indices.len() as u64,
                         checkpoint_output_bytes,
                     )
                 });
@@ -3386,8 +2934,8 @@ impl TrianglePipelineRenderer {
                     batch.target_bytes,
                     combined_status_bytes,
                     batch.tmem_state_count,
-                    schedule.work_items.len() as u64,
-                    schedule.work_triangle_indices.len() as u64,
+                    batch.work_items.len() as u64,
+                    batch.work_triangle_indices.len() as u64,
                     checkpoint_output_bytes,
                 );
                 if index == self.compute_hot_color_buffers.len() {
@@ -3430,16 +2978,15 @@ impl TrianglePipelineRenderer {
             .write_buffer(&self.compute_hot_color_buffers[0].target, 0, &padded_target);
         for (index, batch) in prepared.iter().enumerate() {
             let buffers = &self.compute_hot_color_buffers[index];
-            let schedule = batch.schedule(&self.compute_p2_plan_cache);
             self.queue
                 .write_buffer(&buffers.triangle, 0, &batch.packed_triangles);
             self.queue.write_buffer(&buffers.params, 0, &batch.params);
             self.queue
-                .write_buffer(&buffers.work_items, 0, &schedule.work_items);
+                .write_buffer(&buffers.work_items, 0, &batch.work_items);
             self.queue.write_buffer(
                 &buffers.work_triangle_indices,
                 0,
-                &schedule.work_triangle_indices,
+                &batch.work_triangle_indices,
             );
             self.queue
                 .write_buffer(&buffers.tmem_bytes, 0, &batch.tmem_bytes);
@@ -3658,10 +3205,7 @@ impl TrianglePipelineRenderer {
                 }
                 return Err(TrianglePipelineError::ComputeColorBatchTmemStatus {
                     batch: batch.first_dispatch + state_index as usize,
-                    pixel: batch.schedule(&self.compute_p2_plan_cache).work_item_words[pixel / 2]
-                        as usize
-                        * 2
-                        + pixel % 2,
+                    pixel: batch.work_item_words[pixel / 2] as usize * 2 + pixel % 2,
                     status: status & 0xff,
                 });
             }
@@ -3671,9 +3215,6 @@ impl TrianglePipelineRenderer {
         let checkpoint_words = mapped
             .pop()
             .expect("checkpoint output readback accompanies chain status");
-        let checkpoint_patches = &prepared[0]
-            .schedule(&self.compute_p2_plan_cache)
-            .checkpoint_patches;
         let outputs = reconstruct_compute_color_checkpoints(
             resident_bytes,
             &checkpoint_words,
