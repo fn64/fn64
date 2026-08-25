@@ -15,6 +15,22 @@ pub(crate) const HOT_COMBINE_LOW: u32 = 0xfc51_96a3;
 pub(crate) const HOT_COMBINE_HIGH: u32 = 0x112c_fe7f;
 pub(crate) const HOT_OTHER_MODE_HIGH: u32 = 0x0008_acef;
 pub(crate) const HOT_OTHER_MODE_LOW: u32 = 0x0050_41c8;
+pub(crate) const FULL_COVERAGE_COMBINE_LOW: u32 = 0xfc30_9661;
+pub(crate) const FULL_COVERAGE_COMBINE_HIGH: u32 = 0x552e_ff7f;
+pub(crate) const FULL_COVERAGE_OTHER_MODE_HIGH: u32 = 0x0008_ecef;
+pub(crate) const FULL_COVERAGE_OTHER_MODE_LOW: u32 = 0x0050_4240;
+pub(crate) const FOG_COMBINE_LOW: u32 = 0xfc15_96a3;
+pub(crate) const FOG_COMBINE_HIGH: u32 = 0xf0ff_fe38;
+pub(crate) const FOG_OTHER_MODE_HIGH: u32 = 0x0018_ac8f;
+pub(crate) const FOG_OTHER_MODE_LOW: u32 = 0x0050_4240;
+pub(crate) const COVERAGE_FOG_COMBINE_LOW: u32 = 0xfc15_fea3;
+pub(crate) const COVERAGE_FOG_COMBINE_HIGH: u32 = 0xf00f_f23f;
+pub(crate) const COVERAGE_FOG_OTHER_MODE_HIGH: u32 = 0x0018_ac8f;
+pub(crate) const COVERAGE_FOG_OTHER_MODE_LOW: u32 = 0x0f0a_7008;
+const HOT_PROGRAM_ID: u32 = 0;
+const FULL_COVERAGE_PROGRAM_ID: u32 = 1;
+const FOG_PROGRAM_ID: u32 = 2;
+const COVERAGE_FOG_PROGRAM_ID: u32 = 3;
 
 /// The one complete RDP program admitted by the first compute prototype.
 /// Raw halves are retained because a shader pipeline key must distinguish
@@ -37,6 +53,17 @@ impl ComputeRasterProgramKey {
         if target.format() != ColorTargetFormat::Rgba16 {
             return Err(ComputeRasterAdmissionRefusal::TargetFormat);
         }
+        Self::try_admit_program(combine, other_mode, textured)
+    }
+
+    /// Classifies only immutable draw-program shape. Target and journal
+    /// resource admission remain at execution, where their authoritative
+    /// values exist.
+    pub(crate) fn try_admit_program(
+        combine: CombineParams,
+        other_mode: OtherMode,
+        textured: bool,
+    ) -> Result<Self, ComputeRasterAdmissionRefusal> {
         if !textured {
             return Err(ComputeRasterAdmissionRefusal::Untextured);
         }
@@ -52,15 +79,14 @@ impl ComputeRasterProgramKey {
             other_mode.high(),
             other_mode.low(),
         ];
-        if other_mode.cycle_type() != CycleType::OneCycle {
-            return Err(ComputeRasterAdmissionRefusal::CycleType(program_words));
-        }
-        if combine.low() != HOT_COMBINE_LOW
-            || combine.high() != HOT_COMBINE_HIGH
-            || other_mode.high() != HOT_OTHER_MODE_HIGH
-            || other_mode.low() != HOT_OTHER_MODE_LOW
-        {
-            return Err(ComputeRasterAdmissionRefusal::ProgramBits(program_words));
+        match program_words {
+            [HOT_COMBINE_LOW, HOT_COMBINE_HIGH, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW]
+            | [FULL_COVERAGE_COMBINE_LOW, FULL_COVERAGE_COMBINE_HIGH, FULL_COVERAGE_OTHER_MODE_HIGH, FULL_COVERAGE_OTHER_MODE_LOW]
+            | [FOG_COMBINE_LOW, FOG_COMBINE_HIGH, FOG_OTHER_MODE_HIGH, FOG_OTHER_MODE_LOW] => {}
+            _ if other_mode.cycle_type() != CycleType::OneCycle => {
+                return Err(ComputeRasterAdmissionRefusal::CycleType(program_words));
+            }
+            _ => return Err(ComputeRasterAdmissionRefusal::ProgramBits(program_words)),
         }
         Ok(Self {
             combine_low: combine.low(),
@@ -77,6 +103,24 @@ impl ComputeRasterProgramKey {
             self.other_mode_high,
             self.other_mode_low,
         ]
+    }
+
+    pub(crate) fn shader_id(self) -> u32 {
+        match self.words() {
+            [HOT_COMBINE_LOW, HOT_COMBINE_HIGH, HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW] => {
+                HOT_PROGRAM_ID
+            }
+            [FULL_COVERAGE_COMBINE_LOW, FULL_COVERAGE_COMBINE_HIGH, FULL_COVERAGE_OTHER_MODE_HIGH, FULL_COVERAGE_OTHER_MODE_LOW] => {
+                FULL_COVERAGE_PROGRAM_ID
+            }
+            [FOG_COMBINE_LOW, FOG_COMBINE_HIGH, FOG_OTHER_MODE_HIGH, FOG_OTHER_MODE_LOW] => {
+                FOG_PROGRAM_ID
+            }
+            [COVERAGE_FOG_COMBINE_LOW, COVERAGE_FOG_COMBINE_HIGH, COVERAGE_FOG_OTHER_MODE_HIGH, COVERAGE_FOG_OTHER_MODE_LOW] => {
+                COVERAGE_FOG_PROGRAM_ID
+            }
+            _ => unreachable!("an admitted compute program has an exact shader identity"),
+        }
     }
 }
 
@@ -294,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_complete_hottest_census_key_is_admitted() {
+    fn only_the_three_live_profitable_census_keys_are_admitted() {
         let rgba16_target = target(ColorTargetFormat::Rgba16);
         let key = hot_program(rgba16_target);
         assert_eq!(
@@ -305,6 +349,45 @@ mod tests {
                 HOT_OTHER_MODE_HIGH,
                 HOT_OTHER_MODE_LOW
             ]
+        );
+        let full_coverage = ComputeRasterProgramKey::try_admit(
+            rgba16_target,
+            CombineParams::from_wire(FULL_COVERAGE_COMBINE_LOW, FULL_COVERAGE_COMBINE_HIGH),
+            OtherMode::from_wire(FULL_COVERAGE_OTHER_MODE_HIGH, FULL_COVERAGE_OTHER_MODE_LOW),
+            true,
+        )
+        .unwrap();
+        assert_eq!(full_coverage.shader_id(), FULL_COVERAGE_PROGRAM_ID);
+        let fog = ComputeRasterProgramKey::try_admit(
+            rgba16_target,
+            CombineParams::from_wire(FOG_COMBINE_LOW, FOG_COMBINE_HIGH),
+            OtherMode::from_wire(FOG_OTHER_MODE_HIGH, FOG_OTHER_MODE_LOW),
+            true,
+        )
+        .unwrap();
+        assert_eq!(fog.shader_id(), FOG_PROGRAM_ID);
+        assert!(matches!(
+            ComputeRasterProgramKey::try_admit(
+                rgba16_target,
+                CombineParams::from_wire(COVERAGE_FOG_COMBINE_LOW, COVERAGE_FOG_COMBINE_HIGH),
+                OtherMode::from_wire(COVERAGE_FOG_OTHER_MODE_HIGH, COVERAGE_FOG_OTHER_MODE_LOW),
+                true,
+            ),
+            Err(ComputeRasterAdmissionRefusal::CycleType(_))
+        ));
+        assert_eq!(
+            ComputeRasterProgramKey::try_admit(
+                rgba16_target,
+                CombineParams::from_wire(COVERAGE_FOG_COMBINE_LOW, COVERAGE_FOG_COMBINE_HIGH),
+                OtherMode::from_wire(0x0018_acff, COVERAGE_FOG_OTHER_MODE_LOW),
+                true,
+            ),
+            Err(ComputeRasterAdmissionRefusal::CycleType([
+                COVERAGE_FOG_COMBINE_LOW,
+                COVERAGE_FOG_COMBINE_HIGH,
+                0x0018_acff,
+                COVERAGE_FOG_OTHER_MODE_LOW,
+            ]))
         );
         assert_eq!(
             ComputeRasterProgramKey::try_admit(
@@ -342,6 +425,98 @@ mod tests {
                 HOT_OTHER_MODE_HIGH | (1 << 20),
                 HOT_OTHER_MODE_LOW,
             ]))
+        );
+    }
+
+    #[test]
+    fn program_preclassification_matches_full_rgba16_admission_for_shape_refusals() {
+        let rgba16_target = target(ColorTargetFormat::Rgba16);
+        let cases = [
+            (
+                HOT_COMBINE_LOW,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                FULL_COVERAGE_COMBINE_LOW,
+                FULL_COVERAGE_COMBINE_HIGH,
+                FULL_COVERAGE_OTHER_MODE_HIGH,
+                FULL_COVERAGE_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                FOG_COMBINE_LOW,
+                FOG_COMBINE_HIGH,
+                FOG_OTHER_MODE_HIGH,
+                FOG_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                COVERAGE_FOG_COMBINE_LOW,
+                COVERAGE_FOG_COMBINE_HIGH,
+                COVERAGE_FOG_OTHER_MODE_HIGH,
+                COVERAGE_FOG_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                COVERAGE_FOG_COMBINE_LOW,
+                COVERAGE_FOG_COMBINE_HIGH,
+                0x0018_acff,
+                COVERAGE_FOG_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                HOT_COMBINE_LOW ^ 1,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW,
+                true,
+            ),
+            (
+                HOT_COMBINE_LOW,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW,
+                false,
+            ),
+            (
+                HOT_COMBINE_LOW,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW & !(1 << 19),
+                true,
+            ),
+            (
+                HOT_COMBINE_LOW,
+                HOT_COMBINE_HIGH,
+                HOT_OTHER_MODE_HIGH,
+                HOT_OTHER_MODE_LOW | (1 << 5),
+                true,
+            ),
+        ];
+
+        for (combine_low, combine_high, other_high, other_low, textured) in cases {
+            let combine = CombineParams::from_wire(combine_low, combine_high);
+            let other_mode = OtherMode::from_wire(other_high, other_low);
+            assert_eq!(
+                ComputeRasterProgramKey::try_admit_program(combine, other_mode, textured),
+                ComputeRasterProgramKey::try_admit(rgba16_target, combine, other_mode, textured,),
+            );
+        }
+
+        let hot_combine = CombineParams::from_wire(HOT_COMBINE_LOW, HOT_COMBINE_HIGH);
+        let hot_mode = OtherMode::from_wire(HOT_OTHER_MODE_HIGH, HOT_OTHER_MODE_LOW);
+        assert!(ComputeRasterProgramKey::try_admit_program(hot_combine, hot_mode, true).is_ok());
+        assert_eq!(
+            ComputeRasterProgramKey::try_admit(
+                target(ColorTargetFormat::Rgba32),
+                hot_combine,
+                hot_mode,
+                true,
+            ),
+            Err(ComputeRasterAdmissionRefusal::TargetFormat),
         );
     }
 

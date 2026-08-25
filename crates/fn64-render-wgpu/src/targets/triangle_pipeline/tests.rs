@@ -35,6 +35,83 @@ fn compute_color_checkpoints_are_strict_and_end_at_the_chain_boundary() {
     );
 }
 
+#[test]
+fn sparse_compute_color_checkpoints_reconstruct_cumulative_images_and_odd_tail() {
+    let resident = vec![0, 1, 2, 3, 4, 5];
+    let checkpoint_words = vec![10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 99, 99];
+    let patches = vec![vec![(0, 0)], vec![(1, 1)], vec![(0, 2)]];
+
+    assert_eq!(
+        reconstruct_compute_color_checkpoints(&resident, &checkpoint_words, &patches),
+        vec![
+            vec![10, 11, 12, 13, 4, 5],
+            vec![10, 11, 12, 13, 20, 21],
+            vec![30, 31, 99, 99, 20, 21],
+        ]
+    );
+}
+
+#[test]
+fn compute_dispatch_word_iteration_matches_aligned_rows_and_odd_width_fallback() {
+    let projection = TmemGpuProjection {
+        bytes: [0; fn64_render_ir::TMEM_BYTES as usize],
+        validity_words: [0; crate::TMEM_VALIDITY_WORDS],
+    };
+    let triangle_bytes =
+        crate::wire_words::EdgeWords::zeroed().bytes(crate::wire_words::RAW_TRIANGLE_BASE_EDGE);
+    let raw_triangle =
+        crate::RawTriangle::decode(crate::wire_words::RAW_TRIANGLE_BASE_EDGE, &triangle_bytes)
+            .unwrap();
+    let triangles = [ComputeCoverageTriangle::from_raw(raw_triangle)];
+    let aligned = ComputeHotColorDispatch {
+        triangles: &triangles,
+        tmem: &projection,
+        tile: TileBindingParams::unbound(),
+        first_row: 1,
+        row_count: 2,
+        first_column: 2,
+        column_count: 4,
+    };
+    let mut words = Vec::new();
+    for_each_compute_dispatch_word(
+        TriangleTargetExtent {
+            width: 8,
+            height: 4,
+        },
+        &aligned,
+        true,
+        |word| {
+            words.push(word);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(words, [5, 6, 9, 10]);
+
+    let odd = ComputeHotColorDispatch {
+        first_row: 1,
+        row_count: 2,
+        first_column: 0,
+        column_count: 5,
+        ..aligned
+    };
+    words.clear();
+    for_each_compute_dispatch_word(
+        TriangleTargetExtent {
+            width: 5,
+            height: 4,
+        },
+        &odd,
+        false,
+        |word| {
+            words.push(word);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(words, [2, 3, 4, 5, 6, 7]);
+}
+
 fn identity_raster_params() -> TriangleRasterParams {
     TriangleRasterParams {
         resolution: [EXTENT.width as f32, EXTENT.height as f32],
@@ -2136,6 +2213,66 @@ mod host_gpu_tests {
                 .compute_triangle_samples(extent, &device_triangles)
                 .expect("integer coverage and sample compute must complete");
             assert_eq!(actual, expected, "coverage/sample differential run {run}");
+        }
+    }
+
+    #[test]
+    fn required_host_sparse_multi_checkpoint_chain_reconstructs_each_image_ten_times() {
+        let mut renderer = tlut_renderer();
+        let extent = TriangleTargetExtent {
+            width: 8,
+            height: 8,
+        };
+        let raw = coverage_triangle(crate::wire_words::EdgeWords {
+            lft: true,
+            yl: 96,
+            ym: 88,
+            yh: 80,
+            xl: 8 << 16,
+            xh: 0,
+            xm: 0,
+            ..crate::wire_words::EdgeWords::zeroed()
+        });
+        let triangles = [ComputeCoverageTriangle::from_raw(raw)];
+        let (projection, tile) = no_tmem_binding();
+        let dispatches = [
+            ComputeHotColorDispatch {
+                triangles: &triangles,
+                tmem: &projection,
+                tile,
+                first_row: 0,
+                row_count: extent.height,
+                first_column: 0,
+                column_count: extent.width,
+            },
+            ComputeHotColorDispatch {
+                triangles: &triangles,
+                tmem: &projection,
+                tile,
+                first_row: 0,
+                row_count: extent.height,
+                first_column: 0,
+                column_count: extent.width,
+            },
+        ];
+        let resident = (0..extent.width * extent.height * 2)
+            .map(|byte| byte as u8)
+            .collect::<Vec<_>>();
+
+        for run in 1..=10 {
+            let outputs = renderer
+                .compute_triangle_hot_color_chain_checkpoints(
+                    extent,
+                    &resident,
+                    &dispatches,
+                    &[1, 2],
+                )
+                .expect("single-pass sparse checkpoint chain must complete");
+            assert_eq!(
+                outputs,
+                vec![resident.clone(), resident.clone()],
+                "run {run}"
+            );
         }
     }
 
