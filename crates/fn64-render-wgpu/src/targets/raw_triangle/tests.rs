@@ -1122,13 +1122,13 @@ fn z_compare_against_a_zeroed_z_image_rejects_every_fragment() {
 
 /// A trivial in-memory TMEM image: a 16x16 RGBA16 tile, every byte present.
 struct BenchTmem {
-    bytes: [u8; 512],
+    bytes: [u8; fn64_render_ir::TMEM_BYTES as usize],
     snapshot: crate::TmemSnapshotIdentity,
 }
 
 impl BenchTmem {
     fn new() -> Self {
-        let mut bytes = [0u8; 512];
+        let mut bytes = [0u8; fn64_render_ir::TMEM_BYTES as usize];
         // A varied pattern so the sampler is not reading one constant word
         // (which a smart cache could shortcut); irrelevant to timing but
         // keeps the read honest.
@@ -1189,6 +1189,34 @@ fn bench_tile_binding() -> super::TexrectTileBinding {
             low_t: 0,
             high_s: 60,
             high_t: 60,
+        },
+    )
+    .unwrap()
+}
+
+fn coverage_fog_tile_binding() -> super::TexrectTileBinding {
+    super::TexrectTileBinding::try_from_neutral(
+        fn64_render::NeutralTileDescriptor {
+            format: fn64_render::NeutralImageFormat::ColorIndex,
+            size: fn64_render::NeutralPixelSize::Bits4,
+            line_words: 8,
+            tmem_word_address: 0,
+            palette: 0,
+            s_mode: fn64_render::NeutralTileAddressMode::default(),
+            mask_s: 7,
+            shift_s: 0,
+            t_mode: fn64_render::NeutralTileAddressMode {
+                mirror: true,
+                clamp: false,
+            },
+            mask_t: 5,
+            shift_t: 0,
+        },
+        fn64_render::NeutralTileSize {
+            low_s: 0,
+            low_t: 0,
+            high_s: 508,
+            high_t: 124,
         },
     )
     .unwrap()
@@ -1369,6 +1397,190 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         1,
         "ten identical submissions must allocate one high-water resource generation"
     );
+
+    let full_coverage_mode = OtherMode::from_wire(0x0008_ecef, 0x0050_4240);
+    let full_coverage_completed = execute_raw_triangle(
+        &candidate,
+        full_coverage_mode,
+        &triangle,
+        TexrectShading::new(
+            CombineParams::from_wire(0xfc30_9661, 0x552e_ff7f),
+            environment,
+            primitive,
+        ),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+        Some(RawTriangleTexture {
+            tile,
+            tmem: &tmem,
+            lut_mode: crate::TextureLutMode::Ia16,
+        }),
+        None,
+    )
+    .expect("CPU full-coverage program oracle must rasterize");
+    let full_coverage_expected = full_coverage_completed
+        .device_bytes()
+        .device_bytes()
+        .to_vec();
+    let full_coverage_triangle = [crate::ComputeCoverageTriangle::from_raw(triangle)
+        .with_material(environment, primitive)
+        .with_program(1)];
+    let full_coverage_tile = crate::TileBindingParams::bound(tile.descriptor(), tile.size())
+        .with_lut_mode(crate::TextureLutMode::Ia16);
+    for run in 1..=10 {
+        let actual = renderer
+            .compute_triangle_hot_color(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &full_coverage_triangle,
+                &projection,
+                full_coverage_tile,
+            )
+            .expect("full-coverage compute color must complete");
+        if actual != full_coverage_expected {
+            let byte = actual
+                .iter()
+                .zip(&full_coverage_expected)
+                .position(|(actual, expected)| actual != expected)
+                .expect("unequal buffers have a mismatching byte");
+            panic!(
+                "full-coverage compute differential run {run}: first mismatch at byte {byte} \
+                 (pixel {}): GPU={:#04x}, CPU={:#04x}, GPU pixel={:02x?}, CPU pixel={:02x?}",
+                byte / 2,
+                actual[byte],
+                full_coverage_expected[byte],
+                &actual[byte / 2 * 2..byte / 2 * 2 + 2],
+                &full_coverage_expected[byte / 2 * 2..byte / 2 * 2 + 2],
+            );
+        }
+    }
+
+    let fog_mode = OtherMode::from_wire(0x0018_ac8f, 0x0050_4240);
+    let mut fog_expected = resident.clone();
+    for (draw_environment, draw_primitive) in [
+        (environment, primitive),
+        (second_environment, second_primitive),
+    ] {
+        let fog_completed = execute_raw_triangle(
+            &candidate,
+            fog_mode,
+            &triangle,
+            TexrectShading::new(
+                CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
+                draw_environment,
+                draw_primitive,
+            ),
+            TexrectBlendRegisters::default(),
+            &fog_expected,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Disabled,
+            }),
+            None,
+        )
+        .expect("CPU fog program oracle must rasterize each ordered draw");
+        fog_expected = fog_completed.device_bytes().device_bytes().to_vec();
+    }
+    let fog_triangles = [
+        crate::ComputeCoverageTriangle::from_raw(triangle)
+            .with_material(environment, primitive)
+            .with_program(2),
+        crate::ComputeCoverageTriangle::from_raw(triangle)
+            .with_material(second_environment, second_primitive)
+            .with_program(2),
+    ];
+    for run in 1..=10 {
+        let actual = renderer
+            .compute_triangle_hot_color(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &fog_triangles,
+                &projection,
+                tile_params,
+            )
+            .expect("fog compute color must complete");
+        if actual != fog_expected {
+            let byte = actual
+                .iter()
+                .zip(&fog_expected)
+                .position(|(actual, expected)| actual != expected)
+                .expect("unequal buffers have a mismatching byte");
+            panic!(
+                "fog compute differential run {run}: first mismatch at byte {byte} \
+                 (pixel {}): GPU={:#04x}, CPU={:#04x}, GPU pixel={:02x?}, CPU pixel={:02x?}",
+                byte / 2,
+                actual[byte],
+                fog_expected[byte],
+                &actual[byte / 2 * 2..byte / 2 * 2 + 2],
+                &fog_expected[byte / 2 * 2..byte / 2 * 2 + 2],
+            );
+        }
+    }
+
+    let coverage_fog_mode = OtherMode::from_wire(0x0018_ac8f, 0x0f0a_7008);
+    let coverage_fog_environment = Color4::from_wire(u32::MAX);
+    let coverage_fog_primitive = PrimColor::from_wire(0, 0x0000_00fe);
+    let coverage_fog_tile = coverage_fog_tile_binding();
+    let coverage_fog_completed = execute_raw_triangle(
+        &candidate,
+        coverage_fog_mode,
+        &triangle,
+        TexrectShading::new(
+            CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f),
+            coverage_fog_environment,
+            coverage_fog_primitive,
+        ),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+        Some(RawTriangleTexture {
+            tile: coverage_fog_tile,
+            tmem: &tmem,
+            lut_mode: crate::TextureLutMode::Rgba16,
+        }),
+        None,
+    )
+    .expect("CPU coverage fog program oracle must rasterize");
+    let coverage_fog_expected = coverage_fog_completed
+        .device_bytes()
+        .device_bytes()
+        .to_vec();
+    let coverage_fog_triangles = [crate::ComputeCoverageTriangle::from_raw(triangle)
+        .with_material(coverage_fog_environment, coverage_fog_primitive)
+        .with_program(3)];
+    let coverage_fog_tile_params =
+        crate::TileBindingParams::bound(coverage_fog_tile.descriptor(), coverage_fog_tile.size())
+            .with_lut_mode(crate::TextureLutMode::Rgba16);
+    for run in 1..=10 {
+        let actual = renderer
+            .compute_triangle_hot_color(
+                crate::TriangleTargetExtent { width, height },
+                &resident,
+                &coverage_fog_triangles,
+                &projection,
+                coverage_fog_tile_params,
+            )
+            .expect("coverage fog compute color must complete");
+        if actual != coverage_fog_expected {
+            let byte = actual
+                .iter()
+                .zip(&coverage_fog_expected)
+                .position(|(actual, expected)| actual != expected)
+                .expect("unequal buffers have a mismatching byte");
+            panic!(
+                "coverage fog compute differential run {run}: first mismatch at byte {byte} \
+                 (pixel {}): GPU={:#04x}, CPU={:#04x}, GPU pixel={:02x?}, CPU pixel={:02x?}",
+                byte / 2,
+                actual[byte],
+                coverage_fog_expected[byte],
+                &actual[byte / 2 * 2..byte / 2 * 2 + 2],
+                &coverage_fog_expected[byte / 2 * 2..byte / 2 * 2 + 2],
+            );
+        }
+    }
 
     let mut second_tmem = BenchTmem::new();
     for texel in second_tmem.bytes.chunks_exact_mut(2) {

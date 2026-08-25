@@ -165,19 +165,6 @@ fn compute_gpu_timing_enabled() -> bool {
     })
 }
 
-fn compute_state_table_fusion_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_COMPUTE_STATE_TABLE_FUSION") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
-            panic!("FN64_COMPUTE_STATE_TABLE_FUSION must be exactly 0 or 1, got {value:?}")
-        }
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_COMPUTE_STATE_TABLE_FUSION is not valid Unicode: {error}"),
-    })
-}
-
 fn compute_chain_timing_lap(mark: &mut Option<Instant>) -> Duration {
     let Some(previous) = *mark else {
         return Duration::ZERO;
@@ -1297,6 +1284,7 @@ impl UninitializedTrianglePipeline {
                 fixture_buffers: Vec::new(),
                 compute_hot_color_buffers: Vec::new(),
                 compute_hot_color_chain_status_readback: None,
+                compute_hot_color_plan_scratch: ComputeHotColorPlanScratch::default(),
                 compute_hot_color_resource_generations: 0,
                 errors,
             },
@@ -1431,6 +1419,10 @@ pub struct TrianglePipelineRenderer {
     /// Distinct offsets retain per-batch failure attribution while one map
     /// replaces a map/poll callback cycle per semantic batch.
     compute_hot_color_chain_status_readback: Option<ChainStatusReadback>,
+    /// Host-only two-pass planner storage. Every live element is overwritten
+    /// before it is observed; retaining capacities removes target-sized heap
+    /// churn without retaining dispatch, TMEM, or checkpoint ownership.
+    compute_hot_color_plan_scratch: ComputeHotColorPlanScratch,
     compute_hot_color_resource_generations: u64,
     errors: Arc<BoundedErrorSink>,
 }
@@ -1442,6 +1434,7 @@ struct ComputeHotColorBuffers {
     tmem_state_capacity: u64,
     work_item_capacity: u64,
     work_triangle_index_capacity: u64,
+    target_readback_capacity: u64,
     triangle: wgpu::Buffer,
     params: wgpu::Buffer,
     target: wgpu::Buffer,
@@ -1462,6 +1455,15 @@ struct ChainStatusReadback {
     buffer: wgpu::Buffer,
 }
 
+#[derive(Default)]
+struct ComputeHotColorPlanScratch {
+    event_counts: Vec<u32>,
+    touched: Vec<bool>,
+    interval_words: Vec<u32>,
+    event_cursors: Vec<u32>,
+    checkpoint_words: Vec<Vec<u32>>,
+}
+
 impl ComputeHotColorBuffers {
     fn new(
         device: &wgpu::Device,
@@ -1472,6 +1474,7 @@ impl ComputeHotColorBuffers {
         tmem_state_capacity: u64,
         work_item_capacity: u64,
         work_triangle_index_capacity: u64,
+        target_readback_capacity: u64,
     ) -> Self {
         let create = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -1530,7 +1533,7 @@ impl ComputeHotColorBuffers {
         );
         let target_readback = create(
             "fn64-compute-hot-color-target-readback",
-            target_capacity,
+            target_readback_capacity,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         );
         let status_readback = create(
@@ -1593,6 +1596,7 @@ impl ComputeHotColorBuffers {
             tmem_state_capacity,
             work_item_capacity,
             work_triangle_index_capacity,
+            target_readback_capacity,
             triangle,
             params,
             target,
@@ -1617,6 +1621,7 @@ impl ComputeHotColorBuffers {
         tmem_state_count: u64,
         work_item_bytes: u64,
         work_triangle_index_bytes: u64,
+        target_readback_bytes: u64,
     ) -> bool {
         self.triangle_capacity >= triangle_bytes
             && self.target_capacity >= target_bytes
@@ -1624,6 +1629,7 @@ impl ComputeHotColorBuffers {
             && self.tmem_state_capacity >= tmem_state_count
             && self.work_item_capacity >= work_item_bytes
             && self.work_triangle_index_capacity >= work_triangle_index_bytes
+            && self.target_readback_capacity >= target_readback_bytes
     }
 }
 
@@ -1721,9 +1727,10 @@ pub struct ComputeCoverageTriangle {
     planes: [ComputeAttributePlane; 7],
     env_rgba8: u32,
     prim_rgba8: u32,
+    program_id: u32,
 }
 
-const COMPUTE_COVERAGE_TRIANGLE_BYTES: u64 = 164;
+const COMPUTE_COVERAGE_TRIANGLE_BYTES: u64 = 168;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ComputeAttributePlane {
@@ -1796,7 +1803,6 @@ struct PreparedComputeHotColorBatch {
 struct PreparedComputeHotColorChainBatch {
     first_dispatch: usize,
     dispatch_count: usize,
-    checkpoint: bool,
     triangle_bytes: u64,
     target_bytes: u64,
     status_bytes: u64,
@@ -1839,6 +1845,53 @@ fn validate_compute_color_checkpoints(
     Ok(())
 }
 
+fn reconstruct_compute_color_checkpoints(
+    resident_bytes: &[u8],
+    checkpoint_words: &[u8],
+    checkpoint_patches: &[Vec<(u32, u32)>],
+) -> Vec<Vec<u8>> {
+    let mut current = resident_bytes.to_vec();
+    let mut outputs = Vec::with_capacity(checkpoint_patches.len());
+    for patches in checkpoint_patches {
+        for &(target_word, output_slot) in patches {
+            let source = output_slot as usize * 4;
+            let destination = target_word as usize * 4;
+            let copy_len = 4.min(current.len() - destination);
+            current[destination..destination + copy_len]
+                .copy_from_slice(&checkpoint_words[source..source + copy_len]);
+        }
+        outputs.push(current.clone());
+    }
+    outputs
+}
+
+fn for_each_compute_dispatch_word(
+    extent: TriangleTargetExtent,
+    dispatch: &ComputeHotColorDispatch<'_>,
+    aligned_rectangles: bool,
+    mut visit: impl FnMut(u32) -> Result<(), TrianglePipelineError>,
+) -> Result<(), TrianglePipelineError> {
+    if aligned_rectangles {
+        let words_per_row = extent.width / 2;
+        let first_column_word = dispatch.first_column / 2;
+        let column_word_limit = (dispatch.first_column + dispatch.column_count) / 2;
+        for row in dispatch.first_row..dispatch.first_row + dispatch.row_count {
+            for column_word in first_column_word..column_word_limit {
+                visit(row * words_per_row + column_word)?;
+            }
+        }
+    } else {
+        // A packed word can cross an odd-width row boundary. Match the prior
+        // complete-contiguous-row fallback.
+        let first_pixel = dispatch.first_row * extent.width;
+        let pixel_limit = (dispatch.first_row + dispatch.row_count) * extent.width;
+        for target_word in first_pixel / 2..pixel_limit.div_ceil(2) {
+            visit(target_word)?;
+        }
+    }
+    Ok(())
+}
+
 impl ComputeCoverageTriangle {
     pub fn from_raw(triangle: crate::RawTriangle) -> Self {
         let mut result = Self {
@@ -1862,6 +1915,7 @@ impl ComputeCoverageTriangle {
             }; 7],
             env_rgba8: 0,
             prim_rgba8: 0,
+            program_id: 0,
         };
         if let Some(shade) = triangle.shade() {
             for (destination, source) in result.planes[..4]
@@ -1885,6 +1939,11 @@ impl ComputeCoverageTriangle {
     pub const fn with_material(mut self, environment: Color4, primitive: PrimColor) -> Self {
         self.env_rgba8 = environment.value();
         self.prim_rgba8 = primitive.color().value();
+        self
+    }
+
+    pub(crate) const fn with_program(mut self, program_id: u32) -> Self {
+        self.program_id = program_id;
         self
     }
 
@@ -1924,6 +1983,7 @@ impl ComputeCoverageTriangle {
         bytes[152..156].copy_from_slice(&self.env_rgba8.to_le_bytes());
         bytes[156..160].copy_from_slice(&self.prim_rgba8.to_le_bytes());
         bytes[160..164].copy_from_slice(&tmem_state_index.to_le_bytes());
+        bytes[164..168].copy_from_slice(&self.program_id.to_le_bytes());
         bytes
     }
 }
@@ -2361,6 +2421,7 @@ impl TrianglePipelineRenderer {
                         1,
                         batch.work_items.len() as u64,
                         batch.work_triangle_indices.len() as u64,
+                        batch.target_bytes,
                     )
                 });
             if index == self.compute_hot_color_buffers.len() || replacement {
@@ -2373,6 +2434,7 @@ impl TrianglePipelineRenderer {
                     1,
                     batch.work_items.len() as u64,
                     batch.work_triangle_indices.len() as u64,
+                    batch.target_bytes,
                 );
                 if index == self.compute_hot_color_buffers.len() {
                     self.compute_hot_color_buffers.push(buffers);
@@ -2501,9 +2563,10 @@ impl TrianglePipelineRenderer {
     }
 
     /// Executes one ordered chain while retaining the exact target image at
-    /// each requested dispatch boundary. All passes and checkpoint copies
-    /// occupy one command buffer and therefore one submit/wait. A caller can
-    /// use those images to commit each original packet independently without
+    /// each requested dispatch boundary. One word-major pass writes only the
+    /// packed words touched in each interval to deterministic sparse output
+    /// slots; the host reconstructs full images for the existing publication
+    /// boundary. A caller can therefore commit each original packet without
     /// turning packet-local guest-write journals into one synthetic journal.
     pub(crate) fn compute_triangle_hot_color_chain_checkpoints(
         &mut self,
@@ -2569,22 +2632,9 @@ impl TrianglePipelineRenderer {
             );
         }
 
-        let fusion_enabled = compute_state_table_fusion_enabled();
-        let dispatch_ranges: Vec<(usize, usize)> = if fusion_enabled {
-            let mut start = 0usize;
-            checkpoint_dispatch_limits
-                .iter()
-                .map(|&end| {
-                    let range = (start, end);
-                    start = end;
-                    range
-                })
-                .collect()
-        } else {
-            (0..dispatches.len())
-                .map(|index| (index, index + 1))
-                .collect()
-        };
+        let dispatch_ranges = [(0, dispatches.len())];
+        let mut checkpoint_patches = vec![Vec::new(); checkpoint_dispatch_limits.len()];
+        let mut checkpoint_output_count = 0u32;
         let mut prepared = Vec::with_capacity(dispatch_ranges.len());
         for (dispatch_start, dispatch_end) in dispatch_ranges {
             let batch_dispatches = &dispatches[dispatch_start..dispatch_end];
@@ -2628,6 +2678,9 @@ impl TrianglePipelineRenderer {
             }
             let triangle_count = u32::try_from(draw_count)
                 .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+            if triangle_count >= 0x8000_0000 {
+                return Err(TrianglePipelineError::CoverageSizeOverflow);
+            }
             let triangle_bytes = u64::from(triangle_count)
                 .checked_mul(COMPUTE_COVERAGE_TRIANGLE_BYTES)
                 .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
@@ -2672,102 +2725,117 @@ impl TrianglePipelineRenderer {
                 tmem_validity.extend_from_slice(&dispatch.tmem.validity_words_bytes());
                 tiles.extend_from_slice(&dispatch.tile.to_bytes());
             }
-            let dense_worklist = batch_dispatches.iter().all(|dispatch| {
-                dispatch.first_row == 0
-                    && dispatch.row_count == extent.height
-                    && dispatch.first_column == 0
-                    && dispatch.column_count == extent.width
-            });
-            let (work_items, work_triangle_indices, work_item_words) = if dense_worklist {
-                (
-                    vec![0; 12],
-                    vec![0; 4],
-                    (0..target_words).collect::<Vec<_>>(),
-                )
-            } else {
-                let mut work_items = Vec::new();
-                let mut work_triangle_indices = Vec::new();
-                let mut work_item_words = Vec::new();
-                let aligned_rectangles = extent.width.is_multiple_of(2)
-                    && dispatch_triangle_ranges.iter().all(|(dispatch, _, _)| {
-                        dispatch.first_column.is_multiple_of(2)
-                            && dispatch.column_count.is_multiple_of(2)
-                    });
-                let mut append_target_word =
-                    |target_word: u32| -> Result<(), TrianglePipelineError> {
-                        let first_work_triangle = u32::try_from(work_triangle_indices.len())
-                            .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
-                        for &(dispatch, first_triangle, triangle_count) in &dispatch_triangle_ranges
-                        {
-                            let covered = if aligned_rectangles {
-                                let words_per_row = extent.width / 2;
-                                let row = target_word / words_per_row;
-                                let column_word = target_word % words_per_row;
-                                row >= dispatch.first_row
-                                    && row < dispatch.first_row + dispatch.row_count
-                                    && column_word >= dispatch.first_column / 2
-                                    && column_word
-                                        < (dispatch.first_column + dispatch.column_count) / 2
-                            } else {
-                                // A packed word can cross an odd-width row boundary.
-                                // Match the prior complete-contiguous-row fallback.
-                                let first_pixel = dispatch.first_row * extent.width;
-                                let pixel_limit =
-                                    (dispatch.first_row + dispatch.row_count) * extent.width;
-                                target_word >= first_pixel / 2
-                                    && target_word < pixel_limit.div_ceil(2)
-                            };
-                            if covered {
-                                work_triangle_indices
-                                    .extend(first_triangle..first_triangle + triangle_count);
-                            }
+            let aligned_rectangles = extent.width.is_multiple_of(2)
+                && dispatch_triangle_ranges.iter().all(|(dispatch, _, _)| {
+                    dispatch.first_column.is_multiple_of(2)
+                        && dispatch.column_count.is_multiple_of(2)
+                });
+            // Count first, then prefix-sum exact word-major storage. The
+            // dispatch-major walk preserves painter order without testing
+            // every candidate word against every dispatch.
+            let scratch = &mut self.compute_hot_color_plan_scratch;
+            scratch.event_counts.clear();
+            scratch.event_counts.resize(target_words as usize, 0);
+            scratch.touched.clear();
+            scratch.touched.resize(target_words as usize, false);
+            scratch.interval_words.clear();
+            if scratch.checkpoint_words.len() < checkpoint_dispatch_limits.len() {
+                scratch
+                    .checkpoint_words
+                    .resize_with(checkpoint_dispatch_limits.len(), Vec::new);
+            }
+            for words in &mut scratch.checkpoint_words[..checkpoint_dispatch_limits.len()] {
+                words.clear();
+            }
+            for (local_dispatch, (dispatch, _, dispatch_triangle_count)) in
+                dispatch_triangle_ranges.iter().enumerate()
+            {
+                for_each_compute_dispatch_word(
+                    extent,
+                    dispatch,
+                    aligned_rectangles,
+                    |target_word| {
+                        let word = target_word as usize;
+                        scratch.event_counts[word] = scratch.event_counts[word]
+                            .checked_add(*dispatch_triangle_count)
+                            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                        if !scratch.touched[word] {
+                            scratch.touched[word] = true;
+                            scratch.interval_words.push(target_word);
                         }
-                        let triangle_limit = u32::try_from(work_triangle_indices.len())
-                            .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
-                        let work_triangle_count = triangle_limit - first_work_triangle;
-                        if work_triangle_count == 0 {
-                            return Ok(());
-                        }
-                        for word in [target_word, first_work_triangle, work_triangle_count] {
-                            work_items.extend_from_slice(&word.to_le_bytes());
-                        }
-                        work_item_words.push(target_word);
                         Ok(())
-                    };
-                if aligned_rectangles {
-                    let words_per_row = extent.width / 2;
-                    let first_row = batch_dispatches
-                        .iter()
-                        .map(|dispatch| dispatch.first_row)
-                        .min()
-                        .expect("a prepared batch has at least one dispatch");
-                    let row_limit = batch_dispatches
-                        .iter()
-                        .map(|dispatch| dispatch.first_row + dispatch.row_count)
-                        .max()
-                        .expect("a prepared batch has at least one dispatch");
-                    for row in first_row..row_limit {
-                        let mut first_column_word = words_per_row;
-                        let mut column_word_limit = 0;
-                        for dispatch in batch_dispatches.iter().filter(|dispatch| {
-                            row >= dispatch.first_row
-                                && row < dispatch.first_row + dispatch.row_count
-                        }) {
-                            first_column_word = first_column_word.min(dispatch.first_column / 2);
-                            column_word_limit = column_word_limit
-                                .max((dispatch.first_column + dispatch.column_count) / 2);
-                        }
-                        for column_word in first_column_word..column_word_limit {
-                            append_target_word(row * words_per_row + column_word)?;
-                        }
-                    }
-                } else {
-                    for target_word in 0..target_words {
-                        append_target_word(target_word)?;
+                    },
+                )?;
+                let dispatch_limit = dispatch_start + local_dispatch + 1;
+                if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
+                    for target_word in scratch.interval_words.drain(..) {
+                        let word = target_word as usize;
+                        scratch.event_counts[word] = scratch.event_counts[word]
+                            .checked_add(1)
+                            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+                        scratch.touched[word] = false;
+                        scratch.checkpoint_words[checkpoint].push(target_word);
                     }
                 }
-                (work_items, work_triangle_indices, work_item_words)
-            };
+            }
+
+            scratch.event_cursors.clear();
+            scratch.event_cursors.reserve(scratch.event_counts.len());
+            let mut event_count = 0u32;
+            for &word_events in &scratch.event_counts {
+                scratch.event_cursors.push(event_count);
+                event_count = event_count
+                    .checked_add(word_events)
+                    .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+            }
+            let mut work_triangle_indices = vec![0u32; event_count as usize];
+            for (local_dispatch, (dispatch, first_triangle, dispatch_triangle_count)) in
+                dispatch_triangle_ranges.iter().enumerate()
+            {
+                for_each_compute_dispatch_word(
+                    extent,
+                    dispatch,
+                    aligned_rectangles,
+                    |target_word| {
+                        let cursor = &mut scratch.event_cursors[target_word as usize];
+                        for triangle in *first_triangle..*first_triangle + *dispatch_triangle_count
+                        {
+                            work_triangle_indices[*cursor as usize] = triangle;
+                            *cursor += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+                let dispatch_limit = dispatch_start + local_dispatch + 1;
+                if let Ok(checkpoint) = checkpoint_dispatch_limits.binary_search(&dispatch_limit) {
+                    for &target_word in &scratch.checkpoint_words[checkpoint] {
+                        if checkpoint_output_count >= 0x8000_0000 {
+                            return Err(TrianglePipelineError::CoverageSizeOverflow);
+                        }
+                        let cursor = &mut scratch.event_cursors[target_word as usize];
+                        work_triangle_indices[*cursor as usize] =
+                            0x8000_0000 | checkpoint_output_count;
+                        *cursor += 1;
+                        checkpoint_patches[checkpoint].push((target_word, checkpoint_output_count));
+                        checkpoint_output_count += 1;
+                    }
+                }
+            }
+
+            let mut work_items = Vec::new();
+            let mut work_item_words = Vec::new();
+            for (target_word, &word_events) in scratch.event_counts.iter().enumerate() {
+                if word_events == 0 {
+                    continue;
+                }
+                let first_event = scratch.event_cursors[target_word] - word_events;
+                let target_word = u32::try_from(target_word)
+                    .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
+                for word in [target_word, first_event, word_events] {
+                    work_items.extend_from_slice(&word.to_le_bytes());
+                }
+                work_item_words.push(target_word);
+            }
             let word_count = u32::try_from(work_item_words.len())
                 .map_err(|_| TrianglePipelineError::CoverageSizeOverflow)?;
             let status_bytes = u64::from(word_count) * 8;
@@ -2803,9 +2871,9 @@ impl TrianglePipelineRenderer {
                 extent.height,
                 pixels,
                 triangle_count,
-                0,
+                word_count * 2,
                 word_count,
-                if dense_worklist { u32::MAX } else { 0 },
+                0,
                 0,
             ] {
                 params.extend_from_slice(&word.to_le_bytes());
@@ -2813,9 +2881,6 @@ impl TrianglePipelineRenderer {
             prepared.push(PreparedComputeHotColorChainBatch {
                 first_dispatch: dispatch_start,
                 dispatch_count: batch_dispatches.len(),
-                checkpoint: checkpoint_dispatch_limits
-                    .binary_search(&dispatch_end)
-                    .is_ok(),
                 triangle_bytes,
                 target_bytes,
                 status_bytes,
@@ -2833,6 +2898,17 @@ impl TrianglePipelineRenderer {
                 work_item_words,
             });
         }
+        let checkpoint_output_bytes = u64::from(checkpoint_output_count) * 4;
+        let combined_status_bytes = prepared[0]
+            .status_bytes
+            .checked_add(checkpoint_output_bytes)
+            .ok_or(TrianglePipelineError::CoverageSizeOverflow)?;
+        if combined_status_bytes > limits.max_buffer_size
+            || combined_status_bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || checkpoint_output_bytes > limits.max_buffer_size
+        {
+            return Err(TrianglePipelineError::CoverageTooLarge);
+        }
         let timing_prepare = compute_chain_timing_lap(&mut timing_mark);
 
         for (index, batch) in prepared.iter().enumerate() {
@@ -2843,10 +2919,11 @@ impl TrianglePipelineRenderer {
                     !buffers.fits(
                         batch.triangle_bytes,
                         batch.target_bytes,
-                        batch.status_bytes,
+                        combined_status_bytes,
                         batch.tmem_state_count,
                         batch.work_items.len() as u64,
                         batch.work_triangle_indices.len() as u64,
+                        checkpoint_output_bytes,
                     )
                 });
             if index == self.compute_hot_color_buffers.len() || replacement {
@@ -2855,10 +2932,11 @@ impl TrianglePipelineRenderer {
                     &self.compute_triangle_color_pipeline,
                     batch.triangle_bytes,
                     batch.target_bytes,
-                    batch.status_bytes,
+                    combined_status_bytes,
                     batch.tmem_state_count,
                     batch.work_items.len() as u64,
                     batch.work_triangle_indices.len() as u64,
+                    checkpoint_output_bytes,
                 );
                 if index == self.compute_hot_color_buffers.len() {
                     self.compute_hot_color_buffers.push(buffers);
@@ -2918,10 +2996,9 @@ impl TrianglePipelineRenderer {
         }
         let timing_uploads = compute_chain_timing_lap(&mut timing_mark);
 
-        // Every pass in the chain mutates the same packed target. Pass
-        // boundaries order storage writes, while each invocation retains
-        // exclusive ownership of its packed word. Binding one target avoids
-        // a full-target device copy at every semantic state boundary.
+        // One invocation retains exclusive ownership of its packed word for
+        // the whole semantic chain. Explicit events preserve state and packet
+        // order without cross-invocation target races.
         let shared_target = &self.compute_hot_color_buffers[0].target;
         let layout = self
             .compute_triangle_color_pipeline
@@ -3015,17 +3092,14 @@ impl TrianglePipelineRenderer {
                 pass.set_bind_group(1, &chain_groups[index], &[]);
                 pass.dispatch_workgroups(batch.workgroups, 1, 1);
             }
-            if batch.checkpoint {
-                let checkpoint_readback = &self.compute_hot_color_buffers[index].target_readback;
-                encoder.copy_buffer_to_buffer(
-                    shared_target,
-                    0,
-                    checkpoint_readback,
-                    0,
-                    target_bytes,
-                );
-            }
         }
+        encoder.copy_buffer_to_buffer(
+            &self.compute_hot_color_buffers[0].status,
+            prepared[0].status_bytes,
+            &self.compute_hot_color_buffers[0].target_readback,
+            0,
+            checkpoint_output_bytes,
+        );
         let chain_status_readback = &self
             .compute_hot_color_chain_status_readback
             .as_ref()
@@ -3104,16 +3178,12 @@ impl TrianglePipelineRenderer {
             );
         }
         let timing_gpu_map = compute_chain_timing_lap(&mut timing_mark);
-        let mut readbacks = Vec::with_capacity(checkpoint_dispatch_limits.len() + 1);
+        let mut readbacks = Vec::with_capacity(2);
         readbacks.push((chain_status_readback, chain_status_bytes));
-        for (index, batch) in prepared.iter().enumerate() {
-            if batch.checkpoint {
-                readbacks.push((
-                    &self.compute_hot_color_buffers[index].target_readback,
-                    target_bytes,
-                ));
-            }
-        }
+        readbacks.push((
+            &self.compute_hot_color_buffers[0].target_readback,
+            checkpoint_output_bytes,
+        ));
         let mut mapped = map_and_read_prefixes(&self.device, &readbacks)?;
         let statuses = mapped.remove(0);
         let mut status_offset = 0usize;
@@ -3142,10 +3212,14 @@ impl TrianglePipelineRenderer {
             status_offset = status_end;
         }
         let timing_status_map = compute_chain_timing_lap(&mut timing_mark);
-        let mut outputs = mapped;
-        for output in &mut outputs {
-            output.truncate(expected_bytes);
-        }
+        let checkpoint_words = mapped
+            .pop()
+            .expect("checkpoint output readback accompanies chain status");
+        let outputs = reconstruct_compute_color_checkpoints(
+            resident_bytes,
+            &checkpoint_words,
+            &checkpoint_patches,
+        );
         let timing_target_map = compute_chain_timing_lap(&mut timing_mark);
         if let Some(started) = timing_total {
             eprintln!(

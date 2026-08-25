@@ -25,6 +25,7 @@ struct TriangleEdges {
     env_rgba8: u32,
     prim_rgba8: u32,
     tmem_state_index: u32,
+    program_id: u32,
 }
 
 struct CoverageParams {
@@ -144,6 +145,23 @@ fn i64_mul_i32_u32(a: i32, b: u32) -> I64 {
     let magnitude_a = select(u32(a), ~u32(a) + 1u, a < 0);
     let magnitude = unsigned_mul_32(magnitude_a, b);
     if a < 0 {
+        return i64_neg(magnitude);
+    }
+    return magnitude;
+}
+
+fn i64_mul_i32_wide(value: I64, factor: i32) -> I64 {
+    let value_negative = value.hi < 0;
+    let factor_negative = factor < 0;
+    var magnitude_value = value;
+    if value_negative {
+        magnitude_value = i64_neg(value);
+    }
+    let magnitude_factor = select(u32(factor), ~u32(factor) + 1u, factor_negative);
+    let low_product = unsigned_mul_32(magnitude_value.lo, magnitude_factor);
+    let high = u32(magnitude_value.hi) * magnitude_factor + u32(low_product.hi);
+    let magnitude = I64(low_product.lo, bitcast<i32>(high));
+    if value_negative != factor_negative {
         return i64_neg(magnitude);
     }
     return magnitude;
@@ -318,12 +336,157 @@ fn quantize_rgba8(color: vec4<f32>) -> vec4<f32> {
     return round(clamp(color, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
 }
 
+const FOG_ALPHA_DITHER_MAGIC_SQUARE: array<u32, 16> = array<u32, 16>(
+    0u, 6u, 1u, 7u,
+    4u, 2u, 5u, 3u,
+    3u, 5u, 2u, 4u,
+    7u, 1u, 6u, 0u,
+);
+
+fn fog_alpha_dither(alpha: f32, x: u32, y: u32) -> f32 {
+    let alpha_byte = u32(round(clamp(alpha, 0.0, 1.0) * 255.0));
+    let threshold = FOG_ALPHA_DITHER_MAGIC_SQUARE[((y & 3u) << 2u) | (x & 3u)];
+    let rounded = min(31u, (alpha_byte >> 3u) + select(0u, 1u, (alpha_byte & 7u) > threshold));
+    let expanded = (rounded << 3u) | (rounded >> 2u);
+    return f32(expanded) / 255.0;
+}
+
+fn noise_alpha_dither(alpha: f32) -> f32 {
+    let alpha_byte = u32(round(clamp(alpha, 0.0, 1.0) * 255.0));
+    let truncated = alpha_byte >> 3u;
+    return f32((truncated << 3u) | (truncated >> 2u)) / 255.0;
+}
+
+fn materialize_f32(value: f32) -> f32 {
+    return bitcast<f32>(bitcast<u32>(value));
+}
+
+// Exact specialization of `(Primitive - Environment) * Texel0 +
+// Environment`, with `Texel0.a * Primitive.a` for alpha. The bitcast
+// materializes the multiply as an f32 before the add, matching the CPU
+// oracle's two operations and preventing a contracted GPU FMA from crossing
+// the later RGBA16 quantization threshold.
+fn combine_full_coverage_program(inputs: CombinerInputs) -> vec4<f32> {
+    var output: vec4<f32>;
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        output[channel] = clamp(
+            materialize_f32(
+                (inputs.prim_color[channel] - inputs.env_color[channel])
+                    * inputs.tex_val0[channel]
+            ) + inputs.env_color[channel],
+            0.0,
+            1.0,
+        );
+    }
+    output.a = clamp(materialize_f32(inputs.tex_val0.a * inputs.prim_color.a), 0.0, 1.0);
+    return quantize_rgba8(output);
+}
+
+// Exact specialization of the admitted fog program's two-cycle combiner.
+// Cycle 0 produces Texel0 * ShadeAlpha for RGB and Texel0Alpha *
+// PrimitiveAlpha for alpha. Cycle 1 computes
+// `(Environment - Combined) * Primitive + Combined` for RGB and carries the
+// prior alpha. Every multiply is materialized before its following add so
+// GPU contraction cannot cross an RGBA8/RGBA16 quantization threshold that
+// the CPU oracle's separate f32 operations do not cross.
+fn combine_fog_program(inputs: CombinerInputs) -> vec4<f32> {
+    var first: vec4<f32>;
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        first[channel] = materialize_f32(inputs.tex_val0[channel] * inputs.shade_color.a);
+    }
+    first.a = materialize_f32(inputs.tex_val0.a * inputs.prim_color.a);
+
+    var output = first;
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        output[channel] = clamp(
+            materialize_f32(
+                (inputs.env_color[channel] - first[channel]) * inputs.prim_color[channel]
+            ) + first[channel],
+            0.0,
+            1.0,
+        );
+    }
+    output.a = clamp(first.a, 0.0, 1.0);
+    return quantize_rgba8(output);
+}
+
+fn blend_framebuffer_alpha_program(src_bytes: vec4<u32>, dst: vec4<f32>) -> vec4<f32> {
+    // This exact program selects alpha-dither Noise. The admitted CPU path
+    // has already closed the combiner and alpha-dither stages to RGBA8 before
+    // the blender reads CombinedAlpha.
+    let dst_bytes = round(clamp(dst, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0);
+    let alpha = f32(src_bytes.a) / 255.0;
+    var output: vec4<f32>;
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        output[channel] = round(clamp(
+            materialize_f32(f32(src_bytes[channel]) * alpha)
+                + materialize_f32(dst_bytes[channel] * (1.0 - alpha)),
+            0.0,
+            255.0,
+        ));
+    }
+    output.a = round(clamp(
+        materialize_f32(255.0 * alpha)
+            + materialize_f32(dst_bytes.a * (1.0 - alpha)),
+        0.0,
+        255.0,
+    ));
+    return output / 255.0;
+}
+
+fn blend_full_coverage_program(src: vec4<f32>, dst: vec4<f32>) -> vec4<f32> {
+    var src_bytes = vec4<u32>(round(clamp(src, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
+    // This exact program selects alpha-dither Noise. The admitted CPU path
+    // uses its proved endpoint threshold 7, so no low-three-bit value can
+    // round upward: truncate to five bits, then expand back to RGBA8 before
+    // the blender reads CombinedAlpha.
+    let alpha_five = src_bytes.a >> 3u;
+    src_bytes.a = (alpha_five << 3u) | (alpha_five >> 2u);
+    return blend_framebuffer_alpha_program(src_bytes, dst);
+}
+
+fn blend_fog_program(src: vec4<f32>, dst: vec4<f32>) -> vec4<f32> {
+    let src_bytes = vec4<u32>(round(clamp(src, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
+    return blend_framebuffer_alpha_program(src_bytes, dst);
+}
+
 fn perspective_coordinate(numerator: I64, denominator: I64) -> i32 {
-    let raw = i64_to_f32(numerator) / i64_to_f32(denominator) * 32768.0;
+    let numerator_f32 = i64_to_f32(numerator);
+    let denominator_f32 = i64_to_f32(denominator);
+    let ratio = materialize_f32(numerator_f32 / denominator_f32);
+    let raw = materialize_f32(ratio * 32768.0);
     if raw != raw {
         return 0;
     }
-    return i32(clamp(raw, -32768.0, 32767.0));
+    var coordinate = i32(clamp(raw, -32768.0, 32767.0));
+    // Metal may round the division/scale pair exactly onto an integer texel
+    // boundary where Rust's separately rounded f32 operations remain one
+    // ULP below it. Only arbitrate that exact-boundary case, using the same
+    // already-rounded f32 operands as the CPU before cross multiplication.
+    if raw == f32(coordinate)
+        && abs(numerator_f32) <= 2147483520.0
+        && abs(denominator_f32) <= 2147483520.0
+        && denominator_f32 != 0.0
+    {
+        let rounded_numerator = i32(numerator_f32);
+        let rounded_denominator = i32(denominator_f32);
+        let scaled = i64_mul_i32(rounded_numerator, 32768);
+        let boundary = i64_mul_i32_wide(i64_from_i32(rounded_denominator), coordinate);
+        let rational_is_below = select(
+            i64_less(boundary, scaled),
+            i64_less(scaled, boundary),
+            rounded_denominator > 0,
+        );
+        if coordinate > 0 && rational_is_below {
+            coordinate -= 1;
+        } else if coordinate < 0
+            && !rational_is_below
+            && (i64_less(boundary, scaled) || i64_less(scaled, boundary))
+        {
+            coordinate += 1;
+        }
+    }
+    return coordinate;
 }
 
 struct ColorPixelResult {
@@ -384,27 +547,78 @@ fn execute_hot_color_pixel(
         // that representation boundary here: carrying the combiner's f32
         // result directly into the blender changes values at RGBA16's 5-bit
         // packing thresholds for real WM2000 operands.
-        let combined = quantize_rgba8(
-            run_one_cycle(CombineParams(0xfc5196a3u, 0x112cfe7fu), inputs).combiner_color
-        );
+        var combined: vec4<f32>;
+        if triangle.program_id == 1u {
+            combined = combine_full_coverage_program(inputs);
+        } else if triangle.program_id == 2u {
+            combined = combine_fog_program(inputs);
+            combined.a = fog_alpha_dither(combined.a, x, y);
+        } else if triangle.program_id == 3u {
+            combined = combine_fog_program(inputs);
+            // ac8f selects alpha Pattern, but the CPU orders that stage after
+            // coverage-times-alpha/alpha-coverage-select. This program's
+            // blender ignores alpha, so dithering here would incorrectly
+            // perturb the coverage input; the selected dither is downstream-
+            // dead for this exact key.
+        } else {
+            combined = quantize_rgba8(
+                run_one_cycle(CombineParams(0xfc5196a3u, 0x112cfe7fu), inputs).combiner_color
+            );
+            combined.a = noise_alpha_dither(combined.a);
+        }
         let shade_alpha = round(clamp(inputs.shade_color.a, 0.0, 1.0) * 255.0) / 255.0;
         let memory_count = select(1u, 8u, (current & 1u) != 0u);
-        let coverage = coverage_fragment_fn(8u, memory_count, 1u, 1u, 1u, 1u, 0u, 0u, 0u);
-        if coverage.wraps == 0u {
+        // Program 1's exact other-mode uses CVG_DST_FULL with AA disabled;
+        // program 0 uses CVG_DST_WRAP with AA enabled. The destination count
+        // reaches the packed RGBA16 coverage bit, so this is part of program
+        // identity rather than a dead render-state distinction.
+        let full_coverage_program = triangle.program_id == 1u;
+        let fog_program = triangle.program_id == 2u;
+        let coverage_fog_program = triangle.program_id == 3u;
+        var coverage = coverage_fragment_fn(
+            8u, memory_count, 1u, 1u,
+            select(1u, 0u, full_coverage_program),
+            select(1u, 2u, full_coverage_program),
+            0u, 0u, 0u,
+        );
+        if fog_program {
+            coverage = coverage_fragment_fn(8u, memory_count, 1u, 1u, 0u, 2u, 0u, 0u, 0u);
+        }
+        if coverage_fog_program {
+            let combined_alpha = u32(round(clamp(combined.a, 0.0, 1.0) * 255.0));
+            coverage = coverage_fragment_fn(
+                8u, memory_count, 0u, 1u, 1u, 0u, 1u, 1u, combined_alpha,
+            );
+            combined.a = f32(coverage.adjusted_alpha) / 255.0;
+        }
+        if select(
+            coverage.wraps == 0u,
+            coverage.adjusted_coverage_count == 0u,
+            coverage_fog_program,
+        ) {
             continue;
         }
         let destination = rgba16_color(current);
-        let blended = blend_fragment_memory_composite_fn(
-            1u,
-            0u, 0u, 1u, 0u,
-            0u, 0u, 0u, 0u,
-            combined,
-            shade_alpha,
-            vec4<f32>(0.0),
-            vec4<f32>(0.0),
-            coverage.blend_enabled,
-            destination,
-        );
+        var blended: vec4<f32>;
+        if full_coverage_program {
+            blended = blend_full_coverage_program(combined, destination);
+        } else if fog_program {
+            blended = blend_fog_program(combined, destination);
+        } else if coverage_fog_program {
+            blended = vec4<f32>(combined.rgb, 1.0);
+        } else {
+            blended = blend_fragment_memory_composite_fn(
+                1u,
+                0u, 0u, 1u, 0u,
+                0u, 0u, 0u, 0u,
+                combined,
+                shade_alpha,
+                vec4<f32>(0.0),
+                vec4<f32>(0.0),
+                coverage.blend_enabled,
+                destination,
+            );
+        }
         current = pack_rgba16(blended, (coverage.destination_count - 1u) >> 2u);
     }
     return ColorPixelResult(current, status);
@@ -431,28 +645,49 @@ fn compute_triangle_hot_color(@builtin(global_invocation_id) id: vec3<u32>) {
     let first_pixel = word_index * 2u;
     let first_device = device_word & 0xffffu;
     let first_logical = ((first_device & 0xffu) << 8u) | (first_device >> 8u);
-    let first = execute_hot_color_pixel(
-        first_pixel,
-        first_logical,
-        work_item.first_triangle_index,
-        work_item.triangle_count,
-    );
-    var output_word = ((first.rgba16 & 0xffu) << 8u) | (first.rgba16 >> 8u);
+    var first_current = first_logical;
+    var first_result_status = 0u;
     let first_status = local_word_index * 2u;
-    color_status[first_status] = first.status;
     let second_pixel = first_pixel + 1u;
+    var second_current = 0u;
+    var second_result_status = 0u;
     if second_pixel < params.pixels_per_triangle {
         let second_device = device_word >> 16u;
-        let second_logical = ((second_device & 0xffu) << 8u) | (second_device >> 8u);
-        let second = execute_hot_color_pixel(
-            second_pixel,
-            second_logical,
-            work_item.first_triangle_index,
-            work_item.triangle_count,
-        );
-        let packed_device = ((second.rgba16 & 0xffu) << 8u) | (second.rgba16 >> 8u);
+        second_current = ((second_device & 0xffu) << 8u) | (second_device >> 8u);
+    }
+    for (var event_offset = 0u; event_offset < work_item.triangle_count; event_offset += 1u) {
+        let event = color_work_triangle_indices[work_item.first_triangle_index + event_offset];
+        if (event & 0x80000000u) != 0u {
+            var checkpoint_word = ((first_current & 0xffu) << 8u) | (first_current >> 8u);
+            if second_pixel < params.pixels_per_triangle {
+                let second_device = ((second_current & 0xffu) << 8u) | (second_current >> 8u);
+                checkpoint_word |= second_device << 16u;
+            } else {
+                checkpoint_word |= device_word & 0xffff0000u;
+            }
+            color_status[params.first_word + (event & 0x7fffffffu)] = checkpoint_word;
+            continue;
+        }
+        let event_index = work_item.first_triangle_index + event_offset;
+        let first = execute_hot_color_pixel(first_pixel, first_current, event_index, 1u);
+        first_current = first.rgba16;
+        if first_result_status == 0u {
+            first_result_status = first.status;
+        }
+        if second_pixel < params.pixels_per_triangle {
+            let second = execute_hot_color_pixel(second_pixel, second_current, event_index, 1u);
+            second_current = second.rgba16;
+            if second_result_status == 0u {
+                second_result_status = second.status;
+            }
+        }
+    }
+    color_status[first_status] = first_result_status;
+    var output_word = ((first_current & 0xffu) << 8u) | (first_current >> 8u);
+    if second_pixel < params.pixels_per_triangle {
+        let packed_device = ((second_current & 0xffu) << 8u) | (second_current >> 8u);
         output_word |= packed_device << 16u;
-        color_status[first_status + 1u] = second.status;
+        color_status[first_status + 1u] = second_result_status;
     } else {
         output_word |= device_word & 0xffff0000u;
     }
