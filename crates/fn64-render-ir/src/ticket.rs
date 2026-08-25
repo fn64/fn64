@@ -272,22 +272,62 @@ impl CompletedWrite {
         validity: &[u8],
         last_touched_generation: &[u64],
     ) -> ContentDigest {
-        let byte_count = byte_count.to_be_bytes();
-        let load_epoch = load_epoch.to_be_bytes();
-        let mut touched = Vec::with_capacity(last_touched_generation.len() * 8);
-        for generation in last_touched_generation.iter().copied() {
-            touched.extend_from_slice(&generation.to_be_bytes());
+        let mut hash = physical_tmem_content_hasher(
+            byte_count,
+            load_epoch,
+            normalized_bytes,
+            validity,
+            last_touched_generation.len(),
+        );
+        let mut encoded = [0_u8; 512];
+        for generations in last_touched_generation.chunks(encoded.len() / 8) {
+            for (destination, generation) in
+                encoded.chunks_exact_mut(8).zip(generations.iter().copied())
+            {
+                destination.copy_from_slice(&generation.to_be_bytes());
+            }
+            hash.update(&encoded[..generations.len() * 8]);
         }
-        ContentDigest::hash(
-            Self::PHYSICAL_TMEM_CONTENT_DOMAIN,
-            &[
-                &byte_count,
-                &load_epoch,
-                normalized_bytes,
-                validity,
-                &touched,
-            ],
-        )
+        ContentDigest::from_bytes(hash.finalize().into())
+    }
+
+    /// Hashes the same canonical physical-TMEM effect preimage when every
+    /// projected byte was touched by one generation.
+    ///
+    /// The encoded SHA-256 field remains `byte_count` repeated big-endian
+    /// generations, byte for byte identical to
+    /// [`Self::physical_tmem_content_digest`] with a uniform generation
+    /// slice. This overload avoids materializing that redundant slice or its
+    /// byte encoding; callers still own the structural proof that every
+    /// projected byte has the supplied generation.
+    pub fn physical_tmem_content_digest_uniform_generation(
+        byte_count: u32,
+        load_epoch: u64,
+        normalized_bytes: &[u8],
+        validity: &[u8],
+        last_touched_generation: u64,
+    ) -> ContentDigest {
+        let generation_count = normalized_bytes.len();
+        let mut hash = physical_tmem_content_hasher(
+            byte_count,
+            load_epoch,
+            normalized_bytes,
+            validity,
+            generation_count,
+        );
+        let generation = last_touched_generation.to_be_bytes();
+        let mut encoded = [0_u8; 512];
+        for destination in encoded.chunks_exact_mut(8) {
+            destination.copy_from_slice(&generation);
+        }
+        let generations_per_block = encoded.len() / 8;
+        let full_blocks = generation_count / generations_per_block;
+        for _ in 0..full_blocks {
+            hash.update(&encoded);
+        }
+        let remaining = generation_count % generations_per_block;
+        hash.update(&encoded[..remaining * 8]);
+        ContentDigest::from_bytes(hash.finalize().into())
     }
 
     pub fn try_new(
@@ -331,6 +371,33 @@ impl CompletedWrite {
     pub const fn content(self) -> ContentDigest {
         self.content
     }
+}
+
+fn physical_tmem_content_hasher(
+    byte_count: u32,
+    load_epoch: u64,
+    normalized_bytes: &[u8],
+    validity: &[u8],
+    generation_count: usize,
+) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(CompletedWrite::PHYSICAL_TMEM_CONTENT_DOMAIN);
+    let byte_count = byte_count.to_be_bytes();
+    let load_epoch = load_epoch.to_be_bytes();
+    for field in [
+        byte_count.as_slice(),
+        load_epoch.as_slice(),
+        normalized_bytes,
+        validity,
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    let generation_bytes = generation_count
+        .checked_mul(8)
+        .expect("physical TMEM generation field length overflow");
+    hash.update((generation_bytes as u64).to_be_bytes());
+    hash
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -947,8 +1014,13 @@ mod tests {
         let touched = [9, 9, 9, 9];
         let backend_a =
             CompletedWrite::physical_tmem_content_digest(4, 7, &normalized, &validity, &touched);
-        let backend_b =
-            CompletedWrite::physical_tmem_content_digest(4, 7, &normalized, &validity, &touched);
+        let backend_b = CompletedWrite::physical_tmem_content_digest_uniform_generation(
+            4,
+            7,
+            &normalized,
+            &validity,
+            9,
+        );
 
         assert_eq!(
             CompletedWrite::PHYSICAL_TMEM_CONTENT_DOMAIN,
@@ -958,6 +1030,59 @@ mod tests {
         assert_eq!(
             backend_a.to_string(),
             "a52cc1514e4e131e59fd4ea3b1e8e0d1c8a65ac9e86878d6a7601646335c1d79"
+        );
+    }
+
+    #[test]
+    fn uniform_physical_tmem_generation_matches_slice_encoding_at_boundaries() {
+        for (len, generation) in [
+            (1_usize, 1_u64),
+            (8, u64::MAX),
+            (64, 0x0102_0304_0506_0708),
+            (65, 9),
+            (1_664, 17),
+            (4_096, 23),
+        ] {
+            let normalized = (0..len)
+                .map(|index| if index % 5 == 0 { 0 } else { index as u8 })
+                .collect::<Vec<_>>();
+            let validity = (0..len)
+                .map(|index| u8::from(index % 5 != 0))
+                .collect::<Vec<_>>();
+            let touched = vec![generation; len];
+            assert_eq!(
+                CompletedWrite::physical_tmem_content_digest(
+                    len as u32,
+                    7,
+                    &normalized,
+                    &validity,
+                    &touched,
+                ),
+                CompletedWrite::physical_tmem_content_digest_uniform_generation(
+                    len as u32,
+                    7,
+                    &normalized,
+                    &validity,
+                    generation,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_physical_tmem_generation_does_not_collapse_nonuniform_input() {
+        let normalized = [0x10, 0x11, 0x12, 0x13];
+        let validity = [1, 1, 1, 1];
+        let nonuniform = [9, 9, 10, 9];
+        assert_ne!(
+            CompletedWrite::physical_tmem_content_digest(4, 7, &normalized, &validity, &nonuniform,),
+            CompletedWrite::physical_tmem_content_digest_uniform_generation(
+                4,
+                7,
+                &normalized,
+                &validity,
+                9,
+            )
         );
     }
 

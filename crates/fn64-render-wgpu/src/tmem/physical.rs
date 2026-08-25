@@ -759,11 +759,18 @@ impl StagedTmemTransaction {
                 actual: self.next_word,
             });
         }
+        // `validate_physical_plan` proved that the destination accesses are
+        // exactly the union of every planned word's eight physical lanes.
+        // Reaching this point proves every word completed, and
+        // `stage_expected_word` assigns this one packet generation to all
+        // eight lanes before applying byte validity. The private capability
+        // therefore cannot name a partial, poisoned, or caller-forged load.
+        let touch_generation = CompletedLoadTouchGeneration(self.packet.binding.next_generation);
         let (projection, effects) = project_load(
             self.load_binding,
             &self.packet.bytes,
             &self.packet.valid,
-            &self.packet.last_touched_generation,
+            touch_generation,
             &self.destination_accesses,
         )?;
         self.packet.last_load_epoch = Some(self.load_binding.epoch);
@@ -1544,13 +1551,22 @@ struct LoadProjection {
     accesses: Box<[CanonicalTmemEffectProjection]>,
 }
 
+/// Proof carried only out of a non-poisoned, complete staged load.
+///
+/// Every projected destination byte belongs to a planned physical word lane,
+/// and staging assigns all such lanes the packet's single next generation.
+/// Durable TMEM retains its per-byte generation array; only the immutable
+/// completed-load projection can use this scalar representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletedLoadTouchGeneration(u64);
+
 #[derive(Debug, PartialEq, Eq)]
 struct CanonicalTmemEffectProjection {
     access: ResourceAccess,
     load_epoch: TmemLoadEpoch,
     normalized_bytes: Box<[u8]>,
     validity: Box<[u8]>,
-    last_touched_generation: Box<[u64]>,
+    touch_generation: CompletedLoadTouchGeneration,
 }
 
 fn packet_binding(
@@ -2086,7 +2102,7 @@ fn project_load(
     load_binding: PhysicalTmemLoadBinding,
     bytes: &[u8; TMEM_LEN],
     valid: &[bool; TMEM_LEN],
-    last_touched_generation: &[u64; TMEM_LEN],
+    touch_generation: CompletedLoadTouchGeneration,
     accesses: &[ResourceAccess],
 ) -> Result<(LoadProjection, Vec<CompletedWrite>), PhysicalTmemError> {
     let mut projections = Vec::with_capacity(accesses.len());
@@ -2108,9 +2124,7 @@ fn project_load(
                 .map(|address| u8::from(valid[address]))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            last_touched_generation: last_touched_generation[start..end]
-                .to_vec()
-                .into_boxed_slice(),
+            touch_generation,
         };
         effects.push(completed_effect(&projection)?);
         projections.push(projection);
@@ -2138,7 +2152,6 @@ fn completed_effect(
     let len = range.len() as usize;
     if projection.normalized_bytes.len() != len
         || projection.validity.len() != len
-        || projection.last_touched_generation.len() != len
         || projection.validity.iter().any(|valid| *valid > 1)
         || projection
             .normalized_bytes
@@ -2149,12 +2162,12 @@ fn completed_effect(
         return Err(PhysicalTmemError::ProposalMismatch);
     }
     let byte_count = range.len();
-    let digest = CompletedWrite::physical_tmem_content_digest(
+    let digest = CompletedWrite::physical_tmem_content_digest_uniform_generation(
         byte_count,
         projection.load_epoch.get(),
         &projection.normalized_bytes,
         &projection.validity,
-        &projection.last_touched_generation,
+        projection.touch_generation.0,
     );
     CompletedWrite::try_new(projection.access, byte_count, digest).map_err(PhysicalTmemError::Ir)
 }
@@ -3177,6 +3190,10 @@ mod tests {
             .proposed_effects()
             .iter()
             .all(|effect| effect.byte_count() == 4));
+        assert!(pending.projections[0]
+            .accesses
+            .iter()
+            .all(|projection| projection.touch_generation.0 == 1));
     }
 
     /// The low-level mask mapper retains its partial-mask behavior for hostile
@@ -3256,6 +3273,11 @@ mod tests {
                 ..
             })
         ));
+        let pending = stage_all(&state, &fixture.decoded, &[0x10]);
+        assert!(pending.projections[0]
+            .accesses
+            .iter()
+            .all(|projection| projection.touch_generation.0 == 1));
     }
 
     #[test]
@@ -3274,6 +3296,12 @@ mod tests {
         assert_eq!(pending.completed_loads(), 2);
         let first_projection = &pending.projections[0];
         let second_projection = &pending.projections[1];
+        assert!(pending
+            .projections
+            .iter()
+            .all(|load| load.accesses.iter().all(
+                |projection| projection.touch_generation.0 == pending.binding.next_generation
+            )));
         let projected_byte = |load: &LoadProjection| {
             load.accesses
                 .iter()
@@ -3300,7 +3328,7 @@ mod tests {
             first_projection.binding,
             &pending.bytes,
             &pending.valid,
-            &pending.last_touched_generation,
+            first_projection.accesses[0].touch_generation,
             &first_accesses,
         )
         .unwrap();
@@ -3627,15 +3655,38 @@ mod tests {
                 projection.load_epoch.get(),
                 &projection.normalized_bytes,
                 &projection.validity,
-                &projection.last_touched_generation,
+                &vec![projection.touch_generation.0; byte_count as usize],
             )
+        );
+        let legacy_effect = CompletedWrite::try_new(
+            baseline.access(),
+            baseline.byte_count(),
+            CompletedWrite::physical_tmem_content_digest(
+                byte_count,
+                projection.load_epoch.get(),
+                &projection.normalized_bytes,
+                &projection.validity,
+                &vec![projection.touch_generation.0; byte_count as usize],
+            ),
+        )
+        .unwrap();
+        let mut legacy_effects = first.effects.to_vec();
+        legacy_effects[0] = legacy_effect;
+        assert_eq!(
+            proposal_identity(
+                first.binding,
+                first.last_load_epoch,
+                &first.projections,
+                &legacy_effects,
+            ),
+            first.proposal_identity
         );
         let mut changed_validity = CanonicalTmemEffectProjection {
             access: projection.access,
             load_epoch: projection.load_epoch,
             normalized_bytes: projection.normalized_bytes.clone(),
             validity: projection.validity.clone(),
-            last_touched_generation: projection.last_touched_generation.clone(),
+            touch_generation: projection.touch_generation,
         };
         let lane = changed_validity
             .validity
@@ -3646,7 +3697,7 @@ mod tests {
         changed_validity.normalized_bytes[lane] = 0;
         assert_ne!(baseline, completed_effect(&changed_validity).unwrap());
         let mut changed_touch = changed_validity;
-        changed_touch.last_touched_generation[lane] += 1;
+        changed_touch.touch_generation.0 += 1;
         assert_ne!(
             completed_effect(&changed_touch).unwrap(),
             completed_effect(projection).unwrap()
@@ -3658,9 +3709,28 @@ mod tests {
             ),
             normalized_bytes: projection.normalized_bytes.clone(),
             validity: projection.validity.clone(),
-            last_touched_generation: projection.last_touched_generation.clone(),
+            touch_generation: projection.touch_generation,
         };
         assert_ne!(baseline, completed_effect(&changed_epoch).unwrap());
+    }
+
+    #[test]
+    fn sealed_projection_scalar_generation_mutation_fails_revalidation() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let fixture = fixture(1);
+        let mut pending = stage_all(&state, &fixture.decoded, &[0x20]);
+        let proposed = pending.proposed_effects().to_vec();
+        let complete = gpu_complete(fixture.decoded, fixture.backend, proposed);
+        pending.projections[0].accesses[0].touch_generation.0 += 1;
+
+        assert_eq!(
+            validate_proposal(&pending).unwrap_err(),
+            PhysicalTmemError::ProposalMismatch
+        );
+        assert!(matches!(
+            pending.bind_gpu(&complete),
+            Err(PhysicalTmemError::ProposalMismatch)
+        ));
     }
 
     #[test]
@@ -4246,6 +4316,10 @@ mod tests {
             let payload = staged.physical_word_payload(word, quadricated).unwrap();
             staged.stage_word(payload).unwrap();
             let candidate = staged.finish_load().unwrap();
+            assert!(candidate.projections[0]
+                .accesses
+                .iter()
+                .all(|projection| projection.touch_generation.0 == 1));
             let lanes = fragment_lanes(word.physical()).unwrap();
             for (lane, address) in lanes.into_iter().enumerate() {
                 assert!(candidate.valid[address]);
