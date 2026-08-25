@@ -26,7 +26,62 @@ def row(
     )
 
 
+def armed_row(
+    index: int,
+    wall_ms: float,
+    swapped: bool,
+    completion_before: int,
+    completion_after: int,
+    phases: tuple[float, ...],
+) -> str:
+    assert len(phases) == 11
+    return ",".join(
+        (
+            row(index, wall_ms, swapped),
+            str(completion_before),
+            str(completion_after),
+            *(f"{value:.4f}" for value in phases),
+        )
+    )
+
+
 class PumpCensusSummaryTests(unittest.TestCase):
+    def test_legacy_rows_remain_supported_without_phase_claims(self) -> None:
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                row(0, 1.0, True),
+                row(1, 2.0, False),
+                row(2, 3.0, True),
+            ]
+        )
+        result = MODULE.summarize(text)
+        self.assertEqual(len(MODULE.parse_pumps(text)), 3)
+        self.assertEqual(result["task_cpu_phase_frames"], {"available": False})
+
+    def test_expanded_rows_fold_completion_range_and_phase_totals(self) -> None:
+        zero = (0.0,) * 11
+        first = (10.0, 2.0, 5.0, 3.0, 8.0, 1.5, 0.4, 0.1, 0.0, 2.0, 1.0)
+        second = (20.0, 4.0, 11.0, 6.0, 17.0, 3.0, 0.8, 0.2, 0.0, 3.0, 2.0)
+        text = "\n".join(
+            [
+                "[pump-census] RENDERER: wgpu",
+                armed_row(0, 1.0, True, 7, 7, zero),
+                armed_row(1, 2.0, False, 7, 8, first),
+                armed_row(2, 3.0, True, 8, 9, second),
+            ]
+        )
+        result = MODULE.summarize(text)
+        phases = result["task_cpu_phase_frames"]
+        self.assertTrue(phases["available"])
+        self.assertEqual(phases["metrics"]["task_completions"]["mean"], 2.0)
+        self.assertEqual(phases["metrics"]["task_envelope_ms"]["mean"], 30.0)
+        self.assertEqual(phases["metrics"]["task_renderer_work_ms"]["mean"], 25.0)
+        self.assertEqual(phases["metrics"]["task_outer_residual_ms"]["mean"], 5.0)
+        self.assertEqual(
+            phases["metrics"]["task_rdp_outside_envelope_ms"]["mean"], 3.0
+        )
+
     def test_drawn_frames_are_measured_between_consecutive_swaps(self) -> None:
         text = "\n".join(
             [
