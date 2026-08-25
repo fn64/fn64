@@ -31,6 +31,13 @@ static NEXT_PHYSICAL_TMEM_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+std::thread_local! {
+    static NEUTRAL_TRANSFER_WORD_CONVERSIONS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
 /// Uncaller-chosen identity of one durable physical TMEM allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PhysicalTmemStateIdentity(u64);
@@ -430,18 +437,20 @@ impl PhysicalTmemPacketTransaction {
         load: &fn64_render::TmemLoadSemantics,
         destination_accesses: &[ResourceAccess],
     ) -> Result<StagedTmemTransaction, PhysicalTmemError> {
-        let load_binding = neutral_validate_transfer(
-            load,
-            destination_accesses,
-            expected_source,
-            self.last_load_epoch,
-        )?;
-        let words: Vec<TmemTransferWord> = load
+        let words = load
             .transfer_words()
             .iter()
             .copied()
             .map(neutral_transfer_word)
-            .collect();
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let load_binding = neutral_validate_transfer(
+            load,
+            destination_accesses,
+            &words,
+            expected_source,
+            self.last_load_epoch,
+        )?;
         self.expected_destination_accesses = self
             .expected_destination_accesses
             .iter()
@@ -453,7 +462,7 @@ impl PhysicalTmemPacketTransaction {
             packet: self,
             load_binding,
             destination_accesses: destination_accesses.to_vec().into_boxed_slice(),
-            words: words.into_boxed_slice(),
+            words,
             next_word: 0,
             poisoned: false,
         })
@@ -1663,6 +1672,7 @@ fn neutral_packet_binding(
 fn neutral_validate_transfer(
     load: &fn64_render::TmemLoadSemantics,
     destination_accesses: &[ResourceAccess],
+    words: &[TmemTransferWord],
     // Unlike `validate_transfer`'s `expected_source` (checked against a
     // per-load `TmemLoadSourcePlan::identity()` the decoder path derives
     // independently per load), the neutral path has exactly one source
@@ -1679,13 +1689,7 @@ fn neutral_validate_transfer(
     _source: TmemLoadSourceIdentity,
     previous_epoch: Option<TmemLoadEpoch>,
 ) -> Result<PhysicalTmemLoadBinding, PhysicalTmemError> {
-    let words: Vec<TmemTransferWord> = load
-        .transfer_words()
-        .iter()
-        .copied()
-        .map(neutral_transfer_word)
-        .collect();
-    validate_physical_plan(destination_accesses, &words)?;
+    validate_physical_plan(destination_accesses, words)?;
     let epoch = neutral_load_epoch(load.epoch());
     if previous_epoch.is_some_and(|previous| epoch.get() <= previous.get()) {
         return Err(PhysicalTmemError::EpochNotNewer {
@@ -1726,6 +1730,10 @@ fn neutral_validate_transfer(
 /// `fn64-render`), so this conversion is a straight field copy, never a
 /// recomputation.
 fn neutral_transfer_word(word: fn64_render::NeutralTmemTransferWord) -> TmemTransferWord {
+    #[cfg(test)]
+    NEUTRAL_TRANSFER_WORD_CONVERSIONS.with(|conversions| {
+        conversions.set(conversions.get() + 1);
+    });
     TmemTransferWord::new(
         word.index,
         word.logical_source_offset,
@@ -2639,8 +2647,15 @@ mod tests {
             ResourceRegion::Tmem(TmemRange::try_new(0, 64).unwrap()),
         )
         .unwrap()];
+        let wide_words = wide
+            .transfer_words()
+            .iter()
+            .copied()
+            .map(neutral_transfer_word)
+            .collect::<Vec<_>>();
         let wide_binding =
-            neutral_validate_transfer(&wide, &wide_destination, identity, None).unwrap();
+            neutral_validate_transfer(&wide, &wide_destination, &wide_words, identity, None)
+                .unwrap();
 
         assert_eq!(
             wide_binding.source_access_count, 8,
@@ -2655,6 +2670,82 @@ mod tests {
             "a collapsed identity would make an 8-row load indistinguishable from a 1-row one"
         );
         assert_eq!(wide_binding.source_first_access_index, 1);
+    }
+
+    #[test]
+    fn neutral_staging_converts_each_word_once_and_keeps_validation_and_poisoning() {
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let load = neutral_load_with_source_rows(layout, 8);
+        let destination = [ResourceAccess::try_new(
+            OperationId::new(9),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, 64).unwrap()),
+        )
+        .unwrap()];
+        let invalid_destination = [ResourceAccess::try_new(
+            OperationId::new(9),
+            AccessMode::Write,
+            fn64_render_ir::AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, 56).unwrap()),
+        )
+        .unwrap()];
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let submitted = queue.submit(DecodedTicket::new(planned_packet(1))).unwrap();
+        let identity = TmemLoadSourceIdentity::new(
+            submitted.packet().identity(),
+            submitted.packet().journal().identity(),
+            submitted.identity(),
+            submitted.packet().memory_layout(),
+        );
+        let state = PhysicalTmemState::try_new().unwrap();
+
+        assert_eq!(
+            state
+                .stage_neutral_transfer(
+                    identity,
+                    submitted.queue(),
+                    submitted.ordinal(),
+                    1,
+                    &load,
+                    &invalid_destination,
+                )
+                .unwrap_err(),
+            PhysicalTmemError::DestinationPlanMismatch
+        );
+
+        NEUTRAL_TRANSFER_WORD_CONVERSIONS.with(|conversions| conversions.set(0));
+        let mut staged = state
+            .stage_neutral_transfer(
+                identity,
+                submitted.queue(),
+                submitted.ordinal(),
+                1,
+                &load,
+                &destination,
+            )
+            .unwrap();
+        assert_eq!(
+            NEUTRAL_TRANSFER_WORD_CONVERSIONS.with(core::cell::Cell::get),
+            load.transfer_words().len()
+        );
+
+        let wrong = staged.expected_words()[1];
+        let wrong = staged
+            .physical_word_payload(wrong, defined_physical_lanes(wrong, 0))
+            .unwrap();
+        assert!(matches!(
+            staged.stage_word(wrong),
+            Err(PhysicalTmemError::FragmentMismatch { .. })
+        ));
+        let right = staged.expected_words()[0];
+        let right = staged
+            .physical_word_payload(right, defined_physical_lanes(right, 0))
+            .unwrap();
+        assert_eq!(
+            staged.stage_word(right).unwrap_err(),
+            PhysicalTmemError::PoisonedTransaction
+        );
     }
 
     fn load_tile_words(load_count: usize) -> Vec<u32> {
