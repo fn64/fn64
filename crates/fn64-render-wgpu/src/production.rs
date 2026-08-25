@@ -132,48 +132,62 @@ mod raw_dpc_execute_census {
     }
 
     pub(super) fn timed<R>(phase: Phase, operation: impl FnOnce() -> R) -> R {
-        if !enabled() {
-            return operation();
+        timed_observed(phase, false, operation).0
+    }
+
+    /// Share one coarse phase clock with a task-local observer. `observed`
+    /// receives the elapsed value without arming this census's process totals;
+    /// when both consumers are disabled the closure runs without a clock read.
+    pub(super) fn timed_observed<R>(
+        phase: Phase,
+        observed: bool,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Option<u64>) {
+        let census_enabled = enabled();
+        if !census_enabled && !observed {
+            return (operation(), None);
         }
         let started = std::time::Instant::now();
         let value = operation();
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        match phase {
-            Phase::View => &VIEW_NS,
-            Phase::Stage => &STAGE_NS,
-            Phase::Color => &COLOR_NS,
-            Phase::ColorFill => &COLOR_FILL_NS,
-            Phase::ColorTexrect => &COLOR_TEXRECT_NS,
-            Phase::ColorTriangle => &COLOR_TRIANGLE_NS,
-            Phase::ColorFinalize => &COLOR_FINALIZE_NS,
-            Phase::Complete => &COMPLETE_NS,
-            Phase::DrawValidation => &DRAW_VALIDATION_NS,
-        }
-        .fetch_add(elapsed, Relaxed);
-        match phase {
-            Phase::ColorFill => &COLOR_FILL_CALLS,
-            Phase::ColorTexrect => &COLOR_TEXRECT_CALLS,
-            Phase::ColorTriangle => &COLOR_TRIANGLE_CALLS,
-            Phase::ColorFinalize => &COLOR_FINALIZE_CALLS,
-            _ => &SUBMISSIONS,
-        }
-        .fetch_add(
-            u64::from(matches!(
-                phase,
-                Phase::ColorFill
-                    | Phase::ColorTexrect
-                    | Phase::ColorTriangle
-                    | Phase::ColorFinalize
-            )),
-            Relaxed,
-        );
-        if matches!(phase, Phase::View) {
-            let submissions = SUBMISSIONS.fetch_add(1, Relaxed) + 1;
-            if submissions % 10_000 == 0 {
-                report(submissions);
+        if census_enabled {
+            match phase {
+                Phase::View => &VIEW_NS,
+                Phase::Stage => &STAGE_NS,
+                Phase::Color => &COLOR_NS,
+                Phase::ColorFill => &COLOR_FILL_NS,
+                Phase::ColorTexrect => &COLOR_TEXRECT_NS,
+                Phase::ColorTriangle => &COLOR_TRIANGLE_NS,
+                Phase::ColorFinalize => &COLOR_FINALIZE_NS,
+                Phase::Complete => &COMPLETE_NS,
+                Phase::DrawValidation => &DRAW_VALIDATION_NS,
+            }
+            .fetch_add(elapsed, Relaxed);
+            match phase {
+                Phase::ColorFill => &COLOR_FILL_CALLS,
+                Phase::ColorTexrect => &COLOR_TEXRECT_CALLS,
+                Phase::ColorTriangle => &COLOR_TRIANGLE_CALLS,
+                Phase::ColorFinalize => &COLOR_FINALIZE_CALLS,
+                _ => &SUBMISSIONS,
+            }
+            .fetch_add(
+                u64::from(matches!(
+                    phase,
+                    Phase::ColorFill
+                        | Phase::ColorTexrect
+                        | Phase::ColorTriangle
+                        | Phase::ColorFinalize
+                )),
+                Relaxed,
+            );
+            if matches!(phase, Phase::View) {
+                let submissions = SUBMISSIONS.fetch_add(1, Relaxed) + 1;
+                if submissions % 10_000 == 0 {
+                    report(submissions);
+                }
             }
         }
-        value
+        (value, observed.then_some(elapsed))
     }
 
     fn report(submissions: u64) {
@@ -238,6 +252,52 @@ mod raw_dpc_execute_census {
 /// semantic restructuring or per-draw clocks. The disabled path performs only
 /// the cached flag check made by [`Task::begin`]; no clocks, census-owned
 /// allocations, or program classification are reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskCpuPhaseRunningTotals {
+    pub completed_tasks: u64,
+    pub task_envelope_ns: u64,
+    pub attributed_members: u64,
+    pub cpu_member_ns: u64,
+    pub all_cpu_member_ns: u64,
+    pub compute_segment_ns: u64,
+    pub source_binding_load_ns: u64,
+    pub prefix_capture_ns: u64,
+    pub schedule_decode_row_prep_raster_ns: u64,
+    pub candidate_seed_copy_ns: u64,
+    pub execution_view_gross_ns: u64,
+    pub finalize_coordinator_ns: u64,
+}
+
+impl TaskCpuPhaseRunningTotals {
+    pub fn member_accounted_ns(self) -> u64 {
+        self.source_binding_load_ns
+            .saturating_add(self.prefix_capture_ns)
+            .saturating_add(self.schedule_decode_row_prep_raster_ns)
+            .saturating_add(self.candidate_seed_copy_ns)
+    }
+
+    pub fn execution_view_captured_read_plan_residual_ns(self) -> u64 {
+        self.execution_view_gross_ns
+            .saturating_sub(self.member_accounted_ns())
+    }
+
+    pub fn post_view_wrapper_residual_ns(self) -> u64 {
+        self.cpu_member_ns
+            .saturating_sub(self.execution_view_gross_ns)
+            .saturating_sub(self.finalize_coordinator_ns)
+    }
+
+    pub fn outer_task_residual_ns(self) -> u64 {
+        self.task_envelope_ns
+            .saturating_sub(self.renderer_work_ns())
+    }
+
+    pub fn renderer_work_ns(self) -> u64 {
+        self.all_cpu_member_ns
+            .saturating_add(self.compute_segment_ns)
+    }
+}
+
 mod task_cpu_phase_census {
     use std::sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -251,12 +311,14 @@ mod task_cpu_phase_census {
         PrefixCapture,
         ScheduleDecodeRowPrepRaster,
         CandidateSeedCopy,
+        ExecutionViewGross,
+        FinalizeCoordinator,
         SparseCheckpoint,
         GuestPayloadMaterialization,
         SparsePublication,
     }
 
-    const PHASE_COUNT: usize = 7;
+    const PHASE_COUNT: usize = 9;
     const SOURCE_SUBPHASE_COUNT: usize = 5;
     const MEMBER_PHASES: [Phase; 4] = [
         Phase::SourceBindingLoad,
@@ -266,8 +328,11 @@ mod task_cpu_phase_census {
     ];
 
     static TASKS: AtomicU64 = AtomicU64::new(0);
+    static TASK_ENVELOPE_NS: AtomicU64 = AtomicU64::new(0);
     static MEMBERS: AtomicU64 = AtomicU64::new(0);
     static CPU_MEMBER_NS: AtomicU64 = AtomicU64::new(0);
+    static ALL_CPU_MEMBER_NS: AtomicU64 = AtomicU64::new(0);
+    static COMPUTE_SEGMENT_NS: AtomicU64 = AtomicU64::new(0);
     static PHASE_NS: [AtomicU64; PHASE_COUNT] = [const { AtomicU64::new(0) }; PHASE_COUNT];
     static SOURCE_SUBPHASE_NS: [AtomicU64; SOURCE_SUBPHASE_COUNT] =
         [const { AtomicU64::new(0) }; SOURCE_SUBPHASE_COUNT];
@@ -318,12 +383,19 @@ mod task_cpu_phase_census {
         source_subphase_ns: [u64; SOURCE_SUBPHASE_COUNT],
         source_counters: SourceCounters,
         cpu_member_ns: u64,
+        all_cpu_member_ns: u64,
+        compute_segment_ns: u64,
         members: u64,
         publications_remaining: usize,
+        envelope_started: Option<std::time::Instant>,
+        task_envelope_ns: u64,
     }
 
     impl Task {
-        pub(super) fn begin(publications: usize) -> Option<Self> {
+        pub(super) fn begin(
+            publications: usize,
+            envelope_started: Option<std::time::Instant>,
+        ) -> Option<Self> {
             assert!(
                 publications > 0,
                 "a task CPU phase census requires at least one eventual publication"
@@ -336,17 +408,46 @@ mod task_cpu_phase_census {
                 source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
                 source_counters: SourceCounters::default(),
                 cpu_member_ns: 0,
+                all_cpu_member_ns: 0,
+                compute_segment_ns: 0,
                 members: 0,
                 publications_remaining: publications,
+                envelope_started,
+                task_envelope_ns: 0,
             })
         }
 
         pub(super) fn record_member_total(&mut self, attributed: bool, elapsed_ns: Option<u64>) {
+            self.all_cpu_member_ns = self
+                .all_cpu_member_ns
+                .saturating_add(elapsed_ns.unwrap_or(0));
             if !attributed {
                 return;
             }
             self.members = self.members.saturating_add(1);
             self.cpu_member_ns = self.cpu_member_ns.saturating_add(elapsed_ns.unwrap_or(0));
+        }
+
+        pub(super) fn record_compute_segment(&mut self, elapsed_ns: Option<u64>) {
+            self.compute_segment_ns = self
+                .compute_segment_ns
+                .saturating_add(elapsed_ns.unwrap_or(0));
+        }
+
+        pub(super) fn record_member_envelope(
+            &mut self,
+            attributed: bool,
+            execution_view_ns: Option<u64>,
+            finalize_coordinator_ns: Option<u64>,
+        ) {
+            if !attributed {
+                return;
+            }
+            self.record(Phase::ExecutionViewGross, execution_view_ns.unwrap_or(0));
+            self.record(
+                Phase::FinalizeCoordinator,
+                finalize_coordinator_ns.unwrap_or(0),
+            );
         }
 
         fn record(&mut self, phase: Phase, elapsed_ns: u64) {
@@ -383,6 +484,10 @@ mod task_cpu_phase_census {
                 .checked_sub(1)
                 .expect("a task CPU phase census observes at most one publication per member");
             if self.publications_remaining == 0 {
+                self.task_envelope_ns = self
+                    .envelope_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
                 merge(self);
                 None
             } else {
@@ -414,6 +519,32 @@ mod task_cpu_phase_census {
 
     pub(super) fn wants_member_clock() -> bool {
         enabled()
+    }
+
+    pub(super) fn task_started() -> Option<std::time::Instant> {
+        enabled().then(std::time::Instant::now)
+    }
+
+    pub(super) fn running_totals() -> Option<super::TaskCpuPhaseRunningTotals> {
+        if !enabled() {
+            return None;
+        }
+        Some(super::TaskCpuPhaseRunningTotals {
+            completed_tasks: TASKS.load(Relaxed),
+            task_envelope_ns: TASK_ENVELOPE_NS.load(Relaxed),
+            attributed_members: MEMBERS.load(Relaxed),
+            cpu_member_ns: CPU_MEMBER_NS.load(Relaxed),
+            all_cpu_member_ns: ALL_CPU_MEMBER_NS.load(Relaxed),
+            compute_segment_ns: COMPUTE_SEGMENT_NS.load(Relaxed),
+            source_binding_load_ns: PHASE_NS[Phase::SourceBindingLoad as usize].load(Relaxed),
+            prefix_capture_ns: PHASE_NS[Phase::PrefixCapture as usize].load(Relaxed),
+            schedule_decode_row_prep_raster_ns: PHASE_NS
+                [Phase::ScheduleDecodeRowPrepRaster as usize]
+                .load(Relaxed),
+            candidate_seed_copy_ns: PHASE_NS[Phase::CandidateSeedCopy as usize].load(Relaxed),
+            execution_view_gross_ns: PHASE_NS[Phase::ExecutionViewGross as usize].load(Relaxed),
+            finalize_coordinator_ns: PHASE_NS[Phase::FinalizeCoordinator as usize].load(Relaxed),
+        })
     }
 
     pub(super) fn timed<R>(
@@ -545,8 +676,11 @@ mod task_cpu_phase_census {
     }
 
     fn merge(task: Task) {
+        TASK_ENVELOPE_NS.fetch_add(task.task_envelope_ns, Relaxed);
         MEMBERS.fetch_add(task.members, Relaxed);
         CPU_MEMBER_NS.fetch_add(task.cpu_member_ns, Relaxed);
+        ALL_CPU_MEMBER_NS.fetch_add(task.all_cpu_member_ns, Relaxed);
+        COMPUTE_SEGMENT_NS.fetch_add(task.compute_segment_ns, Relaxed);
         for (total, elapsed) in PHASE_NS.iter().zip(task.phase_ns) {
             total.fetch_add(elapsed, Relaxed);
         }
@@ -586,7 +720,9 @@ mod task_cpu_phase_census {
         });
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "[task-cpu-phase-census] tasks={tasks} members={} cpu_member_total_ms={:.3} \
+            "[task-cpu-phase-census] tasks={tasks} task_envelope_ms={:.3} \
+             all_cpu_member_ms={:.3} compute_segment_ms={:.3} renderer_work_ms={:.3} \
+             outer_task_residual_ms={:.3} members={} cpu_member_total_ms={:.3} \
              member_accounted_ms={:.3} residual_ms={:.3} source_binding_load_ms={:.3} \
              source_subphase_sum_ms={:.3} source_residual_ms={:.3} \
              source_packet_captured_read_bind_ms={:.3} source_load_access_bind_ms={:.3} \
@@ -595,9 +731,22 @@ mod task_cpu_phase_census {
              destination_accesses={} first_loads={} \
              cumulative_expected_destination_elements={} projected_destination_bytes={} \
              prefix_capture_ms={:.3} schedule_decode_row_prep_raster_ms={:.3} \
-             candidate_seed_copy_ms={:.3} \
+             candidate_seed_copy_ms={:.3} execution_view_gross_ms={:.3} \
+             execution_view_captured_read_plan_residual_ms={:.3} \
+             finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
              sparse_checkpoint_ms={:.3} guest_payload_materialization_ms={:.3} \
              sparse_publication_ms={:.3}",
+            ms(TASK_ENVELOPE_NS.load(Relaxed)),
+            ms(ALL_CPU_MEMBER_NS.load(Relaxed)),
+            ms(COMPUTE_SEGMENT_NS.load(Relaxed)),
+            ms(ALL_CPU_MEMBER_NS
+                .load(Relaxed)
+                .saturating_add(COMPUTE_SEGMENT_NS.load(Relaxed))),
+            ms(TASK_ENVELOPE_NS.load(Relaxed).saturating_sub(
+                ALL_CPU_MEMBER_NS
+                    .load(Relaxed)
+                    .saturating_add(COMPUTE_SEGMENT_NS.load(Relaxed)),
+            )),
             MEMBERS.load(Relaxed),
             ms(cpu_member_ns),
             ms(member_accounted_ns),
@@ -620,6 +769,12 @@ mod task_cpu_phase_census {
             ms(phases[Phase::PrefixCapture as usize]),
             ms(phases[Phase::ScheduleDecodeRowPrepRaster as usize]),
             ms(phases[Phase::CandidateSeedCopy as usize]),
+            ms(phases[Phase::ExecutionViewGross as usize]),
+            ms(phases[Phase::ExecutionViewGross as usize].saturating_sub(member_accounted_ns)),
+            ms(phases[Phase::FinalizeCoordinator as usize]),
+            ms(cpu_member_ns
+                .saturating_sub(phases[Phase::ExecutionViewGross as usize])
+                .saturating_sub(phases[Phase::FinalizeCoordinator as usize])),
             ms(phases[Phase::SparseCheckpoint as usize]),
             ms(phases[Phase::GuestPayloadMaterialization as usize]),
             ms(phases[Phase::SparsePublication as usize]),
@@ -646,8 +801,12 @@ mod task_cpu_phase_census {
                 source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
                 source_counters: SourceCounters::default(),
                 cpu_member_ns: 100,
+                all_cpu_member_ns: 100,
+                compute_segment_ns: 0,
                 members: 1,
                 publications_remaining: 1,
+                envelope_started: None,
+                task_envelope_ns: 0,
             };
             task.record(Phase::SourceBindingLoad, 11);
             task.record(Phase::PrefixCapture, 13);
@@ -657,6 +816,92 @@ mod task_cpu_phase_census {
             assert_eq!(task.residual_ns(), 17);
             task.cpu_member_ns = 1;
             assert_eq!(task.residual_ns(), 0, "clock nesting must saturate");
+        }
+
+        #[test]
+        fn coarse_member_envelopes_split_the_residual_and_saturate() {
+            let totals = super::super::TaskCpuPhaseRunningTotals {
+                task_envelope_ns: 200,
+                cpu_member_ns: 100,
+                all_cpu_member_ns: 120,
+                compute_segment_ns: 30,
+                source_binding_load_ns: 10,
+                prefix_capture_ns: 10,
+                schedule_decode_row_prep_raster_ns: 30,
+                candidate_seed_copy_ns: 10,
+                execution_view_gross_ns: 75,
+                finalize_coordinator_ns: 20,
+                ..Default::default()
+            };
+            assert_eq!(totals.member_accounted_ns(), 60);
+            assert_eq!(totals.execution_view_captured_read_plan_residual_ns(), 15);
+            assert_eq!(totals.post_view_wrapper_residual_ns(), 5);
+            assert_eq!(totals.renderer_work_ns(), 150);
+            assert_eq!(totals.outer_task_residual_ns(), 50);
+
+            let inverted = super::super::TaskCpuPhaseRunningTotals {
+                cpu_member_ns: 1,
+                all_cpu_member_ns: 3,
+                compute_segment_ns: 2,
+                task_envelope_ns: 4,
+                source_binding_load_ns: 4,
+                execution_view_gross_ns: 3,
+                finalize_coordinator_ns: 2,
+                ..Default::default()
+            };
+            assert_eq!(inverted.execution_view_captured_read_plan_residual_ns(), 0);
+            assert_eq!(inverted.post_view_wrapper_residual_ns(), 0);
+            assert_eq!(inverted.outer_task_residual_ns(), 0);
+        }
+
+        #[test]
+        fn non_attributed_member_records_no_coarse_envelope() {
+            let mut task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
+                cpu_member_ns: 0,
+                all_cpu_member_ns: 0,
+                compute_segment_ns: 0,
+                members: 0,
+                publications_remaining: 1,
+                envelope_started: None,
+                task_envelope_ns: 0,
+            };
+            task.record_member_envelope(false, Some(75), Some(20));
+            assert_eq!(task.phase_ns[Phase::ExecutionViewGross as usize], 0);
+            assert_eq!(task.phase_ns[Phase::FinalizeCoordinator as usize], 0);
+            task.record_member_total(false, Some(7));
+            task.record_compute_segment(Some(5));
+            assert_eq!(task.cpu_member_ns, 0);
+            assert_eq!(task.all_cpu_member_ns, 7);
+            assert_eq!(task.compute_segment_ns, 5);
+            task.record_member_envelope(true, Some(75), Some(20));
+            assert_eq!(task.phase_ns[Phase::ExecutionViewGross as usize], 75);
+            assert_eq!(task.phase_ns[Phase::FinalizeCoordinator as usize], 20);
+        }
+
+        #[test]
+        fn completion_ordinal_advances_only_at_the_final_publication() {
+            let before = TASKS.load(Relaxed);
+            let task = Task {
+                phase_ns: [0; PHASE_COUNT],
+                source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
+                source_counters: SourceCounters::default(),
+                cpu_member_ns: 0,
+                all_cpu_member_ns: 0,
+                compute_segment_ns: 0,
+                members: 0,
+                publications_remaining: 2,
+                envelope_started: None,
+                task_envelope_ns: 0,
+            };
+            let task = task
+                .publication_finished()
+                .expect("the first publication retains the task-local census");
+            assert_eq!(TASKS.load(Relaxed), before);
+            assert!(task.publication_finished().is_none());
+            assert_eq!(TASKS.load(Relaxed), before + 1);
         }
 
         #[test]
@@ -679,8 +924,12 @@ mod task_cpu_phase_census {
                 source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
                 source_counters: SourceCounters::default(),
                 cpu_member_ns: 0,
+                all_cpu_member_ns: 0,
+                compute_segment_ns: 0,
                 members: 0,
                 publications_remaining: 1,
+                envelope_started: None,
+                task_envelope_ns: 0,
             };
             let mut ticks = [TestInstant(3), TestInstant(14)].into_iter();
             let value = timed_with_clock(
@@ -705,8 +954,12 @@ mod task_cpu_phase_census {
                 source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
                 source_counters: SourceCounters::default(),
                 cpu_member_ns: 29,
+                all_cpu_member_ns: 29,
+                compute_segment_ns: 0,
                 members: 1,
                 publications_remaining: 1,
+                envelope_started: None,
+                task_envelope_ns: 0,
             };
             let mut ticks = [TestInstant(5), TestInstant(18)].into_iter();
             let value = timed_optional_with_clock(
@@ -733,8 +986,12 @@ mod task_cpu_phase_census {
                 source_subphase_ns: [0; SOURCE_SUBPHASE_COUNT],
                 source_counters: SourceCounters::default(),
                 cpu_member_ns: 0,
+                all_cpu_member_ns: 0,
+                compute_segment_ns: 0,
                 members: 1,
                 publications_remaining: 1,
+                envelope_started: None,
+                task_envelope_ns: 0,
             };
             task.record(Phase::SourceBindingLoad, 101);
             task.record_source_subphase(SourceSubphase::PacketCapturedReadBind, 7);
@@ -842,6 +1099,13 @@ mod task_cpu_phase_census {
     }
 }
 
+/// Running totals for completed Wgpu raw-DPC task batches. The task ordinal
+/// advances only after the final publication; it is deliberately independent
+/// of ABI `gfx_tasks`, which counts earlier `osSpTaskLoad` admissions.
+pub fn task_cpu_phase_running_totals() -> Option<TaskCpuPhaseRunningTotals> {
+    task_cpu_phase_census::running_totals()
+}
+
 /// Task-transport census for the opt-in compute replacement. It records only
 /// task/segment boundaries and prints every 30 graphics tasks, making short
 /// live A/B runs answer whether the kernel was actually reached and how much
@@ -905,7 +1169,12 @@ mod task_compute_census {
     }
 
     pub(super) fn segment_started() -> Option<std::time::Instant> {
-        enabled().then(std::time::Instant::now)
+        (enabled() || super::task_cpu_phase_census::wants_member_clock())
+            .then(std::time::Instant::now)
+    }
+
+    pub(super) fn wants_program_attribution() -> bool {
+        enabled()
     }
 
     pub(super) fn cpu_started() -> Option<std::time::Instant> {
@@ -947,16 +1216,16 @@ mod task_compute_census {
         members: usize,
         program: Option<super::ComputeProgramAttribution>,
         started: Option<std::time::Instant>,
-    ) {
+    ) -> Option<u64> {
+        let elapsed =
+            started.map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         if !enabled() {
-            return;
+            return elapsed;
         }
         let program = program.expect("enabled segment census classifies its program mix");
         SEGMENTS.fetch_add(1, Relaxed);
         COMPUTE_MEMBERS.fetch_add(u64::try_from(members).unwrap_or(u64::MAX), Relaxed);
-        let elapsed = started
-            .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+        let elapsed = elapsed.unwrap_or(0);
         COMPUTE_NS.fetch_add(elapsed, Relaxed);
         COMPUTE_PROGRAMS.with(|programs| {
             accumulate_program(&mut programs.borrow_mut(), program, members, elapsed);
@@ -973,6 +1242,7 @@ mod task_compute_census {
                 accumulate_program(&mut programs.borrow_mut(), program, members, elapsed);
             });
         }
+        Some(elapsed)
     }
 
     fn accumulate_program(
@@ -1242,7 +1512,7 @@ mod task_compute_census {
         fn enabled_segment_path_records_nonempty_program_member_denominator() {
             with_census_enabled(|| {
                 let started = segment_started();
-                record_segment(
+                let _ = record_segment(
                     2,
                     Some(super::super::ComputeProgramAttribution::Program(2)),
                     started,
@@ -4926,6 +5196,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bounds: Vec<BoundSubmittedRawDpc>,
     ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
+        let task_cpu_phase_started = task_cpu_phase_census::task_started();
         assert!(
             self.task_cpu_phase_census.is_none(),
             "a task CPU phase census must reach its final publication before the next task"
@@ -4973,7 +5244,8 @@ impl RenderBackend for WgpuBackend {
         let mut prepared = Vec::with_capacity(bounds.len());
         let mut guest_read_pool = TaskGuestReadCapturePool::default();
         let mut ordered_cpu_color_batch = OrderedCpuColorBatch::new();
-        let mut task_cpu_phase_census = task_cpu_phase_census::Task::begin(bounds.len());
+        let mut task_cpu_phase_census =
+            task_cpu_phase_census::Task::begin(bounds.len(), task_cpu_phase_started);
         let mut compute_members = 0usize;
         let mut cpu_members = 0usize;
         {
@@ -5068,17 +5340,19 @@ impl RenderBackend for WgpuBackend {
                         .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                         .map_err(RenderError::from)?;
                     let segment_members = staged_segment.len();
-                    let program_attribution = segment_started
-                        .is_some()
+                    let program_attribution = task_compute_census::wants_program_attribution()
                         .then(|| compute_segment_program_attribution(&staged_segment));
                     let completed_segment =
                         complete_deferred_compute_segment(&mut batch, pipeline, staged_segment)
                             .map_err(RenderError::from)?;
-                    task_compute_census::record_segment(
+                    let compute_elapsed = task_compute_census::record_segment(
                         segment_members,
                         program_attribution,
                         segment_started,
                     );
+                    if let Some(task) = task_cpu_phase_census.as_mut() {
+                        task.record_compute_segment(compute_elapsed);
+                    }
                     compute_members += segment_members;
                     let mut completed = completed_segment.iter();
                     let first = completed
@@ -5846,6 +6120,7 @@ struct StagedRawDpcMember {
     draw_tmem: Option<Vec<TmemGpuProjection>>,
     compute_probes: Vec<ComputeRasterProbe>,
     compute_replacement_receipt: Option<ComputeRasterProbeReceipt>,
+    execution_view_gross_ns: Option<u64>,
 }
 
 fn compute_segment_program_attribution(
@@ -5949,6 +6224,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     defer_compute_replacement: bool,
     task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
 ) -> Result<StagedRawDpcMember, StagedRawDpcFailure> {
+    let observe_task_envelope = task_cpu_phase_census.is_some();
     let mut plan_visitor = PlanCollector::seeded(carry_in);
     let mut view = ExecutionCollector {
         physical: physical_override.unwrap_or_else(|| coordinator.physical()),
@@ -5974,9 +6250,11 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         defer_compute_replacement,
         deferred_compute: None,
     };
-    raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::View, || {
-        coordinator.execution_view(&bound, &mut plan_visitor, &mut view)
-    });
+    let (_, execution_view_gross_ns) = raw_dpc_execute_census::timed_observed(
+        raw_dpc_execute_census::Phase::View,
+        observe_task_envelope,
+        || coordinator.execution_view(&bound, &mut plan_visitor, &mut view),
+    );
     let _ = plan_visitor; // plan contents were moved into `view.plan` by `plan_visited`
 
     let outcome = view
@@ -5990,6 +6268,7 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
             draw_tmem: view.draw_tmem,
             compute_probes: view.compute_probes,
             compute_replacement_receipt: view.compute_replacement_receipt,
+            execution_view_gross_ns,
         }),
         Err(error) => Err(StagedRawDpcFailure { bound, error }),
     }
@@ -6053,6 +6332,7 @@ fn admit_task_compute_member<C: PhysicalExecutionCoordinator>(
 fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     coordinator: &mut C,
     staged_member: StagedRawDpcMember,
+    observe_task_envelope: bool,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -6061,6 +6341,8 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         Option<Vec<TmemGpuProjection>>,
         Vec<ComputeRasterProbe>,
         Option<ComputeRasterProbeReceipt>,
+        Option<u64>,
+        Option<u64>,
     ),
     WgpuRawDpcExecutionError,
 > {
@@ -6071,10 +6353,12 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         draw_tmem,
         compute_probes,
         compute_replacement_receipt,
+        execution_view_gross_ns,
     } = staged_member;
     let submission = bound.submission();
-    let (prepared, pending) = raw_dpc_execute_census::timed(
+    let (completed, finalize_coordinator_ns) = raw_dpc_execute_census::timed_observed(
         raw_dpc_execute_census::Phase::Complete,
+        observe_task_envelope,
         || -> Result<_, WgpuRawDpcExecutionError> {
             let mut pending = None;
             let prepared = match outcome {
@@ -6153,7 +6437,8 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
             };
             Ok((prepared, pending))
         },
-    )?;
+    );
+    let (prepared, pending) = completed?;
 
     Ok((
         prepared,
@@ -6162,6 +6447,8 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         draw_tmem,
         compute_probes,
         compute_replacement_receipt,
+        execution_view_gross_ns,
+        finalize_coordinator_ns,
     ))
 }
 
@@ -6177,7 +6464,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
     compute_replacement_pipeline: Option<&mut TrianglePipelineRenderer>,
     task_guest_read_pool: Option<&mut TaskGuestReadCapturePool>,
     ordered_cpu_color_batch: Option<&mut OrderedCpuColorBatch>,
-    task_cpu_phase_census: Option<&mut task_cpu_phase_census::Task>,
+    mut task_cpu_phase_census: Option<&mut task_cpu_phase_census::Task>,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -6202,12 +6489,20 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
         compute_replacement_pipeline,
         None,
         ordered_cpu_color_batch,
-        task_cpu_phase_census,
+        task_cpu_phase_census.as_deref_mut(),
         false,
         task_guest_read_pool,
     )
     .map_err(|failure| failure.error)?;
-    complete_staged_raw_dpc_member(coordinator, staged)
+    let (prepared, triangles, pending, draw_tmem, probes, receipt, view_ns, complete_ns) =
+        complete_staged_raw_dpc_member(coordinator, staged, task_cpu_phase_census.is_some())?;
+    let attributed = pending
+        .as_ref()
+        .is_some_and(|pending| pending.cpu_phase_attributed);
+    if let Some(task) = task_cpu_phase_census {
+        task.record_member_envelope(attributed, view_ns, complete_ns);
+    }
+    Ok((prepared, triangles, pending, draw_tmem, probes, receipt))
 }
 
 struct CompletedDeferredSegmentMember {
@@ -6452,8 +6747,8 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 },
             )
         };
-        let (prepared, _triangles, pending, _draw_tmem, _, _) =
-            complete_staged_raw_dpc_member(coordinator, member)?;
+        let (prepared, _triangles, pending, _draw_tmem, _, _, _, _) =
+            complete_staged_raw_dpc_member(coordinator, member, false)?;
         let pending = pending.expect("a deferred color completion produces a publication token");
         assert_eq!(pending.submission, submission);
         completed_members.push(CompletedDeferredSegmentMember {

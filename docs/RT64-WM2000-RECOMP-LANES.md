@@ -631,6 +631,31 @@ trailing pad sitting after a `return`/unconditional transfer — control never
 enters them via `pc`. The class is enumerated and closed, not open-ended; no
 general escaping-control-flow mechanism is outstanding.
 
+## Completion-ordinal CPU phase join (2026-08-25)
+
+`FN64_TASK_CPU_PHASE_CENSUS=1` now publishes monotonic Wgpu task-completion
+totals at the task's final raw-DPC publication. When the shell pump census is
+also armed, it differences those totals at pump boundaries and reports the
+renderer completion-ordinal interval `(before, after]` independently of
+`gfx_tasks`. That separation is load-bearing: `gfx_tasks` counts the earlier
+`osSpTaskLoad` admission, which can be replaced before kickoff or separated
+from renderer completion by a yielded task, so it is not a completion
+identity.
+
+The same gate adds only task/member-boundary clocks. One shared coarse clock
+measures `execution_view`, another measures coordinator completion, and the
+existing nested member phases are subtracted from the former to produce the
+captured-read/plan residual. A task-envelope clock runs from batch-execute
+entry through final publication. Existing CPU-member and compute-segment
+clocks close that envelope into renderer work plus an outer residual; the pump
+report separately subtracts the whole envelope from `gfx_lle_rdp_ns`, naming
+planning/session work outside the envelope rather than folding it into the
+renderer remainder.
+There are no per-draw or per-read clocks. The shell folds pump deltas into
+spans ending at VI swaps; because a bounded sample window normally begins and
+ends in the middle of a frame, it reports and excludes the incomplete prefix
+and suffix rather than presenting either as a complete drawn frame.
+
 ## Nonclaims (2026-08-18 fourth pass)
 
 - **"Runs to the step budget" is not "playable."** The lane renders and does
