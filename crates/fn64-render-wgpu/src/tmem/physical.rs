@@ -576,6 +576,18 @@ impl StagedTmemTransaction {
         &self.words
     }
 
+    /// Returns the next word this transaction will accept.
+    ///
+    /// Callers that immediately mint and stage each word can advance through
+    /// a load without cloning the complete word plan merely to end the
+    /// immutable borrow from [`Self::expected_words`]. `stage_word` remains
+    /// the authority that validates the returned word against the private
+    /// plan and advances `next_word`; an error poisons the same packet-local
+    /// transaction exactly as before.
+    pub(crate) fn next_expected_word(&self) -> Option<TmemTransferWord> {
+        self.words.get(self.next_word).copied()
+    }
+
     /// Asserts bytes that M4.2b's LoadTile, M4.2c's LoadBlock, or M4.3.2's
     /// LoadTLUT executor has already arranged into this active load's
     /// physical fragment lanes. The returned payload cannot be rebound to an
@@ -2802,8 +2814,7 @@ mod tests {
         mut staged: StagedTmemTransaction,
         first_byte: u8,
     ) -> PhysicalTmemPacketTransaction {
-        let words = staged.expected_words().to_vec();
-        for word in words {
+        while let Some(word) = staged.next_expected_word() {
             let physical_lanes = defined_physical_lanes(word, first_byte);
             let payload = staged.physical_word_payload(word, physical_lanes).unwrap();
             staged.stage_word(payload).unwrap();

@@ -15,7 +15,10 @@
 use core::fmt;
 use core::num::NonZeroUsize;
 
-use fn64_render_ir::{PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, ValidationError};
+use fn64_render_ir::{
+    CompletedWrite, PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, ResourceRegion,
+    ValidationError,
+};
 
 use crate::{ColorImage, ImageFormat, PixelSize};
 
@@ -703,6 +706,91 @@ impl InitializedCandidateColorTarget {
     pub const fn device_bytes(&self) -> &DeviceColorBytes {
         &self.device_bytes
     }
+
+    /// Captures exactly the journal-declared byte payloads of this completed
+    /// generation while leaving its one full-target image available to the
+    /// ordered task accumulator. The sparse value is independently move-only:
+    /// publication can advance this generation without retaining a second
+    /// full framebuffer image.
+    pub(crate) fn sparse_checkpoint(
+        &self,
+        writes: &[CompletedWrite],
+    ) -> Result<SparseInitializedColorCheckpoint, TargetError> {
+        let key = self.key();
+        let base = key.address().get();
+        let target_end = key.range().end();
+        let mut patches = Vec::with_capacity(writes.len());
+        for write in writes {
+            let ResourceRegion::Rdram { range, .. } = write.access().region() else {
+                return Err(TargetError::SparseCheckpointNonRdramWrite {
+                    operation: write.access().operation().get(),
+                });
+            };
+            if range.start().get() < base || range.end() > target_end {
+                return Err(TargetError::SparseCheckpointRangeOutsideTarget { key, range });
+            }
+            let start = (range.start().get() - base) as usize;
+            let end = start + range.len() as usize;
+            let bytes = self
+                .device_bytes
+                .device_bytes()
+                .get(start..end)
+                .expect("range containment proves sparse checkpoint slice bounds")
+                .to_vec()
+                .into_boxed_slice();
+            let rebound = CompletedWrite::try_from_bytes(write.access(), &bytes)
+                .map_err(TargetError::Address)?;
+            if rebound != *write {
+                return Err(TargetError::SparseCheckpointDigestMismatch {
+                    operation: write.access().operation().get(),
+                });
+            }
+            patches.push(SparseColorPatch {
+                write: *write,
+                bytes,
+            });
+        }
+        Ok(SparseInitializedColorCheckpoint {
+            key,
+            generation: self.generation(),
+            predecessor: self.candidate.predecessor,
+            proof: self.proof,
+            patches: patches.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn into_task_accumulator_bytes(self) -> Vec<u8> {
+        self.device_bytes.into_device_bytes().into_vec()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SparseColorPatch {
+    write: CompletedWrite,
+    bytes: Box<[u8]>,
+}
+
+/// Journal-bound publication authority for one task-private color
+/// generation. It owns only the byte runs the packet declared, never the
+/// full target image used to execute the next packet.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SparseInitializedColorCheckpoint {
+    key: ColorTargetKey,
+    generation: TargetGeneration,
+    predecessor: Option<TargetGeneration>,
+    proof: InitializedRegionProof,
+    patches: Box<[SparseColorPatch]>,
+}
+
+impl SparseInitializedColorCheckpoint {
+    pub(crate) fn payloads(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.patches.iter().map(|patch| patch.bytes.as_ref())
+    }
+
+    #[cfg(test)]
+    fn writes(&self) -> impl ExactSizeIterator<Item = CompletedWrite> + '_ {
+        self.patches.iter().map(|patch| patch.write)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -771,6 +859,118 @@ pub(crate) struct CompletedTaskColorSegment<'a> {
     key: ColorTargetKey,
     first_predecessor: Option<TargetGeneration>,
     final_checkpoint: &'a InitializedCandidateColorTarget,
+}
+
+/// Move-only final image for a task-private CPU segment. Unlike the borrowed
+/// compute-segment proof, this transfers the accumulator into the private
+/// registry at a hard execution boundary without cloning it.
+pub(crate) struct OwnedTaskColorSegment {
+    first_predecessor: Option<TargetGeneration>,
+    final_checkpoint: InitializedCandidateColorTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrderedCpuCandidateReservation {
+    key: ColorTargetKey,
+    generation: TargetGeneration,
+    predecessor: Option<TargetGeneration>,
+}
+
+impl OrderedCpuCandidateReservation {
+    pub(crate) fn new(candidate: &CandidateColorTarget) -> Self {
+        Self {
+            key: candidate.key,
+            generation: candidate.generation,
+            predecessor: candidate.predecessor,
+        }
+    }
+
+    pub(crate) fn validate(
+        self,
+        initialized: &InitializedCandidateColorTarget,
+    ) -> Result<(), TargetError> {
+        if initialized.candidate.key != self.key
+            || initialized.candidate.generation != self.generation
+            || initialized.candidate.predecessor != self.predecessor
+        {
+            return Err(TargetError::OrderedCpuCandidateMismatch {
+                expected_key: self.key,
+                actual_key: initialized.candidate.key,
+                expected_generation: self.generation,
+                actual_generation: initialized.candidate.generation,
+                expected_predecessor: self.predecessor,
+                actual_predecessor: initialized.candidate.predecessor,
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct OrderedCpuColorContinuity {
+    key: ColorTargetKey,
+    first_predecessor: Option<TargetGeneration>,
+    tail_generation: TargetGeneration,
+    tail_predecessor: Option<TargetGeneration>,
+}
+
+impl OrderedCpuColorContinuity {
+    pub(crate) fn start(
+        reservation: OrderedCpuCandidateReservation,
+        initialized: &InitializedCandidateColorTarget,
+    ) -> Result<Self, TargetError> {
+        reservation.validate(initialized)?;
+        Ok(Self {
+            key: initialized.candidate.key,
+            first_predecessor: initialized.candidate.predecessor,
+            tail_generation: initialized.candidate.generation,
+            tail_predecessor: initialized.candidate.predecessor,
+        })
+    }
+
+    pub(crate) fn append(
+        mut self,
+        reservation: OrderedCpuCandidateReservation,
+        initialized: &InitializedCandidateColorTarget,
+    ) -> Result<Self, TargetError> {
+        reservation.validate(initialized)?;
+        let expected_predecessor = Some(self.tail_generation);
+        if initialized.candidate.key != self.key
+            || initialized.candidate.predecessor != expected_predecessor
+        {
+            return Err(TargetError::DiscontinuousTaskColorSegment {
+                expected_key: self.key,
+                actual_key: initialized.candidate.key,
+                expected_predecessor,
+                actual_predecessor: initialized.candidate.predecessor,
+            });
+        }
+        self.tail_generation = initialized.candidate.generation;
+        self.tail_predecessor = initialized.candidate.predecessor;
+        Ok(self)
+    }
+
+    pub(crate) fn finish(
+        self,
+        final_checkpoint: InitializedCandidateColorTarget,
+    ) -> Result<OwnedTaskColorSegment, TargetError> {
+        if final_checkpoint.candidate.key != self.key
+            || final_checkpoint.candidate.generation != self.tail_generation
+            || final_checkpoint.candidate.predecessor != self.tail_predecessor
+        {
+            return Err(TargetError::OrderedCpuCandidateMismatch {
+                expected_key: self.key,
+                actual_key: final_checkpoint.candidate.key,
+                expected_generation: self.tail_generation,
+                actual_generation: final_checkpoint.candidate.generation,
+                expected_predecessor: self.tail_predecessor,
+                actual_predecessor: final_checkpoint.candidate.predecessor,
+            });
+        }
+        Ok(OwnedTaskColorSegment {
+            first_predecessor: self.first_predecessor,
+            final_checkpoint,
+        })
+    }
 }
 
 impl<'a> CompletedTaskColorSegment<'a> {
@@ -1001,6 +1201,143 @@ impl ColorTargetRegistry {
         Ok(&self.residents[index])
     }
 
+    /// Installs an ordered CPU segment's final accumulator by move. Every
+    /// intermediate generation remains represented by its sparse publication
+    /// capability; only the final private execution view belongs here.
+    pub(crate) fn commit_owned_task_shadow_segment(
+        &mut self,
+        segment: OwnedTaskColorSegment,
+    ) -> Result<&ResidentColorTarget, TargetError> {
+        let initialized = segment.final_checkpoint;
+        let key = initialized.candidate.key;
+        let actual = self
+            .residents
+            .iter()
+            .find(|resident| resident.key == key)
+            .map(|resident| resident.generation);
+        if actual != segment.first_predecessor {
+            return Err(TargetError::StaleCandidateGeneration {
+                key,
+                expected_predecessor: segment.first_predecessor,
+                actual_resident: actual,
+            });
+        }
+        let next = ResidentColorTarget {
+            key,
+            generation: initialized.candidate.generation,
+            initialized: initialized.proof,
+            device_bytes: initialized.device_bytes,
+        };
+        if let Some(index) = self
+            .residents
+            .iter()
+            .position(|resident| resident.key == key)
+        {
+            self.residents[index] = next;
+            return Ok(&self.residents[index]);
+        }
+        if let Some(resident) = self
+            .residents
+            .iter()
+            .find(|resident| ranges_overlap(resident.key.range, key.range))
+        {
+            return Err(TargetError::AliasedResidentTarget {
+                candidate: key,
+                resident: resident.key,
+            });
+        }
+        if self.residents.len() == self.capacity.get() {
+            return Err(TargetError::RegistryFull {
+                capacity: self.capacity.get(),
+                candidate: key,
+            });
+        }
+        self.residents.push(next);
+        let index = self.residents.len() - 1;
+        Ok(&self.residents[index])
+    }
+
+    /// Applies one sparse packet checkpoint after that packet's guest commit.
+    /// A first-generation partial checkpoint starts from explicit zeroes,
+    /// matching the existing full-image executor's named uncovered-byte
+    /// semantics; a successor patches the exact prior resident bytes.
+    pub(crate) fn commit_sparse_checkpoint(
+        &mut self,
+        checkpoint: SparseInitializedColorCheckpoint,
+    ) -> Result<&ResidentColorTarget, TargetError> {
+        let key = checkpoint.key;
+        let index = self
+            .residents
+            .iter()
+            .position(|resident| resident.key == key);
+        let actual = index.map(|index| self.residents[index].generation);
+        if actual != checkpoint.predecessor {
+            return Err(TargetError::StaleCandidateGeneration {
+                key,
+                expected_predecessor: checkpoint.predecessor,
+                actual_resident: actual,
+            });
+        }
+        if index.is_none() {
+            if let Some(resident) = self
+                .residents
+                .iter()
+                .find(|resident| ranges_overlap(resident.key.range, key.range))
+            {
+                return Err(TargetError::AliasedResidentTarget {
+                    candidate: key,
+                    resident: resident.key,
+                });
+            }
+            if self.residents.len() == self.capacity.get() {
+                return Err(TargetError::RegistryFull {
+                    capacity: self.capacity.get(),
+                    candidate: key,
+                });
+            }
+        }
+
+        let mut bytes = match index {
+            Some(index) => {
+                core::mem::take(&mut self.residents[index].device_bytes.bytes).into_vec()
+            }
+            None => vec![0; key.range().len() as usize],
+        };
+        let base = key.address().get();
+        for patch in checkpoint.patches {
+            let ResourceRegion::Rdram { range, .. } = patch.write.access().region() else {
+                unreachable!("sparse checkpoint construction accepts only RDRAM writes")
+            };
+            let start = (range.start().get() - base) as usize;
+            let end = start + patch.bytes.len();
+            bytes[start..end].copy_from_slice(&patch.bytes);
+        }
+        let next = ResidentColorTarget {
+            key,
+            generation: checkpoint.generation,
+            initialized: checkpoint.proof,
+            device_bytes: DeviceColorBytes {
+                key,
+                generation: checkpoint.generation,
+                format: key.format(),
+                bytes: bytes.into_boxed_slice(),
+            },
+        };
+        match index {
+            Some(index) => self.residents[index] = next,
+            None => {
+                self.residents.push(next);
+            }
+        }
+        Ok(match index {
+            Some(index) => &self.residents[index],
+            None => self
+                .residents
+                .last()
+                .expect("just inserted sparse resident"),
+        })
+    }
+
     pub(crate) fn prepare_publication(
         &mut self,
         initialized: InitializedCandidateColorTarget,
@@ -1146,6 +1483,24 @@ pub enum TargetError {
         expected_predecessor: Option<TargetGeneration>,
         actual_predecessor: Option<TargetGeneration>,
     },
+    OrderedCpuCandidateMismatch {
+        expected_key: ColorTargetKey,
+        actual_key: ColorTargetKey,
+        expected_generation: TargetGeneration,
+        actual_generation: TargetGeneration,
+        expected_predecessor: Option<TargetGeneration>,
+        actual_predecessor: Option<TargetGeneration>,
+    },
+    SparseCheckpointNonRdramWrite {
+        operation: u32,
+    },
+    SparseCheckpointRangeOutsideTarget {
+        key: ColorTargetKey,
+        range: PhysicalRange,
+    },
+    SparseCheckpointDigestMismatch {
+        operation: u32,
+    },
     PixelBufferLengthOverflow {
         pixels: usize,
         bytes_per_pixel: u32,
@@ -1257,6 +1612,24 @@ impl fmt::Display for TargetError {
                 formatter,
                 "discontinuous task color segment: expected {expected_key:?} after {expected_predecessor:?}, got {actual_key:?} after {actual_predecessor:?}"
             ),
+            Self::OrderedCpuCandidateMismatch { expected_key, actual_key, expected_generation, actual_generation, expected_predecessor, actual_predecessor } => write!(
+                formatter,
+                "ordered CPU color completion mismatch: expected {expected_key:?}/{} after {expected_predecessor:?}, got {actual_key:?}/{} after {actual_predecessor:?}",
+                expected_generation.get(),
+                actual_generation.get(),
+            ),
+            Self::SparseCheckpointNonRdramWrite { operation } => write!(
+                formatter,
+                "sparse color checkpoint operation {operation} does not name RDRAM"
+            ),
+            Self::SparseCheckpointRangeOutsideTarget { key, range } => write!(
+                formatter,
+                "sparse color checkpoint range {range:?} lies outside target {key:?}"
+            ),
+            Self::SparseCheckpointDigestMismatch { operation } => write!(
+                formatter,
+                "sparse color checkpoint payload digest differs from completed write operation {operation}"
+            ),
             Self::PixelBufferLengthOverflow { pixels, bytes_per_pixel } => write!(
                 formatter,
                 "device color buffer length overflows usize: pixels={pixels} bytes_per_pixel={bytes_per_pixel}"
@@ -1281,3 +1654,262 @@ impl std::error::Error for TargetError {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sparse_checkpoint_tests {
+    use super::*;
+    use fn64_render_ir::{AccessMode, AccessPurpose, OperationId, RdramResource, ResourceAccess};
+
+    fn fixture() -> (PhysicalMemoryLayout, ColorTargetKey) {
+        let layout = PhysicalMemoryLayout::try_new(0x20_0000).unwrap();
+        let key = ColorTargetKey::try_new(
+            layout.address(0x400).unwrap(),
+            ColorTargetExtent::try_new(8, 2).unwrap(),
+            ColorTargetFormat::Rgba16,
+        )
+        .unwrap();
+        (layout, key)
+    }
+
+    fn initialized_with(
+        registry: &ColorTargetRegistry,
+        key: ColorTargetKey,
+        bytes: Vec<u8>,
+        rectangle: TargetRectangle,
+    ) -> InitializedCandidateColorTarget {
+        let candidate = registry.begin_candidate(key).unwrap();
+        initialized_candidate(candidate, bytes, rectangle)
+    }
+
+    fn initialized_candidate(
+        candidate: CandidateColorTarget,
+        bytes: Vec<u8>,
+        rectangle: TargetRectangle,
+    ) -> InitializedCandidateColorTarget {
+        let key = candidate.key();
+        let generation = candidate.generation();
+        let device_bytes =
+            DeviceColorBytes::new_for_fill(key, generation, key.format(), bytes).unwrap();
+        candidate
+            .admit_completed_initialization(CompletedColorTargetWrite::new_for_fill(
+                key,
+                generation,
+                key.range(),
+                rectangle,
+                device_bytes,
+            ))
+            .unwrap()
+    }
+
+    fn write(key: ColorTargetKey, operation: u32, start: u32, bytes: &[u8]) -> CompletedWrite {
+        let range = key
+            .address()
+            .layout()
+            .range(start, start + bytes.len() as u32)
+            .unwrap();
+        let access = ResourceAccess::try_new(
+            OperationId::new(operation),
+            AccessMode::Write,
+            AccessPurpose::RenderTarget,
+            ResourceRegion::Rdram {
+                resource: RdramResource::ColorFramebuffer,
+                range,
+            },
+        )
+        .unwrap();
+        CompletedWrite::try_from_bytes(access, bytes).unwrap()
+    }
+
+    #[test]
+    fn first_generation_partial_checkpoint_has_exact_cardinality_and_zero_base() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let mut full = vec![0u8; key.range().len() as usize];
+        full[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        let initialized = initialized_with(
+            &registry,
+            key,
+            full,
+            TargetRectangle::try_new(2, 0, 2, 1).unwrap(),
+        );
+        let writes = [write(key, 7, key.address().get() + 4, &[1, 2, 3, 4])];
+        let checkpoint = initialized.sparse_checkpoint(&writes).unwrap();
+        assert_eq!(checkpoint.payloads().len(), writes.len());
+        assert_eq!(checkpoint.payloads().next().unwrap(), [1, 2, 3, 4]);
+
+        let resident = registry.commit_sparse_checkpoint(checkpoint).unwrap();
+        assert_eq!(resident.generation(), TargetGeneration::FIRST);
+        assert_eq!(
+            resident.device_bytes().device_bytes(),
+            &[
+                0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_packet_checkpoints_preserve_intermediate_and_final_generations() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let first_bytes = vec![0x11; key.range().len() as usize];
+        let first = initialized_with(
+            &registry,
+            key,
+            first_bytes.clone(),
+            TargetRectangle::try_new(0, 0, 8, 2).unwrap(),
+        );
+        let first_writes = [write(key, 0, key.address().get(), &first_bytes)];
+        let first_checkpoint = first.sparse_checkpoint(&first_writes).unwrap();
+        registry.commit_sparse_checkpoint(first_checkpoint).unwrap();
+        assert_eq!(
+            registry.residents()[0].device_bytes().device_bytes(),
+            first_bytes
+        );
+
+        let mut second_bytes = first_bytes;
+        second_bytes[8..16].fill(0x22);
+        let second = initialized_with(
+            &registry,
+            key,
+            second_bytes.clone(),
+            TargetRectangle::try_new(4, 0, 4, 1).unwrap(),
+        );
+        let second_writes = [write(key, 1, key.address().get() + 8, &second_bytes[8..16])];
+        let second_checkpoint = second.sparse_checkpoint(&second_writes).unwrap();
+        let resident = registry
+            .commit_sparse_checkpoint(second_checkpoint)
+            .unwrap();
+        assert_eq!(resident.generation().get(), 2);
+        assert_eq!(resident.device_bytes().device_bytes(), second_bytes);
+    }
+
+    #[test]
+    fn stale_sparse_checkpoint_rejection_is_failure_atomic() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        registry
+            .commit_initialized(initialized_with(
+                &registry,
+                key,
+                vec![0x10; key.range().len() as usize],
+                TargetRectangle::try_new(0, 0, 8, 2).unwrap(),
+            ))
+            .unwrap();
+        let make_checkpoint = |registry: &ColorTargetRegistry, value: u8| {
+            let bytes = vec![value; key.range().len() as usize];
+            let initialized = initialized_with(
+                registry,
+                key,
+                bytes.clone(),
+                TargetRectangle::try_new(0, 0, 8, 2).unwrap(),
+            );
+            initialized
+                .sparse_checkpoint(&[write(key, 2, key.address().get(), &bytes)])
+                .unwrap()
+        };
+        let accepted = make_checkpoint(&registry, 0x20);
+        let stale = make_checkpoint(&registry, 0x30);
+        registry.commit_sparse_checkpoint(accepted).unwrap();
+        let before = registry.residents()[0].clone();
+        assert!(matches!(
+            registry.commit_sparse_checkpoint(stale),
+            Err(TargetError::StaleCandidateGeneration { .. })
+        ));
+        assert_eq!(registry.residents()[0], before);
+    }
+
+    #[test]
+    fn owned_task_shadow_moves_the_full_accumulator_allocation() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let initialized = initialized_with(
+            &registry,
+            key,
+            vec![0x55; key.range().len() as usize],
+            TargetRectangle::try_new(0, 0, 8, 2).unwrap(),
+        );
+        let allocation = initialized.device_bytes().device_bytes().as_ptr();
+        let reservation = OrderedCpuCandidateReservation::new(&initialized.candidate);
+        let continuity = OrderedCpuColorContinuity::start(reservation, &initialized).unwrap();
+        let resident = registry
+            .commit_owned_task_shadow_segment(continuity.finish(initialized).unwrap())
+            .unwrap();
+        assert_eq!(resident.device_bytes().device_bytes().as_ptr(), allocation);
+    }
+
+    #[test]
+    fn ordered_cpu_reservation_rejects_candidate_substitution_and_generation_skip() {
+        let (layout, key) = fixture();
+        let registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let mut planner = ColorTargetExecutionBatch::new();
+        let (first_candidate, _) = planner.begin_candidate(&registry, key).unwrap();
+        let first_reservation = OrderedCpuCandidateReservation::new(&first_candidate);
+        let full = TargetRectangle::try_new(0, 0, 8, 2).unwrap();
+        let first = initialized_candidate(
+            first_candidate,
+            vec![0x11; key.range().len() as usize],
+            full,
+        );
+
+        let other_key =
+            ColorTargetKey::try_new(layout.address(0x800).unwrap(), key.extent(), key.format())
+                .unwrap();
+        let other_candidate = registry.begin_candidate(other_key).unwrap();
+        let other = initialized_candidate(
+            other_candidate,
+            vec![0x22; other_key.range().len() as usize],
+            full,
+        );
+        assert!(matches!(
+            first_reservation.validate(&other),
+            Err(TargetError::OrderedCpuCandidateMismatch { .. })
+        ));
+
+        let continuity = OrderedCpuColorContinuity::start(first_reservation, &first).unwrap();
+        let (_second_candidate, _) = planner.begin_candidate(&registry, key).unwrap();
+        let (third_candidate, _) = planner.begin_candidate(&registry, key).unwrap();
+        let third_reservation = OrderedCpuCandidateReservation::new(&third_candidate);
+        let third = initialized_candidate(
+            third_candidate,
+            vec![0x33; key.range().len() as usize],
+            full,
+        );
+        assert!(matches!(
+            continuity.append(third_reservation, &third),
+            Err(TargetError::DiscontinuousTaskColorSegment { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_checkpoint_rejects_digest_mutation_and_binds_operation_order() {
+        let (layout, key) = fixture();
+        let registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let mut bytes = vec![0u8; key.range().len() as usize];
+        bytes[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[8..12].copy_from_slice(&[5, 6, 7, 8]);
+        let initialized = initialized_with(
+            &registry,
+            key,
+            bytes,
+            TargetRectangle::try_new(0, 0, 8, 2).unwrap(),
+        );
+        let first = write(key, 9, key.address().get(), &[1, 2, 3, 4]);
+        let second = write(key, 3, key.address().get() + 8, &[5, 6, 7, 8]);
+        let checkpoint = initialized.sparse_checkpoint(&[second, first]).unwrap();
+        assert_eq!(
+            checkpoint
+                .writes()
+                .map(|write| write.access().operation().get())
+                .collect::<Vec<_>>(),
+            [3, 9],
+            "checkpoint order is the supplied journal order, never range order"
+        );
+
+        let bad_digest = write(key, 9, key.address().get(), &[9, 9, 9, 9]);
+        assert!(matches!(
+            initialized.sparse_checkpoint(&[bad_digest]),
+            Err(TargetError::SparseCheckpointDigestMismatch { operation: 9 })
+        ));
+    }
+}
