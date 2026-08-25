@@ -274,9 +274,10 @@ mod game {
         /// Exact successful-submit authority, invalidation generation, and
         /// experiment accounting for pump-driven redraw suppression.
         present_cache: framebuffer::PresentCache,
-        /// Experimental exact-input redraw suppression. Default-off until a
-        /// repeated live A/B establishes its wall-time effect.
-        present_cache_enabled: bool,
+        /// Experimental exact-input observation/suppression disposition.
+        /// Disabled remains the default until a repeated live A/B establishes
+        /// both correctness and wall-time effect.
+        present_cache_mode: framebuffer::PresentCacheMode,
         /// Current pixels-surface / scratch width in pixels. Starts at
         /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
         /// latched, so the full framebuffer line is presented (not cropped).
@@ -618,15 +619,16 @@ mod game {
                 );
             }
 
-            let present_cache_enabled = std::env::var("FN64_PRESENT_CACHE")
-                .ok()
-                .as_deref()
-                == Some("1");
-            if present_cache_enabled {
-                println!(
-                    "[fn64-shell] FN64_PRESENT_CACHE=1 (exact framebuffer dependency gate)"
-                );
-            }
+            let present_cache_env = std::env::var("FN64_PRESENT_CACHE").ok();
+            let present_cache_mode =
+                framebuffer::PresentCacheMode::from_env_value(present_cache_env.as_deref());
+            println!(
+                "[fn64-shell] FN64_PRESENT_CACHE mode={} samples_dependencies={} \
+                 suppresses_redraws={}",
+                present_cache_mode.name(),
+                present_cache_mode.samples_dependencies(),
+                present_cache_mode.suppresses_redraw(true),
+            );
 
             Shell {
                 rdram,
@@ -644,7 +646,7 @@ mod game {
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
                 present_cache: framebuffer::PresentCache::default(),
-                present_cache_enabled,
+                present_cache_mode,
                 fb_width: FB_WIDTH,
                 fb_height: FB_HEIGHT,
                 window: None,
@@ -789,13 +791,13 @@ mod game {
         }
 
         fn invalidate_present_cache(&mut self) {
-            if self.present_cache_enabled {
+            if self.present_cache_mode.samples_dependencies() {
                 self.present_cache.invalidate();
             }
         }
 
-        fn presented_frame_is_current(&mut self) -> bool {
-            if !self.present_cache_enabled {
+        fn should_suppress_pump_redraw(&mut self) -> bool {
+            if !self.present_cache_mode.samples_dependencies() {
                 return false;
             }
             self.present_cache
@@ -826,14 +828,15 @@ mod game {
             let target_width = (src_stride - overscan).clamp(1, 4096);
             let target_height = fn64_abi::vi_output_height()
                 .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
-            self.present_cache.is_current(
+            let exact_hit = self.present_cache.is_current(
                 &self.rdram,
                 fb_offset,
                 src_stride,
                 target_width,
                 target_height,
                 fn64_abi::vi_blanked(),
-            )
+            );
+            self.present_cache_mode.suppresses_redraw(exact_hit)
         }
 
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
@@ -920,7 +923,7 @@ mod game {
                     );
                 }
             }
-            let dependency = self.present_cache_enabled.then(|| {
+            let dependency = self.present_cache_mode.samples_dependencies().then(|| {
                 framebuffer::PresentDependency::capture(
                     &self.rdram,
                     fb_offset,
@@ -1033,7 +1036,7 @@ mod game {
                 self.pixels.as_ref().expect("checked above").render()
             };
             if let Err(e) = render_result {
-                if self.present_cache_enabled {
+                if self.present_cache_mode.samples_dependencies() {
                     self.present_cache.record_failure();
                 }
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
@@ -1173,7 +1176,7 @@ mod game {
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
-                         guest/stream_hz={audio_rates:?}; present_cache: enabled={} \
+                         guest/stream_hz={audio_rates:?}; present_cache: mode={} \
                          requests={} hits={} misses={} successful_presents={} failed_presents={} \
                          invalidations={} dependency_samples={} dependency_bytes={} \
                          logical_digest={:016x}",
@@ -1197,7 +1200,7 @@ mod game {
                         audio.nonzero_samples,
                         audio.backend_buffers,
                         fn64_abi::audio_frames_remaining(),
-                        self.present_cache_enabled,
+                        self.present_cache_mode.name(),
                         present_cache.requests,
                         present_cache.hits,
                         present_cache.misses,
@@ -1663,7 +1666,7 @@ mod game {
                     } else {
                         now_t + FRAME
                     };
-                if !self.presented_frame_is_current() {
+                if !self.should_suppress_pump_redraw() {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }
@@ -1748,23 +1751,22 @@ mod game {
             return;
         }
         use std::io::Write as _;
-        if shell.present_cache_enabled {
-            let stats = shell.present_cache.stats();
-            println!(
-                "[fn64-present-cache] phase=final path={path} requests={} hits={} misses={} \
-                 successful_presents={} failed_presents={} invalidations={} \
-                 dependency_samples={} dependency_bytes={} logical_digest={:016x}",
-                stats.requests,
-                stats.hits,
-                stats.misses,
-                stats.successful_presents,
-                stats.failed_presents,
-                stats.invalidations,
-                stats.dependency_samples,
-                stats.dependency_bytes,
-                stats.logical_digest,
-            );
-        }
+        let stats = shell.present_cache.stats();
+        println!(
+            "[fn64-present-cache] phase=final path={path} mode={} requests={} hits={} misses={} \
+             successful_presents={} failed_presents={} invalidations={} \
+             dependency_samples={} dependency_bytes={} logical_digest={:016x}",
+            shell.present_cache_mode.name(),
+            stats.requests,
+            stats.hits,
+            stats.misses,
+            stats.successful_presents,
+            stats.failed_presents,
+            stats.invalidations,
+            stats.dependency_samples,
+            stats.dependency_bytes,
+            stats.logical_digest,
+        );
         let exit = fn64_abi::prepare_process_exit();
         let left_un_detached = exit.threads - exit.detached_coroutines;
         println!(
