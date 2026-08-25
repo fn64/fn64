@@ -1271,6 +1271,367 @@ fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
     RawTriangle::decode(0x0e, &bytes).expect("a shaded+textured triangle decodes")
 }
 
+#[test]
+fn coverage_fog_specialization_admission_is_closed_over_every_required_predicate() {
+    let admit =
+        |format, combine_low, combine_high, mode_high, mode_low, evaluation, shaded, textured| {
+            CoverageFogRgba16Program::try_admit(
+                format,
+                CombineParams::from_wire(combine_low, combine_high),
+                OtherMode::from_wire(mode_high, mode_low),
+                evaluation,
+                shaded,
+                textured,
+            )
+            .is_some()
+        };
+    for mode_high in [0x0018_ac8f, 0x0018_acff] {
+        assert!(admit(
+            ColorTargetFormat::Rgba16,
+            0xfc15_fea3,
+            0xf00f_f23f,
+            mode_high,
+            0x0f0a_7008,
+            TexrectCombinerEvaluation::TwoCycle,
+            true,
+            true,
+        ));
+    }
+    let valid = (
+        ColorTargetFormat::Rgba16,
+        0xfc15_fea3,
+        0xf00f_f23f,
+        0x0018_ac8f,
+        0x0f0a_7008,
+        TexrectCombinerEvaluation::TwoCycle,
+        true,
+        true,
+    );
+    assert!(!admit(
+        ColorTargetFormat::Rgba32,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        valid.5,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0,
+        valid.1 ^ 1,
+        valid.2,
+        valid.3,
+        valid.4,
+        valid.5,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2 ^ 1,
+        valid.3,
+        valid.4,
+        valid.5,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2,
+        valid.3 ^ 1,
+        valid.4,
+        valid.5,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4 ^ 1,
+        valid.5,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        TexrectCombinerEvaluation::OneCycle,
+        valid.6,
+        valid.7
+    ));
+    assert!(!admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, false, valid.7
+    ));
+    assert!(!admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, valid.6, false
+    ));
+}
+
+#[test]
+fn coverage_fog_specialization_matches_generic_at_every_alpha_pair_and_channel_boundaries() {
+    let prepared =
+        PreparedTwoCycleCombiner::new(CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f));
+    for mode_high in [0x0018_ac8f, 0x0018_acff] {
+        let other_mode = OtherMode::from_wire(mode_high, 0x0f0a_7008);
+        for texel_alpha in 0u16..=255 {
+            for primitive_alpha in 0u16..=255 {
+                let seed = u32::from(texel_alpha) * 257 + u32::from(primitive_alpha);
+                let texel = [
+                    seed.wrapping_mul(17) as u8,
+                    seed.wrapping_mul(67).wrapping_add(7) as u8,
+                    seed.wrapping_mul(131).wrapping_add(31) as u8,
+                    texel_alpha as u8,
+                ];
+                let env = [
+                    seed.wrapping_mul(29) as u8,
+                    seed.wrapping_mul(73).wrapping_add(3) as u8,
+                    seed.wrapping_mul(191).wrapping_add(5) as u8,
+                    seed.wrapping_mul(11) as u8,
+                ];
+                let prim = [
+                    seed.wrapping_mul(43).wrapping_add(1) as u8,
+                    seed.wrapping_mul(97).wrapping_add(15) as u8,
+                    seed.wrapping_mul(211).wrapping_add(63) as u8,
+                    primitive_alpha as u8,
+                ];
+                let shade_alpha = seed.wrapping_mul(157).wrapping_add(127) as u8;
+                let normalize = |bytes: [u8; 4]| bytes.map(|v| f32::from(v) / 255.0);
+                let inputs = crate::CombinerInputs {
+                    tex_val0: [0.0; 4],
+                    tex_val1: [0.0; 4],
+                    prim_color: normalize(prim),
+                    shade_color: normalize([3, 5, 7, shade_alpha]),
+                    env_color: normalize(env),
+                    key_center: [0.0; 3],
+                    key_scale: [0.0; 3],
+                    lod_fraction: 0.0,
+                    prim_lod_frac: 0.0,
+                    noise: 0.0,
+                    k4: 0.0,
+                    k5: 0.0,
+                };
+                let specialized_combined = combine_coverage_fog(inputs, texel);
+                let generic_combined =
+                    combine_one_texel_prepared_two_cycle(prepared, inputs, texel);
+                assert_eq!(
+                    specialized_combined, generic_combined,
+                    "combiner mismatch mode={mode_high:#010x} texel_alpha={texel_alpha} primitive_alpha={primitive_alpha}"
+                );
+
+                let resident = (seed as u16).wrapping_mul(0x9e37).to_be_bytes();
+                let registers = TexrectBlendRegisters::new(
+                    Color4::from_wire(seed.wrapping_mul(0x0101_0101)),
+                    Color4::from_wire(seed.rotate_left(13)),
+                );
+                let mut specialized = resident;
+                write_coverage_fog_rgba16(&mut specialized, specialized_combined);
+                let generic = generic_coverage_fog_rgba16_oracle(
+                    other_mode,
+                    inputs,
+                    texel,
+                    registers,
+                    resident,
+                    seed & 7,
+                    (seed >> 3) & 7,
+                );
+                assert_eq!(
+                    specialized, generic,
+                    "terminal-stage mismatch mode={mode_high:#010x} texel_alpha={texel_alpha} primitive_alpha={primitive_alpha}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn coverage_fog_specialization_matches_generic_bytes_for_both_exact_modes() {
+    let width = 80u32;
+    let height = 64u32;
+    let triangle = bench_textured_triangle(60.0, 48);
+    let key = key_at(width, height);
+    let declared = declared_accesses(key, &triangle, None);
+    let tmem = BenchTmem::new();
+    let tile = coverage_fog_tile_binding();
+    let materials = [
+        (u32::MAX, 0x0000_00fe),
+        (0x1020_3040, 0xc080_40a0),
+        (0x7f01_fe80, 0x20e0_6088),
+    ];
+
+    for (mode_high, mode_name) in [(0x0018_ac8f, "pattern/noise"), (0x0018_acff, "disabled")] {
+        for (material_index, &(environment, primitive)) in materials.iter().enumerate() {
+            let mut resident = Vec::with_capacity((width * height * 2) as usize);
+            for pixel in 0..width * height {
+                let word = (pixel as u16)
+                    .wrapping_mul(0x9e37)
+                    .wrapping_add((material_index as u16) << 5);
+                resident.extend_from_slice(&word.to_be_bytes());
+            }
+            let run_specialized = || {
+                let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+                let candidate = registry.begin_candidate(key).unwrap();
+                execute_raw_triangle(
+                    &candidate,
+                    OtherMode::from_wire(mode_high, 0x0f0a_7008),
+                    &triangle,
+                    TexrectShading::new(
+                        CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f),
+                        Color4::from_wire(environment),
+                        PrimColor::from_wire(0, primitive),
+                    ),
+                    TexrectBlendRegisters::default(),
+                    &resident,
+                    &declared,
+                    Some(RawTriangleTexture {
+                        tile,
+                        tmem: &tmem,
+                        lut_mode: crate::TextureLutMode::Rgba16,
+                    }),
+                    None,
+                )
+                .unwrap()
+                .device_bytes()
+                .device_bytes()
+                .to_vec()
+            };
+            let run_generic = || {
+                let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+                let candidate = registry.begin_candidate(key).unwrap();
+                execute_raw_triangle_generic_oracle(
+                    &candidate,
+                    OtherMode::from_wire(mode_high, 0x0f0a_7008),
+                    &triangle,
+                    TexrectShading::new(
+                        CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f),
+                        Color4::from_wire(environment),
+                        PrimColor::from_wire(0, primitive),
+                    ),
+                    TexrectBlendRegisters::default(),
+                    &resident,
+                    &declared,
+                    Some(RawTriangleTexture {
+                        tile,
+                        tmem: &tmem,
+                        lut_mode: crate::TextureLutMode::Rgba16,
+                    }),
+                    None,
+                )
+                .unwrap()
+                .device_bytes()
+                .device_bytes()
+                .to_vec()
+            };
+            for run in 1..=10 {
+                assert_eq!(
+                    run_specialized(),
+                    run_generic(),
+                    "{mode_name} material {material_index} differential run {run} must be byte-exact"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "timing microbenchmark; run with --ignored --nocapture"]
+fn coverage_fog_specialization_microbench() {
+    let width = 320u32;
+    let height = 240u32;
+    let triangle = bench_textured_triangle(300.0, 220);
+    let key = key_at(width, height);
+    let declared = declared_accesses(key, &triangle, None);
+    let resident = vec![0u8; (width * height * 2) as usize];
+    let tmem = BenchTmem::new();
+    let tile = coverage_fog_tile_binding();
+    let shading = TexrectShading::new(
+        CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f),
+        Color4::from_wire(0x7f01_fe80),
+        PrimColor::from_wire(0, 0x20e0_6088),
+    );
+    let run_specialized = || {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let completed = execute_raw_triangle(
+            &candidate,
+            OtherMode::from_wire(0x0018_ac8f, 0x0f0a_7008),
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Rgba16,
+            }),
+            None,
+        )
+        .unwrap();
+        std::hint::black_box(completed.device_bytes().device_bytes().len());
+    };
+    let run_generic = || {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let completed = execute_raw_triangle_generic_oracle(
+            &candidate,
+            OtherMode::from_wire(0x0018_ac8f, 0x0f0a_7008),
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Rgba16,
+            }),
+            None,
+        )
+        .unwrap();
+        std::hint::black_box(completed.device_bytes().device_bytes().len());
+    };
+
+    for _ in 0..8 {
+        run_generic();
+        run_specialized();
+    }
+    let mut generic = Vec::with_capacity(20);
+    let mut specialized = Vec::with_capacity(20);
+    for sample in 0..20 {
+        let measure = |run: &dyn Fn(), samples: &mut Vec<u128>| {
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            samples.push(start.elapsed().as_nanos());
+        };
+        if sample & 1 == 0 {
+            measure(&run_generic, &mut generic);
+            measure(&run_specialized, &mut specialized);
+        } else {
+            measure(&run_specialized, &mut specialized);
+            measure(&run_generic, &mut generic);
+        }
+    }
+    generic.sort_unstable();
+    specialized.sort_unstable();
+    let generic_median = generic[generic.len() / 2] as f64 / 3.0;
+    let specialized_median = specialized[specialized.len() / 2] as f64 / 3.0;
+    println!(
+        "[coverage-fog-microbench] samples=20 calls_per_sample=3 generic_median_ns={generic_median:.0} specialized_median_ns={specialized_median:.0} speedup={:.3}x reduction={:.1}%",
+        generic_median / specialized_median,
+        100.0 * (generic_median - specialized_median) / generic_median,
+    );
+}
+
 #[cfg(feature = "host-gpu-tests")]
 #[test]
 fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
