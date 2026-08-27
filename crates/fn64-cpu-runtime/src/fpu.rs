@@ -27,6 +27,9 @@
 
 use rustc_apfloat::ieee::{Double, Single};
 use rustc_apfloat::{Float, Round, Status, StatusAnd};
+#[cfg(feature = "cop1-fast-receipt")]
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::OnceLock;
 
 /// The five VR4300 FPU exception conditions, in the bit order [`raise_fpu`]
 /// (`runtime.rs`) expects: index = the `exception` argument it takes.
@@ -258,6 +261,165 @@ fn denorm_result_d(bits: u64, flags: Flags) -> (u64, Flags) {
 // DIV_BY_ZERO for finite/0, so we only special-case a signaling-NaN operand
 // (which apfloat quiets under its own encoding — we want the MIPS flag + bits).
 // ---------------------------------------------------------------------------
+
+#[inline]
+#[allow(dead_code)] // Sealed until the live route clears its separate gate.
+const fn finite_normal_or_zero_s(bits: u32) -> bool {
+    let magnitude = bits & 0x7fff_ffff;
+    let exponent = magnitude >> 23;
+    magnitude == 0 || (exponent != 0 && exponent != 0xff)
+}
+
+#[inline]
+#[allow(dead_code)] // Sealed until the live route clears its separate gate.
+fn rn_add_sub_inexact(a: u32, b: u32, rounded: f32, subtract: bool) -> bool {
+    if a & 0x7fff_ffff == 0 || b & 0x7fff_ffff == 0 {
+        return false;
+    }
+    let exponent_a = ((a >> 23) & 0xff) as i16;
+    let exponent_b = ((b >> 23) & 0xff) as i16;
+    if (exponent_a - exponent_b).unsigned_abs() > 29 {
+        // Two nonzero binary32 values this far apart cannot sum exactly in
+        // binary32. The smaller operand lies below the result's ULP even when
+        // the binary64 comparison below would itself round it away.
+        return true;
+    }
+    let exact = if subtract {
+        f64::from(f32::from_bits(a)) - f64::from(f32::from_bits(b))
+    } else {
+        f64::from(f32::from_bits(a)) + f64::from(f32::from_bits(b))
+    };
+    exact != f64::from(rounded)
+}
+
+/// Exact RN fast-path candidate for finite-normal/zero `ADD.S` inputs.
+///
+/// Returns `None` outside the sealed surface; the authoritative soft-float
+/// implementation remains the fallback. This helper is deliberately unrouted.
+#[inline]
+#[allow(dead_code)] // Exact experiment is deliberately unrouted.
+pub(crate) fn try_add_s_rn_finite(a: u32, b: u32) -> Option<(u32, Flags)> {
+    if !finite_normal_or_zero_s(a) || !finite_normal_or_zero_s(b) {
+        return None;
+    }
+    let rounded = f32::from_bits(a) + f32::from_bits(b);
+    let bits = rounded.to_bits();
+    if !finite_normal_or_zero_s(bits) {
+        return None;
+    }
+    if bits & 0x7fff_ffff == 0 && f64::from(f32::from_bits(a)) + f64::from(f32::from_bits(b)) != 0.0
+    {
+        return None;
+    }
+    Some((
+        bits,
+        Flags {
+            inexact: rn_add_sub_inexact(a, b, rounded, false),
+            ..Flags::NONE
+        },
+    ))
+}
+
+/// Exact RN fast-path candidate for finite-normal/zero `SUB.S` inputs.
+#[inline]
+#[allow(dead_code)] // Exact experiment is deliberately unrouted.
+pub(crate) fn try_sub_s_rn_finite(a: u32, b: u32) -> Option<(u32, Flags)> {
+    if !finite_normal_or_zero_s(a) || !finite_normal_or_zero_s(b) {
+        return None;
+    }
+    let rounded = f32::from_bits(a) - f32::from_bits(b);
+    let bits = rounded.to_bits();
+    if !finite_normal_or_zero_s(bits) {
+        return None;
+    }
+    if bits & 0x7fff_ffff == 0 && f64::from(f32::from_bits(a)) - f64::from(f32::from_bits(b)) != 0.0
+    {
+        return None;
+    }
+    Some((
+        bits,
+        Flags {
+            inexact: rn_add_sub_inexact(a, b, rounded, true),
+            ..Flags::NONE
+        },
+    ))
+}
+
+/// Exact RN fast-path candidate for finite-normal/zero `MUL.S` inputs.
+#[inline]
+#[allow(dead_code)] // Exact experiment is deliberately unrouted.
+pub(crate) fn try_mul_s_rn_finite(a: u32, b: u32) -> Option<(u32, Flags)> {
+    if !finite_normal_or_zero_s(a) || !finite_normal_or_zero_s(b) {
+        return None;
+    }
+    let operand_a = f32::from_bits(a);
+    let operand_b = f32::from_bits(b);
+    let rounded = operand_a * operand_b;
+    let bits = rounded.to_bits();
+    if !finite_normal_or_zero_s(bits) {
+        return None;
+    }
+    let exact = f64::from(operand_a) * f64::from(operand_b);
+    if bits & 0x7fff_ffff == 0 && exact != 0.0 {
+        return None;
+    }
+    Some((
+        bits,
+        Flags {
+            inexact: exact != f64::from(rounded),
+            ..Flags::NONE
+        },
+    ))
+}
+
+#[cfg(feature = "cop1-fast-receipt")]
+static EXPERIMENTAL_FAST_SEEN: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "cop1-fast-receipt")]
+static EXPERIMENTAL_FALLBACK_SEEN: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "cop1-fast-receipt")]
+static EXPERIMENTAL_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn parse_rn_finite_setting(value: Option<std::ffi::OsString>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let value = value
+        .into_string()
+        .unwrap_or_else(|_| panic!("FN64_COP1_RN_FINITE_FAST must be Unicode and exactly 0 or 1"));
+    match value.as_str() {
+        "0" => false,
+        "1" => true,
+        _ => panic!("FN64_COP1_RN_FINITE_FAST={value:?} is invalid; expected exactly 0 or 1"),
+    }
+}
+
+pub(crate) fn experimental_rn_finite_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_rn_finite_setting(std::env::var_os("FN64_COP1_RN_FINITE_FAST")))
+}
+
+#[cfg(feature = "cop1-fast-receipt")]
+pub(crate) fn note_experimental_single_selection_once(op_bit: u8, fast: bool) {
+    let receipt = if fast {
+        &EXPERIMENTAL_FAST_SEEN
+    } else {
+        &EXPERIMENTAL_FALLBACK_SEEN
+    };
+    if receipt.load(Relaxed) & op_bit == 0 {
+        receipt.fetch_or(op_bit, Relaxed);
+    }
+}
+
+/// Print the host-diagnostic route receipt once at a bounded-run exit.
+#[cfg(feature = "cop1-fast-receipt")]
+pub fn report_experimental_rn_finite_now() {
+    if !experimental_rn_finite_enabled() || EXPERIMENTAL_REPORTED.swap(true, Relaxed) {
+        return;
+    }
+    let fast = EXPERIMENTAL_FAST_SEEN.load(Relaxed);
+    let fallback = EXPERIMENTAL_FALLBACK_SEEN.load(Relaxed);
+    println!("[cop1-rn-finite-receipt] fast_seen={fast:#04x} fallback_seen={fallback:#04x}");
+}
 
 /// `fd = fs + ft` (single). Honors FCSR.RM; returns the MIPS result bits and
 /// IEEE flags.
@@ -789,6 +951,49 @@ fn is_nan_bits_d(a: u64) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rn_finite_setting_is_default_on_and_strict() {
+        assert!(parse_rn_finite_setting(None));
+        assert!(!parse_rn_finite_setting(Some("0".into())));
+        assert!(parse_rn_finite_setting(Some("1".into())));
+        assert!(std::panic::catch_unwind(|| parse_rn_finite_setting(Some("true".into()))).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let non_unicode = std::ffi::OsString::from_vec(vec![0xff]);
+            assert!(
+                std::panic::catch_unwind(|| parse_rn_finite_setting(Some(non_unicode))).is_err()
+            );
+        }
+    }
+
+    fn next_normal(seed: &mut u64) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let sign = (*seed as u32) & 0x8000_0000;
+        let exponent = (((*seed >> 32) as u32) % 254 + 1) << 23;
+        let mantissa = ((*seed >> 9) as u32) & 0x007f_ffff;
+        sign | exponent | mantissa
+    }
+
+    fn assert_fast_matches_oracle(a: u32, b: u32) -> usize {
+        let cases = [
+            (try_add_s_rn_finite(a, b), add_s(a, b, 0), "add"),
+            (try_sub_s_rn_finite(a, b), sub_s(a, b, 0), "sub"),
+            (try_mul_s_rn_finite(a, b), mul_s(a, b, 0), "mul"),
+        ];
+        let mut admitted = 0;
+        for (fast, oracle, name) in cases {
+            if let Some(fast) = fast {
+                assert_eq!(fast, oracle, "{name} diverged for {a:08x},{b:08x}");
+                admitted += 1;
+            }
+        }
+        admitted
+    }
+
     // RN=0, RZ=1, RP=2, RM=3.
 
     #[test]
@@ -835,6 +1040,131 @@ mod tests {
             let (r, _) = mul_s(a.to_bits(), b.to_bits(), 0);
             assert_eq!(r, (a * b).to_bits(), "mul {a}*{b}");
         }
+    }
+
+    #[test]
+    fn rn_finite_fast_helpers_match_boundary_classes() {
+        let mut values = vec![0, 0x8000_0000, 0x0080_0000, 0x8080_0000];
+        for exponent in [1u32, 2, 63, 96, 126, 127, 128, 158, 190, 253, 254] {
+            for mantissa in [0, 1, 0x003f_ffff, 0x007f_fffe, 0x007f_ffff] {
+                values.push((exponent << 23) | mantissa);
+                values.push(0x8000_0000 | (exponent << 23) | mantissa);
+            }
+        }
+        values.extend([
+            0x0000_0001,
+            0x007f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+        ]);
+        let mut admitted = 0;
+        for &a in &values {
+            for &b in &values {
+                admitted += assert_fast_matches_oracle(a, b);
+            }
+        }
+        assert!(admitted > 10_000, "boundary sweep admitted too little work");
+    }
+
+    #[test]
+    #[ignore = "three-million-pair exact differential; run in release"]
+    fn rn_finite_fast_helpers_match_three_million_deterministic_pairs() {
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut admitted = 0usize;
+        for _ in 0..1_000_000 {
+            admitted += assert_fast_matches_oracle(next_normal(&mut seed), next_normal(&mut seed));
+        }
+        assert!(
+            admitted > 2_000_000,
+            "random exact differential admitted only {admitted} operations"
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only performance kill gate"]
+    fn release_rn_finite_fast_helpers_are_eight_times_faster_than_softfloat() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run this microbench with --release"
+        );
+        let mut seed = 0x1319_8a2e_0370_7344u64;
+        let pairs: Vec<_> = (0..4096)
+            .map(|_| {
+                let a = next_normal(&mut seed);
+                let b = next_normal(&mut seed);
+                // Constrain exponents to a production-like central range so
+                // every operation exercises the admitted interior, not a
+                // fallback dominated by synthetic overflow/underflow.
+                let a = (a & 0x807f_ffff) | ((((a >> 23) & 31) + 112) << 23);
+                let b = (b & 0x807f_ffff) | ((((b >> 23) & 31) + 112) << 23);
+                (a, b)
+            })
+            .collect();
+
+        let mut fast_samples = Vec::new();
+        let mut oracle_samples = Vec::new();
+        for pair in 0..11 {
+            let run_fast = || {
+                let started = std::time::Instant::now();
+                for &(a, b) in &pairs {
+                    std::hint::black_box(try_add_s_rn_finite(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                    ));
+                    std::hint::black_box(try_sub_s_rn_finite(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                    ));
+                    std::hint::black_box(try_mul_s_rn_finite(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                    ));
+                }
+                started.elapsed().as_nanos() as u64
+            };
+            let run_oracle = || {
+                let started = std::time::Instant::now();
+                for &(a, b) in &pairs {
+                    std::hint::black_box(add_s(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                        0,
+                    ));
+                    std::hint::black_box(sub_s(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                        0,
+                    ));
+                    std::hint::black_box(mul_s(
+                        std::hint::black_box(a),
+                        std::hint::black_box(b),
+                        0,
+                    ));
+                }
+                started.elapsed().as_nanos() as u64
+            };
+            if pair % 2 == 0 {
+                fast_samples.push(run_fast());
+                oracle_samples.push(run_oracle());
+            } else {
+                oracle_samples.push(run_oracle());
+                fast_samples.push(run_fast());
+            }
+        }
+        fast_samples.sort_unstable();
+        oracle_samples.sort_unstable();
+        let fast = fast_samples[fast_samples.len() / 2];
+        let oracle = oracle_samples[oracle_samples.len() / 2];
+        println!(
+            "[cop1-rn-fast] operations={} fast_ns={fast} oracle_ns={oracle} speedup={:.2}x",
+            pairs.len() * 3,
+            oracle as f64 / fast as f64
+        );
+        assert!(
+            oracle >= fast.saturating_mul(8),
+            "RN finite helper must be >=8x faster: fast={fast}ns oracle={oracle}ns"
+        );
     }
 
     #[test]

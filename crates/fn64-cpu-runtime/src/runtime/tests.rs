@@ -77,6 +77,12 @@
             },
             fpu_cond: snapshot.fpu_cond,
             fcsr: snapshot.fcsr,
+            rn_finite_fast_selected: false,
+            rn_finite_fast_active: false,
+            #[cfg(feature = "cop1-fast-receipt")]
+            rn_finite_fast_seen: 0,
+            #[cfg(feature = "cop1-fast-receipt")]
+            rn_finite_fallback_seen: 0,
             ll_reservation: snapshot.ll_reservation,
             cop0_count: snapshot.cop0_count,
             // Boundary-owned clock phase is synchronized by the executor and
@@ -1257,4 +1263,104 @@
         super::set_guest_write_boundary_observer(None);
         assert_ne!(super::guest_write_token(0x2000, 0x1000), written);
         super::set_guest_write_boundary_observer(previous);
+    }
+
+    #[test]
+    fn rn_finite_fast_selection_matches_complete_instruction_state() {
+        #[derive(Clone, Copy)]
+        enum Op {
+            Add,
+            Sub,
+            Mul,
+        }
+
+        fn run(context: &mut RecompContext, op: Op, fast: bool, fd: u8, fs: u8, ft: u8) -> bool {
+            match op {
+                Op::Add => context.fpu_add_s_selected(fd, fs, ft, fast),
+                Op::Sub => context.fpu_sub_s_selected(fd, fs, ft, fast),
+                Op::Mul => context.fpu_mul_s_selected(fd, fs, ft, fast),
+            }
+        }
+
+        fn check(op: Op, a: u32, b: u32, fcsr: u32, fd: u8, fs: u8, ft: u8) {
+            let mut control = RecompContext::default();
+            control.fcsr = fcsr;
+            control.set_f_bits(fd, 0xdead_beef);
+            control.set_f_bits(fs, a);
+            control.set_f_bits(ft, b);
+            let mut candidate = control.clone();
+            let control_trap = run(&mut control, op, false, fd, fs, ft);
+            let candidate_trap = run(&mut candidate, op, true, fd, fs, ft);
+            assert_eq!(candidate_trap, control_trap);
+            assert_eq!(
+                candidate.evidence_snapshot_v1(),
+                control.evidence_snapshot_v1()
+            );
+        }
+
+        let mut cached = RecompContext::default();
+        cached.rn_finite_fast_selected = true;
+        cached.rn_finite_fast_active = true;
+        cached.write_fcr(31, 1);
+        assert!(!cached.rn_finite_fast_active);
+        cached.write_fcr(31, 0);
+        assert!(cached.rn_finite_fast_active);
+
+        for fs_bit in [0, 1 << 24] {
+            check(
+                Op::Add,
+                1.0f32.to_bits(),
+                2.0f32.to_bits(),
+                fs_bit | (0x3f << 12),
+                6,
+                2,
+                4,
+            );
+            check(
+                Op::Add,
+                1.0f32.to_bits(),
+                (2.0f32).powi(-30).to_bits(),
+                fs_bit,
+                6,
+                2,
+                4,
+            );
+            check(
+                Op::Add,
+                1.0f32.to_bits(),
+                (2.0f32).powi(-30).to_bits(),
+                fs_bit | (1 << 7) | (1 << 3),
+                6,
+                2,
+                4,
+            );
+            check(
+                Op::Mul,
+                1.5f32.to_bits(),
+                3.25f32.to_bits(),
+                fs_bit,
+                2,
+                2,
+                4,
+            );
+            check(
+                Op::Sub,
+                1.0f32.to_bits(),
+                (2.0f32).powi(-25).to_bits(),
+                fs_bit | 1,
+                6,
+                2,
+                4,
+            );
+
+            for (op, a, b) in [
+                (Op::Add, 0x7fc0_0000, 1.0f32.to_bits()),
+                (Op::Sub, f32::INFINITY.to_bits(), f32::INFINITY.to_bits()),
+                (Op::Mul, f32::MAX.to_bits(), 2.0f32.to_bits()),
+                (Op::Mul, f32::MIN_POSITIVE.to_bits(), 0.5f32.to_bits()),
+                (Op::Add, 1, 1.0f32.to_bits()),
+            ] {
+                check(op, a, b, fs_bit, 6, 2, 4);
+            }
+        }
     }

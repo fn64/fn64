@@ -12,6 +12,9 @@ aot-runtime = []
 production-aot = ["aot-runtime"]
 dynamic-mapped-runtime = ["aot-runtime"]
 dev-interpreter = ["dynamic-mapped-runtime"]
+# Bounded host-test receipt for the COP1 finite-RN route. Ordinary builds do
+# not compile its counters or hot-path observations.
+cop1-fast-receipt = []
 
 [dependencies]
 rustc_apfloat = "0.2.3"

@@ -486,6 +486,10 @@ pub struct RecompContextEvidenceSnapshotV1 {
     pub thread_return_pc: Option<u32>,
 }
 
+/// [`Default`] constructs architecture-only zero state with host experiments
+/// disabled. Production execution enters through [`Self::new`], which seals
+/// process configuration once; evidence reconstruction must remain immune to
+/// ambient environment variables.
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -511,6 +515,14 @@ pub struct RecompContext {
     /// section 6.3.2.2 defines FS(24), Cause(17:12), Enables(11:7),
     /// Flags(6:2), and RM(1:0); reserved bits read as zero.
     fcsr: u32,
+    /// Host-only experiment selection combined with the current FCSR.RM.
+    /// Architectural snapshots deliberately exclude this non-guest state.
+    rn_finite_fast_selected: bool,
+    rn_finite_fast_active: bool,
+    #[cfg(feature = "cop1-fast-receipt")]
+    rn_finite_fast_seen: u8,
+    #[cfg(feature = "cop1-fast-receipt")]
+    rn_finite_fallback_seen: u8,
     /// Address/width of the most recent LL/LLD reservation. There is only one
     /// architectural LLbit. A mismatched SC/SCD must fail and clear it.
     ll_reservation: Option<(u64, u8)>,
@@ -613,7 +625,12 @@ impl RecompContext {
 
     /// A fresh context with all registers zeroed.
     pub fn new() -> Self {
-        RecompContext::default()
+        let selected = crate::fpu::experimental_rn_finite_enabled();
+        RecompContext {
+            rn_finite_fast_selected: selected,
+            rn_finite_fast_active: selected,
+            ..RecompContext::default()
+        }
     }
 
     /// Capture every future-affecting CPU field owned by this context.
@@ -920,6 +937,7 @@ impl RecompContext {
         const WRITABLE: u32 = (1 << 24) | (1 << 23) | 0x0003_FFFF;
         self.fpu_cond = value & (1 << 23) != 0;
         self.fcsr = value & WRITABLE & !(1 << 23);
+        self.rn_finite_fast_active = self.rn_finite_fast_selected && self.fcsr & 3 == 0;
     }
 
     /// Whether the current FCSR value demands a precise floating-point
