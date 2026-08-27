@@ -716,9 +716,24 @@ fn the_perspective_scale_is_linear_in_the_ratio() {
 #[ignore = "timing microbenchmark; run with --ignored --nocapture"]
 fn texture_plane_step_vs_full_isolation() {
     let planes = [
-        AttributePlane { base: 0x0004_2000, dx: 0x0001_2345, de: 0x0011_3300, dy: -0x0002_1100 },
-        AttributePlane { base: -0x0003_1000, dx: -0x0000_edcb, de: 0x0004_0000, dy: 0x0001_0000 },
-        AttributePlane { base: 1 << 20, dx: 0x0000_0080, de: 0, dy: 0 },
+        AttributePlane {
+            base: 0x0004_2000,
+            dx: 0x0001_2345,
+            de: 0x0011_3300,
+            dy: -0x0002_1100,
+        },
+        AttributePlane {
+            base: -0x0003_1000,
+            dx: -0x0000_edcb,
+            de: 0x0004_0000,
+            dy: 0x0001_0000,
+        },
+        AttributePlane {
+            base: 1 << 20,
+            dx: 0x0000_0080,
+            de: 0,
+            dy: 0,
+        },
     ];
     let run_len: i64 = 300; // pixels per run
     let runs: u64 = 400_000; // enough runs for a stable mean
