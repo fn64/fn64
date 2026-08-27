@@ -42,6 +42,7 @@
 //! against those same live-stream bytes, driven through the real decoder.
 
 use super::triangle::RawTriangle;
+use crate::CoverageMask;
 
 /// One pixel in Q16.16, the fixed-point format every X edge coefficient
 /// arrives in.
@@ -336,6 +337,97 @@ pub(crate) struct AttributePlane {
     pub(crate) dy: i32,
 }
 
+/// The RDP-latched interpolation origin for one integer scanline.
+///
+/// Raw coefficients retain bits the span interpolator does not. Those bits
+/// are discarded here, once, before either shade or texture walks the row.
+/// Keeping the latch as a type prevents a caller from accidentally feeding
+/// the decoded Q16.16 plane directly to a continuous geometric evaluator.
+///
+/// The masks and latch order follow paraLLEl-RDP's MIT-licensed
+/// `span_setup.comp`/`interpolation.h`: row values clear bits 0..9 after the
+/// X-fraction correction, and X steps clear bits 0..4. `do_offset` is derived
+/// by `decode_triangle_setup` as `flip == sign(dxhdy)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttributeSpanRow {
+    base_x: i32,
+    y_delta: i32,
+    x_fraction: i32,
+    do_offset: bool,
+}
+
+impl AttributeSpanRow {
+    pub(crate) fn new(triangle: &RawTriangle, y: i32) -> Self {
+        let y_delta = y.wrapping_sub(i32::from(triangle.yh()) >> 2);
+
+        // paraLLEl stores XH at half the wire precision and dxhdy after its
+        // three ignored low bits have been discarded. Staying in those half
+        // units through the latch reproduces its signed shifts exactly.
+        let mut xh_half =
+            (triangle.xh() >> 1).wrapping_add(y_delta.wrapping_mul((triangle.dxhdy() >> 3) << 2));
+        let do_offset = triangle.right_major() == (triangle.dxhdy() < 0);
+        if do_offset {
+            xh_half = xh_half.wrapping_add(3i32.wrapping_mul(triangle.dxhdy() >> 3));
+        }
+
+        Self {
+            base_x: xh_half >> 15,
+            y_delta,
+            x_fraction: (xh_half >> 7) & 0xff,
+            do_offset,
+        }
+    }
+
+    pub(crate) fn interpolate(self, plane: AttributePlane, x: i32) -> i64 {
+        let mut derivative_correction = 0i32;
+        if self.do_offset {
+            let de_high = plane.de & !0x1ff;
+            let dy_high = plane.dy & !0x1ff;
+            derivative_correction = de_high
+                .wrapping_sub(de_high >> 2)
+                .wrapping_sub(dy_high)
+                .wrapping_add(dy_high >> 2);
+        }
+
+        let x_fraction_correction = self.x_fraction.wrapping_mul((plane.dx >> 8) & !1);
+        let row_base = plane.base.wrapping_add(plane.de.wrapping_mul(self.y_delta));
+        let latched = (row_base & !0x1ff)
+            .wrapping_add(derivative_correction)
+            .wrapping_sub(x_fraction_correction)
+            & !0x3ff;
+        let x_step = (plane.dx & !0x1f).wrapping_mul(x.wrapping_sub(self.base_x));
+        i64::from(latched.wrapping_add(x_step))
+    }
+
+    #[inline]
+    pub(crate) fn step(plane: AttributePlane, value: i64) -> i64 {
+        i64::from((value as i32).wrapping_add(plane.dx & !0x1f))
+    }
+
+    /// Completes the RDP shade centroid operation from an integer-pixel span
+    /// latch and the first set checkerboard coverage bit.
+    pub(crate) fn shade_component(
+        plane: AttributePlane,
+        span_value: i64,
+        first_coverage_bit: u32,
+    ) -> u8 {
+        assert!(first_coverage_bit < 8);
+        let y_offset = (first_coverage_bit >> 1) as i16;
+        let x_offset = (((first_coverage_bit & 1) << 1) + (u32::from(y_offset as u16) & 1)) as i16;
+        let mut snapped = ((span_value as i32) >> 14) as i16;
+        snapped = snapped.wrapping_shl(2);
+        snapped = snapped.wrapping_add(x_offset.wrapping_mul((plane.dx >> 14) as i16));
+        snapped = snapped.wrapping_add(y_offset.wrapping_mul((plane.dy >> 14) as i16));
+        let value = i32::from(snapped >> 4);
+
+        // paraLLEl-RDP's MIT-licensed clamp_9bit: sign-extend bits 0..8
+        // around a 0x80 bias, then clamp into the combiner's u8 domain.
+        let biased = value.wrapping_sub(0x80);
+        let signed_nine = (biased << 23) >> 23;
+        signed_nine.wrapping_add(0x80).clamp(0, 255) as u8
+    }
+}
+
 /// Reassembles one Q16.16 coefficient from the split integer and fraction
 /// half-words the RDP's coefficient blocks store them in.
 ///
@@ -456,6 +548,13 @@ struct AttributeSampleLine {
     right_x: i64,
     major_x: i64,
     sample_x_eighths: [i32; 2],
+    covered_x: [(i32, i32); 2],
+}
+
+fn ceil_q16(value: i64) -> i32 {
+    let quotient = value.div_euclid(Q16_ONE);
+    let rounded = quotient + i64::from(value.rem_euclid(Q16_ONE) != 0);
+    i32::try_from(rounded).expect("a triangle sample x bound fits i32")
 }
 
 /// The four edge pairs and major-edge origins shared by every pixel in one
@@ -478,27 +577,55 @@ impl AttributeSampleRow {
                 return None;
             }
             let (left_x, right_x) = row_span(triangle, sample_y_eighth);
+            let sample_x_eighths = sample_x_eighths(offset_y);
+            let covered_x = sample_x_eighths.map(|offset_x| {
+                let offset_q16 = i64::from(offset_x) * Q16_ONE / 8;
+                (
+                    ceil_q16(left_x - offset_q16),
+                    ceil_q16(right_x - offset_q16),
+                )
+            });
             Some(AttributeSampleLine {
                 delta_y_eighth: sample_y_eighth - high_origin_eighth,
                 left_x,
                 right_x,
                 major_x: major_edge_x(triangle, sample_y_eighth),
-                sample_x_eighths: sample_x_eighths(offset_y),
+                sample_x_eighths,
+                covered_x,
             })
         });
         Self { lines }
     }
 
     pub(crate) fn sample(&self, x: i32) -> Option<(i32, i64)> {
-        for line in self.lines.iter().flatten() {
-            for offset_x in line.sample_x_eighths {
-                let sample_x = (i64::from(x) * 8 + i64::from(offset_x)) * Q16_ONE / 8;
-                if sample_x >= line.left_x && sample_x < line.right_x {
-                    return Some((line.delta_y_eighth, sample_x - line.major_x));
+        self.coverage_and_sample(x).map(|(_, sample)| sample)
+    }
+
+    pub(crate) fn coverage_mask(&self, x: i32) -> Option<CoverageMask> {
+        let mut mask = 0u8;
+        for (line_index, line) in self.lines.iter().enumerate() {
+            let Some(line) = line else { continue };
+            for (column_index, (start, end)) in line.covered_x.into_iter().enumerate() {
+                if x >= start && x < end {
+                    mask |= 1 << (line_index * 2 + column_index);
                 }
             }
         }
-        None
+        (mask != 0).then(|| CoverageMask::from_bits(mask))
+    }
+
+    /// Counts all eight checkerboard samples while retaining the first
+    /// covered sample used by shade interpolation. One row walk supplies
+    /// both facts so exact primitive coverage does not double edge tests.
+    pub(crate) fn coverage_and_sample(&self, x: i32) -> Option<(CoverageMask, (i32, i64))> {
+        let mask = self.coverage_mask(x)?;
+        let first_bit = mask.0.trailing_zeros() as usize;
+        let line = self.lines[first_bit / 2]
+            .as_ref()
+            .expect("a covered bit names a present sample line");
+        let offset_x = line.sample_x_eighths[first_bit & 1];
+        let sample_x = i64::from(x) * Q16_ONE + i64::from(offset_x) * Q16_ONE / 8;
+        Some((mask, (line.delta_y_eighth, sample_x - line.major_x)))
     }
 }
 

@@ -12,9 +12,9 @@ use core::fmt;
 use crate::TextureLutMode;
 
 use super::{
-    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
-    PhysicalTexelReadError, PhysicalTmemState, TileAddressMode, TileCoordinate, TileDescriptor,
-    TileSize, TmemByteSource, TmemFirstRowParity,
+    read_committed_texel, read_texel, read_texel_cached, AddressedTmemTexel, DecodedPhysicalTexel,
+    PhysicalTexelReadError, PhysicalTmemState, PreparedTexelReader, TileAddressMode,
+    TileCoordinate, TileDescriptor, TileSize, TlutDecodeCache, TmemByteSource, TmemFirstRowParity,
 };
 
 const TEXEL_FRACTION_BITS: u32 = 5;
@@ -412,6 +412,52 @@ pub fn sample_point<S: TmemByteSource + ?Sized>(
 ) -> Result<DecodedPhysicalTexel, PointSampleError> {
     let addressed = address_point_texel(tile, size, request)?;
     read_texel(state, tile, addressed, lut_mode).map_err(Into::into)
+}
+
+/// Point-samples through a draw-local TLUT decode cache.
+pub fn sample_point_cached<S: TmemByteSource + ?Sized>(
+    state: &S,
+    tile: TileDescriptor,
+    size: TileSize,
+    request: PointSampleRequest,
+    lut_mode: TextureLutMode,
+    cache: &mut TlutDecodeCache,
+) -> Result<DecodedPhysicalTexel, PointSampleError> {
+    let addressed = address_point_texel(tile, size, request)?;
+    read_texel_cached(state, tile, addressed, lut_mode, cache).map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+pub struct PreparedPointSampler {
+    tile: TileDescriptor,
+    size: TileSize,
+    reader: PreparedTexelReader,
+}
+
+impl PreparedPointSampler {
+    pub fn try_new(
+        tile: TileDescriptor,
+        size: TileSize,
+        lut_mode: TextureLutMode,
+    ) -> Result<Self, PointSampleError> {
+        Ok(Self {
+            tile,
+            size,
+            reader: PreparedTexelReader::try_new(tile, lut_mode)?,
+        })
+    }
+
+    pub fn sample<S: TmemByteSource + ?Sized>(
+        self,
+        state: &S,
+        request: PointSampleRequest,
+        cache: &mut TlutDecodeCache,
+    ) -> Result<DecodedPhysicalTexel, PointSampleError> {
+        let addressed = address_point_texel(self.tile, self.size, request)?;
+        self.reader
+            .read_cached(state, addressed, cache)
+            .map_err(Into::into)
+    }
 }
 
 /// Reads all four semantic corners around one point from committed TMEM.

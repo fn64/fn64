@@ -53,7 +53,7 @@ use super::{
     Ci4PaletteError, Ci4UnpackError, DecodedTexel, DirectTexelDecodeError,
     IndexedTexelResolveError, PhysicalTmemState, PhysicalTmemStateIdentity,
     PhysicalTmemTransactionIdentity, RawTexel, RawTexelError, ResolvedIndexedTexel,
-    TexelColumnParity, TileDescriptor, TlutEntryDecodeError,
+    TexelColumnParity, TileDescriptor, TlutEntryDecodeError, TlutLookup,
 };
 use fn64_render_ir::ContentDigest;
 
@@ -287,6 +287,153 @@ pub struct DecodedPhysicalTexel {
     texel: DecodedTexel,
 }
 
+/// Draw-local cache for decoded TLUT entries.
+///
+/// Source indices remain physical reads on every sample. Only the immutable
+/// palette entry selected by a successfully-read index is retained, so an
+/// invalid source byte or the first invalid palette byte keeps the uncached
+/// reader's error order.
+pub struct TlutDecodeCache([Option<DecodedTexel>; 256]);
+
+impl TlutDecodeCache {
+    pub const fn new() -> Self {
+        Self([None; 256])
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PreparedTexelReader {
+    tile: TileDescriptor,
+    lut_mode: TextureLutMode,
+    kind: PreparedReadKind,
+    scope: AddressScope,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedReadKind {
+    General(ReadKind),
+    Ci4Rgba16 { palette: u8 },
+    Ci8Rgba16,
+}
+
+impl PreparedTexelReader {
+    pub fn try_new(
+        tile: TileDescriptor,
+        lut_mode: TextureLutMode,
+    ) -> Result<Self, PhysicalTexelReadError> {
+        let kind = preflight(tile, lut_mode)?;
+        validate_address_scope(tile, kind)?;
+        let prepared_kind = match (tile.size(), lut_mode, kind) {
+            (PixelSize::Bits4, TextureLutMode::Rgba16, ReadKind::Indexed { palette }) => {
+                PreparedReadKind::Ci4Rgba16 {
+                    palette: palette.value(),
+                }
+            }
+            (PixelSize::Bits8, TextureLutMode::Rgba16, ReadKind::Indexed { .. }) => {
+                PreparedReadKind::Ci8Rgba16
+            }
+            _ => PreparedReadKind::General(kind),
+        };
+        Ok(Self {
+            tile,
+            lut_mode,
+            kind: prepared_kind,
+            scope: AddressScope::of(tile, kind),
+        })
+    }
+
+    pub fn read_cached<S: TmemByteSource + ?Sized>(
+        self,
+        state: &S,
+        addressed: AddressedTmemTexel,
+        cache: &mut TlutDecodeCache,
+    ) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
+        let snapshot = state.snapshot();
+        let texel = match self.kind {
+            PreparedReadKind::General(ReadKind::Direct) => {
+                let raw = read_raw_texel(state, self.tile, addressed, self.scope)?;
+                decode_direct_texel(self.tile.format(), raw)?
+            }
+            PreparedReadKind::General(ReadKind::Indexed { palette }) => {
+                let raw_index = read_raw_texel(state, self.tile, addressed, self.scope)?;
+                match resolve_indexed_texel(self.tile.format(), raw_index, palette, self.lut_mode)?
+                {
+                    ResolvedIndexedTexel::Direct(texel) => texel,
+                    ResolvedIndexedTexel::Tlut(lookup) => {
+                        if let Some(texel) = cache.0[usize::from(lookup.index())] {
+                            texel
+                        } else {
+                            let decoded = decode_tlut_entry(
+                                lookup,
+                                read_tlut_entry(state, lookup.byte_address())?,
+                            )?;
+                            cache.0[usize::from(lookup.index())] = Some(decoded);
+                            decoded
+                        }
+                    }
+                }
+            }
+            PreparedReadKind::Ci4Rgba16 { palette } => {
+                let packed = read_valid_byte(
+                    state,
+                    prepared_index_byte_address(self.tile, addressed, self.scope, true),
+                )?;
+                let nibble = if addressed.column() & 1 == 0 {
+                    packed >> 4
+                } else {
+                    packed & 0x0f
+                };
+                read_cached_rgba16(state, (palette << 4) | nibble, cache)?
+            }
+            PreparedReadKind::Ci8Rgba16 => {
+                let index = read_valid_byte(
+                    state,
+                    prepared_index_byte_address(self.tile, addressed, self.scope, false),
+                )?;
+                read_cached_rgba16(state, index, cache)?
+            }
+        };
+        Ok(DecodedPhysicalTexel { snapshot, texel })
+    }
+}
+
+fn read_cached_rgba16<S: TmemByteSource + ?Sized>(
+    state: &S,
+    index: u8,
+    cache: &mut TlutDecodeCache,
+) -> Result<DecodedTexel, PhysicalTexelReadError> {
+    if let Some(texel) = cache.0[usize::from(index)] {
+        return Ok(texel);
+    }
+    let lookup = TlutLookup::rgba16(index);
+    let decoded = decode_tlut_entry(lookup, read_tlut_entry(state, lookup.byte_address())?)?;
+    cache.0[usize::from(index)] = Some(decoded);
+    Ok(decoded)
+}
+
+fn prepared_index_byte_address(
+    tile: TileDescriptor,
+    addressed: AddressedTmemTexel,
+    scope: AddressScope,
+    packed_ci4: bool,
+) -> u16 {
+    let column = if packed_ci4 {
+        u64::from(addressed.column() / 2)
+    } else {
+        u64::from(addressed.column())
+    };
+    let address = (u64::from(tile.tmem().get()) * 8
+        + u64::from(addressed.row()) * u64::from(tile.line_words()) * 8
+        + column)
+        & scope.mask();
+    let address = address as u16;
+    if odd_row_exchange(addressed) {
+        address ^ 4
+    } else {
+        address
+    }
+}
+
 impl DecodedPhysicalTexel {
     pub const fn snapshot(self) -> TmemSnapshotIdentity {
         self.snapshot
@@ -443,6 +590,17 @@ pub fn read_texel<S: TmemByteSource + ?Sized>(
         }
     };
     Ok(DecodedPhysicalTexel { snapshot, texel })
+}
+
+/// The exact reader with a caller-owned, draw-local TLUT decode cache.
+pub fn read_texel_cached<S: TmemByteSource + ?Sized>(
+    state: &S,
+    tile: TileDescriptor,
+    addressed: AddressedTmemTexel,
+    lut_mode: TextureLutMode,
+    cache: &mut TlutDecodeCache,
+) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
+    PreparedTexelReader::try_new(tile, lut_mode)?.read_cached(state, addressed, cache)
 }
 
 fn preflight(
