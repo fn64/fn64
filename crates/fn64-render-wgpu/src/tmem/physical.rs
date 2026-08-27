@@ -1564,9 +1564,29 @@ struct CompletedLoadTouchGeneration(u64);
 struct CanonicalTmemEffectProjection {
     access: ResourceAccess,
     load_epoch: TmemLoadEpoch,
-    normalized_bytes: Box<[u8]>,
-    validity: Box<[u8]>,
+    normalized_and_validity: Box<[u8]>,
+    byte_count: usize,
     touch_generation: CompletedLoadTouchGeneration,
+}
+
+impl CanonicalTmemEffectProjection {
+    fn normalized_bytes(&self) -> &[u8] {
+        &self.normalized_and_validity[..self.byte_count]
+    }
+
+    fn validity(&self) -> &[u8] {
+        &self.normalized_and_validity[self.byte_count..]
+    }
+
+    #[cfg(test)]
+    fn normalized_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.normalized_and_validity[..self.byte_count]
+    }
+
+    #[cfg(test)]
+    fn validity_mut(&mut self) -> &mut [u8] {
+        &mut self.normalized_and_validity[self.byte_count..]
+    }
 }
 
 fn packet_binding(
@@ -2113,17 +2133,19 @@ fn project_load(
         };
         let start = range.start() as usize;
         let end = range.end() as usize;
+        let len = end - start;
+        let mut normalized_and_validity = vec![0; len * 2];
+        let (normalized, validity) = normalized_and_validity.split_at_mut(len);
+        for (index, address) in (start..end).enumerate() {
+            let lane_valid = valid[address];
+            normalized[index] = if lane_valid { bytes[address] } else { 0 };
+            validity[index] = u8::from(lane_valid);
+        }
         let projection = CanonicalTmemEffectProjection {
             access,
             load_epoch: load_binding.epoch,
-            normalized_bytes: (start..end)
-                .map(|address| if valid[address] { bytes[address] } else { 0 })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            validity: (start..end)
-                .map(|address| u8::from(valid[address]))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            normalized_and_validity: normalized_and_validity.into_boxed_slice(),
+            byte_count: len,
             touch_generation,
         };
         effects.push(completed_effect(&projection)?);
@@ -2150,13 +2172,15 @@ fn completed_effect(
         return Err(PhysicalTmemError::DestinationPlanMismatch);
     };
     let len = range.len() as usize;
-    if projection.normalized_bytes.len() != len
-        || projection.validity.len() != len
-        || projection.validity.iter().any(|valid| *valid > 1)
+    let normalized_bytes = projection.normalized_bytes();
+    let validity = projection.validity();
+    if normalized_bytes.len() != len
+        || validity.len() != len
+        || validity.iter().any(|valid| *valid > 1)
         || projection
-            .normalized_bytes
+            .normalized_bytes()
             .iter()
-            .zip(&projection.validity)
+            .zip(validity)
             .any(|(byte, valid)| *valid == 0 && *byte != 0)
     {
         return Err(PhysicalTmemError::ProposalMismatch);
@@ -2165,8 +2189,8 @@ fn completed_effect(
     let digest = CompletedWrite::physical_tmem_content_digest_uniform_generation(
         byte_count,
         projection.load_epoch.get(),
-        &projection.normalized_bytes,
-        &projection.validity,
+        normalized_bytes,
+        validity,
         projection.touch_generation.0,
     );
     CompletedWrite::try_new(projection.access, byte_count, digest).map_err(PhysicalTmemError::Ir)
@@ -3311,7 +3335,7 @@ mod tests {
                     };
                     (range.start() as usize..range.end() as usize)
                         .contains(&address)
-                        .then(|| projection.normalized_bytes[address - range.start() as usize])
+                        .then(|| projection.normalized_bytes()[address - range.start() as usize])
                 })
                 .unwrap()
         };
@@ -3633,28 +3657,28 @@ mod tests {
             .projections
             .iter()
             .all(|load| load.accesses.iter().all(|projection| projection
-                .normalized_bytes
+                .normalized_bytes()
                 .iter()
-                .zip(&projection.validity)
+                .zip(projection.validity())
                 .all(|(byte, valid)| *valid != 0 || *byte == 0))));
 
         let load_projection = &first.projections[0];
         let projection = &load_projection.accesses[0];
         let baseline = completed_effect(projection).unwrap();
-        let byte_count = projection.normalized_bytes.len() as u32;
+        let byte_count = projection.normalized_bytes().len() as u32;
         assert_eq!(baseline.byte_count(), byte_count);
-        assert!(projection.validity.iter().all(|valid| *valid == 1));
+        assert!(projection.validity().iter().all(|valid| *valid == 1));
         assert_eq!(
-            projection.normalized_bytes,
-            (0x20_u8..0x30).collect::<Vec<_>>().into_boxed_slice()
+            projection.normalized_bytes(),
+            (0x20_u8..0x30).collect::<Vec<_>>().as_slice()
         );
         assert_eq!(
             baseline.content(),
             CompletedWrite::physical_tmem_content_digest(
                 byte_count,
                 projection.load_epoch.get(),
-                &projection.normalized_bytes,
-                &projection.validity,
+                projection.normalized_bytes(),
+                projection.validity(),
                 &vec![projection.touch_generation.0; byte_count as usize],
             )
         );
@@ -3664,8 +3688,8 @@ mod tests {
             CompletedWrite::physical_tmem_content_digest(
                 byte_count,
                 projection.load_epoch.get(),
-                &projection.normalized_bytes,
-                &projection.validity,
+                projection.normalized_bytes(),
+                projection.validity(),
                 &vec![projection.touch_generation.0; byte_count as usize],
             ),
         )
@@ -3684,17 +3708,17 @@ mod tests {
         let mut changed_validity = CanonicalTmemEffectProjection {
             access: projection.access,
             load_epoch: projection.load_epoch,
-            normalized_bytes: projection.normalized_bytes.clone(),
-            validity: projection.validity.clone(),
+            normalized_and_validity: projection.normalized_and_validity.clone(),
+            byte_count: projection.byte_count,
             touch_generation: projection.touch_generation,
         };
         let lane = changed_validity
-            .validity
+            .validity()
             .iter()
             .position(|valid| *valid == 1)
             .unwrap();
-        changed_validity.validity[lane] = 0;
-        changed_validity.normalized_bytes[lane] = 0;
+        changed_validity.validity_mut()[lane] = 0;
+        changed_validity.normalized_bytes_mut()[lane] = 0;
         assert_ne!(baseline, completed_effect(&changed_validity).unwrap());
         let mut changed_touch = changed_validity;
         changed_touch.touch_generation.0 += 1;
@@ -3707,8 +3731,8 @@ mod tests {
             load_epoch: TmemLoadEpoch::new(
                 core::num::NonZeroU64::new(projection.load_epoch.get() + 1).unwrap(),
             ),
-            normalized_bytes: projection.normalized_bytes.clone(),
-            validity: projection.validity.clone(),
+            normalized_and_validity: projection.normalized_and_validity.clone(),
+            byte_count: projection.byte_count,
             touch_generation: projection.touch_generation,
         };
         assert_ne!(baseline, completed_effect(&changed_epoch).unwrap());

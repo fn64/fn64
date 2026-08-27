@@ -256,15 +256,19 @@ impl CompletedWrite {
     /// introducing an adapter-specific hash domain for the same projection.
     pub const PHYSICAL_TMEM_CONTENT_DOMAIN: &'static [u8] =
         b"fn64.render-ir.physical-tmem-effect-content.v1\0";
+    const PHYSICAL_TMEM_UNIFORM_CONTENT_DOMAIN: &'static [u8] =
+        b"fn64.render-ir.physical-tmem-effect-content.uniform.v2\0";
 
     /// Hashes one canonical physical-TMEM effect postimage without lifecycle,
     /// allocation, workload, journal, submission, or access identity.
     ///
     /// `byte_count` is complete declared physical access coverage, including
     /// invalid lanes. The remaining fields are load epoch, invalid-data-zeroed
-    /// postimage bytes, one-byte validity flags, and per-byte touch generations
-    /// encoded big-endian. Callers retain structural validation of equal field
-    /// lengths and zero normalized bytes for invalid lanes.
+    /// postimage bytes, one-byte validity flags, and touch generations. A
+    /// uniform generation uses the distinct v2 domain and binds the generation
+    /// count plus one generation value; a nonuniform generation sequence keeps
+    /// the v1 per-byte big-endian encoding. Callers retain structural validation
+    /// of equal field lengths and zero normalized bytes for invalid lanes.
     pub fn physical_tmem_content_digest(
         byte_count: u32,
         load_epoch: u64,
@@ -272,6 +276,20 @@ impl CompletedWrite {
         validity: &[u8],
         last_touched_generation: &[u64],
     ) -> ContentDigest {
+        if uniform_tmem_digest_enabled()
+            && !last_touched_generation.is_empty()
+            && last_touched_generation
+                .iter()
+                .all(|generation| *generation == last_touched_generation[0])
+        {
+            return physical_tmem_uniform_content_digest(
+                byte_count,
+                load_epoch,
+                normalized_bytes,
+                validity,
+                last_touched_generation[0],
+            );
+        }
         let mut hash = physical_tmem_content_hasher(
             byte_count,
             load_epoch,
@@ -294,12 +312,11 @@ impl CompletedWrite {
     /// Hashes the same canonical physical-TMEM effect preimage when every
     /// projected byte was touched by one generation.
     ///
-    /// The encoded SHA-256 field remains `byte_count` repeated big-endian
-    /// generations, byte for byte identical to
-    /// [`Self::physical_tmem_content_digest`] with a uniform generation
-    /// slice. This overload avoids materializing that redundant slice or its
-    /// byte encoding; callers still own the structural proof that every
-    /// projected byte has the supplied generation.
+    /// Under the default v2 encoding, the SHA-256 preimage binds the generation
+    /// count and one generation value instead of repeating the same eight bytes
+    /// once per projected byte. The v1 control retains that repeated encoding.
+    /// Callers still own the structural proof that every projected byte has the
+    /// supplied generation.
     pub fn physical_tmem_content_digest_uniform_generation(
         byte_count: u32,
         load_epoch: u64,
@@ -307,6 +324,15 @@ impl CompletedWrite {
         validity: &[u8],
         last_touched_generation: u64,
     ) -> ContentDigest {
+        if uniform_tmem_digest_enabled() && !normalized_bytes.is_empty() {
+            return physical_tmem_uniform_content_digest(
+                byte_count,
+                load_epoch,
+                normalized_bytes,
+                validity,
+                last_touched_generation,
+            );
+        }
         let generation_count = normalized_bytes.len();
         let mut hash = physical_tmem_content_hasher(
             byte_count,
@@ -371,6 +397,44 @@ impl CompletedWrite {
     pub const fn content(self) -> ContentDigest {
         self.content
     }
+}
+
+fn uniform_tmem_digest_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_TMEM_UNIFORM_DIGEST_V2") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_TMEM_UNIFORM_DIGEST_V2 must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_TMEM_UNIFORM_DIGEST_V2 is not valid Unicode: {error}"),
+    })
+}
+
+fn physical_tmem_uniform_content_digest(
+    byte_count: u32,
+    load_epoch: u64,
+    normalized_bytes: &[u8],
+    validity: &[u8],
+    generation: u64,
+) -> ContentDigest {
+    let mut hash = Sha256::new();
+    hash.update(CompletedWrite::PHYSICAL_TMEM_UNIFORM_CONTENT_DOMAIN);
+    let byte_count = byte_count.to_be_bytes();
+    let load_epoch = load_epoch.to_be_bytes();
+    let generation_count = (normalized_bytes.len() as u64).to_be_bytes();
+    let generation = generation.to_be_bytes();
+    for field in [
+        byte_count.as_slice(),
+        load_epoch.as_slice(),
+        normalized_bytes,
+        validity,
+        generation_count.as_slice(),
+        generation.as_slice(),
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    ContentDigest::from_bytes(hash.finalize().into())
 }
 
 fn physical_tmem_content_hasher(
@@ -1023,13 +1087,13 @@ mod tests {
         );
 
         assert_eq!(
-            CompletedWrite::PHYSICAL_TMEM_CONTENT_DOMAIN,
-            b"fn64.render-ir.physical-tmem-effect-content.v1\0"
+            CompletedWrite::PHYSICAL_TMEM_UNIFORM_CONTENT_DOMAIN,
+            b"fn64.render-ir.physical-tmem-effect-content.uniform.v2\0"
         );
         assert_eq!(backend_a, backend_b);
         assert_eq!(
             backend_a.to_string(),
-            "a52cc1514e4e131e59fd4ea3b1e8e0d1c8a65ac9e86878d6a7601646335c1d79"
+            "a3ccf2cedce557e41b997ca65e4343ac5355cc8db31d39ba4eecee8d58ac5fcf"
         );
     }
 
@@ -1083,6 +1147,38 @@ mod tests {
                 &validity,
                 9,
             )
+        );
+    }
+
+    #[test]
+    fn compressed_uniform_physical_tmem_identity_binds_every_canonical_field() {
+        let normalized = [0x10, 0x11, 0, 0];
+        let validity = [1, 1, 0, 0];
+        let baseline = physical_tmem_uniform_content_digest(4, 7, &normalized, &validity, 9);
+
+        assert_eq!(
+            CompletedWrite::PHYSICAL_TMEM_UNIFORM_CONTENT_DOMAIN,
+            b"fn64.render-ir.physical-tmem-effect-content.uniform.v2\0"
+        );
+        assert_eq!(
+            baseline,
+            physical_tmem_uniform_content_digest(4, 7, &normalized, &validity, 9)
+        );
+        assert_ne!(
+            baseline,
+            physical_tmem_uniform_content_digest(4, 8, &normalized, &validity, 9)
+        );
+        assert_ne!(
+            baseline,
+            physical_tmem_uniform_content_digest(4, 7, &[0x10, 0x12, 0, 0], &validity, 9)
+        );
+        assert_ne!(
+            baseline,
+            physical_tmem_uniform_content_digest(4, 7, &normalized, &[1, 0, 0, 0], 9)
+        );
+        assert_ne!(
+            baseline,
+            physical_tmem_uniform_content_digest(4, 7, &normalized, &validity, 10)
         );
     }
 
